@@ -3,6 +3,13 @@ name = "runnel-server"
 version.workspace = true
 edition.workspace = true
 
+[features]
+instrumentation = [
+    "runnel-core/instrumentation",
+    "runnel-engine/instrumentation",
+    "runnel-raft/instrumentation",
+]
+
 [[bin]]
 name = "runnel"
 path = "src/main.rs"

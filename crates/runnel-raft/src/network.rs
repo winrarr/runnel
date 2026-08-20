@@ -17,6 +17,8 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::watch;
 
 use crate::{GroupManager, METADATA_GROUP_ID, StreamMetadata, TypeConfig};
+#[cfg(feature = "instrumentation")]
+use runnel_engine::StageTimer;
 use runnel_engine::{AckResult, BrokerError, Offset, PollResult};
 
 const MAX_FRAME_SIZE: u32 = 64 * 1024 * 1024;
@@ -65,6 +67,8 @@ impl TcpConnection {
         Req: Serialize,
         Res: DeserializeOwned,
     {
+        #[cfg(feature = "instrumentation")]
+        let _stage_timer = StageTimer::new("raft.peer_rpc");
         let address = self.address.clone().ok_or_else(|| {
             io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -76,12 +80,20 @@ impl TcpConnection {
             let mut stream = match stream {
                 Some(stream) => stream,
                 None => {
+                    #[cfg(feature = "instrumentation")]
+                    let _connect_timer = StageTimer::new("raft.peer_rpc.connect");
                     let stream = TcpStream::connect(address).await?;
                     stream.set_nodelay(true)?;
                     stream
                 }
             };
+            #[cfg(feature = "instrumentation")]
+            let _write_timer = StageTimer::new("raft.peer_rpc.write");
             write_frame(&mut stream, &request).await?;
+            #[cfg(feature = "instrumentation")]
+            drop(_write_timer);
+            #[cfg(feature = "instrumentation")]
+            let _read_timer = StageTimer::new("raft.peer_rpc.read");
             let response = read_frame(&mut stream).await?;
             Ok::<_, io::Error>((stream, response))
         })
@@ -258,6 +270,18 @@ pub(crate) enum ForwardedOperation {
         consumer: String,
         offset: Offset,
     },
+    PollGroup {
+        stream: String,
+        consumer: String,
+        member: String,
+    },
+    AckGroup {
+        stream: String,
+        consumer: String,
+        member: String,
+        offset: Offset,
+        delivery_token: String,
+    },
     InitializeDataStream {
         stream: String,
         stream_id: String,
@@ -271,12 +295,16 @@ pub(crate) enum ForwardedResponse {
     Publish(Result<Offset, ForwardError>),
     Poll(Result<PollResult, ForwardError>),
     Ack(Result<AckResult, ForwardError>),
+    PollGroup(Result<PollResult, ForwardError>),
+    AckGroup(Result<AckResult, ForwardError>),
     InitializeDataStream(Result<bool, ForwardError>),
 }
 
 #[derive(Debug, Serialize, Deserialize)]
 pub(crate) enum ForwardError {
     NotLeader { leader_id: Option<u64> },
+    AckNotInFlight { consumer: String, offset: Offset },
+    StaleDelivery { consumer: String, offset: Offset },
     Message(String),
 }
 
@@ -428,6 +456,28 @@ async fn handle_forwarded(
                 .await
                 .map_err(forward_error),
         ),
+        ForwardedOperation::PollGroup {
+            stream,
+            consumer,
+            member,
+        } => ForwardedResponse::PollGroup(
+            manager
+                .poll_group_local(&stream, &consumer, &member)
+                .await
+                .map_err(forward_error),
+        ),
+        ForwardedOperation::AckGroup {
+            stream,
+            consumer,
+            member,
+            offset,
+            delivery_token,
+        } => ForwardedResponse::AckGroup(
+            manager
+                .ack_group_local(stream, consumer, member, offset, delivery_token)
+                .await
+                .map_err(forward_error),
+        ),
         ForwardedOperation::InitializeDataStream {
             stream,
             stream_id,
@@ -477,6 +527,12 @@ pub(crate) async fn ensure_data_group(
 fn forward_error(error: BrokerError) -> ForwardError {
     match error {
         BrokerError::NotLeader { leader_id } => ForwardError::NotLeader { leader_id },
+        BrokerError::AckNotInFlight { consumer, offset } => {
+            ForwardError::AckNotInFlight { consumer, offset }
+        }
+        BrokerError::StaleDelivery { consumer, offset } => {
+            ForwardError::StaleDelivery { consumer, offset }
+        }
         error => ForwardError::Message(error.to_string()),
     }
 }

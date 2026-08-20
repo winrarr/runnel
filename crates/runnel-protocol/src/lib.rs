@@ -17,10 +17,22 @@ pub enum Request {
         stream: String,
         consumer: String,
     },
+    PollGroup {
+        stream: String,
+        consumer: String,
+        member: String,
+    },
     Ack {
         stream: String,
         consumer: String,
         offset: u64,
+    },
+    AckGroup {
+        stream: String,
+        consumer: String,
+        member: String,
+        offset: u64,
+        delivery_token: String,
     },
     Health,
 }
@@ -39,10 +51,16 @@ pub enum Response {
     Message {
         stream: String,
         consumer: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        member: Option<String>,
         offset: u64,
         key: Option<String>,
         payload: String,
         published_at_ms: u64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        delivery_token: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        delivery_attempt: Option<u32>,
     },
     Empty {
         stream: String,

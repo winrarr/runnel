@@ -3,6 +3,9 @@ name = "runnel-core"
 version.workspace = true
 edition.workspace = true
 
+[features]
+instrumentation = ["runnel-engine/instrumentation"]
+
 [dependencies]
 runnel-engine = { path = "../runnel-engine" }
 serde.workspace = true
@@ -10,6 +13,7 @@ serde_json.workspace = true
 
 [dev-dependencies]
 criterion = "0.8.2"
+runnel-test-support = { path = "../runnel-test-support" }
 tokio.workspace = true
 tempfile = "3.15"
 

@@ -3,6 +3,9 @@ name = "runnel-raft"
 version.workspace = true
 edition.workspace = true
 
+[features]
+instrumentation = ["runnel-engine/instrumentation"]
+
 [dependencies]
 openraft.workspace = true
 runnel-engine = { path = "../runnel-engine" }
@@ -12,4 +15,5 @@ tokio.workspace = true
 tracing.workspace = true
 
 [dev-dependencies]
+runnel-test-support = { path = "../runnel-test-support" }
 tempfile = "3.15"

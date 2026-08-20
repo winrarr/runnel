@@ -1,0 +1,8 @@
+[package]
+name = "runnel-test-support"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+runnel-engine = { path = "../runnel-engine" }
+tokio.workspace = true

@@ -15,18 +15,24 @@ struct RunningServer {
 
 impl RunningServer {
     fn start(data_dir: &Path) -> Self {
+        Self::start_with_args(data_dir, &[])
+    }
+
+    fn start_with_args(data_dir: &Path, extra_args: &[&str]) -> Self {
         let broker_addr = free_addr();
         let http_addr = free_addr();
         let binary = server_binary();
-        let child = Command::new(binary)
-            .args([
-                "--data-dir",
-                data_dir.to_str().expect("temporary path should be UTF-8"),
-                "--listen",
-                &broker_addr.to_string(),
-                "--http-listen",
-                &http_addr.to_string(),
-            ])
+        let mut command = Command::new(binary);
+        command.args([
+            "--data-dir",
+            data_dir.to_str().expect("temporary path should be UTF-8"),
+            "--listen",
+            &broker_addr.to_string(),
+            "--http-listen",
+            &http_addr.to_string(),
+        ]);
+        command.args(extra_args);
+        let child = command
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .spawn()
@@ -170,6 +176,260 @@ fn network_protocol_persists_acknowledgements_across_restart() {
             payload,
             ..
         } if payload == "recover-me"
+    ));
+}
+
+#[test]
+fn network_protocol_shares_work_between_group_members() {
+    let directory = TempDir::new().unwrap();
+    let server = RunningServer::start(directory.path());
+
+    assert!(matches!(
+        request(
+            server.broker_addr,
+            Request::Publish {
+                stream: "jobs".to_owned(),
+                key: None,
+                payload: "first".to_owned(),
+                request_id: None,
+            },
+        ),
+        Response::Published { offset: 0, .. }
+    ));
+    assert!(matches!(
+        request(
+            server.broker_addr,
+            Request::Publish {
+                stream: "jobs".to_owned(),
+                key: None,
+                payload: "second".to_owned(),
+                request_id: None,
+            },
+        ),
+        Response::Published { offset: 1, .. }
+    ));
+
+    let first = request(
+        server.broker_addr,
+        Request::PollGroup {
+            stream: "jobs".to_owned(),
+            consumer: "workers".to_owned(),
+            member: "member-a".to_owned(),
+        },
+    );
+    let first_token = match first {
+        Response::Message {
+            offset: 0,
+            member: Some(member),
+            delivery_token: Some(token),
+            ..
+        } => {
+            assert_eq!(member, "member-a");
+            token
+        }
+        response => panic!("expected first grouped message, got {response:?}"),
+    };
+
+    assert!(matches!(
+        request(
+            server.broker_addr,
+            Request::PollGroup {
+                stream: "jobs".to_owned(),
+                consumer: "workers".to_owned(),
+                member: "member-b".to_owned(),
+            },
+        ),
+        Response::Message { offset: 1, .. }
+    ));
+    assert!(matches!(
+        request(
+            server.broker_addr,
+            Request::AckGroup {
+                stream: "jobs".to_owned(),
+                consumer: "workers".to_owned(),
+                member: "member-a".to_owned(),
+                offset: 0,
+                delivery_token: first_token,
+            },
+        ),
+        Response::Acknowledged {
+            already_acknowledged: false,
+            ..
+        }
+    ));
+}
+
+#[test]
+fn network_protocol_reports_attempts_and_dead_letters_after_limit() {
+    let directory = TempDir::new().unwrap();
+    let server = RunningServer::start_with_args(
+        directory.path(),
+        &["--ack-timeout-ms", "10", "--max-delivery-attempts", "2"],
+    );
+
+    assert!(matches!(
+        request(
+            server.broker_addr,
+            Request::Publish {
+                stream: "events".to_owned(),
+                key: Some("order-1".to_owned()),
+                payload: "poison".to_owned(),
+                request_id: None,
+            },
+        ),
+        Response::Published { offset: 0, .. }
+    ));
+    assert!(matches!(
+        request(
+            server.broker_addr,
+            Request::Poll {
+                stream: "events".to_owned(),
+                consumer: "worker".to_owned(),
+            },
+        ),
+        Response::Message {
+            offset: 0,
+            delivery_attempt: Some(1),
+            ..
+        }
+    ));
+    sleep(Duration::from_millis(20));
+    assert!(matches!(
+        request(
+            server.broker_addr,
+            Request::Poll {
+                stream: "events".to_owned(),
+                consumer: "worker".to_owned(),
+            },
+        ),
+        Response::Message {
+            offset: 0,
+            delivery_attempt: Some(2),
+            ..
+        }
+    ));
+    sleep(Duration::from_millis(20));
+    assert!(matches!(
+        request(
+            server.broker_addr,
+            Request::Poll {
+                stream: "events".to_owned(),
+                consumer: "worker".to_owned(),
+            },
+        ),
+        Response::Empty { .. }
+    ));
+
+    assert!(matches!(
+        request(
+            server.broker_addr,
+            Request::Poll {
+                stream: "events.dead-letter".to_owned(),
+                consumer: "inspector".to_owned(),
+            },
+        ),
+        Response::Message {
+            offset: 0,
+            payload,
+            ..
+        } if payload == "poison"
+    ));
+    assert!(matches!(
+        request(
+            server.broker_addr,
+            Request::Ack {
+                stream: "events.dead-letter".to_owned(),
+                consumer: "inspector".to_owned(),
+                offset: 0,
+            },
+        ),
+        Response::Acknowledged {
+            already_acknowledged: false,
+            ..
+        }
+    ));
+}
+
+#[test]
+fn network_protocol_reassigns_group_delivery_after_restart() {
+    let directory = TempDir::new().unwrap();
+    let server = RunningServer::start(directory.path());
+
+    assert!(matches!(
+        request(
+            server.broker_addr,
+            Request::Publish {
+                stream: "jobs".to_owned(),
+                key: Some("order-1".to_owned()),
+                payload: "recover-me".to_owned(),
+                request_id: None,
+            },
+        ),
+        Response::Published { offset: 0, .. }
+    ));
+    let first_token = match request(
+        server.broker_addr,
+        Request::PollGroup {
+            stream: "jobs".to_owned(),
+            consumer: "workers".to_owned(),
+            member: "member-a".to_owned(),
+        },
+    ) {
+        Response::Message {
+            offset: 0,
+            delivery_attempt: Some(1),
+            delivery_token: Some(token),
+            ..
+        } => token,
+        response => panic!("expected first grouped delivery, got {response:?}"),
+    };
+    server.stop();
+
+    let server = RunningServer::start(directory.path());
+    let second_token = match request(
+        server.broker_addr,
+        Request::PollGroup {
+            stream: "jobs".to_owned(),
+            consumer: "workers".to_owned(),
+            member: "member-b".to_owned(),
+        },
+    ) {
+        Response::Message {
+            offset: 0,
+            delivery_attempt: Some(2),
+            delivery_token: Some(token),
+            ..
+        } => token,
+        response => panic!("expected reassigned grouped delivery, got {response:?}"),
+    };
+    assert!(matches!(
+        request(
+            server.broker_addr,
+            Request::AckGroup {
+                stream: "jobs".to_owned(),
+                consumer: "workers".to_owned(),
+                member: "member-a".to_owned(),
+                offset: 0,
+                delivery_token: first_token,
+            },
+        ),
+        Response::Error { code, .. } if code == "stale_delivery"
+    ));
+    assert!(matches!(
+        request(
+            server.broker_addr,
+            Request::AckGroup {
+                stream: "jobs".to_owned(),
+                consumer: "workers".to_owned(),
+                member: "member-b".to_owned(),
+                offset: 0,
+                delivery_token: second_token,
+            },
+        ),
+        Response::Acknowledged {
+            already_acknowledged: false,
+            ..
+        }
     ));
 }
 

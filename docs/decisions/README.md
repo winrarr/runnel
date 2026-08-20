@@ -16,3 +16,7 @@ Current decisions:
 - 0010-benchmark-history-pages.md: generated benchmark history and GitHub Pages dashboard.
 - 0011-no-formal-rust-msrv.md: no formal source-build compiler guarantee.
 - 0012-dashboard-source-in-main.md: hand-authored dashboard in `main:/docs/benchmarks` with generated history data kept separate.
+- 0013-local-shared-consumer-delivery.md: first shared-consumer semantic baseline, established locally before distributed implementation.
+- 0014-local-retry-and-dead-letter-policy.md: acknowledgement-timeout retries, durable attempt counts, and local dead-letter streams.
+- 0015-clustered-shared-consumer-ownership.md: replicated grouped progress, leases, ownership, and stale-delivery fencing in stream data groups.
+- 0016-clustered-retry-and-dead-letter-policy.md: broker-wide retry limits and atomic dead-letter outcomes for clustered grouped delivery.

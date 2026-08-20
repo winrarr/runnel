@@ -167,6 +167,224 @@ fn three_process_cluster_replicates_and_recovers_after_failures() {
         ),
         Response::Message { offset: 0, .. }
     ));
+
+    let grouped_node = create_stream_on_any(&nodes, "grouped-jobs");
+    for (index, payload) in ["first-grouped-job", "second-grouped-job"]
+        .into_iter()
+        .enumerate()
+    {
+        assert!(matches!(
+            wait_for_response_at(
+                nodes[(grouped_node + index) % nodes.len()].broker_addr,
+                || Request::Publish {
+                    stream: "grouped-jobs".to_owned(),
+                    key: None,
+                    payload: payload.to_owned(),
+                    request_id: Some(format!("grouped-job-{index}")),
+                },
+                |response| matches!(response, Response::Published { offset, .. } if *offset == index as u64),
+            ),
+            Response::Published { offset, .. } if offset == index as u64
+        ));
+    }
+    let first_grouped = wait_for_response_at(
+        nodes[(grouped_node + 1) % nodes.len()].broker_addr,
+        || Request::PollGroup {
+            stream: "grouped-jobs".to_owned(),
+            consumer: "workers".to_owned(),
+            member: "member-a".to_owned(),
+        },
+        |response| {
+            matches!(
+                response,
+                Response::Message {
+                    offset: 0,
+                    delivery_attempt: Some(1),
+                    delivery_token: Some(_),
+                    ..
+                }
+            )
+        },
+    );
+    let first_grouped_token = match first_grouped {
+        Response::Message {
+            delivery_token: Some(token),
+            ..
+        } => token,
+        response => panic!("expected first grouped message, got {response:?}"),
+    };
+    let second_grouped = wait_for_response_at(
+        nodes[(grouped_node + 2) % nodes.len()].broker_addr,
+        || Request::PollGroup {
+            stream: "grouped-jobs".to_owned(),
+            consumer: "workers".to_owned(),
+            member: "member-b".to_owned(),
+        },
+        |response| {
+            matches!(
+                response,
+                Response::Message {
+                    offset: 1,
+                    delivery_attempt: Some(1),
+                    delivery_token: Some(_),
+                    ..
+                }
+            )
+        },
+    );
+    let second_grouped_token = match second_grouped {
+        Response::Message {
+            delivery_token: Some(token),
+            ..
+        } => token,
+        response => panic!("expected second grouped message, got {response:?}"),
+    };
+    assert!(matches!(
+        wait_for_response_at(
+            nodes[grouped_node].broker_addr,
+            || Request::AckGroup {
+                stream: "grouped-jobs".to_owned(),
+                consumer: "workers".to_owned(),
+                member: "member-b".to_owned(),
+                offset: 1,
+                delivery_token: second_grouped_token.clone(),
+            },
+            |response| matches!(response, Response::Acknowledged { .. }),
+        ),
+        Response::Acknowledged {
+            already_acknowledged: false,
+            ..
+        }
+    ));
+    assert!(matches!(
+        wait_for_response_at(
+            nodes[(grouped_node + 1) % nodes.len()].broker_addr,
+            || Request::AckGroup {
+                stream: "grouped-jobs".to_owned(),
+                consumer: "workers".to_owned(),
+                member: "member-a".to_owned(),
+                offset: 0,
+                delivery_token: first_grouped_token.clone(),
+            },
+            |response| matches!(response, Response::Acknowledged { .. }),
+        ),
+        Response::Acknowledged {
+            already_acknowledged: false,
+            ..
+        }
+    ));
+
+    let legacy_retry_node = create_stream_on_any(&nodes, "legacy-retry");
+    assert!(matches!(
+        wait_for_response_at(
+            nodes[legacy_retry_node].broker_addr,
+            || Request::Publish {
+                stream: "legacy-retry".to_owned(),
+                key: Some("poison".to_owned()),
+                payload: "dead-letter-me".to_owned(),
+                request_id: Some("legacy-retry-message".to_owned()),
+            },
+            |response| matches!(response, Response::Published { offset: 0, .. }),
+        ),
+        Response::Published { offset: 0, .. }
+    ));
+    assert!(matches!(
+        wait_for_response_at(
+            nodes[(legacy_retry_node + 1) % nodes.len()].broker_addr,
+            || Request::Poll {
+                stream: "legacy-retry".to_owned(),
+                consumer: "worker".to_owned(),
+            },
+            |response| matches!(
+                response,
+                Response::Message {
+                    offset: 0,
+                    delivery_attempt: Some(1),
+                    ..
+                }
+            ),
+        ),
+        Response::Message {
+            offset: 0,
+            delivery_attempt: Some(1),
+            ..
+        }
+    ));
+    sleep(Duration::from_millis(100));
+    assert!(matches!(
+        wait_for_response_at(
+            nodes[(legacy_retry_node + 2) % nodes.len()].broker_addr,
+            || Request::Poll {
+                stream: "legacy-retry".to_owned(),
+                consumer: "worker".to_owned(),
+            },
+            |response| matches!(
+                response,
+                Response::Message {
+                    offset: 0,
+                    delivery_attempt: Some(2),
+                    ..
+                }
+            ),
+        ),
+        Response::Message {
+            offset: 0,
+            delivery_attempt: Some(2),
+            ..
+        }
+    ));
+    sleep(Duration::from_millis(100));
+    assert!(matches!(
+        wait_for_response_at(
+            nodes[legacy_retry_node].broker_addr,
+            || Request::Poll {
+                stream: "legacy-retry".to_owned(),
+                consumer: "worker".to_owned(),
+            },
+            |response| matches!(response, Response::Empty { .. }),
+        ),
+        Response::Empty { .. }
+    ));
+    assert!(matches!(
+        wait_for_response_at(
+            nodes[legacy_retry_node].broker_addr,
+            || Request::Poll {
+                stream: "legacy-retry.dead-letter".to_owned(),
+                consumer: "inspector".to_owned(),
+            },
+            |response| matches!(
+                response,
+                Response::Message {
+                    offset: 0,
+                    payload,
+                    delivery_attempt: Some(1),
+                    ..
+                } if payload == "dead-letter-me"
+            ),
+        ),
+        Response::Message {
+            offset: 0,
+            payload,
+            delivery_attempt: Some(1),
+            ..
+        } if payload == "dead-letter-me"
+    ));
+    assert!(matches!(
+        wait_for_response_at(
+            nodes[legacy_retry_node].broker_addr,
+            || Request::Ack {
+                stream: "legacy-retry.dead-letter".to_owned(),
+                consumer: "inspector".to_owned(),
+                offset: 0,
+            },
+            |response| matches!(response, Response::Acknowledged { .. }),
+        ),
+        Response::Acknowledged {
+            already_acknowledged: false,
+            ..
+        }
+    ));
+
     let follower = (leader + 1) % nodes.len();
     let create_response = wait_for_response_at(
         nodes[follower].broker_addr,
@@ -301,6 +519,283 @@ fn three_process_cluster_replicates_and_recovers_after_failures() {
         Response::Acknowledged { .. }
     ));
     wait_for_message(replicated_node.broker_addr, 2, "after-leader-failure");
+}
+
+#[test]
+fn three_process_cluster_reassigns_group_delivery_after_node_failure() {
+    let directory = TempDir::new().unwrap();
+    let addresses = (0..9).map(|_| free_addr()).collect::<Vec<_>>();
+    let cluster_nodes = vec![(1, addresses[6]), (2, addresses[7]), (3, addresses[8])];
+    let mut nodes = vec![
+        RunningNode::start(
+            1,
+            addresses[0],
+            addresses[3],
+            addresses[6],
+            directory.path().join("node-1"),
+            cluster_nodes.clone(),
+            true,
+        ),
+        RunningNode::start(
+            2,
+            addresses[1],
+            addresses[4],
+            addresses[7],
+            directory.path().join("node-2"),
+            cluster_nodes.clone(),
+            false,
+        ),
+        RunningNode::start(
+            3,
+            addresses[2],
+            addresses[5],
+            addresses[8],
+            directory.path().join("node-3"),
+            cluster_nodes,
+            false,
+        ),
+    ];
+    for node in &nodes {
+        wait_for_http(node.http_addr);
+    }
+
+    create_stream_on_any(&nodes, "failover-jobs");
+    assert!(matches!(
+        wait_for_response_at(
+            nodes[0].broker_addr,
+            || Request::Publish {
+                stream: "failover-jobs".to_owned(),
+                key: None,
+                payload: "reassign-me".to_owned(),
+                request_id: Some("failover-job".to_owned()),
+            },
+            |response| matches!(response, Response::Published { offset: 0, .. }),
+        ),
+        Response::Published { offset: 0, .. }
+    ));
+
+    let first = wait_for_response_at(
+        nodes[0].broker_addr,
+        || Request::PollGroup {
+            stream: "failover-jobs".to_owned(),
+            consumer: "workers".to_owned(),
+            member: "member-a".to_owned(),
+        },
+        |response| {
+            matches!(
+                response,
+                Response::Message {
+                    offset: 0,
+                    delivery_attempt: Some(1),
+                    delivery_token: Some(_),
+                    ..
+                }
+            )
+        },
+    );
+    let first_token = match first {
+        Response::Message {
+            delivery_token: Some(token),
+            ..
+        } => token,
+        response => panic!("expected initial grouped delivery, got {response:?}"),
+    };
+
+    nodes[0].stop();
+    sleep(Duration::from_millis(100));
+    let survivor = nodes
+        .iter()
+        .enumerate()
+        .find(|(_, node)| node.child.is_some())
+        .map(|(index, _)| index)
+        .expect("a quorum node should remain after the failure");
+    let second = wait_for_response_at(
+        nodes[survivor].broker_addr,
+        || Request::PollGroup {
+            stream: "failover-jobs".to_owned(),
+            consumer: "workers".to_owned(),
+            member: "member-b".to_owned(),
+        },
+        |response| {
+            matches!(
+                response,
+                Response::Message {
+                    offset: 0,
+                    delivery_attempt: Some(2),
+                    delivery_token: Some(_),
+                    ..
+                }
+            )
+        },
+    );
+    let second_token = match second {
+        Response::Message {
+            delivery_token: Some(token),
+            ..
+        } => token,
+        response => panic!("expected reassigned grouped delivery, got {response:?}"),
+    };
+    assert_ne!(first_token, second_token);
+    assert!(matches!(
+        wait_for_response_at(
+            nodes[survivor].broker_addr,
+            || Request::AckGroup {
+                stream: "failover-jobs".to_owned(),
+                consumer: "workers".to_owned(),
+                member: "member-a".to_owned(),
+                offset: 0,
+                delivery_token: first_token.clone(),
+            },
+            |response| matches!(response, Response::Error { code, .. } if code == "stale_delivery"),
+        ),
+        Response::Error { .. }
+    ));
+    assert!(matches!(
+        wait_for_response_at(
+            nodes[survivor].broker_addr,
+            || Request::AckGroup {
+                stream: "failover-jobs".to_owned(),
+                consumer: "workers".to_owned(),
+                member: "member-b".to_owned(),
+                offset: 0,
+                delivery_token: second_token.clone(),
+            },
+            |response| matches!(response, Response::Acknowledged { .. }),
+        ),
+        Response::Acknowledged {
+            already_acknowledged: false,
+            ..
+        }
+    ));
+
+    assert!(matches!(
+        wait_for_response_at(
+            nodes[survivor].broker_addr,
+            || Request::Publish {
+                stream: "failover-jobs".to_owned(),
+                key: Some("poison".to_owned()),
+                payload: "dead-letter-me".to_owned(),
+                request_id: Some("dead-letter-job".to_owned()),
+            },
+            |response| matches!(response, Response::Published { offset: 1, .. }),
+        ),
+        Response::Published { offset: 1, .. }
+    ));
+    assert!(matches!(
+        wait_for_response_at(
+            nodes[survivor].broker_addr,
+            || Request::PollGroup {
+                stream: "failover-jobs".to_owned(),
+                consumer: "workers".to_owned(),
+                member: "member-c".to_owned(),
+            },
+            |response| matches!(
+                response,
+                Response::Message {
+                    offset: 1,
+                    delivery_attempt: Some(1),
+                    ..
+                }
+            ),
+        ),
+        Response::Message {
+            offset: 1,
+            delivery_attempt: Some(1),
+            ..
+        }
+    ));
+    sleep(Duration::from_millis(100));
+    assert!(matches!(
+        wait_for_response_at(
+            nodes[survivor].broker_addr,
+            || Request::PollGroup {
+                stream: "failover-jobs".to_owned(),
+                consumer: "workers".to_owned(),
+                member: "member-d".to_owned(),
+            },
+            |response| matches!(
+                response,
+                Response::Message {
+                    offset: 1,
+                    delivery_attempt: Some(2),
+                    ..
+                }
+            ),
+        ),
+        Response::Message {
+            offset: 1,
+            delivery_attempt: Some(2),
+            ..
+        }
+    ));
+    sleep(Duration::from_millis(100));
+    assert!(matches!(
+        wait_for_response_at(
+            nodes[survivor].broker_addr,
+            || Request::PollGroup {
+                stream: "failover-jobs".to_owned(),
+                consumer: "workers".to_owned(),
+                member: "member-e".to_owned(),
+            },
+            |response| matches!(response, Response::Empty { .. }),
+        ),
+        Response::Empty { .. }
+    ));
+    let dead_letter = wait_for_response_at(
+        nodes[survivor].broker_addr,
+        || Request::PollGroup {
+            stream: "failover-jobs.dead-letter".to_owned(),
+            consumer: "inspector".to_owned(),
+            member: "inspector-1".to_owned(),
+        },
+        |response| {
+            matches!(
+                response,
+                Response::Message {
+                    offset: 0,
+                    payload,
+                    delivery_attempt: Some(1),
+                    delivery_token: Some(_),
+                    ..
+                } if payload == "dead-letter-me"
+            )
+        },
+    );
+    let dead_letter_token = match dead_letter {
+        Response::Message {
+            delivery_token: Some(token),
+            ..
+        } => token,
+        response => panic!("expected dead-letter message, got {response:?}"),
+    };
+    assert!(matches!(
+        wait_for_response_at(
+            nodes[survivor].broker_addr,
+            || Request::AckGroup {
+                stream: "failover-jobs.dead-letter".to_owned(),
+                consumer: "inspector".to_owned(),
+                member: "inspector-1".to_owned(),
+                offset: 0,
+                delivery_token: dead_letter_token.clone(),
+            },
+            |response| matches!(response, Response::Acknowledged { .. }),
+        ),
+        Response::Acknowledged {
+            already_acknowledged: false,
+            ..
+        }
+    ));
+    assert!(matches!(
+        request(
+            nodes[survivor].broker_addr,
+            Request::PollGroup {
+                stream: "failover-jobs.dead-letter".to_owned(),
+                consumer: "inspector".to_owned(),
+                member: "inspector-2".to_owned(),
+            },
+        ),
+        Ok(Response::Empty { .. })
+    ));
 }
 
 #[test]
@@ -440,6 +935,10 @@ fn spawn_node(
         .args([
             "--engine",
             "raft",
+            "--ack-timeout-ms",
+            "50",
+            "--max-delivery-attempts",
+            "2",
             "--node-id",
             &node_id.to_string(),
             "--listen",

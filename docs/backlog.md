@@ -50,6 +50,89 @@ Acceptance criteria:
 - messages with the same requested ordering key are delivered in order while unrelated keys can progress concurrently;
 - slow-consumer tests demonstrate bounded memory and explicit backpressure.
 
+### Make shared consumer delivery dependable
+
+Goal: let multiple worker instances share one durable consumer while preserving independent fan-out consumers, at-least-once delivery, scoped ordering, and safe progress.
+
+Rationale: small applications need a single durable worker without extra coordination, while growing applications should be able to add workers without learning about partitions or triggering application-managed rebalancing.
+
+Constraints:
+
+- the public model must remain streams, consumers, records, acknowledgements, and ordering intent;
+- a worker failure may cause redelivery but must not silently lose committed progress;
+- acknowledgements may arrive out of order when work is shared;
+- stale workers must not be able to acknowledge a later delivery of the same record;
+- delivery and retry state must remain bounded and transferable beyond one process.
+
+Acceptance criteria:
+
+- multiple members of one consumer receive disjoint available work during normal operation;
+- different consumer names continue to receive independent copies of the stream;
+- a message whose delivery expires can be processed by another member, while its previous acknowledgement is rejected as stale;
+- messages with the same requested ordering key are not concurrently delivered to different members;
+- durable progress, replay, retry, and dead-letter behavior remain correct after restart and membership changes;
+- local and clustered engines share conformance tests for these outcomes.
+
+#### Complete local retry and dead-letter behavior
+
+Goal: let a single-node broker handle failed work predictably through retry, redelivery, and dead-letter outcomes without losing durable progress.
+
+Rationale: the current shared-consumer slice establishes assignment, ordering, and stale-token safety, while the initial clustered slice establishes replicated ownership, expiry fencing, and dead-letter transitions. The remaining policy differences still need one coherent contract across engines.
+
+Constraints:
+
+- failed work must remain at least once unless an explicit documented policy says otherwise;
+- retry limits, delays, and dead-letter outcomes must be observable and durable where required by the guarantee;
+- unrelated ordering keys and healthy consumers must continue to make progress;
+- behavior after restart, acknowledgement races, and storage pressure must remain bounded and explicit.
+
+Acceptance criteria:
+
+- a failed delivery follows a documented retry policy and can eventually reach a documented dead-letter outcome;
+- retries and dead-letter transitions survive restart according to the stated durability guarantee;
+- stale or duplicate acknowledgements cannot skip retry or dead-letter state;
+- retry, redelivery, dead-letter, latency, and backlog behavior have focused tests and metrics;
+- representative shared-consumer workloads establish throughput and tail-latency baselines before scheduling or placement changes.
+
+#### Make retry policy application-aware
+
+Goal: let applications choose documented retry, backoff, dead-letter, and recovery behavior appropriate to each durable consumer without exposing storage or cluster topology.
+
+Rationale: a single broker-wide attempt limit is a useful local default, but event fan-out, interactive work, and long-running jobs have different failure and recovery needs.
+
+Constraints:
+
+- policy changes must not weaken at-least-once delivery or ordering guarantees;
+- retry and dead-letter outcomes must remain durable, observable, and bounded;
+- dead-letter records must retain enough provenance for safe inspection and redrive;
+- policy selection must remain independent from physical placement and future clustered ownership.
+
+Acceptance criteria:
+
+- consumers can select and inspect a documented retry and dead-letter policy;
+- backoff, attempt limits, redrive, and poison-message behavior have repeatable failure and restart tests;
+- dead-letter provenance and duplicate behavior are explicit;
+- policy state can be transferred when consumer ownership moves between nodes.
+
+#### Establish reusable shared-delivery verification
+
+Goal: make the shared-consumer semantics precise enough to verify consistently in local and clustered engines.
+
+Rationale: distributed implementation work should preserve observable delivery behavior rather than create a second interpretation of consumers, members, ordering, acknowledgement, and failure.
+
+Constraints:
+
+- tests must exercise public engine and network behavior where the outcome depends on transport or process boundaries;
+- failure scenarios must distinguish confirmed progress, redelivery, stale delivery, and uncertain outcomes;
+- the verification model must not assume a particular storage layout, shard count, or placement strategy.
+
+Acceptance criteria:
+
+- local and clustered engines can be evaluated against the same documented shared-delivery outcomes;
+- restart, member replacement, slow-member, and concurrent-acknowledgement scenarios are repeatable;
+- the verification covers independent fan-out consumers as well as members sharing one consumer;
+- benchmark results identify workload, durability mode, message size, membership, and ordering-key distribution.
+
 ## Make retained data operationally scalable
 
 Goal: allow streams to grow from small local workloads to substantially larger retained data while keeping startup, memory use, recovery, and retention behavior predictable.
@@ -220,23 +303,93 @@ Acceptance criteria:
 - a node or storage failure does not require application-level remapping;
 - placement and balancing behavior is measured for idle, uniform, and skewed workloads.
 
+### Explore stable internal work placement
+
+Goal: determine whether stable internal work lanes, virtual shards, or key-affine ownership can improve throughput, tail latency, batching, or cache locality for large consumer pools without becoming public topology.
+
+Rationale: demand-driven delivery is the simplest first model, but larger deployments may benefit from moving a small, stable fraction of work when workers join or leave rather than recalculating all ownership.
+
+Constraints:
+
+- the public stream and consumer model must not expose lanes, shards, ranges, or worker assignments;
+- any approach must preserve at-least-once delivery, scoped ordering, bounded state, and stale-owner fencing;
+- ownership changes must remain safe during worker, node, and leader failures;
+- the design must be compared with demand-driven delivery using representative skewed and uniform workloads.
+
+Acceptance criteria:
+
+- a documented comparison identifies the workloads where stable placement provides a material benefit or is not worthwhile;
+- membership changes have measured movement, recovery, and tail-latency behavior;
+- hot keys, uneven worker capacity, and slow consumers have explicit behavior;
+- a future optimization can be introduced without changing client programming intent.
+
+### Explore adaptive handling of hot ordering domains
+
+Goal: determine how Runnel should respond when a small number of ordering keys dominate traffic or processing time.
+
+Rationale: per-key ordering permits broad concurrency, but one hot key can still become a throughput or latency bottleneck and can make stable placement decisions misleading.
+
+Constraints:
+
+- ordering guarantees must remain explicit rather than being weakened for performance;
+- unrelated keys must continue to make progress when one key is slow or repeatedly failing;
+- resource and scheduling behavior must remain observable and bounded.
+
+Acceptance criteria:
+
+- representative hot-key workloads quantify backlog, latency, fairness, and resource usage;
+- the project documents which improvements preserve strict key ordering and which require an application-visible tradeoff;
+- any selected policy has repeatable failure, retry, and recovery tests.
+
 ### Make consumer ownership authoritative
 
-Goal: make consumer progress and ownership durable, transferable, and safe under concurrent consumers, crashes, and membership changes.
+Goal: make shared-consumer progress and ownership durable, transferable, and safe across nodes, concurrent members, crashes, and membership changes.
 
-Rationale: stream placement alone does not make work distribution reliable; consumer state must be recoverable without depending on one process's volatile ownership.
+Rationale: stream placement alone does not make work distribution reliable; consumer state must be recoverable without depending on one process's volatile ownership. The current static cluster now provides an initial replicated baseline, which should be extended and hardened before the cluster gains more flexible placement or membership.
 
 Constraints:
 
 - preserve at-least-once delivery and durable acknowledgement semantics;
-- stale consumers must not continue acknowledging work after ownership changes;
+- applications must continue to address streams and consumers without managing node placement or rebalancing;
+- acknowledged progress must remain durable under the selected replication guarantee;
+- stale consumers and members must not continue acknowledging work after ownership changes;
+- node, leader, member, and network failures must not permit stale work to commit later progress;
+- ordering, retries, replay, dead-letter handling, backpressure, and uncertain outcomes must retain their documented meanings;
 - normal consumers must not need to understand internal group placement or consensus terms.
 
 Acceptance criteria:
 
-- consumer progress survives node restart and the documented failure scenarios;
+- grouped delivery, acknowledgement, expiry, and redelivery work through a multi-node deployment;
+- consumer progress and ownership survive node restart and the documented failure scenarios;
 - ownership changes are fenced and cannot produce conflicting committed progress;
-- independent consumers and consumer groups have repeatable crash, retry, and rebalancing tests.
+- independent consumers remain independent while members of one consumer share work;
+- conformance and failure tests demonstrate no loss of acknowledged progress and document permissible redelivery;
+- independent consumers and consumer groups have repeatable crash, retry, and rebalancing tests;
+- the public protocol remains free of physical partitions, node assignments, and internal placement concepts.
+
+#### Harden the initial clustered shared-consumer contract
+
+Goal: make shared consumers dependable across the supported static-cluster failure scenarios while keeping their behavior consistent with the local engine.
+
+Rationale: the first replicated implementation provides durable ownership, lease expiry, and stale-delivery fencing, but it is intentionally a narrow semantic baseline rather than the final clustered consumer system.
+
+Constraints:
+
+- acknowledged progress must remain durable under the selected replication guarantee;
+- redelivery, acknowledgement races, and uncertain client outcomes must remain explicit;
+- independent consumers and shared members must retain their separate meanings;
+- the public model must not expose consensus terms, node ownership, or physical placement;
+- performance work must preserve bounded state and scoped ordering.
+
+Acceptance criteria:
+
+- the shared-delivery contract runs against both local and clustered engines;
+- member, leader, process, and replica-restart scenarios have repeatable tests;
+- expiry and stale-ack behavior remains correct after leadership changes;
+- clustered retry limits and dead-letter outcomes have a documented cross-engine contract and failure tests;
+- remaining policy differences such as backoff, provenance, consumer-scoped configuration, and observability are explicit before expansion;
+- a repeatable clustered benchmark and profiling workflow identifies throughput, tail latency, CPU, memory, and recovery behavior under documented workloads;
+- representative clustered workloads establish throughput and tail-latency baselines before the delivery scheduler is expanded.
 
 ### Make membership and failover behavior safe
 
@@ -272,6 +425,7 @@ Acceptance criteria:
 
 - repeated interrupted snapshot transfers restart without corrupting committed broker state;
 - recovery does not cause acknowledged messages or durable consumer progress to disappear under repeated interruption and restart tests.
+- repeated recovery tests remain reliable under CI and constrained-resource runs, and failures expose process, socket, or resource causes instead of only reporting a final connection error.
 
 ### Make clustered durability and outcomes explicit
 
@@ -344,6 +498,7 @@ Acceptance criteria:
 
 - benchmarks cover durable publish, publish-to-consume latency, sustained throughput, batching, slow consumers, restart, and recovery;
 - results include p50, p99, and p99.9 latency, memory, CPU, and storage usage where applicable;
+- a repeatable profiling workflow can produce actionable per-process hot-path evidence for clustered workloads;
 - the baseline can be rerun to compare future distributed engines without changing the public workload model.
 
 ### Make cross-broker benchmark comparisons reproducible

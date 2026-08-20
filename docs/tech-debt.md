@@ -41,7 +41,7 @@ This register records known implementation shortcuts in the current vertical sli
 
 - Status: open
 - Impact: current metrics expose streams, storage bytes, and snapshot lifecycle counters, but cannot yet explain latency, throughput, consumer lag, redelivery, resource pressure, or most failure behavior under load.
-- Context: the metrics endpoint exists early so deployment checks have a real surface.
+- Context: the metrics endpoint exists early so deployment checks have a real surface. An opt-in Rust timing feature and clustered profiling workflow now provide investigation data without adding timing calls to the default build, but these timings are not yet deployment-grade metrics.
 - Retirement condition: the deployment-grade operations backlog item is implemented and its metrics are exercised by integration or benchmark tests.
 
 ## TD-007: Storage format compatibility is not yet defined
@@ -55,7 +55,7 @@ This register records known implementation shortcuts in the current vertical sli
 
 - Status: open
 - Impact: `runnel-raft` now supports versioned local persistence, group-addressed framed TCP peer RPCs, a metadata group, one static data group per stream, reconciled stream activation, topology-free forwarding, stable stream metadata, durable publish request deduplication, follower restart, leader failure, recovery of an empty replacement replica from a compacted snapshot, interrupted-transfer retry from byte zero, and snapshot lifecycle telemetry. It still lacks dynamic membership, scalable placement and balancing, efficient large-stream representation, fencing policy, repeated-interruption cost controls, authentication, and production-grade operational policy. Replicating every stream to the same static voters is a useful three-node baseline but is not a scalable placement model.
-- Context: the first process-level backend establishes a correctness baseline without committing the public model to Raft topology. All first-version groups use the same static voters, and consumer ownership remains local to a stream data group.
+- Context: the first process-level backend establishes a correctness baseline without committing the public model to Raft topology. All first-version groups use the same static voters, and shared-consumer ownership is replicated within each stream data group even though placement and policy remain simple.
 - Retirement condition: the distributed-engine backlog outcomes are complete, including topology-free access from any node, replicated metadata, failure and upgrade policy, security, observability, and documented production guarantees.
 
 ## TD-009: Snapshots rewrite the complete materialized group state
@@ -76,8 +76,8 @@ This register records known implementation shortcuts in the current vertical sli
 
 - Status: open
 - Impact: the Criterion suite remains focused on local in-process paths, while the end-to-end benchmark harness does not yet establish clustered, statistically stable, equivalent competitor, or complete tail-latency baselines.
-- Context: microbenchmarks were added first to catch local regressions while the broker semantics and cluster recovery behavior were still changing. Containerized and first-pass native competitor measurements now exist, including scenario-scoped resource efficiency, but their semantic and statistical limitations remain.
-- Retirement condition: the performance backlog outcomes provide repeatable machine-readable local, container, clustered, and comparable-broker measurements with explicit workload and durability semantics.
+- Context: microbenchmarks were added first to catch local regressions while the broker semantics and cluster recovery behavior were still changing. Containerized, clustered, and first-pass native competitor measurements now exist, including scenario-scoped resource efficiency and optional Linux profiles, but their semantic and statistical limitations remain.
+- Retirement condition: the performance backlog outcomes provide repeatable machine-readable local, container, clustered, and comparable-broker measurements with explicit workload and durability semantics, plus enough repeated samples and profiling evidence to distinguish regressions from host noise.
 
 ## TD-012: Peer RPC connections are short-lived
 
@@ -99,3 +99,38 @@ This register records known implementation shortcuts in the current vertical sli
 - Impact: the required dependency audit currently ignores `RUSTSEC-2026-0235`, which is reported for `rkyv 0.7.46` retained in the lockfile through an optional/dev-only `rust_decimal` dependency. The exception keeps the security workflow useful for actionable production dependencies, but it could hide the advisory if that feature becomes active.
 - Context: the pinned stable security toolchain can parse current advisories, while the current dependency graph does not expose this optional serialization path in Runnel's runtime dependency tree.
 - Retirement condition: remove the audit exception after the lockfile no longer contains the affected optional dependency or the dependency is upgraded to a fixed release, then verify the complete audit workflow without ignores.
+
+## TD-016: Initial shared dispatcher uses a simple scan and one delivery per member
+
+- Status: open
+- Impact: grouped polling scans the in-memory record index and allows only one outstanding delivery per member. This bounds the first implementation and keeps its behavior inspectable, but it limits throughput, batching, and scalability for large or highly concurrent worker pools.
+- Context: the first implementation is a semantic baseline for demand-driven delivery, not a target storage or scheduling architecture.
+- Retirement condition: workload benchmarks justify bounded scheduling, batching, or stable internal placement improvements while preserving scoped ordering, backpressure, and stale-delivery fencing.
+
+## TD-017: Dead-letter movement spans separate durable records
+
+- Status: open
+- Impact: a crash after a dead-letter append but before the source consumer checkpoint is persisted can produce a duplicate dead-letter record when the source message is retried. The ordering prevents acknowledged progress from being silently skipped, but dead-letter consumers must tolerate at-least-once duplicates.
+- Context: the first local policy uses the existing append-only stream logs and atomic consumer checkpoints without adding a cross-log transaction or reconciliation journal.
+- Retirement condition: a durable transaction or recovery reconciliation protocol provides duplicate-safe dead-letter movement while preserving bounded recovery and at-least-once guarantees.
+
+## TD-018: Retry policy and dead-letter provenance are coarse
+
+- Status: open
+- Impact: retry configuration is broker-wide, backoff is limited to the acknowledgement timeout, and dead-letter records preserve only the original key and payload. Applications cannot yet select policy per consumer or reliably identify the source offset and attempt history from the dead-letter record alone.
+- Context: the initial policy establishes durable attempt counting and usable local and clustered grouped-delivery dead-letter streams before the public consumer configuration model is finalized.
+- Retirement condition: consumer-scoped policy, documented backoff and redrive behavior, and durable dead-letter provenance are available and covered by restart, retry, and clustered ownership tests.
+
+## TD-019: Delivery bookkeeping synchronizes consumer state per delivery
+
+- Status: open
+- Impact: the current durable attempt and acknowledgement bookkeeping replaces and syncs a consumer state file for each delivery path. The current 100-byte local benchmark run measured roughly 31 thousand shared-consumer messages per second in this configuration, but this cost will limit throughput and tail-latency headroom as concurrency and membership grow.
+- Context: persisting the attempt before returning a message makes retry behavior survive restart and keeps the first correctness model straightforward.
+- Retirement condition: benchmarked batching, group commit, or another bounded bookkeeping strategy reduces delivery overhead without losing durable retry state, acknowledgement safety, or predictable recovery.
+
+## TD-020: Clustered shared-consumer policy is only a semantic baseline
+
+- Status: open
+- Impact: the clustered engine now replicates shared progress, in-flight ownership, lease expiry, stale-delivery fencing, broker-wide attempt limits, and atomic dead-letter transitions for grouped and non-grouped delivery. Backoff, provenance, consumer-scoped configuration, and final lease/fencing policy remain unfinished. Delivery state also remains part of the complete materialized stream-group state.
+- Context: the first multi-node implementation establishes the contract and failure boundary before policy and placement work are expanded.
+- Retirement condition: clustered consumers have a documented policy for backoff, provenance, consumer-scoped configuration, and stronger failover fencing semantics, with representative recovery and performance tests that preserve at-least-once delivery and scoped ordering.

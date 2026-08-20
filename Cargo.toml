@@ -2,6 +2,7 @@
 resolver = "2"
 members = [
     "crates/runnel-engine",
+    "crates/runnel-test-support",
     "crates/runnel-core",
     "crates/runnel-raft",
     "crates/runnel-protocol",
