@@ -67,6 +67,8 @@ const SNAPSHOT_LOGS_TO_KEEP: u64 = 4;
 // from the beginning in the current in-memory receiver.
 const SNAPSHOT_CHUNK_SIZE: u64 = 64 * 1024;
 const DEFAULT_RAFT_ACK_TIMEOUT: Duration = Duration::from_secs(30);
+const FORWARD_ATTEMPTS: usize = 3;
+const FORWARD_TIMEOUT: Duration = Duration::from_secs(2);
 const DEAD_LETTER_SUFFIX: &str = ".dead-letter";
 const DEAD_LETTER_HASH_PREFIX: &str = "runnel.dead-letter.";
 
@@ -2656,63 +2658,53 @@ impl PersistentEngine {
         operation: network::ForwardedOperation,
         mut leader_id: Option<NodeId>,
     ) -> Result<network::ForwardedResponse, BrokerError> {
-        for _ in 0..3 {
-            let Some(target) = leader_id.or(self.operation_leader(&operation).await?) else {
-                let mut last_error = None;
-                for target in self
-                    .peers
-                    .keys()
-                    .copied()
-                    .filter(|target| *target != self.node_id)
-                {
-                    let Some(address) = self.peers.get(&target) else {
-                        continue;
-                    };
-                    let response =
-                        match network::forward(address, operation.clone(), Duration::from_secs(2))
-                            .await
-                        {
-                            Ok(response) => response,
-                            Err(error) => {
-                                last_error = Some(format!("leader forwarding failed: {error}"));
-                                continue;
-                            }
-                        };
-                    if let Some(next_leader) = forwarded_leader(&response) {
-                        if let Some(next_leader) = next_leader {
-                            leader_id = Some(next_leader);
-                            break;
-                        }
-                        last_error = Some("peer has no elected leader".to_owned());
-                        continue;
-                    }
-                    return Ok(response);
-                }
-                if leader_id.is_none() {
-                    return Err(BrokerError::Cluster(
-                        last_error.unwrap_or_else(|| "cluster has no elected leader".to_owned()),
-                    ));
-                }
-                continue;
+        let mut last_error = None;
+        for _ in 0..FORWARD_ATTEMPTS {
+            let preferred_leader = if let Some(leader_id) = leader_id.take() {
+                Some(leader_id)
+            } else {
+                self.operation_leader(&operation).await?
             };
-            let address = self.peers.get(&target).ok_or_else(|| {
-                BrokerError::Cluster(format!("leader node {target} has no configured address"))
-            })?;
-            let response = network::forward(address, operation.clone(), Duration::from_secs(2))
-                .await
-                .map_err(|error| {
-                    BrokerError::Cluster(format!("leader forwarding failed: {error}"))
-                })?;
-            let next_leader = forwarded_leader(&response);
-            if let Some(next_leader) = next_leader {
-                leader_id = next_leader;
-                continue;
+            let mut candidates = self
+                .peers
+                .keys()
+                .copied()
+                .filter(|target| *target != self.node_id)
+                .collect::<Vec<_>>();
+            if let Some(preferred_leader) =
+                preferred_leader.filter(|target| *target != self.node_id)
+            {
+                candidates.retain(|target| *target != preferred_leader);
+                candidates.insert(0, preferred_leader);
             }
-            return Ok(response);
+
+            for target in candidates {
+                let Some(address) = self.peers.get(&target) else {
+                    last_error = Some(format!("leader node {target} has no configured address"));
+                    continue;
+                };
+                let response =
+                    match network::forward(address, operation.clone(), FORWARD_TIMEOUT).await {
+                        Ok(response) => response,
+                        Err(error) => {
+                            last_error = Some(format!("leader forwarding failed: {error}"));
+                            continue;
+                        }
+                    };
+                if let Some(next_leader) = forwarded_leader(&response) {
+                    if let Some(next_leader) = next_leader {
+                        leader_id = Some(next_leader);
+                    } else {
+                        last_error = Some("peer has no elected leader".to_owned());
+                    }
+                    continue;
+                }
+                return Ok(response);
+            }
         }
-        Err(BrokerError::Cluster(
-            "leader changed repeatedly during forwarding".to_owned(),
-        ))
+        Err(BrokerError::Cluster(last_error.unwrap_or_else(|| {
+            "cluster has no elected leader".to_owned()
+        })))
     }
 
     async fn forward_create_stream(
