@@ -2657,9 +2657,44 @@ impl PersistentEngine {
         mut leader_id: Option<NodeId>,
     ) -> Result<network::ForwardedResponse, BrokerError> {
         for _ in 0..3 {
-            let target = leader_id
-                .or(self.operation_leader(&operation).await?)
-                .ok_or_else(|| BrokerError::Cluster("cluster has no elected leader".to_owned()))?;
+            let Some(target) = leader_id.or(self.operation_leader(&operation).await?) else {
+                let mut last_error = None;
+                for target in self
+                    .peers
+                    .keys()
+                    .copied()
+                    .filter(|target| *target != self.node_id)
+                {
+                    let Some(address) = self.peers.get(&target) else {
+                        continue;
+                    };
+                    let response =
+                        match network::forward(address, operation.clone(), Duration::from_secs(2))
+                            .await
+                        {
+                            Ok(response) => response,
+                            Err(error) => {
+                                last_error = Some(format!("leader forwarding failed: {error}"));
+                                continue;
+                            }
+                        };
+                    if let Some(next_leader) = forwarded_leader(&response) {
+                        if let Some(next_leader) = next_leader {
+                            leader_id = Some(next_leader);
+                            break;
+                        }
+                        last_error = Some("peer has no elected leader".to_owned());
+                        continue;
+                    }
+                    return Ok(response);
+                }
+                if leader_id.is_none() {
+                    return Err(BrokerError::Cluster(
+                        last_error.unwrap_or_else(|| "cluster has no elected leader".to_owned()),
+                    ));
+                }
+                continue;
+            };
             let address = self.peers.get(&target).ok_or_else(|| {
                 BrokerError::Cluster(format!("leader node {target} has no configured address"))
             })?;
@@ -2668,27 +2703,7 @@ impl PersistentEngine {
                 .map_err(|error| {
                     BrokerError::Cluster(format!("leader forwarding failed: {error}"))
                 })?;
-            let next_leader = match &response {
-                network::ForwardedResponse::CreateStream(Err(
-                    network::ForwardError::NotLeader { leader_id },
-                ))
-                | network::ForwardedResponse::Publish(Err(network::ForwardError::NotLeader {
-                    leader_id,
-                }))
-                | network::ForwardedResponse::Poll(Err(network::ForwardError::NotLeader {
-                    leader_id,
-                }))
-                | network::ForwardedResponse::Ack(Err(network::ForwardError::NotLeader {
-                    leader_id,
-                }))
-                | network::ForwardedResponse::PollGroup(Err(network::ForwardError::NotLeader {
-                    leader_id,
-                }))
-                | network::ForwardedResponse::AckGroup(Err(network::ForwardError::NotLeader {
-                    leader_id,
-                })) => Some(*leader_id),
-                _ => None,
-            };
+            let next_leader = forwarded_leader(&response);
             if let Some(next_leader) = next_leader {
                 leader_id = next_leader;
                 continue;
@@ -2808,6 +2823,26 @@ impl PersistentEngine {
     }
 }
 
+fn forwarded_leader(response: &network::ForwardedResponse) -> Option<Option<NodeId>> {
+    match response {
+        network::ForwardedResponse::CreateStream(Err(network::ForwardError::NotLeader {
+            leader_id,
+        }))
+        | network::ForwardedResponse::Publish(Err(network::ForwardError::NotLeader {
+            leader_id,
+        }))
+        | network::ForwardedResponse::Poll(Err(network::ForwardError::NotLeader { leader_id }))
+        | network::ForwardedResponse::Ack(Err(network::ForwardError::NotLeader { leader_id }))
+        | network::ForwardedResponse::PollGroup(Err(network::ForwardError::NotLeader {
+            leader_id,
+        }))
+        | network::ForwardedResponse::AckGroup(Err(network::ForwardError::NotLeader {
+            leader_id,
+        })) => Some(*leader_id),
+        _ => None,
+    }
+}
+
 impl Engine for PersistentEngine {
     fn create_stream<'a>(&'a self, stream: &'a str) -> EngineFuture<'a, bool> {
         Box::pin(async move {
@@ -2856,13 +2891,10 @@ impl Engine for PersistentEngine {
     fn poll<'a>(&'a self, stream: &'a str, consumer: &'a str) -> EngineFuture<'a, PollResult> {
         Box::pin(async move {
             let data_group = self.manager.data_group_for_stream(stream).await?;
-            let leader_id =
-                data_group.raft().current_leader().await.ok_or_else(|| {
-                    BrokerError::Cluster("cluster has no elected leader".to_owned())
-                })?;
-            if leader_id != self.node_id {
+            let leader_id = data_group.raft().current_leader().await;
+            if leader_id != Some(self.node_id) {
                 return self
-                    .forward_poll(stream.to_owned(), consumer.to_owned(), Some(leader_id))
+                    .forward_poll(stream.to_owned(), consumer.to_owned(), leader_id)
                     .await;
             }
             self.manager.poll_local(stream, consumer).await
@@ -2876,23 +2908,21 @@ impl Engine for PersistentEngine {
         member: &'a str,
     ) -> EngineFuture<'a, PollResult> {
         Box::pin(async move {
-            match self
-                .manager
-                .poll_group_local(stream, consumer, member)
-                .await
-            {
-                Ok(result) => Ok(result),
-                Err(BrokerError::NotLeader { leader_id }) => {
-                    self.forward_poll_group(
+            let data_group = self.manager.data_group_for_stream(stream).await?;
+            let leader_id = data_group.raft().current_leader().await;
+            if leader_id != Some(self.node_id) {
+                return self
+                    .forward_poll_group(
                         stream.to_owned(),
                         consumer.to_owned(),
                         member.to_owned(),
                         leader_id,
                     )
-                    .await
-                }
-                Err(error) => Err(error),
+                    .await;
             }
+            self.manager
+                .poll_group_local(stream, consumer, member)
+                .await
         })
     }
 
