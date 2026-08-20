@@ -9,6 +9,9 @@ use runnel_protocol::{Request, Response};
 use tempfile::TempDir;
 
 const CLUSTER_WAIT_TIMEOUT: Duration = Duration::from_secs(30);
+// Durable publishes can overlap snapshot serialization; keep request attempts
+// bounded while allowing that work more time than the lightweight smoke paths.
+const REQUEST_READ_TIMEOUT: Duration = Duration::from_secs(5);
 
 struct RunningNode {
     node_id: u64,
@@ -663,17 +666,21 @@ fn metric_value(metrics: &str, name: &str) -> u64 {
 }
 
 fn request(address: SocketAddr, request: Request) -> Result<Response, String> {
-    let mut stream = TcpStream::connect(address).map_err(|error| error.to_string())?;
+    let mut stream =
+        TcpStream::connect(address).map_err(|error| format!("connect to {address}: {error}"))?;
     stream
-        .set_read_timeout(Some(Duration::from_secs(2)))
-        .map_err(|error| error.to_string())?;
-    let encoded = serde_json::to_string(&request).map_err(|error| error.to_string())?;
-    writeln!(stream, "{encoded}").map_err(|error| error.to_string())?;
+        .set_read_timeout(Some(REQUEST_READ_TIMEOUT))
+        .map_err(|error| format!("set read timeout for {address}: {error}"))?;
+    let encoded = serde_json::to_string(&request)
+        .map_err(|error| format!("encode request for {address}: {error}"))?;
+    writeln!(stream, "{encoded}")
+        .map_err(|error| format!("write request to {address}: {error}"))?;
     let mut response = String::new();
     BufReader::new(stream)
         .read_line(&mut response)
-        .map_err(|error| error.to_string())?;
-    serde_json::from_str(&response).map_err(|error| error.to_string())
+        .map_err(|error| format!("read response from {address}: {error}"))?;
+    serde_json::from_str(&response)
+        .map_err(|error| format!("decode response from {address}: {error}"))
 }
 
 fn server_binary() -> PathBuf {
