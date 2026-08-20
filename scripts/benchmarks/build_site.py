@@ -18,6 +18,7 @@ METRIC_DEFINITIONS = [
     ("latency_p50", "p50 latency", "µs", False),
     ("latency_p99", "p99 latency", "µs", False),
     ("latency_p999", "p99.9 latency", "µs", False),
+    ("cpu_efficiency_messages_per_cpu_second", "CPU efficiency", "messages/CPU-second", True),
     ("cpu_percent_max", "Peak broker CPU", "%", False),
     ("memory_bytes_max", "Peak broker memory", "bytes", False),
 ]
@@ -120,6 +121,44 @@ def build_points(runs: list[dict[str, Any]]) -> list[dict[str, Any]]:
                             unit=units[metric],
                         )
 
+                resources = scenario.get("resource_samples", {})
+                if isinstance(resources, dict):
+                    for metric, key in (
+                        ("cpu_percent_max", "cpu_percent_max"),
+                        ("memory_bytes_max", "memory_bytes_max"),
+                    ):
+                        value = resources.get(key)
+                        if isinstance(value, (int, float)):
+                            add_point(
+                                points,
+                                run=run,
+                                backend=backend_name,
+                                operation=operation,
+                                size=size,
+                                metric=metric,
+                                value=float(value),
+                                unit=units[metric],
+                            )
+                    cpu_seconds = resources.get("cpu_seconds")
+                    messages = scenario.get("messages")
+                    if (
+                        isinstance(cpu_seconds, (int, float))
+                        and cpu_seconds > 0
+                        and isinstance(messages, (int, float))
+                        and messages > 0
+                        and isinstance(scenario.get("throughput_messages_per_second"), (int, float))
+                    ):
+                        add_point(
+                            points,
+                            run=run,
+                            backend=backend_name,
+                            operation=operation,
+                            size=size,
+                            metric="cpu_efficiency_messages_per_cpu_second",
+                            value=float(messages) / float(cpu_seconds),
+                            unit=units["cpu_efficiency_messages_per_cpu_second"],
+                        )
+
             resources = backend.get("resource_samples", {})
             for metric, key in (("cpu_percent_max", "cpu_percent_max"), ("memory_bytes_max", "memory_bytes_max")):
                 value = resources.get(key) if isinstance(resources, dict) else None
@@ -212,7 +251,7 @@ def render_html(data: dict[str, Any], data_url: str = "data.json") -> str:
 <main>
   <h1>Runnel benchmark history</h1>
   <p class="muted">Automatic measurements from the pinned native-tool broker comparison.</p>
-  <p class="notice">Interpret series according to their recorded measurement boundaries. Runnel and JetStream include acknowledgement paths; Kafka and Redpanda consumer figures currently measure fetch throughput without per-message application acknowledgement. Consumer latency is not reported by every native benchmark client, so an empty latency chart is an unavailable measurement rather than a zero.</p>
+  <p class="notice">Interpret series according to their recorded measurement boundaries. Runnel and JetStream include acknowledgement paths; Kafka and Redpanda consumer figures currently measure fetch throughput without per-message application acknowledgement. CPU efficiency means messages per broker CPU-second, and memory is the peak broker memory sampled during the selected scenario. Consumer latency is not reported by every native benchmark client, so an empty latency chart is an unavailable measurement rather than a zero.</p>
   <section class="controls" aria-label="Chart filters">
     <label>Profile<select id="profile"></select></label>
     <label>Operation<select id="operation"></select></label>
@@ -247,10 +286,10 @@ function formatValue(value, unit) {
   return value.toLocaleString(undefined, { maximumFractionDigits: 2 });
 }
 function filteredPoints(metric, operation, size, profile) {
-  const resourceMetric = metric === 'cpu_percent_max' || metric === 'memory_bytes_max';
+  const resourceMetric = metric === 'cpu_efficiency_messages_per_cpu_second' || metric === 'cpu_percent_max' || metric === 'memory_bytes_max';
   return data.points.filter(point => point.metric === metric &&
-    (resourceMetric || point.operation === operation) &&
-    (resourceMetric || size === null || point.message_size_bytes === size) &&
+    (!resourceMetric || (point.message_size_bytes === null ? size === null : point.operation === operation)) &&
+    (!resourceMetric || point.message_size_bytes === null || size === null || point.message_size_bytes === size) &&
     (profile === 'all' || point.profile === profile));
 }
 function renderChart(definition, operation, size, profile) {

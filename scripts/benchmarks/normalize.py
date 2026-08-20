@@ -117,6 +117,9 @@ def normalize_result(result: dict[str, Any], *, source_name: str = "comparison")
             latency = _latency_values(scenario)
             if latency:
                 normalized_scenario["latency_microseconds"] = latency
+            resource_samples = scenario.get("resource_samples")
+            if isinstance(resource_samples, dict):
+                normalized_scenario["resource_samples"] = resource_samples
             for key in ("elapsed_milliseconds", "throughput_megabytes_per_second"):
                 if key in scenario:
                     normalized_scenario[key] = scenario[key]

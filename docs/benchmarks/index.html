@@ -38,7 +38,7 @@
 <main>
   <h1>Runnel benchmark history</h1>
   <p class="muted">Automatic measurements from the pinned native-tool broker comparison.</p>
-  <p class="notice">Interpret series according to their recorded measurement boundaries. Runnel and JetStream include acknowledgement paths; Kafka and Redpanda consumer figures currently measure fetch throughput without per-message application acknowledgement. Consumer latency is not reported by every native benchmark client, so an empty latency chart is an unavailable measurement rather than a zero.</p>
+  <p class="notice">Interpret series according to their recorded measurement boundaries. Runnel and JetStream include acknowledgement paths; Kafka and Redpanda consumer figures currently measure fetch throughput without per-message application acknowledgement. CPU efficiency means messages per broker CPU-second, and memory is the peak broker memory sampled during the selected scenario. Consumer latency is not reported by every native benchmark client, so an empty latency chart is an unavailable measurement rather than a zero.</p>
   <section class="controls" aria-label="Chart filters">
     <label>Profile<select id="profile"></select></label>
     <label>Operation<select id="operation"></select></label>
@@ -54,7 +54,7 @@
 <script>
 let data = { runs: [], points: [] };
 const dataUrl = "https://raw.githubusercontent.com/winrarr/runnel/benchmark-history/site/data.json";
-const definitions = [{"metric":"throughput_messages_per_second","title":"Throughput","unit":"messages/s","higherBetter":true},{"metric":"latency_p50","title":"p50 latency","unit":"\u00b5s","higherBetter":false},{"metric":"latency_p99","title":"p99 latency","unit":"\u00b5s","higherBetter":false},{"metric":"latency_p999","title":"p99.9 latency","unit":"\u00b5s","higherBetter":false},{"metric":"cpu_percent_max","title":"Peak broker CPU","unit":"%","higherBetter":false},{"metric":"memory_bytes_max","title":"Peak broker memory","unit":"bytes","higherBetter":false}];
+const definitions = [{"metric":"throughput_messages_per_second","title":"Throughput","unit":"messages/s","higherBetter":true},{"metric":"latency_p50","title":"p50 latency","unit":"\u00b5s","higherBetter":false},{"metric":"latency_p99","title":"p99 latency","unit":"\u00b5s","higherBetter":false},{"metric":"latency_p999","title":"p99.9 latency","unit":"\u00b5s","higherBetter":false},{"metric":"cpu_efficiency_messages_per_cpu_second","title":"CPU efficiency","unit":"messages/CPU-second","higherBetter":true},{"metric":"cpu_percent_max","title":"Peak broker CPU","unit":"%","higherBetter":false},{"metric":"memory_bytes_max","title":"Peak broker memory","unit":"bytes","higherBetter":false}];
 const colors = ['#75c7ff', '#ff9f68', '#9be28f', '#d7a5ff', '#ffd166', '#ff7aa2', '#76e4d1'];
 const profileSelect = document.getElementById('profile');
 const operationSelect = document.getElementById('operation');
@@ -73,10 +73,10 @@ function formatValue(value, unit) {
   return value.toLocaleString(undefined, { maximumFractionDigits: 2 });
 }
 function filteredPoints(metric, operation, size, profile) {
-  const resourceMetric = metric === 'cpu_percent_max' || metric === 'memory_bytes_max';
+  const resourceMetric = metric === 'cpu_efficiency_messages_per_cpu_second' || metric === 'cpu_percent_max' || metric === 'memory_bytes_max';
   return data.points.filter(point => point.metric === metric &&
-    (resourceMetric || point.operation === operation) &&
-    (resourceMetric || size === null || point.message_size_bytes === size) &&
+    (!resourceMetric || (point.message_size_bytes === null ? size === null : point.operation === operation)) &&
+    (!resourceMetric || point.message_size_bytes === null || size === null || point.message_size_bytes === size) &&
     (profile === 'all' || point.profile === profile));
 }
 function renderChart(definition, operation, size, profile) {

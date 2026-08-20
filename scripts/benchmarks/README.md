@@ -20,7 +20,7 @@ python3 scripts/benchmarks/run.py \
   --payload-sizes 100,1024
 ```
 
-The result records the image, source revision, host information, resource limits, startup time, peak sampled container CPU and memory, workload parameters, throughput, and p50/p99/p99.9/max latency where a scenario has per-message latency.
+The result records the image, source revision, host information, resource limits, startup time, scenario-scoped cgroup CPU time, CPU efficiency, sampled container memory, workload parameters, throughput, and p50/p99/p99.9/max latency where a scenario has per-message latency.
 
 This is an end-to-end benchmark of the current development protocol. It is not yet a fair Kafka, Redpanda, or NATS JetStream comparison: those brokers require adapters that express equivalent acknowledgement, replication, ordering, and delivery guarantees. The comparison work belongs in the benchmark backlog. Do not compare raw numbers across brokers until the adapter semantics and environment are recorded in the result.
 
@@ -34,7 +34,7 @@ Run the native-tool comparison with:
 just bench-compare
 ```
 
-The runner starts each selected broker in isolation on a temporary Docker network, applies the same broker and client CPU/memory limits, creates one stream/topic, publishes 10,000 messages, consumes them, records image identifiers and coarse resource samples, and writes a JSON result under `benchmark-results/compare-<timestamp>.json`. The default payload sizes are 100 bytes and 1 KiB.
+The runner starts each selected broker in isolation on a temporary Docker network, applies the same broker and client CPU/memory limits, creates one stream/topic, publishes 10,000 messages, consumes them, records image identifiers and scenario-scoped resource measurements, and writes a JSON result under `benchmark-results/compare-<timestamp>.json`. The default payload sizes are 100 bytes and 1 KiB.
 
 The pinned images are Apache Kafka `4.3.1`, Redpanda `v26.2.1`, NATS Server `2.14.5-alpine`, and `nats-box` `0.19.7`. The Runnel image is built by the `just` recipe. Redpanda's development mode needs more than a 1 GiB cgroup, so the shared default is 2 CPUs and 2 GiB; pass `--cpus` and `--memory` to change it.
 
@@ -60,7 +60,7 @@ python3 scripts/benchmarks/build_site.py \
   --output benchmark-results/site
 ```
 
-The normalized schema intentionally excludes native tool logs. It retains workload, limits, image identifiers, semantic boundaries, resource samples, source revision, workflow provenance, and measured points. The GitHub benchmark workflow stores these normalized records and `site/data.json` on the generated `benchmark-history` branch. GitHub Pages serves the static dashboard from the separate `benchmark-pages` branch; its JavaScript reads the public history data from the raw GitHub URL. Local raw Runnel-only and comparison JSON files can also be read by the site generator; invalid or unrelated JSON files are skipped.
+The normalized schema intentionally excludes native tool logs. It retains workload, limits, image identifiers, semantic boundaries, scenario resource samples, source revision, workflow provenance, and measured points. The GitHub benchmark workflow stores these normalized records and `site/data.json` on the generated `benchmark-history` branch. GitHub Pages serves the static dashboard from the separate `benchmark-pages` branch; its JavaScript reads the public history data from the raw GitHub URL. Local raw Runnel-only and comparison JSON files can also be read by the site generator; invalid or unrelated JSON files are skipped.
 
 To generate only the static page or only history data:
 
