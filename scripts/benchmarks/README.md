@@ -60,4 +60,18 @@ python3 scripts/benchmarks/build_site.py \
   --output benchmark-results/site
 ```
 
-The normalized schema intentionally excludes native tool logs. It retains workload, limits, image identifiers, semantic boundaries, resource samples, source revision, workflow provenance, and measured points. The GitHub workflow stores these normalized records on the generated `benchmark-history` branch and deploys the generated site through GitHub Pages. Local raw Runnel-only and comparison JSON files can also be read by the site generator; invalid or unrelated JSON files are skipped.
+The normalized schema intentionally excludes native tool logs. It retains workload, limits, image identifiers, semantic boundaries, resource samples, source revision, workflow provenance, and measured points. The GitHub benchmark workflow stores these normalized records and `site/data.json` on the generated `benchmark-history` branch. GitHub Pages serves the static dashboard from the separate `benchmark-pages` branch; its JavaScript reads the public history data from the raw GitHub URL. Local raw Runnel-only and comparison JSON files can also be read by the site generator; invalid or unrelated JSON files are skipped.
+
+To generate only the static page or only history data:
+
+```text
+python3 scripts/benchmarks/build_site.py \
+  --runs benchmark-results \
+  --output benchmark-results/page \
+  --index-only \
+  --data-url https://raw.githubusercontent.com/winrarr/runnel/benchmark-history/site/data.json
+python3 scripts/benchmarks/build_site.py \
+  --runs benchmark-results \
+  --output benchmark-results/data \
+  --data-only
+```

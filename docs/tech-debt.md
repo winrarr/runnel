@@ -92,3 +92,10 @@ This register records known implementation shortcuts in the current vertical sli
 - Impact: the first comparison baseline uses Runnel's host-side protocol client, Kafka/Redpanda's native Kafka performance clients, and NATS's native JetStream benchmark client. Publish batching, consumer acknowledgement behavior, client startup, and latency visibility differ, so the numbers cannot yet support a definitive product ranking.
 - Context: native tools provide an immediately reproducible baseline while Runnel's public protocol and common benchmark client are still provisional. The result artifacts record each measurement boundary and configuration.
 - Retirement condition: a common workload client or rigorously equivalent adapters measure durable publish, consume with application acknowledgement, batching, recovery, resource usage, and tail latency across all supported brokers while preserving each broker's explicitly stated guarantee.
+
+## TD-014: Security audit has a documented optional-dependency exception
+
+- Status: open
+- Impact: the required dependency audit currently ignores `RUSTSEC-2026-0235`, which is reported for `rkyv 0.7.46` retained in the lockfile through an optional/dev-only `rust_decimal` dependency. The exception keeps the security workflow useful for actionable production dependencies, but it could hide the advisory if that feature becomes active.
+- Context: the pinned stable security toolchain can parse current advisories, while the current dependency graph does not expose this optional serialization path in Runnel's runtime dependency tree.
+- Retirement condition: remove the audit exception after the lockfile no longer contains the affected optional dependency or the dependency is upgraded to a fixed release, then verify the complete audit workflow without ignores.

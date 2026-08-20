@@ -15,7 +15,7 @@ Runnel is a Rust message broker intended to offer durable streams, low operation
 - scripts/benchmarks/run.py: resource-limited container benchmark runner with machine-readable results.
 - scripts/benchmarks/compare.py: first-pass native-tool comparison runner for Runnel, Kafka, Redpanda, and JetStream.
 - scripts/benchmarks/normalize.py: strips raw tool output and adds provenance for durable benchmark history.
-- scripts/benchmarks/build_site.py: generates the dependency-free static benchmark dashboard.
+- scripts/benchmarks/build_site.py: generates the dependency-free static benchmark dashboard and history data.
 - scripts/benchmarks/README.md: benchmark scope, semantics, and comparison guidance.
 - docs/architecture.md: current data flow and boundaries.
 - docs/design/: active architecture explorations, alternatives, and proposed implementation plans that are not accepted decisions.
@@ -77,7 +77,7 @@ Do not add a second task runner. Keep README commands and CI wired to just recip
 
 The required CI path is .github/workflows/ci.yml. It runs the pinned toolchain checks, the minimum supported Rust check, the real network integration test, and the container smoke build. .github/workflows/security.yml audits the dependency lockfile on pull requests and weekly. Dependabot keeps Cargo and GitHub Actions dependencies visible for review.
 
-.github/workflows/benchmarks.yml runs the comparison on pushes to main, weekly, and manually. It keeps raw results as workflow artifacts, appends normalized results to the generated benchmark-history branch, and deploys the static dashboard to GitHub Pages. Treat benchmark-history and its site output as generated data; change the scripts and workflow rather than editing that branch manually.
+.github/workflows/benchmarks.yml runs the comparison on pushes to main, weekly, and manually. It keeps raw results as workflow artifacts and appends normalized results plus data to the generated benchmark-history branch. .github/workflows/benchmark-pages.yml publishes static dashboard code to the benchmark-pages branch when the generator changes; GitHub Pages publishes that branch directly. Treat benchmark-history and benchmark-pages as generated output; change the scripts and workflows rather than editing those branches manually.
 
 ## Knowledge routing
 

@@ -12,9 +12,14 @@ permissions:
 jobs:
   audit:
     runs-on: ubuntu-24.04
+    env:
+      RUSTUP_TOOLCHAIN: stable
     steps:
       - uses: actions/checkout@v4
-      - uses: rustsec/audit-check@v2.0.0
-        with:
-          token: ${{ secrets.GITHUB_TOKEN }}
-
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install pinned cargo-audit
+        run: cargo install --locked cargo-audit --version 0.22.2
+      - name: Audit dependencies
+        # rkyv is an unused optional/dev-only lockfile dependency pulled by rust_decimal;
+        # remove this exception when the dependency graph no longer contains the advisory.
+        run: cargo audit --ignore RUSTSEC-2026-0235

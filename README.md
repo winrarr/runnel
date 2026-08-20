@@ -64,9 +64,9 @@ The test suite includes core persistence and recovery tests, wire-format round-t
 
 `just bench-container` builds a resource-limited Runnel container and runs repeatable end-to-end workload scenarios for 100-byte and 1-KiB messages. It writes machine-readable results under the ignored `benchmark-results/` directory. See [scripts/benchmarks/README.md](scripts/benchmarks/README.md) for workload semantics and comparison limitations.
 
-`just bench-compare` builds Runnel and runs an isolated first-pass native-tool comparison against pinned Kafka, Redpanda, and NATS JetStream containers. It uses a 2 CPU/2 GiB broker and client budget by default because Redpanda's development container needs more than a 1 GiB cgroup. Results are written under the ignored `benchmark-results/` directory and must be read with the recorded measurement boundaries; this is an engineering baseline, not a final apples-to-apples claim.
+`just bench-compare` builds Runnel and runs an isolated first-pass native-tool comparison against pinned Kafka, Redpanda, and NATS JetStream containers. It uses a 2 CPU/2 GiB broker and client budget by default because Redpanda's development container needs more than a 1 GiB cgroup. Results are written under the ignored `benchmark-results/` directory and must be read with the recorded measurement boundaries; this is an engineering baseline, not a final apples-to-apples claim. Missing pinned benchmark images are pulled automatically.
 
-`just bench-dashboard` generates a local static dashboard from JSON results under `benchmark-results/`. The GitHub Actions benchmark workflow normalizes successful runs, keeps the raw result as an artifact, appends history to a generated branch, and publishes the dashboard through GitHub Pages.
+`just bench-dashboard` generates a local static dashboard from JSON results under `benchmark-results/`. The GitHub Actions benchmark workflow normalizes successful runs, keeps the raw result as an artifact, and appends history data to the generated `benchmark-history` branch. GitHub Pages serves a static dashboard from a separate `benchmark-pages` branch; the dashboard reads the public history data directly from that branch.
 
 The current protocol accepts one JSON request per TCP line. For example:
 

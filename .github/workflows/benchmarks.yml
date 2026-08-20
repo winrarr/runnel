@@ -51,17 +51,12 @@ jobs:
           if-no-files-found: error
 
   publish:
-    name: Update history and Pages
+    name: Update benchmark history
     needs: benchmark
     if: needs.benchmark.result == 'success'
     runs-on: ubuntu-24.04
     permissions:
       contents: write
-      pages: write
-      id-token: write
-    environment:
-      name: github-pages
-      url: ${{ steps.deployment.outputs.page_url }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -92,19 +87,13 @@ jobs:
           run_timestamp=$(python3 -c 'import json; print(json.load(open("benchmark-results/normalized.json", encoding="utf-8"))["generated_at"].replace(":", "").replace("+00:00", "Z"))')
           short_sha="${GITHUB_SHA:0:12}"
           cp benchmark-results/normalized.json "history/runs/${run_timestamp}-${short_sha}.json"
-          python3 scripts/benchmarks/build_site.py --runs history/runs --output history/site
+          python3 scripts/benchmarks/build_site.py \
+            --runs history/runs \
+            --output history/site \
+            --data-only
           git -C history add runs site
           git -C history \
             -c user.name="github-actions[bot]" \
             -c user.email="41898282+github-actions[bot]@users.noreply.github.com" \
             commit -m "Record benchmark run ${GITHUB_SHA}" || true
           git -C history push origin HEAD:benchmark-history
-      - name: Configure GitHub Pages
-        uses: actions/configure-pages@v5
-      - name: Upload Pages artifact
-        uses: actions/upload-pages-artifact@v4
-        with:
-          path: history/site
-      - name: Deploy GitHub Pages
-        id: deployment
-        uses: actions/deploy-pages@v4
