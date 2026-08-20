@@ -1,6 +1,6 @@
 # ADR 0004: Use Multi-Raft as the first distributed engine
 
-- Status: accepted
+- Status: accepted; partially superseded by ADR 0011
 - Date: 2026-08-19
 
 ## Decision
@@ -13,7 +13,7 @@ The common engine boundary will express Runnel messaging semantics and outcomes.
 
 An acknowledged durable publish completes only after quorum commit and durable state-machine application. The compactable consensus log and retained message history are separate storage concepts. Durable consumer checkpoints and producer request identity belong to replicated broker state; delivery leases may remain reconstructible volatile state in the initial implementation.
 
-Runnel's MSRV is raised to Rust 1.88 to support the selected dependency graph without relying on a fragile transitive compatibility pin.
+At the time of this decision, Runnel's declared MSRV was raised to Rust 1.88 to support the selected dependency graph without relying on a fragile transitive compatibility pin. That source-build compatibility guarantee was later removed; see ADR 0011.
 
 ## Rationale
 
@@ -29,7 +29,7 @@ The three-node static topology intentionally limits the first implementation's s
 - Every Raft group adds runtime, storage, snapshot, and observability overhead; the initial implementation must keep group density modest and benchmark it.
 - Quorum durability adds network and storage latency relative to the local engine. The acknowledgement point must remain visible in metrics and documentation.
 - OpenRaft is an internal implementation dependency, not a public protocol or storage format. Its types must not cross the semantic engine boundary.
-- The MSRV change affects local setup and CI, but the pinned development toolchain remains independent from the supported minimum.
+- The original MSRV decision was a source-build compatibility policy, not a requirement of the distributed engine architecture; its policy status is superseded by ADR 0011.
 - A future engine must pass the same semantic, failure, recovery, and benchmark suites before it can be offered as a selectable implementation.
 
 ## References

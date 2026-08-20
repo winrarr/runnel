@@ -47,7 +47,7 @@ The current implementation serializes broker operations behind one in-process lo
 - Treat benchmarks as part of performance work; include the durability mode and workload in every result.
 - Treat anything that could improve throughput or latency as worth considering. Evaluate allocation, copying, lock scope, batching, I/O, scheduling, transport, and encoding effects when making changes, while preserving correctness, bounded resource use, and predictable tail latency. Benchmark material assumptions instead of optimizing on intuition alone.
 - Keep network behavior covered by tests that start the real server process.
-- Keep the minimum supported Rust version checked separately from the pinned development toolchain.
+- Keep the pinned development toolchain separate from compatibility policy; do not infer a supported compiler floor from the pinned version.
 
 ## Canonical commands
 
@@ -75,7 +75,7 @@ Do not add a second task runner. Keep README commands and CI wired to just recip
 
 ## Verification and automation
 
-The required CI path is .github/workflows/ci.yml. It runs the pinned toolchain checks, the minimum supported Rust check, the real network integration test, and the container smoke build. .github/workflows/security.yml audits the dependency lockfile on pull requests and weekly. Dependabot keeps Cargo and GitHub Actions dependencies visible for review.
+The required CI path is .github/workflows/ci.yml. It runs the pinned toolchain checks, the real network integration test, and the container smoke build. .github/workflows/security.yml audits the dependency lockfile on pull requests and weekly. Dependabot keeps Cargo and GitHub Actions dependencies visible for review.
 
 .github/workflows/benchmarks.yml runs the comparison on pushes to main, weekly, and manually. It keeps raw results as workflow artifacts and appends normalized results plus data to the generated benchmark-history branch. .github/workflows/benchmark-pages.yml publishes static dashboard code to the benchmark-pages branch when the generator changes; GitHub Pages publishes that branch directly. Treat benchmark-history and benchmark-pages as generated output; change the scripts and workflows rather than editing those branches manually.
 

@@ -27,17 +27,6 @@ jobs:
           tool: just
       - run: just verify
 
-  msrv:
-    name: Minimum supported Rust
-    runs-on: ubuntu-24.04
-    env:
-      RUSTUP_TOOLCHAIN: 1.88.0
-    steps:
-      - uses: actions/checkout@v7.0.1
-      - uses: dtolnay/rust-toolchain@1.88.0
-      - uses: Swatinem/rust-cache@v2.9.2
-      - run: cargo check --locked --workspace
-
   integration:
     name: Integration and container smoke tests
     runs-on: ubuntu-24.04

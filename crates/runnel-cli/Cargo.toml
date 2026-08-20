@@ -2,7 +2,6 @@
 name = "runnel-cli"
 version.workspace = true
 edition.workspace = true
-rust-version.workspace = true
 
 [[bin]]
 name = "runnelctl"
@@ -13,4 +12,3 @@ clap.workspace = true
 runnel-protocol = { path = "../runnel-protocol" }
 serde_json.workspace = true
 tokio.workspace = true
-

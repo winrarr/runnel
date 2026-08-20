@@ -64,11 +64,11 @@ Relevant primary sources:
 - [TiKV raft-rs integration boundary](https://github.com/tikv/raft-rs)
 - [TiKV `Ready` contract](https://docs.rs/raft/0.7.0/raft/raw_node/struct.Ready.html)
 
-### Rust baseline
+### Rust toolchain policy
 
-OpenRaft 0.9.25 itself compiled in a local compatibility probe with Runnel's declared Rust 1.85 baseline only after pinning its `validit` dependency to 0.2.4. Cargo otherwise selected `validit` 0.2.5, which uses let chains stabilized in Rust 1.88 without declaring that requirement. Maintaining a transitive compatibility pin would be fragile.
+Runnel is currently distributed as a broker binary or container and does not promise source-build compatibility with an older compiler. Development, CI, and container builds use the pinned Rust 1.97.1 toolchain.
 
-ADR 0004 accepts raising Runnel's MSRV from 1.85 to 1.88, then testing OpenRaft unmodified in the MSRV CI job. Rust 1.88 is still older than the pinned development toolchain and has direct language support for the dependency's syntax. The repository now records the raised MSRV and has no temporary dependency workaround. If retaining 1.85 becomes important, reassess the library version rather than silently relying on a transitive pin.
+The earlier OpenRaft compatibility probe and the Rust 1.88 decision are historical context. They no longer impose a formal MSRV or require a separate compatibility job. Revisit this policy if Runnel begins publishing libraries or supporting downstream source builds.
 
 ### Initial durable store: evaluate redb, keep payload storage replaceable
 
@@ -167,10 +167,9 @@ Each stage should leave the repository runnable and verified. Stop at a stage if
 
 - Review this plan and resolve the open decisions below.
 - Write an ADR for the first distributed engine, topology, durability acknowledgement point, library choice, engine boundary, and explicitly deferred behavior.
-- Raise and verify the MSRV if OpenRaft is accepted.
 - Add dependency-license, advisory, and exact-version checks before production code depends on the library.
 
-Exit evidence: accepted ADR, clean MSRV build of the selected libraries, and no change to current broker behavior.
+Exit evidence: accepted ADR, clean pinned-toolchain build of the selected libraries, and no change to current broker behavior.
 
 ### Stage 1: establish the semantic engine seam
 
@@ -274,7 +273,7 @@ These remain design constraints. The initial identities, lifecycle states, seman
 ADR 0004 accepts the following defaults:
 
 1. OpenRaft latest reviewed 0.9 patch, exactly pinned and isolated; TiKV `raft` remains the fallback.
-2. Raise the project MSRV from 1.85 to 1.88 instead of pinning an accidental transitive dependency version.
+2. Use the pinned development toolchain without publishing a formal source-build compatibility floor.
 3. Three static voters, one metadata group, and one data group per stream, with all first-version groups replicated to all three nodes.
 4. Any-node client access with internal forwarding; leader-routed linearizable reads initially.
 5. Publish success only after quorum commit and durable state-machine apply.
