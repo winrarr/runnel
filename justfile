@@ -50,7 +50,7 @@ bench-compare:
     python3 scripts/benchmarks/compare.py --build-runnel
 
 bench-dashboard:
-    python3 scripts/benchmarks/build_site.py --runs benchmark-results --output benchmark-results/site
+    python3 scripts/benchmarks/build_history.py --runs benchmark-results --output benchmark-results/site
 
 bench-test:
     python3 -m unittest discover --start-directory scripts/benchmarks --pattern 'test_*.py'

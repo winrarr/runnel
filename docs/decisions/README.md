@@ -14,3 +14,5 @@ Current decisions:
 - 0008-container-benchmark-harness.md: resource-limited container benchmarks and comparable-broker adapter boundary.
 - 0009-native-broker-comparison-baseline.md: pinned native-tool comparison as an explicitly provisional baseline.
 - 0010-benchmark-history-pages.md: generated benchmark history and GitHub Pages dashboard.
+- 0011-no-formal-rust-msrv.md: no formal source-build compiler guarantee.
+- 0012-dashboard-source-in-main.md: hand-authored dashboard in `main:/docs/benchmarks` with generated history data kept separate.

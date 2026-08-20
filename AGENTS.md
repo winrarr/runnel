@@ -15,7 +15,8 @@ Runnel is a Rust message broker intended to offer durable streams, low operation
 - scripts/benchmarks/run.py: resource-limited container benchmark runner with machine-readable results.
 - scripts/benchmarks/compare.py: first-pass native-tool comparison runner for Runnel, Kafka, Redpanda, and JetStream.
 - scripts/benchmarks/normalize.py: strips raw tool output and adds provenance for durable benchmark history.
-- scripts/benchmarks/build_site.py: generates the dependency-free static benchmark dashboard and history data.
+- scripts/benchmarks/build_history.py: aggregates normalized benchmark runs into generated history data.
+- docs/benchmarks/: hand-authored static benchmark dashboard served by GitHub Pages.
 - scripts/benchmarks/README.md: benchmark scope, semantics, and comparison guidance.
 - docs/architecture.md: current data flow and boundaries.
 - docs/design/: active architecture explorations, alternatives, and proposed implementation plans that are not accepted decisions.
@@ -66,7 +67,7 @@ Run these from the repository root:
 - just bench-container builds and benchmarks the broker image with explicit CPU and memory limits.
 - just bench-container-smoke exercises the container benchmark path with a small workload for CI.
 - just bench-compare builds Runnel and runs the documented first-pass comparison against Kafka, Redpanda, and JetStream.
-- just bench-dashboard builds a local dashboard from JSON files under benchmark-results/.
+- just bench-dashboard builds local history data from JSON files under benchmark-results/.
 - just bench-test runs the benchmark normalization and dashboard tests.
 - just audit runs cargo-audit when it is installed.
 - ./scripts/verify.sh is a thin compatibility wrapper for just verify.
@@ -77,7 +78,7 @@ Do not add a second task runner. Keep README commands and CI wired to just recip
 
 The required CI path is .github/workflows/ci.yml. It runs the pinned toolchain checks, the real network integration test, and the container smoke build. .github/workflows/security.yml audits the dependency lockfile on pull requests and weekly. Dependabot keeps Cargo and GitHub Actions dependencies visible for review.
 
-.github/workflows/benchmarks.yml runs the comparison on pushes to main, weekly, and manually. It keeps raw results as workflow artifacts and appends normalized results plus data to the generated benchmark-history branch. .github/workflows/benchmark-pages.yml publishes static dashboard code to the benchmark-pages branch when the generator changes; GitHub Pages publishes that branch directly. Treat benchmark-history and benchmark-pages as generated output; change the scripts and workflows rather than editing those branches manually.
+.github/workflows/benchmarks.yml runs the comparison on pushes to main, weekly, and manually. It keeps raw results as workflow artifacts and appends normalized results plus generated data to the benchmark-history branch. GitHub Pages serves the hand-authored `docs/benchmarks/` directory from `main` and reads the public history data at runtime. Treat benchmark-history as generated output; change the scripts, dashboard assets, and workflow rather than editing that branch manually.
 
 ## Knowledge routing
 

@@ -40,7 +40,7 @@ The broker uses `./data` by default, listens on `127.0.0.1:4222`, and serves rea
 - `just bench-container` builds a Runnel image, applies explicit Docker CPU and memory limits, and runs repeatable end-to-end publish, concurrent publish, consume/acknowledge, round-trip, and restart-recovery scenarios for 100-byte and 1-KiB payloads. Results are written as ignored JSON artifacts under `benchmark-results/` and include scenario-scoped cgroup CPU time, CPU efficiency, memory samples, and p50/p99/p99.9 latency where applicable.
 - `just bench-container-smoke` runs the same container path with a small workload for CI. It verifies the benchmark harness and container lifecycle; it is not a performance gate.
 - `just bench-compare` builds Runnel and runs the first-pass native-tool comparison against the pinned Kafka, Redpanda, and NATS JetStream images. It uses isolated single-node, replication-factor-one containers with explicit CPU and memory limits and writes a machine-readable comparison artifact. Each measured publish or consume scenario records its own broker CPU time and memory interval so the dashboard can show CPU efficiency and memory at the selected workload.
-- `just bench-dashboard` generates a local static dashboard from comparison JSON files under `benchmark-results/`.
+- `just bench-dashboard` generates local benchmark history data from comparison JSON files under `benchmark-results/`; the static dashboard source is in `docs/benchmarks/`.
 - `just bench-test` runs the benchmark normalization and dashboard tests.
 - `just ci` runs verification, the smoke test, the container build, and the container benchmark smoke check.
 
@@ -71,6 +71,6 @@ The current pinned images are Apache Kafka `4.3.1`, Redpanda `v26.2.1`, NATS Ser
 
 ## Automatic benchmark history
 
-`.github/workflows/benchmarks.yml` runs the comparison for pushes to `main`, weekly scheduled runs, and manual runs. It preserves the raw comparison output as a workflow artifact, normalizes stable measurements with commit and runner provenance, and appends the normalized record plus `site/data.json` to the generated `benchmark-history` branch. `.github/workflows/benchmark-pages.yml` publishes only the static dashboard code to the separate `benchmark-pages` branch when the generator changes; the dashboard reads the public history data directly from GitHub.
+`.github/workflows/benchmarks.yml` runs the comparison for pushes to `main`, weekly scheduled runs, and manual runs. It preserves the raw comparison output as a workflow artifact, normalizes stable measurements with commit and runner provenance, and appends the normalized record plus `site/data.json` to the generated `benchmark-history` branch. The hand-authored static dashboard in `docs/benchmarks/` is served directly from `main` and reads the public history data from GitHub.
 
-GitHub Pages is configured to publish the root of the `benchmark-pages` branch. The benchmark workflow does not need Pages deployment permissions or a Pages environment. The data branch is generated output; change the benchmark scripts and workflows rather than editing it manually.
+GitHub Pages is configured to publish `/docs` from `main`. The benchmark workflow does not need Pages deployment permissions or a Pages environment. The data branch is generated output; change the benchmark scripts and dashboard assets rather than editing it manually.

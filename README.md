@@ -66,7 +66,7 @@ The test suite includes core persistence and recovery tests, wire-format round-t
 
 `just bench-compare` builds Runnel and runs an isolated first-pass native-tool comparison against pinned Kafka, Redpanda, and NATS JetStream containers. It uses a 2 CPU/2 GiB broker and client budget by default because Redpanda's development container needs more than a 1 GiB cgroup. Results are written under the ignored `benchmark-results/` directory and must be read with the recorded measurement boundaries; this is an engineering baseline, not a final apples-to-apples claim. Missing pinned benchmark images are pulled automatically.
 
-`just bench-dashboard` generates a local static dashboard from JSON results under `benchmark-results/`. The GitHub Actions benchmark workflow normalizes successful runs, keeps the raw result as an artifact, and appends history data to the generated `benchmark-history` branch. GitHub Pages serves a static dashboard from a separate `benchmark-pages` branch; the dashboard reads the public history data directly from that branch.
+`just bench-dashboard` generates local benchmark history data from JSON results under `benchmark-results/`. The GitHub Actions benchmark workflow normalizes successful runs, keeps the raw result as an artifact, and appends history data to the generated `benchmark-history` branch. GitHub Pages serves the hand-authored dashboard in `docs/benchmarks/` from `main`; the dashboard reads the public history data directly from that branch.
 
 The current protocol accepts one JSON request per TCP line. For example:
 

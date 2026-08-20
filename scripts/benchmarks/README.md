@@ -49,29 +49,23 @@ python3 scripts/benchmarks/compare.py --backends nats --messages 10000 --payload
 
 ## History and dashboard
 
-Normalize a comparison result and generate a local dashboard:
+Normalize a comparison result and generate local history data:
 
 ```text
 python3 scripts/benchmarks/normalize.py \
   --input benchmark-results/compare-<timestamp>.json \
   --output benchmark-results/normalized.json
-python3 scripts/benchmarks/build_site.py \
+python3 scripts/benchmarks/build_history.py \
   --runs benchmark-results \
   --output benchmark-results/site
 ```
 
-The normalized schema intentionally excludes native tool logs. It retains workload, limits, image identifiers, semantic boundaries, scenario resource samples, source revision, workflow provenance, and measured points. The GitHub benchmark workflow stores these normalized records and `site/data.json` on the generated `benchmark-history` branch. GitHub Pages serves the static dashboard from the separate `benchmark-pages` branch; its JavaScript reads the public history data from the raw GitHub URL. Local raw Runnel-only and comparison JSON files can also be read by the site generator; invalid or unrelated JSON files are skipped.
+The normalized schema intentionally excludes native tool logs. It retains workload, limits, image identifiers, semantic boundaries, scenario resource samples, source revision, workflow provenance, and measured points. `build_history.py` aggregates these records into `site/data.json` on the generated `benchmark-history` branch. The hand-authored HTML, CSS, and JavaScript in `docs/benchmarks/` are served directly by GitHub Pages and read that public history data from the raw GitHub URL. Invalid or unrelated JSON files are skipped.
 
-To generate only the static page or only history data:
+To generate history data locally:
 
 ```text
-python3 scripts/benchmarks/build_site.py \
+python3 scripts/benchmarks/build_history.py \
   --runs benchmark-results \
-  --output benchmark-results/page \
-  --index-only \
-  --data-url https://raw.githubusercontent.com/winrarr/runnel/benchmark-history/site/data.json
-python3 scripts/benchmarks/build_site.py \
-  --runs benchmark-results \
-  --output benchmark-results/data \
-  --data-only
+  --output benchmark-results/data
 ```
