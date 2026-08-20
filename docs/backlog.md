@@ -363,7 +363,7 @@ Acceptance criteria:
 
 - a single documented command can run the supported broker adapters in containers with explicit resource limits;
 - the common workload matrix includes message sizes, concurrency, batching, durable publish, consume and acknowledgement, recovery, and resource usage;
-- results report throughput, p50, p99, p99.9, CPU, memory, storage, configuration, and failure state where applicable;
+- results report throughput, p50, p99, p99.9, CPU efficiency, CPU and memory usage, storage, configuration, and failure state where applicable;
 - Kafka, Redpanda, and NATS JetStream comparisons document their acknowledgement, replication, and delivery semantics;
 - repeated runs can be compared without manually transcribing results.
 

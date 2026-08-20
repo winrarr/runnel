@@ -1,0 +1,178 @@
+:root {
+  color-scheme: light dark;
+  --bg: #10151d;
+  --panel: #18212c;
+  --text: #e8eef5;
+  --muted: #9eacba;
+  --line: #344554;
+  --accent: #75c7ff;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  padding: 2rem;
+  background: var(--bg);
+  color: var(--text);
+  font: 15px/1.5 system-ui, sans-serif;
+}
+
+main {
+  max-width: 1280px;
+  margin: 0 auto;
+}
+
+h1,
+h2,
+h3 {
+  line-height: 1.2;
+}
+
+h1 {
+  margin-bottom: 0.4rem;
+}
+
+h2 {
+  margin-top: 2rem;
+}
+
+.muted {
+  color: var(--muted);
+}
+
+.notice {
+  padding: 1rem;
+  border: 1px solid var(--line);
+  border-radius: 0.6rem;
+  background: var(--panel);
+  color: var(--muted);
+}
+
+.controls {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 1rem;
+  margin: 1.5rem 0;
+  padding: 1rem;
+  border: 1px solid var(--line);
+  border-radius: 0.6rem;
+  background: var(--panel);
+}
+
+label {
+  display: grid;
+  gap: 0.3rem;
+  color: var(--muted);
+}
+
+select {
+  min-width: 12rem;
+  padding: 0.45rem;
+  border: 1px solid var(--line);
+  border-radius: 0.35rem;
+  background: var(--bg);
+  color: var(--text);
+}
+
+.charts {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(30rem, 1fr));
+  gap: 1rem;
+}
+
+.chart-card {
+  min-width: 0;
+  padding: 1rem;
+  border: 1px solid var(--line);
+  border-radius: 0.6rem;
+  background: var(--panel);
+}
+
+.chart-card h3 {
+  margin: 0 0 0.5rem;
+}
+
+.chart-card svg {
+  display: block;
+  width: 100%;
+  height: auto;
+  overflow: visible;
+}
+
+.axis {
+  stroke: var(--line);
+  stroke-width: 1;
+}
+
+.gridline {
+  stroke: var(--line);
+  stroke-width: 0.7;
+  stroke-dasharray: 3 4;
+}
+
+.axis-label,
+.empty {
+  fill: var(--muted);
+  font-size: 11px;
+}
+
+.legend {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.7rem;
+  margin-top: 0.5rem;
+  color: var(--muted);
+  font-size: 0.85rem;
+}
+
+.swatch {
+  display: inline-block;
+  width: 0.7rem;
+  height: 0.7rem;
+  margin-right: 0.25rem;
+  border-radius: 50%;
+}
+
+table {
+  width: 100%;
+  border-collapse: collapse;
+  border: 1px solid var(--line);
+  background: var(--panel);
+}
+
+th,
+td {
+  padding: 0.6rem 0.7rem;
+  border-bottom: 1px solid var(--line);
+  text-align: left;
+}
+
+th {
+  color: var(--muted);
+  font-weight: 500;
+}
+
+a {
+  color: var(--accent);
+}
+
+code {
+  font-size: 0.9em;
+}
+
+@media (max-width: 700px) {
+  body {
+    padding: 1rem;
+  }
+
+  .charts {
+    grid-template-columns: 1fr;
+  }
+
+  select {
+    min-width: 10rem;
+  }
+}

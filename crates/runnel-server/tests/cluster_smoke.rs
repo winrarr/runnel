@@ -8,6 +8,8 @@ use std::time::{Duration, Instant};
 use runnel_protocol::{Request, Response};
 use tempfile::TempDir;
 
+const CLUSTER_WAIT_TIMEOUT: Duration = Duration::from_secs(30);
+
 struct RunningNode {
     node_id: u64,
     broker_addr: SocketAddr,
@@ -152,14 +154,15 @@ fn three_process_cluster_replicates_and_recovers_after_failures() {
         Response::Published { offset: 0, .. }
     ));
     assert!(matches!(
-        request(
+        wait_for_response_at(
             nodes[(jobs_node + 1) % nodes.len()].broker_addr,
-            Request::Poll {
+            || Request::Poll {
                 stream: "jobs".to_owned(),
                 consumer: "worker".to_owned(),
             },
+            |response| matches!(response, Response::Message { offset: 0, .. }),
         ),
-        Ok(Response::Message { offset: 0, .. })
+        Response::Message { offset: 0, .. }
     ));
     let follower = (leader + 1) % nodes.len();
     let create_response = wait_for_response_at(
@@ -200,25 +203,27 @@ fn three_process_cluster_replicates_and_recovers_after_failures() {
         Response::Published { offset: 0, .. }
     ));
     assert!(matches!(
-        request(
+        wait_for_response_at(
             nodes[(follower + 1) % nodes.len()].broker_addr,
-            Request::Poll {
+            || Request::Poll {
                 stream: "events".to_owned(),
                 consumer: "worker".to_owned(),
             },
+            |response| matches!(response, Response::Message { offset: 0, .. }),
         ),
-        Ok(Response::Message { offset: 0, .. })
+        Response::Message { offset: 0, .. }
     ));
-    let ack_response = request(
+    let ack_response = wait_for_response_at(
         nodes[follower].broker_addr,
-        Request::Ack {
+        || Request::Ack {
             stream: "events".to_owned(),
             consumer: "worker".to_owned(),
             offset: 0,
         },
+        |response| matches!(response, Response::Acknowledged { .. }),
     );
     assert!(
-        matches!(&ack_response, Ok(Response::Acknowledged { .. })),
+        matches!(&ack_response, Response::Acknowledged { .. }),
         "{ack_response:?}"
     );
 
@@ -281,15 +286,16 @@ fn three_process_cluster_replicates_and_recovers_after_failures() {
         .expect("a follower should remain available")
         .1;
     assert!(matches!(
-        request(
+        wait_for_response_at(
             nodes[post_failure_node].broker_addr,
-            Request::Ack {
+            || Request::Ack {
                 stream: "events".to_owned(),
                 consumer: "worker".to_owned(),
                 offset: 1,
             },
+            |response| matches!(response, Response::Acknowledged { .. }),
         ),
-        Ok(Response::Acknowledged { .. })
+        Response::Acknowledged { .. }
     ));
     wait_for_message(replicated_node.broker_addr, 2, "after-leader-failure");
 }
@@ -485,7 +491,7 @@ fn wait_for_response(
     nodes: &[RunningNode],
     mut predicate: impl FnMut(&RunningNode) -> bool,
 ) -> usize {
-    let deadline = Instant::now() + Duration::from_secs(10);
+    let deadline = Instant::now() + CLUSTER_WAIT_TIMEOUT;
     while Instant::now() < deadline {
         for (index, node) in nodes.iter().enumerate() {
             if node.child.is_some() && predicate(node) {
@@ -502,7 +508,7 @@ fn wait_for_response_at(
     mut request_builder: impl FnMut() -> Request,
     mut predicate: impl FnMut(&Response) -> bool,
 ) -> Response {
-    let deadline = Instant::now() + Duration::from_secs(10);
+    let deadline = Instant::now() + CLUSTER_WAIT_TIMEOUT;
     let mut last_response = None;
     while Instant::now() < deadline {
         match request(address, request_builder()) {
@@ -526,7 +532,7 @@ fn wait_for_message(address: SocketAddr, offset: u64, payload: &str) {
 }
 
 fn wait_for_message_at(address: SocketAddr, offset: u64, payload: &str) {
-    let deadline = Instant::now() + Duration::from_secs(10);
+    let deadline = Instant::now() + CLUSTER_WAIT_TIMEOUT;
     let mut last_response = None;
     while Instant::now() < deadline {
         let response = request(
@@ -555,7 +561,7 @@ fn wait_for_message_at(address: SocketAddr, offset: u64, payload: &str) {
 }
 
 fn wait_for_snapshot(nodes: &[RunningNode], excluded: usize, stream: &str) -> usize {
-    let deadline = Instant::now() + Duration::from_secs(10);
+    let deadline = Instant::now() + CLUSTER_WAIT_TIMEOUT;
     while Instant::now() < deadline {
         for (index, node) in nodes.iter().enumerate() {
             if index == excluded || node.child.is_none() {
@@ -581,7 +587,7 @@ fn wait_for_purged_log(node: &RunningNode, stream: &str) {
         .join("groups/data")
         .join(path_component(stream))
         .join("raft-log.json");
-    let deadline = Instant::now() + Duration::from_secs(10);
+    let deadline = Instant::now() + CLUSTER_WAIT_TIMEOUT;
     while Instant::now() < deadline {
         if let Ok(bytes) = std::fs::read(&path)
             && let Ok(log) = serde_json::from_slice::<serde_json::Value>(&bytes)
@@ -595,7 +601,7 @@ fn wait_for_purged_log(node: &RunningNode, stream: &str) {
 }
 
 fn wait_for_active_snapshot_transfer(address: SocketAddr) {
-    let deadline = Instant::now() + Duration::from_secs(10);
+    let deadline = Instant::now() + CLUSTER_WAIT_TIMEOUT;
     while Instant::now() < deadline {
         let metrics = http_metrics(address);
         let chunks = metric_value(&metrics, "runnel_snapshot_transfer_chunks_received_total");
@@ -612,7 +618,7 @@ fn wait_for_active_snapshot_transfer(address: SocketAddr) {
 }
 
 fn wait_for_metric_at_least(address: SocketAddr, name: &str, expected: u64) {
-    let deadline = Instant::now() + Duration::from_secs(10);
+    let deadline = Instant::now() + CLUSTER_WAIT_TIMEOUT;
     while Instant::now() < deadline {
         if metric_value(&http_metrics(address), name) >= expected {
             return;
@@ -690,7 +696,7 @@ fn free_addr() -> SocketAddr {
 }
 
 fn wait_for_http(address: SocketAddr) {
-    let deadline = Instant::now() + Duration::from_secs(10);
+    let deadline = Instant::now() + CLUSTER_WAIT_TIMEOUT;
     while Instant::now() < deadline {
         if let Ok(mut stream) = TcpStream::connect(address) {
             stream

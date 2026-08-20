@@ -16,13 +16,12 @@ import shutil
 import subprocess
 import sys
 import tempfile
-import threading
 import time
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Callable
 
-from run import read_stats
+from resources import StatsSampler
 
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -70,29 +69,6 @@ def ensure_image(image: str) -> str:
     if inspect.returncode != 0 or not image_id:
         raise ComparisonError(f"Docker pulled benchmark image {image} but it could not be inspected")
     return image_id
-
-
-class StatsSampler:
-    def __init__(self, container: str) -> None:
-        self.container = container
-        self.samples: list[dict[str, float]] = []
-        self.stop_event = threading.Event()
-        self.thread = threading.Thread(target=self._run, name=f"stats-{container}", daemon=True)
-
-    def start(self) -> None:
-        self.thread.start()
-
-    def close(self) -> None:
-        self.stop_event.set()
-        if self.thread.ident is not None:
-            self.thread.join(timeout=2)
-
-    def _run(self) -> None:
-        while not self.stop_event.is_set():
-            sample = read_stats(self.container)
-            if sample is not None:
-                self.samples.append(sample)
-            self.stop_event.wait(0.25)
 
 
 class Service:
@@ -164,7 +140,7 @@ class Service:
 
     def close(self) -> dict[str, Any]:
         self.stats.close()
-        summary = summarize_stats(self.stats.samples)
+        summary = self.stats.summary()
         logs = subprocess.run(
             ["docker", "logs", self.name], capture_output=True, text=True, check=False
         )
@@ -221,6 +197,32 @@ def run_tool(
     return result.stdout + result.stderr
 
 
+def run_measured_tool(
+    service: Service,
+    image: str,
+    network: str,
+    arguments: list[str],
+    *,
+    cpus: str,
+    memory: str,
+    timeout: int = COMMAND_TIMEOUT,
+) -> tuple[str, dict[str, Any]]:
+    token = service.stats.begin()
+    try:
+        output = run_tool(
+            image,
+            network,
+            arguments,
+            cpus=cpus,
+            memory=memory,
+            timeout=timeout,
+        )
+    except BaseException:
+        service.stats.end(token)
+        raise
+    return output, service.stats.end(token)
+
+
 def wait_for(check: Callable[[], None], description: str) -> None:
     deadline = time.monotonic() + 45
     last_error: Exception | None = None
@@ -232,17 +234,6 @@ def wait_for(check: Callable[[], None], description: str) -> None:
             last_error = error
         time.sleep(0.5)
     raise ComparisonError(f"{description} did not become ready: {last_error}")
-
-
-def summarize_stats(samples: list[dict[str, float]]) -> dict[str, Any]:
-    if not samples:
-        return {"samples": 0}
-    return {
-        "samples": len(samples),
-        "cpu_percent_max": max(sample["cpu_percent"] for sample in samples),
-        "memory_bytes_max": max(sample["memory_bytes"] for sample in samples),
-        "memory_percent_max": max(sample["memory_percent"] for sample in samples),
-    }
 
 
 def parse_sizes(value: str) -> list[int]:
@@ -517,7 +508,8 @@ def run_kafka_family(
             cpus=client_cpus,
             memory=client_memory,
         )
-        producer_output = run_tool(
+        producer_output, producer_resources = run_measured_tool(
+            service,
             KAFKA_IMAGE,
             network,
             [
@@ -541,7 +533,8 @@ def run_kafka_family(
             cpus=client_cpus,
             memory=client_memory,
         )
-        consumer_output = run_tool(
+        consumer_output, consumer_resources = run_measured_tool(
+            service,
             KAFKA_IMAGE,
             network,
             [
@@ -559,8 +552,12 @@ def run_kafka_family(
             cpus=client_cpus,
             memory=client_memory,
         )
-        scenarios.append(parse_kafka_publish(producer_output, size, messages))
-        scenarios.append(parse_kafka_consume(consumer_output, size, messages))
+        publish_scenario = parse_kafka_publish(producer_output, size, messages)
+        publish_scenario["resource_samples"] = producer_resources
+        consume_scenario = parse_kafka_consume(consumer_output, size, messages)
+        consume_scenario["resource_samples"] = consumer_resources
+        scenarios.append(publish_scenario)
+        scenarios.append(consume_scenario)
         raw[f"publish_{size}"] = producer_output[-12_000:]
         raw[f"consume_{size}"] = consumer_output[-12_000:]
     return {"scenarios": scenarios, "raw_tool_output": raw}
@@ -580,7 +577,8 @@ def run_nats(
     for size in sizes:
         stream = f"bench{size}"
         subject = f"bench.subject.{size}"
-        producer_output = run_tool(
+        producer_output, producer_resources = run_measured_tool(
+            service,
             NATS_BOX_IMAGE,
             network,
             [
@@ -625,7 +623,8 @@ def run_nats(
             cpus=client_cpus,
             memory=client_memory,
         )
-        consumer_output = run_tool(
+        consumer_output, consumer_resources = run_measured_tool(
+            service,
             NATS_BOX_IMAGE,
             network,
             [
@@ -647,8 +646,12 @@ def run_nats(
             cpus=client_cpus,
             memory=client_memory,
         )
-        scenarios.append(parse_nats_publish(producer_output, size, messages))
-        scenarios.append(parse_nats_consume(consumer_output, size, messages))
+        publish_scenario = parse_nats_publish(producer_output, size, messages)
+        publish_scenario["resource_samples"] = producer_resources
+        consume_scenario = parse_nats_consume(consumer_output, size, messages)
+        consume_scenario["resource_samples"] = consumer_resources
+        scenarios.append(publish_scenario)
+        scenarios.append(consume_scenario)
         raw[f"publish_{size}"] = producer_output[-12_000:]
         raw[f"consume_{size}"] = consumer_output[-12_000:]
     return {"scenarios": scenarios, "raw_tool_output": raw}
@@ -714,6 +717,7 @@ def run_runnel(
                     "throughput_messages_per_second"
                 ],
                 "latency_microseconds": scenario["latency_microseconds"],
+                "resource_samples": scenario.get("resource_samples", {}),
             }
             for scenario in scenarios
         ],

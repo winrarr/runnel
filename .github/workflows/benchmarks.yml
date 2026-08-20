@@ -66,7 +66,7 @@ jobs:
         with:
           name: benchmark-run-${{ github.run_id }}
           path: benchmark-results
-      - name: Append result and build dashboard
+      - name: Append benchmark history
         env:
           GITHUB_SHA: ${{ github.sha }}
           GITHUB_REPOSITORY: ${{ github.repository }}
@@ -87,10 +87,9 @@ jobs:
           run_timestamp=$(python3 -c 'import json; print(json.load(open("benchmark-results/normalized.json", encoding="utf-8"))["generated_at"].replace(":", "").replace("+00:00", "Z"))')
           short_sha="${GITHUB_SHA:0:12}"
           cp benchmark-results/normalized.json "history/runs/${run_timestamp}-${short_sha}.json"
-          python3 scripts/benchmarks/build_site.py \
+          python3 scripts/benchmarks/build_history.py \
             --runs history/runs \
-            --output history/site \
-            --data-only
+            --output history/site
           git -C history add runs site
           git -C history \
             -c user.name="github-actions[bot]" \

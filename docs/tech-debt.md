@@ -75,8 +75,8 @@ This register records known implementation shortcuts in the current vertical sli
 ## TD-011: End-to-end benchmark coverage is incomplete
 
 - Status: open
-- Impact: the current Criterion suite measures only local in-process paths. It does not yet establish containerized server, concurrent, clustered, resource-limited, competitor, or tail-latency baselines.
-- Context: microbenchmarks were added first to catch local regressions while the broker semantics and cluster recovery behavior were still changing.
+- Impact: the Criterion suite remains focused on local in-process paths, while the end-to-end benchmark harness does not yet establish clustered, statistically stable, equivalent competitor, or complete tail-latency baselines.
+- Context: microbenchmarks were added first to catch local regressions while the broker semantics and cluster recovery behavior were still changing. Containerized and first-pass native competitor measurements now exist, including scenario-scoped resource efficiency, but their semantic and statistical limitations remain.
 - Retirement condition: the performance backlog outcomes provide repeatable machine-readable local, container, clustered, and comparable-broker measurements with explicit workload and durability semantics.
 
 ## TD-012: Peer RPC connections are short-lived

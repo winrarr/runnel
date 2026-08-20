@@ -15,17 +15,18 @@ import platform
 import re
 import shutil
 import socket
-import statistics
 import subprocess
 import tempfile
-import threading
 import time
 import urllib.error
 import urllib.request
+from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
+
+from resources import StatsSampler, summarize_stats
 
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -86,7 +87,7 @@ class DockerBroker:
         self.client_port: int | None = None
         self.http_port: int | None = None
         self.startup_ns: int | None = None
-        self.stats = StatsSampler(self)
+        self.stats = StatsSampler(self.name)
 
     def start(self) -> None:
         image = subprocess.run(
@@ -179,59 +180,6 @@ class DockerBroker:
         shutil.rmtree(self.data_dir, ignore_errors=True)
 
 
-class StatsSampler:
-    """Capture coarse container resource samples without adding a client dependency."""
-
-    def __init__(self, broker: DockerBroker) -> None:
-        self.broker = broker
-        self.samples: list[dict[str, float]] = []
-        self.stop_event = threading.Event()
-        self.thread = threading.Thread(target=self._run, name="docker-stats", daemon=True)
-
-    def start(self) -> None:
-        self.thread.start()
-
-    def close(self) -> None:
-        self.stop_event.set()
-        if self.thread.ident is not None:
-            self.thread.join(timeout=2)
-
-    def _run(self) -> None:
-        while not self.stop_event.is_set():
-            sample = read_stats(self.broker.name)
-            if sample is not None:
-                self.samples.append(sample)
-            self.stop_event.wait(0.25)
-
-
-def read_stats(container: str) -> dict[str, float] | None:
-    result = subprocess.run(
-        ["docker", "stats", "--no-stream", "--format", "{{json .}}", container],
-        capture_output=True,
-        text=True,
-        check=False,
-    )
-    if result.returncode != 0 or not result.stdout.strip():
-        return None
-    try:
-        raw = json.loads(result.stdout)
-        return {
-            "cpu_percent": float(raw["CPUPerc"].rstrip("%")),
-            "memory_bytes": parse_size(raw["MemUsage"].split(" / ", 1)[0]),
-            "memory_percent": float(raw["MemPerc"].rstrip("%")),
-        }
-    except (KeyError, TypeError, ValueError, json.JSONDecodeError):
-        return None
-
-
-def parse_size(value: str) -> float:
-    match = re.fullmatch(r"\s*([0-9.]+)\s*([KMGT]?i?B)\s*", value)
-    if match is None:
-        return 0.0
-    units = {"B": 1, "KiB": 1024, "MiB": 1024**2, "GiB": 1024**3, "TiB": 1024**4}
-    return float(match.group(1)) * units[match.group(2)]
-
-
 def wait_for_ready(http_port: int) -> None:
     deadline = time.monotonic() + DEFAULT_TIMEOUT_SECONDS
     url = f"http://127.0.0.1:{http_port}/health/ready"
@@ -322,6 +270,17 @@ def new_stream(run_id: str, name: str, size: int) -> str:
     return f"bench_{run_id}_{name}_{size}"
 
 
+def measure_scenario(broker: DockerBroker, operation: Callable[[], dict[str, Any]]) -> dict[str, Any]:
+    token = broker.stats.begin()
+    try:
+        result = operation()
+    except BaseException:
+        broker.stats.end(token)
+        raise
+    result["resource_samples"] = broker.stats.end(token)
+    return result
+
+
 def run_durable_publish(
     broker: DockerBroker, stream: str, payload: str, messages: int, warmup: int
 ) -> dict[str, Any]:
@@ -332,14 +291,17 @@ def run_durable_publish(
         create_stream(client, stream)
         for _ in range(warmup):
             publish(client, stream, payload)
-        latencies: list[int] = []
-        started = time.perf_counter_ns()
-        for _ in range(messages):
-            latencies.append(publish(client, stream, payload))
-        elapsed = time.perf_counter_ns() - started
+        def measured() -> dict[str, Any]:
+            latencies: list[int] = []
+            started = time.perf_counter_ns()
+            for _ in range(messages):
+                latencies.append(publish(client, stream, payload))
+            elapsed = time.perf_counter_ns() - started
+            return metric("durable_publish", latencies, elapsed, message_size=len(payload))
+
+        return measure_scenario(broker, measured)
     finally:
         client.close()
-    return metric("durable_publish", latencies, elapsed, message_size=len(payload))
 
 
 def run_concurrent_publish(
@@ -363,18 +325,21 @@ def run_concurrent_publish(
         finally:
             client.close()
 
-    started = time.perf_counter_ns()
-    with ThreadPoolExecutor(max_workers=concurrency) as executor:
-        futures = [executor.submit(worker, count) for count in per_worker if count]
-        latencies = [latency for future in futures for latency in future.result()]
-    elapsed = time.perf_counter_ns() - started
-    return metric(
-        "concurrent_publish",
-        latencies,
-        elapsed,
-        message_size=len(payload),
-        metadata={"concurrency": concurrency},
-    )
+    def measured() -> dict[str, Any]:
+        started = time.perf_counter_ns()
+        with ThreadPoolExecutor(max_workers=concurrency) as executor:
+            futures = [executor.submit(worker, count) for count in per_worker if count]
+            latencies = [latency for future in futures for latency in future.result()]
+        elapsed = time.perf_counter_ns() - started
+        return metric(
+            "concurrent_publish",
+            latencies,
+            elapsed,
+            message_size=len(payload),
+            metadata={"concurrency": concurrency},
+        )
+
+    return measure_scenario(broker, measured)
 
 
 def run_consume_ack(
@@ -389,24 +354,28 @@ def run_consume_ack(
     producer.close()
 
     consumer = LineClient("127.0.0.1", broker.client_port)
-    latencies: list[int] = []
-    started = time.perf_counter_ns()
-    try:
-        for offset in range(messages):
-            poll_started = time.perf_counter_ns()
-            poll(consumer, stream, "benchmark-consumer", offset)
-            acknowledge(consumer, stream, "benchmark-consumer", offset)
-            latencies.append(time.perf_counter_ns() - poll_started)
-    finally:
-        consumer.close()
-    elapsed = time.perf_counter_ns() - started
-    return metric(
-        "consume_ack",
-        latencies,
-        elapsed,
-        message_size=len(payload),
-        metadata={"publish_setup_excluded": True},
-    )
+
+    def measured() -> dict[str, Any]:
+        latencies: list[int] = []
+        started = time.perf_counter_ns()
+        try:
+            for offset in range(messages):
+                poll_started = time.perf_counter_ns()
+                poll(consumer, stream, "benchmark-consumer", offset)
+                acknowledge(consumer, stream, "benchmark-consumer", offset)
+                latencies.append(time.perf_counter_ns() - poll_started)
+        finally:
+            consumer.close()
+        elapsed = time.perf_counter_ns() - started
+        return metric(
+            "consume_ack",
+            latencies,
+            elapsed,
+            message_size=len(payload),
+            metadata={"publish_setup_excluded": True},
+        )
+
+    return measure_scenario(broker, measured)
 
 
 def run_roundtrip(
@@ -417,20 +386,24 @@ def run_roundtrip(
     producer = LineClient("127.0.0.1", broker.client_port)
     consumer = LineClient("127.0.0.1", broker.client_port)
     create_stream(producer, stream)
-    latencies: list[int] = []
-    started = time.perf_counter_ns()
-    try:
-        for offset in range(messages):
-            roundtrip_started = time.perf_counter_ns()
-            publish(producer, stream, payload)
-            poll(consumer, stream, "roundtrip-consumer", offset)
-            acknowledge(consumer, stream, "roundtrip-consumer", offset)
-            latencies.append(time.perf_counter_ns() - roundtrip_started)
-    finally:
-        producer.close()
-        consumer.close()
-    elapsed = time.perf_counter_ns() - started
-    return metric("publish_consume_ack_roundtrip", latencies, elapsed, message_size=len(payload))
+
+    def measured() -> dict[str, Any]:
+        latencies: list[int] = []
+        started = time.perf_counter_ns()
+        try:
+            for offset in range(messages):
+                roundtrip_started = time.perf_counter_ns()
+                publish(producer, stream, payload)
+                poll(consumer, stream, "roundtrip-consumer", offset)
+                acknowledge(consumer, stream, "roundtrip-consumer", offset)
+                latencies.append(time.perf_counter_ns() - roundtrip_started)
+        finally:
+            producer.close()
+            consumer.close()
+        elapsed = time.perf_counter_ns() - started
+        return metric("publish_consume_ack_roundtrip", latencies, elapsed, message_size=len(payload))
+
+    return measure_scenario(broker, measured)
 
 
 def run_restart_recovery(
@@ -443,20 +416,23 @@ def run_restart_recovery(
     publish(client, stream, payload)
     poll(client, stream, "restart-consumer", 0)
     client.close()
-    restart_ns = broker.restart()
-    recovered = LineClient("127.0.0.1", broker.client_port)
-    try:
-        poll(recovered, stream, "restart-consumer", 0)
-        acknowledge(recovered, stream, "restart-consumer", 0)
-    finally:
-        recovered.close()
-    return {
-        "name": "restart_recovery",
-        "messages": 1,
-        "message_size_bytes": len(payload),
-        "restart_ready_seconds": restart_ns / 1_000_000_000,
-        "metadata": {"unacknowledged_message_redelivered": True},
-    }
+    def measured() -> dict[str, Any]:
+        restart_ns = broker.restart()
+        recovered = LineClient("127.0.0.1", broker.client_port or 0)
+        try:
+            poll(recovered, stream, "restart-consumer", 0)
+            acknowledge(recovered, stream, "restart-consumer", 0)
+        finally:
+            recovered.close()
+        return {
+            "name": "restart_recovery",
+            "messages": 1,
+            "message_size_bytes": len(payload),
+            "restart_ready_seconds": restart_ns / 1_000_000_000,
+            "metadata": {"unacknowledged_message_redelivered": True},
+        }
+
+    return measure_scenario(broker, measured)
 
 
 def build_image(image: str) -> None:
@@ -500,14 +476,7 @@ def parse_args() -> argparse.Namespace:
 
 
 def stats_summary(samples: list[dict[str, float]]) -> dict[str, Any]:
-    if not samples:
-        return {"samples": 0}
-    return {
-        "samples": len(samples),
-        "cpu_percent_max": max(sample["cpu_percent"] for sample in samples),
-        "memory_bytes_max": max(sample["memory_bytes"] for sample in samples),
-        "memory_percent_max": max(sample["memory_percent"] for sample in samples),
-    }
+    return summarize_stats(samples)
 
 
 def main() -> int:
