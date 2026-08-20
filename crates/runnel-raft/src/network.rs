@@ -47,6 +47,7 @@ impl RaftNetworkFactory<TypeConfig> for TcpNetwork {
             target,
             address,
             group_id: self.group_id.clone(),
+            stream: None,
         }
     }
 }
@@ -55,10 +56,11 @@ pub struct TcpConnection {
     target: u64,
     address: Option<String>,
     group_id: String,
+    stream: Option<TcpStream>,
 }
 
 impl TcpConnection {
-    async fn request<Req, Res>(&self, request: Req, ttl: Duration) -> Result<Res, io::Error>
+    async fn request<Req, Res>(&mut self, request: Req, ttl: Duration) -> Result<Res, io::Error>
     where
         Req: Serialize,
         Res: DeserializeOwned,
@@ -69,14 +71,33 @@ impl TcpConnection {
                 format!("node {} has no valid peer address", self.target),
             )
         })?;
-        tokio::time::timeout(ttl, async move {
-            let mut stream = TcpStream::connect(address).await?;
-            stream.set_nodelay(true)?;
+        let stream = self.stream.take();
+        let result = tokio::time::timeout(ttl, async move {
+            let mut stream = match stream {
+                Some(stream) => stream,
+                None => {
+                    let stream = TcpStream::connect(address).await?;
+                    stream.set_nodelay(true)?;
+                    stream
+                }
+            };
             write_frame(&mut stream, &request).await?;
-            read_frame(&mut stream).await
+            let response = read_frame(&mut stream).await?;
+            Ok::<_, io::Error>((stream, response))
         })
-        .await
-        .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "peer RPC timed out"))?
+        .await;
+
+        match result {
+            Ok(Ok((stream, response))) => {
+                self.stream = Some(stream);
+                Ok(response)
+            }
+            Ok(Err(error)) => Err(error),
+            Err(_) => Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "peer RPC timed out",
+            )),
+        }
     }
 }
 
@@ -85,10 +106,11 @@ pub(crate) async fn forward(
     operation: ForwardedOperation,
     timeout: Duration,
 ) -> Result<ForwardedResponse, io::Error> {
-    let connection = TcpConnection {
+    let mut connection = TcpConnection {
         target: 0,
         address: Some(address.to_owned()),
         group_id: METADATA_GROUP_ID.to_owned(),
+        stream: None,
     };
     let response = connection
         .request(PeerRequest::Forward(operation), timeout)
@@ -272,6 +294,7 @@ pub async fn serve(
             }
             accepted = listener.accept() => {
                 let (stream, peer) = accepted?;
+                stream.set_nodelay(true)?;
                 let manager = Arc::clone(&manager);
                 tokio::spawn(async move {
                     if let Err(error) = handle_connection(stream, manager).await {
@@ -287,71 +310,67 @@ async fn handle_connection(
     mut stream: TcpStream,
     manager: Arc<GroupManager>,
 ) -> Result<(), io::Error> {
-    let request: PeerRequest = read_frame(&mut stream).await?;
-    let response = match request {
-        PeerRequest::AppendEntries { group_id, request } => {
-            let Some(group) = resolve_group(&manager, &group_id).await? else {
-                return write_frame(
-                    &mut stream,
-                    &PeerResponse::Error(format!("unknown Raft group '{group_id}'")),
-                )
-                .await;
-            };
-            match group.raft().append_entries(request).await {
-                Ok(response) => PeerResponse::AppendEntries(response),
-                Err(error) => PeerResponse::Error(error.to_string()),
+    loop {
+        let request: PeerRequest = match read_frame(&mut stream).await {
+            Ok(request) => request,
+            Err(error) if error.kind() == io::ErrorKind::UnexpectedEof => return Ok(()),
+            Err(error) => return Err(error),
+        };
+        let response = match request {
+            PeerRequest::AppendEntries { group_id, request } => {
+                match resolve_group(&manager, &group_id).await? {
+                    Some(group) => match group.raft().append_entries(request).await {
+                        Ok(response) => PeerResponse::AppendEntries(response),
+                        Err(error) => PeerResponse::Error(error.to_string()),
+                    },
+                    None => PeerResponse::Error(format!("unknown Raft group '{group_id}'")),
+                }
             }
-        }
-        PeerRequest::InstallSnapshot { group_id, request } => {
-            let Some(group) = resolve_group(&manager, &group_id).await? else {
-                return write_frame(
-                    &mut stream,
-                    &PeerResponse::Error(format!("unknown Raft group '{group_id}'")),
-                )
-                .await;
-            };
-            group.record_snapshot_chunk(request.data.len() as u64, request.done);
-            match group.raft().install_snapshot(request).await {
-                Ok(response) => PeerResponse::InstallSnapshot(response),
-                Err(error) => PeerResponse::Error(error.to_string()),
+            PeerRequest::InstallSnapshot { group_id, request } => {
+                match resolve_group(&manager, &group_id).await? {
+                    Some(group) => {
+                        group.record_snapshot_chunk(request.data.len() as u64, request.done);
+                        match group.raft().install_snapshot(request).await {
+                            Ok(response) => PeerResponse::InstallSnapshot(response),
+                            Err(error) => PeerResponse::Error(error.to_string()),
+                        }
+                    }
+                    None => PeerResponse::Error(format!("unknown Raft group '{group_id}'")),
+                }
             }
-        }
-        PeerRequest::Vote { group_id, request } => {
-            let Some(group) = resolve_group(&manager, &group_id).await? else {
-                return write_frame(
-                    &mut stream,
-                    &PeerResponse::Error(format!("unknown Raft group '{group_id}'")),
-                )
-                .await;
-            };
-            match group.raft().vote(request).await {
-                Ok(response) => PeerResponse::Vote(response),
-                Err(error) => PeerResponse::Error(error.to_string()),
+            PeerRequest::Vote { group_id, request } => {
+                match resolve_group(&manager, &group_id).await? {
+                    Some(group) => match group.raft().vote(request).await {
+                        Ok(response) => PeerResponse::Vote(response),
+                        Err(error) => PeerResponse::Error(error.to_string()),
+                    },
+                    None => PeerResponse::Error(format!("unknown Raft group '{group_id}'")),
+                }
             }
-        }
-        PeerRequest::Forward(operation) => {
-            PeerResponse::Forward(handle_forwarded(&manager, operation).await)
-        }
-        PeerRequest::EnsureDataGroup {
-            stream,
-            stream_id,
-            group_id,
-        } => match manager
-            .ensure_data_group_local(
-                &stream,
-                &StreamMetadata {
-                    stream_id,
-                    group_id,
-                    lifecycle: crate::StreamLifecycle::Creating,
-                },
-            )
-            .await
-        {
-            Ok(_) => PeerResponse::Ready,
-            Err(error) => PeerResponse::Error(error.to_string()),
-        },
-    };
-    write_frame(&mut stream, &response).await
+            PeerRequest::Forward(operation) => {
+                PeerResponse::Forward(handle_forwarded(&manager, operation).await)
+            }
+            PeerRequest::EnsureDataGroup {
+                stream,
+                stream_id,
+                group_id,
+            } => match manager
+                .ensure_data_group_local(
+                    &stream,
+                    &StreamMetadata {
+                        stream_id,
+                        group_id,
+                        lifecycle: crate::StreamLifecycle::Creating,
+                    },
+                )
+                .await
+            {
+                Ok(_) => PeerResponse::Ready,
+                Err(error) => PeerResponse::Error(error.to_string()),
+            },
+        };
+        write_frame(&mut stream, &response).await?;
+    }
 }
 
 async fn resolve_group(
@@ -429,10 +448,11 @@ pub(crate) async fn ensure_data_group(
     group_id: String,
     timeout: Duration,
 ) -> Result<(), io::Error> {
-    let connection = TcpConnection {
+    let mut connection = TcpConnection {
         target: 0,
         address: Some(address.to_owned()),
         group_id: METADATA_GROUP_ID.to_owned(),
+        stream: None,
     };
     match connection
         .request(
@@ -497,4 +517,157 @@ fn unreachable_snapshot_error(
     error: &io::Error,
 ) -> RPCError<u64, BasicNode, RaftError<u64, openraft::error::InstallSnapshotError>> {
     RPCError::Unreachable(Unreachable::new(error))
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::Instant;
+
+    use super::*;
+
+    struct TestPeer {
+        address: String,
+        connections: Arc<AtomicUsize>,
+        server: tokio::task::JoinHandle<()>,
+    }
+
+    impl TestPeer {
+        async fn start(close_after_requests: Option<usize>) -> Self {
+            Self::start_with_delay(close_after_requests, None).await
+        }
+
+        async fn start_with_delay(
+            close_after_requests: Option<usize>,
+            response_delay: Option<Duration>,
+        ) -> Self {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap().to_string();
+            let connections = Arc::new(AtomicUsize::new(0));
+            let connection_count = Arc::clone(&connections);
+            let server = tokio::spawn(async move {
+                loop {
+                    let Ok((mut stream, _)) = listener.accept().await else {
+                        return;
+                    };
+                    stream.set_nodelay(true).unwrap();
+                    connection_count.fetch_add(1, Ordering::Relaxed);
+                    let mut requests = 0;
+                    loop {
+                        let request = match read_frame::<PeerRequest>(&mut stream).await {
+                            Ok(request) => request,
+                            Err(_) => break,
+                        };
+                        requests += 1;
+                        let response = match request {
+                            PeerRequest::Forward(_) => {
+                                PeerResponse::Forward(ForwardedResponse::CreateStream(Ok(true)))
+                            }
+                            _ => PeerResponse::Error("unexpected test request".to_owned()),
+                        };
+                        if let Some(delay) = response_delay {
+                            tokio::time::sleep(delay).await;
+                        }
+                        if write_frame(&mut stream, &response).await.is_err() {
+                            break;
+                        }
+                        if close_after_requests.is_some_and(|limit| requests >= limit) {
+                            break;
+                        }
+                    }
+                }
+            });
+            Self {
+                address,
+                connections,
+                server,
+            }
+        }
+
+        fn connection(&self) -> TcpConnection {
+            TcpConnection {
+                target: 1,
+                address: Some(self.address.clone()),
+                group_id: "test".to_owned(),
+                stream: None,
+            }
+        }
+    }
+
+    impl Drop for TestPeer {
+        fn drop(&mut self) {
+            self.server.abort();
+        }
+    }
+
+    fn request() -> PeerRequest {
+        PeerRequest::Forward(ForwardedOperation::CreateStream {
+            stream: "test".to_owned(),
+        })
+    }
+
+    #[tokio::test]
+    async fn repeated_requests_reuse_connection() {
+        let peer = TestPeer::start(None).await;
+        let mut connection = peer.connection();
+        let started = Instant::now();
+        for _ in 0..256 {
+            let response: PeerResponse = connection
+                .request(request(), Duration::from_secs(1))
+                .await
+                .unwrap();
+            assert!(matches!(
+                response,
+                PeerResponse::Forward(ForwardedResponse::CreateStream(Ok(true)))
+            ));
+        }
+        eprintln!(
+            "repeated peer requests: connections={}, elapsed={:?}",
+            peer.connections.load(Ordering::Relaxed),
+            started.elapsed()
+        );
+        assert_eq!(peer.connections.load(Ordering::Relaxed), 1);
+    }
+
+    #[tokio::test]
+    async fn failed_persistent_connection_is_replaced_before_next_request() {
+        let peer = TestPeer::start(Some(1)).await;
+        let mut connection = peer.connection();
+
+        connection
+            .request::<_, PeerResponse>(request(), Duration::from_secs(1))
+            .await
+            .unwrap();
+        assert!(
+            connection
+                .request::<_, PeerResponse>(request(), Duration::from_secs(1))
+                .await
+                .is_err()
+        );
+        connection
+            .request::<_, PeerResponse>(request(), Duration::from_secs(1))
+            .await
+            .unwrap();
+
+        assert_eq!(peer.connections.load(Ordering::Relaxed), 2);
+    }
+
+    #[tokio::test]
+    async fn timed_out_request_drops_connection_before_reconnect() {
+        let peer = TestPeer::start_with_delay(None, Some(Duration::from_millis(50))).await;
+        let mut connection = peer.connection();
+
+        let error = connection
+            .request::<_, PeerResponse>(request(), Duration::from_millis(1))
+            .await
+            .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+        connection
+            .request::<_, PeerResponse>(request(), Duration::from_secs(1))
+            .await
+            .unwrap();
+
+        assert_eq!(peer.connections.load(Ordering::Relaxed), 2);
+    }
 }
