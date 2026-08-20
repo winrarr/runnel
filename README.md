@@ -7,16 +7,21 @@ This repository currently provides the first vertical slice:
 - a single-node broker process;
 - durable append-only stream storage;
 - multiple independent durable consumers;
+- shared consumers that distribute work between named members;
 - at-least-once polling and acknowledgements;
+- per-key ordering and stale-delivery rejection for local and clustered shared consumers;
+- retry attempt tracking and optional dead-letter streams in local and clustered grouped delivery;
 - redelivery after acknowledgement timeout or broker restart;
 - health and basic Prometheus-compatible metrics;
 - a small development CLI;
 - an early three-node Multi-Raft development backend with any-node client routing;
 - Docker and Kubernetes starting points.
 
-The workspace also contains `runnel-engine`, the shared semantic engine contract, and `runnel-raft`, an early static Multi-Raft backend. `--engine raft` enables versioned durable Raft/state-machine files, framed TCP peer transport, topology-free client forwarding, and a three-node development cluster. The backend is not yet production-complete: replicated metadata, dynamic membership, security policy, and broader failure semantics remain unfinished.
+The workspace also contains `runnel-engine`, the shared semantic engine contract, and `runnel-raft`, an early static Multi-Raft backend. `--engine raft` enables versioned durable Raft/state-machine files, framed TCP peer transport, topology-free client forwarding, replicated shared-consumer ownership, clustered attempt limits and dead-letter streams, and a three-node development cluster. The backend is not yet production-complete: dynamic membership, scalable placement, backoff and dead-letter provenance, security policy, and broader failure semantics remain unfinished.
 
-Consumer groups, retention, batching, compression, authentication, TLS, and clustering are planned product work. The current line-delimited JSON protocol is a development protocol and is not yet a compatibility promise.
+The workspace includes a reusable runnel-test-support crate containing storage- and topology-independent assertions for the Engine contract.
+
+Retention, batching, compression, authentication, and TLS remain planned product work. The current line-delimited JSON protocol is a development protocol and is not yet a compatibility promise. Retry limits and dead-letter streams are broker-wide configuration for local and clustered delivery; the early static Raft backend provides replicated ownership, expiry fencing, and dead-letter recovery without exposing its internal consumer state.
 
 ## Quick start
 
@@ -31,6 +36,11 @@ Use the CLI in another terminal:
     cargo run -p runnel-cli -- consume events worker
     cargo run -p runnel-cli -- ack events worker 0
 
+To share work between local worker processes, use one consumer name and a distinct member name for each worker. The grouped consume response includes a delivery token that must be supplied when acknowledging:
+
+    cargo run -p runnel-cli -- consume jobs workers --member worker-a
+    cargo run -p runnel-cli -- ack jobs workers 0 --member worker-a --delivery-token <token-from-consume>
+
 The broker listens on 127.0.0.1:4222. Health endpoints and metrics listen on 127.0.0.1:8080:
 
     curl http://127.0.0.1:8080/health/live
@@ -38,6 +48,8 @@ The broker listens on 127.0.0.1:4222. Health endpoints and metrics listen on 127
     curl http://127.0.0.1:8080/metrics
 
 To demonstrate restart recovery, publish a message, consume it without acknowledging, stop and restart the broker with the same data directory, then consume with the same consumer name. The message is delivered again because the checkpoint did not advance.
+
+When max-delivery-attempts is set, a message that reaches the limit is copied to the stream's .dead-letter stream with its key and payload preserved. The acknowledgement timeout controls when the next attempt becomes eligible. The clustered path commits the dead-letter record and source progress in the same replicated data-group operation; the local path remains at least once across the source checkpoint and dead-letter log, so operators should tolerate duplicate dead-letter records after a local crash.
 
 ## Development
 
@@ -50,9 +62,15 @@ Useful workflows:
 
     just run
     just smoke
+    just isolated
+    just isolated cluster-test
+    just isolated bench-container-smoke
     just cluster-test
     just bench
     just bench-container
+    just bench-cluster
+    just profile-cluster
+    just profile-cluster-instrumented
     just bench-compare
     just bench-dashboard
     just bench-test
@@ -60,9 +78,15 @@ Useful workflows:
 
 The existing scripts/verify.sh command remains as a thin compatibility wrapper around just verify.
 
+When multiple local processes, containers, or test suites need to run at the same time, use `just isolated <workflow>`. Each invocation gets its own Cargo target directory, temporary-file directory, benchmark artifact directory, and workflow-specific Docker resources. The supported workflows are listed by `python3 scripts/isolated.py --help`; failed runs retain their temporary state for diagnosis, while successful build state is removed and benchmark results remain under `benchmark-results/isolated/`. This is intentionally a named-workflow interface rather than a wrapper for arbitrary commands whose ports or external state are unknown.
+
 The test suite includes core persistence and recovery tests, wire-format round-trip tests, and a network-level test that starts the real broker process and verifies acknowledgement state across restart. `just smoke` is the canonical local end-to-end test: it starts the broker itself and uses `runnelctl` to publish, consume, acknowledge, restart, and verify recovery. The benchmark suite measures durable publish and publish/poll/ack paths; benchmark results must always be interpreted with their durability settings and workload. See [docs/testing.md](docs/testing.md) for the interactive walkthrough and test layers.
 
 `just bench-container` builds a resource-limited Runnel container and runs repeatable end-to-end workload scenarios for 100-byte and 1-KiB messages. It writes machine-readable results under the ignored `benchmark-results/` directory. See [scripts/benchmarks/README.md](scripts/benchmarks/README.md) for workload semantics and comparison limitations.
+
+`just bench-cluster` builds the release broker and runs durable publish, non-grouped delivery, shared-consumer delivery, and restart-recovery scenarios against a real three-node cluster. `just profile-cluster` captures optional Linux `perf` call graphs for the broker processes under sustained traffic. Both workflows write ignored artifacts under `benchmark-results/`; profiling requires suitable Linux kernel permissions.
+
+`just profile-cluster-instrumented` enables the opt-in Rust timing feature and records stage timing summaries for protocol handling, lock waits, storage, Raft quorum operations, state-machine application, and peer RPCs. The default build does not compile these timing calls. It is useful on hosts where `perf` is unavailable or restricted; combine `--features instrumentation` with the normal profile command when both internal timings and `perf` are available.
 
 `just bench-compare` builds Runnel and runs an isolated first-pass native-tool comparison against pinned Kafka, Redpanda, and NATS JetStream containers. It uses a 2 CPU/2 GiB broker and client budget by default because Redpanda's development container needs more than a 1 GiB cgroup. Results are written under the ignored `benchmark-results/` directory and must be read with the recorded measurement boundaries; this is an engineering baseline, not a final apples-to-apples claim. Missing pinned benchmark images are pulled automatically.
 
@@ -73,6 +97,10 @@ The current protocol accepts one JSON request per TCP line. For example:
     {"op":"publish","stream":"events","payload":"hello","request_id":"optional-stable-id"}
     {"op":"poll","stream":"events","consumer":"worker"}
     {"op":"ack","stream":"events","consumer":"worker","offset":0}
+
+Grouped delivery uses `poll_group` and `ack_group` requests with a consumer name, member name, and delivery token. These are provisional development-protocol operations.
+
+Message responses include a delivery attempt while retry state is being tracked. Dead-letter records are available on the source stream's .dead-letter stream and preserve the original key and payload.
 
 See [docs/architecture.md](docs/architecture.md) for the current boundaries, [docs/design/distributed-architecture-options.md](docs/design/distributed-architecture-options.md) for the multi-node alternatives, [docs/design/multi-raft-implementation-plan.md](docs/design/multi-raft-implementation-plan.md) for the proposed first clustered plan, [docs/backlog.md](docs/backlog.md) for intended next outcomes, and [docs/tech-debt.md](docs/tech-debt.md) for known implementation shortcuts. Repository operating guidance lives in AGENTS.md.
 

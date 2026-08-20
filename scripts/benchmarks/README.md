@@ -1,5 +1,21 @@
 # Container benchmarks
 
+## Concurrent local workflows
+
+The benchmark commands are safe to run concurrently through the repository's
+isolation runner:
+
+```text
+just isolated bench-container-smoke
+just isolated bench-cluster-smoke
+```
+
+Each run receives a unique Cargo target directory, temporary directory, output
+directory, and Docker network. Use the normal `just bench-*` commands for
+single-run investigation or authoritative performance measurements; use
+`just isolated bench-*` when the goal is to keep independent development runs
+from sharing local state.
+
 The repeatable local container benchmark is:
 
 ```text
@@ -25,6 +41,42 @@ The result records the image, source revision, host information, resource limits
 This is an end-to-end benchmark of the current development protocol. It is not yet a fair Kafka, Redpanda, or NATS JetStream comparison: those brokers require adapters that express equivalent acknowledgement, replication, ordering, and delivery guarantees. The comparison work belongs in the benchmark backlog. Do not compare raw numbers across brokers until the adapter semantics and environment are recorded in the result.
 
 The short `just bench-container-smoke` recipe is used by CI to verify that the image can start, accept workload traffic under limits, expose metrics, and recover an unacknowledged message. It is a workflow check, not a performance gate.
+
+## Clustered baseline
+
+Run the real three-node clustered baseline with:
+
+```text
+just bench-cluster
+```
+
+The runner builds the release broker, starts three processes with independent durable directories, and exercises the public protocol through multiple nodes. It measures durable publish, non-grouped consume/acknowledge, sequential shared-consumer delivery, parallel shared-consumer delivery, and restart recovery for the selected payload sizes. Each result records the node count, acknowledgement timeout, quorum durability boundary, protocol boundary, workload, throughput, p50/p99/p99.9 latency, aggregate process CPU time, and resident memory samples. Results use the same `backends` shape as the container and comparison runners, so they can be normalized into the existing history dashboard.
+
+For a quick lifecycle check:
+
+```text
+just bench-cluster-smoke
+```
+
+This is not a performance gate. Host scheduling, background processes, filesystem, and kernel state can materially affect the numbers. Keep the host and workload metadata with any result used for comparison.
+
+## Profiling
+
+Capture Linux CPU call-graph samples while the cluster is under a sustained publish/consume/acknowledge workload:
+
+```text
+just profile-cluster
+```
+
+The profile workflow writes one `perf.data` file and one `perf report --stdio` text report per broker process, plus broker logs and a JSON manifest, under `benchmark-results/profile-*/`. Use the reports to distinguish time spent in protocol parsing, serialization, consensus, locks, storage, and scheduling. The workload is deliberately representative rather than a synthetic microbenchmark; change its duration, worker count, payload size, and sampling frequency through the script options when investigating a hypothesis. `perf` permissions and kernel configuration are host prerequisites, so this workflow remains local and optional.
+
+For internal stage timing without `perf`:
+
+```text
+just profile-cluster-instrumented
+```
+
+The `instrumentation` Cargo feature compiles timing guards into the broker and `RUST_LOG=runnel::timing=trace` records their durations in each node's broker log. The workflow summarizes p50, p99, and maximum microseconds for protocol handling, lock waits, storage, quorum operations, state-machine application, and peer RPCs in `profile.json`. Peer RPCs are split into connect, write, and read stages. The profile workload performs one publish, poll, and acknowledgement per completed message, so stage counts can be interpreted alongside the recorded workload count. The normal build has no timing guards, and the timing feature should not be used for uncontaminated performance comparisons.
 
 ## First-pass broker comparison
 

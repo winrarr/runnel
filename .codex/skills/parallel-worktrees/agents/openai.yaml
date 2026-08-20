@@ -1,0 +1,3 @@
+interface:
+  display_name: "Parallel Worktrees"
+  short_description: "Run disjoint worktree tasks safely in parallel"

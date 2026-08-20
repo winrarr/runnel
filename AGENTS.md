@@ -6,14 +6,18 @@ Runnel is a Rust message broker intended to offer durable streams, low operation
 
 - crates/runnel-protocol: provisional line-delimited JSON request and response types. This is the boundary for future language clients.
 - crates/runnel-engine: topology-free broker engine contract and shared messaging outcomes.
+- crates/runnel-test-support: reusable engine-level contract assertions for local and future distributed implementations.
 - crates/runnel-core: local broker engine, append-only durable stream log, consumer checkpoints, acknowledgements, and recovery.
 - crates/runnel-raft: OpenRaft adapter with durable local storage, framed TCP peer transport, and the early static-cluster backend.
 - crates/runnel-server: runnel broker process, TCP protocol server, health endpoints, and Prometheus-compatible metrics.
 - crates/runnel-cli: runnelctl, a small development client for the current protocol.
-- crates/runnel-core/benches: Criterion benchmarks for durable publish and publish/poll/ack paths.
+- crates/runnel-core/benches: Criterion benchmarks for durable publish, legacy publish/poll/ack, and shared-consumer delivery paths.
 - crates/runnel-server/tests: network-level protocol and restart tests.
 - scripts/benchmarks/run.py: resource-limited container benchmark runner with machine-readable results.
+- scripts/benchmarks/cluster.py: real three-node clustered benchmark runner with machine-readable results.
+- scripts/benchmarks/profile.py: optional Linux `perf` workflow for clustered CPU hotspot profiles.
 - scripts/benchmarks/compare.py: first-pass native-tool comparison runner for Runnel, Kafka, Redpanda, and JetStream.
+- scripts/isolated.py: canonical isolated workflow runner for concurrent local tests and benchmarks.
 - scripts/benchmarks/normalize.py: strips raw tool output and adds provenance for durable benchmark history.
 - scripts/benchmarks/build_history.py: aggregates normalized benchmark runs into generated history data.
 - docs/benchmarks/: hand-authored static benchmark dashboard served by GitHub Pages.
@@ -28,14 +32,15 @@ Runnel is a Rust message broker intended to offer durable streams, low operation
 - justfile: canonical Linux development command interface.
 - scripts/smoke.sh: repeatable broker/CLI/restart smoke test.
 - scripts/verify.sh: compatibility wrapper around just verify.
+- .codex/skills/parallel-worktrees/SKILL.md: repository workflow for disjoint delegated work, isolated tests, and benchmark resource separation.
 
 ## Sources of truth and boundaries
 
 Rust code and tests define current behavior. The wire protocol is intentionally provisional until compatibility policy is decided. Do not expose storage paths, offsets, or physical layout as public concepts beyond what the current protocol already requires.
 
-The semantic engine contract is owned by runnel-engine. The local durable log format is owned by runnel-core. Changes to either require focused tests and a decision record when they affect compatibility, crash behavior, or future engine boundaries. Keep local file I/O and consumer-state persistence inside runnel-core; keep transport concerns in runnel-server and client ergonomics in runnel-cli. Consensus-specific code must stay behind a distributed-engine adapter and must not become part of the public protocol model.
+The semantic engine contract is owned by runnel-engine. Reusable behavior assertions for that contract belong in runnel-test-support and must not depend on storage or topology. The local durable log format is owned by runnel-core. Changes to either require focused tests and a decision record when they affect compatibility, crash behavior, or future engine boundaries. Keep local file I/O and consumer-state persistence inside runnel-core; keep transport concerns in runnel-server and client ergonomics in runnel-cli. Consensus-specific code must stay behind a distributed-engine adapter and must not become part of the public protocol model.
 
-The current implementation serializes broker operations behind one in-process lock. Treat that as a vertical-slice limitation, not as a target performance architecture. Benchmark before replacing it, and preserve the public model while changing internals.
+The current implementation serializes broker operations behind one in-process lock. Treat that as a vertical-slice limitation, not as a target performance architecture. Benchmark before replacing it, and preserve the public model while changing internals. The local and early clustered engines have an initial shared-consumer path with transient members, out-of-order durable acknowledgements, per-key delivery gates, fenced delivery tokens, expiry-based redelivery, persisted attempt limits, and optional dead-letter streams; backoff, provenance, and final policy semantics remain future work.
 
 ## Engineering rules
 
@@ -62,15 +67,22 @@ Run these from the repository root:
 - just ci runs verification, the real broker smoke test, the Docker build, and the container benchmark smoke check.
 - just run starts a local broker with data in ./data.
 - just smoke starts a real broker and uses runnelctl to exercise publish, consume, acknowledgement, restart recovery, readiness, and metrics with temporary state.
+- just isolated runs the default workspace test with a unique Cargo target, temporary directory, and benchmark artifact directory; pass a supported workflow such as `just isolated cluster-test` or `just isolated bench-container-smoke` for concurrent work.
 - just cluster-test starts three real broker processes, exercises quorum replication, follower restart, leader failure, and recovery through the public protocol.
-- just bench runs the Criterion performance benchmarks.
+- just bench runs the Criterion performance benchmarks, including shared-consumer delivery and keyed-ordering baselines.
 - just bench-container builds and benchmarks the broker image with explicit CPU and memory limits.
 - just bench-container-smoke exercises the container benchmark path with a small workload for CI.
+- just bench-cluster runs the real three-node clustered performance baseline.
+- just bench-cluster-smoke exercises the clustered benchmark lifecycle with a small workload.
+- just profile-cluster captures optional Linux `perf` samples and reports for all clustered broker processes.
+- just profile-cluster-instrumented builds the opt-in Rust timing instrumentation and records internal stage timings without requiring `perf` permissions.
 - just bench-compare builds Runnel and runs the documented first-pass comparison against Kafka, Redpanda, and JetStream.
 - just bench-dashboard builds local history data from JSON files under benchmark-results/.
 - just bench-test runs the benchmark normalization and dashboard tests.
 - just audit runs cargo-audit when it is installed.
 - ./scripts/verify.sh is a thin compatibility wrapper for just verify.
+
+Use `just isolated <workflow>` when running process-heavy tests or benchmarks concurrently. The runner owns a unique Cargo target directory, temporary-file directory, benchmark artifact directory, and workflow-specific Docker image or network. It only supports named workflows because arbitrary commands may still bind fixed ports or use external state that the runner cannot identify.
 
 Do not add a second task runner. Keep README commands and CI wired to just recipes. If the command graph changes, update AGENTS.md, README.md, justfile, and .github/workflows/ together.
 
@@ -83,3 +95,5 @@ The required CI path is .github/workflows/ci.yml. It runs the pinned toolchain c
 ## Knowledge routing
 
 Put implementation behavior in code and tests, current boundaries in docs/architecture.md, unsettled alternatives in docs/design/, durable accepted rationale in a dated decision record, external or user-mandated guardrails in docs/constraints.md, intended unfinished outcomes in docs/backlog.md, known implementation shortcuts in docs/tech-debt.md, verification workflows in docs/testing.md, and operational deployment guidance beside its deployment artifact. Put workflow changes in justfile and CI changes in .github/workflows. Remove stale guidance instead of appending exceptions.
+
+When parallel delegated work is authorized, follow .codex/skills/parallel-worktrees/SKILL.md. Keep task ownership disjoint, isolate process and container resources, and treat concurrent performance measurements as exploratory unless CPU, storage, and workload interference are controlled.

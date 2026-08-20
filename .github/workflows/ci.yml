@@ -40,7 +40,7 @@ jobs:
       - uses: taiki-e/install-action@v2.86.3
         with:
           tool: just
-      - run: just smoke
-      - run: just cluster-test
+      - run: just isolated smoke
+      - run: just isolated cluster-test
       - run: just docker-build
-      - run: just bench-container-smoke
+      - run: just isolated bench-container-smoke
