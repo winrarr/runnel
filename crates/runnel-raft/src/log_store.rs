@@ -39,6 +39,16 @@ struct PersistedLog<E> {
     vote: Option<Vote<NodeId>>,
 }
 
+#[derive(Serialize)]
+#[serde(bound(serialize = "E: Serialize"))]
+struct PersistedLogRef<'a, E> {
+    version: u32,
+    last_purged_log_id: Option<LogId<NodeId>>,
+    log: &'a BTreeMap<u64, E>,
+    committed: Option<LogId<NodeId>>,
+    vote: Option<Vote<NodeId>>,
+}
+
 impl<C: RaftTypeConfig> Default for LogStoreInner<C> {
     fn default() -> Self {
         Self {
@@ -107,10 +117,10 @@ where
             return Ok(());
         };
 
-        let persisted = PersistedLog {
+        let persisted = PersistedLogRef {
             version: FORMAT_VERSION,
             last_purged_log_id: inner.last_purged_log_id,
-            log: inner.log.clone(),
+            log: &inner.log,
             committed: inner.committed,
             vote: inner.vote,
         };
