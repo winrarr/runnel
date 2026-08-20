@@ -42,6 +42,36 @@ class ComparisonError(RuntimeError):
     """A benchmark setup or native-tool failure."""
 
 
+def ensure_image(image: str) -> str:
+    """Return a local image ID, pulling the pinned image when necessary."""
+    inspect = subprocess.run(
+        ["docker", "image", "inspect", "--format", "{{.Id}}", image],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    image_id = inspect.stdout.strip()
+    if inspect.returncode == 0 and image_id:
+        return image_id
+
+    try:
+        subprocess.run(["docker", "pull", image], check=True, capture_output=True, text=True)
+    except subprocess.CalledProcessError as error:
+        detail = f"{error.stdout or ''}{error.stderr or ''}"
+        raise ComparisonError(f"could not pull benchmark image {image}:\n{detail}") from error
+
+    inspect = subprocess.run(
+        ["docker", "image", "inspect", "--format", "{{.Id}}", image],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    image_id = inspect.stdout.strip()
+    if inspect.returncode != 0 or not image_id:
+        raise ComparisonError(f"Docker pulled benchmark image {image} but it could not be inspected")
+    return image_id
+
+
 class StatsSampler:
     def __init__(self, container: str) -> None:
         self.container = container
@@ -95,13 +125,7 @@ class Service:
         self.stats = StatsSampler(name)
 
     def start(self) -> None:
-        inspect = subprocess.run(
-            ["docker", "image", "inspect", "--format", "{{.Id}}", self.image],
-            check=True,
-            capture_output=True,
-            text=True,
-        )
-        self.image_id = inspect.stdout.strip()
+        self.image_id = ensure_image(self.image)
         command = [
             "docker",
             "run",
@@ -166,6 +190,7 @@ def run_tool(
     memory: str,
     timeout: int = COMMAND_TIMEOUT,
 ) -> str:
+    ensure_image(image)
     command = [
         "docker",
         "run",
