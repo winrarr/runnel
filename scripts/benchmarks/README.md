@@ -46,3 +46,18 @@ Examples:
 python3 scripts/benchmarks/compare.py --backends kafka,redpanda --messages 1000 --payload-sizes 100 --cpus 2 --memory 2g
 python3 scripts/benchmarks/compare.py --backends nats --messages 10000 --payload-sizes 1024 --cpus 2 --memory 2g
 ```
+
+## History and dashboard
+
+Normalize a comparison result and generate a local dashboard:
+
+```text
+python3 scripts/benchmarks/normalize.py \
+  --input benchmark-results/compare-<timestamp>.json \
+  --output benchmark-results/normalized.json
+python3 scripts/benchmarks/build_site.py \
+  --runs benchmark-results \
+  --output benchmark-results/site
+```
+
+The normalized schema intentionally excludes native tool logs. It retains workload, limits, image identifiers, semantic boundaries, resource samples, source revision, workflow provenance, and measured points. The GitHub workflow stores these normalized records on the generated `benchmark-history` branch and deploys the generated site through GitHub Pages. Local raw Runnel-only and comparison JSON files can also be read by the site generator; invalid or unrelated JSON files are skipped.

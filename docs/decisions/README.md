@@ -13,3 +13,4 @@ Current decisions:
 - 0007-snapshot-based-replica-recovery.md: snapshot-based replacement replica recovery.
 - 0008-container-benchmark-harness.md: resource-limited container benchmarks and comparable-broker adapter boundary.
 - 0009-native-broker-comparison-baseline.md: pinned native-tool comparison as an explicitly provisional baseline.
+- 0010-benchmark-history-pages.md: generated benchmark history and GitHub Pages dashboard.

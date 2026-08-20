@@ -26,7 +26,7 @@ build:
 release:
     cargo build --locked --workspace --release
 
-verify: fmt-check lint test doc-test shellcheck build
+verify: fmt-check lint test doc-test shellcheck bench-test build
 
 run:
     cargo run -p runnel-server -- --data-dir ./data
@@ -48,6 +48,12 @@ bench-container-smoke:
 
 bench-compare:
     python3 scripts/benchmarks/compare.py --build-runnel
+
+bench-dashboard:
+    python3 scripts/benchmarks/build_site.py --runs benchmark-results --output benchmark-results/site
+
+bench-test:
+    python3 -m unittest discover --start-directory scripts/benchmarks --pattern 'test_*.py'
 
 audit:
     command -v cargo-audit >/dev/null || { echo "cargo-audit is required; install it with: cargo install --locked cargo-audit" >&2; exit 1; }

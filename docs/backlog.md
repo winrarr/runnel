@@ -367,11 +367,11 @@ Acceptance criteria:
 - Kafka, Redpanda, and NATS JetStream comparisons document their acknowledgement, replication, and delivery semantics;
 - repeated runs can be compared without manually transcribing results.
 
-### Make performance history visible without making noisy benchmarks a gate
+### Make benchmark history statistically trustworthy without making noisy benchmarks a gate
 
-Goal: retain benchmark results from selected pull requests and scheduled runs so meaningful performance changes can be investigated over time.
+Goal: make historical benchmark trends reliable enough to distinguish meaningful performance changes from runner noise.
 
-Rationale: a benchmark suite becomes more valuable when regressions and improvements can be related to code changes, while noisy shared runners should not block unrelated development.
+Rationale: the repository now has an automatic history and dashboard path, but repeated-run aggregation and variance analysis are still needed before trend changes can be treated as strong evidence.
 
 Constraints:
 
@@ -381,7 +381,7 @@ Constraints:
 
 Acceptance criteria:
 
-- selected benchmark runs publish machine-readable artifacts and a human-readable summary linked to the change;
+- reference profiles repeat measurements and preserve individual samples as well as summaries;
 - scheduled runs provide a stable comparison history for supported workloads;
 - the project can identify genuine regressions separately from runner noise;
 - enabling or changing a performance gate requires an explicit decision based on observed variance.

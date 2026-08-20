@@ -33,13 +33,15 @@ The broker uses `./data` by default, listens on `127.0.0.1:4222`, and serves rea
 
 - `just test` runs workspace unit, integration, and benchmark-target tests.
 - `just doc-test` runs Rust documentation tests.
-- `just verify` runs formatting, Clippy, tests, ShellCheck, and a workspace build.
+- `just verify` runs formatting, Clippy, Rust tests, ShellCheck, benchmark-script tests, and a workspace build.
 - `just smoke` exercises the running process and CLI across a restart.
 - `just cluster-test` starts three real Raft-backed broker processes and verifies quorum replication, follower restart, leader election, post-failure recovery, consensus-log compaction, empty replacement-node snapshot recovery, an interrupted snapshot transfer retry, and recovery metrics through the public protocol.
 - `just bench` runs the Criterion durable publish and publish/poll/ack benchmarks; interpret every result with its durability mode and workload.
 - `just bench-container` builds a Runnel image, applies explicit Docker CPU and memory limits, and runs repeatable end-to-end publish, concurrent publish, consume/acknowledge, round-trip, and restart-recovery scenarios for 100-byte and 1-KiB payloads. Results are written as ignored JSON artifacts under `benchmark-results/` and include resource samples and p50/p99/p99.9 latency where applicable.
 - `just bench-container-smoke` runs the same container path with a small workload for CI. It verifies the benchmark harness and container lifecycle; it is not a performance gate.
 - `just bench-compare` builds Runnel and runs the first-pass native-tool comparison against the pinned Kafka, Redpanda, and NATS JetStream images. It uses isolated single-node, replication-factor-one containers with explicit CPU and memory limits and writes a machine-readable comparison artifact.
+- `just bench-dashboard` generates a local static dashboard from comparison JSON files under `benchmark-results/`.
+- `just bench-test` runs the benchmark normalization and dashboard tests.
 - `just ci` runs verification, the smoke test, the container build, and the container benchmark smoke check.
 
 When a test depends on crash behavior, use a real process and persistent temporary storage. Keep mocks and unit tests for local domain logic, not as substitutes for process, filesystem, or protocol coverage.
@@ -66,3 +68,9 @@ python3 scripts/benchmarks/compare.py \
 ```
 
 The current pinned images are Apache Kafka `4.3.1`, Redpanda `v26.2.1`, NATS Server `2.12.14-alpine`, and `nats-box` `0.19.7`. Redpanda's development image cannot reliably start under the shared 1 GiB default, so the comparison defaults to 2 GiB. The image identifiers and limits are copied into each JSON result.
+
+## Automatic benchmark history
+
+`.github/workflows/benchmarks.yml` runs the comparison for pushes to `main`, weekly scheduled runs, and manual runs. It preserves the raw comparison output as a workflow artifact, normalizes stable measurements with commit and runner provenance, appends the normalized record to the generated `benchmark-history` branch, and deploys a static dashboard through GitHub Pages. The dashboard keeps workload and measurement boundaries visible instead of combining semantically different consumer measurements into one series.
+
+Enable GitHub Pages for the repository by selecting `GitHub Actions` as the publishing source in the repository's Pages settings. The workflow uses the `github-pages` environment and deploys the generated `history/site` directory; it does not commit generated results to `main`.

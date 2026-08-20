@@ -14,6 +14,8 @@ Runnel is a Rust message broker intended to offer durable streams, low operation
 - crates/runnel-server/tests: network-level protocol and restart tests.
 - scripts/benchmarks/run.py: resource-limited container benchmark runner with machine-readable results.
 - scripts/benchmarks/compare.py: first-pass native-tool comparison runner for Runnel, Kafka, Redpanda, and JetStream.
+- scripts/benchmarks/normalize.py: strips raw tool output and adds provenance for durable benchmark history.
+- scripts/benchmarks/build_site.py: generates the dependency-free static benchmark dashboard.
 - scripts/benchmarks/README.md: benchmark scope, semantics, and comparison guidance.
 - docs/architecture.md: current data flow and boundaries.
 - docs/design/: active architecture explorations, alternatives, and proposed implementation plans that are not accepted decisions.
@@ -55,7 +57,7 @@ Linux development uses `just` as the canonical command runner. Install it once w
 
 Run these from the repository root:
 
-- just verify runs formatting, Clippy, all-target tests, documentation tests, ShellCheck, and a workspace build.
+- just verify runs formatting, Clippy, all-target tests, documentation tests, ShellCheck, benchmark-script tests, and a workspace build.
 - just ci runs verification, the real broker smoke test, the Docker build, and the container benchmark smoke check.
 - just run starts a local broker with data in ./data.
 - just smoke starts a real broker and uses runnelctl to exercise publish, consume, acknowledgement, restart recovery, readiness, and metrics with temporary state.
@@ -64,6 +66,8 @@ Run these from the repository root:
 - just bench-container builds and benchmarks the broker image with explicit CPU and memory limits.
 - just bench-container-smoke exercises the container benchmark path with a small workload for CI.
 - just bench-compare builds Runnel and runs the documented first-pass comparison against Kafka, Redpanda, and JetStream.
+- just bench-dashboard builds a local dashboard from JSON files under benchmark-results/.
+- just bench-test runs the benchmark normalization and dashboard tests.
 - just audit runs cargo-audit when it is installed.
 - ./scripts/verify.sh is a thin compatibility wrapper for just verify.
 
@@ -72,6 +76,8 @@ Do not add a second task runner. Keep README commands and CI wired to just recip
 ## Verification and automation
 
 The required CI path is .github/workflows/ci.yml. It runs the pinned toolchain checks, the minimum supported Rust check, the real network integration test, and the container smoke build. .github/workflows/security.yml audits the dependency lockfile on pull requests and weekly. Dependabot keeps Cargo and GitHub Actions dependencies visible for review.
+
+.github/workflows/benchmarks.yml runs the comparison on pushes to main, weekly, and manually. It keeps raw results as workflow artifacts, appends normalized results to the generated benchmark-history branch, and deploys the static dashboard to GitHub Pages. Treat benchmark-history and its site output as generated data; change the scripts and workflow rather than editing that branch manually.
 
 ## Knowledge routing
 

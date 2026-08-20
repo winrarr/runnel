@@ -1,23 +1,110 @@
-name: Cross-broker benchmarks
+name: Benchmark history
 
 on:
+  push:
+    branches: [main]
+  schedule:
+    - cron: "17 3 * * 1"
   workflow_dispatch:
+    inputs:
+      messages:
+        description: Number of messages per benchmark scenario
+        required: false
+        default: "10000"
 
 permissions:
   contents: read
 
+concurrency:
+  group: benchmark-history
+  cancel-in-progress: false
+
 jobs:
-  compare:
-    name: Native broker comparison
+  benchmark:
+    name: Run comparison
     runs-on: ubuntu-24.04
     timeout-minutes: 20
+    env:
+      BENCHMARK_PROFILE: ${{ github.event_name == 'schedule' && 'scheduled' || github.event_name == 'workflow_dispatch' && 'manual' || 'push' }}
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@1.95.0
-      - run: python3 scripts/benchmarks/compare.py --build-runnel --messages 10000 --payload-sizes 100,1024 --cpus 2 --memory 2g
-      - uses: actions/upload-artifact@v4
-        if: always()
+      - name: Run benchmark matrix
+        run: |
+          mkdir -p benchmark-results
+          python3 scripts/benchmarks/compare.py \
+            --build-runnel \
+            --messages "${{ inputs.messages || '10000' }}" \
+            --payload-sizes 100,1024 \
+            --cpus 2 \
+            --memory 2g \
+            --output benchmark-results/compare.json
+      - name: Normalize result for history
+        run: |
+          python3 scripts/benchmarks/normalize.py \
+            --input benchmark-results/compare.json \
+            --output benchmark-results/normalized.json
+      - name: Upload raw and normalized results
+        uses: actions/upload-artifact@v4
         with:
-          name: cross-broker-benchmark-results
-          path: benchmark-results/compare-*.json
-          if-no-files-found: warn
+          name: benchmark-run-${{ github.run_id }}
+          path: benchmark-results/*.json
+          if-no-files-found: error
+
+  publish:
+    name: Update history and Pages
+    needs: benchmark
+    if: needs.benchmark.result == 'success'
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Download benchmark result
+        uses: actions/download-artifact@v4
+        with:
+          name: benchmark-run-${{ github.run_id }}
+          path: benchmark-results
+      - name: Append result and build dashboard
+        env:
+          GITHUB_SHA: ${{ github.sha }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          GITHUB_RUN_ID: ${{ github.run_id }}
+          GITHUB_SERVER_URL: ${{ github.server_url }}
+        run: |
+          set -euo pipefail
+          git fetch origin benchmark-history || true
+          if git show-ref --quiet refs/remotes/origin/benchmark-history; then
+            git worktree add --detach history origin/benchmark-history
+          else
+            git worktree add --detach history
+            git -C history switch --orphan benchmark-history
+            git -C history rm -rf . >/dev/null 2>&1 || true
+            git -C history clean -fdx
+          fi
+          mkdir -p history/runs
+          run_timestamp=$(python3 -c 'import json; print(json.load(open("benchmark-results/normalized.json", encoding="utf-8"))["generated_at"].replace(":", "").replace("+00:00", "Z"))')
+          short_sha="${GITHUB_SHA:0:12}"
+          cp benchmark-results/normalized.json "history/runs/${run_timestamp}-${short_sha}.json"
+          python3 scripts/benchmarks/build_site.py --runs history/runs --output history/site
+          git -C history add runs site
+          git -C history \
+            -c user.name="github-actions[bot]" \
+            -c user.email="41898282+github-actions[bot]@users.noreply.github.com" \
+            commit -m "Record benchmark run ${GITHUB_SHA}" || true
+          git -C history push origin HEAD:benchmark-history
+      - name: Configure GitHub Pages
+        uses: actions/configure-pages@v5
+      - name: Upload Pages artifact
+        uses: actions/upload-pages-artifact@v4
+        with:
+          path: history/site
+      - name: Deploy GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4
