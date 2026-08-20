@@ -1,6 +1,8 @@
 use std::time::Duration;
 
-use criterion::{BatchSize, Criterion, Throughput, black_box, criterion_group, criterion_main};
+use std::hint::black_box;
+
+use criterion::{BatchSize, Criterion, Throughput, criterion_group, criterion_main};
 use runnel_core::{Broker, BrokerConfig, PollResult};
 use tempfile::TempDir;
 
@@ -10,7 +12,10 @@ const PAYLOAD: &[u8] = &[b'x'; 100];
 fn durable_publish(c: &mut Criterion) {
     let mut group = c.benchmark_group("durable_publish");
     group.sample_size(20);
-    group.throughput(Throughput::Elements(MESSAGE_COUNT));
+    group.throughput(Throughput::ElementsAndBytes {
+        elements: MESSAGE_COUNT,
+        bytes: MESSAGE_COUNT * PAYLOAD.len() as u64,
+    });
     group.bench_function("100-byte_messages", |benchmark| {
         benchmark.iter_batched(
             || {
@@ -32,7 +37,10 @@ fn durable_publish(c: &mut Criterion) {
 fn publish_poll_ack(c: &mut Criterion) {
     let mut group = c.benchmark_group("publish_poll_ack");
     group.sample_size(20);
-    group.throughput(Throughput::Elements(MESSAGE_COUNT));
+    group.throughput(Throughput::ElementsAndBytes {
+        elements: MESSAGE_COUNT,
+        bytes: MESSAGE_COUNT * PAYLOAD.len() as u64,
+    });
     group.bench_function("100-byte_messages", |benchmark| {
         benchmark.iter_batched(
             || {

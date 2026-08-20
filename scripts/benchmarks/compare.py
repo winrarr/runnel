@@ -28,7 +28,7 @@ from run import read_stats
 ROOT = Path(__file__).resolve().parents[2]
 KAFKA_IMAGE = "apache/kafka:4.3.1"
 REDPANDA_IMAGE = "docker.redpanda.com/redpandadata/redpanda:v26.2.1"
-NATS_IMAGE = "nats:2.12.14-alpine"
+NATS_IMAGE = "nats:2.14.5-alpine"
 NATS_BOX_IMAGE = "natsio/nats-box:0.19.7"
 DEFAULT_MESSAGES = 10_000
 DEFAULT_CPUS = "2"

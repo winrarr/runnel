@@ -67,7 +67,7 @@ python3 scripts/benchmarks/compare.py \
   --memory 2g
 ```
 
-The current pinned images are Apache Kafka `4.3.1`, Redpanda `v26.2.1`, NATS Server `2.12.14-alpine`, and `nats-box` `0.19.7`. Redpanda's development image cannot reliably start under the shared 1 GiB default, so the comparison defaults to 2 GiB. The image identifiers and limits are copied into each JSON result.
+The current pinned images are Apache Kafka `4.3.1`, Redpanda `v26.2.1`, NATS Server `2.14.5-alpine`, and `nats-box` `0.19.7`. Redpanda's development image cannot reliably start under the shared 1 GiB default, so the comparison defaults to 2 GiB. The image identifiers and limits are copied into each JSON result.
 
 ## Automatic benchmark history
 
