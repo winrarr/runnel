@@ -66,7 +66,7 @@ start_server() {
 assert_contains() {
     local output=$1
     local pattern=$2
-    printf '%s' "$output" | rg -q "$pattern"
+    printf '%s' "$output" | grep -Eq "$pattern"
 }
 
 trap cleanup EXIT INT TERM
@@ -96,6 +96,6 @@ output=$("$PWD/target/debug/runnelctl" --server "$broker_addr" consume events re
 assert_contains "$output" '"offset": 1'
 "$PWD/target/debug/runnelctl" --server "$broker_addr" ack events recovery-worker 1
 curl -fsS "http://127.0.0.1:$http_port/health/ready" >/dev/null
-curl -fsS "http://127.0.0.1:$http_port/metrics" | rg -q 'runnel_streams 1'
+curl -fsS "http://127.0.0.1:$http_port/metrics" | grep -Eq 'runnel_streams 1'
 
 printf '%s\n' 'Runnel smoke test passed'

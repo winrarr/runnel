@@ -67,10 +67,10 @@ python3 scripts/benchmarks/compare.py \
   --memory 2g
 ```
 
-The current pinned images are Apache Kafka `4.3.1`, Redpanda `v26.2.1`, NATS Server `2.12.14-alpine`, and `nats-box` `0.19.7`. Redpanda's development image cannot reliably start under the shared 1 GiB default, so the comparison defaults to 2 GiB. The image identifiers and limits are copied into each JSON result.
+The current pinned images are Apache Kafka `4.3.1`, Redpanda `v26.2.1`, NATS Server `2.14.5-alpine`, and `nats-box` `0.19.7`. Redpanda's development image cannot reliably start under the shared 1 GiB default, so the comparison defaults to 2 GiB. The image identifiers and limits are copied into each JSON result.
 
 ## Automatic benchmark history
 
-`.github/workflows/benchmarks.yml` runs the comparison for pushes to `main`, weekly scheduled runs, and manual runs. It preserves the raw comparison output as a workflow artifact, normalizes stable measurements with commit and runner provenance, appends the normalized record to the generated `benchmark-history` branch, and deploys a static dashboard through GitHub Pages. The dashboard keeps workload and measurement boundaries visible instead of combining semantically different consumer measurements into one series.
+`.github/workflows/benchmarks.yml` runs the comparison for pushes to `main`, weekly scheduled runs, and manual runs. It preserves the raw comparison output as a workflow artifact, normalizes stable measurements with commit and runner provenance, and appends the normalized record plus `site/data.json` to the generated `benchmark-history` branch. `.github/workflows/benchmark-pages.yml` publishes only the static dashboard code to the separate `benchmark-pages` branch when the generator changes; the dashboard reads the public history data directly from GitHub.
 
-Enable GitHub Pages for the repository by selecting `GitHub Actions` as the publishing source in the repository's Pages settings. The workflow uses the `github-pages` environment and deploys the generated `history/site` directory; it does not commit generated results to `main`.
+GitHub Pages is configured to publish the root of the `benchmark-pages` branch. The benchmark workflow does not need Pages deployment permissions or a Pages environment. The data branch is generated output; change the benchmark scripts and workflows rather than editing it manually.

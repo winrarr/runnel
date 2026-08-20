@@ -86,7 +86,8 @@ class HistoryTests(unittest.TestCase):
 
         self.assertEqual(len(runs), 1)
         self.assertIn("Runnel benchmark history", rendered)
-        self.assertIn("benchmark-data", rendered)
+        self.assertIn('const dataUrl = "data.json";', rendered)
+        self.assertIn("loadData", rendered)
 
 
 if __name__ == "__main__":

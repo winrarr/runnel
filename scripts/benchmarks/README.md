@@ -36,7 +36,7 @@ just bench-compare
 
 The runner starts each selected broker in isolation on a temporary Docker network, applies the same broker and client CPU/memory limits, creates one stream/topic, publishes 10,000 messages, consumes them, records image identifiers and coarse resource samples, and writes a JSON result under `benchmark-results/compare-<timestamp>.json`. The default payload sizes are 100 bytes and 1 KiB.
 
-The pinned images are Apache Kafka `4.3.1`, Redpanda `v26.2.1`, NATS Server `2.12.14-alpine`, and `nats-box` `0.19.7`. The Runnel image is built by the `just` recipe. Redpanda's development mode needs more than a 1 GiB cgroup, so the shared default is 2 CPUs and 2 GiB; pass `--cpus` and `--memory` to change it.
+The pinned images are Apache Kafka `4.3.1`, Redpanda `v26.2.1`, NATS Server `2.14.5-alpine`, and `nats-box` `0.19.7`. The Runnel image is built by the `just` recipe. Redpanda's development mode needs more than a 1 GiB cgroup, so the shared default is 2 CPUs and 2 GiB; pass `--cpus` and `--memory` to change it.
 
 This is intentionally a first baseline built around native benchmark clients. Runnel and JetStream report durable publish latency; Kafka and Redpanda use Kafka's native producer performance client, whose latency includes its configured client batching, and their native consumer performance client reports fetch throughput without application-level acknowledgement. The JSON records these boundaries. Do not present the output as a final cross-product ranking until a common client workload and equivalent consumer acknowledgement path exist.
 
@@ -60,4 +60,18 @@ python3 scripts/benchmarks/build_site.py \
   --output benchmark-results/site
 ```
 
-The normalized schema intentionally excludes native tool logs. It retains workload, limits, image identifiers, semantic boundaries, resource samples, source revision, workflow provenance, and measured points. The GitHub workflow stores these normalized records on the generated `benchmark-history` branch and deploys the generated site through GitHub Pages. Local raw Runnel-only and comparison JSON files can also be read by the site generator; invalid or unrelated JSON files are skipped.
+The normalized schema intentionally excludes native tool logs. It retains workload, limits, image identifiers, semantic boundaries, resource samples, source revision, workflow provenance, and measured points. The GitHub benchmark workflow stores these normalized records and `site/data.json` on the generated `benchmark-history` branch. GitHub Pages serves the static dashboard from the separate `benchmark-pages` branch; its JavaScript reads the public history data from the raw GitHub URL. Local raw Runnel-only and comparison JSON files can also be read by the site generator; invalid or unrelated JSON files are skipped.
+
+To generate only the static page or only history data:
+
+```text
+python3 scripts/benchmarks/build_site.py \
+  --runs benchmark-results \
+  --output benchmark-results/page \
+  --index-only \
+  --data-url https://raw.githubusercontent.com/winrarr/runnel/benchmark-history/site/data.json
+python3 scripts/benchmarks/build_site.py \
+  --runs benchmark-results \
+  --output benchmark-results/data \
+  --data-only
+```
