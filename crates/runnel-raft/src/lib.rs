@@ -3117,7 +3117,7 @@ mod tests {
             directory.path(),
             peers.clone(),
             true,
-            Duration::from_millis(10),
+            Duration::from_millis(100),
             Some(2),
         )
         .await
@@ -3141,7 +3141,7 @@ mod tests {
                 ..
             })
         ));
-        tokio::time::sleep(Duration::from_millis(20)).await;
+        tokio::time::sleep(Duration::from_millis(250)).await;
         assert!(matches!(
             engine.poll("events", "worker").await.unwrap(),
             PollResult::Message(Message {
@@ -3150,7 +3150,7 @@ mod tests {
                 ..
             })
         ));
-        tokio::time::sleep(Duration::from_millis(20)).await;
+        tokio::time::sleep(Duration::from_millis(250)).await;
         assert_eq!(
             engine.poll("events", "worker").await.unwrap(),
             PollResult::Empty
@@ -3180,7 +3180,7 @@ mod tests {
             directory.path(),
             peers,
             true,
-            Duration::from_millis(10),
+            Duration::from_millis(100),
             Some(2),
         )
         .await
@@ -3208,11 +3208,11 @@ mod tests {
             directory.path(),
             peers,
             true,
-            Duration::from_millis(20),
+            Duration::from_millis(100),
         )
         .await
         .unwrap();
-        runnel_test_support::assert_expired_delivery_is_fenced(&engine, Duration::from_millis(30))
+        runnel_test_support::assert_expired_delivery_is_fenced(&engine, Duration::from_millis(250))
             .await;
     }
 
@@ -3226,7 +3226,7 @@ mod tests {
             directory.path(),
             peers.clone(),
             true,
-            Duration::from_millis(20),
+            Duration::from_millis(100),
         )
         .await
         .unwrap();
@@ -3249,14 +3249,14 @@ mod tests {
         assert_eq!(old_attempt, 1);
         drop(engine);
 
-        tokio::time::sleep(Duration::from_millis(30)).await;
+        tokio::time::sleep(Duration::from_millis(250)).await;
         let reopened = PersistentEngine::open_with_ack_timeout(
             1,
             "runnel-group-restart-test".to_owned(),
             directory.path(),
             peers,
             true,
-            Duration::from_millis(20),
+            Duration::from_millis(100),
         )
         .await
         .unwrap();
@@ -3298,7 +3298,7 @@ mod tests {
             directory.path(),
             peers.clone(),
             true,
-            Duration::from_millis(10),
+            Duration::from_millis(100),
             Some(2),
         )
         .await
@@ -3325,7 +3325,7 @@ mod tests {
                 ..
             })
         ));
-        tokio::time::sleep(Duration::from_millis(20)).await;
+        tokio::time::sleep(Duration::from_millis(250)).await;
         let second = engine
             .poll_group("events", "workers", "member-b")
             .await
@@ -3337,7 +3337,7 @@ mod tests {
                 ..
             })
         ));
-        tokio::time::sleep(Duration::from_millis(20)).await;
+        tokio::time::sleep(Duration::from_millis(250)).await;
         assert_eq!(
             engine
                 .poll_group("events", "workers", "member-c")
@@ -3381,7 +3381,7 @@ mod tests {
             directory.path(),
             peers,
             true,
-            Duration::from_millis(10),
+            Duration::from_millis(100),
             Some(2),
         )
         .await

@@ -857,14 +857,14 @@ mod tests {
         let broker = Broker::open(
             directory.path(),
             BrokerConfig {
-                ack_timeout: Duration::from_millis(10),
+                ack_timeout: Duration::from_millis(100),
                 max_delivery_attempts: None,
             },
         )
         .unwrap();
         broker.publish("events", None, b"payload".to_vec()).unwrap();
         let (offset, old_token) = delivery(broker.poll_group("events", "workers", "a"));
-        std::thread::sleep(Duration::from_millis(20));
+        std::thread::sleep(Duration::from_millis(250));
         let (_, new_token) = delivery(broker.poll_group("events", "workers", "b"));
 
         assert!(matches!(
@@ -883,7 +883,7 @@ mod tests {
     fn delivery_attempts_are_durable_and_dead_letter_after_limit() {
         let directory = tempdir().unwrap();
         let config = BrokerConfig {
-            ack_timeout: Duration::from_millis(10),
+            ack_timeout: Duration::from_millis(100),
             max_delivery_attempts: Some(2),
         };
         let broker = Broker::open(directory.path(), config.clone()).unwrap();
@@ -898,7 +898,7 @@ mod tests {
                 ..
             })
         ));
-        std::thread::sleep(Duration::from_millis(20));
+        std::thread::sleep(Duration::from_millis(250));
         assert!(matches!(
             broker.poll("events", "worker").unwrap(),
             PollResult::Message(Message {
@@ -906,7 +906,7 @@ mod tests {
                 ..
             })
         ));
-        std::thread::sleep(Duration::from_millis(20));
+        std::thread::sleep(Duration::from_millis(250));
 
         assert_eq!(broker.poll("events", "worker").unwrap(), PollResult::Empty);
         assert_eq!(
@@ -929,7 +929,7 @@ mod tests {
                 ..
             }) if key == "order-1" && payload == b"poison"
         ));
-        std::thread::sleep(Duration::from_millis(20));
+        std::thread::sleep(Duration::from_millis(250));
         assert!(matches!(
             broker.poll("events.dead-letter", "inspector").unwrap(),
             PollResult::Message(Message {
@@ -999,7 +999,7 @@ mod tests {
         let broker = Broker::open(
             directory.path(),
             BrokerConfig {
-                ack_timeout: Duration::from_millis(10),
+                ack_timeout: Duration::from_millis(100),
                 max_delivery_attempts: None,
             },
         )
@@ -1009,7 +1009,7 @@ mod tests {
             broker.poll("events", "worker").unwrap(),
             PollResult::Message(Message { offset: 0, .. })
         ));
-        std::thread::sleep(Duration::from_millis(20));
+        std::thread::sleep(Duration::from_millis(250));
         assert!(matches!(
             broker.poll("events", "worker").unwrap(),
             PollResult::Message(Message { offset: 0, .. })
