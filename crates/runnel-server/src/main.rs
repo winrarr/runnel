@@ -10,6 +10,8 @@ use axum::routing::get;
 use axum::{Json, Router};
 use clap::{Parser, ValueEnum};
 use runnel_core::{Broker, BrokerConfig};
+#[cfg(feature = "instrumentation")]
+use runnel_engine::StageTimer;
 use runnel_engine::{AckResult, BrokerError, Engine, PollResult};
 use runnel_protocol::{Request, Response};
 use runnel_raft::{GroupManager, NodeId, PersistentEngine, SnapshotMetricsSnapshot};
@@ -31,6 +33,8 @@ struct Args {
     http_listen: SocketAddr,
     #[arg(long, default_value_t = 30_000)]
     ack_timeout_ms: u64,
+    #[arg(long)]
+    max_delivery_attempts: Option<u32>,
     #[arg(long)]
     node_id: Option<NodeId>,
     #[arg(long)]
@@ -81,6 +85,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 &args.data_dir,
                 BrokerConfig {
                     ack_timeout: Duration::from_millis(args.ack_timeout_ms),
+                    max_delivery_attempts: args.max_delivery_attempts,
                 },
             )?;
             (Arc::new(broker) as Arc<dyn Engine>, None, None)
@@ -97,12 +102,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 return Err(format!("cluster nodes do not contain node {node_id}").into());
             }
             let peer_listener = TcpListener::bind(peer_listen).await?;
-            let raft_engine = PersistentEngine::open(
+            let raft_engine = PersistentEngine::open_with_config(
                 node_id,
                 args.cluster_name.clone(),
                 &args.data_dir,
                 peers,
                 args.bootstrap,
+                Duration::from_millis(args.ack_timeout_ms),
+                args.max_delivery_attempts,
             )
             .await?;
             let manager = raft_engine.manager();
@@ -216,6 +223,8 @@ async fn handle_connection(
     let (reader, mut writer) = stream.into_split();
     let mut lines = BufReader::new(reader).lines();
     while let Some(line) = lines.next_line().await? {
+        #[cfg(feature = "instrumentation")]
+        let _stage_timer = StageTimer::new("server.protocol_round_trip");
         let response = match serde_json::from_str::<Request>(&line) {
             Ok(request) => handle_request(engine.as_ref(), request).await,
             Err(error) => Response::Error {
@@ -231,6 +240,8 @@ async fn handle_connection(
 }
 
 async fn handle_request(engine: &dyn Engine, request: Request) -> Response {
+    #[cfg(feature = "instrumentation")]
+    let _stage_timer = StageTimer::new("server.engine_request");
     let result = match request {
         Request::CreateStream { stream } => engine
             .create_stream(&stream)
@@ -253,20 +264,59 @@ async fn handle_request(engine: &dyn Engine, request: Request) -> Response {
                     PollResult::Message(message) => Response::Message {
                         stream: message.stream,
                         consumer,
+                        member: None,
                         offset: message.offset,
                         key: message.key,
                         payload: String::from_utf8_lossy(&message.payload).into_owned(),
                         published_at_ms: message.published_at_ms,
+                        delivery_token: None,
+                        delivery_attempt: message.delivery_attempt,
                     },
                     PollResult::Empty => Response::Empty { stream, consumer },
                 })
         }
+        Request::PollGroup {
+            stream,
+            consumer,
+            member,
+        } => engine
+            .poll_group(&stream, &consumer, &member)
+            .await
+            .map(|result| match result {
+                PollResult::Message(message) => Response::Message {
+                    stream: message.stream,
+                    consumer,
+                    member: Some(member),
+                    offset: message.offset,
+                    key: message.key,
+                    payload: String::from_utf8_lossy(&message.payload).into_owned(),
+                    published_at_ms: message.published_at_ms,
+                    delivery_token: message.delivery_token,
+                    delivery_attempt: message.delivery_attempt,
+                },
+                PollResult::Empty => Response::Empty { stream, consumer },
+            }),
         Request::Ack {
             stream,
             consumer,
             offset,
         } => engine
             .ack(&stream, &consumer, offset)
+            .await
+            .map(|result| Response::Acknowledged {
+                stream,
+                consumer,
+                offset,
+                already_acknowledged: result == AckResult::AlreadyAcknowledged,
+            }),
+        Request::AckGroup {
+            stream,
+            consumer,
+            member,
+            offset,
+            delivery_token,
+        } => engine
+            .ack_group(&stream, &consumer, &member, offset, &delivery_token)
             .await
             .map(|result| Response::Acknowledged {
                 stream,
@@ -290,11 +340,13 @@ fn error_response(error: &BrokerError) -> Response {
         BrokerError::StreamNotFound(_) => "stream_not_found",
         BrokerError::StreamNotReady(_) => "stream_not_ready",
         BrokerError::AckNotInFlight { .. } => "ack_not_in_flight",
+        BrokerError::StaleDelivery { .. } => "stale_delivery",
         BrokerError::OutOfOrderAck { .. } => "out_of_order_ack",
         BrokerError::CorruptRecord(_) => "corrupt_record",
         BrokerError::Io(_) => "storage_error",
         BrokerError::State(_) => "consumer_state_error",
         BrokerError::LockPoisoned => "internal_error",
+        BrokerError::Configuration(_) => "invalid_configuration",
         BrokerError::NotLeader { .. } => "cluster_error",
         BrokerError::Cluster(_) => "cluster_error",
     };
@@ -361,7 +413,13 @@ async fn metrics(State(state): State<HttpState>) -> (StatusCode, String) {
             };
             (
                 StatusCode::OK,
-                format_metrics(health.streams, health.storage_bytes, snapshot_metrics),
+                format_metrics(
+                    health.streams,
+                    health.storage_bytes,
+                    health.redeliveries,
+                    health.dead_letters,
+                    snapshot_metrics,
+                ),
             )
         }
         Err(error) => {
@@ -374,10 +432,12 @@ async fn metrics(State(state): State<HttpState>) -> (StatusCode, String) {
 fn format_metrics(
     streams: usize,
     storage_bytes: u64,
+    redeliveries: u64,
+    dead_letters: u64,
     snapshot_metrics: SnapshotMetricsSnapshot,
 ) -> String {
     format!(
-        "# TYPE runnel_streams gauge\nrunnel_streams {streams}\n# TYPE runnel_storage_bytes gauge\nrunnel_storage_bytes {storage_bytes}\n# TYPE runnel_snapshot_builds_started_total counter\nrunnel_snapshot_builds_started_total {}\n# TYPE runnel_snapshot_builds_completed_total counter\nrunnel_snapshot_builds_completed_total {}\n# TYPE runnel_snapshot_build_failures_total counter\nrunnel_snapshot_build_failures_total {}\n# TYPE runnel_snapshot_installs_started_total counter\nrunnel_snapshot_installs_started_total {}\n# TYPE runnel_snapshot_installs_completed_total counter\nrunnel_snapshot_installs_completed_total {}\n# TYPE runnel_snapshot_install_failures_total counter\nrunnel_snapshot_install_failures_total {}\n# TYPE runnel_snapshot_install_bytes_total counter\nrunnel_snapshot_install_bytes_total {}\n# TYPE runnel_snapshot_installs_in_progress gauge\nrunnel_snapshot_installs_in_progress {}\n# TYPE runnel_snapshot_transfer_chunks_received_total counter\nrunnel_snapshot_transfer_chunks_received_total {}\n# TYPE runnel_snapshot_transfer_final_chunks_received_total counter\nrunnel_snapshot_transfer_final_chunks_received_total {}\n# TYPE runnel_snapshot_transfer_bytes_received_total counter\nrunnel_snapshot_transfer_bytes_received_total {}\n",
+        "# TYPE runnel_streams gauge\nrunnel_streams {streams}\n# TYPE runnel_storage_bytes gauge\nrunnel_storage_bytes {storage_bytes}\n# TYPE runnel_redeliveries_total counter\nrunnel_redeliveries_total {redeliveries}\n# TYPE runnel_dead_letters_total counter\nrunnel_dead_letters_total {dead_letters}\n# TYPE runnel_snapshot_builds_started_total counter\nrunnel_snapshot_builds_started_total {}\n# TYPE runnel_snapshot_builds_completed_total counter\nrunnel_snapshot_builds_completed_total {}\n# TYPE runnel_snapshot_build_failures_total counter\nrunnel_snapshot_build_failures_total {}\n# TYPE runnel_snapshot_installs_started_total counter\nrunnel_snapshot_installs_started_total {}\n# TYPE runnel_snapshot_installs_completed_total counter\nrunnel_snapshot_installs_completed_total {}\n# TYPE runnel_snapshot_install_failures_total counter\nrunnel_snapshot_install_failures_total {}\n# TYPE runnel_snapshot_install_bytes_total counter\nrunnel_snapshot_install_bytes_total {}\n# TYPE runnel_snapshot_installs_in_progress gauge\nrunnel_snapshot_installs_in_progress {}\n# TYPE runnel_snapshot_transfer_chunks_received_total counter\nrunnel_snapshot_transfer_chunks_received_total {}\n# TYPE runnel_snapshot_transfer_final_chunks_received_total counter\nrunnel_snapshot_transfer_final_chunks_received_total {}\n# TYPE runnel_snapshot_transfer_bytes_received_total counter\nrunnel_snapshot_transfer_bytes_received_total {}\n",
         snapshot_metrics.builds_started,
         snapshot_metrics.builds_completed,
         snapshot_metrics.build_failures,

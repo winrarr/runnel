@@ -12,6 +12,8 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
 
 use crate::NodeId;
+#[cfg(feature = "instrumentation")]
+use runnel_engine::StageTimer;
 
 const FORMAT_VERSION: u32 = 1;
 
@@ -214,6 +216,8 @@ where
         I: IntoIterator<Item = C::Entry> + Send,
         I::IntoIter: Send,
     {
+        #[cfg(feature = "instrumentation")]
+        let _stage_timer = StageTimer::new("raft.log_append");
         let mut inner = self.inner.lock().await;
         for entry in entries {
             inner.log.insert(entry.get_log_id().index, entry);

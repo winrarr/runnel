@@ -30,11 +30,17 @@ enum Command {
     Consume {
         stream: String,
         consumer: String,
+        #[arg(long)]
+        member: Option<String>,
     },
     Ack {
         stream: String,
         consumer: String,
         offset: u64,
+        #[arg(long)]
+        member: Option<String>,
+        #[arg(long)]
+        delivery_token: Option<String>,
     },
     Health,
 }
@@ -55,15 +61,38 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             payload,
             request_id,
         },
-        Command::Consume { stream, consumer } => Request::Poll { stream, consumer },
+        Command::Consume {
+            stream,
+            consumer,
+            member,
+        } => match member {
+            Some(member) => Request::PollGroup {
+                stream,
+                consumer,
+                member,
+            },
+            None => Request::Poll { stream, consumer },
+        },
         Command::Ack {
             stream,
             consumer,
             offset,
-        } => Request::Ack {
-            stream,
-            consumer,
-            offset,
+            member,
+            delivery_token,
+        } => match (member, delivery_token) {
+            (Some(member), Some(delivery_token)) => Request::AckGroup {
+                stream,
+                consumer,
+                member,
+                offset,
+                delivery_token,
+            },
+            (None, None) => Request::Ack {
+                stream,
+                consumer,
+                offset,
+            },
+            _ => return Err("--member and --delivery-token must be provided together".into()),
         },
         Command::Health => Request::Health,
     };

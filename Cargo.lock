@@ -1244,6 +1244,7 @@ version = "0.1.0"
 dependencies = [
  "criterion",
  "runnel-engine",
+ "runnel-test-support",
  "serde",
  "serde_json",
  "tempfile",
@@ -1257,6 +1258,7 @@ dependencies = [
  "serde",
  "serde_json",
  "thiserror 2.0.20",
+ "tracing",
 ]
 
 [[package]]
@@ -1273,6 +1275,7 @@ version = "0.1.0"
 dependencies = [
  "openraft",
  "runnel-engine",
+ "runnel-test-support",
  "serde",
  "serde_json",
  "tempfile",
@@ -1296,6 +1299,14 @@ dependencies = [
  "tokio",
  "tracing",
  "tracing-subscriber",
+]
+
+[[package]]
+name = "runnel-test-support"
+version = "0.1.0"
+dependencies = [
+ "runnel-engine",
+ "tokio",
 ]
 
 [[package]]

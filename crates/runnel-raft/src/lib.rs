@@ -7,7 +7,7 @@
 //! stream has a data group, and public requests are routed to the elected
 //! leader through the internal peer protocol.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::io::Cursor;
 use std::path::{Path, PathBuf};
@@ -26,6 +26,8 @@ use openraft::{
     BasicNode, Config, Entry, EntryPayload, LogId, RaftSnapshotBuilder, RaftTypeConfig,
     SnapshotMeta, SnapshotPolicy, StorageError, StorageIOError, StoredMembership,
 };
+#[cfg(feature = "instrumentation")]
+use runnel_engine::StageTimer;
 use runnel_engine::{AckResult, BrokerError, Engine, EngineFuture, Message, Offset, PollResult};
 use serde::{Deserialize, Serialize};
 use tokio::sync::{Mutex, RwLock};
@@ -64,6 +66,9 @@ const SNAPSHOT_LOGS_TO_KEEP: u64 = 4;
 // Keep individual peer snapshot RPCs bounded; interrupted transfers restart
 // from the beginning in the current in-memory receiver.
 const SNAPSHOT_CHUNK_SIZE: u64 = 64 * 1024;
+const DEFAULT_RAFT_ACK_TIMEOUT: Duration = Duration::from_secs(30);
+const DEAD_LETTER_SUFFIX: &str = ".dead-letter";
+const DEAD_LETTER_HASH_PREFIX: &str = "runnel.dead-letter.";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum Command {
@@ -95,6 +100,23 @@ pub enum Command {
         consumer: String,
         offset: Offset,
     },
+    PollGroup {
+        stream: String,
+        consumer: String,
+        member: String,
+        now_ms: u64,
+        lease_deadline_ms: u64,
+        #[serde(default)]
+        max_delivery_attempts: Option<u32>,
+    },
+    AckGroup {
+        stream: String,
+        consumer: String,
+        member: String,
+        offset: Offset,
+        delivery_token: String,
+        now_ms: u64,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -106,6 +128,11 @@ pub enum CommandResponse {
     Acknowledged,
     AlreadyAcknowledged,
     OutOfOrderAck { expected: Offset, received: Offset },
+    GroupPoll { result: PollResult },
+    GroupAcknowledged,
+    GroupAlreadyAcknowledged,
+    GroupAckNotInFlight { consumer: String, offset: Offset },
+    GroupStaleDelivery { consumer: String, offset: Offset },
     StreamNotFound,
     Noop,
 }
@@ -137,6 +164,44 @@ struct StreamState {
     group_id: String,
     lifecycle: StreamLifecycle,
     messages: Vec<StoredMessage>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct GroupDelivery {
+    member: String,
+    key: Option<String>,
+    delivery_attempt: u32,
+    delivery_token: String,
+    deadline_ms: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+struct GroupConsumerState {
+    committed_offset: Offset,
+    #[serde(default)]
+    acknowledged_offsets: BTreeSet<Offset>,
+    #[serde(default)]
+    delivery_attempts: BTreeMap<Offset, u32>,
+    #[serde(default)]
+    in_flight: BTreeMap<Offset, GroupDelivery>,
+}
+
+struct GroupPollRequest {
+    stream: String,
+    consumer: String,
+    member: String,
+    now_ms: u64,
+    lease_deadline_ms: u64,
+    max_delivery_attempts: Option<u32>,
+}
+
+struct GroupAckRequest {
+    stream: String,
+    consumer: String,
+    member: String,
+    offset: Offset,
+    delivery_token: String,
+    now_ms: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -187,7 +252,13 @@ impl StreamState {
 struct SnapshotState {
     streams: BTreeMap<String, StreamState>,
     consumers: BTreeMap<(String, String), Offset>,
+    #[serde(default)]
+    group_consumers: BTreeMap<(String, String), GroupConsumerState>,
     dedup: BTreeMap<String, BTreeMap<String, Offset>>,
+    #[serde(default)]
+    redeliveries: u64,
+    #[serde(default)]
+    dead_letters: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -205,7 +276,13 @@ struct PersistedState {
     streams: BTreeMap<String, PersistedStreamData>,
     consumers: Vec<PersistedConsumer>,
     #[serde(default)]
+    group_consumers: Vec<PersistedGroupConsumer>,
+    #[serde(default)]
     dedup: BTreeMap<String, BTreeMap<String, Offset>>,
+    #[serde(default)]
+    redeliveries: u64,
+    #[serde(default)]
+    dead_letters: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -215,7 +292,13 @@ struct PersistedSnapshotState {
     streams: BTreeMap<String, PersistedStreamData>,
     consumers: Vec<PersistedConsumer>,
     #[serde(default)]
+    group_consumers: Vec<PersistedGroupConsumer>,
+    #[serde(default)]
     dedup: BTreeMap<String, BTreeMap<String, Offset>>,
+    #[serde(default)]
+    redeliveries: u64,
+    #[serde(default)]
+    dead_letters: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -272,6 +355,13 @@ struct PersistedConsumer {
     stream: String,
     consumer: String,
     offset: Offset,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct PersistedGroupConsumer {
+    stream: String,
+    consumer: String,
+    state: GroupConsumerState,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -369,7 +459,14 @@ impl StateMachineStore {
                         .into_iter()
                         .map(|consumer| ((consumer.stream, consumer.consumer), consumer.offset))
                         .collect(),
+                    group_consumers: persisted
+                        .group_consumers
+                        .into_iter()
+                        .map(|consumer| ((consumer.stream, consumer.consumer), consumer.state))
+                        .collect(),
                     dedup: persisted.dedup,
+                    redeliveries: persisted.redeliveries,
+                    dead_letters: persisted.dead_letters,
                 },
             }
         } else {
@@ -400,6 +497,8 @@ impl StateMachineStore {
     }
 
     fn persist_state(&self, state: &StateMachineData) -> Result<(), StorageError<NodeId>> {
+        #[cfg(feature = "instrumentation")]
+        let _stage_timer = StageTimer::new("raft.state_persist");
         let Some(path) = &self.path else {
             return Ok(());
         };
@@ -423,7 +522,19 @@ impl StateMachineStore {
                     offset: *offset,
                 })
                 .collect(),
+            group_consumers: state
+                .state
+                .group_consumers
+                .iter()
+                .map(|((stream, consumer), state)| PersistedGroupConsumer {
+                    stream: stream.clone(),
+                    consumer: consumer.clone(),
+                    state: state.clone(),
+                })
+                .collect(),
             dedup: state.state.dedup.clone(),
+            redeliveries: state.state.redeliveries,
+            dead_letters: state.state.dead_letters,
         };
         let bytes = serde_json::to_vec(&persisted)
             .map_err(|error| StorageIOError::write_state_machine(&error))?;
@@ -446,6 +557,7 @@ impl StateMachineStore {
         Ok(())
     }
 
+    #[cfg(test)]
     async fn poll(&self, stream: &str, consumer: &str) -> Result<PollResult, BrokerError> {
         let state = self.state.read().await;
         let Some(stream_state) = state.state.streams.get(stream) else {
@@ -471,6 +583,8 @@ impl StateMachineStore {
             key: message.key.clone(),
             payload: message.payload.clone(),
             published_at_ms: message.published_at_ms,
+            delivery_token: None,
+            delivery_attempt: None,
         }))
     }
 
@@ -494,6 +608,19 @@ impl StateMachineStore {
             .map(|(stream, stream_state)| (stream.clone(), stream_state.metadata(stream)))
     }
 
+    async fn dead_letter_source(
+        &self,
+        dead_letter_stream: &str,
+    ) -> Option<(String, StreamMetadata)> {
+        let state = self.state.read().await;
+        state
+            .state
+            .streams
+            .iter()
+            .find(|(stream, _)| dead_letter_stream_name(stream) == dead_letter_stream)
+            .map(|(stream, stream_state)| (stream.clone(), stream_state.metadata(stream)))
+    }
+
     async fn health(&self) -> runnel_engine::HealthSnapshot {
         let state = self.state.read().await;
         let streams = state.state.streams.len();
@@ -510,6 +637,8 @@ impl StateMachineStore {
         runnel_engine::HealthSnapshot {
             streams,
             storage_bytes,
+            redeliveries: state.state.redeliveries,
+            dead_letters: state.state.dead_letters,
         }
     }
 
@@ -591,6 +720,8 @@ impl RaftStateMachine<TypeConfig> for Arc<StateMachineStore> {
         I: IntoIterator<Item = Entry<TypeConfig>> + Send,
         I::IntoIter: Send,
     {
+        #[cfg(feature = "instrumentation")]
+        let _stage_timer = StageTimer::new("raft.state_machine_apply");
         let mut state = self.state.write().await;
         let mut responses = Vec::new();
         for entry in entries {
@@ -601,9 +732,12 @@ impl RaftStateMachine<TypeConfig> for Arc<StateMachineStore> {
                     state.last_membership = StoredMembership::new(Some(entry.log_id), membership);
                     responses.push(CommandResponse::Noop);
                 }
-                EntryPayload::Normal(command) => {
-                    responses.push(apply_command(&mut state.state, command, &self.kind))
-                }
+                EntryPayload::Normal(command) => responses.push(apply_command(
+                    &mut state.state,
+                    command,
+                    &self.kind,
+                    entry.log_id,
+                )),
             }
         }
         if !responses.is_empty() {
@@ -703,7 +837,18 @@ fn persisted_snapshot_state(state: &SnapshotState) -> PersistedSnapshotState {
                 offset: *offset,
             })
             .collect(),
+        group_consumers: state
+            .group_consumers
+            .iter()
+            .map(|((stream, consumer), state)| PersistedGroupConsumer {
+                stream: stream.clone(),
+                consumer: consumer.clone(),
+                state: state.clone(),
+            })
+            .collect(),
         dedup: state.dedup.clone(),
+        redeliveries: state.redeliveries,
+        dead_letters: state.dead_letters,
     }
 }
 
@@ -734,11 +879,23 @@ fn snapshot_state_from_persisted(persisted: PersistedSnapshotState) -> SnapshotS
             .into_iter()
             .map(|consumer| ((consumer.stream, consumer.consumer), consumer.offset))
             .collect(),
+        group_consumers: persisted
+            .group_consumers
+            .into_iter()
+            .map(|consumer| ((consumer.stream, consumer.consumer), consumer.state))
+            .collect(),
         dedup: persisted.dedup,
+        redeliveries: persisted.redeliveries,
+        dead_letters: persisted.dead_letters,
     }
 }
 
-fn apply_command(state: &mut SnapshotState, command: Command, kind: &GroupKind) -> CommandResponse {
+fn apply_command(
+    state: &mut SnapshotState,
+    command: Command,
+    kind: &GroupKind,
+    log_id: LogId<NodeId>,
+) -> CommandResponse {
     match command {
         Command::CreateStream {
             stream,
@@ -878,11 +1035,340 @@ fn apply_command(state: &mut SnapshotState, command: Command, kind: &GroupKind) 
             state.consumers.insert(key, offset + 1);
             CommandResponse::Acknowledged
         }
+        Command::PollGroup {
+            stream,
+            consumer,
+            member,
+            now_ms,
+            lease_deadline_ms,
+            max_delivery_attempts,
+        } => apply_group_poll(
+            state,
+            GroupPollRequest {
+                stream,
+                consumer,
+                member,
+                now_ms,
+                lease_deadline_ms,
+                max_delivery_attempts,
+            },
+            log_id,
+            kind,
+        ),
+        Command::AckGroup {
+            stream,
+            consumer,
+            member,
+            offset,
+            delivery_token,
+            now_ms,
+        } => apply_group_ack(
+            state,
+            GroupAckRequest {
+                stream,
+                consumer,
+                member,
+                offset,
+                delivery_token,
+                now_ms,
+            },
+            kind,
+        ),
+    }
+}
+
+fn apply_group_poll(
+    state: &mut SnapshotState,
+    request: GroupPollRequest,
+    log_id: LogId<NodeId>,
+    kind: &GroupKind,
+) -> CommandResponse {
+    if matches!(kind, GroupKind::Metadata) {
+        return CommandResponse::StreamNotFound;
+    }
+    let GroupPollRequest {
+        stream,
+        consumer,
+        member,
+        now_ms,
+        lease_deadline_ms,
+        max_delivery_attempts,
+    } = request;
+    if !state
+        .streams
+        .get(&stream)
+        .is_some_and(StreamState::is_active)
+    {
+        return CommandResponse::StreamNotFound;
+    }
+
+    let consumer_key = (stream.clone(), consumer.clone());
+    if !state.group_consumers.contains_key(&consumer_key) {
+        let committed_offset = state
+            .consumers
+            .get(&consumer_key)
+            .copied()
+            .unwrap_or_default();
+        state.group_consumers.insert(
+            consumer_key.clone(),
+            GroupConsumerState {
+                committed_offset,
+                ..GroupConsumerState::default()
+            },
+        );
+    }
+    let existing = {
+        let consumer_state = state
+            .group_consumers
+            .entry(consumer_key.clone())
+            .or_default();
+        let expired = consumer_state
+            .in_flight
+            .iter()
+            .filter_map(|(offset, delivery)| (delivery.deadline_ms <= now_ms).then_some(*offset))
+            .collect::<Vec<_>>();
+        for offset in expired {
+            consumer_state.in_flight.remove(&offset);
+        }
+        consumer_state
+            .in_flight
+            .iter()
+            .find(|(_, delivery)| delivery.member == member)
+            .map(|(offset, delivery)| (*offset, delivery.clone()))
+    };
+
+    if let Some((offset, delivery)) = existing {
+        let messages = &state
+            .streams
+            .get(&stream)
+            .expect("stream was checked above")
+            .messages;
+        return group_poll_message(&stream, offset, messages, &delivery);
+    }
+
+    loop {
+        let candidate = {
+            let consumer_state = state
+                .group_consumers
+                .get(&consumer_key)
+                .expect("group consumer state was initialized above");
+            let stream_state = state
+                .streams
+                .get(&stream)
+                .expect("stream was checked above");
+            stream_state
+                .messages
+                .iter()
+                .enumerate()
+                .map(|(offset, message)| (offset as Offset, message))
+                .filter(|(offset, _)| *offset >= consumer_state.committed_offset)
+                .find(|(offset, message)| {
+                    if consumer_state.acknowledged_offsets.contains(offset)
+                        || consumer_state.in_flight.contains_key(offset)
+                    {
+                        return false;
+                    }
+                    message.key.as_ref().is_none_or(|key| {
+                        !consumer_state
+                            .in_flight
+                            .values()
+                            .any(|delivery| delivery.key.as_ref() == Some(key))
+                    })
+                })
+                .map(|(offset, message)| (offset, message.key.clone()))
+        };
+        let Some((offset, key)) = candidate else {
+            return CommandResponse::GroupPoll {
+                result: PollResult::Empty,
+            };
+        };
+
+        let attempts = state
+            .group_consumers
+            .get(&consumer_key)
+            .expect("group consumer state was initialized above")
+            .delivery_attempts
+            .get(&offset)
+            .copied()
+            .unwrap_or_default();
+        if max_delivery_attempts.is_some_and(|max| attempts >= max)
+            && !is_dead_letter_stream(&stream)
+        {
+            let original = state
+                .streams
+                .get(&stream)
+                .and_then(|stream_state| stream_state.messages.get(offset as usize))
+                .cloned()
+                .expect("candidate offset must refer to a stored message");
+            let dead_letter_stream = dead_letter_stream_name(&stream);
+            let (stream_id, group_id) = stream_identity(&dead_letter_stream);
+            state
+                .streams
+                .entry(dead_letter_stream)
+                .or_insert_with(|| StreamState::active(stream_id, group_id))
+                .messages
+                .push(original);
+            acknowledge_group_offset(
+                state
+                    .group_consumers
+                    .get_mut(&consumer_key)
+                    .expect("group consumer state was initialized above"),
+                offset,
+            );
+            state.dead_letters = state.dead_letters.saturating_add(1);
+            continue;
+        }
+
+        let (delivery_attempt, delivery) = {
+            let consumer_state = state
+                .group_consumers
+                .get_mut(&consumer_key)
+                .expect("group consumer state was initialized above");
+            let delivery_attempt = consumer_state
+                .delivery_attempts
+                .entry(offset)
+                .and_modify(|attempt| *attempt = attempt.saturating_add(1))
+                .or_insert(1);
+            let delivery = GroupDelivery {
+                member: member.clone(),
+                key,
+                delivery_attempt: *delivery_attempt,
+                delivery_token: format!("raft-{log_id}"),
+                deadline_ms: lease_deadline_ms,
+            };
+            consumer_state.in_flight.insert(offset, delivery.clone());
+            (*delivery_attempt, delivery)
+        };
+        if delivery_attempt > 1 {
+            state.redeliveries = state.redeliveries.saturating_add(1);
+        }
+        let messages = &state
+            .streams
+            .get(&stream)
+            .expect("stream was checked above")
+            .messages;
+        return group_poll_message(&stream, offset, messages, &delivery);
+    }
+}
+
+fn group_poll_message(
+    stream: &str,
+    offset: Offset,
+    messages: &[StoredMessage],
+    delivery: &GroupDelivery,
+) -> CommandResponse {
+    let Some(message) = messages.get(offset as usize) else {
+        return CommandResponse::StreamNotFound;
+    };
+    CommandResponse::GroupPoll {
+        result: PollResult::Message(Message {
+            stream: stream.to_owned(),
+            offset,
+            key: message.key.clone(),
+            payload: message.payload.clone(),
+            published_at_ms: message.published_at_ms,
+            delivery_token: Some(delivery.delivery_token.clone()),
+            delivery_attempt: Some(delivery.delivery_attempt),
+        }),
+    }
+}
+
+fn apply_group_ack(
+    state: &mut SnapshotState,
+    request: GroupAckRequest,
+    kind: &GroupKind,
+) -> CommandResponse {
+    if matches!(kind, GroupKind::Metadata) {
+        return CommandResponse::StreamNotFound;
+    }
+    let GroupAckRequest {
+        stream,
+        consumer,
+        member,
+        offset,
+        delivery_token,
+        now_ms,
+    } = request;
+    let Some(stream_state) = state.streams.get(&stream) else {
+        return CommandResponse::StreamNotFound;
+    };
+    if !stream_state.is_active() {
+        return CommandResponse::StreamNotFound;
+    }
+
+    let consumer_key = (stream, consumer.clone());
+    let consumer_state = state.group_consumers.entry(consumer_key).or_default();
+    let expired = consumer_state
+        .in_flight
+        .iter()
+        .filter_map(|(offset, delivery)| (delivery.deadline_ms <= now_ms).then_some(*offset))
+        .collect::<Vec<_>>();
+    for expired_offset in expired {
+        consumer_state.in_flight.remove(&expired_offset);
+    }
+
+    if offset < consumer_state.committed_offset
+        || consumer_state.acknowledged_offsets.contains(&offset)
+    {
+        return CommandResponse::GroupAlreadyAcknowledged;
+    }
+    let Some(delivery) = consumer_state.in_flight.get(&offset) else {
+        if delivery_token.is_empty()
+            && member == consumer
+            && offset == consumer_state.committed_offset
+        {
+            acknowledge_group_offset(consumer_state, offset);
+            return CommandResponse::GroupAcknowledged;
+        }
+        return if consumer_state.delivery_attempts.contains_key(&offset) {
+            CommandResponse::GroupStaleDelivery { consumer, offset }
+        } else {
+            CommandResponse::GroupAckNotInFlight { consumer, offset }
+        };
+    };
+    if delivery.member != member
+        || (!delivery_token.is_empty() && delivery.delivery_token != delivery_token)
+    {
+        return CommandResponse::GroupStaleDelivery { consumer, offset };
+    }
+
+    acknowledge_group_offset(consumer_state, offset);
+    CommandResponse::GroupAcknowledged
+}
+
+fn acknowledge_group_offset(consumer_state: &mut GroupConsumerState, offset: Offset) {
+    consumer_state.in_flight.remove(&offset);
+    consumer_state.delivery_attempts.remove(&offset);
+    if offset == consumer_state.committed_offset {
+        consumer_state.committed_offset = consumer_state.committed_offset.saturating_add(1);
+        while consumer_state
+            .acknowledged_offsets
+            .remove(&consumer_state.committed_offset)
+        {
+            consumer_state.committed_offset = consumer_state.committed_offset.saturating_add(1);
+        }
+    } else {
+        consumer_state.acknowledged_offsets.insert(offset);
     }
 }
 
 fn stream_identity(stream: &str) -> (String, String) {
     (format!("stream/{stream}"), format!("group/{stream}/data"))
+}
+
+fn dead_letter_stream_name(stream: &str) -> String {
+    let name = format!("{stream}{DEAD_LETTER_SUFFIX}");
+    if name.len() <= 128 {
+        return name;
+    }
+    let hash = stream.bytes().fold(0xcbf29ce484222325_u64, |hash, byte| {
+        (hash ^ u64::from(byte)).wrapping_mul(0x100000001b3)
+    });
+    format!("{DEAD_LETTER_HASH_PREFIX}{hash:016x}")
+}
+
+fn is_dead_letter_stream(stream: &str) -> bool {
+    stream.ends_with(DEAD_LETTER_SUFFIX) || stream.starts_with(DEAD_LETTER_HASH_PREFIX)
 }
 
 fn legacy_format_version() -> u32 {
@@ -1071,6 +1557,8 @@ impl InMemoryCluster {
                     node_id,
                     raft,
                     state_machine,
+                    ack_timeout: DEFAULT_RAFT_ACK_TIMEOUT,
+                    max_delivery_attempts: None,
                 }),
             );
         }
@@ -1129,6 +1617,8 @@ pub struct RaftGroup {
     node_id: NodeId,
     raft: Raft,
     state_machine: Arc<StateMachineStore>,
+    ack_timeout: Duration,
+    max_delivery_attempts: Option<u32>,
 }
 
 fn map_client_write_error(
@@ -1214,10 +1704,14 @@ impl RaftGroup {
             node_id,
             raft,
             state_machine,
+            ack_timeout: DEFAULT_RAFT_ACK_TIMEOUT,
+            max_delivery_attempts: None,
         })
     }
 
     pub async fn create_stream(&self, stream: String) -> Result<bool, BrokerError> {
+        #[cfg(feature = "instrumentation")]
+        let _stage_timer = StageTimer::new("raft.create_stream");
         let (stream_id, group_id) = stream_identity(&stream);
         let response = self
             .raft
@@ -1281,6 +1775,8 @@ impl RaftGroup {
         published_at_ms: u64,
         request_id: Option<String>,
     ) -> Result<Offset, BrokerError> {
+        #[cfg(feature = "instrumentation")]
+        let _stage_timer = StageTimer::new("raft.publish_quorum");
         let stream_name = stream.clone();
         let response = self
             .raft
@@ -1303,7 +1799,8 @@ impl RaftGroup {
     }
 
     pub async fn poll(&self, stream: &str, consumer: &str) -> Result<PollResult, BrokerError> {
-        self.state_machine.poll(stream, consumer).await
+        self.poll_group(stream.to_owned(), consumer.to_owned(), consumer.to_owned())
+            .await
     }
 
     pub async fn stream_metadata(&self, stream: &str) -> Result<StreamMetadata, BrokerError> {
@@ -1316,30 +1813,78 @@ impl RaftGroup {
         consumer: String,
         offset: Offset,
     ) -> Result<AckResult, BrokerError> {
+        self.ack_group(stream, consumer.clone(), consumer, offset, String::new())
+            .await
+    }
+
+    pub async fn poll_group(
+        &self,
+        stream: String,
+        consumer: String,
+        member: String,
+    ) -> Result<PollResult, BrokerError> {
+        #[cfg(feature = "instrumentation")]
+        let _stage_timer = StageTimer::new("raft.poll_quorum");
+        let now_ms = now_ms();
+        let lease_deadline_ms = now_ms.saturating_add(duration_ms(self.ack_timeout));
         let stream_name = stream.clone();
-        let consumer_name = consumer.clone();
         let response = self
             .raft
-            .client_write(Command::Ack {
+            .client_write(Command::PollGroup {
                 stream,
                 consumer,
-                offset,
+                member,
+                now_ms,
+                lease_deadline_ms,
+                max_delivery_attempts: self.max_delivery_attempts,
             })
             .await
             .map_err(map_client_write_error)?;
         match response.data {
-            CommandResponse::Acknowledged => Ok(AckResult::Acknowledged),
-            CommandResponse::AlreadyAcknowledged => Ok(AckResult::AlreadyAcknowledged),
-            CommandResponse::OutOfOrderAck { expected, received } => {
-                Err(BrokerError::OutOfOrderAck {
-                    consumer: consumer_name,
-                    expected,
-                    received,
-                })
+            CommandResponse::GroupPoll { result } => Ok(result),
+            CommandResponse::StreamNotFound => Err(BrokerError::StreamNotFound(stream_name)),
+            other => Err(BrokerError::Cluster(format!(
+                "unexpected grouped poll response: {other:?}"
+            ))),
+        }
+    }
+
+    pub async fn ack_group(
+        &self,
+        stream: String,
+        consumer: String,
+        member: String,
+        offset: Offset,
+        delivery_token: String,
+    ) -> Result<AckResult, BrokerError> {
+        #[cfg(feature = "instrumentation")]
+        let _stage_timer = StageTimer::new("raft.ack_quorum");
+        let stream_name = stream.clone();
+        let consumer_name = consumer.clone();
+        let response = self
+            .raft
+            .client_write(Command::AckGroup {
+                stream,
+                consumer,
+                member,
+                offset,
+                delivery_token,
+                now_ms: now_ms(),
+            })
+            .await
+            .map_err(map_client_write_error)?;
+        match response.data {
+            CommandResponse::GroupAcknowledged => Ok(AckResult::Acknowledged),
+            CommandResponse::GroupAlreadyAcknowledged => Ok(AckResult::AlreadyAcknowledged),
+            CommandResponse::GroupAckNotInFlight { consumer, offset } => {
+                Err(BrokerError::AckNotInFlight { consumer, offset })
+            }
+            CommandResponse::GroupStaleDelivery { consumer, offset } => {
+                Err(BrokerError::StaleDelivery { consumer, offset })
             }
             CommandResponse::StreamNotFound => Err(BrokerError::StreamNotFound(stream_name)),
             other => Err(BrokerError::Cluster(format!(
-                "unexpected ack response: {other:?}"
+                "unexpected grouped acknowledgement response for consumer '{consumer_name}': {other:?}"
             ))),
         }
     }
@@ -1404,6 +1949,19 @@ impl Engine for SingleNodeEngine {
         Box::pin(async move { self.group.poll(stream, consumer).await })
     }
 
+    fn poll_group<'a>(
+        &'a self,
+        stream: &'a str,
+        consumer: &'a str,
+        member: &'a str,
+    ) -> EngineFuture<'a, PollResult> {
+        Box::pin(async move {
+            self.group
+                .poll_group(stream.to_owned(), consumer.to_owned(), member.to_owned())
+                .await
+        })
+    }
+
     fn ack<'a>(
         &'a self,
         stream: &'a str,
@@ -1413,6 +1971,27 @@ impl Engine for SingleNodeEngine {
         Box::pin(async move {
             self.group
                 .ack(stream.to_owned(), consumer.to_owned(), offset)
+                .await
+        })
+    }
+
+    fn ack_group<'a>(
+        &'a self,
+        stream: &'a str,
+        consumer: &'a str,
+        member: &'a str,
+        offset: Offset,
+        delivery_token: &'a str,
+    ) -> EngineFuture<'a, AckResult> {
+        Box::pin(async move {
+            self.group
+                .ack_group(
+                    stream.to_owned(),
+                    consumer.to_owned(),
+                    member.to_owned(),
+                    offset,
+                    delivery_token.to_owned(),
+                )
                 .await
         })
     }
@@ -1434,6 +2013,8 @@ pub struct GroupManager {
     cluster_name: String,
     data_dir: PathBuf,
     peers: BTreeMap<NodeId, String>,
+    ack_timeout: Duration,
+    max_delivery_attempts: Option<u32>,
     groups: RwLock<BTreeMap<String, Arc<RaftGroup>>>,
     creation_lock: Mutex<()>,
 }
@@ -1444,12 +2025,16 @@ impl GroupManager {
         cluster_name: String,
         data_dir: impl AsRef<Path>,
         peers: BTreeMap<NodeId, String>,
+        ack_timeout: Duration,
+        max_delivery_attempts: Option<u32>,
     ) -> Result<Arc<Self>, BrokerError> {
         let manager = Arc::new(Self {
             node_id,
             cluster_name,
             data_dir: data_dir.as_ref().to_path_buf(),
             peers,
+            ack_timeout,
+            max_delivery_attempts,
             groups: RwLock::new(BTreeMap::new()),
             creation_lock: Mutex::new(()),
         });
@@ -1496,6 +2081,8 @@ impl GroupManager {
             node_id: self.node_id,
             raft,
             state_machine,
+            ack_timeout: self.ack_timeout,
+            max_delivery_attempts: self.max_delivery_attempts,
         }))
     }
 
@@ -1622,11 +2209,19 @@ impl GroupManager {
         stream: &str,
     ) -> Result<Arc<RaftGroup>, BrokerError> {
         let metadata_group = self.metadata_group().await;
-        let metadata = metadata_group.stream_metadata(stream).await?;
+        let (group_stream, metadata) = match metadata_group.stream_metadata(stream).await {
+            Ok(metadata) => (stream.to_owned(), metadata),
+            Err(BrokerError::StreamNotFound(_)) => metadata_group
+                .state_machine
+                .dead_letter_source(stream)
+                .await
+                .ok_or_else(|| BrokerError::StreamNotFound(stream.to_owned()))?,
+            Err(error) => return Err(error),
+        };
         if metadata.lifecycle != StreamLifecycle::Active {
             return Err(BrokerError::StreamNotReady(stream.to_owned()));
         }
-        self.ensure_data_group_local(stream, &metadata).await
+        self.ensure_data_group_local(&group_stream, &metadata).await
     }
 
     pub(crate) async fn create_stream_local(&self, stream: String) -> Result<bool, BrokerError> {
@@ -1794,7 +2389,7 @@ impl GroupManager {
     ) -> Result<PollResult, BrokerError> {
         self.data_group_for_stream(stream)
             .await?
-            .poll(stream, consumer)
+            .poll_group(stream.to_owned(), consumer.to_owned(), consumer.to_owned())
             .await
     }
 
@@ -1806,7 +2401,33 @@ impl GroupManager {
     ) -> Result<AckResult, BrokerError> {
         self.data_group_for_stream(&stream)
             .await?
-            .ack(stream, consumer, offset)
+            .ack_group(stream, consumer.clone(), consumer, offset, String::new())
+            .await
+    }
+
+    pub(crate) async fn poll_group_local(
+        &self,
+        stream: &str,
+        consumer: &str,
+        member: &str,
+    ) -> Result<PollResult, BrokerError> {
+        self.data_group_for_stream(stream)
+            .await?
+            .poll_group(stream.to_owned(), consumer.to_owned(), member.to_owned())
+            .await
+    }
+
+    pub(crate) async fn ack_group_local(
+        &self,
+        stream: String,
+        consumer: String,
+        member: String,
+        offset: Offset,
+        delivery_token: String,
+    ) -> Result<AckResult, BrokerError> {
+        self.data_group_for_stream(&stream)
+            .await?
+            .ack_group(stream, consumer, member, offset, delivery_token)
             .await
     }
 
@@ -1820,12 +2441,19 @@ impl GroupManager {
             .cloned()
             .collect::<Vec<_>>();
         let mut storage_bytes = 0;
+        let mut redeliveries = metadata_health.redeliveries;
+        let mut dead_letters = metadata_health.dead_letters;
         for group in groups {
-            storage_bytes += group.health().await.storage_bytes;
+            let health = group.health().await;
+            storage_bytes += health.storage_bytes;
+            redeliveries += health.redeliveries;
+            dead_letters += health.dead_letters;
         }
         runnel_engine::HealthSnapshot {
             streams: metadata_health.streams,
             storage_bytes,
+            redeliveries,
+            dead_letters,
         }
     }
 
@@ -1885,6 +2513,51 @@ impl PersistentEngine {
         peers: BTreeMap<NodeId, String>,
         bootstrap: bool,
     ) -> Result<Self, BrokerError> {
+        Self::open_with_ack_timeout(
+            node_id,
+            cluster_name,
+            data_dir,
+            peers,
+            bootstrap,
+            DEFAULT_RAFT_ACK_TIMEOUT,
+        )
+        .await
+    }
+
+    pub async fn open_with_ack_timeout(
+        node_id: NodeId,
+        cluster_name: String,
+        data_dir: impl AsRef<Path>,
+        peers: BTreeMap<NodeId, String>,
+        bootstrap: bool,
+        ack_timeout: Duration,
+    ) -> Result<Self, BrokerError> {
+        Self::open_with_config(
+            node_id,
+            cluster_name,
+            data_dir,
+            peers,
+            bootstrap,
+            ack_timeout,
+            None,
+        )
+        .await
+    }
+
+    pub async fn open_with_config(
+        node_id: NodeId,
+        cluster_name: String,
+        data_dir: impl AsRef<Path>,
+        peers: BTreeMap<NodeId, String>,
+        bootstrap: bool,
+        ack_timeout: Duration,
+        max_delivery_attempts: Option<u32>,
+    ) -> Result<Self, BrokerError> {
+        if max_delivery_attempts == Some(0) {
+            return Err(BrokerError::Configuration(
+                "max delivery attempts must be greater than zero".to_owned(),
+            ));
+        }
         let data_dir = data_dir.as_ref();
         fs::create_dir_all(data_dir)?;
         if data_dir.join("raft-log.json").exists() || data_dir.join("state-machine").exists() {
@@ -1893,7 +2566,15 @@ impl PersistentEngine {
                     .to_owned(),
             ));
         }
-        let manager = GroupManager::open(node_id, cluster_name, data_dir, peers.clone()).await?;
+        let manager = GroupManager::open(
+            node_id,
+            cluster_name,
+            data_dir,
+            peers.clone(),
+            ack_timeout,
+            max_delivery_attempts,
+        )
+        .await?;
         let metadata_group = manager.metadata_group().await;
 
         if bootstrap && !metadata_group.is_initialized().await? {
@@ -1958,6 +2639,8 @@ impl PersistentEngine {
             network::ForwardedOperation::Publish { stream, .. }
             | network::ForwardedOperation::Poll { stream, .. }
             | network::ForwardedOperation::Ack { stream, .. }
+            | network::ForwardedOperation::PollGroup { stream, .. }
+            | network::ForwardedOperation::AckGroup { stream, .. }
             | network::ForwardedOperation::InitializeDataStream { stream, .. } => Ok(self
                 .manager
                 .data_group_for_stream(stream)
@@ -1974,9 +2657,44 @@ impl PersistentEngine {
         mut leader_id: Option<NodeId>,
     ) -> Result<network::ForwardedResponse, BrokerError> {
         for _ in 0..3 {
-            let target = leader_id
-                .or(self.operation_leader(&operation).await?)
-                .ok_or_else(|| BrokerError::Cluster("cluster has no elected leader".to_owned()))?;
+            let Some(target) = leader_id.or(self.operation_leader(&operation).await?) else {
+                let mut last_error = None;
+                for target in self
+                    .peers
+                    .keys()
+                    .copied()
+                    .filter(|target| *target != self.node_id)
+                {
+                    let Some(address) = self.peers.get(&target) else {
+                        continue;
+                    };
+                    let response =
+                        match network::forward(address, operation.clone(), Duration::from_secs(2))
+                            .await
+                        {
+                            Ok(response) => response,
+                            Err(error) => {
+                                last_error = Some(format!("leader forwarding failed: {error}"));
+                                continue;
+                            }
+                        };
+                    if let Some(next_leader) = forwarded_leader(&response) {
+                        if let Some(next_leader) = next_leader {
+                            leader_id = Some(next_leader);
+                            break;
+                        }
+                        last_error = Some("peer has no elected leader".to_owned());
+                        continue;
+                    }
+                    return Ok(response);
+                }
+                if leader_id.is_none() {
+                    return Err(BrokerError::Cluster(
+                        last_error.unwrap_or_else(|| "cluster has no elected leader".to_owned()),
+                    ));
+                }
+                continue;
+            };
             let address = self.peers.get(&target).ok_or_else(|| {
                 BrokerError::Cluster(format!("leader node {target} has no configured address"))
             })?;
@@ -1985,21 +2703,7 @@ impl PersistentEngine {
                 .map_err(|error| {
                     BrokerError::Cluster(format!("leader forwarding failed: {error}"))
                 })?;
-            let next_leader = match &response {
-                network::ForwardedResponse::CreateStream(Err(
-                    network::ForwardError::NotLeader { leader_id },
-                ))
-                | network::ForwardedResponse::Publish(Err(network::ForwardError::NotLeader {
-                    leader_id,
-                }))
-                | network::ForwardedResponse::Poll(Err(network::ForwardError::NotLeader {
-                    leader_id,
-                }))
-                | network::ForwardedResponse::Ack(Err(network::ForwardError::NotLeader {
-                    leader_id,
-                })) => Some(*leader_id),
-                _ => None,
-            };
+            let next_leader = forwarded_leader(&response);
             if let Some(next_leader) = next_leader {
                 leader_id = next_leader;
                 continue;
@@ -2077,6 +2781,66 @@ impl PersistentEngine {
             )),
         }
     }
+
+    async fn forward_poll_group(
+        &self,
+        stream: String,
+        consumer: String,
+        member: String,
+        leader_id: Option<NodeId>,
+    ) -> Result<PollResult, BrokerError> {
+        match self
+            .forward_operation(
+                network::ForwardedOperation::PollGroup {
+                    stream,
+                    consumer,
+                    member,
+                },
+                leader_id,
+            )
+            .await?
+        {
+            network::ForwardedResponse::PollGroup(result) => {
+                result.map_err(forward_error_to_broker)
+            }
+            _ => Err(BrokerError::Cluster(
+                "leader returned the wrong grouped poll response".to_owned(),
+            )),
+        }
+    }
+
+    async fn forward_ack_group(
+        &self,
+        operation: network::ForwardedOperation,
+        leader_id: Option<NodeId>,
+    ) -> Result<AckResult, BrokerError> {
+        match self.forward_operation(operation, leader_id).await? {
+            network::ForwardedResponse::AckGroup(result) => result.map_err(forward_error_to_broker),
+            _ => Err(BrokerError::Cluster(
+                "leader returned the wrong grouped acknowledgement response".to_owned(),
+            )),
+        }
+    }
+}
+
+fn forwarded_leader(response: &network::ForwardedResponse) -> Option<Option<NodeId>> {
+    match response {
+        network::ForwardedResponse::CreateStream(Err(network::ForwardError::NotLeader {
+            leader_id,
+        }))
+        | network::ForwardedResponse::Publish(Err(network::ForwardError::NotLeader {
+            leader_id,
+        }))
+        | network::ForwardedResponse::Poll(Err(network::ForwardError::NotLeader { leader_id }))
+        | network::ForwardedResponse::Ack(Err(network::ForwardError::NotLeader { leader_id }))
+        | network::ForwardedResponse::PollGroup(Err(network::ForwardError::NotLeader {
+            leader_id,
+        }))
+        | network::ForwardedResponse::AckGroup(Err(network::ForwardError::NotLeader {
+            leader_id,
+        })) => Some(*leader_id),
+        _ => None,
+    }
 }
 
 impl Engine for PersistentEngine {
@@ -2127,16 +2891,38 @@ impl Engine for PersistentEngine {
     fn poll<'a>(&'a self, stream: &'a str, consumer: &'a str) -> EngineFuture<'a, PollResult> {
         Box::pin(async move {
             let data_group = self.manager.data_group_for_stream(stream).await?;
-            let leader_id =
-                data_group.raft().current_leader().await.ok_or_else(|| {
-                    BrokerError::Cluster("cluster has no elected leader".to_owned())
-                })?;
-            if leader_id != self.node_id {
+            let leader_id = data_group.raft().current_leader().await;
+            if leader_id != Some(self.node_id) {
                 return self
-                    .forward_poll(stream.to_owned(), consumer.to_owned(), Some(leader_id))
+                    .forward_poll(stream.to_owned(), consumer.to_owned(), leader_id)
                     .await;
             }
             self.manager.poll_local(stream, consumer).await
+        })
+    }
+
+    fn poll_group<'a>(
+        &'a self,
+        stream: &'a str,
+        consumer: &'a str,
+        member: &'a str,
+    ) -> EngineFuture<'a, PollResult> {
+        Box::pin(async move {
+            let data_group = self.manager.data_group_for_stream(stream).await?;
+            let leader_id = data_group.raft().current_leader().await;
+            if leader_id != Some(self.node_id) {
+                return self
+                    .forward_poll_group(
+                        stream.to_owned(),
+                        consumer.to_owned(),
+                        member.to_owned(),
+                        leader_id,
+                    )
+                    .await;
+            }
+            self.manager
+                .poll_group_local(stream, consumer, member)
+                .await
         })
     }
 
@@ -2160,6 +2946,42 @@ impl Engine for PersistentEngine {
                 Ok(result) => Ok(result),
                 Err(BrokerError::NotLeader { leader_id }) => {
                     self.forward_ack(operation, leader_id).await
+                }
+                Err(error) => Err(error),
+            }
+        })
+    }
+
+    fn ack_group<'a>(
+        &'a self,
+        stream: &'a str,
+        consumer: &'a str,
+        member: &'a str,
+        offset: Offset,
+        delivery_token: &'a str,
+    ) -> EngineFuture<'a, AckResult> {
+        Box::pin(async move {
+            let operation = network::ForwardedOperation::AckGroup {
+                stream: stream.to_owned(),
+                consumer: consumer.to_owned(),
+                member: member.to_owned(),
+                offset,
+                delivery_token: delivery_token.to_owned(),
+            };
+            match self
+                .manager
+                .ack_group_local(
+                    stream.to_owned(),
+                    consumer.to_owned(),
+                    member.to_owned(),
+                    offset,
+                    delivery_token.to_owned(),
+                )
+                .await
+            {
+                Ok(result) => Ok(result),
+                Err(BrokerError::NotLeader { leader_id }) => {
+                    self.forward_ack_group(operation, leader_id).await
                 }
                 Err(error) => Err(error),
             }
@@ -2194,6 +3016,12 @@ impl Engine for PersistentEngine {
 fn forward_error_to_broker(error: network::ForwardError) -> BrokerError {
     match error {
         network::ForwardError::NotLeader { leader_id } => BrokerError::NotLeader { leader_id },
+        network::ForwardError::AckNotInFlight { consumer, offset } => {
+            BrokerError::AckNotInFlight { consumer, offset }
+        }
+        network::ForwardError::StaleDelivery { consumer, offset } => {
+            BrokerError::StaleDelivery { consumer, offset }
+        }
         network::ForwardError::Message(message) => BrokerError::Cluster(message),
     }
 }
@@ -2207,6 +3035,10 @@ fn now_ms() -> u64 {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis() as u64
+}
+
+fn duration_ms(duration: Duration) -> u64 {
+    duration.as_millis().try_into().unwrap_or(u64::MAX)
 }
 
 fn atomic_write(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
@@ -2252,6 +3084,326 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn single_node_raft_implements_shared_delivery_contract() {
+        let engine = SingleNodeEngine::new(1).await.unwrap();
+        runnel_test_support::assert_shared_delivery_contract(&engine).await;
+    }
+
+    #[tokio::test]
+    async fn persistent_raft_implements_shared_delivery_contract() {
+        let directory = tempfile::tempdir().unwrap();
+        let peers = BTreeMap::from([(1, "127.0.0.1:0".to_owned())]);
+        let engine = PersistentEngine::open(
+            1,
+            "runnel-persistent-group-contract-test".to_owned(),
+            directory.path(),
+            peers,
+            true,
+        )
+        .await
+        .unwrap();
+        runnel_test_support::assert_shared_delivery_contract(&engine).await;
+        runnel_test_support::assert_independent_consumers_contract(&engine).await;
+        runnel_test_support::assert_key_ordering_contract(&engine).await;
+    }
+
+    #[tokio::test]
+    async fn persistent_raft_legacy_consumers_use_clustered_retry_policy() {
+        let directory = tempfile::tempdir().unwrap();
+        let peers = BTreeMap::from([(1, "127.0.0.1:0".to_owned())]);
+        let engine = PersistentEngine::open_with_config(
+            1,
+            "runnel-legacy-retry-contract-test".to_owned(),
+            directory.path(),
+            peers.clone(),
+            true,
+            Duration::from_millis(10),
+            Some(2),
+        )
+        .await
+        .unwrap();
+        engine.create_stream("events").await.unwrap();
+        engine
+            .publish(
+                "events",
+                Some("poison".to_owned()),
+                b"dead-letter-me".to_vec(),
+                None,
+            )
+            .await
+            .unwrap();
+
+        assert!(matches!(
+            engine.poll("events", "worker").await.unwrap(),
+            PollResult::Message(Message {
+                offset: 0,
+                delivery_attempt: Some(1),
+                ..
+            })
+        ));
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert!(matches!(
+            engine.poll("events", "worker").await.unwrap(),
+            PollResult::Message(Message {
+                offset: 0,
+                delivery_attempt: Some(2),
+                ..
+            })
+        ));
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert_eq!(
+            engine.poll("events", "worker").await.unwrap(),
+            PollResult::Empty
+        );
+        assert!(matches!(
+            engine.poll("events.dead-letter", "inspector").await.unwrap(),
+            PollResult::Message(Message {
+                offset: 0,
+                payload,
+                delivery_attempt: Some(1),
+                ..
+            }) if payload == b"dead-letter-me"
+        ));
+        assert_eq!(
+            engine
+                .ack("events.dead-letter", "inspector", 0)
+                .await
+                .unwrap(),
+            AckResult::Acknowledged
+        );
+        assert_eq!(engine.health().await.unwrap().dead_letters, 1);
+
+        drop(engine);
+        let reopened = PersistentEngine::open_with_config(
+            1,
+            "runnel-legacy-retry-contract-test".to_owned(),
+            directory.path(),
+            peers,
+            true,
+            Duration::from_millis(10),
+            Some(2),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            reopened.poll("events", "worker").await.unwrap(),
+            PollResult::Empty
+        );
+        assert_eq!(
+            reopened
+                .poll("events.dead-letter", "inspector")
+                .await
+                .unwrap(),
+            PollResult::Empty
+        );
+    }
+
+    #[tokio::test]
+    async fn persistent_raft_fences_expired_group_delivery() {
+        let directory = tempfile::tempdir().unwrap();
+        let peers = BTreeMap::from([(1, "127.0.0.1:0".to_owned())]);
+        let engine = PersistentEngine::open_with_ack_timeout(
+            1,
+            "runnel-group-expiry-test".to_owned(),
+            directory.path(),
+            peers,
+            true,
+            Duration::from_millis(20),
+        )
+        .await
+        .unwrap();
+        runnel_test_support::assert_expired_delivery_is_fenced(&engine, Duration::from_millis(30))
+            .await;
+    }
+
+    #[tokio::test]
+    async fn persistent_raft_recovers_group_delivery_after_restart() {
+        let directory = tempfile::tempdir().unwrap();
+        let peers = BTreeMap::from([(1, "127.0.0.1:0".to_owned())]);
+        let engine = PersistentEngine::open_with_ack_timeout(
+            1,
+            "runnel-group-restart-test".to_owned(),
+            directory.path(),
+            peers.clone(),
+            true,
+            Duration::from_millis(20),
+        )
+        .await
+        .unwrap();
+        engine.create_stream("jobs").await.unwrap();
+        engine
+            .publish("jobs", None, b"recover".to_vec(), None)
+            .await
+            .unwrap();
+        let (old_token, old_attempt) = match engine
+            .poll_group("jobs", "workers", "member-a")
+            .await
+            .unwrap()
+        {
+            PollResult::Message(message) => (
+                message.delivery_token.unwrap(),
+                message.delivery_attempt.unwrap(),
+            ),
+            PollResult::Empty => panic!("expected grouped delivery"),
+        };
+        assert_eq!(old_attempt, 1);
+        drop(engine);
+
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        let reopened = PersistentEngine::open_with_ack_timeout(
+            1,
+            "runnel-group-restart-test".to_owned(),
+            directory.path(),
+            peers,
+            true,
+            Duration::from_millis(20),
+        )
+        .await
+        .unwrap();
+        let (new_token, new_attempt) = match reopened
+            .poll_group("jobs", "workers", "member-b")
+            .await
+            .unwrap()
+        {
+            PollResult::Message(message) => (
+                message.delivery_token.unwrap(),
+                message.delivery_attempt.unwrap(),
+            ),
+            PollResult::Empty => panic!("expected redelivery after restart"),
+        };
+        assert_eq!(new_attempt, 2);
+        assert_ne!(new_token, old_token);
+        assert!(matches!(
+            reopened
+                .ack_group("jobs", "workers", "member-a", 0, &old_token)
+                .await,
+            Err(BrokerError::StaleDelivery { .. })
+        ));
+        assert_eq!(
+            reopened
+                .ack_group("jobs", "workers", "member-b", 0, &new_token)
+                .await
+                .unwrap(),
+            AckResult::Acknowledged
+        );
+    }
+
+    #[tokio::test]
+    async fn persistent_raft_dead_letters_after_the_configured_attempt_limit() {
+        let directory = tempfile::tempdir().unwrap();
+        let peers = BTreeMap::from([(1, "127.0.0.1:0".to_owned())]);
+        let engine = PersistentEngine::open_with_config(
+            1,
+            "runnel-group-dead-letter-test".to_owned(),
+            directory.path(),
+            peers.clone(),
+            true,
+            Duration::from_millis(10),
+            Some(2),
+        )
+        .await
+        .unwrap();
+        engine.create_stream("events").await.unwrap();
+        engine
+            .publish(
+                "events",
+                Some("poison".to_owned()),
+                b"do-not-process".to_vec(),
+                None,
+            )
+            .await
+            .unwrap();
+
+        let first = engine
+            .poll_group("events", "workers", "member-a")
+            .await
+            .unwrap();
+        assert!(matches!(
+            first,
+            PollResult::Message(Message {
+                delivery_attempt: Some(1),
+                ..
+            })
+        ));
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        let second = engine
+            .poll_group("events", "workers", "member-b")
+            .await
+            .unwrap();
+        assert!(matches!(
+            second,
+            PollResult::Message(Message {
+                delivery_attempt: Some(2),
+                ..
+            })
+        ));
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert_eq!(
+            engine
+                .poll_group("events", "workers", "member-c")
+                .await
+                .unwrap(),
+            PollResult::Empty
+        );
+
+        let dead_letter = engine
+            .poll_group("events.dead-letter", "inspector", "member-a")
+            .await
+            .unwrap();
+        let dead_letter_token = match dead_letter {
+            PollResult::Message(message) => {
+                assert_eq!(message.payload, b"do-not-process");
+                assert_eq!(message.key.as_deref(), Some("poison"));
+                assert_eq!(message.delivery_attempt, Some(1));
+                message.delivery_token.unwrap()
+            }
+            PollResult::Empty => panic!("expected dead-letter message"),
+        };
+        assert_eq!(
+            engine
+                .ack_group(
+                    "events.dead-letter",
+                    "inspector",
+                    "member-a",
+                    0,
+                    &dead_letter_token
+                )
+                .await
+                .unwrap(),
+            AckResult::Acknowledged
+        );
+        assert_eq!(engine.health().await.unwrap().dead_letters, 1);
+        drop(engine);
+
+        let reopened = PersistentEngine::open_with_config(
+            1,
+            "runnel-group-dead-letter-test".to_owned(),
+            directory.path(),
+            peers,
+            true,
+            Duration::from_millis(10),
+            Some(2),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            reopened
+                .poll_group("events", "workers", "member-d")
+                .await
+                .unwrap(),
+            PollResult::Empty
+        );
+        assert_eq!(
+            reopened
+                .poll_group("events.dead-letter", "inspector", "member-b")
+                .await
+                .unwrap(),
+            PollResult::Empty
+        );
+        assert_eq!(reopened.health().await.unwrap().dead_letters, 1);
+    }
+
+    #[tokio::test]
     async fn three_node_cluster_replicates_a_committed_message() {
         let cluster = InMemoryCluster::new([1, 2, 3]).await.unwrap();
         let leader = cluster.leader().await.unwrap();
@@ -2269,7 +3421,7 @@ mod tests {
             let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
             loop {
                 if matches!(
-                    node.poll("events", "worker").await.unwrap(),
+                    node.state_machine.poll("events", "worker").await.unwrap(),
                     PollResult::Message(Message { offset: 0, .. })
                 ) {
                     break;
@@ -2492,6 +3644,7 @@ mod tests {
                     group_id: Some("group/events/data".to_owned()),
                 },
                 &GroupKind::Metadata,
+                LogId::default(),
             ),
             CommandResponse::StreamCreated { created: true }
         );
@@ -2506,6 +3659,7 @@ mod tests {
                     stream: "events".to_owned(),
                 },
                 &GroupKind::Metadata,
+                LogId::default(),
             ),
             CommandResponse::StreamActivated { activated: true }
         );
@@ -2528,6 +3682,7 @@ mod tests {
                     stream_id: "stream/events".to_owned(),
                     group_id: "group/events/data".to_owned(),
                 },
+                LogId::default(),
             ),
             CommandResponse::DataStreamInitialized { initialized: true }
         );

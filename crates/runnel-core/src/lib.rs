@@ -1,28 +1,33 @@
-use std::collections::HashMap;
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+#[cfg(feature = "instrumentation")]
+use runnel_engine::StageTimer;
 use runnel_engine::{Engine, EngineFuture};
 use serde::{Deserialize, Serialize};
 
 const MAGIC: &[u8; 4] = b"RNL1";
 const HEADER_LEN: usize = 28;
 const DEFAULT_ACK_TIMEOUT: Duration = Duration::from_secs(30);
+const DEAD_LETTER_SUFFIX: &str = ".dead-letter";
 
 pub use runnel_engine::{AckResult, BrokerError, HealthSnapshot, Message, Offset, PollResult};
 
 #[derive(Debug, Clone)]
 pub struct BrokerConfig {
     pub ack_timeout: Duration,
+    pub max_delivery_attempts: Option<u32>,
 }
 
 impl Default for BrokerConfig {
     fn default() -> Self {
         Self {
             ack_timeout: DEFAULT_ACK_TIMEOUT,
+            max_delivery_attempts: None,
         }
     }
 }
@@ -35,8 +40,13 @@ pub struct Broker {
 struct BrokerState {
     root: PathBuf,
     streams: HashMap<String, StreamLog>,
-    in_flight: HashMap<ConsumerKey, InFlight>,
+    in_flight: HashMap<DeliveryKey, InFlight>,
     ack_timeout: Duration,
+    max_delivery_attempts: Option<u32>,
+    redeliveries: u64,
+    dead_letters: u64,
+    delivery_epoch: u128,
+    next_delivery_id: u64,
 }
 
 #[derive(Debug, Clone, Hash, PartialEq, Eq)]
@@ -45,9 +55,19 @@ struct ConsumerKey {
     consumer: String,
 }
 
+#[derive(Debug, Clone, Hash, PartialEq, Eq)]
+struct DeliveryKey {
+    consumer: ConsumerKey,
+    offset: Offset,
+}
+
 #[derive(Debug, Clone)]
 struct InFlight {
+    member: String,
     offset: Offset,
+    key: Option<String>,
+    delivery_attempt: u32,
+    delivery_token: String,
     deadline: Instant,
 }
 
@@ -70,10 +90,34 @@ struct ConsumerState {
     stream: String,
     consumer: String,
     committed_offset: Offset,
+    #[serde(default)]
+    acknowledged_offsets: BTreeSet<Offset>,
+    #[serde(default)]
+    delivery_attempts: BTreeMap<Offset, u32>,
+}
+
+impl ConsumerState {
+    fn acknowledge(&mut self, offset: Offset) {
+        self.delivery_attempts.remove(&offset);
+        if offset == self.committed_offset {
+            self.committed_offset += 1;
+            while self.acknowledged_offsets.remove(&self.committed_offset) {
+                self.delivery_attempts.remove(&self.committed_offset);
+                self.committed_offset += 1;
+            }
+        } else {
+            self.acknowledged_offsets.insert(offset);
+        }
+    }
 }
 
 impl Broker {
     pub fn open(root: impl AsRef<Path>, config: BrokerConfig) -> Result<Self, BrokerError> {
+        if config.max_delivery_attempts == Some(0) {
+            return Err(BrokerError::Configuration(
+                "max delivery attempts must be greater than zero".to_owned(),
+            ));
+        }
         let root = root.as_ref().to_path_buf();
         let streams_dir = root.join("streams");
         let consumers_dir = root.join("consumers");
@@ -102,11 +146,18 @@ impl Broker {
                 streams,
                 in_flight: HashMap::new(),
                 ack_timeout: config.ack_timeout,
+                max_delivery_attempts: config.max_delivery_attempts,
+                redeliveries: 0,
+                dead_letters: 0,
+                delivery_epoch: delivery_epoch(),
+                next_delivery_id: 0,
             })),
         })
     }
 
     pub fn create_stream(&self, stream: &str) -> Result<bool, BrokerError> {
+        #[cfg(feature = "instrumentation")]
+        let _stage_timer = StageTimer::new("core.create_stream");
         validate_name("stream", stream)?;
         let mut state = self.lock()?;
         if state.streams.contains_key(stream) {
@@ -125,6 +176,8 @@ impl Broker {
         key: Option<String>,
         payload: Vec<u8>,
     ) -> Result<Offset, BrokerError> {
+        #[cfg(feature = "instrumentation")]
+        let _stage_timer = StageTimer::new("core.publish");
         validate_name("stream", stream)?;
         let mut state = self.lock()?;
         if !state.streams.contains_key(stream) {
@@ -141,49 +194,131 @@ impl Broker {
     }
 
     pub fn poll(&self, stream: &str, consumer: &str) -> Result<PollResult, BrokerError> {
+        self.poll_group(stream, consumer, consumer)
+    }
+
+    pub fn poll_group(
+        &self,
+        stream: &str,
+        consumer: &str,
+        member: &str,
+    ) -> Result<PollResult, BrokerError> {
+        #[cfg(feature = "instrumentation")]
+        let _stage_timer = StageTimer::new("core.poll");
         validate_name("stream", stream)?;
         validate_name("consumer", consumer)?;
+        validate_name("member", member)?;
         let mut state = self.lock()?;
-        let key = ConsumerKey {
+        let consumer_key = ConsumerKey {
             stream: stream.to_owned(),
             consumer: consumer.to_owned(),
         };
         let root = state.root.clone();
+        let now = Instant::now();
+        state
+            .in_flight
+            .retain(|_, in_flight| in_flight.deadline > now);
 
-        let existing = state.in_flight.get(&key).cloned();
+        let existing = state
+            .in_flight
+            .iter()
+            .find(|(delivery_key, in_flight)| {
+                delivery_key.consumer == consumer_key && in_flight.member == member
+            })
+            .map(|(delivery_key, in_flight)| (delivery_key.clone(), in_flight.clone()));
         if let Some(in_flight) = existing {
-            if Instant::now() < in_flight.deadline {
-                let stream_log = state
-                    .streams
-                    .get_mut(stream)
-                    .ok_or_else(|| BrokerError::StreamNotFound(stream.to_owned()))?;
-                return Ok(PollResult::Message(
-                    stream_log.read_message(stream, in_flight.offset)?,
-                ));
+            let stream_log = state
+                .streams
+                .get_mut(stream)
+                .ok_or_else(|| BrokerError::StreamNotFound(stream.to_owned()))?;
+            let mut message = stream_log.read_message(stream, in_flight.1.offset)?;
+            message.delivery_token = Some(in_flight.1.delivery_token);
+            message.delivery_attempt = Some(in_flight.1.delivery_attempt);
+            return Ok(PollResult::Message(message));
+        }
+
+        let mut consumer_state = load_consumer_state(&root, stream, consumer)?;
+        loop {
+            let candidate = state
+                .streams
+                .get(stream)
+                .ok_or_else(|| BrokerError::StreamNotFound(stream.to_owned()))?
+                .records
+                .iter()
+                .filter(|record| record.offset >= consumer_state.committed_offset)
+                .find(|record| {
+                    if consumer_state.acknowledged_offsets.contains(&record.offset) {
+                        return false;
+                    }
+                    if state.in_flight.keys().any(|delivery_key| {
+                        delivery_key.consumer == consumer_key
+                            && delivery_key.offset == record.offset
+                    }) {
+                        return false;
+                    }
+                    record.key.as_ref().is_none_or(|key| {
+                        !state.in_flight.iter().any(|(delivery_key, in_flight)| {
+                            delivery_key.consumer == consumer_key
+                                && in_flight.key.as_ref() == Some(key)
+                        })
+                    })
+                })
+                .cloned();
+            let Some(candidate) = candidate else {
+                return Ok(PollResult::Empty);
+            };
+
+            let attempts = consumer_state
+                .delivery_attempts
+                .get(&candidate.offset)
+                .copied()
+                .unwrap_or(0);
+            if state
+                .max_delivery_attempts
+                .is_some_and(|max_attempts| attempts >= max_attempts)
+                && !stream.ends_with(DEAD_LETTER_SUFFIX)
+            {
+                dead_letter_record(&mut state, stream, &candidate)?;
+                consumer_state.acknowledge(candidate.offset);
+                persist_consumer_state(&root, &consumer_state)?;
+                state.dead_letters += 1;
+                continue;
             }
-            state.in_flight.remove(&key);
-        }
 
-        let consumer_state = load_consumer_state(&root, stream, consumer)?;
-        let stream_log = state
-            .streams
-            .get_mut(stream)
-            .ok_or_else(|| BrokerError::StreamNotFound(stream.to_owned()))?;
-        if consumer_state.committed_offset as usize >= stream_log.records.len() {
-            return Ok(PollResult::Empty);
+            let delivery_attempt = attempts.saturating_add(1);
+            let stream_log = state
+                .streams
+                .get_mut(stream)
+                .ok_or_else(|| BrokerError::StreamNotFound(stream.to_owned()))?;
+            let mut message = stream_log.read_message(stream, candidate.offset)?;
+            let mut next_state = consumer_state;
+            next_state
+                .delivery_attempts
+                .insert(candidate.offset, delivery_attempt);
+            persist_consumer_state(&root, &next_state)?;
+            let delivery_token = next_delivery_token(&mut state);
+            message.delivery_token = Some(delivery_token.clone());
+            message.delivery_attempt = Some(delivery_attempt);
+            if delivery_attempt > 1 {
+                state.redeliveries += 1;
+            }
+            let ack_timeout = state.ack_timeout;
+            state.in_flight.insert(
+                DeliveryKey {
+                    consumer: consumer_key,
+                    offset: candidate.offset,
+                },
+                InFlight {
+                    member: member.to_owned(),
+                    offset: candidate.offset,
+                    key: candidate.key,
+                    delivery_attempt,
+                    delivery_token,
+                    deadline: Instant::now() + ack_timeout,
+                },
+            );
+            return Ok(PollResult::Message(message));
         }
-
-        let offset = consumer_state.committed_offset;
-        let message = stream_log.read_message(stream, offset)?;
-        let ack_timeout = state.ack_timeout;
-        state.in_flight.insert(
-            key,
-            InFlight {
-                offset,
-                deadline: Instant::now() + ack_timeout,
-            },
-        );
-        Ok(PollResult::Message(message))
     }
 
     pub fn ack(
@@ -192,8 +327,22 @@ impl Broker {
         consumer: &str,
         offset: Offset,
     ) -> Result<AckResult, BrokerError> {
+        self.ack_group(stream, consumer, consumer, offset, "")
+    }
+
+    pub fn ack_group(
+        &self,
+        stream: &str,
+        consumer: &str,
+        member: &str,
+        offset: Offset,
+        delivery_token: &str,
+    ) -> Result<AckResult, BrokerError> {
+        #[cfg(feature = "instrumentation")]
+        let _stage_timer = StageTimer::new("core.ack");
         validate_name("stream", stream)?;
         validate_name("consumer", consumer)?;
+        validate_name("member", member)?;
         let mut state = self.lock()?;
         if !state.streams.contains_key(stream) {
             return Err(BrokerError::StreamNotFound(stream.to_owned()));
@@ -204,42 +353,53 @@ impl Broker {
         if offset < consumer_state.committed_offset {
             return Ok(AckResult::AlreadyAcknowledged);
         }
-        if offset > consumer_state.committed_offset {
-            return Err(BrokerError::OutOfOrderAck {
-                consumer: consumer.to_owned(),
-                expected: consumer_state.committed_offset,
-                received: offset,
-            });
+        if consumer_state.acknowledged_offsets.contains(&offset) {
+            return Ok(AckResult::AlreadyAcknowledged);
         }
-
-        let key = ConsumerKey {
+        let consumer_key = ConsumerKey {
             stream: stream.to_owned(),
             consumer: consumer.to_owned(),
         };
-        let Some(in_flight) = state.in_flight.get(&key) else {
+        let delivery_key = DeliveryKey {
+            consumer: consumer_key,
+            offset,
+        };
+        let Some(in_flight) = state.in_flight.get(&delivery_key) else {
+            if !delivery_token.is_empty() {
+                return Err(BrokerError::StaleDelivery {
+                    consumer: consumer.to_owned(),
+                    offset,
+                });
+            }
             return Err(BrokerError::AckNotInFlight {
                 consumer: consumer.to_owned(),
                 offset,
             });
         };
-        if in_flight.offset != offset {
-            return Err(BrokerError::AckNotInFlight {
+        if in_flight.member != member
+            || (!delivery_token.is_empty() && in_flight.delivery_token != delivery_token)
+        {
+            return Err(BrokerError::StaleDelivery {
                 consumer: consumer.to_owned(),
                 offset,
             });
         }
 
+        let mut next_state = consumer_state;
+        next_state.acknowledge(offset);
         let next_state = ConsumerState {
             stream: stream.to_owned(),
             consumer: consumer.to_owned(),
-            committed_offset: offset + 1,
+            ..next_state
         };
         persist_consumer_state(&root, &next_state)?;
-        state.in_flight.remove(&key);
+        state.in_flight.remove(&delivery_key);
         Ok(AckResult::Acknowledged)
     }
 
     pub fn health(&self) -> Result<HealthSnapshot, BrokerError> {
+        #[cfg(feature = "instrumentation")]
+        let _stage_timer = StageTimer::new("core.health");
         let state = self.lock()?;
         let mut storage_bytes = 0;
         for stream in state.streams.values() {
@@ -248,10 +408,14 @@ impl Broker {
         Ok(HealthSnapshot {
             streams: state.streams.len(),
             storage_bytes,
+            redeliveries: state.redeliveries,
+            dead_letters: state.dead_letters,
         })
     }
 
     fn lock(&self) -> Result<std::sync::MutexGuard<'_, BrokerState>, BrokerError> {
+        #[cfg(feature = "instrumentation")]
+        let _stage_timer = StageTimer::new("core.lock_wait");
         self.inner.lock().map_err(|_| BrokerError::LockPoisoned)
     }
 }
@@ -275,6 +439,15 @@ impl Engine for Broker {
         Box::pin(async move { Broker::poll(self, stream, consumer) })
     }
 
+    fn poll_group<'a>(
+        &'a self,
+        stream: &'a str,
+        consumer: &'a str,
+        member: &'a str,
+    ) -> EngineFuture<'a, PollResult> {
+        Box::pin(async move { Broker::poll_group(self, stream, consumer, member) })
+    }
+
     fn ack<'a>(
         &'a self,
         stream: &'a str,
@@ -282,6 +455,19 @@ impl Engine for Broker {
         offset: Offset,
     ) -> EngineFuture<'a, AckResult> {
         Box::pin(async move { Broker::ack(self, stream, consumer, offset) })
+    }
+
+    fn ack_group<'a>(
+        &'a self,
+        stream: &'a str,
+        consumer: &'a str,
+        member: &'a str,
+        offset: Offset,
+        delivery_token: &'a str,
+    ) -> EngineFuture<'a, AckResult> {
+        Box::pin(async move {
+            Broker::ack_group(self, stream, consumer, member, offset, delivery_token)
+        })
     }
 
     fn health<'a>(&'a self) -> EngineFuture<'a, HealthSnapshot> {
@@ -357,6 +543,8 @@ impl StreamLog {
     }
 
     fn append(&mut self, key: Option<String>, payload: Vec<u8>) -> Result<Offset, BrokerError> {
+        #[cfg(feature = "instrumentation")]
+        let _stage_timer = StageTimer::new("core.storage_append");
         let key_bytes = key.as_deref().unwrap_or_default().as_bytes();
         let key_len = u32::try_from(key_bytes.len()).map_err(|_| {
             BrokerError::Io(io::Error::new(
@@ -397,6 +585,8 @@ impl StreamLog {
     }
 
     fn read_message(&mut self, stream: &str, offset: Offset) -> Result<Message, BrokerError> {
+        #[cfg(feature = "instrumentation")]
+        let _stage_timer = StageTimer::new("core.storage_read");
         let Some(index) = self.records.iter().find(|record| record.offset == offset) else {
             return Err(BrokerError::CorruptRecord(offset));
         };
@@ -409,12 +599,54 @@ impl StreamLog {
             key: index.key.clone(),
             payload,
             published_at_ms: index.published_at_ms,
+            delivery_token: None,
+            delivery_attempt: None,
         })
     }
 }
 
+fn dead_letter_record(
+    state: &mut BrokerState,
+    stream: &str,
+    record: &RecordIndex,
+) -> Result<(), BrokerError> {
+    let dead_letter_stream = dead_letter_stream_name(stream)?;
+    let message = state
+        .streams
+        .get_mut(stream)
+        .ok_or_else(|| BrokerError::StreamNotFound(stream.to_owned()))?
+        .read_message(stream, record.offset)?;
+
+    if !state.streams.contains_key(&dead_letter_stream) {
+        let path = stream_path(&state.root, &dead_letter_stream);
+        let log = StreamLog::create(&path)?;
+        state.streams.insert(dead_letter_stream.clone(), log);
+    }
+    state
+        .streams
+        .get_mut(&dead_letter_stream)
+        .ok_or_else(|| BrokerError::StreamNotFound(dead_letter_stream.clone()))?
+        .append(message.key, message.payload)?;
+    Ok(())
+}
+
 fn stream_path(root: &Path, stream: &str) -> PathBuf {
     root.join("streams").join(format!("{stream}.log"))
+}
+
+fn dead_letter_stream_name(stream: &str) -> Result<String, BrokerError> {
+    let name = format!("{stream}{DEAD_LETTER_SUFFIX}");
+    if name.len() <= 128 {
+        validate_name("dead-letter stream", &name)?;
+        return Ok(name);
+    }
+
+    let hash = stream.bytes().fold(0xcbf29ce484222325_u64, |hash, byte| {
+        (hash ^ u64::from(byte)).wrapping_mul(0x100000001b3)
+    });
+    let fallback = format!("runnel.dead-letter.{hash:016x}");
+    validate_name("dead-letter stream", &fallback)?;
+    Ok(fallback)
 }
 
 fn consumer_state_path(root: &Path, stream: &str, consumer: &str) -> PathBuf {
@@ -434,6 +666,8 @@ fn load_consumer_state(
             stream: stream.to_owned(),
             consumer: consumer.to_owned(),
             committed_offset: 0,
+            acknowledged_offsets: BTreeSet::new(),
+            delivery_attempts: BTreeMap::new(),
         });
     }
     let bytes = fs::read(path)?;
@@ -441,6 +675,8 @@ fn load_consumer_state(
 }
 
 fn persist_consumer_state(root: &Path, state: &ConsumerState) -> Result<(), BrokerError> {
+    #[cfg(feature = "instrumentation")]
+    let _stage_timer = StageTimer::new("core.consumer_state_persist");
     let path = consumer_state_path(root, &state.stream, &state.consumer);
     let parent = path.parent().ok_or_else(|| {
         BrokerError::Io(io::Error::new(
@@ -481,6 +717,18 @@ fn now_ms() -> u64 {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis() as u64
+}
+
+fn delivery_epoch() -> u128 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos()
+}
+
+fn next_delivery_token(state: &mut BrokerState) -> String {
+    state.next_delivery_id = state.next_delivery_id.wrapping_add(1);
+    format!("{:x}-{:x}", state.delivery_epoch, state.next_delivery_id)
 }
 
 #[cfg(test)]
@@ -526,6 +774,204 @@ mod tests {
     }
 
     #[test]
+    fn grouped_consumers_share_records_and_allow_out_of_order_acknowledgements() {
+        let directory = tempdir().unwrap();
+        let broker = Broker::open(directory.path(), BrokerConfig::default()).unwrap();
+        for payload in [
+            b"first".as_slice(),
+            b"second".as_slice(),
+            b"third".as_slice(),
+        ] {
+            broker.publish("events", None, payload.to_vec()).unwrap();
+        }
+
+        let (first_offset, first_token) = delivery(broker.poll_group("events", "workers", "a"));
+        let (second_offset, second_token) = delivery(broker.poll_group("events", "workers", "b"));
+        assert_eq!((first_offset, second_offset), (0, 1));
+
+        assert_eq!(
+            broker
+                .ack_group("events", "workers", "b", second_offset, &second_token)
+                .unwrap(),
+            AckResult::Acknowledged
+        );
+        let (third_offset, third_token) = delivery(broker.poll_group("events", "workers", "b"));
+        assert_eq!(third_offset, 2);
+
+        assert_eq!(
+            broker
+                .ack_group("events", "workers", "a", first_offset, &first_token)
+                .unwrap(),
+            AckResult::Acknowledged
+        );
+        assert_eq!(
+            broker
+                .ack_group("events", "workers", "b", third_offset, &third_token)
+                .unwrap(),
+            AckResult::Acknowledged
+        );
+        assert_eq!(
+            broker.poll_group("events", "workers", "a").unwrap(),
+            PollResult::Empty
+        );
+    }
+
+    #[test]
+    fn grouped_consumers_preserve_order_for_each_key() {
+        let directory = tempdir().unwrap();
+        let broker = Broker::open(directory.path(), BrokerConfig::default()).unwrap();
+        broker
+            .publish("events", Some("customer-a".to_owned()), b"a1".to_vec())
+            .unwrap();
+        broker
+            .publish("events", Some("customer-a".to_owned()), b"a2".to_vec())
+            .unwrap();
+        broker
+            .publish("events", Some("customer-b".to_owned()), b"b1".to_vec())
+            .unwrap();
+
+        let (first_offset, first_token) = delivery(broker.poll_group("events", "workers", "a"));
+        assert_eq!(first_offset, 0);
+        let (other_offset, other_token) = delivery(broker.poll_group("events", "workers", "b"));
+        assert_eq!(other_offset, 2);
+        assert!(matches!(
+            broker.poll_group("events", "workers", "a").unwrap(),
+            PollResult::Message(Message { offset: 0, .. })
+        ));
+
+        broker
+            .ack_group("events", "workers", "a", first_offset, &first_token)
+            .unwrap();
+        broker
+            .ack_group("events", "workers", "b", other_offset, &other_token)
+            .unwrap();
+        assert!(matches!(
+            broker.poll_group("events", "workers", "b").unwrap(),
+            PollResult::Message(Message { offset: 1, .. })
+        ));
+    }
+
+    #[test]
+    fn expired_group_delivery_rejects_stale_acknowledgement() {
+        let directory = tempdir().unwrap();
+        let broker = Broker::open(
+            directory.path(),
+            BrokerConfig {
+                ack_timeout: Duration::from_millis(10),
+                max_delivery_attempts: None,
+            },
+        )
+        .unwrap();
+        broker.publish("events", None, b"payload".to_vec()).unwrap();
+        let (offset, old_token) = delivery(broker.poll_group("events", "workers", "a"));
+        std::thread::sleep(Duration::from_millis(20));
+        let (_, new_token) = delivery(broker.poll_group("events", "workers", "b"));
+
+        assert!(matches!(
+            broker.ack_group("events", "workers", "a", offset, &old_token),
+            Err(BrokerError::StaleDelivery { .. })
+        ));
+        assert_eq!(
+            broker
+                .ack_group("events", "workers", "b", offset, &new_token)
+                .unwrap(),
+            AckResult::Acknowledged
+        );
+    }
+
+    #[test]
+    fn delivery_attempts_are_durable_and_dead_letter_after_limit() {
+        let directory = tempdir().unwrap();
+        let config = BrokerConfig {
+            ack_timeout: Duration::from_millis(10),
+            max_delivery_attempts: Some(2),
+        };
+        let broker = Broker::open(directory.path(), config.clone()).unwrap();
+        broker
+            .publish("events", Some("order-1".to_owned()), b"poison".to_vec())
+            .unwrap();
+
+        assert!(matches!(
+            broker.poll("events", "worker").unwrap(),
+            PollResult::Message(Message {
+                delivery_attempt: Some(1),
+                ..
+            })
+        ));
+        std::thread::sleep(Duration::from_millis(20));
+        assert!(matches!(
+            broker.poll("events", "worker").unwrap(),
+            PollResult::Message(Message {
+                delivery_attempt: Some(2),
+                ..
+            })
+        ));
+        std::thread::sleep(Duration::from_millis(20));
+
+        assert_eq!(broker.poll("events", "worker").unwrap(), PollResult::Empty);
+        assert_eq!(
+            broker.health().unwrap(),
+            HealthSnapshot {
+                streams: 2,
+                storage_bytes: broker.health().unwrap().storage_bytes,
+                redeliveries: 1,
+                dead_letters: 1,
+            }
+        );
+
+        let dead_letter = broker.poll("events.dead-letter", "inspector").unwrap();
+        assert!(matches!(
+            dead_letter,
+            PollResult::Message(Message {
+                key: Some(key),
+                payload,
+                delivery_attempt: Some(1),
+                ..
+            }) if key == "order-1" && payload == b"poison"
+        ));
+        std::thread::sleep(Duration::from_millis(20));
+        assert!(matches!(
+            broker.poll("events.dead-letter", "inspector").unwrap(),
+            PollResult::Message(Message {
+                delivery_attempt: Some(2),
+                ..
+            })
+        ));
+        assert_eq!(broker.health().unwrap().streams, 2);
+        assert_eq!(
+            broker.ack("events.dead-letter", "inspector", 0).unwrap(),
+            AckResult::Acknowledged
+        );
+        assert_eq!(
+            broker.poll("events.dead-letter", "inspector").unwrap(),
+            PollResult::Empty
+        );
+
+        drop(broker);
+        let reopened = Broker::open(directory.path(), config).unwrap();
+        assert_eq!(
+            reopened.poll("events", "worker").unwrap(),
+            PollResult::Empty
+        );
+        assert_eq!(
+            reopened.poll("events.dead-letter", "inspector").unwrap(),
+            PollResult::Empty
+        );
+    }
+
+    fn delivery(result: Result<PollResult, BrokerError>) -> (Offset, String) {
+        match result.unwrap() {
+            PollResult::Message(message) => (
+                message.offset,
+                message
+                    .delivery_token
+                    .expect("group deliveries should have a token"),
+            ),
+            PollResult::Empty => panic!("expected a message"),
+        }
+    }
+
+    #[test]
     fn unacknowledged_message_is_delivered_after_restart() {
         let directory = tempdir().unwrap();
         {
@@ -554,6 +1000,7 @@ mod tests {
             directory.path(),
             BrokerConfig {
                 ack_timeout: Duration::from_millis(10),
+                max_delivery_attempts: None,
             },
         )
         .unwrap();
