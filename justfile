@@ -12,7 +12,7 @@ lint:
     cargo clippy --locked --workspace --all-targets --all-features -- -D warnings
 
 test:
-    cargo test --locked --workspace --all-targets --all-features
+    RUST_TEST_THREADS=1 cargo test --locked --workspace --all-targets --all-features
 
 doc-test:
     cargo test --locked --workspace --doc
@@ -35,7 +35,7 @@ smoke:
     ./scripts/smoke.sh
 
 cluster-test:
-    cargo test --locked -p runnel-server --test cluster_smoke -- --nocapture
+    RUST_TEST_THREADS=1 cargo test --locked -p runnel-server --test cluster_smoke -- --nocapture
 
 bench:
     cargo bench --locked --workspace
