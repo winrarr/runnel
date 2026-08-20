@@ -1,0 +1,116 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: runnel
+spec:
+  selector:
+    app.kubernetes.io/name: runnel
+  ports:
+    - name: broker
+      port: 4222
+      targetPort: broker
+    - name: http
+      port: 8080
+      targetPort: http
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: runnel-headless
+spec:
+  clusterIP: None
+  selector:
+    app.kubernetes.io/name: runnel
+  ports:
+    - name: broker
+      port: 4222
+      targetPort: broker
+    - name: http
+      port: 8080
+      targetPort: http
+    - name: peer
+      port: 7000
+      targetPort: peer
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: runnel
+spec:
+  serviceName: runnel-headless
+  podManagementPolicy: Parallel
+  replicas: 3
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: runnel
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: runnel
+    spec:
+      terminationGracePeriodSeconds: 30
+      securityContext:
+        runAsNonRoot: true
+        fsGroup: 10001
+        fsGroupChangePolicy: OnRootMismatch
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: runnel
+          image: runnel:dev
+          imagePullPolicy: IfNotPresent
+          command: ["/bin/sh", "-ec"]
+          args:
+            - |
+              node_id="${HOSTNAME##*-}"
+              bootstrap_args=""
+              if [ "$node_id" = "0" ]; then bootstrap_args="--bootstrap"; fi
+              exec /usr/local/bin/runnel \
+                --engine raft \
+                --node-id "$node_id" \
+                --data-dir /var/lib/runnel \
+                --listen 0.0.0.0:4222 \
+                --http-listen 0.0.0.0:8080 \
+                --peer-listen 0.0.0.0:7000 \
+                --cluster-node 0=runnel-0.runnel-headless:7000 \
+                --cluster-node 1=runnel-1.runnel-headless:7000 \
+                --cluster-node 2=runnel-2.runnel-headless:7000 \
+                $bootstrap_args
+          ports:
+            - name: broker
+              containerPort: 4222
+            - name: http
+              containerPort: 8080
+            - name: peer
+              containerPort: 7000
+          readinessProbe:
+            httpGet:
+              path: /health/ready
+              port: http
+          livenessProbe:
+            httpGet:
+              path: /health/live
+              port: http
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: [ALL]
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              cpu: "1"
+              memory: 1Gi
+          volumeMounts:
+            - name: data
+              mountPath: /var/lib/runnel
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes: [ReadWriteOnce]
+        resources:
+          requests:
+            storage: 10Gi

@@ -1,0 +1,9 @@
+.git
+.github
+target
+data
+benchmark-results
+**/__pycache__
+docs
+deploy
+*.log
