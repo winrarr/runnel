@@ -1,0 +1,303 @@
+{
+  "history_schema_version": 1,
+  "generated_at": "2026-08-20T10:02:05.031593+00:00",
+  "source": {
+    "repository": "winrarr/runnel",
+    "revision": "80f1f62563b6771fe1df4cd5c62d25b7a96f07e6",
+    "ref": "main",
+    "event": "push",
+    "workflow": "Benchmark history",
+    "run_id": "32356756879",
+    "run_url": "https://github.com/winrarr/runnel/actions/runs/32356756879",
+    "profile": "push"
+  },
+  "environment": {
+    "host": "runnervm76f27",
+    "platform": "Linux-6.17.0-1022-azure-x86_64-with-glibc2.39",
+    "python": "3.12.3",
+    "cpu_count": 4,
+    "docker_server": "28.0.4"
+  },
+  "comparison_mode": "native broker tools; first-pass, not a final apples-to-apples claim",
+  "resource_limits": {
+    "broker_cpu": "2",
+    "broker_memory": "2g",
+    "client_cpu": "2",
+    "client_memory": "2g"
+  },
+  "workload": {
+    "messages": 10000,
+    "payload_sizes_bytes": [
+      100,
+      1024
+    ],
+    "single_node": true,
+    "replication_factor": 1,
+    "compression": "disabled where the native client exposes the setting"
+  },
+  "backends": {
+    "runnel": {
+      "image": "runnel:bench",
+      "image_id": "sha256:9a3403c9d49c7c6b74ce6a9b3f4080835302a104b44a4fb7bc52e5f7a12f568a",
+      "acknowledgement": "request response after the current local durable append; consume acknowledgement persists a consumer checkpoint",
+      "replication": "single local broker engine",
+      "measurement_boundary": "Runnel's current line-delimited JSON protocol",
+      "measurement_client": "host Python socket client",
+      "startup_seconds": 0.362105454,
+      "resource_samples": {
+        "samples": 30,
+        "cpu_percent_max": 44.87,
+        "memory_bytes_max": 7847542.784,
+        "memory_percent_max": 0.37
+      },
+      "scenarios": [
+        {
+          "operation": "publish",
+          "messages": 10000,
+          "message_size_bytes": 100,
+          "throughput_messages_per_second": 2743.8719532685154,
+          "latency_available": true,
+          "latency_microseconds": {
+            "p50": 330.201,
+            "p99": 547.4051600000026,
+            "p999": 1342.709551000007,
+            "max": 15995.981
+          }
+        },
+        {
+          "operation": "consume_ack",
+          "messages": 10000,
+          "message_size_bytes": 100,
+          "throughput_messages_per_second": 1379.1473046964059,
+          "latency_available": true,
+          "latency_microseconds": {
+            "p50": 713.3245,
+            "p99": 996.7915100000004,
+            "p999": 1498.5348370000002,
+            "max": 3405.877
+          }
+        },
+        {
+          "operation": "publish",
+          "messages": 10000,
+          "message_size_bytes": 1024,
+          "throughput_messages_per_second": 2652.1420171266955,
+          "latency_available": true,
+          "latency_microseconds": {
+            "p50": 335.2935,
+            "p99": 501.38050000000004,
+            "p999": 898.3026900000002,
+            "max": 1203.751
+          }
+        },
+        {
+          "operation": "consume_ack",
+          "messages": 10000,
+          "message_size_bytes": 1024,
+          "throughput_messages_per_second": 1342.1670015896332,
+          "latency_available": true,
+          "latency_microseconds": {
+            "p50": 720.129,
+            "p99": 1027.3183600000002,
+            "p999": 1883.602983000017,
+            "max": 35691.997
+          }
+        }
+      ]
+    },
+    "kafka": {
+      "image": "apache/kafka:4.3.1",
+      "image_id": "sha256:47dccc76b32761bc57462b8753144cdbb73a16b123b1d13d3eedb92bb7952b11",
+      "acknowledgement": "Kafka producer performance client with acks=all; consumer perf client measures fetch throughput without per-record application acknowledgement",
+      "replication": "single broker, one partition, replication factor one",
+      "measurement_boundary": "Kafka producer/consumer performance clients over the Kafka protocol",
+      "measurement_client": "broker-native client container",
+      "startup_seconds": 0.139229133,
+      "resource_samples": {
+        "samples": 10,
+        "cpu_percent_max": 202.48,
+        "memory_bytes_max": 349700096.0,
+        "memory_percent_max": 16.29
+      },
+      "scenarios": [
+        {
+          "operation": "publish",
+          "messages": 10000,
+          "message_size_bytes": 100,
+          "throughput_messages_per_second": 16694.490818,
+          "latency_available": true,
+          "latency_microseconds": {
+            "avg": 134230.0,
+            "p50": 137000.0,
+            "p95": 149000.0,
+            "p99": 150000.0,
+            "p999": 151000.0,
+            "max": 475000.0
+          }
+        },
+        {
+          "operation": "consume",
+          "messages": 10000,
+          "message_size_bytes": 100,
+          "throughput_messages_per_second": 11312.2172,
+          "latency_available": false,
+          "elapsed_milliseconds": 884.0,
+          "throughput_megabytes_per_second": 1.0788
+        },
+        {
+          "operation": "publish",
+          "messages": 10000,
+          "message_size_bytes": 1024,
+          "throughput_messages_per_second": 8857.395926,
+          "latency_available": true,
+          "latency_microseconds": {
+            "avg": 252130.0,
+            "p50": 271000.0,
+            "p95": 371000.0,
+            "p99": 379000.0,
+            "p999": 384000.0,
+            "max": 384000.0
+          }
+        },
+        {
+          "operation": "consume",
+          "messages": 10000,
+          "message_size_bytes": 1024,
+          "throughput_messages_per_second": 20325.2033,
+          "latency_available": false,
+          "elapsed_milliseconds": 492.0,
+          "throughput_megabytes_per_second": 19.8488
+        }
+      ]
+    },
+    "redpanda": {
+      "image": "docker.redpanda.com/redpandadata/redpanda:v26.2.1",
+      "image_id": "sha256:d97ce2c85cdd77e11db049fb609d18b4bb9c9a6c74e0748751461cc297280b77",
+      "acknowledgement": "Kafka producer performance client with acks=all; consumer perf client measures fetch throughput without per-record application acknowledgement",
+      "replication": "single broker, one partition, replication factor one",
+      "measurement_boundary": "Kafka producer/consumer performance clients over the Kafka protocol",
+      "measurement_client": "broker-native client container",
+      "startup_seconds": 0.140676069,
+      "resource_samples": {
+        "samples": 9,
+        "cpu_percent_max": 9.13,
+        "memory_bytes_max": 385875968.0,
+        "memory_percent_max": 17.97
+      },
+      "scenarios": [
+        {
+          "operation": "publish",
+          "messages": 10000,
+          "message_size_bytes": 100,
+          "throughput_messages_per_second": 14814.814815,
+          "latency_available": true,
+          "latency_microseconds": {
+            "avg": 252490.0,
+            "p50": 265000.0,
+            "p95": 312000.0,
+            "p99": 320000.0,
+            "p999": 323000.0,
+            "max": 635000.0
+          }
+        },
+        {
+          "operation": "consume",
+          "messages": 10000,
+          "message_size_bytes": 100,
+          "throughput_messages_per_second": 18518.5185,
+          "latency_available": false,
+          "elapsed_milliseconds": 540.0,
+          "throughput_megabytes_per_second": 1.7661
+        },
+        {
+          "operation": "publish",
+          "messages": 10000,
+          "message_size_bytes": 1024,
+          "throughput_messages_per_second": 11454.753723,
+          "latency_available": true,
+          "latency_microseconds": {
+            "avg": 8320.0,
+            "p50": 4000.0,
+            "p95": 46000.0,
+            "p99": 53000.0,
+            "p999": 55000.0,
+            "max": 336000.0
+          }
+        },
+        {
+          "operation": "consume",
+          "messages": 10000,
+          "message_size_bytes": 1024,
+          "throughput_messages_per_second": 20964.3606,
+          "latency_available": false,
+          "elapsed_milliseconds": 477.0,
+          "throughput_megabytes_per_second": 20.473
+        }
+      ]
+    },
+    "nats": {
+      "image": "nats:2.12.14-alpine",
+      "image_id": "sha256:b42e55ec4f46d59447526bad7d1e83f8b3eb4adf09fa49b99ebe7355be6e884c",
+      "acknowledgement": "JetStream synchronous publish PubAck; durable consumer explicit acknowledgement with synchronous double acknowledgement",
+      "replication": "single NATS server, file storage, one replica",
+      "measurement_boundary": "nats bench js native benchmark client",
+      "measurement_client": "broker-native client container",
+      "startup_seconds": 0.132705167,
+      "resource_samples": {
+        "samples": 6,
+        "cpu_percent_max": 103.62,
+        "memory_bytes_max": 58321797.12,
+        "memory_percent_max": 2.72
+      },
+      "scenarios": [
+        {
+          "operation": "publish",
+          "messages": 10000,
+          "message_size_bytes": 100,
+          "throughput_messages_per_second": 7388.0,
+          "latency_available": true,
+          "latency_microseconds": {
+            "min": 85.84,
+            "avg": 135.1,
+            "max": 834.57,
+            "p50": 133.81,
+            "p90": 151.31,
+            "p99": 176.58,
+            "p999": 370.75
+          }
+        },
+        {
+          "operation": "consume_ack",
+          "messages": 10000,
+          "message_size_bytes": 100,
+          "throughput_messages_per_second": 4066.0,
+          "latency_available": false
+        },
+        {
+          "operation": "publish",
+          "messages": 10000,
+          "message_size_bytes": 1024,
+          "throughput_messages_per_second": 7196.0,
+          "latency_available": true,
+          "latency_microseconds": {
+            "min": 71.43,
+            "avg": 138.73,
+            "max": 962.95,
+            "p50": 137.59,
+            "p90": 155.15,
+            "p99": 175.7,
+            "p999": 328.64
+          }
+        },
+        {
+          "operation": "consume_ack",
+          "messages": 10000,
+          "message_size_bytes": 1024,
+          "throughput_messages_per_second": 3934.0,
+          "latency_available": false
+        }
+      ]
+    }
+  },
+  "source_result": "compare.json"
+}
