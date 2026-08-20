@@ -1,0 +1,491 @@
+{
+  "history_schema_version": 1,
+  "generated_at": "2026-08-20T12:17:47.023587+00:00",
+  "source": {
+    "repository": "winrarr/runnel",
+    "revision": "c135708bf3f1e442f4dcd1eb8b262a4d8817fddd",
+    "ref": "main",
+    "event": "push",
+    "workflow": "Benchmark history",
+    "run_id": "32367968825",
+    "run_url": "https://github.com/winrarr/runnel/actions/runs/32367968825",
+    "profile": "push"
+  },
+  "environment": {
+    "host": "runnervm76f27",
+    "platform": "Linux-6.17.0-1022-azure-x86_64-with-glibc2.39",
+    "python": "3.12.3",
+    "cpu_count": 4,
+    "docker_server": "28.0.4"
+  },
+  "comparison_mode": "native broker tools; first-pass, not a final apples-to-apples claim",
+  "resource_limits": {
+    "broker_cpu": "2",
+    "broker_memory": "2g",
+    "client_cpu": "2",
+    "client_memory": "2g"
+  },
+  "workload": {
+    "messages": 10000,
+    "payload_sizes_bytes": [
+      100,
+      1024
+    ],
+    "single_node": true,
+    "replication_factor": 1,
+    "compression": "disabled where the native client exposes the setting"
+  },
+  "backends": {
+    "runnel": {
+      "image": "runnel:bench",
+      "image_id": "sha256:d0e2d98539ac873a0127cde907e588c049d089476834faf47b3e54627c5783ba",
+      "acknowledgement": "request response after the current local durable append; consume acknowledgement persists a consumer checkpoint",
+      "replication": "single local broker engine",
+      "measurement_boundary": "Runnel's current line-delimited JSON protocol",
+      "measurement_client": "host Python socket client",
+      "startup_seconds": 0.23230635,
+      "resource_samples": {
+        "samples": 63,
+        "cpu_percent_avg": 15.631428571428572,
+        "cpu_percent_max": 45.13,
+        "memory_bytes_avg": 4695756.344888888,
+        "memory_bytes_max": 7823425.536,
+        "memory_percent_avg": 0.2177777777777778,
+        "memory_percent_max": 0.36
+      },
+      "scenarios": [
+        {
+          "operation": "publish",
+          "messages": 10000,
+          "message_size_bytes": 100,
+          "throughput_messages_per_second": 2796.6331077843793,
+          "latency_available": true,
+          "latency_microseconds": {
+            "p50": 330.447,
+            "p99": 452.4289,
+            "p999": 691.0325140000089,
+            "max": 6128.625
+          },
+          "resource_samples": {
+            "samples": 4,
+            "cpu_percent_avg": 10.6025,
+            "cpu_percent_max": 23.73,
+            "memory_bytes_avg": 2046033.92,
+            "memory_bytes_max": 2240806.912,
+            "memory_percent_avg": 0.0925,
+            "memory_percent_max": 0.1,
+            "cpu_seconds": 0.814627,
+            "elapsed_seconds": 3.579796194
+          }
+        },
+        {
+          "operation": "consume_ack",
+          "messages": 10000,
+          "message_size_bytes": 100,
+          "throughput_messages_per_second": 1376.888615396463,
+          "latency_available": true,
+          "latency_microseconds": {
+            "p50": 716.4065,
+            "p99": 878.2202600000003,
+            "p999": 1258.7037410000016,
+            "max": 28563.835
+          },
+          "resource_samples": {
+            "samples": 5,
+            "cpu_percent_avg": 30.806,
+            "cpu_percent_max": 45.13,
+            "memory_bytes_avg": 3555511.5008,
+            "memory_bytes_max": 3624927.232,
+            "memory_percent_avg": 0.166,
+            "memory_percent_max": 0.17,
+            "cpu_seconds": 3.025901,
+            "elapsed_seconds": 7.266834694
+          }
+        },
+        {
+          "operation": "publish",
+          "messages": 10000,
+          "message_size_bytes": 1024,
+          "throughput_messages_per_second": 2651.234051010425,
+          "latency_available": true,
+          "latency_microseconds": {
+            "p50": 337.2575,
+            "p99": 497.13530000000003,
+            "p999": 1102.8190150000005,
+            "max": 1368.929
+          },
+          "resource_samples": {
+            "samples": 4,
+            "cpu_percent_avg": 12.165,
+            "cpu_percent_max": 24.58,
+            "memory_bytes_avg": 4749262.848,
+            "memory_bytes_max": 5206179.84,
+            "memory_percent_avg": 0.22,
+            "memory_percent_max": 0.24,
+            "cpu_seconds": 0.8912319999999987,
+            "elapsed_seconds": 3.775994063
+          }
+        },
+        {
+          "operation": "consume_ack",
+          "messages": 10000,
+          "message_size_bytes": 1024,
+          "throughput_messages_per_second": 1364.7429028891327,
+          "latency_available": true,
+          "latency_microseconds": {
+            "p50": 722.2755,
+            "p99": 882.9580000000001,
+            "p999": 1388.6891030000002,
+            "max": 22245.539
+          },
+          "resource_samples": {
+            "samples": 5,
+            "cpu_percent_avg": 30.514,
+            "cpu_percent_max": 44.74,
+            "memory_bytes_avg": 6876141.977599999,
+            "memory_bytes_max": 7114588.16,
+            "memory_percent_avg": 0.318,
+            "memory_percent_max": 0.33,
+            "cpu_seconds": 3.0481510000000007,
+            "elapsed_seconds": 7.331581912
+          }
+        }
+      ]
+    },
+    "kafka": {
+      "image": "apache/kafka:4.3.1",
+      "image_id": "sha256:47dccc76b32761bc57462b8753144cdbb73a16b123b1d13d3eedb92bb7952b11",
+      "acknowledgement": "Kafka producer performance client with acks=all; consumer perf client measures fetch throughput without per-record application acknowledgement",
+      "replication": "single broker, one partition, replication factor one",
+      "measurement_boundary": "Kafka producer/consumer performance clients over the Kafka protocol",
+      "measurement_client": "broker-native client container",
+      "startup_seconds": 0.139464901,
+      "resource_samples": {
+        "samples": 26,
+        "cpu_percent_avg": 23.60307692307692,
+        "cpu_percent_max": 210.07,
+        "memory_bytes_avg": 319104261.51384616,
+        "memory_bytes_max": 352111820.8,
+        "memory_percent_avg": 14.860000000000001,
+        "memory_percent_max": 16.4
+      },
+      "scenarios": [
+        {
+          "operation": "publish",
+          "messages": 10000,
+          "message_size_bytes": 100,
+          "throughput_messages_per_second": 17301.038062,
+          "latency_available": true,
+          "latency_microseconds": {
+            "avg": 145890.0,
+            "p50": 146000.0,
+            "p95": 162000.0,
+            "p99": 164000.0,
+            "p999": 165000.0,
+            "max": 460000.0
+          },
+          "resource_samples": {
+            "samples": 3,
+            "cpu_percent_avg": 17.97,
+            "cpu_percent_max": 45.07,
+            "memory_bytes_avg": 320165205.3333333,
+            "memory_bytes_max": 321912832.0,
+            "memory_percent_avg": 14.910000000000002,
+            "memory_percent_max": 14.99,
+            "cpu_seconds": 0.4797349999999998,
+            "elapsed_seconds": 2.292904439
+          }
+        },
+        {
+          "operation": "consume",
+          "messages": 10000,
+          "message_size_bytes": 100,
+          "throughput_messages_per_second": 11641.4435,
+          "latency_available": false,
+          "resource_samples": {
+            "samples": 3,
+            "cpu_percent_avg": 38.79666666666667,
+            "cpu_percent_max": 104.25,
+            "memory_bytes_avg": 334740411.73333335,
+            "memory_bytes_max": 345505792.0,
+            "memory_percent_avg": 15.589999999999998,
+            "memory_percent_max": 16.09,
+            "cpu_seconds": 1.107971,
+            "elapsed_seconds": 3.11260416
+          },
+          "elapsed_milliseconds": 859.0,
+          "throughput_megabytes_per_second": 1.1102
+        },
+        {
+          "operation": "publish",
+          "messages": 10000,
+          "message_size_bytes": 1024,
+          "throughput_messages_per_second": 8703.220191,
+          "latency_available": true,
+          "latency_microseconds": {
+            "avg": 219390.0,
+            "p50": 217000.0,
+            "p95": 349000.0,
+            "p99": 360000.0,
+            "p999": 363000.0,
+            "max": 363000.0
+          },
+          "resource_samples": {
+            "samples": 4,
+            "cpu_percent_avg": 3.2975,
+            "cpu_percent_max": 4.81,
+            "memory_bytes_avg": 343618355.2,
+            "memory_bytes_max": 352111820.8,
+            "memory_percent_avg": 16.0,
+            "memory_percent_max": 16.4,
+            "cpu_seconds": 1.2182840000000006,
+            "elapsed_seconds": 2.834571401
+          }
+        },
+        {
+          "operation": "consume",
+          "messages": 10000,
+          "message_size_bytes": 1024,
+          "throughput_messages_per_second": 20833.3333,
+          "latency_available": false,
+          "resource_samples": {
+            "samples": 3,
+            "cpu_percent_avg": 4.31,
+            "cpu_percent_max": 6.54,
+            "memory_bytes_avg": 345191219.2,
+            "memory_bytes_max": 345610649.6,
+            "memory_percent_avg": 16.073333333333334,
+            "memory_percent_max": 16.09,
+            "cpu_seconds": 0.19118300000000055,
+            "elapsed_seconds": 2.68136685
+          },
+          "elapsed_milliseconds": 480.0,
+          "throughput_megabytes_per_second": 20.3451
+        }
+      ]
+    },
+    "redpanda": {
+      "image": "docker.redpanda.com/redpandadata/redpanda:v26.2.1",
+      "image_id": "sha256:d97ce2c85cdd77e11db049fb609d18b4bb9c9a6c74e0748751461cc297280b77",
+      "acknowledgement": "Kafka producer performance client with acks=all; consumer perf client measures fetch throughput without per-record application acknowledgement",
+      "replication": "single broker, one partition, replication factor one",
+      "measurement_boundary": "Kafka producer/consumer performance clients over the Kafka protocol",
+      "measurement_client": "broker-native client container",
+      "startup_seconds": 0.135913851,
+      "resource_samples": {
+        "samples": 25,
+        "cpu_percent_avg": 1.1064,
+        "cpu_percent_max": 8.05,
+        "memory_bytes_avg": 290195505.152,
+        "memory_bytes_max": 386609971.2,
+        "memory_percent_avg": 13.511600000000001,
+        "memory_percent_max": 18.0
+      },
+      "scenarios": [
+        {
+          "operation": "publish",
+          "messages": 10000,
+          "message_size_bytes": 100,
+          "throughput_messages_per_second": 14903.129657,
+          "latency_available": true,
+          "latency_microseconds": {
+            "avg": 221930.0,
+            "p50": 228000.0,
+            "p95": 311000.0,
+            "p99": 319000.0,
+            "p999": 323000.0,
+            "max": 634000.0
+          },
+          "resource_samples": {
+            "samples": 4,
+            "cpu_percent_avg": 0.6849999999999999,
+            "cpu_percent_max": 2.03,
+            "memory_bytes_avg": 155923251.2,
+            "memory_bytes_max": 157076684.8,
+            "memory_percent_avg": 7.2625,
+            "memory_percent_max": 7.32,
+            "cpu_seconds": 0.052642999999999995,
+            "elapsed_seconds": 2.422040377
+          }
+        },
+        {
+          "operation": "consume",
+          "messages": 10000,
+          "message_size_bytes": 100,
+          "throughput_messages_per_second": 18148.8203,
+          "latency_available": false,
+          "resource_samples": {
+            "samples": 4,
+            "cpu_percent_avg": 1.245,
+            "cpu_percent_max": 3.04,
+            "memory_bytes_avg": 319658393.6,
+            "memory_bytes_max": 373922201.6,
+            "memory_percent_avg": 14.8825,
+            "memory_percent_max": 17.41,
+            "cpu_seconds": 0.06576900000000002,
+            "elapsed_seconds": 3.253158971
+          },
+          "elapsed_milliseconds": 551.0,
+          "throughput_megabytes_per_second": 1.7308
+        },
+        {
+          "operation": "publish",
+          "messages": 10000,
+          "message_size_bytes": 1024,
+          "throughput_messages_per_second": 10471.204188,
+          "latency_available": true,
+          "latency_microseconds": {
+            "avg": 51020.0,
+            "p50": 66000.0,
+            "p95": 92000.0,
+            "p99": 94000.0,
+            "p999": 95000.0,
+            "max": 350000.0
+          },
+          "resource_samples": {
+            "samples": 4,
+            "cpu_percent_avg": 1.0074999999999998,
+            "cpu_percent_max": 3.26,
+            "memory_bytes_avg": 378798080.0,
+            "memory_bytes_max": 384303104.0,
+            "memory_percent_avg": 17.634999999999998,
+            "memory_percent_max": 17.89,
+            "cpu_seconds": 0.154105,
+            "elapsed_seconds": 2.708472778
+          }
+        },
+        {
+          "operation": "consume",
+          "messages": 10000,
+          "message_size_bytes": 1024,
+          "throughput_messages_per_second": 22471.9101,
+          "latency_available": false,
+          "resource_samples": {
+            "samples": 4,
+            "cpu_percent_avg": 1.2975,
+            "cpu_percent_max": 3.16,
+            "memory_bytes_avg": 385823539.2,
+            "memory_bytes_max": 386609971.2,
+            "memory_percent_avg": 17.965,
+            "memory_percent_max": 18.0,
+            "cpu_seconds": 0.05164400000000002,
+            "elapsed_seconds": 3.186015996
+          },
+          "elapsed_milliseconds": 445.0,
+          "throughput_megabytes_per_second": 21.9452
+        }
+      ]
+    },
+    "nats": {
+      "image": "nats:2.14.5-alpine",
+      "image_id": "sha256:9d6f44f99d2bf938cade3056908491a689089af9f69717a5c9c43ea56837e660",
+      "acknowledgement": "JetStream synchronous publish PubAck; durable consumer explicit acknowledgement with synchronous double acknowledgement",
+      "replication": "single NATS server, file storage, one replica",
+      "measurement_boundary": "nats bench js native benchmark client",
+      "measurement_client": "broker-native client container",
+      "startup_seconds": 0.138140177,
+      "resource_samples": {
+        "samples": 22,
+        "cpu_percent_avg": 17.94272727272727,
+        "cpu_percent_max": 103.76,
+        "memory_bytes_avg": 29436912.360727273,
+        "memory_bytes_max": 63963136.0,
+        "memory_percent_avg": 1.3695454545454544,
+        "memory_percent_max": 2.98
+      },
+      "scenarios": [
+        {
+          "operation": "publish",
+          "messages": 10000,
+          "message_size_bytes": 100,
+          "throughput_messages_per_second": 7376.0,
+          "latency_available": true,
+          "latency_microseconds": {
+            "min": 78.11,
+            "avg": 135.33,
+            "max": 705.64,
+            "p50": 134.0,
+            "p90": 151.88,
+            "p99": 177.83,
+            "p999": 377.48
+          },
+          "resource_samples": {
+            "samples": 3,
+            "cpu_percent_avg": 31.76,
+            "cpu_percent_max": 95.09,
+            "memory_bytes_avg": 14070142.293333335,
+            "memory_bytes_max": 17930649.6,
+            "memory_percent_avg": 0.6533333333333333,
+            "memory_percent_max": 0.83,
+            "cpu_seconds": 1.139801,
+            "elapsed_seconds": 1.58875227
+          }
+        },
+        {
+          "operation": "consume_ack",
+          "messages": 10000,
+          "message_size_bytes": 100,
+          "throughput_messages_per_second": 4021.0,
+          "latency_available": false,
+          "resource_samples": {
+            "samples": 4,
+            "cpu_percent_avg": 31.265,
+            "cpu_percent_max": 103.76,
+            "memory_bytes_avg": 19687014.4,
+            "memory_bytes_max": 20573061.12,
+            "memory_percent_avg": 0.9175,
+            "memory_percent_max": 0.96,
+            "cpu_seconds": 2.1891480000000003,
+            "elapsed_seconds": 2.715467055
+          }
+        },
+        {
+          "operation": "publish",
+          "messages": 10000,
+          "message_size_bytes": 1024,
+          "throughput_messages_per_second": 7214.0,
+          "latency_available": true,
+          "latency_microseconds": {
+            "min": 81.59,
+            "avg": 138.35,
+            "max": 883.33,
+            "p50": 137.23,
+            "p90": 155.48,
+            "p99": 177.69,
+            "p999": 421.08
+          },
+          "resource_samples": {
+            "samples": 3,
+            "cpu_percent_avg": 13.216666666666667,
+            "cpu_percent_max": 28.01,
+            "memory_bytes_avg": 35613136.21333333,
+            "memory_bytes_max": 40611348.48,
+            "memory_percent_avg": 1.6566666666666665,
+            "memory_percent_max": 1.89,
+            "cpu_seconds": 1.167704,
+            "elapsed_seconds": 1.617892264
+          }
+        },
+        {
+          "operation": "consume_ack",
+          "messages": 10000,
+          "message_size_bytes": 1024,
+          "throughput_messages_per_second": 3952.0,
+          "latency_available": false,
+          "resource_samples": {
+            "samples": 3,
+            "cpu_percent_avg": 44.370000000000005,
+            "cpu_percent_max": 103.01,
+            "memory_bytes_avg": 59733879.46666667,
+            "memory_bytes_max": 63963136.0,
+            "memory_percent_avg": 2.78,
+            "memory_percent_max": 2.98,
+            "cpu_seconds": 2.2345749999999995,
+            "elapsed_seconds": 2.760340175
+          }
+        }
+      ]
+    }
+  },
+  "source_result": "compare.json"
+}
