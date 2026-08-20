@@ -80,7 +80,11 @@ class DockerBroker:
         self.image = image
         self.cpus = cpus
         self.memory = memory
-        self.name = f"runnel-bench-{os.getpid()}-{time.time_ns()}"
+        isolation_id = os.environ.get("RUNNEL_ISOLATION_ID")
+        suffix = isolation_id or f"{os.getpid()}-{time.time_ns()}"
+        self.name = f"runnel-bench-{suffix}"
+        self.network = f"runnel-bench-net-{suffix}"
+        self.network_created = False
         self.data_dir = Path(tempfile.mkdtemp(prefix="runnel-bench-"))
         self.data_dir.chmod(0o777)
         self.image_id: str | None = None
@@ -105,6 +109,8 @@ class DockerBroker:
             self.name,
             "--label",
             "runnel.benchmark=true",
+            "--network",
+            self.network,
             "--cpus",
             self.cpus,
             "--memory",
@@ -119,6 +125,20 @@ class DockerBroker:
         ]
         started = time.perf_counter_ns()
         try:
+            subprocess.run(
+                [
+                    "docker",
+                    "network",
+                    "create",
+                    "--label",
+                    "runnel.benchmark=true",
+                    self.network,
+                ],
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            self.network_created = True
             subprocess.run(command, check=True, capture_output=True, text=True)
             self.client_port = self._published_port(4222)
             self.http_port = self._published_port(8080)
@@ -177,6 +197,12 @@ class DockerBroker:
     def close(self) -> None:
         self.stats.close()
         subprocess.run(["docker", "rm", "--force", self.name], check=False, capture_output=True)
+        if self.network_created:
+            subprocess.run(
+                ["docker", "network", "rm", self.network],
+                check=False,
+                capture_output=True,
+            )
         shutil.rmtree(self.data_dir, ignore_errors=True)
 
 

@@ -34,6 +34,9 @@ run:
 smoke:
     ./scripts/smoke.sh
 
+isolated workflow="test":
+    python3 scripts/isolated.py {{workflow}}
+
 cluster-test:
     RUST_TEST_THREADS=1 cargo test --locked -p runnel-server --test cluster_smoke -- --nocapture
 
@@ -45,6 +48,18 @@ bench-container:
 
 bench-container-smoke:
     python3 scripts/benchmarks/run.py --image runnel:dev --messages 20 --warmup 2 --concurrency 2 --payload-sizes 100
+
+bench-cluster:
+    python3 scripts/benchmarks/cluster.py --build
+
+bench-cluster-smoke:
+    python3 scripts/benchmarks/cluster.py --build --messages 20 --warmup 2 --payload-sizes 100 --skip-recovery
+
+profile-cluster:
+    python3 scripts/benchmarks/profile.py --build
+
+profile-cluster-instrumented:
+    RUST_LOG=runnel::timing=trace python3 scripts/benchmarks/profile.py --build --features instrumentation --skip-perf
 
 bench-compare:
     python3 scripts/benchmarks/compare.py --build-runnel
@@ -62,4 +77,6 @@ audit:
 docker-build:
     docker build --tag runnel:dev .
 
-ci: verify smoke docker-build bench-container-smoke
+ci: verify docker-build
+    python3 scripts/isolated.py smoke
+    python3 scripts/isolated.py bench-container-smoke

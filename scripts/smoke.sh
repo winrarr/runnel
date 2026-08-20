@@ -3,12 +3,15 @@ set -euo pipefail
 
 cd "$(dirname "$0")/.."
 
-data_dir=$(mktemp -d /tmp/runnel-smoke.XXXXXX)
+target_dir=${CARGO_TARGET_DIR:-$PWD/target}
+data_dir=$(mktemp -d "${TMPDIR:-/tmp}/runnel-smoke.XXXXXX")
 log_file="$data_dir/server.log"
 server_pid=
 broker_port=
 http_port=
 broker_addr=
+server_binary="$target_dir/debug/runnel"
+cli_binary="$target_dir/debug/runnelctl"
 
 cleanup() {
     if [ -n "$server_pid" ] && kill -0 "$server_pid" 2>/dev/null; then
@@ -44,10 +47,12 @@ PY
 }
 
 start_server() {
-    target/debug/runnel \
+    "$server_binary" \
         --data-dir "$data_dir" \
         --listen "$broker_addr" \
         --http-listen "127.0.0.1:$http_port" \
+        --ack-timeout-ms 50 \
+        --max-delivery-attempts 2 \
         >"$log_file" 2>&1 &
     server_pid=$!
 
@@ -69,6 +74,11 @@ assert_contains() {
     printf '%s' "$output" | grep -Eq "$pattern"
 }
 
+json_field() {
+    local field=$1
+    python3 -c 'import json, sys; print(json.load(sys.stdin)[sys.argv[1]])' "$field"
+}
+
 trap cleanup EXIT INT TERM
 
 allocate_ports
@@ -76,26 +86,58 @@ cargo build -q --locked -p runnel-server -p runnel-cli
 
 start_server
 
-"$PWD/target/debug/runnelctl" --server "$broker_addr" create-stream events
-"$PWD/target/debug/runnelctl" --server "$broker_addr" publish events hello
-output=$("$PWD/target/debug/runnelctl" --server "$broker_addr" consume events worker)
+"$cli_binary" --server "$broker_addr" create-stream events
+"$cli_binary" --server "$broker_addr" publish events hello
+output=$("$cli_binary" --server "$broker_addr" consume events worker)
 assert_contains "$output" '"offset": 0'
-"$PWD/target/debug/runnelctl" --server "$broker_addr" ack events worker 0
-output=$("$PWD/target/debug/runnelctl" --server "$broker_addr" consume events worker)
+"$cli_binary" --server "$broker_addr" ack events worker 0
+output=$("$cli_binary" --server "$broker_addr" consume events worker)
 assert_contains "$output" '"type": "empty"'
 
-"$PWD/target/debug/runnelctl" --server "$broker_addr" publish events recover-me
-"$PWD/target/debug/runnelctl" --server "$broker_addr" consume events recovery-worker
-"$PWD/target/debug/runnelctl" --server "$broker_addr" ack events recovery-worker 0
-output=$("$PWD/target/debug/runnelctl" --server "$broker_addr" consume events recovery-worker)
+"$cli_binary" --server "$broker_addr" publish events recover-me
+"$cli_binary" --server "$broker_addr" consume events recovery-worker
+"$cli_binary" --server "$broker_addr" ack events recovery-worker 0
+output=$("$cli_binary" --server "$broker_addr" consume events recovery-worker)
 assert_contains "$output" '"offset": 1'
+
+"$cli_binary" --server "$broker_addr" create-stream jobs
+"$cli_binary" --server "$broker_addr" publish jobs group-first
+"$cli_binary" --server "$broker_addr" publish jobs group-second
+group_a_output=$("$cli_binary" --server "$broker_addr" consume jobs workers --member worker-a)
+group_b_output=$("$cli_binary" --server "$broker_addr" consume jobs workers --member worker-b)
+group_a_offset=$(printf '%s' "$group_a_output" | json_field offset)
+group_a_token=$(printf '%s' "$group_a_output" | json_field delivery_token)
+group_b_offset=$(printf '%s' "$group_b_output" | json_field offset)
+group_b_token=$(printf '%s' "$group_b_output" | json_field delivery_token)
+if [ "$group_a_offset" = "$group_b_offset" ]; then
+    printf '%s\n' 'group members received the same record' >&2
+    exit 1
+fi
+"$cli_binary" --server "$broker_addr" ack jobs workers "$group_a_offset" \
+    --member worker-a --delivery-token "$group_a_token"
+"$cli_binary" --server "$broker_addr" ack jobs workers "$group_b_offset" \
+    --member worker-b --delivery-token "$group_b_token"
+
+"$cli_binary" --server "$broker_addr" publish poison poison
+output=$("$cli_binary" --server "$broker_addr" consume poison poison-worker)
+assert_contains "$output" '"delivery_attempt": 1'
+sleep 0.08
+output=$("$cli_binary" --server "$broker_addr" consume poison poison-worker)
+assert_contains "$output" '"delivery_attempt": 2'
+sleep 0.08
+output=$("$cli_binary" --server "$broker_addr" consume poison poison-worker)
+assert_contains "$output" '"type": "empty"'
+output=$("$cli_binary" --server "$broker_addr" consume poison.dead-letter poison-inspector)
+assert_contains "$output" '"payload": "poison"'
+"$cli_binary" --server "$broker_addr" ack poison.dead-letter poison-inspector 0
+curl -fsS "http://127.0.0.1:$http_port/metrics" | grep -Eq 'runnel_dead_letters_total 1'
 
 stop_server
 start_server
-output=$("$PWD/target/debug/runnelctl" --server "$broker_addr" consume events recovery-worker)
+output=$("$cli_binary" --server "$broker_addr" consume events recovery-worker)
 assert_contains "$output" '"offset": 1'
-"$PWD/target/debug/runnelctl" --server "$broker_addr" ack events recovery-worker 1
+"$cli_binary" --server "$broker_addr" ack events recovery-worker 1
 curl -fsS "http://127.0.0.1:$http_port/health/ready" >/dev/null
-curl -fsS "http://127.0.0.1:$http_port/metrics" | grep -Eq 'runnel_streams 1'
+curl -fsS "http://127.0.0.1:$http_port/metrics" | grep -Eq 'runnel_streams 4'
 
 printf '%s\n' 'Runnel smoke test passed'

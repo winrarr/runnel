@@ -70,14 +70,14 @@ async fn local_broker_fences_expired_shared_deliveries() {
     let broker = Broker::open(
         directory.path(),
         BrokerConfig {
-            ack_timeout: std::time::Duration::from_millis(10),
+            ack_timeout: std::time::Duration::from_millis(100),
             max_delivery_attempts: None,
         },
     )
     .unwrap();
     let engine: &dyn Engine = &broker;
 
-    assert_expired_delivery_is_fenced(engine, std::time::Duration::from_millis(20)).await;
+    assert_expired_delivery_is_fenced(engine, std::time::Duration::from_millis(250)).await;
 }
 
 #[tokio::test]
