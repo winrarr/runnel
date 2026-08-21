@@ -12,9 +12,12 @@ const definitions = [
 const colors = ['#75c7ff', '#ff9f68', '#9be28f', '#d7a5ff', '#ffd166', '#ff7aa2', '#76e4d1'];
 
 const profileSelect = document.getElementById('profile');
+const suiteSelect = document.getElementById('suite');
 const operationSelect = document.getElementById('operation');
 const sizeSelect = document.getElementById('size');
 const charts = document.getElementById('charts');
+const changes = document.getElementById('changes');
+const changesNote = document.getElementById('changes-note');
 
 function unique(values) {
   return [...new Set(values)].sort((a, b) => String(a).localeCompare(String(b)));
@@ -47,7 +50,21 @@ function formatValue(value, unit) {
   return value.toLocaleString(undefined, { maximumFractionDigits: 2 });
 }
 
-function filteredPoints(metric, operation, size, profile) {
+function definitionFor(metric) {
+  return definitions.find((definition) => definition.metric === metric);
+}
+
+function pointSuite(point) {
+  if (point.benchmark_suite) return point.benchmark_suite;
+  return point.comparison_mode === 'cluster-baseline' ? 'cluster' : 'native-comparison';
+}
+
+function runSuite(run) {
+  if (run.benchmark_suite) return run.benchmark_suite;
+  return run.comparison_mode === 'cluster-baseline' ? 'cluster' : 'native-comparison';
+}
+
+function filteredPoints(metric, operation, size, profile, suite) {
   const resourceMetric = [
     'cpu_efficiency_messages_per_cpu_second',
     'cpu_percent_max',
@@ -61,7 +78,8 @@ function filteredPoints(metric, operation, size, profile) {
       || point.message_size_bytes === null
       || size === null
       || point.message_size_bytes === size)
-    && (profile === 'all' || point.profile === profile));
+    && (profile === 'all' || point.profile === profile)
+    && (suite === 'all' || pointSuite(point) === suite));
 }
 
 function renderEmptyChart(card) {
@@ -105,8 +123,8 @@ function chartGeometry(points) {
   };
 }
 
-function renderChart(definition, operation, size, profile) {
-  const points = filteredPoints(definition.metric, operation, size, profile);
+function renderChart(definition, operation, size, profile, suite) {
+  const points = filteredPoints(definition.metric, operation, size, profile, suite);
   const card = document.createElement('article');
   card.className = 'chart-card';
 
@@ -143,7 +161,13 @@ function renderChart(definition, operation, size, profile) {
     svg += `<path d="${path}" fill="none" stroke="${color}" stroke-width="2"/>`;
 
     series.forEach((point) => {
-      const detail = `${new Date(point.timestamp).toLocaleString()} · ${backend} · ${formatValue(point.value, definition.unit)}`;
+      const range = point.range
+        ? ` · range ${formatValue(point.range.min, definition.unit)}–${formatValue(point.range.max, definition.unit)}`
+        : '';
+      const change = point.delta_percent === undefined
+        ? ''
+        : ` · change ${point.delta_percent.toFixed(1)}%`;
+      const detail = `${new Date(point.timestamp).toLocaleString()} · ${backend} · ${formatValue(point.value, definition.unit)}${range}${change}`;
       svg += `<circle cx="${geometry.x(point.timestamp_ms)}" cy="${geometry.y(point.value)}" r="3.5" fill="${color}"><title>${escapeText(detail)}</title></circle>`;
     });
   });
@@ -164,15 +188,20 @@ function renderChart(definition, operation, size, profile) {
 
 function refresh() {
   const profile = profileSelect.value;
+  const suite = suiteSelect.value;
   const operation = operationSelect.value;
   const sizeValue = sizeSelect.value;
   const size = sizeValue === 'all' ? null : Number(sizeValue);
-  charts.replaceChildren(...definitions.map((definition) => renderChart(definition, operation, size, profile)));
+  charts.replaceChildren(...definitions.map((definition) => renderChart(definition, operation, size, profile, suite)));
+  renderChanges(operation, size, profile, suite);
 }
 
 function populateSizes() {
+  const suite = suiteSelect.value;
   const sizes = unique(data.points
-    .filter((point) => point.operation === operationSelect.value && point.message_size_bytes !== null)
+    .filter((point) => point.operation === operationSelect.value
+      && (suite === 'all' || pointSuite(point) === suite)
+      && point.message_size_bytes !== null)
     .map((point) => point.message_size_bytes));
   const oldValue = sizeSelect.value;
   sizeSelect.replaceChildren(
@@ -186,20 +215,51 @@ function populateSizes() {
   }
 }
 
+function populateOperations() {
+  const suite = suiteSelect.value;
+  const oldValue = operationSelect.value;
+  const operations = unique(data.points
+    .filter((point) => point.metric === 'throughput_messages_per_second'
+      && (suite === 'all' || pointSuite(point) === suite))
+    .map((point) => point.operation));
+  operationSelect.replaceChildren(...operations.map((value) => new Option(value, value)));
+  if (operations.includes(oldValue)) {
+    operationSelect.value = oldValue;
+  } else if (operations.includes('publish')) {
+    operationSelect.value = 'publish';
+  } else if (operations.length) {
+    operationSelect.value = operations[0];
+  }
+}
+
+function suiteLabel(value) {
+  return {
+    'native-comparison': 'Native broker comparison',
+    cluster: 'Runnel cluster',
+  }[value] || value;
+}
+
 function populate() {
+  const suites = unique(data.points.map(pointSuite));
+  suiteSelect.replaceChildren(
+    new Option('All suites', 'all'),
+    ...suites.map((value) => new Option(suiteLabel(value), value)),
+  );
+  if (suites.includes('native-comparison')) suiteSelect.value = 'native-comparison';
+
   const profiles = unique(data.points.map((point) => point.profile));
   profileSelect.replaceChildren(
     new Option('All profiles', 'all'),
     ...profiles.map((value) => new Option(value, value)),
   );
 
-  const operations = unique(data.points
-    .filter((point) => point.metric === 'throughput_messages_per_second')
-    .map((point) => point.operation));
-  operationSelect.replaceChildren(...operations.map((value) => new Option(value, value)));
-  if (operations.includes('publish')) operationSelect.value = 'publish';
-
+  populateOperations();
   populateSizes();
+  suiteSelect.addEventListener('change', () => {
+    populateOperations();
+    populateSizes();
+    refresh();
+  });
   profileSelect.addEventListener('change', refresh);
   operationSelect.addEventListener('change', () => {
     populateSizes();
@@ -217,8 +277,34 @@ function renderRuns() {
     const commit = run.run_url
       ? `<a href="${escapeText(run.run_url)}">${escapeText(run.revision.slice(0, 12))}</a>`
       : `<code>${escapeText(run.revision.slice(0, 12))}</code>`;
-    row.innerHTML = `<td>${escapeText(time)}</td><td>${escapeText(run.profile)}</td><td>${commit}</td><td>${escapeText(run.event || '')}</td><td>${escapeText(run.backends.join(', '))}</td><td>${escapeText(JSON.stringify(run.resource_limits || {}))}</td>`;
+    row.innerHTML = `<td>${escapeText(time)}</td><td>${escapeText(suiteLabel(runSuite(run)))}</td><td>${escapeText(run.profile)}</td><td>${escapeText(run.repetitions || 1)}</td><td>${commit}</td><td>${escapeText(run.event || '')}</td><td>${escapeText(run.backends.join(', '))}</td><td>${escapeText(JSON.stringify(run.resource_limits || {}))}</td>`;
     tbody.appendChild(row);
+  });
+}
+
+function renderChanges(operation, size, profile, suite) {
+  const candidates = data.points.filter((point) => point.previous_value !== undefined
+    && point.operation === operation
+    && (size === null || point.message_size_bytes === size)
+    && (profile === 'all' || point.profile === profile)
+    && (suite === 'all' || pointSuite(point) === suite));
+  changes.replaceChildren();
+  if (!candidates.length) {
+    changesNote.textContent = 'No previous comparable run is available for this selection.';
+    return;
+  }
+
+  const latestTimestamp = Math.max(...candidates.map((point) => point.timestamp_ms));
+  const latest = candidates.filter((point) => point.timestamp_ms === latestTimestamp);
+  const latestPoint = latest[0];
+  changesNote.textContent = `Compared with the previous ${suiteLabel(pointSuite(latestPoint))} run for commit ${latestPoint.revision.slice(0, 12)}. Each value is the median of ${latestPoint.repetitions || 1} repetition(s).`;
+  latest.forEach((point) => {
+    const definition = definitionFor(point.metric);
+    const row = document.createElement('tr');
+    const percent = point.delta_percent === undefined ? 'n/a' : `${point.delta_percent.toFixed(1)}%`;
+    const result = point.improved ? 'Improved' : 'Regressed';
+    row.innerHTML = `<td>${escapeText(point.backend)}</td><td>${escapeText(definition ? definition.title : point.metric)}</td><td>${escapeText(formatValue(point.value, definition ? definition.unit : ''))}</td><td>${escapeText(formatValue(point.previous_value, definition ? definition.unit : ''))}</td><td>${escapeText(percent)}</td><td class="${point.improved ? 'improved' : 'regressed'}">${result}</td>`;
+    changes.appendChild(row);
   });
 }
 

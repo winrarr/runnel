@@ -22,6 +22,7 @@ METRIC_DEFINITIONS = [
     ("cpu_percent_max", "Peak broker CPU", "%", False),
     ("memory_bytes_max", "Peak broker memory", "bytes", False),
 ]
+METRIC_CONFIG = {name: higher_better for name, _, _, higher_better in METRIC_DEFINITIONS}
 
 
 def parse_timestamp(value: str) -> float:
@@ -63,26 +64,50 @@ def add_point(
     metric: str,
     value: float,
     unit: str,
+    repetitions: int | None = None,
+    repetition_summary: dict[str, Any] | None = None,
 ) -> None:
     if not isinstance(value, (int, float)):
         return
     source = run.get("source", {})
-    points.append(
-        {
-            "timestamp": run.get("generated_at"),
-            "timestamp_ms": parse_timestamp(run.get("generated_at", "")) * 1000,
-            "run_file": run.get("_path"),
-            "profile": source.get("profile", "local"),
-            "revision": source.get("revision", "unknown"),
-            "run_url": source.get("run_url"),
-            "backend": backend,
-            "operation": operation,
-            "message_size_bytes": size,
-            "metric": metric,
-            "value": float(value),
-            "unit": unit,
-        }
-    )
+    point = {
+        "timestamp": run.get("generated_at"),
+        "timestamp_ms": parse_timestamp(run.get("generated_at", "")) * 1000,
+        "run_file": run.get("_path"),
+        "profile": source.get("profile", "local"),
+        "revision": source.get("revision", "unknown"),
+        "run_url": source.get("run_url"),
+        "comparison_mode": run.get("comparison_mode", "unknown"),
+        "benchmark_suite": benchmark_suite(run),
+        "backend": backend,
+        "operation": operation,
+        "message_size_bytes": size,
+        "metric": metric,
+        "value": float(value),
+        "unit": unit,
+    }
+    if repetitions is not None:
+        point["repetitions"] = repetitions
+    if repetition_summary:
+        metric_summary = repetition_summary.get(metric)
+        if isinstance(metric_summary, dict):
+            point["range"] = {
+                key: metric_summary[key]
+                for key in ("min", "median", "max")
+                if key in metric_summary
+            }
+    points.append(point)
+
+
+def benchmark_suite(run: dict[str, Any]) -> str:
+    explicit = run.get("benchmark_suite")
+    if isinstance(explicit, str) and explicit:
+        return explicit
+    if run.get("comparison_mode") == "cluster-baseline":
+        return "cluster"
+    if run.get("workload", {}).get("single_node") is True:
+        return "native-comparison"
+    return "other"
 
 
 def build_points(runs: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -94,6 +119,10 @@ def build_points(runs: list[dict[str, Any]]) -> list[dict[str, Any]]:
                 operation = str(scenario.get("operation", "unknown"))
                 size_value = scenario.get("message_size_bytes")
                 size = int(size_value) if isinstance(size_value, (int, float)) else None
+                repetitions = scenario.get(
+                    "repetitions", run.get("aggregate", {}).get("repetitions")
+                )
+                repetition_summary = scenario.get("repetition_summary", {})
                 throughput = scenario.get("throughput_messages_per_second")
                 if isinstance(throughput, (int, float)):
                     add_point(
@@ -105,6 +134,8 @@ def build_points(runs: list[dict[str, Any]]) -> list[dict[str, Any]]:
                         metric="throughput_messages_per_second",
                         value=float(throughput),
                         unit=units["throughput_messages_per_second"],
+                        repetitions=repetitions,
+                        repetition_summary=repetition_summary,
                     )
 
                 for percentile, metric in (
@@ -124,6 +155,8 @@ def build_points(runs: list[dict[str, Any]]) -> list[dict[str, Any]]:
                             metric=metric,
                             value=float(value),
                             unit=units[metric],
+                            repetitions=repetitions,
+                            repetition_summary=repetition_summary,
                         )
 
                 resources = scenario.get("resource_samples", {})
@@ -144,29 +177,44 @@ def build_points(runs: list[dict[str, Any]]) -> list[dict[str, Any]]:
                             metric=metric,
                             value=float(value),
                             unit=units[metric],
+                            repetitions=repetitions,
+                            repetition_summary=repetition_summary,
                         )
 
                 cpu_seconds = resources.get("cpu_seconds")
                 messages = scenario.get("messages")
-                if (
-                    isinstance(cpu_seconds, (int, float))
-                    and cpu_seconds > 0
-                    and isinstance(messages, (int, float))
-                    and messages > 0
-                    and isinstance(throughput, (int, float))
-                ):
-                    add_point(
-                        points,
-                        run=run,
-                        backend=backend_name,
-                        operation=operation,
-                        size=size,
-                        metric="cpu_efficiency_messages_per_cpu_second",
-                        value=float(messages) / float(cpu_seconds),
-                        unit=units["cpu_efficiency_messages_per_cpu_second"],
-                    )
+                efficiency_summary = repetition_summary.get(
+                    "cpu_efficiency_messages_per_cpu_second", {}
+                )
+                efficiency_value = (
+                    efficiency_summary.get("median")
+                    if isinstance(efficiency_summary, dict)
+                    else None
+                )
+                if not isinstance(messages, (int, float)) or messages <= 0:
+                    continue
+                if not isinstance(efficiency_value, (int, float)):
+                    if not isinstance(cpu_seconds, (int, float)) or cpu_seconds <= 0:
+                        continue
+                    efficiency_value = float(messages) / float(cpu_seconds)
+                add_point(
+                    points,
+                    run=run,
+                    backend=backend_name,
+                    operation=operation,
+                    size=size,
+                    metric="cpu_efficiency_messages_per_cpu_second",
+                    value=float(efficiency_value),
+                    unit=units["cpu_efficiency_messages_per_cpu_second"],
+                    repetitions=repetitions,
+                    repetition_summary=repetition_summary,
+                )
 
             resources = backend.get("resource_samples", {})
+            backend_repetitions = backend.get(
+                "repetitions", run.get("aggregate", {}).get("repetitions")
+            )
+            backend_summary = backend.get("repetition_summary", {})
             for metric, key in (
                 ("cpu_percent_max", "cpu_percent_max"),
                 ("memory_bytes_max", "memory_bytes_max"),
@@ -182,6 +230,8 @@ def build_points(runs: list[dict[str, Any]]) -> list[dict[str, Any]]:
                         metric=metric,
                         value=float(value),
                         unit=units[metric],
+                        repetitions=backend_repetitions,
+                        repetition_summary=backend_summary,
                     )
     return points
 
@@ -200,17 +250,90 @@ def site_data(runs: list[dict[str, Any]]) -> dict[str, Any]:
                 "event": source.get("event"),
                 "workflow": source.get("workflow"),
                 "run_file": run.get("_path"),
+                "comparison_mode": run.get("comparison_mode"),
+                "benchmark_suite": benchmark_suite(run),
+                "repetitions": run.get("aggregate", {}).get(
+                    "repetitions", source.get("repetitions", 1)
+                ),
                 "backends": sorted(run.get("backends", {}).keys()),
                 "resource_limits": run.get("resource_limits", {}),
                 "workload": run.get("workload", {}),
             }
         )
+    points = build_points(runs)
+    add_comparable_deltas(runs, points)
     return {
         "schema_version": 1,
         "generated_at": datetime.now(UTC).isoformat(),
         "runs": public_runs,
-        "points": build_points(runs),
+        "points": points,
     }
+
+
+def comparison_identity(run: dict[str, Any]) -> str:
+    return json.dumps(
+        {
+            "benchmark_suite": benchmark_suite(run),
+            "comparison_mode": run.get("comparison_mode"),
+            "resource_limits": run.get("resource_limits", {}),
+            "workload": run.get("workload", {}),
+            "backends": {
+                name: {
+                    key: backend.get(key)
+                    for key in (
+                        "image",
+                        "acknowledgement",
+                        "replication",
+                        "measurement_boundary",
+                        "measurement_client",
+                    )
+                }
+                for name, backend in run.get("backends", {}).items()
+            },
+        },
+        sort_keys=True,
+    )
+
+
+def add_comparable_deltas(runs: list[dict[str, Any]], points: list[dict[str, Any]]) -> None:
+    points_by_run: dict[str | None, list[dict[str, Any]]] = {}
+    for point in points:
+        points_by_run.setdefault(point.get("run_file"), []).append(point)
+
+    previous: dict[str, dict[tuple[Any, ...], dict[str, Any]]] = {}
+    for run in runs:
+        identity = comparison_identity(run)
+        current_points = points_by_run.get(run.get("_path"), [])
+        current_by_key = {
+            (
+                point["backend"],
+                point["operation"],
+                point["message_size_bytes"],
+                point["metric"],
+            ): point
+            for point in current_points
+        }
+        previous_points = previous.get(identity, {})
+        for key, point in current_by_key.items():
+            old = previous_points.get(key)
+            if old is None:
+                continue
+            old_value = old.get("value")
+            current_value = point.get("value")
+            if not isinstance(old_value, (int, float)) or not isinstance(
+                current_value, (int, float)
+            ):
+                continue
+            point["previous_value"] = old_value
+            point["delta"] = current_value - old_value
+            if old_value != 0:
+                point["delta_percent"] = ((current_value - old_value) / old_value) * 100
+            point["improved"] = (
+                current_value > old_value
+                if METRIC_CONFIG.get(point["metric"], True)
+                else current_value < old_value
+            )
+        previous[identity] = current_by_key
 
 
 def parse_args() -> argparse.Namespace:

@@ -749,6 +749,7 @@ def main() -> int:
         "schema_version": 1,
         "generated_at": timestamp.isoformat(),
         "comparison_mode": "cluster-baseline",
+        "benchmark_suite": "cluster",
         "git_revision": git_revision(),
         "host": {
             "platform": platform.platform(),

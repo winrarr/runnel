@@ -80,6 +80,17 @@ def environment_metadata() -> dict[str, Any]:
     return metadata
 
 
+def benchmark_suite(result: dict[str, Any]) -> str:
+    explicit = result.get("benchmark_suite")
+    if isinstance(explicit, str) and explicit:
+        return explicit
+    if result.get("comparison_mode") == "cluster-baseline":
+        return "cluster"
+    if result.get("workload", {}).get("single_node") is True:
+        return "native-comparison"
+    return "other"
+
+
 def _latency_values(scenario: dict[str, Any]) -> dict[str, float]:
     latency = scenario.get("latency_microseconds")
     if not isinstance(latency, dict):
@@ -153,6 +164,7 @@ def normalize_result(result: dict[str, Any], *, source_name: str = "comparison")
         "source": source_metadata(),
         "environment": environment_metadata(),
         "comparison_mode": result.get("comparison_mode"),
+        "benchmark_suite": benchmark_suite(result),
         "resource_limits": result.get("resource_limits", {}),
         "workload": result["workload"],
         "backends": backends,

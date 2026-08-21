@@ -114,6 +114,21 @@ python3 scripts/benchmarks/build_history.py \
 
 The normalized schema intentionally excludes native tool logs. It retains workload, limits, image identifiers, semantic boundaries, scenario resource samples, source revision, workflow provenance, and measured points. `build_history.py` aggregates these records into `site/data.json` on the generated `benchmark-history` branch. The hand-authored HTML, CSS, and JavaScript in `docs/benchmarks/` are served directly by GitHub Pages and read that public history data from the raw GitHub URL. Invalid or unrelated JSON files are skipped.
 
+For repeated measurements, normalize each independent result and aggregate the
+normalized files with the median as the displayed value:
+
+```text
+python3 scripts/benchmarks/aggregate.py \
+  --inputs benchmark-results/normalized/native-repetition-*.json \
+  --output benchmark-results/normalized/native-aggregate.json
+```
+
+The aggregate records the repetition count and min/median/max observed range
+for each measured metric. The automatic workflow performs this for both the
+native comparison and the clustered Runnel suite. A benchmark history point is
+compared only with the previous run that has the same suite, workload, resource
+limits, broker image, measurement boundary, and comparison mode.
+
 To generate history data locally:
 
 ```text

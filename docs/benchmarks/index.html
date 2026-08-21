@@ -9,7 +9,7 @@
 <body>
   <main>
     <h1>Runnel benchmark history</h1>
-    <p class="muted">Automatic measurements from the pinned native-tool broker comparison.</p>
+    <p class="muted">Automatic measurements from the native broker comparison and clustered Runnel baseline.</p>
     <p class="notice">
       Interpret series according to their recorded measurement boundaries. Runnel and JetStream
       include acknowledgement paths; Kafka and Redpanda consumer figures currently measure fetch
@@ -20,6 +20,7 @@
     </p>
 
     <section class="controls" aria-label="Chart filters">
+      <label>Benchmark suite<select id="suite"></select></label>
       <label>Profile<select id="profile"></select></label>
       <label>Operation<select id="operation"></select></label>
       <label>Payload size<select id="size"></select></label>
@@ -27,12 +28,30 @@
 
     <section id="charts" class="charts" aria-live="polite"></section>
 
+    <h2>Latest comparable change</h2>
+    <p id="changes-note" class="muted"></p>
+    <table>
+      <thead>
+        <tr>
+          <th>Backend</th>
+          <th>Metric</th>
+          <th>Current</th>
+          <th>Previous</th>
+          <th>Change</th>
+          <th>Result</th>
+        </tr>
+      </thead>
+      <tbody id="changes"></tbody>
+    </table>
+
     <h2>Recent runs</h2>
     <table>
       <thead>
         <tr>
           <th>Time</th>
+          <th>Suite</th>
           <th>Profile</th>
+          <th>Repetitions</th>
           <th>Commit</th>
           <th>Event</th>
           <th>Backends</th>
