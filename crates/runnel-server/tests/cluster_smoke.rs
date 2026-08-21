@@ -8,7 +8,10 @@ use std::time::{Duration, Instant};
 use runnel_protocol::{Request, Response};
 use tempfile::TempDir;
 
-const CLUSTER_WAIT_TIMEOUT: Duration = Duration::from_secs(30);
+// Restart and log replay can be substantially slower on contended CI disks;
+// keep the assertion bounded without treating an intermediate empty poll as
+// successful recovery.
+const CLUSTER_WAIT_TIMEOUT: Duration = Duration::from_secs(60);
 // Durable publishes can overlap snapshot serialization; keep request attempts
 // bounded while allowing that work more time than the lightweight smoke paths.
 const REQUEST_READ_TIMEOUT: Duration = Duration::from_secs(5);
