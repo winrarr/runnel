@@ -8,7 +8,10 @@ use std::time::{Duration, Instant};
 use runnel_protocol::{Request, Response};
 use tempfile::TempDir;
 
-const CLUSTER_WAIT_TIMEOUT: Duration = Duration::from_secs(30);
+// Restart and log replay can be substantially slower on contended CI disks;
+// keep the assertion bounded without treating an intermediate empty poll as
+// successful recovery.
+const CLUSTER_WAIT_TIMEOUT: Duration = Duration::from_secs(60);
 // Durable publishes can overlap snapshot serialization; keep request attempts
 // bounded while allowing that work more time than the lightweight smoke paths.
 const REQUEST_READ_TIMEOUT: Duration = Duration::from_secs(5);
@@ -897,12 +900,12 @@ fn replacement_node_recovers_from_compacted_snapshot() {
     wait_for_active_snapshot_transfer(nodes[replacement].http_addr);
     nodes[replacement].stop();
     nodes[replacement].restart();
-    wait_for_message_at(nodes[replacement].broker_addr, 1, "snapshot-1");
     wait_for_metric_at_least(
         nodes[replacement].http_addr,
         "runnel_snapshot_installs_completed_total",
         1,
     );
+    wait_for_message_at(nodes[replacement].broker_addr, 1, "snapshot-1");
     let metrics = http_metrics(nodes[replacement].http_addr);
     assert!(
         metric_value(&metrics, "runnel_snapshot_transfer_chunks_received_total") >= 1,

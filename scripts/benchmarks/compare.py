@@ -836,6 +836,7 @@ def main() -> int:
         "schema_version": 1,
         "generated_at": timestamp.isoformat(),
         "comparison_mode": "native broker tools; first-pass, not a final apples-to-apples claim",
+        "benchmark_suite": "native-comparison",
         "resource_limits": {
             "broker_cpu": args.cpus,
             "broker_memory": args.memory,

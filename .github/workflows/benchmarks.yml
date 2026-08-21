@@ -11,6 +11,10 @@ on:
         description: Number of messages per benchmark scenario
         required: false
         default: "10000"
+      repetitions:
+        description: Independent repetitions to aggregate per benchmark suite
+        required: false
+        default: "3"
 
 permissions:
   contents: read
@@ -21,33 +25,71 @@ concurrency:
 
 jobs:
   benchmark:
-    name: Run comparison
+    name: Run broker comparisons and cluster baseline
     runs-on: ubuntu-24.04
-    timeout-minutes: 20
+    timeout-minutes: 40
     env:
       BENCHMARK_PROFILE: ${{ github.event_name == 'schedule' && 'scheduled' || github.event_name == 'workflow_dispatch' && 'manual' || 'push' }}
+      BENCHMARK_MESSAGES: ${{ inputs.messages || '10000' }}
+      BENCHMARK_REPETITIONS: ${{ inputs.repetitions || '3' }}
     steps:
       - uses: actions/checkout@v7.0.1
-      - name: Run benchmark matrix
+      - uses: dtolnay/rust-toolchain@1.97.1
+      - uses: Swatinem/rust-cache@v2.9.2
+      - name: Run native comparison repetitions
         run: |
-          mkdir -p benchmark-results
-          python3 scripts/benchmarks/compare.py \
-            --build-runnel \
-            --messages "${{ inputs.messages || '10000' }}" \
-            --payload-sizes 100,1024 \
-            --cpus 2 \
-            --memory 2g \
-            --output benchmark-results/compare.json
-      - name: Normalize result for history
+          set -euo pipefail
+          mkdir -p benchmark-results/raw benchmark-results/normalized
+          for repetition in $(seq 1 "$BENCHMARK_REPETITIONS"); do
+            build_args=()
+            if [ "$repetition" -eq 1 ]; then
+              build_args+=(--build-runnel)
+            fi
+            python3 scripts/benchmarks/compare.py \
+              "${build_args[@]}" \
+              --runnel-image runnel:bench \
+              --messages "$BENCHMARK_MESSAGES" \
+              --payload-sizes 100,1024 \
+              --cpus 2 \
+              --memory 2g \
+              --output "benchmark-results/raw/native-${repetition}.json"
+            python3 scripts/benchmarks/normalize.py \
+              --input "benchmark-results/raw/native-${repetition}.json" \
+              --output "benchmark-results/normalized/native-repetition-${repetition}.json"
+          done
+          python3 scripts/benchmarks/aggregate.py \
+            --inputs benchmark-results/normalized/native-repetition-*.json \
+            --output benchmark-results/normalized/native-aggregate.json
+      - name: Run clustered Runnel repetitions
         run: |
-          python3 scripts/benchmarks/normalize.py \
-            --input benchmark-results/compare.json \
-            --output benchmark-results/normalized.json
-      - name: Upload raw and normalized results
+          set -euo pipefail
+          mkdir -p benchmark-results/raw benchmark-results/normalized benchmark-results/logs
+          for repetition in $(seq 1 "$BENCHMARK_REPETITIONS"); do
+            build_args=()
+            if [ "$repetition" -eq 1 ]; then
+              build_args+=(--build)
+            fi
+            python3 scripts/benchmarks/cluster.py \
+              "${build_args[@]}" \
+              --binary target/release/runnel \
+              --messages "$BENCHMARK_MESSAGES" \
+              --warmup 100 \
+              --concurrency 2 \
+              --payload-sizes 100,1024 \
+              --output "benchmark-results/raw/cluster-${repetition}.json" \
+              --log-dir "benchmark-results/logs/cluster-${repetition}"
+            python3 scripts/benchmarks/normalize.py \
+              --input "benchmark-results/raw/cluster-${repetition}.json" \
+              --output "benchmark-results/normalized/cluster-repetition-${repetition}.json"
+          done
+          python3 scripts/benchmarks/aggregate.py \
+            --inputs benchmark-results/normalized/cluster-repetition-*.json \
+            --output benchmark-results/normalized/cluster-aggregate.json
+      - name: Upload raw and aggregated results
         uses: actions/upload-artifact@v7.0.1
         with:
           name: benchmark-run-${{ github.run_id }}
-          path: benchmark-results/*.json
+          path: benchmark-results
           if-no-files-found: error
 
   publish:
@@ -84,9 +126,12 @@ jobs:
             git -C history clean -fdx
           fi
           mkdir -p history/runs
-          run_timestamp=$(python3 -c 'import json; print(json.load(open("benchmark-results/normalized.json", encoding="utf-8"))["generated_at"].replace(":", "").replace("+00:00", "Z"))')
           short_sha="${GITHUB_SHA:0:12}"
-          cp benchmark-results/normalized.json "history/runs/${run_timestamp}-${short_sha}.json"
+          for result in benchmark-results/normalized/*-aggregate.json; do
+            run_timestamp=$(python3 -c 'import json, sys; print(json.load(open(sys.argv[1], encoding="utf-8"))["generated_at"].replace(":", "").replace("+00:00", "Z"))' "$result")
+            suite=$(basename "$result" -aggregate.json)
+            cp "$result" "history/runs/${run_timestamp}-${short_sha}-${suite}.json"
+          done
           python3 scripts/benchmarks/build_history.py \
             --runs history/runs \
             --output history/site

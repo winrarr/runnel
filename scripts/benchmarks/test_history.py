@@ -1,3 +1,4 @@
+import copy
 import json
 import sys
 import tempfile
@@ -9,6 +10,7 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 sys.path.insert(0, str(SCRIPT_DIR))
 
 from build_history import build_points, load_runs, site_data  # noqa: E402
+from aggregate import aggregate_results  # noqa: E402
 from normalize import normalize_result  # noqa: E402
 from resources import parse_cpu_stat, summarize_stats  # noqa: E402
 
@@ -88,6 +90,49 @@ class HistoryTests(unittest.TestCase):
                 "memory_bytes_max",
             },
         )
+
+    def test_aggregation_keeps_medians_and_observed_ranges(self) -> None:
+        first = normalize_result(comparison_result(), source_name="first.json")
+        second = copy.deepcopy(first)
+        second["generated_at"] = "2026-08-20T08:58:56.024168+00:00"
+        second["backends"]["runnel"]["scenarios"][0][
+            "throughput_messages_per_second"
+        ] = 2000.0
+
+        aggregated = aggregate_results([first, second])
+        scenario = aggregated["backends"]["runnel"]["scenarios"][0]
+        self.assertEqual(aggregated["aggregate"]["repetitions"], 2)
+        self.assertEqual(scenario["repetitions"], 2)
+        self.assertEqual(scenario["throughput_messages_per_second"], 1500.0)
+        self.assertEqual(
+            scenario["repetition_summary"]["throughput_messages_per_second"]["min"],
+            1000.0,
+        )
+
+    def test_site_data_compares_only_compatible_runs(self) -> None:
+        first = normalize_result(comparison_result(), source_name="first.json")
+        second = copy.deepcopy(first)
+        second["generated_at"] = "2026-08-20T08:58:56.024168+00:00"
+        second["backends"]["runnel"]["scenarios"][0][
+            "throughput_messages_per_second"
+        ] = 2000.0
+        second["backends"]["runnel"]["image_id"] = "sha256:rebuilt"
+
+        generated = site_data(
+            [
+                {**first, "_path": "first.json"},
+                {**second, "_path": "second.json"},
+            ]
+        )
+        current = next(
+            point
+            for point in generated["points"]
+            if point["run_file"] == "second.json"
+            and point["metric"] == "throughput_messages_per_second"
+        )
+        self.assertEqual(current["previous_value"], 1000.0)
+        self.assertEqual(current["delta_percent"], 100.0)
+        self.assertTrue(current["improved"])
 
     def test_resource_helpers_report_cpu_time_and_averages(self) -> None:
         self.assertEqual(parse_cpu_stat("usage_usec 250000\nuser_usec 1\n"), 0.25)

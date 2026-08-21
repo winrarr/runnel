@@ -159,6 +159,14 @@ a {
   color: var(--accent);
 }
 
+.improved {
+  color: #9be28f;
+}
+
+.regressed {
+  color: #ff9f68;
+}
+
 code {
   font-size: 0.9em;
 }
