@@ -897,12 +897,12 @@ fn replacement_node_recovers_from_compacted_snapshot() {
     wait_for_active_snapshot_transfer(nodes[replacement].http_addr);
     nodes[replacement].stop();
     nodes[replacement].restart();
-    wait_for_message_at(nodes[replacement].broker_addr, 1, "snapshot-1");
     wait_for_metric_at_least(
         nodes[replacement].http_addr,
         "runnel_snapshot_installs_completed_total",
         1,
     );
+    wait_for_message_at(nodes[replacement].broker_addr, 1, "snapshot-1");
     let metrics = http_metrics(nodes[replacement].http_addr);
     assert!(
         metric_value(&metrics, "runnel_snapshot_transfer_chunks_received_total") >= 1,
