@@ -2883,10 +2883,12 @@ impl Engine for PersistentEngine {
     fn poll<'a>(&'a self, stream: &'a str, consumer: &'a str) -> EngineFuture<'a, PollResult> {
         Box::pin(async move {
             let data_group = self.manager.data_group_for_stream(stream).await?;
-            let leader_id = data_group.raft().current_leader().await;
-            if leader_id != Some(self.node_id) {
+            let Some(leader_id) = data_group.raft().current_leader().await else {
+                return Err(BrokerError::NotLeader { leader_id: None });
+            };
+            if leader_id != self.node_id {
                 return self
-                    .forward_poll(stream.to_owned(), consumer.to_owned(), leader_id)
+                    .forward_poll(stream.to_owned(), consumer.to_owned(), Some(leader_id))
                     .await;
             }
             self.manager.poll_local(stream, consumer).await
@@ -2901,14 +2903,16 @@ impl Engine for PersistentEngine {
     ) -> EngineFuture<'a, PollResult> {
         Box::pin(async move {
             let data_group = self.manager.data_group_for_stream(stream).await?;
-            let leader_id = data_group.raft().current_leader().await;
-            if leader_id != Some(self.node_id) {
+            let Some(leader_id) = data_group.raft().current_leader().await else {
+                return Err(BrokerError::NotLeader { leader_id: None });
+            };
+            if leader_id != self.node_id {
                 return self
                     .forward_poll_group(
                         stream.to_owned(),
                         consumer.to_owned(),
                         member.to_owned(),
-                        leader_id,
+                        Some(leader_id),
                     )
                     .await;
             }

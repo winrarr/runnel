@@ -12,9 +12,9 @@ use tempfile::TempDir;
 // keep the assertion bounded without treating an intermediate empty poll as
 // successful recovery.
 const CLUSTER_WAIT_TIMEOUT: Duration = Duration::from_secs(60);
-// Durable publishes can overlap snapshot serialization; keep request attempts
-// bounded while allowing that work more time than the lightweight smoke paths.
-const REQUEST_READ_TIMEOUT: Duration = Duration::from_secs(5);
+// Durable publishes and snapshot recovery can overlap while a node rejoins;
+// allow one request to span the bounded cluster recovery window.
+const REQUEST_READ_TIMEOUT: Duration = CLUSTER_WAIT_TIMEOUT;
 
 struct RunningNode {
     node_id: u64,
@@ -1040,12 +1040,13 @@ fn wait_for_message_at(address: SocketAddr, offset: u64, payload: &str) {
     let deadline = Instant::now() + CLUSTER_WAIT_TIMEOUT;
     let mut last_response = None;
     while Instant::now() < deadline {
-        let response = request(
+        let response = request_with_timeout(
             address,
             Request::Poll {
                 stream: "events".to_owned(),
                 consumer: "worker".to_owned(),
             },
+            CLUSTER_WAIT_TIMEOUT,
         );
         if let Ok(Response::Message {
             offset: received,
@@ -1060,8 +1061,9 @@ fn wait_for_message_at(address: SocketAddr, offset: u64, payload: &str) {
         last_response = Some(response);
         sleep(Duration::from_millis(50));
     }
+    let metrics = http_metrics(address);
     panic!(
-        "node {address} did not recover message at offset {offset}; last response: {last_response:?}"
+        "node {address} did not recover message at offset {offset}; last response: {last_response:?}; metrics:\n{metrics}"
     );
 }
 
@@ -1168,10 +1170,18 @@ fn metric_value(metrics: &str, name: &str) -> u64 {
 }
 
 fn request(address: SocketAddr, request: Request) -> Result<Response, String> {
+    request_with_timeout(address, request, REQUEST_READ_TIMEOUT)
+}
+
+fn request_with_timeout(
+    address: SocketAddr,
+    request: Request,
+    read_timeout: Duration,
+) -> Result<Response, String> {
     let mut stream =
         TcpStream::connect(address).map_err(|error| format!("connect to {address}: {error}"))?;
     stream
-        .set_read_timeout(Some(REQUEST_READ_TIMEOUT))
+        .set_read_timeout(Some(read_timeout))
         .map_err(|error| format!("set read timeout for {address}: {error}"))?;
     let encoded = serde_json::to_string(&request)
         .map_err(|error| format!("encode request for {address}: {error}"))?;
