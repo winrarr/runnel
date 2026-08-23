@@ -1144,21 +1144,36 @@ fn path_component(value: &str) -> String {
 }
 
 fn http_metrics(address: SocketAddr) -> String {
-    let mut stream = TcpStream::connect(address).expect("metrics endpoint should accept requests");
+    let deadline = Instant::now() + CLUSTER_WAIT_TIMEOUT;
+    let mut last_error = None;
+    while Instant::now() < deadline {
+        match try_http_metrics(address) {
+            Ok(metrics) => return metrics,
+            Err(error) => last_error = Some(error),
+        }
+        sleep(Duration::from_millis(50));
+    }
+    panic!(
+        "metrics endpoint {address} did not respond before the deadline; last error: {last_error:?}"
+    );
+}
+
+fn try_http_metrics(address: SocketAddr) -> Result<String, String> {
+    let mut stream = TcpStream::connect(address).map_err(|error| error.to_string())?;
     stream
         .set_read_timeout(Some(Duration::from_secs(2)))
-        .expect("metrics read timeout should be set");
+        .map_err(|error| error.to_string())?;
     stream
         .write_all(b"GET /metrics HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
-        .expect("metrics request should be written");
+        .map_err(|error| error.to_string())?;
     let mut response = String::new();
     stream
         .read_to_string(&mut response)
-        .expect("metrics response should be readable");
-    match response.find("\r\n\r\n") {
+        .map_err(|error| error.to_string())?;
+    Ok(match response.find("\r\n\r\n") {
         Some(index) => response[index + 4..].to_owned(),
         None => response,
-    }
+    })
 }
 
 fn metric_value(metrics: &str, name: &str) -> u64 {
