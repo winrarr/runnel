@@ -53,6 +53,7 @@ The current implementation serializes broker operations behind one in-process lo
 - Add a focused crash/recovery test before changing persistence, acknowledgement, or redelivery behavior.
 - Treat benchmarks as part of performance work; include the durability mode and workload in every result.
 - Treat anything that could improve throughput or latency as worth considering. Evaluate allocation, copying, lock scope, batching, I/O, scheduling, transport, and encoding effects when making changes, while preserving correctness, bounded resource use, and predictable tail latency. Benchmark material assumptions instead of optimizing on intuition alone.
+- Treat `just` recipes, development scripts, and CLI flags as part of the developer-facing interface. When changing a test, benchmark, or operational workflow, expose useful workload, wait, timeout, retry, isolation, and output controls when they have a real use; keep defaults sensible, document them, and test them. Prefer explicit options over hard-coded values, without adding speculative configuration.
 - Keep network behavior covered by tests that start the real server process.
 - Keep the pinned development toolchain separate from compatibility policy; do not infer a supported compiler floor from the pinned version.
 
