@@ -14,7 +14,7 @@ on:
       cluster_messages:
         description: Number of messages per clustered Runnel scenario
         required: false
-        default: "1000"
+        default: "200"
       repetitions:
         description: Independent repetitions to aggregate per benchmark suite
         required: false
@@ -35,7 +35,7 @@ jobs:
     env:
       BENCHMARK_PROFILE: ${{ github.event_name == 'schedule' && 'scheduled' || github.event_name == 'workflow_dispatch' && 'manual' || 'push' }}
       BENCHMARK_MESSAGES: ${{ inputs.messages || '10000' }}
-      BENCHMARK_CLUSTER_MESSAGES: ${{ inputs.cluster_messages || '1000' }}
+      BENCHMARK_CLUSTER_MESSAGES: ${{ inputs.cluster_messages || '200' }}
       BENCHMARK_REPETITIONS: ${{ inputs.repetitions || '3' }}
     steps:
       - uses: actions/checkout@v7.0.1
