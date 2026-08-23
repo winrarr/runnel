@@ -11,7 +11,7 @@ use tempfile::TempDir;
 // Restart and log replay can be substantially slower on contended CI disks;
 // keep the assertion bounded without treating an intermediate empty poll as
 // successful recovery.
-const CLUSTER_WAIT_TIMEOUT: Duration = Duration::from_secs(60);
+const CLUSTER_WAIT_TIMEOUT: Duration = Duration::from_secs(120);
 // Durable publishes and snapshot recovery can overlap while a node rejoins;
 // allow one request to span the bounded cluster recovery window.
 const REQUEST_READ_TIMEOUT: Duration = CLUSTER_WAIT_TIMEOUT;

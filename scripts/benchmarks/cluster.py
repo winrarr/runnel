@@ -43,7 +43,9 @@ DEFAULT_BINARY = default_binary()
 DEFAULT_MESSAGES = 1_000
 DEFAULT_WARMUP = 50
 DEFAULT_NODES = 3
-DEFAULT_ACK_TIMEOUT_MS = 1_000
+# Match the broker's default so constrained benchmark hosts do not turn slow
+# but valid operations into redeliveries while measuring unrelated scenarios.
+DEFAULT_ACK_TIMEOUT_MS = 30_000
 COMMAND_TIMEOUT_SECONDS = 30.0
 
 
