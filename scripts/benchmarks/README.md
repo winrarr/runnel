@@ -52,6 +52,8 @@ just bench-cluster
 
 The runner builds the release broker, starts three processes with independent durable directories, and exercises the public protocol through multiple nodes. It measures durable publish, non-grouped consume/acknowledge, sequential shared-consumer delivery, parallel shared-consumer delivery, and restart recovery for the selected payload sizes. Each result records the node count, acknowledgement timeout, quorum durability boundary, protocol boundary, workload, throughput, p50/p99/p99.9 latency, aggregate process CPU time, and resident memory samples. Results use the same `backends` shape as the container and comparison runners, so they can be normalized into the existing history dashboard.
 
+The scheduled GitHub Actions history uses 1,000 messages per clustered scenario by default, independently of the native comparison workload. This keeps repeated recovery and quorum measurements within the workflow time budget while retaining enough traffic to compare the cluster scenarios. Increase the `cluster_messages` input for a larger manual run when investigating sustained-load behavior.
+
 For a quick lifecycle check:
 
 ```text
