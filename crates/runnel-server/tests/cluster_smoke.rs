@@ -16,7 +16,9 @@ const CLUSTER_WAIT_TIMEOUT: Duration = Duration::from_secs(120);
 // keep ordinary request helpers tolerant of the bounded cluster recovery
 // window. Retrying helpers use a shorter per-attempt timeout below.
 const REQUEST_READ_TIMEOUT: Duration = CLUSTER_WAIT_TIMEOUT;
-const REQUEST_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(2);
+// A forwarded request can traverse the bounded peer-forwarding retry window;
+// allow that work to finish before the test opens another request.
+const REQUEST_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(10);
 
 struct RunningNode {
     node_id: u64,
