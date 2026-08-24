@@ -134,6 +134,42 @@ class HistoryTests(unittest.TestCase):
         self.assertEqual(current["delta_percent"], 100.0)
         self.assertTrue(current["improved"])
 
+    def test_runnel_history_series_spans_single_node_suites(self) -> None:
+        raw = comparison_result()
+        raw["workload"]["single_node"] = True
+        first = normalize_result(raw, source_name="first.json")
+        second = copy.deepcopy(first)
+        second["benchmark_suite"] = "runnel"
+        second["generated_at"] = "2026-08-20T08:58:56.024168+00:00"
+        second["backends"]["runnel"]["scenarios"][0][
+            "throughput_messages_per_second"
+        ] = 2000.0
+
+        points = build_points(
+            [
+                {**first, "_path": "first.json"},
+                {**second, "_path": "second.json"},
+            ]
+        )
+
+        runnel_points = [point for point in points if point["backend"] == "runnel"]
+        self.assertEqual({point["benchmark_series"] for point in runnel_points}, {"runnel-single-node"})
+
+        generated = site_data(
+            [
+                {**first, "_path": "first.json"},
+                {**second, "_path": "second.json"},
+            ]
+        )
+        current = next(
+            point
+            for point in generated["points"]
+            if point["run_file"] == "second.json"
+            and point["metric"] == "throughput_messages_per_second"
+        )
+        self.assertEqual(current["previous_value"], 1000.0)
+        self.assertEqual(current["delta_percent"], 100.0)
+
     def test_resource_helpers_report_cpu_time_and_averages(self) -> None:
         self.assertEqual(parse_cpu_stat("usage_usec 250000\nuser_usec 1\n"), 0.25)
         self.assertEqual(parse_cpu_stat("cpuacct.usage 500000000\n"), 0.5)
@@ -164,6 +200,8 @@ class HistoryTests(unittest.TestCase):
         self.assertIn("Runnel benchmark history", (site_dir / "index.html").read_text(encoding="utf-8"))
         app = (site_dir / "app.js").read_text(encoding="utf-8")
         self.assertIn("CPU efficiency", app)
+        self.assertIn("runnel-single-node", app)
+        self.assertIn("seriesKey", app)
         self.assertIn("loadData", app)
 
 

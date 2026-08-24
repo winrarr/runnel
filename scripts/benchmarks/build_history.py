@@ -79,6 +79,7 @@ def add_point(
         "run_url": source.get("run_url"),
         "comparison_mode": run.get("comparison_mode", "unknown"),
         "benchmark_suite": benchmark_suite(run),
+        "benchmark_series": benchmark_series(run, backend),
         "backend": backend,
         "operation": operation,
         "message_size_bytes": size,
@@ -108,6 +109,14 @@ def benchmark_suite(run: dict[str, Any]) -> str:
     if run.get("workload", {}).get("single_node") is True:
         return "native-comparison"
     return "other"
+
+
+def benchmark_series(run: dict[str, Any], backend: str) -> str:
+    """Return the user-facing history series for a backend measurement."""
+    suite = benchmark_suite(run)
+    if backend == "runnel" and suite in {"runnel", "native-comparison"}:
+        return "runnel-single-node"
+    return suite
 
 
 def build_points(runs: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -270,7 +279,37 @@ def site_data(runs: list[dict[str, Any]]) -> dict[str, Any]:
     }
 
 
-def comparison_identity(run: dict[str, Any]) -> str:
+def comparison_identity(run: dict[str, Any], backend_name: str | None = None) -> str:
+    if backend_name == "runnel" and benchmark_series(run, backend_name) == "runnel-single-node":
+        backend = run.get("backends", {}).get(backend_name, {})
+        workload = run.get("workload", {})
+        return json.dumps(
+            {
+                "benchmark_series": "runnel-single-node",
+                "resource_limits": run.get("resource_limits", {}),
+                "workload": {
+                    key: workload.get(key)
+                    for key in (
+                        "messages",
+                        "payload_sizes_bytes",
+                        "single_node",
+                        "replication_factor",
+                        "compression",
+                    )
+                },
+                "backend": {
+                    key: backend.get(key)
+                    for key in (
+                        "image",
+                        "acknowledgement",
+                        "replication",
+                        "measurement_boundary",
+                        "measurement_client",
+                    )
+                },
+            },
+            sort_keys=True,
+        )
     return json.dumps(
         {
             "benchmark_suite": benchmark_suite(run),
@@ -300,29 +339,28 @@ def add_comparable_deltas(runs: list[dict[str, Any]], points: list[dict[str, Any
     for point in points:
         points_by_run.setdefault(point.get("run_file"), []).append(point)
 
-    previous: dict[str, dict[tuple[Any, ...], dict[str, Any]]] = {}
+    previous: dict[tuple[str, tuple[Any, ...]], dict[str, Any]] = {}
     for run in runs:
-        identity = comparison_identity(run)
         current_points = points_by_run.get(run.get("_path"), [])
-        current_by_key = {
-            (
+        for point in current_points:
+            identity = comparison_identity(run, point["backend"])
+            point_key = (
                 point["backend"],
                 point["operation"],
                 point["message_size_bytes"],
                 point["metric"],
-            ): point
-            for point in current_points
-        }
-        previous_points = previous.get(identity, {})
-        for key, point in current_by_key.items():
-            old = previous_points.get(key)
+            )
+            previous_point = previous.get((identity, point_key))
+            old = previous_point
             if old is None:
+                previous[(identity, point_key)] = point
                 continue
             old_value = old.get("value")
             current_value = point.get("value")
             if not isinstance(old_value, (int, float)) or not isinstance(
                 current_value, (int, float)
             ):
+                previous[(identity, point_key)] = point
                 continue
             point["previous_value"] = old_value
             point["delta"] = current_value - old_value
@@ -333,7 +371,7 @@ def add_comparable_deltas(runs: list[dict[str, Any]], points: list[dict[str, Any
                 if METRIC_CONFIG.get(point["metric"], True)
                 else current_value < old_value
             )
-        previous[identity] = current_by_key
+            previous[(identity, point_key)] = point
 
 
 def parse_args() -> argparse.Namespace:

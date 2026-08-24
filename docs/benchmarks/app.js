@@ -59,6 +59,18 @@ function pointSuite(point) {
   return point.comparison_mode === 'cluster-baseline' ? 'cluster' : 'native-comparison';
 }
 
+function pointSeries(point) {
+  if (point.benchmark_series) return point.benchmark_series;
+  if (point.backend === 'runnel' && ['runnel', 'native-comparison'].includes(pointSuite(point))) {
+    return 'runnel-single-node';
+  }
+  return pointSuite(point);
+}
+
+function matchesSuite(point, suite) {
+  return suite === 'all' || pointSeries(point) === suite;
+}
+
 function runSuite(run) {
   if (run.benchmark_suite) return run.benchmark_suite;
   return run.comparison_mode === 'cluster-baseline' ? 'cluster' : 'native-comparison';
@@ -79,7 +91,7 @@ function filteredPoints(metric, operation, size, profile, suite) {
       || size === null
       || point.message_size_bytes === size)
     && (profile === 'all' || point.profile === profile)
-    && (suite === 'all' || pointSuite(point) === suite));
+    && matchesSuite(point, suite));
 }
 
 function renderEmptyChart(card) {
@@ -123,6 +135,32 @@ function chartGeometry(points) {
   };
 }
 
+function seriesKey(point) {
+  return `${pointSeries(point)}:${point.backend}:${point.message_size_bytes ?? 'broker'}`;
+}
+
+function seriesLabel(point, suite) {
+  const prefix = suite === 'all' ? `${suiteLabel(pointSeries(point))} · ` : '';
+  const size = point.message_size_bytes === null
+    ? 'broker'
+    : `${point.message_size_bytes} bytes`;
+  return `${prefix}${point.backend} · ${size}`;
+}
+
+function xTickPoints(points) {
+  const byTimestamp = new Map();
+  points.forEach((point) => {
+    if (!byTimestamp.has(point.timestamp_ms)) byTimestamp.set(point.timestamp_ms, point);
+  });
+  const uniquePoints = [...byTimestamp.values()].sort((a, b) => a.timestamp_ms - b.timestamp_ms);
+  const tickCount = Math.min(6, uniquePoints.length);
+  if (tickCount <= 1) return uniquePoints;
+  return Array.from({ length: tickCount }, (_, index) => {
+    const position = Math.round(index * (uniquePoints.length - 1) / (tickCount - 1));
+    return uniquePoints[position];
+  });
+}
+
 function renderChart(definition, operation, size, profile, suite) {
   const points = filteredPoints(definition.metric, operation, size, profile, suite);
   const card = document.createElement('article');
@@ -138,8 +176,12 @@ function renderChart(definition, operation, size, profile, suite) {
   }
 
   const grouped = {};
-  points.forEach((point) => (grouped[point.backend] ||= []).push(point));
-  Object.values(grouped).forEach((series) => series.sort((a, b) => a.timestamp_ms - b.timestamp_ms));
+  points.forEach((point) => {
+    const key = seriesKey(point);
+    if (!grouped[key]) grouped[key] = { label: seriesLabel(point, suite), points: [] };
+    grouped[key].points.push(point);
+  });
+  Object.values(grouped).forEach((series) => series.points.sort((a, b) => a.timestamp_ms - b.timestamp_ms));
 
   const geometry = chartGeometry(points);
   const ticks = [0, 0.25, 0.5, 0.75, 1];
@@ -155,19 +197,26 @@ function renderChart(definition, operation, size, profile, suite) {
   svg += `<line class="axis" x1="${geometry.left}" x2="${geometry.left}" y1="${geometry.top}" y2="${geometry.height - geometry.bottom}"/>`;
   svg += `<line class="axis" x1="${geometry.left}" x2="${geometry.width - geometry.right}" y1="${geometry.height - geometry.bottom}" y2="${geometry.height - geometry.bottom}"/>`;
 
-  Object.entries(grouped).forEach(([backend, series], index) => {
+  xTickPoints(points).forEach((point) => {
+    const position = geometry.x(point.timestamp_ms);
+    const revision = (point.revision || 'unknown').slice(0, 7);
+    svg += `<line class="tick" x1="${position}" x2="${position}" y1="${geometry.height - geometry.bottom}" y2="${geometry.height - geometry.bottom + 5}"/>`;
+    svg += `<text class="axis-label" x="${position}" y="${geometry.height - geometry.bottom + 17}" text-anchor="middle"><title>${escapeText(new Date(point.timestamp).toLocaleString())}</title>${escapeText(revision)}</text>`;
+  });
+
+  Object.values(grouped).forEach((series, index) => {
     const color = colors[index % colors.length];
-    const path = series.map((point, pointIndex) => `${pointIndex ? 'L' : 'M'} ${geometry.x(point.timestamp_ms)} ${geometry.y(point.value)}`).join(' ');
+    const path = series.points.map((point, pointIndex) => `${pointIndex ? 'L' : 'M'} ${geometry.x(point.timestamp_ms)} ${geometry.y(point.value)}`).join(' ');
     svg += `<path d="${path}" fill="none" stroke="${color}" stroke-width="2"/>`;
 
-    series.forEach((point) => {
+    series.points.forEach((point) => {
       const range = point.range
         ? ` · range ${formatValue(point.range.min, definition.unit)}–${formatValue(point.range.max, definition.unit)}`
         : '';
       const change = point.delta_percent === undefined
         ? ''
         : ` · change ${point.delta_percent.toFixed(1)}%`;
-      const detail = `${new Date(point.timestamp).toLocaleString()} · ${backend} · ${formatValue(point.value, definition.unit)}${range}${change}`;
+      const detail = `${new Date(point.timestamp).toLocaleString()} · ${series.label} · ${formatValue(point.value, definition.unit)}${range}${change}`;
       svg += `<circle cx="${geometry.x(point.timestamp_ms)}" cy="${geometry.y(point.value)}" r="3.5" fill="${color}"><title>${escapeText(detail)}</title></circle>`;
     });
   });
@@ -177,9 +226,9 @@ function renderChart(definition, operation, size, profile, suite) {
 
   const legend = document.createElement('div');
   legend.className = 'legend';
-  Object.keys(grouped).forEach((backend, index) => {
+  Object.values(grouped).forEach((series, index) => {
     const item = document.createElement('span');
-    item.innerHTML = `<span class="swatch" style="background:${colors[index % colors.length]}"></span>${escapeText(backend)}`;
+    item.innerHTML = `<span class="swatch" style="background:${colors[index % colors.length]}"></span>${escapeText(series.label)}`;
     legend.appendChild(item);
   });
   card.appendChild(legend);
@@ -200,7 +249,7 @@ function populateSizes() {
   const suite = suiteSelect.value;
   const sizes = unique(data.points
     .filter((point) => point.operation === operationSelect.value
-      && (suite === 'all' || pointSuite(point) === suite)
+      && matchesSuite(point, suite)
       && point.message_size_bytes !== null)
     .map((point) => point.message_size_bytes));
   const oldValue = sizeSelect.value;
@@ -220,7 +269,7 @@ function populateOperations() {
   const oldValue = operationSelect.value;
   const operations = unique(data.points
     .filter((point) => point.metric === 'throughput_messages_per_second'
-      && (suite === 'all' || pointSuite(point) === suite))
+      && matchesSuite(point, suite))
     .map((point) => point.operation));
   operationSelect.replaceChildren(...operations.map((value) => new Option(value, value)));
   if (operations.includes(oldValue)) {
@@ -235,6 +284,7 @@ function populateOperations() {
 function suiteLabel(value) {
   return {
     runnel: 'Runnel benchmark',
+    'runnel-single-node': 'Runnel single-node history',
     'native-comparison': 'Native broker comparison',
     'cluster-comparison': 'Three-node competitor comparison',
     cluster: 'Runnel cluster',
@@ -242,12 +292,12 @@ function suiteLabel(value) {
 }
 
 function populate() {
-  const suites = unique(data.points.map(pointSuite));
+  const suites = unique(data.points.map(pointSeries));
   suiteSelect.replaceChildren(
     new Option('All suites', 'all'),
     ...suites.map((value) => new Option(suiteLabel(value), value)),
   );
-  if (suites.includes('runnel')) suiteSelect.value = 'runnel';
+  if (suites.includes('runnel-single-node')) suiteSelect.value = 'runnel-single-node';
   else if (suites.includes('native-comparison')) suiteSelect.value = 'native-comparison';
 
   const profiles = unique(data.points.map((point) => point.profile));
@@ -290,7 +340,7 @@ function renderChanges(operation, size, profile, suite) {
     && point.operation === operation
     && (size === null || point.message_size_bytes === size)
     && (profile === 'all' || point.profile === profile)
-    && (suite === 'all' || pointSuite(point) === suite));
+    && matchesSuite(point, suite));
   changes.replaceChildren();
   if (!candidates.length) {
     changesNote.textContent = 'No previous comparable run is available for this selection.';
@@ -300,7 +350,7 @@ function renderChanges(operation, size, profile, suite) {
   const latestTimestamp = Math.max(...candidates.map((point) => point.timestamp_ms));
   const latest = candidates.filter((point) => point.timestamp_ms === latestTimestamp);
   const latestPoint = latest[0];
-  changesNote.textContent = `Compared with the previous ${suiteLabel(pointSuite(latestPoint))} run for commit ${latestPoint.revision.slice(0, 12)}. Each value is the median of ${latestPoint.repetitions || 1} repetition(s).`;
+  changesNote.textContent = `Compared with the previous ${suiteLabel(pointSeries(latestPoint))} run for commit ${latestPoint.revision.slice(0, 12)}. Each value is the median of ${latestPoint.repetitions || 1} repetition(s).`;
   latest.forEach((point) => {
     const definition = definitionFor(point.metric);
     const row = document.createElement('tr');
