@@ -190,11 +190,51 @@ def _revision(result: dict[str, Any], sources: list[dict[str, Any]]) -> object:
     for key in ("git_revision", "revision"):
         if result.get(key):
             return result[key]
+    source = result.get("source")
+    if isinstance(source, dict) and source.get("revision"):
+        return source["revision"]
     for source in sources:
         for key in ("git_revision", "revision"):
             if source["data"].get(key):
                 return source["data"][key]
     return "unknown"
+
+
+def _repetitions(result: dict[str, Any], sources: list[dict[str, Any]]) -> int | None:
+    aggregate = result.get("aggregate")
+    if isinstance(aggregate, dict):
+        value = _number(aggregate.get("repetitions"))
+        if value is not None and value > 0:
+            return int(value)
+    value = _number(result.get("repetitions"))
+    if value is not None and value > 0:
+        return int(value)
+    for source in sources:
+        value = _number(source["data"].get("repetitions"))
+        if value is not None and value > 0:
+            return int(value)
+    return None
+
+
+def _format_host(result: dict[str, Any]) -> str | None:
+    environment = result.get("environment")
+    host = result.get("host")
+    metadata = environment if isinstance(environment, dict) else host
+    if not isinstance(metadata, dict):
+        return None
+    parts: list[str] = []
+    for key, label in (
+        ("platform", "platform"),
+        ("processor", "processor"),
+        ("cpu_count", "CPUs"),
+        ("cpus", "CPUs"),
+        ("python", "Python"),
+    ):
+        value = metadata.get(key)
+        if value is None or value == "":
+            continue
+        parts.append(f"{label} {_code(value)}")
+    return "; ".join(parts) if parts else None
 
 
 def _image(source: dict[str, Any]) -> object | None:
@@ -490,6 +530,12 @@ def render_report(
     lines = [f"## {heading}", ""]
     lines.append(f"- Revision: {_code(_revision(result, current_sources))}")
     lines.append(f"- Workload: {_cell(_format_workload(current_workload))}")
+    repetitions = _repetitions(result, current_sources)
+    if repetitions is not None:
+        lines.append(f"- Repetitions: {repetitions} (displayed values are medians)")
+    host = _format_host(result)
+    if host is not None:
+        lines.append(f"- Host: {host}")
     lines.append(f"- Limits: {_format_limits(_limits(result, current_sources))}")
     images = [_image(source) for source in current_sources if _image(source) is not None]
     if images:
