@@ -42,7 +42,9 @@ DEFAULT_MEMORY = "2g"
 COMMAND_TIMEOUT = 180
 READINESS_TIMEOUT = 45
 READINESS_COMMAND_TIMEOUT = 10
-RESOURCE_COMMAND_TIMEOUT = 1
+# Docker's stats endpoint commonly takes just over one second even for a
+# healthy local container. Keep probes bounded while allowing useful samples.
+RESOURCE_COMMAND_TIMEOUT = 2
 
 
 class ComparisonError(RuntimeError):
