@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
 """Run a first-pass native-tool comparison of Runnel, Kafka, Redpanda, and JetStream.
 
-The comparison intentionally preserves each broker's native benchmark client. It
-is useful for an initial baseline, but results must not be treated as a final
-apples-to-apples claim until a common client workload is available.
+The default comparison preserves each broker's native benchmark client and
+single-node topology. ``--nodes 3`` adds a competitor-only, durable-publish
+comparison with three broker nodes and replication factor three. It deliberately
+does not include Runnel or a consumer result because those paths do not yet have
+matching distributed semantics in this harness.
 """
 
 from __future__ import annotations
@@ -16,12 +18,13 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Callable
 
-from resources import StatsSampler
+from resources import parse_cpu_stat, parse_size, summarize_stats
 
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -31,14 +34,122 @@ NATS_IMAGE = "nats:2.14.5-alpine"
 NATS_BOX_IMAGE = "natsio/nats-box:0.19.7"
 DEFAULT_MESSAGES = 10_000
 DEFAULT_CPUS = "2"
+DEFAULT_NODES = 1
+THREE_NODE_COUNT = 3
 # Redpanda's development container reserves approximately 1 GiB before
 # application overhead, so a 1 GiB cgroup is not a viable shared default.
 DEFAULT_MEMORY = "2g"
 COMMAND_TIMEOUT = 180
+READINESS_TIMEOUT = 45
+READINESS_COMMAND_TIMEOUT = 10
+RESOURCE_COMMAND_TIMEOUT = 1
 
 
 class ComparisonError(RuntimeError):
     """A benchmark setup or native-tool failure."""
+
+
+def bounded_read_stats(container: str) -> dict[str, float] | None:
+    try:
+        result = subprocess.run(
+            ["docker", "stats", "--no-stream", "--format", "{{json .}}", container],
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=RESOURCE_COMMAND_TIMEOUT,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if result.returncode != 0 or not result.stdout.strip():
+        return None
+    try:
+        raw = json.loads(result.stdout)
+        return {
+            "cpu_percent": float(raw["CPUPerc"].rstrip("%")),
+            "memory_bytes": parse_size(raw["MemUsage"].split(" / ", 1)[0]),
+            "memory_percent": float(raw["MemPerc"].rstrip("%")),
+        }
+    except (KeyError, TypeError, ValueError, json.JSONDecodeError):
+        return None
+
+
+def bounded_read_cpu_seconds(container: str) -> float | None:
+    for path in ("/sys/fs/cgroup/cpu.stat", "/sys/fs/cgroup/cpuacct/cpuacct.usage"):
+        try:
+            result = subprocess.run(
+                ["docker", "exec", container, "cat", path],
+                capture_output=True,
+                text=True,
+                check=False,
+                timeout=RESOURCE_COMMAND_TIMEOUT,
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            continue
+        if result.returncode == 0:
+            usage = parse_cpu_stat(result.stdout)
+            if usage is not None:
+                return usage
+    return None
+
+
+class BoundedStatsSampler:
+    """Collect comparison resources without allowing Docker probes to hang."""
+
+    def __init__(self, container: str) -> None:
+        self.container = container
+        self.samples: list[dict[str, float]] = []
+        self.lock = threading.Lock()
+        self.stop_event = threading.Event()
+        self.thread = threading.Thread(
+            target=self._run, name=f"docker-stats-{container}", daemon=True
+        )
+
+    def start(self) -> None:
+        self.thread.start()
+
+    def close(self) -> None:
+        self.stop_event.set()
+        if self.thread.ident is not None:
+            self.thread.join(timeout=2)
+
+    def begin(self) -> tuple[int, float | None, int]:
+        self._record()
+        with self.lock:
+            sample_index = len(self.samples)
+        return sample_index, bounded_read_cpu_seconds(self.container), time.perf_counter_ns()
+
+    def end(self, token: tuple[int, float | None, int]) -> dict[str, Any]:
+        sample_index, cpu_start, started_ns = token
+        ended_ns = time.perf_counter_ns()
+        cpu_end = bounded_read_cpu_seconds(self.container)
+        self._record()
+        with self.lock:
+            samples = list(self.samples[sample_index:])
+        cpu_seconds = None
+        if cpu_start is not None and cpu_end is not None:
+            cpu_seconds = cpu_end - cpu_start
+        return summarize_stats(
+            samples,
+            cpu_seconds=cpu_seconds,
+            elapsed_seconds=(ended_ns - started_ns) / 1_000_000_000,
+        )
+
+    def summary(self) -> dict[str, Any]:
+        with self.lock:
+            samples = list(self.samples)
+        return summarize_stats(samples)
+
+    def _record(self) -> None:
+        sample = bounded_read_stats(self.container)
+        if sample is None:
+            return
+        with self.lock:
+            self.samples.append(sample)
+
+    def _run(self) -> None:
+        while not self.stop_event.is_set():
+            self._record()
+            self.stop_event.wait(0.25)
 
 
 def ensure_image(image: str) -> str:
@@ -90,7 +201,7 @@ class Service:
         self.network = network
         self.cpus = cpus
         self.memory = memory
-        self.data_dir = Path(tempfile.mkdtemp(prefix=f"runnel-{name}-"))
+        self.data_dir = Path(tempfile.mkdtemp(prefix=f"{name}-"))
         self.data_dir.chmod(0o777)
         self.data_target = data_target
         self.command = command or []
@@ -157,6 +268,25 @@ class Service:
         }
 
 
+def combine_resource_summaries(summaries: list[dict[str, Any]]) -> dict[str, Any]:
+    """Return totals for a cluster while retaining per-node measurements."""
+    if len(summaries) == 1:
+        return summaries[0]
+
+    combined: dict[str, Any] = {
+        "nodes": summaries,
+        "samples": min(summary.get("samples", 0) for summary in summaries),
+    }
+    for key in ("cpu_seconds", "memory_bytes_avg", "memory_bytes_max"):
+        values = [summary.get(key) for summary in summaries]
+        if all(isinstance(value, (int, float)) for value in values):
+            combined[key] = sum(values)
+    elapsed = [summary.get("elapsed_seconds") for summary in summaries]
+    if all(isinstance(value, (int, float)) for value in elapsed):
+        combined["elapsed_seconds"] = max(elapsed)
+    return combined
+
+
 def run_tool(
     image: str,
     network: str,
@@ -198,7 +328,7 @@ def run_tool(
 
 
 def run_measured_tool(
-    service: Service,
+    services: Service | list[Service],
     image: str,
     network: str,
     arguments: list[str],
@@ -207,7 +337,8 @@ def run_measured_tool(
     memory: str,
     timeout: int = COMMAND_TIMEOUT,
 ) -> tuple[str, dict[str, Any]]:
-    token = service.stats.begin()
+    service_list = services if isinstance(services, list) else [services]
+    tokens = [service.stats.begin() for service in service_list]
     try:
         output = run_tool(
             image,
@@ -218,13 +349,15 @@ def run_measured_tool(
             timeout=timeout,
         )
     except BaseException:
-        service.stats.end(token)
+        for service, token in zip(service_list, tokens):
+            service.stats.end(token)
         raise
-    return output, service.stats.end(token)
+    resources = [service.stats.end(token) for service, token in zip(service_list, tokens)]
+    return output, combine_resource_summaries(resources)
 
 
 def wait_for(check: Callable[[], None], description: str) -> None:
-    deadline = time.monotonic() + 45
+    deadline = time.monotonic() + READINESS_TIMEOUT
     last_error: Exception | None = None
     while time.monotonic() < deadline:
         try:
@@ -351,140 +484,232 @@ def parse_nats_consume(output: str, size: int, messages: int) -> dict[str, Any]:
     }
 
 
-def kafka_environment(name: str) -> dict[str, str]:
+def kafka_environment(name: str, node_id: int, broker_names: list[str]) -> dict[str, str]:
+    voters = ",".join(
+        f"{index + 1}@{broker_name}:9093" for index, broker_name in enumerate(broker_names)
+    )
+    replication_factor = str(len(broker_names))
     return {
-        "KAFKA_NODE_ID": "1",
+        "KAFKA_NODE_ID": str(node_id),
         "KAFKA_PROCESS_ROLES": "broker,controller",
         "KAFKA_LISTENER_SECURITY_PROTOCOL_MAP": "CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT",
         "KAFKA_LISTENERS": "PLAINTEXT://:9092,CONTROLLER://:9093",
         "KAFKA_ADVERTISED_LISTENERS": f"PLAINTEXT://{name}:9092",
-        "KAFKA_CONTROLLER_QUORUM_VOTERS": f"1@{name}:9093",
+        "KAFKA_CONTROLLER_QUORUM_VOTERS": voters,
         "KAFKA_CONTROLLER_LISTENER_NAMES": "CONTROLLER",
+        "KAFKA_INTER_BROKER_LISTENER_NAME": "PLAINTEXT",
         "KAFKA_LOG_DIRS": "/var/lib/kafka/data",
-        "KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR": "1",
-        "KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR": "1",
-        "KAFKA_TRANSACTION_STATE_LOG_MIN_ISR": "1",
+        "KAFKA_DEFAULT_REPLICATION_FACTOR": replication_factor,
+        "KAFKA_MIN_INSYNC_REPLICAS": replication_factor,
+        "KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR": replication_factor,
+        "KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR": replication_factor,
+        "KAFKA_TRANSACTION_STATE_LOG_MIN_ISR": replication_factor,
         "KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS": "0",
         "KAFKA_NUM_PARTITIONS": "1",
     }
 
 
-def start_kafka_service(network: str, cpus: str, memory: str) -> Service:
-    service = Service(
-        name="bench-kafka",
-        image=KAFKA_IMAGE,
-        network=network,
-        cpus=cpus,
-        memory=memory,
-        data_target="/var/lib/kafka/data",
-        environment=kafka_environment("bench-kafka"),
-    )
+def start_kafka_services(
+    network: str, cpus: str, memory: str, nodes: int, resource_prefix: str
+) -> list[Service]:
+    names = [f"{resource_prefix}-kafka-{index + 1}" for index in range(nodes)]
+    services = [
+        Service(
+            name=name,
+            image=KAFKA_IMAGE,
+            network=network,
+            cpus=cpus,
+            memory=memory,
+            data_target="/var/lib/kafka/data",
+            environment=kafka_environment(name, index + 1, names),
+        )
+        for index, name in enumerate(names)
+    ]
     try:
-        service.start()
+        for service in services:
+            service.start()
 
         def ready() -> None:
-            run_tool(
-                KAFKA_IMAGE,
-                network,
-                [
-                    "/opt/kafka/bin/kafka-topics.sh",
-                    "--bootstrap-server",
-                    "bench-kafka:9092",
-                    "--list",
-                ],
-                cpus=cpus,
-                memory=memory,
-            )
+            for name in names:
+                run_tool(
+                    KAFKA_IMAGE,
+                    network,
+                    [
+                        "/opt/kafka/bin/kafka-topics.sh",
+                        "--bootstrap-server",
+                        f"{name}:9092",
+                        "--list",
+                    ],
+                    cpus=cpus,
+                    memory=memory,
+                    timeout=READINESS_COMMAND_TIMEOUT,
+                )
 
         wait_for(ready, "Kafka")
     except BaseException:
-        service.close()
+        for service in services:
+            service.close()
         raise
-    return service
+    return services
 
 
-def start_redpanda_service(network: str, cpus: str, memory: str) -> Service:
-    service = Service(
-        name="bench-redpanda",
-        image=REDPANDA_IMAGE,
-        network=network,
-        cpus=cpus,
-        memory=memory,
-        data_target="/var/lib/redpanda/data",
-        command=[
-            "redpanda",
-            "start",
-            "--mode",
-            "dev-container",
-            "--smp",
-            "1",
-            "--node-id",
-            "0",
-            "--kafka-addr",
-            "internal://0.0.0.0:9092",
-            "--advertise-kafka-addr",
-            "internal://bench-redpanda:9092",
-        ],
-        environment={"REDPANDA_DATA_DIRECTORY": "/var/lib/redpanda/data"},
-    )
-    try:
-        service.start()
+def redpanda_command(name: str, node_id: int, seed_name: str | None) -> list[str]:
+    command = [
+        "redpanda",
+        "start",
+        "--mode",
+        "dev-container",
+        "--smp",
+        "1",
+        "--node-id",
+        str(node_id),
+        "--kafka-addr",
+        "internal://0.0.0.0:9092",
+        "--advertise-kafka-addr",
+        f"internal://{name}:9092",
+        "--rpc-addr",
+        f"{name}:33145",
+        "--advertise-rpc-addr",
+        f"{name}:33145",
+    ]
+    if seed_name is not None:
+        command.extend(["--seeds", f"{seed_name}:33145"])
+    return command
 
-        def ready() -> None:
-            run_tool(
-                REDPANDA_IMAGE,
-                network,
-                ["cluster", "info", "-X", "brokers=bench-redpanda:9092"],
+
+def require_redpanda_broker_count(output: str, expected: int) -> None:
+    rows = re.findall(r"^\s*\d+\*?\s+\S+\s+\d+\s*$", output, re.MULTILINE)
+    if len(rows) < expected:
+        raise ComparisonError(
+            f"Redpanda cluster has {len(rows)} brokers; expected {expected}:\n{output}"
+        )
+
+
+def start_redpanda_services(
+    network: str, cpus: str, memory: str, nodes: int, resource_prefix: str
+) -> list[Service]:
+    names = [f"{resource_prefix}-redpanda-{index}" for index in range(nodes)]
+    services = []
+    for index, name in enumerate(names):
+        services.append(
+            Service(
+                name=name,
+                image=REDPANDA_IMAGE,
+                network=network,
                 cpus=cpus,
                 memory=memory,
+                data_target="/var/lib/redpanda/data",
+                command=redpanda_command(name, index, names[0] if index else None),
+                environment={"REDPANDA_DATA_DIRECTORY": "/var/lib/redpanda/data"},
             )
+        )
+    try:
+        for service in services:
+            service.start()
+
+        def ready() -> None:
+            output = run_tool(
+                REDPANDA_IMAGE,
+                network,
+                ["cluster", "info", "-X", f"brokers={','.join(f'{name}:9092' for name in names)}"],
+                cpus=cpus,
+                memory=memory,
+                timeout=READINESS_COMMAND_TIMEOUT,
+            )
+            require_redpanda_broker_count(output, nodes)
 
         wait_for(ready, "Redpanda")
     except BaseException:
-        service.close()
+        for service in services:
+            service.close()
         raise
-    return service
+    return services
 
 
-def start_nats_service(network: str, cpus: str, memory: str) -> Service:
-    service = Service(
-        name="bench-nats",
-        image=NATS_IMAGE,
-        network=network,
-        cpus=cpus,
-        memory=memory,
-        data_target="/data",
-        command=["-js", "-sd", "/data"],
-    )
-    try:
-        service.start()
+def nats_server_command(name: str, names: list[str], cluster_name: str) -> list[str]:
+    if len(names) == 1:
+        return ["-js", "-sd", "/data"]
+    routes = ",".join(f"nats://{other}:6222" for other in names if other != name)
+    return [
+        "-js",
+        "-sd",
+        "/data",
+        "--name",
+        name,
+        "--cluster_name",
+        cluster_name,
+        "--cluster",
+        "nats://0.0.0.0:6222",
+        "--routes",
+        routes,
+    ]
 
-        def ready() -> None:
-            run_tool(
-                NATS_BOX_IMAGE,
-                network,
-                ["nats", "rtt", "1", "--server", "nats://bench-nats:4222"],
+
+def start_nats_services(
+    network: str, cpus: str, memory: str, nodes: int, resource_prefix: str
+) -> list[Service]:
+    names = [f"{resource_prefix}-nats-{index + 1}" for index in range(nodes)]
+    cluster_name = f"{resource_prefix}-nats-cluster"
+    services = []
+    for name in names:
+        services.append(
+            Service(
+                name=name,
+                image=NATS_IMAGE,
+                network=network,
                 cpus=cpus,
                 memory=memory,
+                data_target="/data",
+                command=nats_server_command(name, names, cluster_name),
             )
+        )
+    try:
+        for service in services:
+            service.start()
+
+        def ready() -> None:
+            for service in services:
+                run_tool(
+                    NATS_BOX_IMAGE,
+                    network,
+                    ["nats", "stream", "ls", "--server", f"nats://{service.name}:4222"],
+                    cpus=cpus,
+                    memory=memory,
+                    timeout=READINESS_COMMAND_TIMEOUT,
+                )
 
         wait_for(ready, "NATS JetStream")
     except BaseException:
-        service.close()
+        for service in services:
+            service.close()
         raise
-    return service
+    return services
+
+
+def start_kafka_service(network: str, cpus: str, memory: str) -> Service:
+    return start_kafka_services(network, cpus, memory, 1, "bench")[0]
+
+
+def start_redpanda_service(network: str, cpus: str, memory: str) -> Service:
+    return start_redpanda_services(network, cpus, memory, 1, "bench")[0]
+
+
+def start_nats_service(network: str, cpus: str, memory: str) -> Service:
+    return start_nats_services(network, cpus, memory, 1, "bench")[0]
 
 
 def run_kafka_family(
     *,
     backend: str,
-    service: Service,
+    services: list[Service],
     network: str,
     client_cpus: str,
     client_memory: str,
     messages: int,
     sizes: list[int],
 ) -> dict[str, Any]:
+    service = services[0]
+    nodes = len(services)
     scenarios: list[dict[str, Any]] = []
     raw: dict[str, str] = {}
     for size in sizes:
@@ -503,13 +728,15 @@ def run_kafka_family(
                 "--partitions",
                 "1",
                 "--replication-factor",
-                "1",
+                str(nodes),
+                "--config",
+                f"min.insync.replicas={nodes}",
             ],
             cpus=client_cpus,
             memory=client_memory,
         )
         producer_output, producer_resources = run_measured_tool(
-            service,
+            services,
             KAFKA_IMAGE,
             network,
             [
@@ -526,6 +753,7 @@ def run_kafka_family(
                 "-1",
                 "--producer-props",
                 "acks=all",
+                "enable.idempotence=true",
                 "linger.ms=0",
                 "compression.type=none",
                 "--print-metrics",
@@ -533,127 +761,157 @@ def run_kafka_family(
             cpus=client_cpus,
             memory=client_memory,
         )
-        consumer_output, consumer_resources = run_measured_tool(
-            service,
-            KAFKA_IMAGE,
-            network,
-            [
-                "/opt/kafka/bin/kafka-consumer-perf-test.sh",
-                "--bootstrap-server",
-                f"{service.name}:9092",
-                "--topic",
-                topic,
-                "--num-records",
-                str(messages),
-                "--group",
-                f"bench-{backend}-{size}-{time.time_ns()}",
-                "--print-metrics",
-            ],
-            cpus=client_cpus,
-            memory=client_memory,
-        )
         publish_scenario = parse_kafka_publish(producer_output, size, messages)
         publish_scenario["resource_samples"] = producer_resources
-        consume_scenario = parse_kafka_consume(consumer_output, size, messages)
-        consume_scenario["resource_samples"] = consumer_resources
         scenarios.append(publish_scenario)
-        scenarios.append(consume_scenario)
         raw[f"publish_{size}"] = producer_output[-12_000:]
-        raw[f"consume_{size}"] = consumer_output[-12_000:]
+
+        if nodes == 1:
+            consumer_output, consumer_resources = run_measured_tool(
+                services,
+                KAFKA_IMAGE,
+                network,
+                [
+                    "/opt/kafka/bin/kafka-consumer-perf-test.sh",
+                    "--bootstrap-server",
+                    f"{service.name}:9092",
+                    "--topic",
+                    topic,
+                    "--num-records",
+                    str(messages),
+                    "--group",
+                    f"bench-{backend}-{size}-{time.time_ns()}",
+                    "--print-metrics",
+                ],
+                cpus=client_cpus,
+                memory=client_memory,
+            )
+            consume_scenario = parse_kafka_consume(consumer_output, size, messages)
+            consume_scenario["resource_samples"] = consumer_resources
+            scenarios.append(consume_scenario)
+            raw[f"consume_{size}"] = consumer_output[-12_000:]
     return {"scenarios": scenarios, "raw_tool_output": raw}
 
 
 def run_nats(
     *,
-    service: Service,
+    services: list[Service],
     network: str,
     client_cpus: str,
     client_memory: str,
     messages: int,
     sizes: list[int],
 ) -> dict[str, Any]:
+    service = services[0]
+    nodes = len(services)
     scenarios: list[dict[str, Any]] = []
     raw: dict[str, str] = {}
     for size in sizes:
         stream = f"bench{size}"
         subject = f"bench.subject.{size}"
+        if nodes > 1:
+            run_tool(
+                NATS_BOX_IMAGE,
+                network,
+                [
+                    "nats",
+                    "stream",
+                    "add",
+                    stream,
+                    "--server",
+                    f"nats://{service.name}:4222",
+                    "--subjects",
+                    subject,
+                    "--storage",
+                    "file",
+                    "--replicas",
+                    str(nodes),
+                    "--defaults",
+                ],
+                cpus=client_cpus,
+                memory=client_memory,
+            )
+        producer_arguments = [
+            "nats",
+            "bench",
+            "js",
+            "pub",
+            "sync",
+            "--server",
+            f"nats://{service.name}:4222",
+            "--storage=file",
+            f"--replicas={nodes}",
+            f"--stream={stream}",
+            f"--msgs={messages}",
+            f"--size={size}B",
+            "--no-progress",
+            subject,
+        ]
+        if nodes == 1:
+            producer_arguments.insert(7, "--create")
         producer_output, producer_resources = run_measured_tool(
-            service,
+            services,
             NATS_BOX_IMAGE,
             network,
-            [
-                "nats",
-                "bench",
-                "js",
-                "pub",
-                "sync",
-                "--server",
-                "nats://bench-nats:4222",
-                "--create",
-                "--storage=file",
-                "--replicas=1",
-                f"--stream={stream}",
-                f"--msgs={messages}",
-                f"--size={size}B",
-                "--no-progress",
-                subject,
-            ],
-            cpus=client_cpus,
-            memory=client_memory,
-        )
-        consumer = f"bench-consumer-{size}"
-        run_tool(
-            NATS_BOX_IMAGE,
-            network,
-            [
-                "nats",
-                "consumer",
-                "add",
-                stream,
-                consumer,
-                "--server",
-                "nats://bench-nats:4222",
-                "--pull",
-                "--ack=explicit",
-                "--deliver=all",
-                "--replay=instant",
-                f"--filter={subject}",
-                "--defaults",
-            ],
-            cpus=client_cpus,
-            memory=client_memory,
-        )
-        consumer_output, consumer_resources = run_measured_tool(
-            service,
-            NATS_BOX_IMAGE,
-            network,
-            [
-                "nats",
-                "bench",
-                "js",
-                "consume",
-                "--server",
-                "nats://bench-nats:4222",
-                f"--stream={stream}",
-                f"--consumer={consumer}",
-                f"--msgs={messages}",
-                f"--size={size}B",
-                "--batch=1",
-                "--acks=explicit",
-                "--doubleack",
-                "--no-progress",
-            ],
+            producer_arguments,
             cpus=client_cpus,
             memory=client_memory,
         )
         publish_scenario = parse_nats_publish(producer_output, size, messages)
         publish_scenario["resource_samples"] = producer_resources
-        consume_scenario = parse_nats_consume(consumer_output, size, messages)
-        consume_scenario["resource_samples"] = consumer_resources
         scenarios.append(publish_scenario)
-        scenarios.append(consume_scenario)
         raw[f"publish_{size}"] = producer_output[-12_000:]
-        raw[f"consume_{size}"] = consumer_output[-12_000:]
+
+        if nodes == 1:
+            consumer = f"bench-consumer-{size}"
+            run_tool(
+                NATS_BOX_IMAGE,
+                network,
+                [
+                    "nats",
+                    "consumer",
+                    "add",
+                    stream,
+                    consumer,
+                    "--server",
+                    f"nats://{service.name}:4222",
+                    "--pull",
+                    "--ack=explicit",
+                    "--deliver=all",
+                    "--replay=instant",
+                    f"--filter={subject}",
+                    "--defaults",
+                ],
+                cpus=client_cpus,
+                memory=client_memory,
+            )
+            consumer_output, consumer_resources = run_measured_tool(
+                services,
+                NATS_BOX_IMAGE,
+                network,
+                [
+                    "nats",
+                    "bench",
+                    "js",
+                    "consume",
+                    "--server",
+                    f"nats://{service.name}:4222",
+                    f"--stream={stream}",
+                    f"--consumer={consumer}",
+                    f"--msgs={messages}",
+                    f"--size={size}B",
+                    "--batch=1",
+                    "--acks=explicit",
+                    "--doubleack",
+                    "--no-progress",
+                ],
+                cpus=client_cpus,
+                memory=client_memory,
+            )
+            consume_scenario = parse_nats_consume(consumer_output, size, messages)
+            consume_scenario["resource_samples"] = consumer_resources
+            scenarios.append(consume_scenario)
+            raw[f"consume_{size}"] = consumer_output[-12_000:]
     return {"scenarios": scenarios, "raw_tool_output": raw}
 
 
@@ -725,7 +983,59 @@ def run_runnel(
     }
 
 
-def backend_metadata(name: str) -> dict[str, Any]:
+def close_services(services: list[Service]) -> dict[str, Any]:
+    summaries = [service.close() for service in services]
+    if len(summaries) == 1:
+        return summaries[0]
+    return {
+        "image": summaries[0]["image"],
+        "image_id": summaries[0]["image_id"],
+        "image_ids": [summary["image_id"] for summary in summaries],
+        "cpu_limit": summaries[0]["cpu_limit"],
+        "memory_limit": summaries[0]["memory_limit"],
+        "startup_seconds": max(summary["startup_seconds"] for summary in summaries),
+        "resource_samples": combine_resource_summaries(
+            [summary["resource_samples"] for summary in summaries]
+        ),
+        "nodes": summaries,
+    }
+
+
+def remove_network(network: str) -> None:
+    """Remove a run network, disconnecting only containers attached to it if needed."""
+    for _ in range(3):
+        result = subprocess.run(
+            ["docker", "network", "rm", network],
+            check=False,
+            capture_output=True,
+        )
+        if result.returncode == 0:
+            return
+        time.sleep(0.2)
+
+    inspect = subprocess.run(
+        [
+            "docker",
+            "network",
+            "inspect",
+            network,
+            "--format",
+            "{{range $id, $container := .Containers}}{{$id}} {{end}}",
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    for container in inspect.stdout.split():
+        subprocess.run(
+            ["docker", "network", "disconnect", "--force", network, container],
+            check=False,
+            capture_output=True,
+        )
+    subprocess.run(["docker", "network", "rm", network], check=False, capture_output=True)
+
+
+def backend_metadata(name: str, nodes: int) -> dict[str, Any]:
     if name == "runnel":
         return {
             "acknowledgement": "request response after the current local durable append; consume acknowledgement persists a consumer checkpoint",
@@ -733,10 +1043,22 @@ def backend_metadata(name: str) -> dict[str, Any]:
             "measurement_boundary": "Runnel's current line-delimited JSON protocol",
         }
     if name in {"kafka", "redpanda"}:
+        if nodes == THREE_NODE_COUNT:
+            return {
+                "acknowledgement": "Kafka producer performance client with acks=all and idempotence enabled; topic min.insync.replicas=3",
+                "replication": "three broker nodes, one partition, replication factor three, min.insync.replicas three",
+                "measurement_boundary": "Kafka native producer performance client over the Kafka protocol; durable publish only",
+            }
         return {
             "acknowledgement": "Kafka producer performance client with acks=all; consumer perf client measures fetch throughput without per-record application acknowledgement",
             "replication": "single broker, one partition, replication factor one",
             "measurement_boundary": "Kafka producer/consumer performance clients over the Kafka protocol",
+        }
+    if nodes == THREE_NODE_COUNT:
+        return {
+            "acknowledgement": "JetStream synchronous publish PubAck to a file-backed stream configured with three replicas",
+            "replication": "three NATS servers, file storage, three stream replicas",
+            "measurement_boundary": "nats bench js native synchronous publisher; durable publish only",
         }
     return {
         "acknowledgement": "JetStream synchronous publish PubAck; durable consumer explicit acknowledgement with synchronous double acknowledgement",
@@ -754,6 +1076,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--memory", default=DEFAULT_MEMORY)
     parser.add_argument("--client-cpus", default=DEFAULT_CPUS)
     parser.add_argument("--client-memory", default=DEFAULT_MEMORY)
+    parser.add_argument(
+        "--nodes",
+        type=int,
+        choices=(1, THREE_NODE_COUNT),
+        default=DEFAULT_NODES,
+        help="broker count; 3 enables competitor-only replicated durable publish",
+    )
     parser.add_argument("--messages", type=int, default=DEFAULT_MESSAGES)
     parser.add_argument("--payload-sizes", type=parse_sizes, default=[100, 1024])
     parser.add_argument("--output", type=Path)
@@ -762,6 +1091,10 @@ def parse_args() -> argparse.Namespace:
     valid = {"runnel", "kafka", "redpanda", "nats"}
     if not args.backends or any(backend not in valid for backend in args.backends):
         parser.error(f"backends must be selected from: {', '.join(sorted(valid))}")
+    if args.nodes == THREE_NODE_COUNT and "runnel" in args.backends:
+        parser.error("--nodes 3 supports only kafka, redpanda, and nats; Runnel has no comparison adapter")
+    if args.nodes == THREE_NODE_COUNT and args.build_runnel:
+        parser.error("--build-runnel is only valid for the single-node comparison")
     if args.messages <= 0:
         parser.error("messages must be positive")
     return args
@@ -775,12 +1108,13 @@ def main() -> int:
     run_id = timestamp.strftime("%Y%m%d%H%M%S%f")
     output = args.output or ROOT / "benchmark-results" / f"compare-{run_id}.json"
     output.parent.mkdir(parents=True, exist_ok=True)
-    network = f"runnel-compare-{os.getpid()}-{time.time_ns()}"
+    resource_prefix = f"runnel-compare-{os.getpid()}-{time.time_ns()}"
+    network = resource_prefix
     subprocess.run(["docker", "network", "create", network], check=True, capture_output=True)
     backends: dict[str, Any] = {}
     try:
         for backend in args.backends:
-            service: Service | None = None
+            services: list[Service] = []
             if backend == "runnel":
                 result = run_runnel(
                     image=args.runnel_image,
@@ -792,14 +1126,20 @@ def main() -> int:
             else:
                 try:
                     if backend == "kafka":
-                        service = start_kafka_service(network, args.cpus, args.memory)
+                        services = start_kafka_services(
+                            network, args.cpus, args.memory, args.nodes, resource_prefix
+                        )
                     elif backend == "redpanda":
-                        service = start_redpanda_service(network, args.cpus, args.memory)
+                        services = start_redpanda_services(
+                            network, args.cpus, args.memory, args.nodes, resource_prefix
+                        )
                     else:
-                        service = start_nats_service(network, args.cpus, args.memory)
+                        services = start_nats_services(
+                            network, args.cpus, args.memory, args.nodes, resource_prefix
+                        )
                     if backend == "nats":
                         benchmark = run_nats(
-                            service=service,
+                            services=services,
                             network=network,
                             client_cpus=args.client_cpus,
                             client_memory=args.client_memory,
@@ -809,7 +1149,7 @@ def main() -> int:
                     else:
                         benchmark = run_kafka_family(
                             backend=backend,
-                            service=service,
+                            services=services,
                             network=network,
                             client_cpus=args.client_cpus,
                             client_memory=args.client_memory,
@@ -817,25 +1157,30 @@ def main() -> int:
                             sizes=args.payload_sizes,
                         )
                     result = {
-                        **service.close(),
+                        **close_services(services),
                         **benchmark,
                         "measurement_client": "broker-native client container",
                     }
+                    services = []
                 except BaseException:
-                    if service is not None:
-                        service.close()
+                    if services:
+                        close_services(services)
                     raise
             backends[backend] = {
-                **backend_metadata(backend),
+                **backend_metadata(backend, args.nodes),
                 **result,
             }
     finally:
-        subprocess.run(["docker", "network", "rm", network], check=False, capture_output=True)
+        remove_network(network)
 
     summary = {
         "schema_version": 1,
         "generated_at": timestamp.isoformat(),
-        "comparison_mode": "native broker tools; first-pass, not a final apples-to-apples claim",
+        "comparison_mode": (
+            "three-node replicated durable publish; native broker tools; publish-only first slice"
+            if args.nodes == THREE_NODE_COUNT
+            else "native broker tools; first-pass, not a final apples-to-apples claim"
+        ),
         "benchmark_suite": "native-comparison",
         "resource_limits": {
             "broker_cpu": args.cpus,
@@ -846,8 +1191,10 @@ def main() -> int:
         "workload": {
             "messages": args.messages,
             "payload_sizes_bytes": args.payload_sizes,
-            "single_node": True,
-            "replication_factor": 1,
+            "single_node": args.nodes == 1,
+            "nodes": args.nodes,
+            "replication_factor": args.nodes,
+            "operations": ["publish"] if args.nodes == THREE_NODE_COUNT else ["publish", "consume"],
             "compression": "disabled where the native client exposes the setting",
         },
         "backends": backends,

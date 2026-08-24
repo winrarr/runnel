@@ -90,11 +90,29 @@ Run the native-tool comparison with:
 just bench-compare
 ```
 
-The runner starts each selected broker in isolation on a temporary Docker network, applies the same broker and client CPU/memory limits, creates one stream/topic, publishes 10,000 messages, consumes them, records image identifiers and scenario-scoped resource measurements, and writes a JSON result under `benchmark-results/compare-<timestamp>.json`. The default payload sizes are 100 bytes and 1 KiB.
+The runner starts each selected broker in isolation on a temporary Docker network, applies the same per-container broker and client CPU/memory limits, creates one stream/topic, publishes 10,000 messages, consumes them, records image identifiers and scenario-scoped resource measurements, and writes a JSON result under `benchmark-results/compare-<timestamp>.json`. The default payload sizes are 100 bytes and 1 KiB. Container names, data directories, and the Docker network are run-scoped, so separate comparison invocations can overlap without name collisions; cleanup removes the containers, temporary data, and network on success or failure. Broker readiness is bounded at 45 seconds, with each Docker readiness probe bounded at 10 seconds; measured native commands retain a 180-second timeout.
 
 The pinned images are Apache Kafka `4.3.1`, Redpanda `v26.2.1`, NATS Server `2.14.5-alpine`, and `nats-box` `0.19.7`. The Runnel image is built by the `just` recipe. Redpanda's development mode needs more than a 1 GiB cgroup, so the shared default is 2 CPUs and 2 GiB; pass `--cpus` and `--memory` to change it.
 
-This is intentionally a first baseline built around native benchmark clients. Runnel and JetStream report durable publish latency; Kafka and Redpanda use Kafka's native producer performance client, whose latency includes its configured client batching, and their native consumer performance client reports fetch throughput without application-level acknowledgement. The JSON records these boundaries. Do not present the output as a final cross-product ranking until a common client workload and equivalent consumer acknowledgement path exist.
+This is intentionally a first baseline built around native benchmark clients. Runnel and JetStream report durable publish latency; Kafka and Redpanda use Kafka's native producer performance client, whose latency includes its configured client batching, and their native consumer performance client reports fetch throughput without application-level acknowledgement. The JSON records these boundaries. Do not present the single-node output as a final cross-product ranking until a common client workload and equivalent consumer acknowledgement path exist.
+
+The bounded three-node slice measures only replicated durable publish for the three external competitors:
+
+```text
+python3 scripts/benchmarks/compare.py \
+  --nodes 3 \
+  --backends kafka,redpanda,nats \
+  --messages 1000 \
+  --payload-sizes 100 \
+  --cpus 2 \
+  --memory 2g \
+  --client-cpus 2 \
+  --client-memory 2g
+```
+
+`--nodes 3` starts three Kafka KRaft brokers/controllers, three Redpanda brokers, or three NATS servers with JetStream clustering. Kafka topics use one partition, replication factor 3, `min.insync.replicas=3`, `acks=all`, and producer idempotence. JetStream streams use file storage and `--replicas=3`; the native synchronous publisher measures the PubAck boundary. Each broker container receives the broker limits and the short-lived native client receives the client limits, so a three-node run consumes up to three times the per-container broker budget plus the client budget. The result keeps per-node resource summaries and aggregate CPU/memory fields.
+
+The three-node mode rejects Runnel because this comparison runner has no distributed Runnel adapter, and it omits consumers because Kafka and Redpanda's native consumer performance client does not perform application-level acknowledgements. It therefore establishes a useful RF=3 publish baseline, not a complete end-to-end or failure-tolerance comparison. The broker modes also differ in their exact persistence and acknowledgement implementation: `acks=all`/`min.insync.replicas=3` and synchronous JetStream PubAck are recorded as client-visible boundaries, not a claim that every broker performs identical filesystem flushes. Fault injection, common client code, partitioning/concurrency parity, and replicated consume/ack remain follow-up work.
 
 Examples:
 
