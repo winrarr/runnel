@@ -12,7 +12,7 @@ lint:
     cargo clippy --locked --workspace --all-targets --all-features -- -D warnings
 
 test:
-    # Test-only recovery experiments are run explicitly by cluster-test.
+    # Test-only recovery experiments are run explicitly by cluster-replacement-test.
     RUST_TEST_THREADS=1 cargo test --locked --workspace --all-targets
 
 doc-test:
@@ -39,6 +39,9 @@ isolated workflow="test":
     python3 scripts/isolated.py {{workflow}}
 
 cluster-test:
+    cargo test --locked -p runnel-server --test cluster_smoke -- --nocapture --test-threads=1
+
+cluster-replacement-test:
     cargo test --locked -p runnel-server --features test-replacement-recovery --test cluster_smoke -- --nocapture --test-threads=1
 
 bench:

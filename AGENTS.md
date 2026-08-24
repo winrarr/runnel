@@ -74,8 +74,9 @@ Run these from the repository root:
 - just integration runs the same smoke, clustered, Docker, and container-smoke sequence used by the CI integration job.
 - just run starts a local broker with data in ./data.
 - just smoke starts a real broker and uses runnelctl to exercise publish, consume, acknowledgement, restart recovery, readiness, and metrics with temporary state.
-- just isolated runs the default workspace test with a unique Cargo target, temporary directory, and benchmark artifact directory; pass a supported workflow such as `just isolated cluster-test` or `just isolated bench-container-smoke` for concurrent work.
+- just isolated runs the default workspace test with a unique Cargo target, temporary directory, and benchmark artifact directory; pass a supported workflow such as `just isolated cluster-test`, `just isolated cluster-replacement-test`, or `just isolated bench-container-smoke` for concurrent work.
 - just cluster-test starts three real broker processes, exercises quorum replication, follower restart, leader failure, and recovery through the public protocol.
+- just cluster-replacement-test runs the opt-in snapshot replacement experiment that depends on the test-only permissive recovery feature.
 - just bench runs the Criterion performance benchmarks, including shared-consumer delivery and keyed-ordering baselines.
 - just bench-container builds and benchmarks the broker image with explicit CPU and memory limits.
 - just bench-container-smoke exercises the container benchmark path with a small workload for CI.
@@ -97,7 +98,7 @@ Do not add a second task runner. Keep README commands and CI wired to just recip
 
 ## Verification and automation
 
-The required CI path is .github/workflows/ci.yml. It runs the pinned toolchain checks, the real network integration test, and the container smoke build. .github/workflows/security.yml audits the dependency lockfile on pull requests and weekly. Dependabot keeps Cargo and GitHub Actions dependencies visible for review.
+The required CI path is .github/workflows/ci.yml. It runs the pinned toolchain checks, the supported real network integration test, and the container smoke build. The test-only replacement-recovery experiment is not part of the required CI path; run it explicitly with `just cluster-replacement-test` when investigating that recovery boundary. .github/workflows/security.yml audits the dependency lockfile on pull requests and weekly. Dependabot keeps Cargo and GitHub Actions dependencies visible for review.
 
 .github/workflows/benchmarks.yml runs the longer Runnel-only single-node and three-node history suites on pushes to `main`, daily, and manually. `.github/workflows/benchmark-competitors.yml` runs the separate native and three-node competitor comparisons weekly or manually. `.github/workflows/benchmark-pr.yml` produces a short, read-only Runnel artifact for pull requests, and `.github/workflows/benchmark-pr-comment.yml` runs the same short workload against the default branch and turns both results into an informational PR comment with relative deltas. The Runnel history is the primary optimization signal; competitor suites are separate ranking evidence. The history workflows keep raw and aggregated results as artifacts and append generated data to the `benchmark-history` branch. GitHub Pages serves the hand-authored `docs/benchmarks/` directory from `main` and reads the public history data at runtime. Treat `benchmark-history` as generated output; change the scripts, dashboard assets, and workflows rather than editing that branch manually.
 

@@ -17,6 +17,7 @@ Use the isolation runner when more than one process-heavy workflow needs to run 
 ```text
 just isolated
 just isolated cluster-test
+just isolated cluster-replacement-test
 just isolated bench-container-smoke
 ```
 
@@ -47,7 +48,7 @@ cargo run -q -p runnel-cli -- consume playground workers --member worker-b
 cargo run -q -p runnel-cli -- ack playground workers <offset> --member worker-a --delivery-token <token>
 ```
 
-The two members share work under `workers`; a different consumer name receives an independent copy. Both local and clustered grouped paths serialize messages with the same key and reject stale delivery tokens after redelivery. For a real three-node process test, run `just cluster-test`; it also verifies grouped delivery through follower forwarding, reassignment after a node failure, and clustered dead-letter recovery after the configured attempt limit.
+The two members share work under `workers`; a different consumer name receives an independent copy. Both local and clustered grouped paths serialize messages with the same key and reject stale delivery tokens after redelivery. For a real three-node process test, run `just cluster-test`; it also verifies grouped delivery through follower forwarding, reassignment after a node failure, and clustered dead-letter recovery after the configured attempt limit. The experimental empty-replica snapshot replacement test is separate: run `just cluster-replacement-test` when explicitly investigating that recovery boundary.
 
 The broker uses `./data` by default, listens on `127.0.0.1:4222`, and serves readiness and metrics on `127.0.0.1:8080`. Stop it with SIGINT or SIGTERM. Use a new stream and consumer name, or remove local development data deliberately, when an old checkpoint would make the expected offset unclear.
 
@@ -79,10 +80,11 @@ The Criterion suite includes durable publish, legacy publish/poll/ack, two-membe
 
 - `just test` runs workspace unit, integration, and benchmark-target tests.
 - `just doc-test` runs Rust documentation tests.
-- `just verify` runs formatting, Clippy, default-feature Rust tests, ShellCheck, benchmark-script tests, and a workspace build. Test-only recovery experiments are run explicitly by `just cluster-test` so an opt-in permissive recovery feature cannot silently become part of the normal verification contract.
+- `just verify` runs formatting, Clippy, default-feature Rust tests, ShellCheck, benchmark-script tests, and a workspace build. Test-only recovery experiments are run explicitly by `just cluster-replacement-test` so an opt-in permissive recovery feature cannot silently become part of the normal verification contract.
 - `just integration` runs the same smoke, clustered recovery, Docker build, and container benchmark-smoke sequence as the CI integration job.
 - `just smoke` exercises the running process and CLI across a restart.
-- `just cluster-test` starts three real Raft-backed broker processes and verifies quorum replication, grouped and non-grouped delivery through follower forwarding, grouped reassignment after node failure, clustered retry limits and dead-letter recovery, follower restart, leader election, post-failure recovery, consensus-log compaction, empty replacement-node snapshot recovery, an interrupted snapshot transfer retry, and recovery metrics through the public protocol.
+- `just cluster-test` starts three real Raft-backed broker processes and verifies quorum replication, grouped and non-grouped delivery through follower forwarding, grouped reassignment after node failure, clustered retry limits and dead-letter recovery, follower restart, leader election, post-failure recovery, and recovery metrics through the public protocol.
+- `just cluster-replacement-test` explicitly enables the test-only permissive recovery feature and runs the experimental empty replacement-node snapshot recovery and interrupted snapshot transfer checks.
 - `just bench` runs the Criterion durable publish, publish/poll/ack, shared-consumer, keyed-ordering, and local concurrency-scaling benchmarks; interpret every result with its durability mode and workload.
 - `just bench-container` builds a Runnel image, applies explicit Docker CPU and memory limits, and runs repeatable end-to-end publish, concurrent publish, consume/acknowledge, round-trip, and restart-recovery scenarios for 100-byte and 1-KiB payloads. Results are written as ignored JSON artifacts under `benchmark-results/` and include scenario-scoped cgroup CPU time, CPU efficiency, memory samples, and p50/p99/p99.9 latency where applicable.
 - `just bench-container-smoke` runs the same container path with a small workload for CI. It verifies the benchmark harness and container lifecycle; it is not a performance gate.
