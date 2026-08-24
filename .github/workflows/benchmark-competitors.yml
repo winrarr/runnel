@@ -1,20 +1,18 @@
-name: Runnel benchmark history
+name: Competitor benchmark history
 
 on:
-  push:
-    branches: [main]
   schedule:
-    - cron: "17 3 * * *"
+    - cron: "17 3 * * 1"
   workflow_dispatch:
     inputs:
       messages:
-        description: Number of messages per benchmark scenario
+        description: Number of messages per single-node benchmark scenario
         required: false
         default: "10000"
-      cluster_messages:
-        description: Number of messages per clustered Runnel scenario
+      cluster_comparison_messages:
+        description: Number of messages per replicated competitor publish scenario
         required: false
-        default: "200"
+        default: "10000"
       repetitions:
         description: Independent repetitions to aggregate per benchmark suite
         required: false
@@ -29,72 +27,65 @@ concurrency:
 
 jobs:
   benchmark:
-    name: Run Runnel benchmarks
+    name: Run competitor comparisons
     runs-on: ubuntu-24.04
     timeout-minutes: 40
     env:
-      BENCHMARK_PROFILE: ${{ github.event_name == 'schedule' && 'scheduled' || github.event_name == 'workflow_dispatch' && 'manual' || 'push' }}
+      BENCHMARK_PROFILE: ${{ github.event_name == 'schedule' && 'scheduled' || 'manual' }}
       BENCHMARK_MESSAGES: ${{ inputs.messages || '10000' }}
-      BENCHMARK_CLUSTER_MESSAGES: ${{ inputs.cluster_messages || '200' }}
+      BENCHMARK_CLUSTER_COMPARISON_MESSAGES: ${{ inputs.cluster_comparison_messages || '10000' }}
       BENCHMARK_REPETITIONS: ${{ inputs.repetitions || '3' }}
     steps:
       - uses: actions/checkout@v7.0.1
       - uses: dtolnay/rust-toolchain@1.97.1
       - uses: Swatinem/rust-cache@v2.9.2
-      - name: Run single-node Runnel repetitions
+      - name: Run native competitor repetitions
         run: |
           set -euo pipefail
           mkdir -p benchmark-results/raw benchmark-results/normalized
           for repetition in $(seq 1 "$BENCHMARK_REPETITIONS"); do
-            build_args=()
-            if [ "$repetition" -eq 1 ]; then
-              build_args+=(--build-runnel)
-            fi
             python3 scripts/benchmarks/compare.py \
-              "${build_args[@]}" \
-              --backends runnel \
-              --runnel-image runnel:bench \
+              --backends kafka,redpanda,nats \
               --messages "$BENCHMARK_MESSAGES" \
               --payload-sizes 100,1024 \
               --cpus 2 \
               --memory 2g \
-              --output "benchmark-results/raw/runnel-${repetition}.json"
+              --client-cpus 1 \
+              --client-memory 512m \
+              --output "benchmark-results/raw/native-${repetition}.json"
             python3 scripts/benchmarks/normalize.py \
-              --input "benchmark-results/raw/runnel-${repetition}.json" \
-              --output "benchmark-results/normalized/runnel-repetition-${repetition}.json"
+              --input "benchmark-results/raw/native-${repetition}.json" \
+              --output "benchmark-results/normalized/native-repetition-${repetition}.json"
           done
           python3 scripts/benchmarks/aggregate.py \
-            --inputs benchmark-results/normalized/runnel-repetition-*.json \
-            --output benchmark-results/normalized/runnel-aggregate.json
-      - name: Run clustered Runnel repetitions
+            --inputs benchmark-results/normalized/native-repetition-*.json \
+            --output benchmark-results/normalized/native-aggregate.json
+      - name: Run three-node competitor repetitions
         run: |
           set -euo pipefail
-          mkdir -p benchmark-results/raw benchmark-results/normalized benchmark-results/logs
+          mkdir -p benchmark-results/raw benchmark-results/normalized
           for repetition in $(seq 1 "$BENCHMARK_REPETITIONS"); do
-            build_args=()
-            if [ "$repetition" -eq 1 ]; then
-              build_args+=(--build)
-            fi
-            python3 scripts/benchmarks/cluster.py \
-              "${build_args[@]}" \
-              --binary target/release/runnel \
-              --messages "$BENCHMARK_CLUSTER_MESSAGES" \
-              --warmup 100 \
-              --concurrency 2 \
+            python3 scripts/benchmarks/compare.py \
+              --nodes 3 \
+              --backends kafka,redpanda,nats \
+              --messages "$BENCHMARK_CLUSTER_COMPARISON_MESSAGES" \
               --payload-sizes 100,1024 \
-              --output "benchmark-results/raw/cluster-${repetition}.json" \
-              --log-dir "benchmark-results/logs/cluster-${repetition}"
+              --cpus 2 \
+              --memory 2g \
+              --client-cpus 1 \
+              --client-memory 512m \
+              --output "benchmark-results/raw/cluster-comparison-${repetition}.json"
             python3 scripts/benchmarks/normalize.py \
-              --input "benchmark-results/raw/cluster-${repetition}.json" \
-              --output "benchmark-results/normalized/cluster-repetition-${repetition}.json"
+              --input "benchmark-results/raw/cluster-comparison-${repetition}.json" \
+              --output "benchmark-results/normalized/cluster-comparison-repetition-${repetition}.json"
           done
           python3 scripts/benchmarks/aggregate.py \
-            --inputs benchmark-results/normalized/cluster-repetition-*.json \
-            --output benchmark-results/normalized/cluster-aggregate.json
+            --inputs benchmark-results/normalized/cluster-comparison-repetition-*.json \
+            --output benchmark-results/normalized/cluster-comparison-aggregate.json
       - name: Upload raw and aggregated results
         uses: actions/upload-artifact@v7.0.1
         with:
-          name: benchmark-run-${{ github.run_id }}
+          name: competitor-benchmark-run-${{ github.run_id }}
           path: benchmark-results
           if-no-files-found: error
 
@@ -112,7 +103,7 @@ jobs:
       - name: Download benchmark result
         uses: actions/download-artifact@v8.0.1
         with:
-          name: benchmark-run-${{ github.run_id }}
+          name: competitor-benchmark-run-${{ github.run_id }}
           path: benchmark-results
       - name: Append benchmark history
         env:

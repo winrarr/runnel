@@ -6,7 +6,7 @@ This register records known implementation shortcuts in the current vertical sli
 
 - Status: open
 - Impact: all publishes, polls, acknowledgements, recovery-related state access, and health reads serialize behind one mutex. This limits throughput and makes tail-latency work impossible to evaluate against the intended architecture.
-- Context: the lock keeps the first crash/recovery path easy to inspect and correct.
+- Context: the lock keeps the first crash/recovery path easy to inspect and correct. A bounded Criterion baseline now measures same-stream durable publishing with 1, 2, 4, and 8 workers; the observed median throughput stayed around 347–373 thousand elements per second while batch time increased from 179 microseconds to 1.45 milliseconds. This is an end-to-end persistence and scheduling measurement, not an isolated mutex-wait measurement.
 - Retirement condition: replace it with measured ownership boundaries and concurrency tests without weakening acknowledgement or recovery invariants. This is part of the storage and clustered-core backlog work.
 
 ## TD-002: One file and an in-memory index per stream
@@ -68,15 +68,15 @@ This register records known implementation shortcuts in the current vertical sli
 ## TD-010: Clustered state materializes complete retained history
 
 - Status: open
-- Impact: the clustered state machine keeps retained messages in materialized state and persists that state after committed apply batches. Serialization, copying, memory use, and recovery cost grow with retained history, which can make hot-path latency and resource use unpredictable.
-- Context: this is the smallest state-machine representation that makes the first replicated vertical slice and snapshot recovery easy to inspect.
+- Impact: the clustered state machine keeps retained messages in materialized state and appends JSON journal records for committed apply entries. The journal avoids a complete state-file replacement on every apply, but serialization, copying, memory use, and recovery replay still grow with retained history.
+- Context: the incremental journal and checkpoint path is the first durable step toward separating hot-path appends from materialized recovery state. It deliberately keeps the existing JSON checkpoint and snapshot model while compatibility and crash behavior are established.
 - Retirement condition: retained-data growth, recovery, and resource benchmarks justify a durable representation whose append, read, and recovery work remains bounded without weakening ordering, replay, or acknowledgement guarantees.
 
 ## TD-011: End-to-end benchmark coverage is incomplete
 
 - Status: open
 - Impact: the Criterion suite remains focused on local in-process paths, while the end-to-end benchmark harness does not yet establish clustered, statistically stable, equivalent competitor, or complete tail-latency baselines.
-- Context: microbenchmarks were added first to catch local regressions while the broker semantics and cluster recovery behavior were still changing. Containerized, clustered, and first-pass native competitor measurements now exist, including scenario-scoped resource efficiency and optional Linux profiles, but their semantic and statistical limitations remain.
+- Context: microbenchmarks were added first to catch local regressions while the broker semantics and cluster recovery behavior were still changing. Containerized, clustered Runnel, single-node native competitor, and first RF=3 competitor-publish measurements now exist, including scenario-scoped resource efficiency and optional Linux profiles. Pull requests now get a short Runnel-only report, daily and `main` runs provide the primary longer Runnel history, and competitor comparisons are kept in separate weekly/manual suites; their semantic and statistical limitations remain.
 - Retirement condition: the performance backlog outcomes provide repeatable machine-readable local, container, clustered, and comparable-broker measurements with explicit workload and durability semantics, plus enough repeated samples and profiling evidence to distinguish regressions from host noise.
 
 ## TD-012: Peer RPC connections are short-lived
@@ -90,7 +90,7 @@ This register records known implementation shortcuts in the current vertical sli
 
 - Status: open
 - Impact: the first comparison baseline uses Runnel's host-side protocol client, Kafka/Redpanda's native Kafka performance clients, and NATS's native JetStream benchmark client. Publish batching, consumer acknowledgement behavior, client startup, and latency visibility differ, so the numbers cannot yet support a definitive product ranking.
-- Context: native tools provide an immediately reproducible baseline while Runnel's public protocol and common benchmark client are still provisional. The result artifacts record each measurement boundary and configuration.
+- Context: native tools provide an immediately reproducible single-node and RF=3 publish baseline while Runnel's public protocol and common benchmark client are still provisional. The result artifacts record each measurement boundary, topology, and configuration.
 - Retirement condition: a common workload client or rigorously equivalent adapters measure durable publish, consume with application acknowledgement, batching, recovery, resource usage, and tail latency across all supported brokers while preserving each broker's explicitly stated guarantee.
 
 ## TD-014: Security audit has a documented optional-dependency exception

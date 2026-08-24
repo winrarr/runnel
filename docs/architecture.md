@@ -31,9 +31,9 @@ This establishes an at-least-once vertical slice for both independent consumers 
 
 ## Performance posture
 
-The clustered state machine persists one durable state update per committed apply batch and snapshots copy the state before serialization, so a batch does not pay one state-file replacement per entry and snapshot encoding does not hold the state read lock. These are correctness-preserving first wins, not a performance claim.
+The clustered state machine appends one framed, durable journal record per committed apply entry and replays records after the last durable checkpoint during recovery. Snapshot installation writes a checkpoint and compacts the journal with an atomic replacement, so normal message processing no longer pays for a complete state-file replacement per apply batch. The materialized state and journal are still JSON-based, so this is a correctness-preserving first storage step rather than a final performance architecture.
 
-The current baseline still uses JSON encodings, synchronous atomic file replacement, and a new TCP connection for each internal RPC. Those costs should be measured before replacing them with pooled transport, binary formats, segmented storage, or more aggressive batching. Any optimization must report its durability point and p50/p99/p99.9 behavior, especially for 100-byte and 1-KiB messages.
+The current baseline still uses JSON encodings, synchronous atomic file replacement for checkpoints and Raft-log persistence, and a new TCP connection for each internal RPC. Those costs should be measured before replacing them with pooled transport, binary formats, segmented storage, or more aggressive batching. Any optimization must report its durability point and p50/p99/p99.9 behavior, especially for 100-byte and 1-KiB messages.
 
 ## Deliberate boundaries
 

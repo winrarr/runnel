@@ -7,11 +7,32 @@ from pathlib import Path
 SCRIPT_DIR = Path(__file__).resolve().parent
 sys.path.insert(0, str(SCRIPT_DIR))
 
-from cluster import metric, percentile, process_stats  # noqa: E402
+from cluster import metric, percentile, poll_until_redelivered, process_stats  # noqa: E402
 from profile import summarize_timing_logs  # noqa: E402
 
 
 class ClusterBenchmarkTests(unittest.TestCase):
+    def test_recovery_poll_retries_empty_responses_until_second_attempt(self) -> None:
+        class FakeClient:
+            def __init__(self) -> None:
+                self.responses = [
+                    {"type": "empty"},
+                    {"type": "message", "offset": 0, "delivery_attempt": 2},
+                ]
+
+            def request(self, request: dict[str, object]) -> tuple[dict[str, object], int]:
+                self.assertEqual(request["op"], "poll")
+                return self.responses.pop(0), 1_000
+
+            def assertEqual(self, first: object, second: object) -> None:
+                if first != second:
+                    raise AssertionError(f"expected {second!r}, got {first!r}")
+
+        response, attempts = poll_until_redelivered(FakeClient(), "events", "worker", 0)
+
+        self.assertEqual(response["delivery_attempt"], 2)
+        self.assertEqual(attempts, 2)
+
     def test_percentile_interpolates_sorted_values(self) -> None:
         values = [30, 10, 20]
         self.assertEqual(percentile(values, 0), 10)
