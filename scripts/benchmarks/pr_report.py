@@ -444,7 +444,12 @@ def _render_table(
         lines.append(f"Showing the first {MAX_SCENARIOS} scenarios.")
 
 
-def render_report(result: dict[str, Any], baseline: dict[str, Any] | None = None) -> str:
+def render_report(
+    result: dict[str, Any],
+    baseline: dict[str, Any] | None = None,
+    *,
+    heading: str = "Runnel benchmark",
+) -> str:
     """Render a bounded report from a raw container or clustered result."""
     current_sources = _sources(result)
     current_workload = _workload(result, current_sources)
@@ -482,7 +487,7 @@ def render_report(result: dict[str, Any], baseline: dict[str, Any] | None = None
     metric_names = ("throughput", "p50", "p99", "p999", "cpu", "memory")
     multiple_sources = len({record["source"] for record in current_records}) > 1
 
-    lines = ["## Runnel benchmark", ""]
+    lines = [f"## {heading}", ""]
     lines.append(f"- Revision: {_code(_revision(result, current_sources))}")
     lines.append(f"- Workload: {_cell(_format_workload(current_workload))}")
     lines.append(f"- Limits: {_format_limits(_limits(result, current_sources))}")
@@ -559,6 +564,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--input", type=Path, required=True, help="benchmark result JSON")
     parser.add_argument("--output", type=Path, required=True, help="Markdown report path")
     parser.add_argument("--baseline", type=Path, help="optional compatible benchmark result JSON")
+    parser.add_argument("--heading", default="Runnel benchmark", help="Markdown section heading")
     return parser.parse_args()
 
 
@@ -567,7 +573,7 @@ def main() -> int:
     try:
         result = _load(args.input)
         baseline = _load(args.baseline) if args.baseline else None
-        report = render_report(result, baseline)
+        report = render_report(result, baseline, heading=args.heading)
         args.output.parent.mkdir(parents=True, exist_ok=True)
         args.output.write_text(report, encoding="utf-8")
     except (OSError, ValueError) as error:

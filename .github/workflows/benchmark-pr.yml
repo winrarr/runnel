@@ -44,3 +44,36 @@ jobs:
           name: runnel-pr-benchmark-${{ github.run_id }}
           path: benchmark-results/pr.json
           if-no-files-found: error
+
+  clustered-benchmark:
+    name: Run clustered Runnel benchmark
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    env:
+      BENCHMARK_PROFILE: pull-request
+    steps:
+      - uses: actions/checkout@v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@1.97.1
+      - uses: Swatinem/rust-cache@v2.9.2
+      - name: Run three-node Runnel benchmark
+        run: |
+          set -euo pipefail
+          mkdir -p benchmark-results benchmark-results/logs
+          python3 scripts/benchmarks/cluster.py \
+            --build \
+            --binary target/release/runnel \
+            --messages 200 \
+            --warmup 100 \
+            --concurrency 2 \
+            --payload-sizes 100 \
+            --skip-recovery \
+            --output benchmark-results/pr-cluster.json \
+            --log-dir benchmark-results/logs/pr-cluster
+      - name: Upload clustered benchmark result
+        uses: actions/upload-artifact@v7.0.1
+        with:
+          name: runnel-pr-cluster-benchmark-${{ github.run_id }}
+          path: benchmark-results/pr-cluster.json
+          if-no-files-found: error

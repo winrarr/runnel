@@ -133,14 +133,24 @@ class PrReportTests(unittest.TestCase):
             },
         }
 
-        report = pr_report.render_report(result)
+        report = pr_report.render_report(result, heading="Clustered Runnel benchmark (primary)")
 
+        self.assertIn("## Clustered Runnel benchmark (primary)", report)
         self.assertIn("nodes 3", report)
         self.assertIn("cluster_publish", report)
         self.assertIn("200 msg/s", report)
         self.assertIn("50 µs", report)
         self.assertIn("1 s", report)
         self.assertIn("16 MiB", report)
+
+        baseline = copy.deepcopy(result)
+        baseline["git_revision"] = "base123"
+        baseline["backends"]["runnel-cluster"]["scenarios"][0][
+            "throughput_messages_per_second"
+        ] = 100.0
+        report_with_baseline = pr_report.render_report(result, baseline)
+        self.assertIn("Default branch benchmark", report_with_baseline)
+        self.assertIn("200 msg/s (Δ +100.0%)", report_with_baseline)
 
 
 if __name__ == "__main__":
