@@ -20,7 +20,6 @@ Runnel is a Rust message broker intended to offer durable streams, low operation
 - scripts/benchmarks/pr_report.py: renders the short Runnel pull-request benchmark artifact as a Markdown report.
 - scripts/benchmarks/aggregate.py: median aggregation and observed-range summaries for repeated benchmark runs.
 - scripts/isolated.py: canonical isolated workflow runner for concurrent local tests and benchmarks.
-- scripts/check_conventional_commits.py: local and CI validation for commit subjects and pull-request titles.
 - scripts/benchmarks/normalize.py: strips raw tool output and adds provenance for durable benchmark history.
 - scripts/benchmarks/build_history.py: aggregates normalized benchmark runs into generated history data.
 - docs/benchmarks/: hand-authored static benchmark dashboard served by GitHub Pages.
@@ -69,7 +68,7 @@ Linux development uses `just` as the canonical command runner. Install it once w
 
 Run these from the repository root:
 
-- just verify runs formatting, Clippy, all-target tests, documentation tests, Python script tests, ShellCheck, benchmark-script tests, and a workspace build.
+- just verify runs formatting, Clippy, all-target tests, documentation tests, ShellCheck, benchmark-script tests, and a workspace build.
 - just ci runs verification, the real broker smoke test, the Docker build, and the container benchmark smoke check.
 - just run starts a local broker with data in ./data.
 - just smoke starts a real broker and uses runnelctl to exercise publish, consume, acknowledgement, restart recovery, readiness, and metrics with temporary state.
@@ -86,8 +85,6 @@ Run these from the repository root:
 - just bench-compare-cluster runs the documented RF=3 durable-publish comparison against three-node Kafka, Redpanda, and JetStream clusters.
 - just bench-dashboard builds local history data from JSON files under benchmark-results/.
 - just bench-test runs the benchmark normalization and dashboard tests.
-- just script-test runs the Python helper and benchmark-script tests.
-- just check-commits validates a commit range using the project's Conventional Commit format.
 - python3 scripts/benchmarks/pr_report.py renders a pull-request benchmark JSON artifact as a Markdown report.
 - just audit runs cargo-audit when it is installed.
 - ./scripts/verify.sh is a thin compatibility wrapper for just verify.

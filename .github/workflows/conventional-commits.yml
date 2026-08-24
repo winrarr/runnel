@@ -19,7 +19,12 @@ jobs:
       - name: Validate title
         env:
           PR_TITLE: ${{ github.event.pull_request.title }}
-        run: python3 scripts/check_conventional_commits.py --title "$PR_TITLE"
+        run: |
+          if [[ ! "$PR_TITLE" =~ ^[a-z][a-z0-9-]*(\([^()]+\))?!?:\ [^[:space:]].*$ ]]; then
+            echo "Pull-request title is not a Conventional Commit: $PR_TITLE" >&2
+            echo "Expected <type>[optional scope][!]: description" >&2
+            exit 1
+          fi
 
   main-commits:
     name: Main commit subjects
@@ -39,4 +44,13 @@ jobs:
           else
             range="$BEFORE..$AFTER"
           fi
-          python3 scripts/check_conventional_commits.py --range "$range"
+          invalid=0
+          while IFS= read -r line; do
+            hash="${line%% *}"
+            subject="${line#* }"
+            if [[ ! "$subject" =~ ^[a-z][a-z0-9-]*(\([^()]+\))?!?:\ [^[:space:]].*$ ]]; then
+              echo "Invalid Conventional Commit subject for ${hash:0:12}: $subject" >&2
+              invalid=1
+            fi
+          done < <(git log --no-merges --format='%H %s' "$range")
+          exit "$invalid"

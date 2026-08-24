@@ -26,11 +26,6 @@ Pull-request titles follow the same format because Runnel uses squash merges;
 the title becomes the release-facing commit subject. Existing history predates
 this rule and is not rewritten.
 
-Run the local check with:
-
-    just check-commits
-    just check-commits 'origin/main..HEAD'
-
-The check is also enforced for pull-request titles and new commits pushed to
-`main`. Automated dependency updates should use a Conventional Commit prefix
-through Dependabot's commit-message configuration.
+The check is enforced by GitHub Actions for pull-request titles and new
+commits pushed to `main`. Automated dependency updates use a Conventional
+Commit prefix through Dependabot's commit-message configuration.

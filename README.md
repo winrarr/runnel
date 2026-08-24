@@ -75,14 +75,14 @@ Useful workflows:
     just bench-compare-cluster
     just bench-dashboard
     just bench-test
-    just script-test
     just ci
 
 The existing scripts/verify.sh command remains as a thin compatibility wrapper around just verify.
 
 Contributions use Conventional Commits because pull-request titles become the
 release-facing subjects after squash merges. See [CONTRIBUTING.md](CONTRIBUTING.md)
-for the format and run `just check-commits` for a local check.
+for the format; GitHub Actions enforces it on pull requests and new commits to
+`main`.
 
 When multiple local processes, containers, or test suites need to run at the same time, use `just isolated <workflow>`. Each invocation gets its own Cargo target directory, temporary-file directory, benchmark artifact directory, and workflow-specific Docker resources. The supported workflows are listed by `python3 scripts/isolated.py --help`; failed runs retain their temporary state for diagnosis, while successful build state is removed and benchmark results remain under `benchmark-results/isolated/`. This is intentionally a named-workflow interface rather than a wrapper for arbitrary commands whose ports or external state are unknown.
 
