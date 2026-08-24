@@ -15,6 +15,10 @@ on:
         description: Number of messages per clustered Runnel scenario
         required: false
         default: "200"
+      cluster_comparison_messages:
+        description: Number of messages per replicated competitor publish scenario
+        required: false
+        default: "10000"
       repetitions:
         description: Independent repetitions to aggregate per benchmark suite
         required: false
@@ -36,6 +40,7 @@ jobs:
       BENCHMARK_PROFILE: ${{ github.event_name == 'schedule' && 'scheduled' || github.event_name == 'workflow_dispatch' && 'manual' || 'push' }}
       BENCHMARK_MESSAGES: ${{ inputs.messages || '10000' }}
       BENCHMARK_CLUSTER_MESSAGES: ${{ inputs.cluster_messages || '200' }}
+      BENCHMARK_CLUSTER_COMPARISON_MESSAGES: ${{ inputs.cluster_comparison_messages || '10000' }}
       BENCHMARK_REPETITIONS: ${{ inputs.repetitions || '3' }}
     steps:
       - uses: actions/checkout@v7.0.1
@@ -90,6 +95,28 @@ jobs:
           python3 scripts/benchmarks/aggregate.py \
             --inputs benchmark-results/normalized/cluster-repetition-*.json \
             --output benchmark-results/normalized/cluster-aggregate.json
+      - name: Run three-node competitor repetitions
+        run: |
+          set -euo pipefail
+          mkdir -p benchmark-results/raw benchmark-results/normalized
+          for repetition in $(seq 1 "$BENCHMARK_REPETITIONS"); do
+            python3 scripts/benchmarks/compare.py \
+              --nodes 3 \
+              --backends kafka,redpanda,nats \
+              --messages "$BENCHMARK_CLUSTER_COMPARISON_MESSAGES" \
+              --payload-sizes 100,1024 \
+              --cpus 2 \
+              --memory 2g \
+              --client-cpus 1 \
+              --client-memory 512m \
+              --output "benchmark-results/raw/cluster-comparison-${repetition}.json"
+            python3 scripts/benchmarks/normalize.py \
+              --input "benchmark-results/raw/cluster-comparison-${repetition}.json" \
+              --output "benchmark-results/normalized/cluster-comparison-repetition-${repetition}.json"
+          done
+          python3 scripts/benchmarks/aggregate.py \
+            --inputs benchmark-results/normalized/cluster-comparison-repetition-*.json \
+            --output benchmark-results/normalized/cluster-comparison-aggregate.json
       - name: Upload raw and aggregated results
         uses: actions/upload-artifact@v7.0.1
         with:

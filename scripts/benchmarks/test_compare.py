@@ -11,6 +11,10 @@ import compare  # noqa: E402
 
 
 class ComparisonBenchmarkTests(unittest.TestCase):
+    def test_comparison_suite_distinguishes_single_and_three_node_runs(self) -> None:
+        self.assertEqual(compare.benchmark_suite(1), "native-comparison")
+        self.assertEqual(compare.benchmark_suite(3), "cluster-comparison")
+
     def test_three_node_arguments_select_competitor_only_publish_mode(self) -> None:
         with patch.object(
             sys,

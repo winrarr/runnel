@@ -110,6 +110,14 @@ python3 scripts/benchmarks/compare.py \
   --client-memory 2g
 ```
 
+Run the replicated three-node competitor baseline with:
+
+```text
+just bench-compare-cluster
+```
+
+This records one publish scenario per payload size for Kafka, Redpanda, and NATS JetStream with replication factor three. It is deliberately a separate `cluster-comparison` history suite: the current Runnel cluster runner measures the public protocol and consumer acknowledgement paths, while this first competitor slice has only equivalent durable-publish adapters. The GitHub Actions history workflow repeats and aggregates this suite alongside the single-node native comparison and the Runnel cluster baseline.
+
 `--nodes 3` starts three Kafka KRaft brokers/controllers, three Redpanda brokers, or three NATS servers with JetStream clustering. Kafka topics use one partition, replication factor 3, `min.insync.replicas=3`, `acks=all`, and producer idempotence. JetStream streams use file storage and `--replicas=3`; the native synchronous publisher measures the PubAck boundary. Each broker container receives the broker limits and the short-lived native client receives the client limits, so a three-node run consumes up to three times the per-container broker budget plus the client budget. The result keeps per-node resource summaries and aggregate CPU/memory fields.
 
 The three-node mode rejects Runnel because this comparison runner has no distributed Runnel adapter, and it omits consumers because Kafka and Redpanda's native consumer performance client does not perform application-level acknowledgements. It therefore establishes a useful RF=3 publish baseline, not a complete end-to-end or failure-tolerance comparison. The broker modes also differ in their exact persistence and acknowledgement implementation: `acks=all`/`min.insync.replicas=3` and synchronous JetStream PubAck are recorded as client-visible boundaries, not a claim that every broker performs identical filesystem flushes. Fault injection, common client code, partitioning/concurrency parity, and replicated consume/ack remain follow-up work.
@@ -146,8 +154,9 @@ python3 scripts/benchmarks/aggregate.py \
 ```
 
 The aggregate records the repetition count and min/median/max observed range
-for each measured metric. The automatic workflow performs this for both the
-native comparison and the clustered Runnel suite. A benchmark history point is
+for each measured metric. The automatic workflow performs this for the
+native comparison, the three-node competitor comparison, and the clustered
+Runnel suite. A benchmark history point is
 compared only with the previous run that has the same suite, workload, resource
 limits, broker image, measurement boundary, and comparison mode.
 

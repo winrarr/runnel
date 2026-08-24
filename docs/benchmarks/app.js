@@ -235,6 +235,7 @@ function populateOperations() {
 function suiteLabel(value) {
   return {
     'native-comparison': 'Native broker comparison',
+    'cluster-comparison': 'Three-node competitor comparison',
     cluster: 'Runnel cluster',
   }[value] || value;
 }

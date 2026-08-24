@@ -51,6 +51,11 @@ class ComparisonError(RuntimeError):
     """A benchmark setup or native-tool failure."""
 
 
+def benchmark_suite(nodes: int) -> str:
+    """Identify the history series represented by a comparison topology."""
+    return "cluster-comparison" if nodes == THREE_NODE_COUNT else "native-comparison"
+
+
 def bounded_read_stats(container: str) -> dict[str, float] | None:
     try:
         result = subprocess.run(
@@ -1183,7 +1188,7 @@ def main() -> int:
             if args.nodes == THREE_NODE_COUNT
             else "native broker tools; first-pass, not a final apples-to-apples claim"
         ),
-        "benchmark_suite": "native-comparison",
+        "benchmark_suite": benchmark_suite(args.nodes),
         "resource_limits": {
             "broker_cpu": args.cpus,
             "broker_memory": args.memory,
