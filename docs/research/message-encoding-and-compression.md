@@ -1,6 +1,6 @@
-# Message encoding and compression exploration
+# Message encoding and compression study
 
-- Status: exploratory
+- Status: research-backed exploratory study
 - Last reviewed: 2026-08-24
 - Scope: public request/response payloads, peer frames, and retained broker records
 
@@ -33,6 +33,116 @@ The current [benchmark guidance](../testing.md) already treats 100-byte and
 1-KiB messages, durability mode, ordering distribution, p50/p99/p99.9 latency,
 CPU, and memory as relevant dimensions. Encoding work should extend that
 evidence rather than infer a win from encoded size alone.
+
+## Research-backed comparison
+
+This section separates documented behavior from interpretation. The external
+systems are evidence about useful design boundaries, not specifications for
+Runnel.
+
+### Sourced facts
+
+#### Kafka and Redpanda: producer-side full-batch compression
+
+Apache Kafka's [producer configuration](https://kafka.apache.org/41/configuration/producer-configs/)
+defines `compression.type` for the producer and explicitly says compression is
+applied to full batches. Its choices are `none`, `gzip`, `snappy`, `lz4`, and
+`zstd`; `batch.size` groups records per partition, `linger.ms` bounds the wait
+for more records, and the producer documentation calls out extra memory for
+compression. The same page exposes codec levels for gzip, LZ4, and Zstandard.
+Kafka's [broker configuration](https://kafka.apache.org/41/configuration/broker-configs/)
+also has a final topic compression policy: `producer` retains the codec chosen
+by the producer, while a named codec selects the final representation. Kafka's
+[record-batch format](https://kafka.apache.org/41/implementation/message-format/)
+stores codec attributes and a CRC-32C over the batch body.
+
+Redpanda's [producer guidance](https://docs.redpanda.com/streaming/current/develop/produce-data/configure-producers/)
+likewise says the producer compresses full batches, with `zstd`, `lz4`,
+`gzip`, and `snappy`, and exposes `batch.size` and `linger.ms`. Its
+[topic properties](https://docs.redpanda.com/streaming/current/reference/properties/topic-properties/)
+state that `compression.type` is retained for Kafka compatibility while
+Redpanda uses producer semantics: compressed data is stored and served as-is,
+uncompressed data remains uncompressed, and compression consumes more CPU.
+The documented `max.message.bytes` limit applies to the compressed message or
+batch when compression is enabled.
+
+#### NATS JetStream: file-store compression is not transport compression
+
+The [NATS client protocol](https://docs.nats.io/reference/protocols/client)
+defines text commands such as `PUB` and `MSG` with an explicit byte count for
+the payload. The protocol page documents headers and protocol capability flags,
+but does not document a negotiated payload-compression codec. NATS's
+[message structure guidance](https://docs.nats.io/using-nats/developer/sending/structure)
+leaves the choice of bytes, JSON, Protobuf, or another application format to
+the client.
+
+JetStream's [stream configuration](https://github.com/nats-io/nats.docs/blob/master/nats-concepts/jetstream/streams.md)
+has a different `Compression` setting: for file-based storage, an empty value
+means no compression and `s2` means Snappy compression on disk. The same
+configuration documents `AllowBatchPublish` and `AllowAtomicPublish` as
+separate publish features. Thus JetStream file-store compression describes an
+at-rest transformation; it does not imply compression of the client transport
+or of the logical payload delivered to consumers.
+
+#### Primary research and standards
+
+- A 2025 MASCOTS study of Kafka batching models the full-batch-versus-timeout
+  policy and derives a throughput/latency trade-off from truncated Erlang and
+  Poisson batch arrivals. It is an analytical and simulation result, not a
+  compression benchmark: [Horváth et al.,
+  *Analytical characterization and efficient simulation of batched arrivals in
+  the Kafka broker*](https://qed.usc.edu/paolieri/papers/2025_mascots_arrivals_batching_simulation.html).
+- The Zstandard project documents that small independent samples are harder to
+  compress, and that a trained, data-family-specific dictionary can improve
+  small-data ratio and speed. It also documents a broad speed/ratio level
+  range and a fast decoder: [Zstandard small-data guidance and
+  benchmarks](https://facebook.github.io/zstd/). This is an implementation
+  reference and benchmark, not an independent messaging study.
+- A 2026 PETRA III study evaluated more than 212 TiB of heterogeneous science
+  data, found compression ratios varying by more than two orders of magnitude,
+  and reported that heterogeneous codec strategies outperformed a uniform
+  policy; Zstandard and LZ4 occupied the high-throughput part of its Pareto
+  front: [Buschmann et al., *Lossless Compression Performance for PETRA III
+  Datasets*](https://arxiv.org/abs/2608.00168). The corpus is archival data, so
+  its result motivates but does not establish a Runnel policy.
+- [RFC 8878](https://www.rfc-editor.org/rfc/rfc8878.html) standardizes Zstandard
+  frames, including optional content size, checksum, and dictionary identifiers;
+  the frame window is a bounded memory concern. [RFC
+  9659](https://www.rfc-editor.org/rfc/rfc9659.html) gives a concrete example of
+  constraining Zstandard window size for resource-bounded protocols.
+
+### Inferences for Runnel
+
+These are deductions from the facts above, not claims made by the cited
+projects. Full-batch compression favors a producer or transport layer that can
+hold a bounded batch; compressing each small record independently pays framing
+and dictionary overhead repeatedly. Broker-side recompression can normalize
+storage but spends CPU after the producer has already paid to compress and can
+break a producer's intended wire/at-rest separation. A mixed workload therefore
+needs an explicit policy boundary: logical bytes should remain stable while
+wire and durable representations may choose different codecs.
+
+The likely tail-latency cost is not just codec time. Waiting to fill a batch,
+allocating an uncompressed and compressed copy, decompression during replay,
+and a cache miss on an old dictionary can all lengthen p99/p99.9. Conversely,
+smaller batches, per-record frames, and no dictionary make recovery and random
+access simpler but may increase bytes, syscalls, and network overhead. The
+MASCOTS model supports measuring batch wait as a first-class variable; the
+heterogeneous-data study supports testing workload-aware selection rather than
+assuming one codec wins everywhere.
+
+### Hypotheses for Runnel
+
+- Keep application payload bytes, encoded envelope bytes, wire bytes, and
+  durable bytes as separate measurements and compatibility concepts.
+- Treat producer-side batch compression as the primary comparison point for
+  peer transport, while allowing storage to select a separate representation.
+- For small, correlated records, test a versioned dictionary identifier only
+  when its distribution and retirement protocol are explicit; never make
+  recovery depend on an unbounded or ambient dictionary.
+- Compare `none`, LZ4-fast, and low-level Zstandard on the same bounded batches,
+  plus an adaptive policy that may decline compression. The adaptive policy is
+  a performance experiment, not a default.
 
 ## Design goals
 
@@ -180,7 +290,7 @@ on each small message independently. A batch can expose first offset, record
 count, encoded length, logical length, compression identifier, and checksum;
 the broker can decompress one bounded block for replay while retaining an index
 from offsets to blocks. This follows the useful property illustrated by
-[Kafka's record-batch format](https://kafka.apache.org/26/implementation/message-format/):
+[Kafka's record-batch format](https://kafka.apache.org/41/implementation/message-format/):
 records are batched and the batch carries compression attributes. It also keeps
 compression scope separate from acknowledgement scope: a batch is a physical
 unit, not a single delivery or acknowledgement unit.
@@ -301,31 +411,68 @@ existing [container and clustered benchmark workflows](../testing.md) are the
 right end-to-end evidence; add focused codec/block microbenchmarks only to
 explain a result, not as a substitute for durable and network measurements.
 
-## Recommendation for the next implementation slice
+## Recommendation hypotheses for the next implementation slice
 
-Adopt the following as an implementation proposal, pending an ADR:
+The following is a research-informed hypothesis, not an accepted ADR. The
+useful boundary is a deliberately small Day 1 design followed by Day 2
+experiments that earn their complexity through measurements.
 
-1. Define a Runnel-owned, versioned frame/codec interface with bounded lengths,
-   explicit encoding and compression identifiers, and CRC-32C. Keep the
-   logical payload as bytes and leave the current JSON-lines protocol unchanged.
-2. Implement a read-only compatibility decoder for `RNL1` and a v2 durable
-   record writer in new format-tagged segments. Start with `compression = none`.
-   Add crash, mixed-segment, checksum, length-limit, and replay tests before
-   changing the default writer.
-3. Benchmark a Protocol Buffers envelope against JSON for peer requests and
-   public payload bytes; benchmark CBOR only as the fallback comparator. Do not
-   commit to a public binary protocol until the benchmark and cross-language
-   fixture establish the compatibility boundary.
-4. Add a binary connection preface and capability negotiation only after the
-   v2 frame reader/writer is stable. Keep JSON as an explicit development
-   protocol for at least one compatibility window.
-5. Add bounded batch compression as a separate change, starting with LZ4 fast
-   and Zstandard low level, and select a default only from end-to-end CPU,
-   storage, memory, and tail-latency evidence.
+### Day 1: small, robust, measurable
 
-This order makes the first risky change format recovery and observability,
-rather than combining schema migration, compression, and public client
-compatibility in one cutover.
+1. Keep the JSON-lines development protocol and its compatibility behavior.
+   Define the logical message as opaque bytes in a Runnel-owned envelope, but
+   defer committing public clients to Protobuf, CBOR, or another binary schema.
+2. Define one versioned durable frame for a new format-tagged segment family:
+   bounded header and payload lengths, explicit encoding and compression IDs,
+   uncompressed length, batch byte/record limits, and CRC-32C. Start with
+   `compression = none` so framing, allocation bounds, and corruption behavior
+   are independently testable.
+3. Make recovery recognize both `RNL1` and the new frame, skip no unknown
+   format silently, and recover a mixed stream by validating each frame before
+   exposing it. Keep old segments readable and make the new writer opt-in
+   until crash, torn-suffix, checksum, length-limit, and replay fixtures pass.
+4. Measure the baseline and the new frame with the existing JSON and raw-record
+   paths: logical/encoded/durable bytes, encode/decode CPU, allocations, peak
+   memory, throughput, recovery time, and p50/p99/p99.9 request latency. Report
+   the workload, durability point, and batch wait with every result.
+5. Add capability/version metadata only where it is needed to select a reader;
+   keep JSON as a fallback for at least one rolling-upgrade window. A binary
+   connection preface and peer negotiation can follow the stable frame tests.
+
+Day 1 is successful only if the format is bounded, corruption is observable,
+mixed-format restart recovery is deterministic, and the benchmark makes the
+cost of the framing change visible. It intentionally does not add dictionaries,
+adaptive selection, broker recompression, or a new public schema dependency.
+
+### Day 2: designs to explore for performance and robustness
+
+These options should remain experiments until workload evidence justifies them:
+
+- Producer-side full-batch compression for peer and client transport, with
+  bounded `batch.size` and `linger` limits, negotiated codec capabilities, and
+  storage allowed to retain a different representation. Compare no compression,
+  LZ4-fast, and low-level Zstandard; include an adaptive policy that can decline
+  compression when the batch is small or already compressed.
+- Data-family-specific Zstandard dictionaries for small messages, with an
+  immutable dictionary ID, distribution/retirement protocol, bounded memory,
+  and a recovery fallback. Measure whether the dictionary benefit survives
+  mixed tenants and rolling upgrades rather than assuming it does.
+- Independent versus linked compression blocks, block indexes, background or
+  parallel compression, and parallel replay/decompression. These may improve
+  throughput or ratio but affect random access, memory, recovery time, and
+  tail latency.
+- Broker-side final compression or lazy at-rest rewrite for storage-heavy
+  workloads. Treat this as a separate policy from producer compression and
+  verify that it does not duplicate CPU work or make a partially rewritten
+  segment unrecoverable.
+- Stronger corruption diagnosis, such as a cryptographic digest in addition to
+  a fast frame checksum, plus fuzzing and fault-injection of every codec and
+  mixed-format transition.
+
+Day 2 should be judged by the benchmark matrix, with separate acceptance
+criteria for CPU, bytes, memory, recovery, and tail latency. None of these
+experiments is a compatibility decision until a future ADR records the chosen
+format and upgrade policy.
 
 ## Unresolved decisions
 
@@ -358,13 +505,13 @@ This document-only change should be checked with the following commands from
 the repository root:
 
 ```text
-git diff --check -- docs/design/message-encoding-and-compression.md
+git diff --check -- docs/research/message-encoding-and-compression.md
 python3 - <<'PY'
 import re
 import urllib.request
 from pathlib import Path
 
-path = Path("docs/design/message-encoding-and-compression.md")
+path = Path("docs/research/message-encoding-and-compression.md")
 text = path.read_text(encoding="utf-8")
 urls = sorted(set(re.findall(r"\]\((https?://[^)]+)\)", text)))
 for url in urls:
@@ -373,7 +520,7 @@ for url in urls:
             raise SystemExit(f"{response.status}: {url}")
 print(f"checked {len(urls)} external links")
 PY
-git status --short -- docs/design/message-encoding-and-compression.md
+git status --short -- docs/research/message-encoding-and-compression.md
 ```
 
 No Rust or benchmark command is required for a document-only change; the
