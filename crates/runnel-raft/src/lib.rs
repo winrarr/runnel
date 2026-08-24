@@ -71,6 +71,8 @@ const SNAPSHOT_CHUNK_SIZE: u64 = 64 * 1024;
 const DEFAULT_RAFT_ACK_TIMEOUT: Duration = Duration::from_secs(30);
 const FORWARD_ATTEMPTS: usize = 3;
 const FORWARD_TIMEOUT: Duration = Duration::from_secs(2);
+const STORAGE_METADATA_FORMAT_VERSION: u32 = 1;
+const STORAGE_METADATA_FILE: &str = "storage.json";
 const STATE_MACHINE_JOURNAL_FORMAT_VERSION: u32 = 1;
 const STATE_MACHINE_JOURNAL_FILE: &str = "state-machine.log";
 const MAX_STATE_MACHINE_JOURNAL_RECORD_SIZE: u32 = 64 * 1024 * 1024;
@@ -276,6 +278,14 @@ struct StateMachineData {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PersistedStorageMetadata {
+    version: u32,
+    cluster_name: String,
+    node_id: NodeId,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct PersistedState {
     version: u32,
     last_applied_log: Option<LogId<NodeId>>,
@@ -460,7 +470,12 @@ impl StateMachineStore {
         let state_path = path.join("state-machine.json");
         let mut state = if state_path.exists() {
             let bytes = fs::read(&state_path)?;
-            let persisted: PersistedState = serde_json::from_slice(&bytes)?;
+            let persisted: PersistedState = serde_json::from_slice(&bytes).map_err(|error| {
+                BrokerError::Cluster(format!(
+                    "invalid persisted state-machine '{}': {error}",
+                    state_path.display()
+                ))
+            })?;
             if !matches!(persisted.version, 1 | FORMAT_VERSION) {
                 return Err(BrokerError::Cluster(format!(
                     "unsupported state-machine format version {}",
@@ -500,7 +515,12 @@ impl StateMachineStore {
         let snapshot_path = path.join("snapshot.json");
         let (current_snapshot, snapshot_state) = if snapshot_path.exists() {
             let bytes = fs::read(&snapshot_path)?;
-            let snapshot: StoredSnapshot = serde_json::from_slice(&bytes)?;
+            let snapshot: StoredSnapshot = serde_json::from_slice(&bytes).map_err(|error| {
+                BrokerError::Cluster(format!(
+                    "invalid persisted snapshot '{}': {error}",
+                    snapshot_path.display()
+                ))
+            })?;
             let persisted = validate_snapshot_data(&snapshot.data).map_err(|error| {
                 BrokerError::Cluster(format!(
                     "invalid persisted snapshot '{}': {error}",
@@ -813,7 +833,12 @@ fn read_state_machine_journal(path: &Path) -> Result<Vec<StateMachineJournalEntr
             break;
         }
         let entry: StateMachineJournalEntry =
-            serde_json::from_slice(&bytes[cursor..cursor + record_len])?;
+            serde_json::from_slice(&bytes[cursor..cursor + record_len]).map_err(|error| {
+                BrokerError::Cluster(format!(
+                    "invalid state-machine journal record in '{}': {error}",
+                    path.display()
+                ))
+            })?;
         if entry.version != STATE_MACHINE_JOURNAL_FORMAT_VERSION {
             return Err(BrokerError::Cluster(format!(
                 "unsupported state-machine journal format version {}",
@@ -2734,6 +2759,74 @@ fn path_component(value: &str) -> String {
         .collect()
 }
 
+fn ensure_storage_metadata(
+    data_dir: &Path,
+    cluster_name: &str,
+    node_id: NodeId,
+) -> Result<(), BrokerError> {
+    let metadata_path = data_dir.join(STORAGE_METADATA_FILE);
+    if metadata_path.exists() {
+        let bytes = fs::read(&metadata_path).map_err(|error| {
+            BrokerError::Cluster(format!(
+                "could not read persisted storage metadata '{}': {error}",
+                metadata_path.display()
+            ))
+        })?;
+        let metadata: PersistedStorageMetadata =
+            serde_json::from_slice(&bytes).map_err(|error| {
+                BrokerError::Cluster(format!(
+                    "invalid persisted storage metadata '{}': {error}",
+                    metadata_path.display()
+                ))
+            })?;
+        if metadata.version != STORAGE_METADATA_FORMAT_VERSION {
+            return Err(BrokerError::Cluster(format!(
+                "unsupported storage metadata format version {}",
+                metadata.version
+            )));
+        }
+        if metadata.cluster_name != cluster_name {
+            return Err(BrokerError::Cluster(format!(
+                "cluster identity mismatch: storage belongs to cluster '{}', configured cluster is '{}'",
+                metadata.cluster_name, cluster_name
+            )));
+        }
+        if metadata.node_id != node_id {
+            return Err(BrokerError::Cluster(format!(
+                "node identity mismatch: storage belongs to node {}, configured node is {}",
+                metadata.node_id, node_id
+            )));
+        }
+        return Ok(());
+    }
+
+    if data_dir.join("groups").exists() {
+        return Err(BrokerError::Cluster(
+            "persisted clustered storage is missing storage metadata; refusing to open it because its cluster identity cannot be verified"
+                .to_owned(),
+        ));
+    }
+
+    let metadata = PersistedStorageMetadata {
+        version: STORAGE_METADATA_FORMAT_VERSION,
+        cluster_name: cluster_name.to_owned(),
+        node_id,
+    };
+    let bytes = serde_json::to_vec(&metadata).map_err(|error| {
+        BrokerError::Cluster(format!(
+            "could not encode storage metadata '{}': {error}",
+            metadata_path.display()
+        ))
+    })?;
+    atomic_write(&metadata_path, &bytes).map_err(|error| {
+        BrokerError::Cluster(format!(
+            "could not persist storage metadata '{}': {error}",
+            metadata_path.display()
+        ))
+    })?;
+    Ok(())
+}
+
 pub struct PersistentEngine {
     manager: Arc<GroupManager>,
     node_id: NodeId,
@@ -2801,6 +2894,7 @@ impl PersistentEngine {
                     .to_owned(),
             ));
         }
+        ensure_storage_metadata(data_dir, &cluster_name, node_id)?;
         let manager = GroupManager::open(
             node_id,
             cluster_name,
@@ -3715,6 +3809,62 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn persisted_storage_rejects_cluster_identity_mismatch_without_rewriting_data() {
+        let directory = tempfile::tempdir().unwrap();
+        let peers = BTreeMap::from([(1, "127.0.0.1:0".to_owned())]);
+        let engine = PersistentEngine::open(
+            1,
+            "runnel-persistent-identity-test".to_owned(),
+            directory.path(),
+            peers.clone(),
+            true,
+        )
+        .await
+        .unwrap();
+        assert!(engine.create_stream("events").await.unwrap());
+        assert_eq!(
+            engine
+                .publish("events", None, b"acknowledged".to_vec(), None)
+                .await
+                .unwrap(),
+            0
+        );
+        drop(engine);
+
+        let metadata_path = directory.path().join(STORAGE_METADATA_FILE);
+        let metadata_before = fs::read(&metadata_path).unwrap();
+        let error = match PersistentEngine::open(
+            1,
+            "another-cluster".to_owned(),
+            directory.path(),
+            peers.clone(),
+            false,
+        )
+        .await
+        {
+            Ok(_) => panic!("opening storage under another cluster identity must fail"),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains("cluster identity mismatch"));
+        assert_eq!(fs::read(&metadata_path).unwrap(), metadata_before);
+
+        let reopened = PersistentEngine::open(
+            1,
+            "runnel-persistent-identity-test".to_owned(),
+            directory.path(),
+            peers,
+            true,
+        )
+        .await
+        .unwrap();
+        assert!(matches!(
+            reopened.poll("events", "worker").await.unwrap(),
+            PollResult::Message(Message { offset: 0, payload, .. })
+                if payload == b"acknowledged"
+        ));
+    }
+
+    #[tokio::test]
     async fn state_machine_journal_replays_and_discards_a_partial_tail() {
         let directory = tempfile::tempdir().unwrap();
         let state_directory = directory.path().join("state-machine");
@@ -3761,6 +3911,108 @@ mod tests {
             fs::metadata(&journal_path).unwrap().len(),
             valid_journal_length
         );
+    }
+
+    #[test]
+    fn invalid_persisted_state_machine_is_rejected_with_file_context() {
+        let directory = tempfile::tempdir().unwrap();
+        let state_directory = directory.path().join("state-machine");
+        fs::create_dir_all(&state_directory).unwrap();
+        fs::write(
+            state_directory.join("state-machine.json"),
+            b"not-a-state-machine",
+        )
+        .unwrap();
+
+        let error = StateMachineStore::open(&state_directory, GroupKind::Metadata)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("invalid persisted state-machine"));
+        assert!(error.contains("state-machine.json"));
+    }
+
+    #[tokio::test]
+    async fn legacy_cluster_layout_is_rejected_without_creating_new_layout() {
+        let directory = tempfile::tempdir().unwrap();
+        let legacy_log = directory.path().join("raft-log.json");
+        fs::write(&legacy_log, b"legacy acknowledged data").unwrap();
+        let peers = BTreeMap::from([(1, "127.0.0.1:0".to_owned())]);
+
+        let error = match PersistentEngine::open(
+            1,
+            "runnel-legacy-layout-test".to_owned(),
+            directory.path(),
+            peers,
+            true,
+        )
+        .await
+        {
+            Ok(_) => panic!("legacy clustered storage must be rejected"),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains("legacy single-group storage detected"));
+        assert_eq!(fs::read(&legacy_log).unwrap(), b"legacy acknowledged data");
+        assert!(!directory.path().join(STORAGE_METADATA_FILE).exists());
+        assert!(!directory.path().join("groups").exists());
+    }
+
+    #[tokio::test]
+    async fn unsupported_storage_metadata_version_is_rejected_before_opening_groups() {
+        let directory = tempfile::tempdir().unwrap();
+        let metadata_path = directory.path().join(STORAGE_METADATA_FILE);
+        fs::write(
+            &metadata_path,
+            serde_json::to_vec(&serde_json::json!({
+                "version": STORAGE_METADATA_FORMAT_VERSION + 1,
+                "cluster_name": "runnel-version-test",
+                "node_id": 1,
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let metadata_before = fs::read(&metadata_path).unwrap();
+        let peers = BTreeMap::from([(1, "127.0.0.1:0".to_owned())]);
+
+        let error = match PersistentEngine::open(
+            1,
+            "runnel-version-test".to_owned(),
+            directory.path(),
+            peers,
+            true,
+        )
+        .await
+        {
+            Ok(_) => panic!("unsupported storage metadata must be rejected"),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains("unsupported storage metadata format version"));
+        assert_eq!(fs::read(&metadata_path).unwrap(), metadata_before);
+        assert!(!directory.path().join("groups").exists());
+    }
+
+    #[tokio::test]
+    async fn unmarked_clustered_layout_is_rejected_without_guessing_identity() {
+        let directory = tempfile::tempdir().unwrap();
+        let marker = directory.path().join("groups").join("acknowledged.data");
+        fs::create_dir_all(marker.parent().unwrap()).unwrap();
+        fs::write(&marker, b"acknowledged data").unwrap();
+        let peers = BTreeMap::from([(1, "127.0.0.1:0".to_owned())]);
+
+        let error = match PersistentEngine::open(
+            1,
+            "runnel-unmarked-layout-test".to_owned(),
+            directory.path(),
+            peers,
+            true,
+        )
+        .await
+        {
+            Ok(_) => panic!("unmarked clustered storage must be rejected"),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains("missing storage metadata"));
+        assert!(!directory.path().join(STORAGE_METADATA_FILE).exists());
+        assert_eq!(fs::read(marker).unwrap(), b"acknowledged data");
     }
 
     #[tokio::test]
