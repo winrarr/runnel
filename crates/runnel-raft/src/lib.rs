@@ -3521,13 +3521,14 @@ mod tests {
     async fn persistent_raft_dead_letters_after_the_configured_attempt_limit() {
         let directory = tempfile::tempdir().unwrap();
         let peers = BTreeMap::from([(1, "127.0.0.1:0".to_owned())]);
+        let ack_timeout = Duration::from_secs(2);
         let engine = PersistentEngine::open_with_config(
             1,
             "runnel-group-dead-letter-test".to_owned(),
             directory.path(),
             peers.clone(),
             true,
-            Duration::from_millis(100),
+            ack_timeout,
             Some(2),
         )
         .await
@@ -3554,7 +3555,7 @@ mod tests {
                 ..
             })
         ));
-        tokio::time::sleep(Duration::from_millis(250)).await;
+        tokio::time::sleep(ack_timeout + Duration::from_millis(100)).await;
         let second = engine
             .poll_group("events", "workers", "member-b")
             .await
@@ -3566,7 +3567,7 @@ mod tests {
                 ..
             })
         ));
-        tokio::time::sleep(Duration::from_millis(250)).await;
+        tokio::time::sleep(ack_timeout + Duration::from_millis(100)).await;
         assert_eq!(
             engine
                 .poll_group("events", "workers", "member-c")
@@ -3610,7 +3611,7 @@ mod tests {
             directory.path(),
             peers,
             true,
-            Duration::from_millis(100),
+            ack_timeout,
             Some(2),
         )
         .await

@@ -1,4 +1,4 @@
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use std::hint::black_box;
 
@@ -12,6 +12,8 @@ const MESSAGE_COUNT: u64 = 100;
 const CONCURRENT_MESSAGES_PER_WORKER: u64 = 64;
 const CONCURRENT_WORKER_COUNTS: &[usize] = &[1, 2, 4, 8];
 const PAYLOAD: &[u8] = &[b'x'; 100];
+const RECOVERY_PAYLOAD: &[u8] = &[b'r'; 100];
+const RECOVERY_RETAINED_MESSAGE_COUNTS: &[u64] = &[100, 1_000, 5_000];
 
 fn durable_publish(c: &mut Criterion) {
     let mut group = c.benchmark_group("durable_publish");
@@ -232,6 +234,51 @@ fn concurrent_publish_same_stream(c: &mut Criterion) {
     group.finish();
 }
 
+fn reopen_recovery_retained_messages(c: &mut Criterion) {
+    let mut group = c.benchmark_group("reopen_recovery_retained_messages");
+    group.sample_size(10);
+    group.warm_up_time(Duration::from_secs(1));
+    group.measurement_time(Duration::from_secs(3));
+
+    for &retained_message_count in RECOVERY_RETAINED_MESSAGE_COUNTS {
+        // The local publish path calls sync_data for every record. Keep all records
+        // retained and prepare the bounded log outside the measured reopen loop.
+        let directory = TempDir::new().unwrap();
+        let broker = Broker::open(directory.path(), BrokerConfig::default()).unwrap();
+        for offset in 0..retained_message_count {
+            assert_eq!(
+                broker
+                    .publish("recovery", None, RECOVERY_PAYLOAD.to_vec())
+                    .unwrap(),
+                offset
+            );
+        }
+        drop(broker);
+
+        group.throughput(Throughput::Elements(retained_message_count));
+        group.bench_function(
+            BenchmarkId::new(
+                "sync_data_per_publish_100_byte_payload",
+                format!("{retained_message_count}_retained_messages"),
+            ),
+            |benchmark| {
+                benchmark.iter_custom(|iterations| {
+                    let started = Instant::now();
+                    for _ in 0..iterations {
+                        // Dropping each reopened broker closes its log descriptor before
+                        // the next iteration and keeps recovery input size unchanged.
+                        let reopened =
+                            Broker::open(directory.path(), BrokerConfig::default()).unwrap();
+                        black_box(reopened);
+                    }
+                    started.elapsed()
+                });
+            },
+        );
+    }
+    group.finish();
+}
+
 fn grouped_delivery(result: PollResult) -> (u64, String) {
     match result {
         PollResult::Message(message) => (
@@ -250,6 +297,7 @@ criterion_group!(
     publish_poll_ack,
     shared_consumer_poll_ack,
     shared_consumer_keyed_poll_ack,
-    concurrent_publish_same_stream
+    concurrent_publish_same_stream,
+    reopen_recovery_retained_messages,
 );
 criterion_main!(benches);
