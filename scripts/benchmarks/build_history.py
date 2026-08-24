@@ -94,7 +94,7 @@ def add_point(
         if isinstance(metric_summary, dict):
             point["range"] = {
                 key: metric_summary[key]
-                for key in ("min", "median", "max")
+                for key in ("min", "median", "max", "relative_range_percent")
                 if key in metric_summary
             }
     points.append(point)
