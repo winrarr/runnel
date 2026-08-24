@@ -16,7 +16,9 @@ const CLUSTER_WAIT_TIMEOUT: Duration = Duration::from_secs(120);
 // keep ordinary request helpers tolerant of the bounded cluster recovery
 // window. Retrying helpers use a shorter per-attempt timeout below.
 const REQUEST_READ_TIMEOUT: Duration = CLUSTER_WAIT_TIMEOUT;
-const REQUEST_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(2);
+// A forwarded request can traverse the bounded peer-forwarding retry window;
+// allow that work to finish before the test opens another request.
+const REQUEST_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(10);
 
 struct RunningNode {
     node_id: u64,
@@ -878,8 +880,9 @@ fn replacement_node_recovers_from_compacted_snapshot() {
         };
         let request_id = format!("snapshot-message-{index}");
         assert!(matches!(
-            wait_for_response_at(
-                nodes[leader].broker_addr,
+            wait_for_response_on_any(
+                &nodes,
+                replacement,
                 || Request::Publish {
                     stream: "events".to_owned(),
                     key: None,
@@ -1030,6 +1033,38 @@ fn wait_for_response_at(
     }
     panic!(
         "node {address} did not accept the request before the deadline; last response: {last_response:?}"
+    );
+}
+
+fn wait_for_response_on_any(
+    nodes: &[RunningNode],
+    excluded: usize,
+    mut request_builder: impl FnMut() -> Request,
+    mut predicate: impl FnMut(&Response) -> bool,
+) -> Response {
+    let deadline = Instant::now() + CLUSTER_WAIT_TIMEOUT;
+    let mut last_response = None;
+    while Instant::now() < deadline {
+        for (index, node) in nodes.iter().enumerate() {
+            if index == excluded || node.child.is_none() {
+                continue;
+            }
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            let attempt_timeout = remaining.min(REQUEST_ATTEMPT_TIMEOUT);
+            match request_with_timeout(node.broker_addr, request_builder(), attempt_timeout) {
+                Ok(response) => {
+                    if predicate(&response) {
+                        return response;
+                    }
+                    last_response = Some(Ok(response));
+                }
+                Err(error) => last_response = Some(Err(error)),
+            }
+        }
+        sleep(Duration::from_millis(50));
+    }
+    panic!(
+        "no surviving node accepted the request before the deadline; last response: {last_response:?}"
     );
 }
 
