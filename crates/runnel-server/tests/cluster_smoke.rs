@@ -1019,6 +1019,9 @@ fn wait_for_response_at(
     let mut last_response = None;
     while Instant::now() < deadline {
         let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            break;
+        }
         let attempt_timeout = remaining.min(REQUEST_ATTEMPT_TIMEOUT);
         match request_with_timeout(address, request_builder(), attempt_timeout) {
             Ok(response) => {
@@ -1050,6 +1053,9 @@ fn wait_for_response_on_any(
                 continue;
             }
             let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                break;
+            }
             let attempt_timeout = remaining.min(REQUEST_ATTEMPT_TIMEOUT);
             match request_with_timeout(node.broker_addr, request_builder(), attempt_timeout) {
                 Ok(response) => {
