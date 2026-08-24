@@ -3,8 +3,8 @@ const dataUrl = 'https://raw.githubusercontent.com/winrarr/runnel/benchmark-hist
 const definitions = [
   { metric: 'throughput_messages_per_second', title: 'Throughput', unit: 'messages/s', higherBetter: true },
   { metric: 'latency_p50', title: 'p50 latency', unit: 'µs', higherBetter: false },
-  { metric: 'latency_p99', title: 'p99 latency', unit: 'µs', higherBetter: false },
-  { metric: 'latency_p999', title: 'p99.9 latency', unit: 'µs', higherBetter: false },
+  { metric: 'latency_p99', title: 'p99 latency', unit: 'µs', higherBetter: false, scale: 'log' },
+  { metric: 'latency_p999', title: 'p99.9 latency', unit: 'µs', higherBetter: false, scale: 'log' },
   { metric: 'cpu_efficiency_messages_per_cpu_second', title: 'CPU efficiency', unit: 'messages/CPU-second', higherBetter: true },
   { metric: 'cpu_percent_max', title: 'Peak broker CPU', unit: '%', higherBetter: false },
   { metric: 'memory_bytes_max', title: 'Peak broker memory', unit: 'bytes', higherBetter: false },
@@ -18,6 +18,7 @@ const sizeSelect = document.getElementById('size');
 const charts = document.getElementById('charts');
 const changes = document.getElementById('changes');
 const changesNote = document.getElementById('changes-note');
+const TREND_WINDOW = 5;
 
 function unique(values) {
   return [...new Set(values)].sort((a, b) => String(a).localeCompare(String(b)));
@@ -60,10 +61,14 @@ function pointSuite(point) {
 }
 
 function pointSeries(point) {
-  if (point.benchmark_series) return point.benchmark_series;
-  if (point.backend === 'runnel' && ['runnel', 'native-comparison'].includes(pointSuite(point))) {
-    return 'runnel-single-node';
+  // Older generated data used one combined series. Prefer the recorded suite
+  // when it is available so the dashboard can separate those histories before
+  // the next history workflow has regenerated data.
+  if (point.backend === 'runnel' && point.benchmark_suite === 'runnel') return 'runnel';
+  if (point.backend === 'runnel' && point.benchmark_suite === 'native-comparison') {
+    return 'runnel-native-comparison';
   }
+  if (point.benchmark_series) return point.benchmark_series;
   return pointSuite(point);
 }
 
@@ -83,15 +88,16 @@ function filteredPoints(metric, operation, size, profile, suite) {
     'memory_bytes_max',
   ].includes(metric);
 
-  return data.points.filter((point) => point.metric === metric
-    && (!resourceMetric
-      || (point.message_size_bytes === null ? size === null : point.operation === operation))
-    && (!resourceMetric
-      || point.message_size_bytes === null
-      || size === null
-      || point.message_size_bytes === size)
-    && (profile === 'all' || point.profile === profile)
-    && matchesSuite(point, suite));
+  return data.points.filter((point) => {
+    if (point.metric !== metric) return false;
+    if (profile !== 'all' && point.profile !== profile) return false;
+    if (!matchesSuite(point, suite)) return false;
+
+    const brokerPoint = point.message_size_bytes === null;
+    if (brokerPoint) return resourceMetric && size === null;
+    if (point.operation !== operation) return false;
+    return size === null || point.message_size_bytes === size;
+  });
 }
 
 function renderEmptyChart(card) {
@@ -101,7 +107,19 @@ function renderEmptyChart(card) {
   card.appendChild(empty);
 }
 
-function chartGeometry(points) {
+function logTickValues(min, max) {
+  const values = [min];
+  const firstPower = Math.ceil(Math.log10(min));
+  const lastPower = Math.floor(Math.log10(max));
+  for (let power = firstPower; power <= lastPower; power += 1) {
+    const value = 10 ** power;
+    if (value > min && value < max) values.push(value);
+  }
+  if (max !== min) values.push(max);
+  return values;
+}
+
+function chartGeometry(points, definition) {
   const width = 900;
   const height = 330;
   const left = 70;
@@ -110,12 +128,23 @@ function chartGeometry(points) {
   const bottom = 48;
   const plotWidth = width - left - right;
   const plotHeight = height - top - bottom;
-  const values = points.map((point) => point.value);
+  const values = points.flatMap((point) => {
+    const rangeValues = point.range
+      ? [point.range.min, point.range.max].filter((value) => Number.isFinite(value))
+      : [];
+    return [point.value, ...rangeValues];
+  });
   const times = points.map((point) => point.timestamp_ms);
-  const min = Math.min(0, ...values);
-  const max = Math.max(...values, min + 1);
+  const useLogScale = definition.scale === 'log' && values.every((value) => value > 0);
+  const min = useLogScale ? Math.min(...values) : Math.min(0, ...values);
+  const max = useLogScale
+    ? Math.max(...values, min * 10)
+    : Math.max(...values, min + 1);
   const timeMin = Math.min(...times);
   const timeMax = Math.max(...times);
+  const transform = (value) => (useLogScale ? Math.log10(value) : value);
+  const transformedMin = transform(min);
+  const transformedMax = transform(max);
 
   return {
     width,
@@ -126,25 +155,28 @@ function chartGeometry(points) {
     bottom,
     plotWidth,
     plotHeight,
+    logScale: useLogScale,
+    tickValues: useLogScale ? logTickValues(min, max) : null,
     min,
     max,
     x: (value) => (timeMax === timeMin
       ? left + plotWidth / 2
       : left + ((value - timeMin) / (timeMax - timeMin)) * plotWidth),
-    y: (value) => top + plotHeight - ((value - min) / (max - min)) * plotHeight,
+    y: (value) => top + plotHeight - ((transform(value) - transformedMin) / (transformedMax - transformedMin)) * plotHeight,
   };
 }
 
 function seriesKey(point) {
-  return `${pointSeries(point)}:${point.backend}:${point.message_size_bytes ?? 'broker'}`;
+  return `${pointSeries(point)}:${point.backend}:${point.message_size_bytes ?? 'broker'}:${point.profile || 'unknown'}`;
 }
 
-function seriesLabel(point, suite) {
+function seriesLabel(point, suite, profile) {
   const prefix = suite === 'all' ? `${suiteLabel(pointSeries(point))} · ` : '';
   const size = point.message_size_bytes === null
     ? 'broker'
     : `${point.message_size_bytes} bytes`;
-  return `${prefix}${point.backend} · ${size}`;
+  const profileSuffix = profile === 'all' ? ` · ${point.profile || 'unknown profile'}` : '';
+  return `${prefix}${point.backend} · ${size}${profileSuffix}`;
 }
 
 function xTickPoints(points) {
@@ -153,12 +185,57 @@ function xTickPoints(points) {
     if (!byTimestamp.has(point.timestamp_ms)) byTimestamp.set(point.timestamp_ms, point);
   });
   const uniquePoints = [...byTimestamp.values()].sort((a, b) => a.timestamp_ms - b.timestamp_ms);
-  const tickCount = Math.min(6, uniquePoints.length);
+  const tickCount = Math.min(5, uniquePoints.length);
   if (tickCount <= 1) return uniquePoints;
   return Array.from({ length: tickCount }, (_, index) => {
     const position = Math.round(index * (uniquePoints.length - 1) / (tickCount - 1));
     return uniquePoints[position];
   });
+}
+
+function formatTickLabel(point, ticks) {
+  const date = new Date(point.timestamp);
+  const days = new Set(ticks.map((tick) => new Date(tick.timestamp).toDateString()));
+  if (days.size === 1) {
+    return date.toLocaleTimeString(undefined, { hour: 'numeric', minute: '2-digit' });
+  }
+  const years = new Set(ticks.map((tick) => new Date(tick.timestamp).getFullYear()));
+  return date.toLocaleDateString(undefined, {
+    month: 'short',
+    day: 'numeric',
+    ...(years.size > 1 ? { year: 'numeric' } : {}),
+  });
+}
+
+function median(values) {
+  const sorted = [...values].sort((a, b) => a - b);
+  if (!sorted.length) return null;
+  const middle = Math.floor(sorted.length / 2);
+  return sorted.length % 2 === 0
+    ? (sorted[middle - 1] + sorted[middle]) / 2
+    : sorted[middle];
+}
+
+function rollingMedian(points) {
+  return points.map((point, index) => {
+    const start = Math.max(0, index - TREND_WINDOW + 1);
+    const value = median(points.slice(start, index + 1).map((item) => item.value));
+    return { timestamp_ms: point.timestamp_ms, value };
+  });
+}
+
+function rangePath(points, geometry) {
+  const ranged = points.filter((point) => point.range
+    && Number.isFinite(point.range.min)
+    && Number.isFinite(point.range.max));
+  if (ranged.length < 2) return '';
+  const upper = ranged.map((point, index) => `${index ? 'L' : 'M'} ${geometry.x(point.timestamp_ms)} ${geometry.y(point.range.max)}`).join(' ');
+  const lower = [...ranged].reverse().map((point) => `L ${geometry.x(point.timestamp_ms)} ${geometry.y(point.range.min)}`).join(' ');
+  return `${upper} ${lower} Z`;
+}
+
+function linePath(points, geometry) {
+  return points.map((point, index) => `${index ? 'L' : 'M'} ${geometry.x(point.timestamp_ms)} ${geometry.y(point.value)}`).join(' ');
 }
 
 function renderChart(definition, operation, size, profile, suite) {
@@ -167,7 +244,9 @@ function renderChart(definition, operation, size, profile, suite) {
   card.className = 'chart-card';
 
   const heading = document.createElement('h3');
-  heading.textContent = definition.title;
+  heading.textContent = definition.scale === 'log'
+    ? `${definition.title} (log scale)`
+    : definition.title;
   card.appendChild(heading);
 
   if (!points.length) {
@@ -178,17 +257,18 @@ function renderChart(definition, operation, size, profile, suite) {
   const grouped = {};
   points.forEach((point) => {
     const key = seriesKey(point);
-    if (!grouped[key]) grouped[key] = { label: seriesLabel(point, suite), points: [] };
+    if (!grouped[key]) grouped[key] = { label: seriesLabel(point, suite, profile), points: [] };
     grouped[key].points.push(point);
   });
   Object.values(grouped).forEach((series) => series.points.sort((a, b) => a.timestamp_ms - b.timestamp_ms));
 
-  const geometry = chartGeometry(points);
-  const ticks = [0, 0.25, 0.5, 0.75, 1];
+  const geometry = chartGeometry(points, definition);
+  const tickValues = geometry.logScale
+    ? geometry.tickValues
+    : [0, 0.25, 0.5, 0.75, 1].map((tick) => geometry.min + (geometry.max - geometry.min) * tick);
   let svg = `<svg viewBox="0 0 ${geometry.width} ${geometry.height}" role="img" aria-label="${escapeText(definition.title)} over time">`;
 
-  ticks.forEach((tick) => {
-    const value = geometry.min + (geometry.max - geometry.min) * tick;
+  tickValues.forEach((value) => {
     const position = geometry.y(value);
     svg += `<line class="gridline" x1="${geometry.left}" x2="${geometry.width - geometry.right}" y1="${position}" y2="${position}"/>`;
     svg += `<text class="axis-label" x="${geometry.left - 8}" y="${position + 4}" text-anchor="end">${escapeText(formatValue(value, definition.unit))}</text>`;
@@ -197,17 +277,19 @@ function renderChart(definition, operation, size, profile, suite) {
   svg += `<line class="axis" x1="${geometry.left}" x2="${geometry.left}" y1="${geometry.top}" y2="${geometry.height - geometry.bottom}"/>`;
   svg += `<line class="axis" x1="${geometry.left}" x2="${geometry.width - geometry.right}" y1="${geometry.height - geometry.bottom}" y2="${geometry.height - geometry.bottom}"/>`;
 
-  xTickPoints(points).forEach((point) => {
+  const xTicks = xTickPoints(points);
+  xTicks.forEach((point) => {
     const position = geometry.x(point.timestamp_ms);
-    const revision = (point.revision || 'unknown').slice(0, 7);
     svg += `<line class="tick" x1="${position}" x2="${position}" y1="${geometry.height - geometry.bottom}" y2="${geometry.height - geometry.bottom + 5}"/>`;
-    svg += `<text class="axis-label" x="${position}" y="${geometry.height - geometry.bottom + 17}" text-anchor="middle"><title>${escapeText(new Date(point.timestamp).toLocaleString())}</title>${escapeText(revision)}</text>`;
+    svg += `<text class="axis-label" x="${position}" y="${geometry.height - geometry.bottom + 17}" text-anchor="middle"><title>${escapeText(new Date(point.timestamp).toLocaleString())}</title>${escapeText(formatTickLabel(point, xTicks))}</text>`;
   });
 
   Object.values(grouped).forEach((series, index) => {
     const color = colors[index % colors.length];
-    const path = series.points.map((point, pointIndex) => `${pointIndex ? 'L' : 'M'} ${geometry.x(point.timestamp_ms)} ${geometry.y(point.value)}`).join(' ');
-    svg += `<path d="${path}" fill="none" stroke="${color}" stroke-width="2"/>`;
+    const band = rangePath(series.points, geometry);
+    if (band) svg += `<path class="range-band" d="${band}" fill="${color}"/>`;
+    const trend = linePath(rollingMedian(series.points), geometry);
+    svg += `<path class="trend-line" d="${trend}" stroke="${color}"/>`;
 
     series.points.forEach((point) => {
       const range = point.range
@@ -216,8 +298,9 @@ function renderChart(definition, operation, size, profile, suite) {
       const change = point.delta_percent === undefined
         ? ''
         : ` · change ${point.delta_percent.toFixed(1)}%`;
-      const detail = `${new Date(point.timestamp).toLocaleString()} · ${series.label} · ${formatValue(point.value, definition.unit)}${range}${change}`;
-      svg += `<circle cx="${geometry.x(point.timestamp_ms)}" cy="${geometry.y(point.value)}" r="3.5" fill="${color}"><title>${escapeText(detail)}</title></circle>`;
+      const revision = (point.revision || 'unknown').slice(0, 12);
+      const detail = `${new Date(point.timestamp).toLocaleString()} · commit ${revision} · ${series.label} · observed median ${formatValue(point.value, definition.unit)}${range}${change}`;
+      svg += `<circle class="raw-point" cx="${geometry.x(point.timestamp_ms)}" cy="${geometry.y(point.value)}" r="3.5" fill="${color}"><title>${escapeText(detail)}</title></circle>`;
     });
   });
 
@@ -231,6 +314,12 @@ function renderChart(definition, operation, size, profile, suite) {
     item.innerHTML = `<span class="swatch" style="background:${colors[index % colors.length]}"></span>${escapeText(series.label)}`;
     legend.appendChild(item);
   });
+  const guide = document.createElement('span');
+  guide.className = 'legend-note';
+  guide.textContent = definition.scale === 'log'
+    ? 'dots: run median · line: 5-run rolling median · band: repetition range · logarithmic y-axis'
+    : 'dots: run median · line: 5-run rolling median · band: repetition range';
+  legend.appendChild(guide);
   card.appendChild(legend);
   return card;
 }
@@ -284,7 +373,8 @@ function populateOperations() {
 function suiteLabel(value) {
   return {
     runnel: 'Runnel benchmark',
-    'runnel-single-node': 'Runnel single-node history',
+    'runnel-native-comparison': 'Runnel native-comparison history',
+    'runnel-single-node': 'Runnel legacy combined history',
     'native-comparison': 'Native broker comparison',
     'cluster-comparison': 'Three-node competitor comparison',
     cluster: 'Runnel cluster',
@@ -297,7 +387,9 @@ function populate() {
     new Option('All suites', 'all'),
     ...suites.map((value) => new Option(suiteLabel(value), value)),
   );
-  if (suites.includes('runnel-single-node')) suiteSelect.value = 'runnel-single-node';
+  if (suites.includes('runnel')) suiteSelect.value = 'runnel';
+  else if (suites.includes('runnel-single-node')) suiteSelect.value = 'runnel-single-node';
+  else if (suites.includes('runnel-native-comparison')) suiteSelect.value = 'runnel-native-comparison';
   else if (suites.includes('native-comparison')) suiteSelect.value = 'native-comparison';
 
   const profiles = unique(data.points.map((point) => point.profile));

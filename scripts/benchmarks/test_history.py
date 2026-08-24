@@ -134,7 +134,7 @@ class HistoryTests(unittest.TestCase):
         self.assertEqual(current["delta_percent"], 100.0)
         self.assertTrue(current["improved"])
 
-    def test_runnel_history_series_spans_single_node_suites(self) -> None:
+    def test_runnel_history_series_separates_measurement_suites(self) -> None:
         raw = comparison_result()
         raw["workload"]["single_node"] = True
         first = normalize_result(raw, source_name="first.json")
@@ -153,7 +153,10 @@ class HistoryTests(unittest.TestCase):
         )
 
         runnel_points = [point for point in points if point["backend"] == "runnel"]
-        self.assertEqual({point["benchmark_series"] for point in runnel_points}, {"runnel-single-node"})
+        self.assertEqual(
+            {point["benchmark_series"] for point in runnel_points},
+            {"runnel-native-comparison", "runnel"},
+        )
 
         generated = site_data(
             [
@@ -167,8 +170,8 @@ class HistoryTests(unittest.TestCase):
             if point["run_file"] == "second.json"
             and point["metric"] == "throughput_messages_per_second"
         )
-        self.assertEqual(current["previous_value"], 1000.0)
-        self.assertEqual(current["delta_percent"], 100.0)
+        self.assertNotIn("previous_value", current)
+        self.assertNotIn("delta_percent", current)
 
     def test_resource_helpers_report_cpu_time_and_averages(self) -> None:
         self.assertEqual(parse_cpu_stat("usage_usec 250000\nuser_usec 1\n"), 0.25)
@@ -200,7 +203,11 @@ class HistoryTests(unittest.TestCase):
         self.assertIn("Runnel benchmark history", (site_dir / "index.html").read_text(encoding="utf-8"))
         app = (site_dir / "app.js").read_text(encoding="utf-8")
         self.assertIn("CPU efficiency", app)
-        self.assertIn("runnel-single-node", app)
+        self.assertIn("runnel-native-comparison", app)
+        self.assertIn("rollingMedian", app)
+        self.assertIn("logTickValues", app)
+        self.assertIn("commit ${revision}", app)
+        self.assertIn("point.operation !== operation", app)
         self.assertIn("seriesKey", app)
         self.assertIn("loadData", app)
 
