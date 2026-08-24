@@ -658,9 +658,13 @@ mod tests {
     }
 
     fn request() -> PeerRequest {
-        PeerRequest::Forward(ForwardedOperation::CreateStream {
+        PeerRequest::Forward(forwarded_operation())
+    }
+
+    fn forwarded_operation() -> ForwardedOperation {
+        ForwardedOperation::CreateStream {
             stream: "test".to_owned(),
-        })
+        }
     }
 
     #[tokio::test]
@@ -684,6 +688,29 @@ mod tests {
             started.elapsed()
         );
         assert_eq!(peer.connections.load(Ordering::Relaxed), 1);
+    }
+
+    #[tokio::test]
+    async fn topology_free_forwarding_opens_one_connection_per_request() {
+        const REQUESTS: usize = 64;
+
+        let peer = TestPeer::start(None).await;
+        let started = Instant::now();
+        for _ in 0..REQUESTS {
+            let response = forward(&peer.address, forwarded_operation(), Duration::from_secs(1))
+                .await
+                .unwrap();
+            assert!(matches!(
+                response,
+                ForwardedResponse::CreateStream(Ok(true))
+            ));
+        }
+        let connections = peer.connections.load(Ordering::Relaxed);
+        eprintln!(
+            "topology-free forwarding: requests={REQUESTS}, connections={connections}, elapsed={:?}",
+            started.elapsed()
+        );
+        assert_eq!(connections, REQUESTS);
     }
 
     #[tokio::test]
