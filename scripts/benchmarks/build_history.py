@@ -114,8 +114,10 @@ def benchmark_suite(run: dict[str, Any]) -> str:
 def benchmark_series(run: dict[str, Any], backend: str) -> str:
     """Return the user-facing history series for a backend measurement."""
     suite = benchmark_suite(run)
-    if backend == "runnel" and suite in {"runnel", "native-comparison"}:
-        return "runnel-single-node"
+    if backend == "runnel" and suite == "runnel":
+        return "runnel"
+    if backend == "runnel" and suite == "native-comparison":
+        return "runnel-native-comparison"
     return suite
 
 
@@ -280,36 +282,6 @@ def site_data(runs: list[dict[str, Any]]) -> dict[str, Any]:
 
 
 def comparison_identity(run: dict[str, Any], backend_name: str | None = None) -> str:
-    if backend_name == "runnel" and benchmark_series(run, backend_name) == "runnel-single-node":
-        backend = run.get("backends", {}).get(backend_name, {})
-        workload = run.get("workload", {})
-        return json.dumps(
-            {
-                "benchmark_series": "runnel-single-node",
-                "resource_limits": run.get("resource_limits", {}),
-                "workload": {
-                    key: workload.get(key)
-                    for key in (
-                        "messages",
-                        "payload_sizes_bytes",
-                        "single_node",
-                        "replication_factor",
-                        "compression",
-                    )
-                },
-                "backend": {
-                    key: backend.get(key)
-                    for key in (
-                        "image",
-                        "acknowledgement",
-                        "replication",
-                        "measurement_boundary",
-                        "measurement_client",
-                    )
-                },
-            },
-            sort_keys=True,
-        )
     return json.dumps(
         {
             "benchmark_suite": benchmark_suite(run),

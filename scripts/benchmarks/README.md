@@ -144,7 +144,7 @@ python3 scripts/benchmarks/build_history.py \
 
 The normalized schema intentionally excludes native tool logs. It retains workload, limits, image identifiers, semantic boundaries, scenario resource samples, source revision, workflow provenance, and measured points. `build_history.py` aggregates these records into `site/data.json` on the generated `benchmark-history` branch. The hand-authored HTML, CSS, and JavaScript in `docs/benchmarks/` are served directly by GitHub Pages and read that public history data from the raw GitHub URL. The longer Runnel-only history is the primary optimization series; native and three-node competitor records are kept as separate suites. Invalid or unrelated JSON files are skipped.
 
-The dashboard treats all single-node Runnel measurements as one optimization history, including older Runnel points recorded by the native-comparison workflow. Charts keep benchmark suite, backend, and payload size in separate visual series, so selecting all sizes or suites does not connect unrelated measurements or hide which point belongs to which workload.
+The dashboard uses the dedicated Runnel suite as the primary optimization history. Older Runnel points recorded by the native-comparison workflow remain available as a separate history, because their measurement boundary can differ. Charts keep benchmark suite, backend, operation, and payload size in separate visual series, so selecting all sizes or suites does not connect unrelated measurements or hide which point belongs to which workload. Raw run medians are shown as dots, while a five-run rolling median makes the direction of change easier to see; repetition ranges are shown as a band when available.
 
 For pull-request feedback, render a short Runnel result as Markdown:
 
