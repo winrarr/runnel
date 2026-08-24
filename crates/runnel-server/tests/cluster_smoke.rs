@@ -1184,7 +1184,7 @@ fn wait_for_message_at(address: SocketAddr, offset: u64, payload: &str) {
                 stream: "events".to_owned(),
                 consumer: "worker".to_owned(),
             },
-            CLUSTER_WAIT_TIMEOUT,
+            REQUEST_ATTEMPT_TIMEOUT,
         );
         if let Ok(Response::Message {
             offset: received,
