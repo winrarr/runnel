@@ -1,0 +1,51 @@
+name: Publish Runnel PR benchmark
+
+on:
+  workflow_run:
+    workflows: [Runnel PR benchmark]
+    types: [completed]
+
+# This workflow is privileged only after the read-only benchmark has
+# completed. It checks out the default branch, so the report code is trusted;
+# the PR workflow contributes data only through the downloaded artifact.
+permissions:
+  actions: read
+  contents: read
+  pull-requests: write
+
+jobs:
+  comment:
+    if: >-
+      github.event.workflow_run.conclusion == 'success' &&
+      github.event.workflow_run.event == 'pull_request' &&
+      github.event.workflow_run.pull_requests[0].number
+    name: Comment benchmark result
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7.0.1
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          persist-credentials: false
+      - name: Download benchmark result
+        uses: actions/download-artifact@v8.0.1
+        with:
+          name: runnel-pr-benchmark-${{ github.event.workflow_run.id }}
+          path: benchmark-results
+          run-id: ${{ github.event.workflow_run.id }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+      - name: Generate benchmark comment
+        run: |
+          set -euo pipefail
+          python3 scripts/benchmarks/pr_report.py \
+            --input benchmark-results/pr.json \
+            --output benchmark-results/pr-comment.md
+      - name: Publish benchmark comment
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_NUMBER: ${{ github.event.workflow_run.pull_requests[0].number }}
+        run: |
+          set -euo pipefail
+          gh pr comment "$PR_NUMBER" \
+            --repo "$GITHUB_REPOSITORY" \
+            --body-file benchmark-results/pr-comment.md
