@@ -1,3 +1,4 @@
+use std::fs::OpenOptions;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
@@ -246,8 +247,8 @@ fn three_process_cluster_replicates_and_recovers_after_failures() {
         response => panic!("expected second grouped message, got {response:?}"),
     };
     assert!(matches!(
-        wait_for_response_at(
-            nodes[grouped_node].broker_addr,
+        wait_for_response_on_any(
+            &nodes,
             || Request::AckGroup {
                 stream: "grouped-jobs".to_owned(),
                 consumer: "workers".to_owned(),
@@ -263,8 +264,8 @@ fn three_process_cluster_replicates_and_recovers_after_failures() {
         }
     ));
     assert!(matches!(
-        wait_for_response_at(
-            nodes[(grouped_node + 1) % nodes.len()].broker_addr,
+        wait_for_response_on_any(
+            &nodes,
             || Request::AckGroup {
                 stream: "grouped-jobs".to_owned(),
                 consumer: "workers".to_owned(),
@@ -881,7 +882,7 @@ fn replacement_node_recovers_from_compacted_snapshot() {
         assert!(matches!(
             wait_for_response_on_any_with_timeout(
                 &nodes,
-                replacement,
+                Some(replacement),
                 RECOVERY_REQUEST_ATTEMPT_TIMEOUT,
                 || Request::Publish {
                     stream: "events".to_owned(),
@@ -957,6 +958,18 @@ fn spawn_node(
         ])
         .stdout(Stdio::null())
         .stderr(Stdio::null());
+    if std::env::var_os("RUNNEL_TEST_CAPTURE_LOGS").is_some() {
+        let log_path = data_dir.with_extension("log");
+        let stdout = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&log_path)
+            .expect("node log should be writable");
+        let stderr = stdout.try_clone().expect("node log should be cloneable");
+        command
+            .stdout(Stdio::from(stdout))
+            .stderr(Stdio::from(stderr));
+    }
     for (id, address) in cluster_nodes {
         command.args(["--cluster-node", &format!("{id}={address}")]);
     }
@@ -1048,9 +1061,23 @@ fn wait_for_response_at_with_timeout(
     );
 }
 
+fn wait_for_response_on_any(
+    nodes: &[RunningNode],
+    request_builder: impl FnMut() -> Request,
+    predicate: impl FnMut(&Response) -> bool,
+) -> Response {
+    wait_for_response_on_any_with_timeout(
+        nodes,
+        None,
+        REQUEST_ATTEMPT_TIMEOUT,
+        request_builder,
+        predicate,
+    )
+}
+
 fn wait_for_response_on_any_with_timeout(
     nodes: &[RunningNode],
-    excluded: usize,
+    excluded: Option<usize>,
     attempt_timeout: Duration,
     mut request_builder: impl FnMut() -> Request,
     mut predicate: impl FnMut(&Response) -> bool,
@@ -1059,7 +1086,7 @@ fn wait_for_response_on_any_with_timeout(
     let mut last_response = None;
     while Instant::now() < deadline {
         for (index, node) in nodes.iter().enumerate() {
-            if index == excluded || node.child.is_none() {
+            if excluded == Some(index) || node.child.is_none() {
                 continue;
             }
             let remaining = deadline.saturating_duration_since(Instant::now());

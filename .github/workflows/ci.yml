@@ -16,6 +16,7 @@ jobs:
   verify:
     name: Verify
     runs-on: ubuntu-24.04
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v7.0.1
       - uses: dtolnay/rust-toolchain@1.97.1
@@ -30,6 +31,7 @@ jobs:
   integration:
     name: Integration and container smoke tests
     runs-on: ubuntu-24.04
+    timeout-minutes: 15
     needs: verify
     steps:
       - uses: actions/checkout@v7.0.1
@@ -40,7 +42,33 @@ jobs:
       - uses: taiki-e/install-action@v2.86.3
         with:
           tool: just
+      - name: Enable integration diagnostics
+        run: echo "RUNNEL_TEST_CAPTURE_LOGS=1" >> "$GITHUB_ENV"
       - run: just isolated smoke
       - run: just isolated cluster-test
       - run: just docker-build
       - run: just isolated bench-container-smoke
+      - name: Capture integration diagnostics
+        if: failure()
+        run: |
+          set +e
+          mkdir -p benchmark-results/ci-diagnostics
+          {
+            date --iso-8601=seconds
+            uname -a
+            nproc
+            free -h
+            df -h
+            ulimit -a
+            ps -eo pid,ppid,stat,etime,%cpu,%mem,cmd --sort=-%cpu
+            ss -s
+          } > benchmark-results/ci-diagnostics/runner.txt 2>&1
+      - name: Upload integration diagnostics
+        if: failure()
+        uses: actions/upload-artifact@v7.0.1
+        with:
+          name: integration-diagnostics-${{ github.run_id }}
+          if-no-files-found: warn
+          path: |
+            benchmark-results/ci-diagnostics
+            /tmp/runnel-isolated-*
