@@ -9,7 +9,7 @@ This document records candidate architectures for Runnel's multi-node future. It
 
 Use Multi-Raft for the first three-node implementation, behind a narrow distributed-log engine boundary shared with the existing local engine. Multi-Raft offers a well-understood path to quorum durability, leader fencing, recovery, and membership changes, making it a useful correctness baseline.
 
-The reviewable implementation proposal is recorded in [multi-raft-implementation-plan.md](multi-raft-implementation-plan.md). It remains a proposal until an ADR accepts the consequential choices.
+The reviewable implementation proposal is recorded in [multi-raft-implementation-plan.md](../design/multi-raft-implementation-plan.md). It remains a proposal until an ADR accepts the consequential choices.
 
 Do not model the boundary as a generic consensus strategy. The broker should depend on durable messaging semantics, not on terms, leaders, quorums, sequencers, or copysets. Those concepts differ across candidate architectures and belong inside an engine.
 

@@ -1,0 +1,56 @@
+name: Conventional Commits
+
+on:
+  pull_request:
+    types: [opened, edited, reopened, synchronize]
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  pull-request-title:
+    name: Pull request title
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - name: Validate title
+        env:
+          PR_TITLE: ${{ github.event.pull_request.title }}
+        run: |
+          if [[ ! "$PR_TITLE" =~ ^[a-z][a-z0-9-]*(\([^()]+\))?!?:\ [^[:space:]].*$ ]]; then
+            echo "Pull-request title is not a Conventional Commit: $PR_TITLE" >&2
+            echo "Expected <type>[optional scope][!]: description" >&2
+            exit 1
+          fi
+
+  main-commits:
+    name: Main commit subjects
+    if: github.event_name == 'push'
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7.0.1
+        with:
+          fetch-depth: 0
+      - name: Validate new commits
+        env:
+          BEFORE: ${{ github.event.before }}
+          AFTER: ${{ github.sha }}
+        run: |
+          if [ "$BEFORE" = "0000000000000000000000000000000000000000" ]; then
+            range="$AFTER"
+          else
+            range="$BEFORE..$AFTER"
+          fi
+          invalid=0
+          while IFS= read -r line; do
+            hash="${line%% *}"
+            subject="${line#* }"
+            if [[ ! "$subject" =~ ^[a-z][a-z0-9-]*(\([^()]+\))?!?:\ [^[:space:]].*$ ]]; then
+              echo "Invalid Conventional Commit subject for ${hash:0:12}: $subject" >&2
+              invalid=1
+            fi
+          done < <(git log --no-merges --format='%H %s' "$range")
+          exit "$invalid"

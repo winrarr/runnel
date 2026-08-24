@@ -79,6 +79,11 @@ Useful workflows:
 
 The existing scripts/verify.sh command remains as a thin compatibility wrapper around just verify.
 
+Contributions use Conventional Commits because pull-request titles become the
+release-facing subjects after squash merges. See [CONTRIBUTING.md](CONTRIBUTING.md)
+for the format; GitHub Actions enforces it on pull requests and new commits to
+`main`.
+
 When multiple local processes, containers, or test suites need to run at the same time, use `just isolated <workflow>`. Each invocation gets its own Cargo target directory, temporary-file directory, benchmark artifact directory, and workflow-specific Docker resources. The supported workflows are listed by `python3 scripts/isolated.py --help`; failed runs retain their temporary state for diagnosis, while successful build state is removed and benchmark results remain under `benchmark-results/isolated/`. This is intentionally a named-workflow interface rather than a wrapper for arbitrary commands whose ports or external state are unknown.
 
 The test suite includes core persistence and recovery tests, wire-format round-trip tests, and a network-level test that starts the real broker process and verifies acknowledgement state across restart. `just smoke` is the canonical local end-to-end test: it starts the broker itself and uses `runnelctl` to publish, consume, acknowledge, restart, and verify recovery. The benchmark suite measures durable publish and publish/poll/ack paths; benchmark results must always be interpreted with their durability settings and workload. See [docs/testing.md](docs/testing.md) for the interactive walkthrough and test layers.
@@ -103,7 +108,7 @@ Grouped delivery uses `poll_group` and `ack_group` requests with a consumer name
 
 Message responses include a delivery attempt while retry state is being tracked. Dead-letter records are available on the source stream's .dead-letter stream and preserve the original key and payload.
 
-See [docs/architecture.md](docs/architecture.md) for the current boundaries, [docs/design/distributed-architecture-options.md](docs/design/distributed-architecture-options.md) for the multi-node alternatives, [docs/design/multi-raft-implementation-plan.md](docs/design/multi-raft-implementation-plan.md) for the proposed first clustered plan, [docs/backlog.md](docs/backlog.md) for intended next outcomes, and [docs/tech-debt.md](docs/tech-debt.md) for known implementation shortcuts. Repository operating guidance lives in AGENTS.md.
+See [docs/architecture.md](docs/architecture.md) for the current boundaries, [docs/research/README.md](docs/research/README.md) for source-backed investigations, [docs/design/multi-raft-implementation-plan.md](docs/design/multi-raft-implementation-plan.md) for the proposed first clustered plan, [docs/backlog.md](docs/backlog.md) for intended next outcomes, and [docs/tech-debt.md](docs/tech-debt.md) for known implementation shortcuts. Repository operating guidance lives in AGENTS.md.
 
 For dependency auditing, install cargo-audit and run:
 

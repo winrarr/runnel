@@ -34,4 +34,4 @@ The clustered implementation was intentionally deferred while the local conforma
 
 - [Product backlog](../backlog.md)
 - [Current architecture](../architecture.md)
-- [Distributed architecture alternatives](../design/distributed-architecture-options.md)
+- [Distributed architecture alternatives](../research/distributed-architecture-options.md)
