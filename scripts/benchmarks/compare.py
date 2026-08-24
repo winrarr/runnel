@@ -209,7 +209,7 @@ class Service:
         self.entrypoint = entrypoint
         self.image_id: str | None = None
         self.startup_ns: int | None = None
-        self.stats = StatsSampler(name)
+        self.stats = BoundedStatsSampler(name)
 
     def start(self) -> None:
         self.image_id = ensure_image(self.image)
