@@ -15,8 +15,10 @@
       include acknowledgement paths; Kafka and Redpanda consumer figures currently measure fetch
       throughput without per-message application acknowledgement. CPU efficiency means messages
       per broker CPU-second, and memory is the peak broker memory sampled during the selected
-      scenario. Consumer latency is not reported by every native benchmark client, so an empty
-      latency chart is an unavailable measurement rather than a zero.
+      scenario. The Runnel single-node history combines Runnel measurements from the dedicated
+      Runnel suite and the earlier native-comparison suite; competitor suites remain separate.
+      Consumer latency is not reported by every native benchmark client, so an empty latency chart
+      is an unavailable measurement rather than a zero.
     </p>
 
     <section class="controls" aria-label="Chart filters">
