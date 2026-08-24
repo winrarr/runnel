@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
@@ -40,6 +40,9 @@ pub struct Broker {
 struct BrokerState {
     root: PathBuf,
     streams: HashMap<String, StreamLog>,
+    // Entries are retained only while a consumer has active deliveries; the file remains the
+    // durable source of truth across restart and cache eviction.
+    consumer_states: HashMap<ConsumerKey, ConsumerState>,
     in_flight: HashMap<DeliveryKey, InFlight>,
     ack_timeout: Duration,
     max_delivery_attempts: Option<u32>,
@@ -85,7 +88,7 @@ struct RecordIndex {
     published_at_ms: u64,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct ConsumerState {
     stream: String,
     consumer: String,
@@ -144,6 +147,7 @@ impl Broker {
             inner: Arc::new(Mutex::new(BrokerState {
                 root,
                 streams,
+                consumer_states: HashMap::new(),
                 in_flight: HashMap::new(),
                 ack_timeout: config.ack_timeout,
                 max_delivery_attempts: config.max_delivery_attempts,
@@ -218,6 +222,16 @@ impl Broker {
         state
             .in_flight
             .retain(|_, in_flight| in_flight.deadline > now);
+        if !state.consumer_states.is_empty() {
+            let active_consumers: HashSet<_> = state
+                .in_flight
+                .keys()
+                .map(|delivery_key| delivery_key.consumer.clone())
+                .collect();
+            state
+                .consumer_states
+                .retain(|consumer_key, _| active_consumers.contains(consumer_key));
+        }
 
         let existing = state
             .in_flight
@@ -237,7 +251,7 @@ impl Broker {
             return Ok(PollResult::Message(message));
         }
 
-        let mut consumer_state = load_consumer_state(&root, stream, consumer)?;
+        let mut consumer_state = load_consumer_state_for_request(&mut state, &consumer_key)?;
         loop {
             let candidate = state
                 .streams
@@ -281,6 +295,9 @@ impl Broker {
                 dead_letter_record(&mut state, stream, &candidate)?;
                 consumer_state.acknowledge(candidate.offset);
                 persist_consumer_state(&root, &consumer_state)?;
+                state
+                    .consumer_states
+                    .insert(consumer_key.clone(), consumer_state.clone());
                 state.dead_letters += 1;
                 continue;
             }
@@ -296,6 +313,9 @@ impl Broker {
                 .delivery_attempts
                 .insert(candidate.offset, delivery_attempt);
             persist_consumer_state(&root, &next_state)?;
+            state
+                .consumer_states
+                .insert(consumer_key.clone(), next_state);
             let delivery_token = next_delivery_token(&mut state);
             message.delivery_token = Some(delivery_token.clone());
             message.delivery_attempt = Some(delivery_attempt);
@@ -349,19 +369,19 @@ impl Broker {
         }
 
         let root = state.root.clone();
-        let consumer_state = load_consumer_state(&root, stream, consumer)?;
+        let consumer_key = ConsumerKey {
+            stream: stream.to_owned(),
+            consumer: consumer.to_owned(),
+        };
+        let consumer_state = load_consumer_state_for_request(&mut state, &consumer_key)?;
         if offset < consumer_state.committed_offset {
             return Ok(AckResult::AlreadyAcknowledged);
         }
         if consumer_state.acknowledged_offsets.contains(&offset) {
             return Ok(AckResult::AlreadyAcknowledged);
         }
-        let consumer_key = ConsumerKey {
-            stream: stream.to_owned(),
-            consumer: consumer.to_owned(),
-        };
         let delivery_key = DeliveryKey {
-            consumer: consumer_key,
+            consumer: consumer_key.clone(),
             offset,
         };
         let Some(in_flight) = state.in_flight.get(&delivery_key) else {
@@ -393,7 +413,17 @@ impl Broker {
             ..next_state
         };
         persist_consumer_state(&root, &next_state)?;
+        state
+            .consumer_states
+            .insert(consumer_key.clone(), next_state);
         state.in_flight.remove(&delivery_key);
+        if !state
+            .in_flight
+            .keys()
+            .any(|remaining| remaining.consumer == consumer_key)
+        {
+            state.consumer_states.remove(&consumer_key);
+        }
         Ok(AckResult::Acknowledged)
     }
 
@@ -672,6 +702,21 @@ fn load_consumer_state(
     }
     let bytes = fs::read(path)?;
     Ok(serde_json::from_slice(&bytes)?)
+}
+
+fn load_consumer_state_for_request(
+    broker_state: &mut BrokerState,
+    consumer_key: &ConsumerKey,
+) -> Result<ConsumerState, BrokerError> {
+    if let Some(cached) = broker_state.consumer_states.get(consumer_key) {
+        return Ok(cached.clone());
+    }
+
+    load_consumer_state(
+        &broker_state.root,
+        &consumer_key.stream,
+        &consumer_key.consumer,
+    )
 }
 
 fn persist_consumer_state(root: &Path, state: &ConsumerState) -> Result<(), BrokerError> {
@@ -990,6 +1035,60 @@ mod tests {
         assert!(matches!(
             result,
             PollResult::Message(Message { offset: 0, .. })
+        ));
+    }
+
+    #[test]
+    fn acknowledged_group_progress_and_retry_state_survive_restart() {
+        let directory = tempdir().unwrap();
+        let config = BrokerConfig {
+            ack_timeout: Duration::from_secs(60),
+            max_delivery_attempts: None,
+        };
+        {
+            let broker = Broker::open(directory.path(), config.clone()).unwrap();
+            for payload in [
+                b"first".as_slice(),
+                b"second".as_slice(),
+                b"third".as_slice(),
+            ] {
+                broker.publish("events", None, payload.to_vec()).unwrap();
+            }
+
+            let first = delivery(broker.poll_group("events", "workers", "member-a"));
+            let second = delivery(broker.poll_group("events", "workers", "member-b"));
+            assert_eq!((first.0, second.0), (0, 1));
+            assert_eq!(
+                broker
+                    .ack_group("events", "workers", "member-b", second.0, &second.1)
+                    .unwrap(),
+                AckResult::Acknowledged
+            );
+        }
+
+        let broker = Broker::open(directory.path(), config).unwrap();
+        let redelivered = match broker
+            .poll_group("events", "workers", "replacement")
+            .unwrap()
+        {
+            PollResult::Message(message) => {
+                assert_eq!(message.offset, 0);
+                assert_eq!(message.delivery_attempt, Some(2));
+                message.delivery_token.unwrap()
+            }
+            PollResult::Empty => panic!("expected the unacknowledged message to be redelivered"),
+        };
+        assert_eq!(
+            broker
+                .ack_group("events", "workers", "replacement", 0, &redelivered)
+                .unwrap(),
+            AckResult::Acknowledged
+        );
+        assert!(matches!(
+            broker
+                .poll_group("events", "workers", "replacement")
+                .unwrap(),
+            PollResult::Message(Message { offset: 2, .. })
         ));
     }
 
