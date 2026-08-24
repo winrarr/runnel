@@ -1,0 +1,658 @@
+{
+  "history_schema_version": 1,
+  "generated_at": "2026-08-24T14:24:42.906691+00:00",
+  "source": {
+    "repository": "winrarr/runnel",
+    "revision": "675b5a4fd1f743f8ac25235d3c16d6ba30342ec7",
+    "ref": "main",
+    "event": "push",
+    "workflow": "Runnel benchmark history",
+    "run_id": "32737156552",
+    "run_url": "https://github.com/winrarr/runnel/actions/runs/32737156552",
+    "profile": "push",
+    "repetitions": 3,
+    "repetition_run_ids": [
+      "32737156552",
+      "32737156552",
+      "32737156552"
+    ]
+  },
+  "environment": {
+    "host": "runnervm76f27",
+    "platform": "Linux-6.17.0-1022-azure-x86_64-with-glibc2.39",
+    "python": "3.12.3",
+    "cpu_count": 4,
+    "docker_server": "28.0.4"
+  },
+  "comparison_mode": "cluster-baseline",
+  "benchmark_suite": "cluster",
+  "resource_limits": {
+    "processes": "host-scheduled; no cgroup limit"
+  },
+  "workload": {
+    "messages": 200,
+    "warmup": 100,
+    "concurrency": 2,
+    "nodes": 3,
+    "ack_timeout_ms": 30000,
+    "payload_sizes_bytes": [
+      100,
+      1024
+    ],
+    "protocol": "line-delimited JSON with UTF-8 string payloads",
+    "durability": "committed by the current three-node Raft quorum and local durable state"
+  },
+  "aggregate": {
+    "repetitions": 3,
+    "first_generated_at": "2026-08-24T14:22:50.425537+00:00",
+    "last_generated_at": "2026-08-24T14:24:42.906691+00:00"
+  },
+  "backends": {
+    "runnel-cluster": {
+      "image": "target/release/runnel",
+      "image_id": null,
+      "acknowledgement": "durable quorum commit",
+      "replication": "3-node static Multi-Raft",
+      "measurement_boundary": "public line-delimited JSON protocol",
+      "measurement_client": "scripts/benchmarks/cluster.py",
+      "startup_seconds": 0.083597356,
+      "resource_samples": {
+        "samples": 584.0,
+        "memory_bytes_max": 144601088.0,
+        "memory_bytes_avg": 64312799.319148935
+      },
+      "scenarios": [
+        {
+          "operation": "cluster_durable_publish",
+          "messages": 200.0,
+          "message_size_bytes": 100.0,
+          "throughput_messages_per_second": 175.88840717793377,
+          "latency_available": 1.0,
+          "latency_microseconds": {
+            "p50": 4418.4445,
+            "p99": 28031.003619999967,
+            "p999": 36894.70886200011,
+            "max": 38242.389
+          },
+          "resource_samples": {
+            "samples": 12.0,
+            "cpu_seconds": 0.49999999999999994,
+            "elapsed_seconds": 1.137172778,
+            "memory_bytes_max": 38006784.0,
+            "memory_bytes_avg": 35410261.333333336
+          },
+          "metadata": {
+            "nodes": 3,
+            "any_node_routing": true
+          },
+          "repetitions": 3,
+          "repetition_summary": {
+            "throughput_messages_per_second": {
+              "count": 3,
+              "min": 156.03374880478634,
+              "median": 175.88840717793377,
+              "max": 181.1269739518745
+            },
+            "latency_p50": {
+              "count": 3,
+              "min": 4231.2415,
+              "median": 4418.4445,
+              "max": 4907.879
+            },
+            "latency_p99": {
+              "count": 3,
+              "min": 25737.901339999997,
+              "median": 28031.003619999967,
+              "max": 36067.79706999987
+            },
+            "latency_p999": {
+              "count": 3,
+              "min": 26337.246089,
+              "median": 36894.70886200011,
+              "max": 52500.42628000003
+            },
+            "latency_max": {
+              "count": 3,
+              "min": 26362.497,
+              "median": 38242.389,
+              "max": 52905.049
+            },
+            "cpu_efficiency_messages_per_cpu_second": {
+              "count": 3,
+              "min": 400.0,
+              "median": 400.00000000000006,
+              "max": 408.1632653061225
+            }
+          }
+        },
+        {
+          "operation": "cluster_consume_ack",
+          "messages": 200.0,
+          "message_size_bytes": 100.0,
+          "throughput_messages_per_second": 95.41981300260544,
+          "latency_available": 1.0,
+          "latency_microseconds": {
+            "p50": 9010.1305,
+            "p99": 38083.33283,
+            "p999": 48543.3239900002,
+            "max": 51079.776
+          },
+          "resource_samples": {
+            "samples": 22.0,
+            "cpu_seconds": 0.94,
+            "elapsed_seconds": 2.096072243,
+            "memory_bytes_max": 40935424.0,
+            "memory_bytes_avg": 40378695.68
+          },
+          "metadata": {
+            "nodes": 3,
+            "publish_setup_excluded": true
+          },
+          "repetitions": 3,
+          "repetition_summary": {
+            "throughput_messages_per_second": {
+              "count": 3,
+              "min": 83.86199441926017,
+              "median": 95.41981300260544,
+              "max": 95.73234524444094
+            },
+            "latency_p50": {
+              "count": 3,
+              "min": 8565.849,
+              "median": 9010.1305,
+              "max": 9289.186
+            },
+            "latency_p99": {
+              "count": 3,
+              "min": 36055.19681999998,
+              "median": 38083.33283,
+              "max": 44016.53046999997
+            },
+            "latency_p999": {
+              "count": 3,
+              "min": 43497.78052500011,
+              "median": 48543.3239900002,
+              "max": 52215.74238400009
+            },
+            "latency_max": {
+              "count": 3,
+              "min": 44867.204,
+              "median": 51079.776,
+              "max": 53405.202
+            },
+            "cpu_efficiency_messages_per_cpu_second": {
+              "count": 3,
+              "min": 206.18556701030934,
+              "median": 212.76595744680853,
+              "max": 212.76595744680853
+            }
+          }
+        },
+        {
+          "operation": "cluster_grouped_consume_ack",
+          "messages": 200.0,
+          "message_size_bytes": 100.0,
+          "throughput_messages_per_second": 83.6342716406259,
+          "latency_available": 1.0,
+          "latency_microseconds": {
+            "p50": 9052.1655,
+            "p99": 42633.373539999986,
+            "p999": 52630.22710300017,
+            "max": 54764.841
+          },
+          "resource_samples": {
+            "samples": 24.0,
+            "cpu_seconds": 0.9600000000000004,
+            "elapsed_seconds": 2.391490837,
+            "memory_bytes_max": 44847104.0,
+            "memory_bytes_avg": 43583624.53333333
+          },
+          "metadata": {
+            "nodes": 3,
+            "members": 2,
+            "parallel": false
+          },
+          "repetitions": 3,
+          "repetition_summary": {
+            "throughput_messages_per_second": {
+              "count": 3,
+              "min": 67.06279710862438,
+              "median": 83.6342716406259,
+              "max": 95.44177566816161
+            },
+            "latency_p50": {
+              "count": 3,
+              "min": 8949.01,
+              "median": 9052.1655,
+              "max": 9907.219
+            },
+            "latency_p99": {
+              "count": 3,
+              "min": 37405.030029999914,
+              "median": 42633.373539999986,
+              "max": 69386.93417999997
+            },
+            "latency_p999": {
+              "count": 3,
+              "min": 48339.007063000034,
+              "median": 52630.22710300017,
+              "max": 91937.29223100038
+            },
+            "latency_max": {
+              "count": 3,
+              "min": 48726.194,
+              "median": 54764.841,
+              "max": 96654.076
+            },
+            "cpu_efficiency_messages_per_cpu_second": {
+              "count": 3,
+              "min": 206.18556701030934,
+              "median": 208.33333333333326,
+              "max": 215.05376344086008
+            }
+          }
+        },
+        {
+          "operation": "cluster_parallel_grouped_consume_ack",
+          "messages": 200.0,
+          "message_size_bytes": 100.0,
+          "throughput_messages_per_second": 96.59219854736597,
+          "latency_available": 1.0,
+          "latency_microseconds": {
+            "p50": 17067.7075,
+            "p99": 69317.90189999981,
+            "p999": 104121.54432200003,
+            "max": 104513.917
+          },
+          "resource_samples": {
+            "samples": 21.0,
+            "cpu_seconds": 0.9300000000000002,
+            "elapsed_seconds": 2.07064111,
+            "memory_bytes_max": 47525888.0,
+            "memory_bytes_avg": 46848614.4
+          },
+          "metadata": {
+            "nodes": 3,
+            "members": 2,
+            "parallel": true
+          },
+          "repetitions": 3,
+          "repetition_summary": {
+            "throughput_messages_per_second": {
+              "count": 3,
+              "min": 82.58023435286154,
+              "median": 96.59219854736597,
+              "max": 106.01716851356419
+            },
+            "latency_p50": {
+              "count": 3,
+              "min": 15959.5,
+              "median": 17067.7075,
+              "max": 18531.357
+            },
+            "latency_p99": {
+              "count": 3,
+              "min": 54584.22592999956,
+              "median": 69317.90189999981,
+              "max": 91104.90130999981
+            },
+            "latency_p999": {
+              "count": 3,
+              "min": 95638.4162910001,
+              "median": 104121.54432200003,
+              "max": 114397.31077400004
+            },
+            "latency_max": {
+              "count": 3,
+              "min": 96899.179,
+              "median": 104513.917,
+              "max": 115003.579
+            },
+            "cpu_efficiency_messages_per_cpu_second": {
+              "count": 3,
+              "min": 212.76595744680841,
+              "median": 215.05376344086017,
+              "max": 217.3913043478262
+            }
+          }
+        },
+        {
+          "operation": "cluster_restart_recovery",
+          "messages": 1.0,
+          "message_size_bytes": 100.0,
+          "throughput_messages_per_second": 14.912047772952025,
+          "latency_available": 1.0,
+          "latency_microseconds": {
+            "p50": 67059.871,
+            "p99": 67059.871,
+            "p999": 67059.871,
+            "max": 67059.871
+          },
+          "resource_samples": {
+            "samples": 2.0,
+            "cpu_seconds": 0.0,
+            "elapsed_seconds": 0.06709206,
+            "memory_bytes_max": 44011520.0,
+            "memory_bytes_avg": 42952704.0
+          },
+          "metadata": {
+            "unacknowledged_message_redelivered": true,
+            "delivery_attempt": 2,
+            "latency_scope": "restart_ready_to_redelivered_acknowledgement",
+            "redelivery_poll_attempts": 1,
+            "restarted_node": 1
+          },
+          "repetitions": 3,
+          "repetition_summary": {
+            "throughput_messages_per_second": {
+              "count": 3,
+              "min": 10.869059333564495,
+              "median": 14.912047772952025,
+              "max": 15.392642055422593
+            },
+            "latency_p50": {
+              "count": 3,
+              "min": 64966.105,
+              "median": 67059.871,
+              "max": 92004.282
+            },
+            "latency_p99": {
+              "count": 3,
+              "min": 64966.105,
+              "median": 67059.871,
+              "max": 92004.282
+            },
+            "latency_p999": {
+              "count": 3,
+              "min": 64966.105,
+              "median": 67059.871,
+              "max": 92004.282
+            },
+            "latency_max": {
+              "count": 3,
+              "min": 64966.105,
+              "median": 67059.871,
+              "max": 92004.282
+            }
+          }
+        },
+        {
+          "operation": "cluster_durable_publish",
+          "messages": 200.0,
+          "message_size_bytes": 1024.0,
+          "throughput_messages_per_second": 128.85375712103925,
+          "latency_available": 1.0,
+          "latency_microseconds": {
+            "p50": 5617.152,
+            "p99": 52178.828079999985,
+            "p999": 57268.60351400003,
+            "max": 57606.17
+          },
+          "resource_samples": {
+            "samples": 16.0,
+            "cpu_seconds": 0.8700000000000001,
+            "elapsed_seconds": 1.552207509,
+            "memory_bytes_max": 101339136.0,
+            "memory_bytes_avg": 78267505.77777778
+          },
+          "metadata": {
+            "nodes": 3,
+            "any_node_routing": true
+          },
+          "repetitions": 3,
+          "repetition_summary": {
+            "throughput_messages_per_second": {
+              "count": 3,
+              "min": 118.12251284669885,
+              "median": 128.85375712103925,
+              "max": 134.46675459389482
+            },
+            "latency_p50": {
+              "count": 3,
+              "min": 5595.808,
+              "median": 5617.152,
+              "max": 5900.506
+            },
+            "latency_p99": {
+              "count": 3,
+              "min": 42713.45142999988,
+              "median": 52178.828079999985,
+              "max": 53715.62197999998
+            },
+            "latency_p999": {
+              "count": 3,
+              "min": 54773.962996000024,
+              "median": 57268.60351400003,
+              "max": 57655.34498500004
+            },
+            "latency_max": {
+              "count": 3,
+              "min": 55045.04,
+              "median": 57606.17,
+              "max": 58130.156
+            },
+            "cpu_efficiency_messages_per_cpu_second": {
+              "count": 3,
+              "min": 222.22222222222226,
+              "median": 229.88505747126433,
+              "max": 235.29411764705867
+            }
+          }
+        },
+        {
+          "operation": "cluster_consume_ack",
+          "messages": 200.0,
+          "message_size_bytes": 1024.0,
+          "throughput_messages_per_second": 76.77401624325442,
+          "latency_available": 1.0,
+          "latency_microseconds": {
+            "p50": 9091.174,
+            "p99": 53621.853689999996,
+            "p999": 75022.10481900026,
+            "max": 78243.242
+          },
+          "resource_samples": {
+            "samples": 27.0,
+            "cpu_seconds": 1.25,
+            "elapsed_seconds": 2.605111707,
+            "memory_bytes_max": 125341696.0,
+            "memory_bytes_avg": 121775063.04
+          },
+          "metadata": {
+            "nodes": 3,
+            "publish_setup_excluded": true
+          },
+          "repetitions": 3,
+          "repetition_summary": {
+            "throughput_messages_per_second": {
+              "count": 3,
+              "min": 74.11525193159531,
+              "median": 76.77401624325442,
+              "max": 81.1759248047699
+            },
+            "latency_p50": {
+              "count": 3,
+              "min": 9075.3175,
+              "median": 9091.174,
+              "max": 9637.126
+            },
+            "latency_p99": {
+              "count": 3,
+              "min": 47815.44950999974,
+              "median": 53621.853689999996,
+              "max": 61247.13167999999
+            },
+            "latency_p999": {
+              "count": 3,
+              "min": 53700.600053999995,
+              "median": 75022.10481900026,
+              "max": 103135.99132200054
+            },
+            "latency_max": {
+              "count": 3,
+              "min": 53711.317,
+              "median": 78243.242,
+              "max": 109808.207
+            },
+            "cpu_efficiency_messages_per_cpu_second": {
+              "count": 3,
+              "min": 160.0,
+              "median": 160.0,
+              "max": 163.93442622950823
+            }
+          }
+        },
+        {
+          "operation": "cluster_grouped_consume_ack",
+          "messages": 200.0,
+          "message_size_bytes": 1024.0,
+          "throughput_messages_per_second": 82.74921014130842,
+          "latency_available": 1.0,
+          "latency_microseconds": {
+            "p50": 9045.794,
+            "p99": 56507.3569,
+            "p999": 57602.56467700002,
+            "max": 57786.854
+          },
+          "resource_samples": {
+            "samples": 26.0,
+            "cpu_seconds": 1.2399999999999993,
+            "elapsed_seconds": 2.417013283,
+            "memory_bytes_max": 139640832.0,
+            "memory_bytes_avg": 131705147.07692307
+          },
+          "metadata": {
+            "nodes": 3,
+            "members": 2,
+            "parallel": false
+          },
+          "repetitions": 3,
+          "repetition_summary": {
+            "throughput_messages_per_second": {
+              "count": 3,
+              "min": 68.94760436846394,
+              "median": 82.74921014130842,
+              "max": 85.41115279666955
+            },
+            "latency_p50": {
+              "count": 3,
+              "min": 8831.156,
+              "median": 9045.794,
+              "max": 9509.607
+            },
+            "latency_p99": {
+              "count": 3,
+              "min": 48198.74466,
+              "median": 56507.3569,
+              "max": 61402.937659999996
+            },
+            "latency_p999": {
+              "count": 3,
+              "min": 51582.15971400006,
+              "median": 57602.56467700002,
+              "max": 85823.27932400048
+            },
+            "latency_max": {
+              "count": 3,
+              "min": 52344.233,
+              "median": 57786.854,
+              "max": 91767.434
+            },
+            "cpu_efficiency_messages_per_cpu_second": {
+              "count": 3,
+              "min": 161.29032258064512,
+              "median": 161.29032258064524,
+              "max": 166.66666666666663
+            }
+          }
+        },
+        {
+          "operation": "cluster_parallel_grouped_consume_ack",
+          "messages": 200.0,
+          "message_size_bytes": 1024.0,
+          "throughput_messages_per_second": 84.72085266316012,
+          "latency_available": 1.0,
+          "latency_microseconds": {
+            "p50": 16977.1215,
+            "p99": 79717.78664999995,
+            "p999": 84171.53952600005,
+            "max": 84810.673
+          },
+          "resource_samples": {
+            "samples": 24.0,
+            "cpu_seconds": 1.1799999999999997,
+            "elapsed_seconds": 2.360788974,
+            "memory_bytes_max": 144601088.0,
+            "memory_bytes_avg": 141062534.0952381
+          },
+          "metadata": {
+            "nodes": 3,
+            "members": 2,
+            "parallel": true
+          },
+          "repetitions": 3,
+          "repetition_summary": {
+            "throughput_messages_per_second": {
+              "count": 3,
+              "min": 77.93312587381958,
+              "median": 84.72085266316012,
+              "max": 98.87752571664038
+            },
+            "latency_p50": {
+              "count": 3,
+              "min": 15284.241,
+              "median": 16977.1215,
+              "max": 17944.722
+            },
+            "latency_p99": {
+              "count": 3,
+              "min": 60887.60207999997,
+              "median": 79717.78664999995,
+              "max": 80873.75120999999
+            },
+            "latency_p999": {
+              "count": 3,
+              "min": 65433.148623000016,
+              "median": 84171.53952600005,
+              "max": 87017.89656600001
+            },
+            "latency_max": {
+              "count": 3,
+              "min": 65664.63,
+              "median": 84810.673,
+              "max": 87240.531
+            },
+            "cpu_efficiency_messages_per_cpu_second": {
+              "count": 3,
+              "min": 162.6016260162601,
+              "median": 169.49152542372886,
+              "max": 172.4137931034485
+            }
+          }
+        }
+      ],
+      "repetition_summary": {
+        "samples": {
+          "count": 3,
+          "min": 564.0,
+          "median": 584.0,
+          "max": 588.0
+        },
+        "memory_bytes_max": {
+          "count": 3,
+          "min": 144105472.0,
+          "median": 144601088.0,
+          "max": 144805888.0
+        },
+        "memory_bytes_avg": {
+          "count": 3,
+          "min": 64102098.4109589,
+          "median": 64312799.319148935,
+          "max": 65723684.571428575
+        }
+      },
+      "repetitions": 3
+    }
+  },
+  "source_result": "aggregate"
+}
