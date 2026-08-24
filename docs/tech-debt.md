@@ -76,7 +76,7 @@ This register records known implementation shortcuts in the current vertical sli
 
 - Status: open
 - Impact: the Criterion suite remains focused on local in-process paths, while the end-to-end benchmark harness does not yet establish clustered, statistically stable, equivalent competitor, or complete tail-latency baselines.
-- Context: microbenchmarks were added first to catch local regressions while the broker semantics and cluster recovery behavior were still changing. Containerized, clustered, and first-pass native competitor measurements now exist, including scenario-scoped resource efficiency and optional Linux profiles, but their semantic and statistical limitations remain.
+- Context: microbenchmarks were added first to catch local regressions while the broker semantics and cluster recovery behavior were still changing. Containerized, clustered Runnel, single-node native competitor, and first RF=3 competitor-publish measurements now exist, including scenario-scoped resource efficiency and optional Linux profiles, but their semantic and statistical limitations remain.
 - Retirement condition: the performance backlog outcomes provide repeatable machine-readable local, container, clustered, and comparable-broker measurements with explicit workload and durability semantics, plus enough repeated samples and profiling evidence to distinguish regressions from host noise.
 
 ## TD-012: Peer RPC connections are short-lived
@@ -90,7 +90,7 @@ This register records known implementation shortcuts in the current vertical sli
 
 - Status: open
 - Impact: the first comparison baseline uses Runnel's host-side protocol client, Kafka/Redpanda's native Kafka performance clients, and NATS's native JetStream benchmark client. Publish batching, consumer acknowledgement behavior, client startup, and latency visibility differ, so the numbers cannot yet support a definitive product ranking.
-- Context: native tools provide an immediately reproducible baseline while Runnel's public protocol and common benchmark client are still provisional. The result artifacts record each measurement boundary and configuration.
+- Context: native tools provide an immediately reproducible single-node and RF=3 publish baseline while Runnel's public protocol and common benchmark client are still provisional. The result artifacts record each measurement boundary, topology, and configuration.
 - Retirement condition: a common workload client or rigorously equivalent adapters measure durable publish, consume with application acknowledgement, batching, recovery, resource usage, and tail latency across all supported brokers while preserving each broker's explicitly stated guarantee.
 
 ## TD-014: Security audit has a documented optional-dependency exception
