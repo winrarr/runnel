@@ -252,15 +252,21 @@ class Cluster:
 
     def stop_node(self, index: int) -> None:
         node = self.nodes[index]
-        if node.process is None:
+        process = node.process
+        if process is None:
             return
-        if node.process.poll() is None:
-            node.process.terminate()
+        if process.poll() is None:
+            process.terminate()
             try:
-                node.process.wait(timeout=5)
+                process.wait(timeout=5)
             except subprocess.TimeoutExpired:
-                node.process.kill()
-                node.process.wait()
+                process.kill()
+                process.wait()
+        else:
+            # Reap a node that exited before readiness or during a scenario.
+            # Leaving it unreaped creates a zombie and can exhaust process
+            # resources during repeated benchmark runs.
+            process.wait()
         node.process = None
 
     def restart_node(self, index: int) -> int:
@@ -394,6 +400,37 @@ def poll(client: LineClient, stream: str, consumer: str, expected_offset: int) -
     if response.get("offset") != expected_offset:
         raise BenchmarkError(f"expected offset {expected_offset}, got {response}")
     return response, elapsed
+
+
+def poll_until_redelivered(
+    client: LineClient, stream: str, consumer: str, expected_offset: int
+) -> tuple[dict[str, Any], int]:
+    """Wait for an expired unacknowledged message without assuming a margin."""
+    deadline = time.monotonic() + COMMAND_TIMEOUT_SECONDS
+    attempts = 0
+    last_response: dict[str, Any] | None = None
+    while time.monotonic() < deadline:
+        attempts += 1
+        response, elapsed = client.request(
+            {"op": "poll", "stream": stream, "consumer": consumer}
+        )
+        last_response = response
+        if response.get("type") == "empty":
+            remaining = deadline - time.monotonic()
+            if remaining > 0:
+                time.sleep(min(0.05, remaining))
+            continue
+        if response.get("type") != "message":
+            raise BenchmarkError(f"unexpected recovery poll response: {response}")
+        if response.get("offset") != expected_offset:
+            raise BenchmarkError(f"expected recovery offset {expected_offset}, got {response}")
+        if response.get("delivery_attempt") != 2:
+            raise BenchmarkError(f"expected recovery delivery attempt 2, got {response}")
+        return response, attempts
+    raise BenchmarkError(
+        f"message at offset {expected_offset} was not redelivered before the deadline; "
+        f"last response: {last_response}"
+    )
 
 
 def acknowledge(client: LineClient, stream: str, consumer: str, offset: int) -> int:
@@ -626,28 +663,37 @@ def run_restart_recovery(cluster: Cluster, stream: str, payload: str) -> dict[st
     publish(client, stream, payload)
     poll(client, stream, "recovery-consumer", 0)
     client.close()
-    time.sleep(cluster.ack_timeout_ms / 1_000 + 0.05)
+    # Let the configured lease expire. The measured operation below polls for
+    # actual eligibility instead of relying on a fixed scheduling margin.
+    time.sleep(cluster.ack_timeout_ms / 1_000)
 
     def operation() -> dict[str, Any]:
+        started = time.perf_counter_ns()
         restart_ns = cluster.restart_node(0)
-        recovered = cluster.client(1)
+        recovered = cluster.client(0)
         try:
-            response, elapsed = poll(recovered, stream, "recovery-consumer", 0)
-            if response.get("delivery_attempt") != 2:
-                raise BenchmarkError(f"expected recovery delivery attempt 2, got {response}")
+            response, poll_attempts = poll_until_redelivered(
+                recovered, stream, "recovery-consumer", 0
+            )
             acknowledge(recovered, stream, "recovery-consumer", 0)
         finally:
             recovered.close()
-        return {
-            "operation": "cluster_restart_recovery",
-            "messages": 1,
-            "message_size_bytes": len(payload),
-            "elapsed_seconds": elapsed / 1_000_000_000,
-            "throughput_messages_per_second": 1 / (elapsed / 1_000_000_000),
-            "latency_microseconds": {"p50": elapsed / 1_000, "p99": elapsed / 1_000, "p999": elapsed / 1_000},
-            "restart_ready_seconds": restart_ns / 1_000_000_000,
-            "metadata": {"unacknowledged_message_redelivered": True, "delivery_attempt": response.get("delivery_attempt")},
-        }
+        elapsed_ns = time.perf_counter_ns() - started
+        result = metric(
+            "cluster_restart_recovery",
+            [elapsed_ns],
+            elapsed_ns,
+            message_size=len(payload),
+            metadata={
+                "unacknowledged_message_redelivered": True,
+                "delivery_attempt": response.get("delivery_attempt"),
+                "latency_scope": "restart_ready_to_redelivered_acknowledgement",
+                "redelivery_poll_attempts": poll_attempts,
+                "restarted_node": cluster.nodes[0].node_id,
+            },
+        )
+        result["restart_ready_seconds"] = restart_ns / 1_000_000_000
+        return result
 
     return measured(cluster, operation)
 
