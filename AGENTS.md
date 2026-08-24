@@ -17,7 +17,7 @@ Runnel is a Rust message broker intended to offer durable streams, low operation
 - scripts/benchmarks/cluster.py: real three-node clustered benchmark runner with machine-readable results.
 - scripts/benchmarks/profile.py: optional Linux `perf` workflow for clustered CPU hotspot profiles.
 - scripts/benchmarks/compare.py: first-pass single-node and three-node native-tool comparison runner for Runnel, Kafka, Redpanda, and JetStream.
-- scripts/benchmarks/pr_report.py: renders the short Runnel pull-request benchmark artifact as a Markdown report.
+- scripts/benchmarks/pr_report.py: renders clustered and single-node Runnel pull-request benchmark artifacts as Markdown reports.
 - scripts/benchmarks/aggregate.py: median aggregation and observed-range summaries for repeated benchmark runs.
 - scripts/isolated.py: canonical isolated workflow runner for concurrent local tests and benchmarks.
 - scripts/benchmarks/normalize.py: strips raw tool output and adds provenance for durable benchmark history.
@@ -74,7 +74,7 @@ Run these from the repository root:
 - just integration runs the same smoke, clustered, Docker, and container-smoke sequence used by the CI integration job.
 - just run starts a local broker with data in ./data.
 - just smoke starts a real broker and uses runnelctl to exercise publish, consume, acknowledgement, restart recovery, readiness, and metrics with temporary state.
-- just isolated runs the default workspace test with a unique Cargo target, temporary directory, and benchmark artifact directory; pass a supported workflow such as `just isolated cluster-test`, `just isolated cluster-replacement-test`, or `just isolated bench-container-smoke` for concurrent work.
+- just isolated runs the default workspace test with a unique Cargo target, temporary directory, and benchmark artifact directory; pass a supported workflow such as `just isolated cluster-test`, `just isolated cluster-replacement-test`, `just isolated bench-container-smoke`, or `just isolated bench-pr` for concurrent work.
 - just cluster-test starts three real broker processes, exercises quorum replication, follower restart, leader failure, and recovery through the public protocol.
 - just cluster-replacement-test runs the opt-in snapshot replacement experiment that depends on the test-only permissive recovery feature.
 - just bench runs the Criterion performance benchmarks, including shared-consumer delivery and keyed-ordering baselines.
@@ -82,6 +82,7 @@ Run these from the repository root:
 - just bench-container-smoke exercises the container benchmark path with a small workload for CI.
 - just bench-cluster runs the real three-node clustered performance baseline.
 - just bench-cluster-smoke exercises the clustered benchmark lifecycle with a small workload.
+- just bench-pr runs the short three-node clustered benchmark used as the primary pull-request performance signal.
 - just profile-cluster captures optional Linux `perf` samples and reports for all clustered broker processes.
 - just profile-cluster-instrumented builds the opt-in Rust timing instrumentation and records internal stage timings without requiring `perf` permissions.
 - just bench-compare builds Runnel and runs the documented first-pass comparison against Kafka, Redpanda, and JetStream.
@@ -100,7 +101,7 @@ Do not add a second task runner. Keep README commands and CI wired to just recip
 
 The required CI path is .github/workflows/ci.yml. It runs the pinned toolchain checks, the supported real network integration test, and the container smoke build. The test-only replacement-recovery experiment is not part of the required CI path; run it explicitly with `just cluster-replacement-test` when investigating that recovery boundary. .github/workflows/security.yml audits the dependency lockfile on pull requests and weekly. Dependabot keeps Cargo and GitHub Actions dependencies visible for review.
 
-.github/workflows/benchmarks.yml runs the longer Runnel-only single-node and three-node history suites on pushes to `main`, daily, and manually. `.github/workflows/benchmark-competitors.yml` runs the separate native and three-node competitor comparisons weekly or manually. `.github/workflows/benchmark-pr.yml` produces a short, read-only Runnel artifact for pull requests, and `.github/workflows/benchmark-pr-comment.yml` runs the same short workload against the default branch and turns both results into an informational PR comment with relative deltas. The Runnel history is the primary optimization signal; competitor suites are separate ranking evidence. The history workflows keep raw and aggregated results as artifacts and append generated data to the `benchmark-history` branch. GitHub Pages serves the hand-authored `docs/benchmarks/` directory from `main` and reads the public history data at runtime. Treat `benchmark-history` as generated output; change the scripts, dashboard assets, and workflows rather than editing that branch manually.
+.github/workflows/benchmarks.yml runs the longer Runnel-only single-node and three-node history suites on pushes to `main`, daily, and manually. `.github/workflows/benchmark-competitors.yml` runs the separate native and three-node competitor comparisons weekly or manually. `.github/workflows/benchmark-pr.yml` produces short, read-only clustered and single-node Runnel artifacts for pull requests; the clustered result is the primary performance signal because production deployments are expected to use multiple nodes. `.github/workflows/benchmark-pr-comment.yml` runs both matching workloads against the default branch and publishes separate informational comments with relative deltas. The Runnel history is the primary optimization signal; competitor suites are separate ranking evidence. The history workflows keep raw and aggregated results as artifacts and append generated data to the `benchmark-history` branch. GitHub Pages serves the hand-authored `docs/benchmarks/` directory from `main` and reads the public history data at runtime. Treat `benchmark-history` as generated output; change the scripts, dashboard assets, and workflows rather than editing that branch manually.
 
 ## Knowledge routing
 

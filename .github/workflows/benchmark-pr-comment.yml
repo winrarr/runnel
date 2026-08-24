@@ -34,6 +34,30 @@ jobs:
           path: benchmark-results
           run-id: ${{ github.event.workflow_run.id }}
           github-token: ${{ secrets.GITHUB_TOKEN }}
+      - name: Download clustered benchmark result
+        uses: actions/download-artifact@v8.0.1
+        with:
+          name: runnel-pr-cluster-benchmark-${{ github.event.workflow_run.id }}
+          path: benchmark-results
+          run-id: ${{ github.event.workflow_run.id }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+      - uses: dtolnay/rust-toolchain@1.97.1
+      - uses: Swatinem/rust-cache@v2.9.2
+      - name: Run default branch clustered baseline
+        continue-on-error: true
+        run: |
+          set -euo pipefail
+          mkdir -p benchmark-results benchmark-results/logs
+          python3 scripts/benchmarks/cluster.py \
+            --build \
+            --binary target/release/runnel \
+            --messages 200 \
+            --warmup 100 \
+            --concurrency 2 \
+            --payload-sizes 100 \
+            --skip-recovery \
+            --output benchmark-results/main-cluster.json \
+            --log-dir benchmark-results/logs/main-cluster
       - name: Run default branch baseline
         continue-on-error: true
         run: |
@@ -49,18 +73,40 @@ jobs:
             --client-cpus 2 \
             --client-memory 2g \
             --output benchmark-results/main.json
+      - name: Generate clustered benchmark comment
+        run: |
+          set -euo pipefail
+          report_args=(
+            --input benchmark-results/pr-cluster.json
+            --output benchmark-results/pr-cluster-comment.md
+            --heading "Clustered Runnel benchmark (primary)"
+          )
+          if [ -s benchmark-results/main-cluster.json ]; then
+            report_args+=(--baseline benchmark-results/main-cluster.json)
+          fi
+          python3 scripts/benchmarks/pr_report.py "${report_args[@]}"
       - name: Generate benchmark comment
         run: |
           set -euo pipefail
           report_args=(
             --input benchmark-results/pr.json
             --output benchmark-results/pr-comment.md
+            --heading "Single-node Runnel benchmark (secondary)"
           )
           if [ -s benchmark-results/main.json ]; then
             report_args+=(--baseline benchmark-results/main.json)
           fi
           python3 scripts/benchmarks/pr_report.py "${report_args[@]}"
-      - name: Publish benchmark comment
+      - name: Publish clustered benchmark comment
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_NUMBER: ${{ github.event.workflow_run.pull_requests[0].number }}
+        run: |
+          set -euo pipefail
+          gh pr comment "$PR_NUMBER" \
+            --repo "$GITHUB_REPOSITORY" \
+            --body-file benchmark-results/pr-cluster-comment.md
+      - name: Publish single-node benchmark comment
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           PR_NUMBER: ${{ github.event.workflow_run.pull_requests[0].number }}

@@ -146,6 +146,31 @@ The normalized schema intentionally excludes native tool logs. It retains worklo
 
 The dashboard uses the dedicated Runnel suite as the primary optimization history. Older Runnel points recorded by the native-comparison workflow remain available as a separate history, because their measurement boundary can differ. Charts keep benchmark suite, backend, operation, and payload size in separate visual series, so selecting all sizes or suites does not connect unrelated measurements or hide which point belongs to which workload. Raw run medians are shown as dots, while a five-run rolling median makes the direction of change easier to see; repetition ranges are shown as a band when available.
 
+## Pull-request performance
+
+Run the primary short pull-request workload locally with:
+
+```text
+just bench-pr
+```
+
+This starts three real Runnel nodes and measures durable publish, non-grouped
+consume/acknowledge, sequential shared-consumer delivery, and parallel
+shared-consumer delivery through the public protocol. It uses 200 messages,
+100 warmup messages, two parallel members, and 100-byte payloads, and skips
+restart recovery to keep feedback fast. Use `just isolated bench-pr` when
+running it alongside another process-heavy workflow.
+
+The pull-request workflow runs this clustered benchmark as the primary
+performance signal and retains the existing single-node container benchmark as
+a secondary diagnostic. The trusted comment workflow runs both exact workloads
+against the default branch and publishes separate reports with relative deltas.
+The clustered runner uses host-scheduled processes rather than cgroup limits,
+so its CPU and memory values are useful for matching PR-to-default-branch runs
+on the same hosted-runner class, not for direct comparison with the
+resource-limited single-node container result. The PR cluster workload skips
+restart recovery; the longer clustered history suite includes it.
+
 For pull-request feedback, render a short Runnel result as Markdown:
 
 ```text
@@ -154,7 +179,7 @@ python3 scripts/benchmarks/pr_report.py \
   --output benchmark-results/pr-comment.md
 ```
 
-The report is deliberately informational and does not mix PR points into the long-term history unless a history workflow records them. The trusted pull-request comment workflow also runs the exact short workload against the default branch and passes it as `--baseline`, so comments show a separate default-branch table followed by the pull-request table; matching PR metrics include a percentage delta from the current default-branch result. A missing or failed baseline never suppresses the PR result.
+The report is deliberately informational and does not mix PR points into the long-term history unless a history workflow records them. The trusted pull-request comment workflow also runs each exact workload against the default branch and passes it as `--baseline`, so comments show a separate default-branch table followed by the pull-request table; matching PR metrics include a percentage delta from the current default-branch result. A missing or failed baseline never suppresses the PR result.
 
 For repeated measurements, normalize each independent result and aggregate the
 normalized files with the median as the displayed value:
