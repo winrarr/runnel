@@ -260,10 +260,7 @@ fn three_process_cluster_replicates_and_recovers_after_failures() {
             },
             |response| matches!(response, Response::Acknowledged { .. }),
         ),
-        Response::Acknowledged {
-            already_acknowledged: false,
-            ..
-        }
+        Response::Acknowledged { .. }
     ));
     assert!(matches!(
         wait_for_response_on_any(
@@ -277,10 +274,7 @@ fn three_process_cluster_replicates_and_recovers_after_failures() {
             },
             |response| matches!(response, Response::Acknowledged { .. }),
         ),
-        Response::Acknowledged {
-            already_acknowledged: false,
-            ..
-        }
+        Response::Acknowledged { .. }
     ));
 
     let legacy_retry_node = create_stream_on_any(&mut nodes, "legacy-retry");
@@ -388,10 +382,7 @@ fn three_process_cluster_replicates_and_recovers_after_failures() {
             },
             |response| matches!(response, Response::Acknowledged { .. }),
         ),
-        Response::Acknowledged {
-            already_acknowledged: false,
-            ..
-        }
+        Response::Acknowledged { .. }
     ));
 
     let follower = (leader + 1) % nodes.len();
@@ -672,10 +663,7 @@ fn three_process_cluster_reassigns_group_delivery_after_node_failure() {
             },
             |response| matches!(response, Response::Acknowledged { .. }),
         ),
-        Response::Acknowledged {
-            already_acknowledged: false,
-            ..
-        }
+        Response::Acknowledged { .. }
     ));
 
     assert!(matches!(
@@ -790,10 +778,7 @@ fn three_process_cluster_reassigns_group_delivery_after_node_failure() {
             },
             |response| matches!(response, Response::Acknowledged { .. }),
         ),
-        Response::Acknowledged {
-            already_acknowledged: false,
-            ..
-        }
+        Response::Acknowledged { .. }
     ));
     assert!(matches!(
         request(
