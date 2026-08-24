@@ -36,12 +36,18 @@ def summary(values: list[Any]) -> dict[str, float | int]:
     numbers = numeric_values(values)
     if not numbers:
         return {}
-    return {
+    median_value = float(median(numbers))
+    result: dict[str, float | int] = {
         "count": len(numbers),
         "min": min(numbers),
-        "median": float(median(numbers)),
+        "median": median_value,
         "max": max(numbers),
     }
+    if median_value != 0:
+        result["relative_range_percent"] = (
+            (max(numbers) - min(numbers)) / abs(median_value) * 100
+        )
+    return result
 
 
 def aggregate_mapping(mappings: list[dict[str, Any]]) -> dict[str, Any]:

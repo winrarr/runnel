@@ -108,6 +108,23 @@ class HistoryTests(unittest.TestCase):
             scenario["repetition_summary"]["throughput_messages_per_second"]["min"],
             1000.0,
         )
+        self.assertAlmostEqual(
+            scenario["repetition_summary"]["throughput_messages_per_second"][
+                "relative_range_percent"
+            ],
+            66.6666666667,
+        )
+
+        generated = site_data(
+            [{**aggregated, "_path": "aggregate.json"}]
+        )
+        current = next(
+            point
+            for point in generated["points"]
+            if point["run_file"] == "aggregate.json"
+            and point["metric"] == "throughput_messages_per_second"
+        )
+        self.assertAlmostEqual(current["range"]["relative_range_percent"], 66.6666666667)
 
     def test_site_data_compares_only_compatible_runs(self) -> None:
         first = normalize_result(comparison_result(), source_name="first.json")
