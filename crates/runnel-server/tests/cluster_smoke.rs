@@ -16,9 +16,11 @@ const CLUSTER_WAIT_TIMEOUT: Duration = Duration::from_secs(120);
 // keep ordinary request helpers tolerant of the bounded cluster recovery
 // window. Retrying helpers use a shorter per-attempt timeout below.
 const REQUEST_READ_TIMEOUT: Duration = CLUSTER_WAIT_TIMEOUT;
-// A recovery request may wait for a Raft write and bounded peer forwarding;
-// allow that complete operation to finish before opening another request.
-const REQUEST_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(45);
+const REQUEST_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(10);
+// Snapshot recovery publishes may wait for a slow Raft write while a node
+// rejoins; give this one workload a longer request budget without slowing all
+// cluster assertions.
+const SNAPSHOT_REQUEST_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(45);
 
 struct RunningNode {
     node_id: u64,
@@ -880,9 +882,10 @@ fn replacement_node_recovers_from_compacted_snapshot() {
         };
         let request_id = format!("snapshot-message-{index}");
         assert!(matches!(
-            wait_for_response_on_any(
+            wait_for_response_on_any_with_timeout(
                 &nodes,
                 replacement,
+                SNAPSHOT_REQUEST_ATTEMPT_TIMEOUT,
                 || Request::Publish {
                     stream: "events".to_owned(),
                     key: None,
@@ -1012,6 +1015,15 @@ fn wait_for_response(
 
 fn wait_for_response_at(
     address: SocketAddr,
+    request_builder: impl FnMut() -> Request,
+    predicate: impl FnMut(&Response) -> bool,
+) -> Response {
+    wait_for_response_at_with_timeout(address, REQUEST_ATTEMPT_TIMEOUT, request_builder, predicate)
+}
+
+fn wait_for_response_at_with_timeout(
+    address: SocketAddr,
+    attempt_timeout: Duration,
     mut request_builder: impl FnMut() -> Request,
     mut predicate: impl FnMut(&Response) -> bool,
 ) -> Response {
@@ -1022,8 +1034,8 @@ fn wait_for_response_at(
         if remaining.is_zero() {
             break;
         }
-        let attempt_timeout = remaining.min(REQUEST_ATTEMPT_TIMEOUT);
-        match request_with_timeout(address, request_builder(), attempt_timeout) {
+        let request_timeout = remaining.min(attempt_timeout);
+        match request_with_timeout(address, request_builder(), request_timeout) {
             Ok(response) => {
                 if predicate(&response) {
                     return response;
@@ -1039,9 +1051,10 @@ fn wait_for_response_at(
     );
 }
 
-fn wait_for_response_on_any(
+fn wait_for_response_on_any_with_timeout(
     nodes: &[RunningNode],
     excluded: usize,
+    attempt_timeout: Duration,
     mut request_builder: impl FnMut() -> Request,
     mut predicate: impl FnMut(&Response) -> bool,
 ) -> Response {
@@ -1056,8 +1069,8 @@ fn wait_for_response_on_any(
             if remaining.is_zero() {
                 break;
             }
-            let attempt_timeout = remaining.min(REQUEST_ATTEMPT_TIMEOUT);
-            match request_with_timeout(node.broker_addr, request_builder(), attempt_timeout) {
+            let request_timeout = remaining.min(attempt_timeout);
+            match request_with_timeout(node.broker_addr, request_builder(), request_timeout) {
                 Ok(response) => {
                     if predicate(&response) {
                         return response;
