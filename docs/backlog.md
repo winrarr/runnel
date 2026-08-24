@@ -409,6 +409,28 @@ Acceptance criteria:
 - the documented node-failure and restart scenarios have repeatable integration tests;
 - adding or removing a member has deterministic recovery and rejection behavior.
 
+### Make missing-replica replacement safe
+
+Goal: recover a node whose local replica state is missing or inconsistent without allowing stale or under-specified state to participate in serving or quorum decisions.
+
+Rationale: snapshot transfer is useful evidence for recovery, but an empty process with a reused voter identity is not yet a defined production lifecycle and can interact badly with Raft log invariants.
+
+Constraints:
+
+- acknowledged messages and durable consumer progress must remain protected by the selected quorum guarantee;
+- replacement must have explicit identity, progress, serving, fencing, and membership semantics;
+- the Kubernetes control plane must not be required to preserve correctness;
+- recovery cost and failure behavior must be observable and bounded;
+- the public streams, records, consumers, and acknowledgement model must not expose replica placement.
+
+Acceptance criteria:
+
+- a documented replacement scenario distinguishes ordinary restart, temporary outage, lost local state, and stale process identity;
+- a replacement cannot serve or affect quorum decisions before the cluster has validated its recovered state;
+- repeated interruption, restart, and leader failure during replacement preserve acknowledged data and consumer progress;
+- process, storage, transport, and consensus failures are distinguishable in tests and diagnostics;
+- the behavior is supported by competitor/reference research, an ADR, process-level tests, and recovery benchmarks.
+
 ### Make repeated interrupted replica recovery operationally complete
 
 Goal: make repeated snapshot-based recovery interruptions safe when transfer or installation is interrupted and retried.

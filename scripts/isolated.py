@@ -133,6 +133,8 @@ def command_for(workflow: str, isolation: Isolation) -> list[str]:
             "--locked",
             "-p",
             "runnel-server",
+            "--features",
+            "test-replacement-recovery",
             "--test",
             "cluster_smoke",
             "--",

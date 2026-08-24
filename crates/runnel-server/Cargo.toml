@@ -9,6 +9,7 @@ instrumentation = [
     "runnel-engine/instrumentation",
     "runnel-raft/instrumentation",
 ]
+test-replacement-recovery = ["runnel-raft/test-replacement-recovery"]
 
 [[bin]]
 name = "runnel"

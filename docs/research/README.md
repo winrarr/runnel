@@ -37,3 +37,6 @@ accepts it and the relevant implementation and verification work is complete.
 - [Message encoding and compression](message-encoding-and-compression.md)
   compares representation and compression choices, competitor behavior, and
   research findings relevant to Runnel's latency, throughput, and storage goals.
+- [Raft follower recovery and replacement](raft-recovery-and-replacement.md)
+  records the evidence and open design questions around crashed, stale, and
+  empty replicas in the early clustered backend.
