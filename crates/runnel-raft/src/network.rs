@@ -1,6 +1,6 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::io;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use openraft::BasicNode;
@@ -14,7 +14,7 @@ use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::watch;
+use tokio::sync::{Mutex, Semaphore, watch};
 
 use crate::{GroupManager, METADATA_GROUP_ID, StreamMetadata, TypeConfig};
 #[cfg(feature = "instrumentation")]
@@ -22,6 +22,14 @@ use runnel_engine::StageTimer;
 use runnel_engine::{AckResult, BrokerError, Offset, PollResult};
 
 const MAX_FRAME_SIZE: u32 = 64 * 1024 * 1024;
+// Forwarding currently receives only a peer address, so there is no long-lived
+// network object on which to scope its connections. Keep the compatibility
+// bridge process-wide but bounded until that ownership moves into the engine.
+const MAX_POOLED_PEERS: usize = 64;
+const MAX_CONNECTIONS_PER_POOLED_PEER: usize = 4;
+
+static FORWARD_POOLS: OnceLock<std::sync::Mutex<HashMap<String, Arc<ForwardConnectionPool>>>> =
+    OnceLock::new();
 
 #[derive(Clone)]
 pub struct TcpNetwork {
@@ -62,6 +70,15 @@ pub struct TcpConnection {
 }
 
 impl TcpConnection {
+    fn new(address: impl Into<String>) -> Self {
+        Self {
+            target: 0,
+            address: Some(address.into()),
+            group_id: METADATA_GROUP_ID.to_owned(),
+            stream: None,
+        }
+    }
+
     async fn request<Req, Res>(&mut self, request: Req, ttl: Duration) -> Result<Res, io::Error>
     where
         Req: Serialize,
@@ -105,12 +122,90 @@ impl TcpConnection {
                 Ok(response)
             }
             Ok(Err(error)) => Err(error),
-            Err(_) => Err(io::Error::new(
-                io::ErrorKind::TimedOut,
-                "peer RPC timed out",
-            )),
+            Err(_) => Err(timed_out_error()),
         }
     }
+}
+
+struct ForwardConnectionPool {
+    permits: Arc<Semaphore>,
+    idle: Mutex<Vec<TcpConnection>>,
+}
+
+impl ForwardConnectionPool {
+    fn new() -> Self {
+        Self {
+            permits: Arc::new(Semaphore::new(MAX_CONNECTIONS_PER_POOLED_PEER)),
+            idle: Mutex::new(Vec::with_capacity(MAX_CONNECTIONS_PER_POOLED_PEER)),
+        }
+    }
+
+    async fn request<Req, Res>(
+        &self,
+        address: &str,
+        request: Req,
+        ttl: Duration,
+    ) -> Result<Res, io::Error>
+    where
+        Req: Serialize,
+        Res: DeserializeOwned,
+    {
+        let started = tokio::time::Instant::now();
+        let permit = tokio::time::timeout(ttl, Arc::clone(&self.permits).acquire_owned())
+            .await
+            .map_err(|_| timed_out_error())?
+            .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "peer RPC pool is closed"))?;
+        let remaining = ttl.saturating_sub(started.elapsed());
+        let mut connection = self
+            .idle
+            .lock()
+            .await
+            .pop()
+            .unwrap_or_else(|| TcpConnection::new(address));
+        let result = connection.request(request, remaining).await;
+        if result.is_ok() {
+            self.idle.lock().await.push(connection);
+        }
+        drop(permit);
+        result
+    }
+}
+
+fn forward_pool(address: &str) -> Option<Arc<ForwardConnectionPool>> {
+    let pools = FORWARD_POOLS.get_or_init(|| std::sync::Mutex::new(HashMap::new()));
+    let mut pools = pools
+        .lock()
+        .expect("peer RPC pool registry is not poisoned");
+    if let Some(pool) = pools.get(address) {
+        return Some(Arc::clone(pool));
+    }
+    if pools.len() >= MAX_POOLED_PEERS {
+        return None;
+    }
+    let pool = Arc::new(ForwardConnectionPool::new());
+    pools.insert(address.to_owned(), Arc::clone(&pool));
+    Some(pool)
+}
+
+async fn peer_request<Req, Res>(
+    address: &str,
+    request: Req,
+    ttl: Duration,
+) -> Result<Res, io::Error>
+where
+    Req: Serialize,
+    Res: DeserializeOwned,
+{
+    if let Some(pool) = forward_pool(address) {
+        return pool.request(address, request, ttl).await;
+    }
+
+    let mut connection = TcpConnection::new(address);
+    connection.request(request, ttl).await
+}
+
+fn timed_out_error() -> io::Error {
+    io::Error::new(io::ErrorKind::TimedOut, "peer RPC timed out")
 }
 
 pub(crate) async fn forward(
@@ -118,15 +213,7 @@ pub(crate) async fn forward(
     operation: ForwardedOperation,
     timeout: Duration,
 ) -> Result<ForwardedResponse, io::Error> {
-    let mut connection = TcpConnection {
-        target: 0,
-        address: Some(address.to_owned()),
-        group_id: METADATA_GROUP_ID.to_owned(),
-        stream: None,
-    };
-    let response = connection
-        .request(PeerRequest::Forward(operation), timeout)
-        .await?;
+    let response = peer_request(address, PeerRequest::Forward(operation), timeout).await?;
     match response {
         PeerResponse::Forward(response) => Ok(response),
         PeerResponse::Error(error) => Err(io::Error::other(error)),
@@ -498,22 +585,16 @@ pub(crate) async fn ensure_data_group(
     group_id: String,
     timeout: Duration,
 ) -> Result<(), io::Error> {
-    let mut connection = TcpConnection {
-        target: 0,
-        address: Some(address.to_owned()),
-        group_id: METADATA_GROUP_ID.to_owned(),
-        stream: None,
-    };
-    match connection
-        .request(
-            PeerRequest::EnsureDataGroup {
-                stream,
-                stream_id,
-                group_id,
-            },
-            timeout,
-        )
-        .await?
+    match peer_request(
+        address,
+        PeerRequest::EnsureDataGroup {
+            stream,
+            stream_id,
+            group_id,
+        },
+        timeout,
+    )
+    .await?
     {
         PeerResponse::Ready => Ok(()),
         PeerResponse::Error(error) => Err(io::Error::other(error)),
@@ -603,34 +684,42 @@ mod tests {
             let connections = Arc::new(AtomicUsize::new(0));
             let connection_count = Arc::clone(&connections);
             let server = tokio::spawn(async move {
+                let mut handlers = tokio::task::JoinSet::new();
                 loop {
-                    let Ok((mut stream, _)) = listener.accept().await else {
-                        return;
-                    };
-                    stream.set_nodelay(true).unwrap();
-                    connection_count.fetch_add(1, Ordering::Relaxed);
-                    let mut requests = 0;
-                    loop {
-                        let request = match read_frame::<PeerRequest>(&mut stream).await {
-                            Ok(request) => request,
-                            Err(_) => break,
-                        };
-                        requests += 1;
-                        let response = match request {
-                            PeerRequest::Forward(_) => {
-                                PeerResponse::Forward(ForwardedResponse::CreateStream(Ok(true)))
-                            }
-                            _ => PeerResponse::Error("unexpected test request".to_owned()),
-                        };
-                        if let Some(delay) = response_delay {
-                            tokio::time::sleep(delay).await;
+                    tokio::select! {
+                        accepted = listener.accept() => {
+                            let Ok((mut stream, _)) = accepted else {
+                                return;
+                            };
+                            stream.set_nodelay(true).unwrap();
+                            connection_count.fetch_add(1, Ordering::Relaxed);
+                            handlers.spawn(async move {
+                                let mut requests = 0;
+                                loop {
+                                    let request = match read_frame::<PeerRequest>(&mut stream).await {
+                                        Ok(request) => request,
+                                        Err(_) => break,
+                                    };
+                                    requests += 1;
+                                    let response = match request {
+                                        PeerRequest::Forward(_) => {
+                                            PeerResponse::Forward(ForwardedResponse::CreateStream(Ok(true)))
+                                        }
+                                        _ => PeerResponse::Error("unexpected test request".to_owned()),
+                                    };
+                                    if let Some(delay) = response_delay {
+                                        tokio::time::sleep(delay).await;
+                                    }
+                                    if write_frame(&mut stream, &response).await.is_err() {
+                                        break;
+                                    }
+                                    if close_after_requests.is_some_and(|limit| requests >= limit) {
+                                        break;
+                                    }
+                                }
+                            });
                         }
-                        if write_frame(&mut stream, &response).await.is_err() {
-                            break;
-                        }
-                        if close_after_requests.is_some_and(|limit| requests >= limit) {
-                            break;
-                        }
+                        Some(_) = handlers.join_next(), if !handlers.is_empty() => {}
                     }
                 }
             });
@@ -691,7 +780,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn topology_free_forwarding_opens_one_connection_per_request() {
+    async fn topology_free_forwarding_reuses_a_connection() {
         const REQUESTS: usize = 64;
 
         let peer = TestPeer::start(None).await;
@@ -710,7 +799,76 @@ mod tests {
             "topology-free forwarding: requests={REQUESTS}, connections={connections}, elapsed={:?}",
             started.elapsed()
         );
-        assert_eq!(connections, REQUESTS);
+        assert_eq!(connections, 1);
+    }
+
+    #[tokio::test]
+    async fn concurrent_forwarding_uses_a_bounded_connection_pool() {
+        const REQUESTS: usize = 32;
+
+        let peer = TestPeer::start_with_delay(None, Some(Duration::from_millis(5))).await;
+        let started = Instant::now();
+        let mut tasks = Vec::with_capacity(REQUESTS);
+        for _ in 0..REQUESTS {
+            let address = peer.address.clone();
+            tasks.push(tokio::spawn(async move {
+                forward(&address, forwarded_operation(), Duration::from_secs(1)).await
+            }));
+        }
+
+        for task in tasks {
+            let response = task.await.unwrap().unwrap();
+            assert!(matches!(
+                response,
+                ForwardedResponse::CreateStream(Ok(true))
+            ));
+        }
+
+        let connections = peer.connections.load(Ordering::Relaxed);
+        eprintln!(
+            "concurrent topology-free forwarding: requests={REQUESTS}, connections={connections}, elapsed={:?}",
+            started.elapsed()
+        );
+        assert!(connections > 1);
+        assert!(connections <= MAX_CONNECTIONS_PER_POOLED_PEER);
+    }
+
+    #[tokio::test]
+    async fn failed_forward_connection_is_replaced_before_next_request() {
+        let peer = TestPeer::start(Some(1)).await;
+
+        forward(&peer.address, forwarded_operation(), Duration::from_secs(1))
+            .await
+            .unwrap();
+        assert!(
+            forward(&peer.address, forwarded_operation(), Duration::from_secs(1))
+                .await
+                .is_err()
+        );
+        forward(&peer.address, forwarded_operation(), Duration::from_secs(1))
+            .await
+            .unwrap();
+
+        assert_eq!(peer.connections.load(Ordering::Relaxed), 2);
+    }
+
+    #[tokio::test]
+    async fn timed_out_forward_request_drops_connection_before_reconnect() {
+        let peer = TestPeer::start_with_delay(None, Some(Duration::from_millis(50))).await;
+
+        let error = forward(
+            &peer.address,
+            forwarded_operation(),
+            Duration::from_millis(1),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+        forward(&peer.address, forwarded_operation(), Duration::from_secs(1))
+            .await
+            .unwrap();
+
+        assert_eq!(peer.connections.load(Ordering::Relaxed), 2);
     }
 
     #[tokio::test]
