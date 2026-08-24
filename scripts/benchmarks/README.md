@@ -148,7 +148,7 @@ The dashboard uses the dedicated Runnel suite as the primary optimization histor
 
 ## Pull-request performance
 
-Run the primary short pull-request workload locally with:
+Run the short pull-request sanity workload locally with:
 
 ```text
 just bench-pr
@@ -161,10 +161,12 @@ shared-consumer delivery through the public protocol. It uses 200 messages,
 restart recovery to keep feedback fast. Use `just isolated bench-pr` when
 running it alongside another process-heavy workflow.
 
-The pull-request workflow runs this clustered benchmark as the primary
-performance signal and retains the existing single-node container benchmark as
-a secondary diagnostic. The trusted comment workflow runs both exact workloads
-against the default branch and publishes separate reports with relative deltas.
+The pull-request workflow runs this clustered benchmark as an informational
+sanity check and retains the existing single-node container benchmark as a
+secondary diagnostic. Shared hosted runners can vary substantially, so these
+points should not be treated as authoritative optimization evidence. The
+trusted comment workflow runs both exact workloads against the default branch
+and publishes separate reports with relative deltas.
 The clustered runner uses host-scheduled processes rather than cgroup limits,
 so its CPU and memory values are useful for matching PR-to-default-branch runs
 on the same hosted-runner class, not for direct comparison with the
@@ -179,7 +181,23 @@ python3 scripts/benchmarks/pr_report.py \
   --output benchmark-results/pr-comment.md
 ```
 
-The report is deliberately informational and does not mix PR points into the long-term history unless a history workflow records them. The trusted pull-request comment workflow also runs each exact workload against the default branch and passes it as `--baseline`, so comments show a separate default-branch table followed by the pull-request table; matching PR metrics include a percentage delta from the current default-branch result. A missing or failed baseline never suppresses the PR result.
+The report is deliberately informational and does not mix PR points into the long-term history unless a history workflow records them. For a performance-sensitive PR, use the same-host comparison helper:
+
+```text
+just bench-pr-local
+```
+
+It requires a clean current worktree and an available `origin/main` ref. The
+helper creates a detached base worktree, alternates the same three-node
+workload between the current commit and the base, repeats each side three
+times, aggregates medians, and writes a report plus raw JSON and logs under
+`benchmark-results/pr-local/<run>/`. The report includes the revisions,
+workload, host, repetition count, throughput, latency, CPU, memory, and
+relative deltas. Use `just bench-pr-local -- --repetitions 1` for a quick
+measurement, and paste the generated Markdown into the PR description. The
+trusted pull-request comment workflow also runs each exact hosted workload
+against the default branch and passes it as `--baseline`; a missing or failed
+baseline never suppresses the hosted result.
 
 For repeated measurements, normalize each independent result and aggregate the
 normalized files with the median as the displayed value:

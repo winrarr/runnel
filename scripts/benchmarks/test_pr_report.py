@@ -152,6 +152,23 @@ class PrReportTests(unittest.TestCase):
         self.assertIn("Default branch benchmark", report_with_baseline)
         self.assertIn("200 msg/s (Δ +100.0%)", report_with_baseline)
 
+    def test_reports_aggregate_metadata(self) -> None:
+        result = container_result()
+        del result["git_revision"]
+        result["source"] = {"revision": "aggregate123"}
+        result["environment"] = {
+            "platform": "Linux-test",
+            "cpu_count": 8,
+            "python": "3.14.0",
+        }
+        result["aggregate"] = {"repetitions": 3}
+
+        report = pr_report.render_report(result)
+
+        self.assertIn("Revision: `aggregate123`", report)
+        self.assertIn("Repetitions: 3 (displayed values are medians)", report)
+        self.assertIn("Host: platform `Linux-test`; CPUs `8`; Python `3.14.0`", report)
+
 
 if __name__ == "__main__":
     unittest.main()
