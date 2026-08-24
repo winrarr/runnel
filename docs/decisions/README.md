@@ -22,3 +22,4 @@ Current decisions:
 - 0016-clustered-retry-and-dead-letter-policy.md: broker-wide retry limits and atomic dead-letter outcomes for clustered grouped delivery.
 - 0017-benchmark-cadence-and-evidence.md: separate pull-request, daily Runnel, and weekly competitor benchmark purposes.
 - 0018-safe-replica-recovery-boundary.md: keep permissive empty-replica recovery test-only until a safe replacement lifecycle exists.
+- 0019-clustered-storage-identity.md: fail closed when persisted clustered state does not match its configured identity or format.
