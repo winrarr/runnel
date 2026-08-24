@@ -79,7 +79,7 @@ The Criterion suite includes durable publish, legacy publish/poll/ack, two-membe
 
 - `just test` runs workspace unit, integration, and benchmark-target tests.
 - `just doc-test` runs Rust documentation tests.
-- `just verify` runs formatting, Clippy, Rust tests, ShellCheck, benchmark-script tests, and a workspace build.
+- `just verify` runs formatting, Clippy, default-feature Rust tests, ShellCheck, benchmark-script tests, and a workspace build. Test-only recovery experiments are run explicitly by `just cluster-test` so an opt-in permissive recovery feature cannot silently become part of the normal verification contract.
 - `just smoke` exercises the running process and CLI across a restart.
 - `just cluster-test` starts three real Raft-backed broker processes and verifies quorum replication, grouped and non-grouped delivery through follower forwarding, grouped reassignment after node failure, clustered retry limits and dead-letter recovery, follower restart, leader election, post-failure recovery, consensus-log compaction, empty replacement-node snapshot recovery, an interrupted snapshot transfer retry, and recovery metrics through the public protocol.
 - `just bench` runs the Criterion durable publish, publish/poll/ack, shared-consumer, keyed-ordering, and local concurrency-scaling benchmarks; interpret every result with its durability mode and workload.

@@ -12,7 +12,8 @@ lint:
     cargo clippy --locked --workspace --all-targets --all-features -- -D warnings
 
 test:
-    RUST_TEST_THREADS=1 cargo test --locked --workspace --all-targets --all-features
+    # Test-only recovery experiments are run explicitly by cluster-test.
+    RUST_TEST_THREADS=1 cargo test --locked --workspace --all-targets
 
 doc-test:
     cargo test --locked --workspace --doc

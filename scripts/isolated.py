@@ -123,7 +123,7 @@ def command_for(workflow: str, isolation: Isolation) -> list[str]:
         str(artifact / "cluster-logs"),
     ]
     if workflow == "test":
-        return ["cargo", "test", "--locked", "--workspace", "--all-targets", "--all-features"]
+        return ["cargo", "test", "--locked", "--workspace", "--all-targets"]
     if workflow == "smoke":
         return ["./scripts/smoke.sh"]
     if workflow == "cluster-test":
