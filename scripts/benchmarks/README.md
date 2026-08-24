@@ -152,7 +152,7 @@ python3 scripts/benchmarks/pr_report.py \
   --output benchmark-results/pr-comment.md
 ```
 
-The report is deliberately informational and does not mix PR points into the long-term history unless a history workflow records them. The trusted pull-request comment workflow also runs the exact short workload against the default branch and passes it as `--baseline`, so matching metrics include a percentage delta from the current default-branch result. A missing or failed baseline never suppresses the PR result.
+The report is deliberately informational and does not mix PR points into the long-term history unless a history workflow records them. The trusted pull-request comment workflow also runs the exact short workload against the default branch and passes it as `--baseline`, so comments show a separate default-branch table followed by the pull-request table; matching PR metrics include a percentage delta from the current default-branch result. A missing or failed baseline never suppresses the PR result.
 
 For repeated measurements, normalize each independent result and aggregate the
 normalized files with the median as the displayed value:

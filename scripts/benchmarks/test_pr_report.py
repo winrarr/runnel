@@ -88,6 +88,11 @@ class PrReportTests(unittest.TestCase):
 
         self.assertIn("Baseline revision: `base123`", report)
         self.assertIn("Δ +100.0%", report)
+        baseline_table, pull_request_table = report.split("### Pull request benchmark", maxsplit=1)
+        self.assertIn("### Default branch benchmark", baseline_table)
+        self.assertIn("400 msg/s", baseline_table)
+        self.assertNotIn("Δ", baseline_table)
+        self.assertIn("800 msg/s (Δ +100.0%)", pull_request_table)
 
         mismatched = copy.deepcopy(baseline)
         mismatched["workload"]["messages"] = 200

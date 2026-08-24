@@ -374,6 +374,76 @@ def _with_delta(formatted: str | None, current: object, baseline: object | None)
     return f"{formatted} (Δ {delta:+.1f}%)"
 
 
+def _render_table(
+    title: str,
+    records: list[dict[str, Any]],
+    baseline_records: dict[tuple[str, str, str, str, str], dict[str, Any]],
+    workload_key: str | None,
+    metric_names: tuple[str, ...],
+    multiple_sources: bool,
+    lines: list[str],
+) -> None:
+    lines.extend([title, ""])
+    if not records:
+        lines.append("No measured scenarios found.")
+        return
+
+    shown_records = records[:MAX_SCENARIOS]
+    visible_metrics = [
+        metric
+        for metric in metric_names
+        if any(_metric_value(record, metric) is not None for record in shown_records)
+    ]
+    headers = (["Source"] if multiple_sources else []) + ["Operation", "Messages", "Size"]
+    headers.extend(
+        {
+            "throughput": "Throughput",
+            "p50": "p50",
+            "p99": "p99",
+            "p999": "p99.9",
+            "cpu": "CPU",
+            "memory": "Memory",
+        }[metric]
+        for metric in visible_metrics
+    )
+    lines.append("| " + " | ".join(headers) + " |")
+    lines.append("| " + " | ".join("---:" if index else "---" for index in range(len(headers))) + " |")
+
+    for record in shown_records:
+        baseline_record = None
+        identity = _scenario_identity(record, workload_key)
+        if identity is not None:
+            baseline_record = baseline_records.get(identity)
+        cells = []
+        if multiple_sources:
+            cells.append(_cell(record["source"]))
+        cells.extend(
+            [
+                _cell(record["operation"]),
+                _cell(_format_scalar(record.get("messages")) if record.get("messages") is not None else "—"),
+                _cell(
+                    _format_bytes(record.get("message_size_bytes"))
+                    or (
+                        _format_scalar(record.get("message_size_bytes"))
+                        if record.get("message_size_bytes") is not None
+                        else "—"
+                    )
+                ),
+            ]
+        )
+        for metric in visible_metrics:
+            current_value = _metric_value(record, metric)
+            baseline_value = _metric_value(baseline_record, metric) if baseline_record else None
+            cells.append(
+                _cell(_with_delta(_format_metric(metric, current_value), current_value, baseline_value))
+            )
+        lines.append("| " + " | ".join(cells) + " |")
+
+    if len(records) > MAX_SCENARIOS:
+        lines.append("")
+        lines.append(f"Showing the first {MAX_SCENARIOS} scenarios.")
+
+
 def render_report(result: dict[str, Any], baseline: dict[str, Any] | None = None) -> str:
     """Render a bounded report from a raw container or clustered result."""
     current_sources = _sources(result)
@@ -387,11 +457,18 @@ def render_report(result: dict[str, Any], baseline: dict[str, Any] | None = None
     ]
 
     baseline_records: dict[tuple[str, str, str, str, str], dict[str, Any]] = {}
+    baseline_scenario_records: list[dict[str, Any]] = []
     baseline_sources: list[dict[str, Any]] = []
     baseline_workload_key: str | None = None
     if baseline is not None:
         baseline_sources = _sources(baseline)
         baseline_workload_key = workload_identity(baseline)
+        baseline_scenario_records = [
+            _scenario_record(source, scenario)
+            for source in baseline_sources
+            for scenario in source["scenarios"]
+            if isinstance(scenario, dict)
+        ]
         if current_workload_key is not None and current_workload_key == baseline_workload_key:
             for source in baseline_sources:
                 for scenario in source["scenarios"]:
@@ -402,14 +479,8 @@ def render_report(result: dict[str, Any], baseline: dict[str, Any] | None = None
                     if identity is not None:
                         baseline_records.setdefault(identity, record)
 
-    shown_records = current_records[:MAX_SCENARIOS]
     metric_names = ("throughput", "p50", "p99", "p999", "cpu", "memory")
-    visible_metrics = [
-        metric
-        for metric in metric_names
-        if any(_metric_value(record, metric) is not None for record in shown_records)
-    ]
-    multiple_sources = len({record["source"] for record in shown_records}) > 1
+    multiple_sources = len({record["source"] for record in current_records}) > 1
 
     lines = ["## Runnel benchmark", ""]
     lines.append(f"- Revision: {_code(_revision(result, current_sources))}")
@@ -431,59 +502,43 @@ def render_report(result: dict[str, Any], baseline: dict[str, Any] | None = None
             lines.append("> Baseline deltas omitted: workload identity differs or is not recorded.")
         elif not all(
             _scenario_identity(record, current_workload_key) in baseline_records
-            for record in shown_records
+            for record in current_records[:MAX_SCENARIOS]
         ):
             lines.append("> Baseline deltas are shown only for matching operation, message count, and message size.")
         else:
             lines.append("> Baseline deltas compare matching workload, operation, message count, and message size.")
 
     lines.append("")
-    if not shown_records:
-        lines.append("No measured scenarios found.")
-        return "\n".join(lines) + "\n"
-
-    headers = (["Source"] if multiple_sources else []) + ["Operation", "Messages", "Size"]
-    headers.extend(
-        {
-            "throughput": "Throughput",
-            "p50": "p50",
-            "p99": "p99",
-            "p999": "p99.9",
-            "cpu": "CPU",
-            "memory": "Memory",
-        }[metric]
-        for metric in visible_metrics
-    )
-    lines.append("| " + " | ".join(headers) + " |")
-    lines.append("| " + " | ".join("---:" if index else "---" for index in range(len(headers))) + " |")
-
-    for record in shown_records:
-        baseline_record = None
-        identity = _scenario_identity(record, current_workload_key)
-        if identity is not None:
-            baseline_record = baseline_records.get(identity)
-        cells = []
-        if multiple_sources:
-            cells.append(_cell(record["source"]))
-        cells.extend(
-            [
-                _cell(record["operation"]),
-                _cell(_format_scalar(record.get("messages")) if record.get("messages") is not None else "—"),
-                _cell(
-                    _format_bytes(record.get("message_size_bytes"))
-                    or (_format_scalar(record.get("message_size_bytes")) if record.get("message_size_bytes") is not None else "—")
-                ),
-            ]
+    if baseline is not None:
+        _render_table(
+            "### Default branch benchmark",
+            baseline_scenario_records,
+            {},
+            None,
+            metric_names,
+            len({record["source"] for record in baseline_scenario_records}) > 1,
+            lines,
         )
-        for metric in visible_metrics:
-            current_value = _metric_value(record, metric)
-            baseline_value = _metric_value(baseline_record, metric) if baseline_record else None
-            cells.append(_cell(_with_delta(_format_metric(metric, current_value), current_value, baseline_value)))
-        lines.append("| " + " | ".join(cells) + " |")
-
-    if len(current_records) > MAX_SCENARIOS:
         lines.append("")
-        lines.append(f"Showing the first {MAX_SCENARIOS} scenarios.")
+        _render_table(
+            "### Pull request benchmark",
+            current_records,
+            baseline_records,
+            current_workload_key,
+            metric_names,
+            multiple_sources,
+            lines,
+        )
+    else:
+        _render_table(
+            "### Benchmark",
+            current_records,
+            {},
+            None,
+            metric_names,
+            multiple_sources,
+            lines,
+        )
     return "\n".join(lines) + "\n"
 
 
