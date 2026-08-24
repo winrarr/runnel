@@ -1,4 +1,4 @@
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -11,6 +11,7 @@ use tempfile::TempDir;
 struct RunningServer {
     child: Child,
     broker_addr: SocketAddr,
+    http_addr: SocketAddr,
 }
 
 impl RunningServer {
@@ -39,7 +40,11 @@ impl RunningServer {
             .expect("runnel server should start");
 
         wait_for_http(http_addr);
-        Self { child, broker_addr }
+        Self {
+            child,
+            broker_addr,
+            http_addr,
+        }
     }
 
     fn stop(mut self) {
@@ -177,6 +182,45 @@ fn network_protocol_persists_acknowledgements_across_restart() {
             ..
         } if payload == "recover-me"
     ));
+}
+
+#[test]
+fn metrics_report_messages_returned_by_polls() {
+    let directory = TempDir::new().unwrap();
+    let server = RunningServer::start(directory.path());
+
+    let initial_metrics = http_metrics(server.http_addr);
+    assert_eq!(metric_value(&initial_metrics, "runnel_deliveries_total"), 0);
+    assert!(initial_metrics.contains(
+        "# HELP runnel_deliveries_total Number of messages returned by successful poll operations."
+    ));
+    assert!(initial_metrics.contains("# TYPE runnel_deliveries_total counter"));
+
+    assert!(matches!(
+        request(
+            server.broker_addr,
+            Request::Publish {
+                stream: "events".to_owned(),
+                key: None,
+                payload: "hello".to_owned(),
+                request_id: None,
+            },
+        ),
+        Response::Published { offset: 0, .. }
+    ));
+    assert!(matches!(
+        request(
+            server.broker_addr,
+            Request::Poll {
+                stream: "events".to_owned(),
+                consumer: "worker".to_owned(),
+            },
+        ),
+        Response::Message { offset: 0, .. }
+    ));
+
+    let metrics = http_metrics(server.http_addr);
+    assert_eq!(metric_value(&metrics, "runnel_deliveries_total"), 1);
 }
 
 #[test]
@@ -450,6 +494,32 @@ fn free_addr() -> SocketAddr {
         .unwrap()
         .local_addr()
         .unwrap()
+}
+
+fn http_metrics(address: SocketAddr) -> String {
+    let mut stream =
+        TcpStream::connect(address).expect("metrics endpoint should accept connections");
+    stream
+        .set_read_timeout(Some(Duration::from_secs(2)))
+        .expect("metrics read timeout should be set");
+    stream
+        .write_all(b"GET /metrics HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+        .expect("metrics request should be written");
+    let mut response = String::new();
+    stream
+        .read_to_string(&mut response)
+        .expect("metrics response should be readable");
+    response
+        .split_once("\r\n\r\n")
+        .map_or(response.clone(), |(_, body)| body.to_owned())
+}
+
+fn metric_value(metrics: &str, name: &str) -> u64 {
+    metrics
+        .lines()
+        .find_map(|line| line.strip_prefix(&format!("{name} ")))
+        .and_then(|value| value.parse().ok())
+        .unwrap_or_default()
 }
 
 fn wait_for_http(address: SocketAddr) {

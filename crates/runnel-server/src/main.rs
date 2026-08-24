@@ -2,6 +2,7 @@ use std::collections::BTreeMap;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use axum::extract::State;
@@ -57,6 +58,12 @@ enum EngineKind {
 struct HttpState {
     engine: Arc<dyn Engine>,
     cluster: Option<Arc<GroupManager>>,
+    metrics: Arc<ServerMetrics>,
+}
+
+#[derive(Default)]
+struct ServerMetrics {
+    deliveries: AtomicU64,
 }
 
 #[derive(serde::Serialize)]
@@ -131,7 +138,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
     let tcp_engine = Arc::clone(&engine);
-    let tcp_task = tokio::spawn(run_tcp(tcp_listener, tcp_engine, shutdown_rx.clone()));
+    let server_metrics = Arc::new(ServerMetrics::default());
+    let tcp_metrics = Arc::clone(&server_metrics);
+    let tcp_task = tokio::spawn(run_tcp(
+        tcp_listener,
+        tcp_engine,
+        tcp_metrics,
+        shutdown_rx.clone(),
+    ));
     if let Some((peer_listener, group)) = peer {
         let peer_shutdown = shutdown_rx.clone();
         tokio::spawn(async move {
@@ -145,7 +159,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/health/live", get(liveness))
         .route("/health/ready", get(readiness))
         .route("/metrics", get(metrics))
-        .with_state(HttpState { engine, cluster });
+        .with_state(HttpState {
+            engine,
+            cluster,
+            metrics: server_metrics,
+        });
     let http_task = tokio::spawn(async move {
         axum::serve(http_listener, app)
             .with_graceful_shutdown(wait_for_shutdown(shutdown_rx))
@@ -194,6 +212,7 @@ fn parse_cluster_nodes(
 async fn run_tcp(
     listener: TcpListener,
     engine: Arc<dyn Engine>,
+    metrics: Arc<ServerMetrics>,
     mut shutdown: watch::Receiver<bool>,
 ) -> Result<(), std::io::Error> {
     loop {
@@ -206,8 +225,9 @@ async fn run_tcp(
             result = listener.accept() => {
                 let (stream, peer) = result?;
                 let engine = Arc::clone(&engine);
+                let metrics = Arc::clone(&metrics);
                 tokio::spawn(async move {
-                    if let Err(error) = handle_connection(stream, engine).await {
+                    if let Err(error) = handle_connection(stream, engine, metrics).await {
                         warn!(%peer, %error, "connection closed with error");
                     }
                 });
@@ -219,6 +239,7 @@ async fn run_tcp(
 async fn handle_connection(
     stream: TcpStream,
     engine: Arc<dyn Engine>,
+    metrics: Arc<ServerMetrics>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let (reader, mut writer) = stream.into_split();
     let mut lines = BufReader::new(reader).lines();
@@ -226,7 +247,7 @@ async fn handle_connection(
         #[cfg(feature = "instrumentation")]
         let _stage_timer = StageTimer::new("server.protocol_round_trip");
         let response = match serde_json::from_str::<Request>(&line) {
-            Ok(request) => handle_request(engine.as_ref(), request).await,
+            Ok(request) => handle_request(engine.as_ref(), request, &metrics).await,
             Err(error) => Response::Error {
                 code: "invalid_request".to_owned(),
                 message: error.to_string(),
@@ -239,7 +260,11 @@ async fn handle_connection(
     Ok(())
 }
 
-async fn handle_request(engine: &dyn Engine, request: Request) -> Response {
+async fn handle_request(
+    engine: &dyn Engine,
+    request: Request,
+    metrics: &ServerMetrics,
+) -> Response {
     #[cfg(feature = "instrumentation")]
     let _stage_timer = StageTimer::new("server.engine_request");
     let result = match request {
@@ -257,32 +282,31 @@ async fn handle_request(engine: &dyn Engine, request: Request) -> Response {
             .await
             .map(|offset| Response::Published { stream, offset }),
         Request::Poll { stream, consumer } => {
-            engine
-                .poll(&stream, &consumer)
-                .await
-                .map(|result| match result {
-                    PollResult::Message(message) => Response::Message {
-                        stream: message.stream,
-                        consumer,
-                        member: None,
-                        offset: message.offset,
-                        key: message.key,
-                        payload: String::from_utf8_lossy(&message.payload).into_owned(),
-                        published_at_ms: message.published_at_ms,
-                        delivery_token: None,
-                        delivery_attempt: message.delivery_attempt,
-                    },
-                    PollResult::Empty => Response::Empty { stream, consumer },
-                })
+            let result = engine.poll(&stream, &consumer).await;
+            record_delivery(metrics, &result);
+            result.map(|result| match result {
+                PollResult::Message(message) => Response::Message {
+                    stream: message.stream,
+                    consumer,
+                    member: None,
+                    offset: message.offset,
+                    key: message.key,
+                    payload: String::from_utf8_lossy(&message.payload).into_owned(),
+                    published_at_ms: message.published_at_ms,
+                    delivery_token: None,
+                    delivery_attempt: message.delivery_attempt,
+                },
+                PollResult::Empty => Response::Empty { stream, consumer },
+            })
         }
         Request::PollGroup {
             stream,
             consumer,
             member,
-        } => engine
-            .poll_group(&stream, &consumer, &member)
-            .await
-            .map(|result| match result {
+        } => {
+            let result = engine.poll_group(&stream, &consumer, &member).await;
+            record_delivery(metrics, &result);
+            result.map(|result| match result {
                 PollResult::Message(message) => Response::Message {
                     stream: message.stream,
                     consumer,
@@ -295,7 +319,8 @@ async fn handle_request(engine: &dyn Engine, request: Request) -> Response {
                     delivery_attempt: message.delivery_attempt,
                 },
                 PollResult::Empty => Response::Empty { stream, consumer },
-            }),
+            })
+        }
         Request::Ack {
             stream,
             consumer,
@@ -332,6 +357,12 @@ async fn handle_request(engine: &dyn Engine, request: Request) -> Response {
     };
 
     result.unwrap_or_else(|error| error_response(&error))
+}
+
+fn record_delivery(metrics: &ServerMetrics, result: &Result<PollResult, BrokerError>) {
+    if matches!(result, Ok(PollResult::Message(_))) {
+        metrics.deliveries.fetch_add(1, Ordering::Relaxed);
+    }
 }
 
 fn error_response(error: &BrokerError) -> Response {
@@ -418,6 +449,7 @@ async fn metrics(State(state): State<HttpState>) -> (StatusCode, String) {
                     health.storage_bytes,
                     health.redeliveries,
                     health.dead_letters,
+                    state.metrics.deliveries.load(Ordering::Relaxed),
                     snapshot_metrics,
                 ),
             )
@@ -434,10 +466,11 @@ fn format_metrics(
     storage_bytes: u64,
     redeliveries: u64,
     dead_letters: u64,
+    deliveries: u64,
     snapshot_metrics: SnapshotMetricsSnapshot,
 ) -> String {
     format!(
-        "# TYPE runnel_streams gauge\nrunnel_streams {streams}\n# TYPE runnel_storage_bytes gauge\nrunnel_storage_bytes {storage_bytes}\n# TYPE runnel_redeliveries_total counter\nrunnel_redeliveries_total {redeliveries}\n# TYPE runnel_dead_letters_total counter\nrunnel_dead_letters_total {dead_letters}\n# TYPE runnel_snapshot_builds_started_total counter\nrunnel_snapshot_builds_started_total {}\n# TYPE runnel_snapshot_builds_completed_total counter\nrunnel_snapshot_builds_completed_total {}\n# TYPE runnel_snapshot_build_failures_total counter\nrunnel_snapshot_build_failures_total {}\n# TYPE runnel_snapshot_installs_started_total counter\nrunnel_snapshot_installs_started_total {}\n# TYPE runnel_snapshot_installs_completed_total counter\nrunnel_snapshot_installs_completed_total {}\n# TYPE runnel_snapshot_install_failures_total counter\nrunnel_snapshot_install_failures_total {}\n# TYPE runnel_snapshot_install_bytes_total counter\nrunnel_snapshot_install_bytes_total {}\n# TYPE runnel_snapshot_installs_in_progress gauge\nrunnel_snapshot_installs_in_progress {}\n# TYPE runnel_snapshot_transfer_chunks_received_total counter\nrunnel_snapshot_transfer_chunks_received_total {}\n# TYPE runnel_snapshot_transfer_final_chunks_received_total counter\nrunnel_snapshot_transfer_final_chunks_received_total {}\n# TYPE runnel_snapshot_transfer_bytes_received_total counter\nrunnel_snapshot_transfer_bytes_received_total {}\n",
+        "# TYPE runnel_streams gauge\nrunnel_streams {streams}\n# TYPE runnel_storage_bytes gauge\nrunnel_storage_bytes {storage_bytes}\n# TYPE runnel_redeliveries_total counter\nrunnel_redeliveries_total {redeliveries}\n# TYPE runnel_dead_letters_total counter\nrunnel_dead_letters_total {dead_letters}\n# HELP runnel_deliveries_total Number of messages returned by successful poll operations.\n# TYPE runnel_deliveries_total counter\nrunnel_deliveries_total {deliveries}\n# TYPE runnel_snapshot_builds_started_total counter\nrunnel_snapshot_builds_started_total {}\n# TYPE runnel_snapshot_builds_completed_total counter\nrunnel_snapshot_builds_completed_total {}\n# TYPE runnel_snapshot_build_failures_total counter\nrunnel_snapshot_build_failures_total {}\n# TYPE runnel_snapshot_installs_started_total counter\nrunnel_snapshot_installs_started_total {}\n# TYPE runnel_snapshot_installs_completed_total counter\nrunnel_snapshot_installs_completed_total {}\n# TYPE runnel_snapshot_install_failures_total counter\nrunnel_snapshot_install_failures_total {}\n# TYPE runnel_snapshot_install_bytes_total counter\nrunnel_snapshot_install_bytes_total {}\n# TYPE runnel_snapshot_installs_in_progress gauge\nrunnel_snapshot_installs_in_progress {}\n# TYPE runnel_snapshot_transfer_chunks_received_total counter\nrunnel_snapshot_transfer_chunks_received_total {}\n# TYPE runnel_snapshot_transfer_final_chunks_received_total counter\nrunnel_snapshot_transfer_final_chunks_received_total {}\n# TYPE runnel_snapshot_transfer_bytes_received_total counter\nrunnel_snapshot_transfer_bytes_received_total {}\n",
         snapshot_metrics.builds_started,
         snapshot_metrics.builds_completed,
         snapshot_metrics.build_failures,
