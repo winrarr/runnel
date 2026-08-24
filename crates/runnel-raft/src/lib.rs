@@ -9,9 +9,11 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
-use std::io::Cursor;
+use std::io::{Cursor, Read, Write};
+use std::mem::size_of;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::Mutex as StdMutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -69,6 +71,9 @@ const SNAPSHOT_CHUNK_SIZE: u64 = 64 * 1024;
 const DEFAULT_RAFT_ACK_TIMEOUT: Duration = Duration::from_secs(30);
 const FORWARD_ATTEMPTS: usize = 3;
 const FORWARD_TIMEOUT: Duration = Duration::from_secs(2);
+const STATE_MACHINE_JOURNAL_FORMAT_VERSION: u32 = 1;
+const STATE_MACHINE_JOURNAL_FILE: &str = "state-machine.log";
+const MAX_STATE_MACHINE_JOURNAL_RECORD_SIZE: u32 = 64 * 1024 * 1024;
 const DEAD_LETTER_SUFFIX: &str = ".dead-letter";
 const DEAD_LETTER_HASH_PREFIX: &str = "runnel.dead-letter.";
 
@@ -372,6 +377,23 @@ struct StoredSnapshot {
     data: Vec<u8>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct StateMachineJournalEntry {
+    version: u32,
+    log_id: LogId<NodeId>,
+    payload: EntryPayload<TypeConfig>,
+}
+
+impl StateMachineJournalEntry {
+    fn from_entry(entry: &Entry<TypeConfig>) -> Self {
+        Self {
+            version: STATE_MACHINE_JOURNAL_FORMAT_VERSION,
+            log_id: entry.log_id,
+            payload: entry.payload.clone(),
+        }
+    }
+}
+
 #[derive(Debug, Default)]
 struct SnapshotMetrics {
     builds_started: AtomicU64,
@@ -426,6 +448,7 @@ struct StateMachineStore {
     snapshot_idx: AtomicU64,
     current_snapshot: RwLock<Option<StoredSnapshot>>,
     path: Option<PathBuf>,
+    journal: Option<StdMutex<fs::File>>,
     kind: GroupKind,
     metrics: Arc<SnapshotMetrics>,
 }
@@ -435,7 +458,7 @@ impl StateMachineStore {
         let path = path.as_ref().to_path_buf();
         fs::create_dir_all(&path)?;
         let state_path = path.join("state-machine.json");
-        let state = if state_path.exists() {
+        let mut state = if state_path.exists() {
             let bytes = fs::read(&state_path)?;
             let persisted: PersistedState = serde_json::from_slice(&bytes)?;
             if !matches!(persisted.version, 1 | FORMAT_VERSION) {
@@ -475,32 +498,77 @@ impl StateMachineStore {
             StateMachineData::default()
         };
         let snapshot_path = path.join("snapshot.json");
-        let current_snapshot = if snapshot_path.exists() {
+        let (current_snapshot, snapshot_state) = if snapshot_path.exists() {
             let bytes = fs::read(&snapshot_path)?;
             let snapshot: StoredSnapshot = serde_json::from_slice(&bytes)?;
-            validate_snapshot_data(&snapshot.data).map_err(|error| {
+            let persisted = validate_snapshot_data(&snapshot.data).map_err(|error| {
                 BrokerError::Cluster(format!(
                     "invalid persisted snapshot '{}': {error}",
                     snapshot_path.display()
                 ))
             })?;
-            Some(snapshot)
+            (
+                Some(snapshot),
+                Some(snapshot_state_from_persisted(persisted)),
+            )
         } else {
-            None
+            (None, None)
         };
+        if let (Some(snapshot), Some(snapshot_state)) = (&current_snapshot, snapshot_state)
+            && is_optional_log_after(snapshot.meta.last_log_id, state.last_applied_log)
+        {
+            state = StateMachineData {
+                last_applied_log: snapshot.meta.last_log_id,
+                last_membership: snapshot.meta.last_membership.clone(),
+                state: snapshot_state,
+            };
+        }
+        let journal_path = path.join(STATE_MACHINE_JOURNAL_FILE);
+        let journal_entries = read_state_machine_journal(&journal_path)?;
+        replay_state_machine_journal(&mut state, &journal_entries, &kind)?;
+        let journal = fs::OpenOptions::new()
+            .create(true)
+            .read(true)
+            .append(true)
+            .open(&journal_path)?;
         Ok(Self {
             state: RwLock::new(state),
             snapshot_idx: AtomicU64::new(0),
             current_snapshot: RwLock::new(current_snapshot),
             path: Some(path),
+            journal: Some(StdMutex::new(journal)),
             kind,
             metrics: Arc::new(SnapshotMetrics::default()),
         })
     }
 
-    fn persist_state(&self, state: &StateMachineData) -> Result<(), StorageError<NodeId>> {
+    fn persist_journal(
+        &self,
+        entries: &[StateMachineJournalEntry],
+    ) -> Result<(), StorageError<NodeId>> {
         #[cfg(feature = "instrumentation")]
         let _stage_timer = StageTimer::new("raft.state_persist");
+        let Some(journal) = &self.journal else {
+            return Ok(());
+        };
+        let mut journal = journal.lock().map_err(|_| {
+            StorageIOError::write_state_machine(&std::io::Error::other(
+                "state-machine journal lock was poisoned",
+            ))
+        })?;
+        for entry in entries {
+            append_state_machine_journal_entry(&mut journal, entry)
+                .map_err(|error| StorageIOError::write_state_machine(&error))?;
+        }
+        journal
+            .sync_data()
+            .map_err(|error| StorageIOError::write_state_machine(&error))?;
+        Ok(())
+    }
+
+    fn persist_checkpoint(&self, state: &StateMachineData) -> Result<(), StorageError<NodeId>> {
+        #[cfg(feature = "instrumentation")]
+        let _stage_timer = StageTimer::new("raft.state_checkpoint");
         let Some(path) = &self.path else {
             return Ok(());
         };
@@ -541,6 +609,56 @@ impl StateMachineStore {
         let bytes = serde_json::to_vec(&persisted)
             .map_err(|error| StorageIOError::write_state_machine(&error))?;
         atomic_write(&path.join("state-machine.json"), &bytes)
+            .map_err(|error| StorageIOError::write_state_machine(&error))?;
+        Ok(())
+    }
+
+    fn compact_journal(
+        &self,
+        last_applied_log: Option<LogId<NodeId>>,
+    ) -> Result<(), StorageError<NodeId>> {
+        let Some(path) = &self.path else {
+            return Ok(());
+        };
+        let Some(journal) = &self.journal else {
+            return Ok(());
+        };
+        let mut journal = journal.lock().map_err(|_| {
+            StorageIOError::write_state_machine(&std::io::Error::other(
+                "state-machine journal lock was poisoned",
+            ))
+        })?;
+        let journal_path = path.join(STATE_MACHINE_JOURNAL_FILE);
+        let retained = read_state_machine_journal(&journal_path)
+            .map_err(|error| {
+                StorageIOError::write_state_machine(&std::io::Error::other(error.to_string()))
+            })?
+            .into_iter()
+            .filter(|entry| last_applied_log.is_none_or(|last| is_log_after(entry.log_id, last)))
+            .collect::<Vec<_>>();
+        let temporary_path = journal_path.with_extension(format!("tmp-{}", std::process::id()));
+        let mut temporary = fs::File::create(&temporary_path)
+            .map_err(|error| StorageIOError::write_state_machine(&error))?;
+        for entry in &retained {
+            append_state_machine_journal_entry(&mut temporary, entry)
+                .map_err(|error| StorageIOError::write_state_machine(&error))?;
+        }
+        temporary
+            .sync_all()
+            .map_err(|error| StorageIOError::write_state_machine(&error))?;
+        fs::rename(&temporary_path, &journal_path)
+            .map_err(|error| StorageIOError::write_state_machine(&error))?;
+        let parent = journal_path.parent().unwrap_or_else(|| Path::new("."));
+        let directory =
+            fs::File::open(parent).map_err(|error| StorageIOError::write_state_machine(&error))?;
+        directory
+            .sync_all()
+            .map_err(|error| StorageIOError::write_state_machine(&error))?;
+        *journal = fs::OpenOptions::new()
+            .create(true)
+            .read(true)
+            .append(true)
+            .open(&journal_path)
             .map_err(|error| StorageIOError::write_state_machine(&error))?;
         Ok(())
     }
@@ -661,6 +779,116 @@ impl StateMachineStore {
     }
 }
 
+fn read_state_machine_journal(path: &Path) -> Result<Vec<StateMachineJournalEntry>, BrokerError> {
+    if !path.exists() {
+        return Ok(Vec::new());
+    }
+    let mut file = fs::OpenOptions::new().read(true).write(true).open(path)?;
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes)?;
+    let mut cursor = 0usize;
+    let mut truncated = false;
+    let mut entries = Vec::new();
+    while cursor < bytes.len() {
+        let record_start = cursor;
+        if bytes.len() - cursor < size_of::<u32>() {
+            truncated = true;
+            break;
+        }
+        let record_len = u32::from_le_bytes(
+            bytes[cursor..cursor + size_of::<u32>()]
+                .try_into()
+                .expect("journal length has a fixed size"),
+        );
+        cursor += size_of::<u32>();
+        if record_len > MAX_STATE_MACHINE_JOURNAL_RECORD_SIZE {
+            return Err(BrokerError::Cluster(format!(
+                "state-machine journal record is too large: {record_len} bytes"
+            )));
+        }
+        let record_len = record_len as usize;
+        if bytes.len() - cursor < record_len {
+            truncated = true;
+            cursor = record_start;
+            break;
+        }
+        let entry: StateMachineJournalEntry =
+            serde_json::from_slice(&bytes[cursor..cursor + record_len])?;
+        if entry.version != STATE_MACHINE_JOURNAL_FORMAT_VERSION {
+            return Err(BrokerError::Cluster(format!(
+                "unsupported state-machine journal format version {}",
+                entry.version
+            )));
+        }
+        entries.push(entry);
+        cursor += record_len;
+    }
+    if truncated {
+        file.set_len(cursor as u64)?;
+        file.sync_data()?;
+    }
+    Ok(entries)
+}
+
+fn append_state_machine_journal_entry(
+    file: &mut fs::File,
+    entry: &StateMachineJournalEntry,
+) -> std::io::Result<()> {
+    let bytes = serde_json::to_vec(entry).map_err(std::io::Error::other)?;
+    if bytes.len() > MAX_STATE_MACHINE_JOURNAL_RECORD_SIZE as usize {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "state-machine journal record exceeds configured size",
+        ));
+    }
+    let length = u32::try_from(bytes.len()).map_err(|_| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "state-machine journal record exceeds u32 length",
+        )
+    })?;
+    file.write_all(&length.to_le_bytes())?;
+    file.write_all(&bytes)
+}
+
+fn replay_state_machine_journal(
+    state: &mut StateMachineData,
+    entries: &[StateMachineJournalEntry],
+    kind: &GroupKind,
+) -> Result<(), BrokerError> {
+    for entry in entries {
+        if state
+            .last_applied_log
+            .is_some_and(|last| !is_log_after(entry.log_id, last))
+        {
+            continue;
+        }
+        state.last_applied_log = Some(entry.log_id);
+        match entry.payload.clone() {
+            EntryPayload::Blank => {}
+            EntryPayload::Membership(membership) => {
+                state.last_membership = StoredMembership::new(Some(entry.log_id), membership);
+            }
+            EntryPayload::Normal(command) => {
+                apply_command(&mut state.state, command, kind, entry.log_id);
+            }
+        }
+    }
+    Ok(())
+}
+
+fn is_log_after(candidate: LogId<NodeId>, current: LogId<NodeId>) -> bool {
+    (candidate.leader_id.term, candidate.index) > (current.leader_id.term, current.index)
+}
+
+fn is_optional_log_after(candidate: Option<LogId<NodeId>>, current: Option<LogId<NodeId>>) -> bool {
+    match (candidate, current) {
+        (Some(candidate), Some(current)) => is_log_after(candidate, current),
+        (Some(_), None) => true,
+        _ => false,
+    }
+}
+
 impl RaftSnapshotBuilder<TypeConfig> for Arc<StateMachineStore> {
     async fn build_snapshot(&mut self) -> Result<Snapshot<TypeConfig>, StorageError<NodeId>> {
         self.metrics.builds_started.fetch_add(1, Ordering::Relaxed);
@@ -688,6 +916,7 @@ impl RaftSnapshotBuilder<TypeConfig> for Arc<StateMachineStore> {
                 data: data.clone(),
             };
             self.persist_snapshot(&stored_snapshot).await?;
+            self.compact_journal(last_applied_log)?;
             *self.current_snapshot.write().await = Some(stored_snapshot);
             Ok(Snapshot {
                 meta,
@@ -726,7 +955,9 @@ impl RaftStateMachine<TypeConfig> for Arc<StateMachineStore> {
         let _stage_timer = StageTimer::new("raft.state_machine_apply");
         let mut state = self.state.write().await;
         let mut responses = Vec::new();
+        let mut journal_entries = Vec::new();
         for entry in entries {
+            journal_entries.push(StateMachineJournalEntry::from_entry(&entry));
             state.last_applied_log = Some(entry.log_id);
             match entry.payload {
                 EntryPayload::Blank => responses.push(CommandResponse::Noop),
@@ -742,8 +973,8 @@ impl RaftStateMachine<TypeConfig> for Arc<StateMachineStore> {
                 )),
             }
         }
-        if !responses.is_empty() {
-            self.persist_state(&state)?;
+        if !journal_entries.is_empty() {
+            self.persist_journal(&journal_entries)?;
         }
         Ok(responses)
     }
@@ -781,8 +1012,10 @@ impl RaftStateMachine<TypeConfig> for Arc<StateMachineStore> {
             state.last_applied_log = meta.last_log_id;
             state.last_membership = meta.last_membership.clone();
             state.state = snapshot_state;
-            self.persist_state(&state)?;
+            self.persist_checkpoint(&state)?;
+            let last_applied_log = state.last_applied_log;
             drop(state);
+            self.compact_journal(last_applied_log)?;
             let stored_snapshot = StoredSnapshot {
                 meta: meta.clone(),
                 data,
@@ -3476,6 +3709,55 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn state_machine_journal_replays_and_discards_a_partial_tail() {
+        let directory = tempfile::tempdir().unwrap();
+        let state_directory = directory.path().join("state-machine");
+        let store =
+            Arc::new(StateMachineStore::open(&state_directory, GroupKind::Metadata).unwrap());
+        let mut state_machine = store.clone();
+        state_machine
+            .apply(std::iter::once(Entry {
+                log_id: LogId {
+                    leader_id: openraft::CommittedLeaderId::new(1, 1),
+                    index: 0,
+                },
+                payload: EntryPayload::Normal(Command::CreateStream {
+                    stream: "events".to_owned(),
+                    stream_id: Some("stream/events".to_owned()),
+                    group_id: Some("group/events/data".to_owned()),
+                }),
+            }))
+            .await
+            .unwrap();
+        drop(state_machine);
+        drop(store);
+
+        let journal_path = state_directory.join(STATE_MACHINE_JOURNAL_FILE);
+        let valid_journal_length = fs::metadata(&journal_path).unwrap().len();
+        let mut journal = fs::OpenOptions::new()
+            .append(true)
+            .open(&journal_path)
+            .unwrap();
+        journal.write_all(&[0x01, 0x02, 0x03]).unwrap();
+        drop(journal);
+
+        let reopened = StateMachineStore::open(&state_directory, GroupKind::Metadata).unwrap();
+        assert_eq!(
+            reopened.metadata("events").await.unwrap(),
+            StreamMetadata {
+                stream_id: "stream/events".to_owned(),
+                group_id: "group/events/data".to_owned(),
+                lifecycle: StreamLifecycle::Creating,
+            }
+        );
+        assert_eq!(read_state_machine_journal(&journal_path).unwrap().len(), 1);
+        assert_eq!(
+            fs::metadata(&journal_path).unwrap().len(),
+            valid_journal_length
+        );
+    }
+
+    #[tokio::test]
     async fn snapshots_bound_consensus_history_and_recover_state() {
         let directory = tempfile::tempdir().unwrap();
         let peers = BTreeMap::from([(1, "127.0.0.1:0".to_owned())]);
@@ -3509,6 +3791,12 @@ mod tests {
         let snapshot_metrics = data_group.state_machine.snapshot_metrics();
         assert!(snapshot_metrics.builds_started >= 1);
         assert!(snapshot_metrics.builds_completed >= 1);
+        let journal_path = directory
+            .path()
+            .join("groups/data")
+            .join(path_component("events"))
+            .join("state-machine/state-machine.log");
+        assert!(journal_path.exists());
 
         let snapshot_path = directory
             .path()
@@ -3516,6 +3804,15 @@ mod tests {
             .join(path_component("events"))
             .join("state-machine/snapshot.json");
         assert!(snapshot_path.exists());
+        let snapshot: StoredSnapshot =
+            serde_json::from_slice(&fs::read(&snapshot_path).unwrap()).unwrap();
+        let remaining_journal = read_state_machine_journal(&journal_path).unwrap();
+        assert!(remaining_journal.iter().all(|entry| {
+            snapshot
+                .meta
+                .last_log_id
+                .is_none_or(|last| is_log_after(entry.log_id, last))
+        }));
         drop(engine);
 
         let reopened = PersistentEngine::open(

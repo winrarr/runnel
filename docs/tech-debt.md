@@ -68,8 +68,8 @@ This register records known implementation shortcuts in the current vertical sli
 ## TD-010: Clustered state materializes complete retained history
 
 - Status: open
-- Impact: the clustered state machine keeps retained messages in materialized state and persists that state after committed apply batches. Serialization, copying, memory use, and recovery cost grow with retained history, which can make hot-path latency and resource use unpredictable.
-- Context: this is the smallest state-machine representation that makes the first replicated vertical slice and snapshot recovery easy to inspect.
+- Impact: the clustered state machine keeps retained messages in materialized state and appends JSON journal records for committed apply entries. The journal avoids a complete state-file replacement on every apply, but serialization, copying, memory use, and recovery replay still grow with retained history.
+- Context: the incremental journal and checkpoint path is the first durable step toward separating hot-path appends from materialized recovery state. It deliberately keeps the existing JSON checkpoint and snapshot model while compatibility and crash behavior are established.
 - Retirement condition: retained-data growth, recovery, and resource benchmarks justify a durable representation whose append, read, and recovery work remains bounded without weakening ordering, replay, or acknowledgement guarantees.
 
 ## TD-011: End-to-end benchmark coverage is incomplete
