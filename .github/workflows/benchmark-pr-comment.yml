@@ -21,7 +21,7 @@ jobs:
       github.event.workflow_run.pull_requests[0].number
     name: Comment benchmark result
     runs-on: ubuntu-24.04
-    timeout-minutes: 10
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v7.0.1
         with:
@@ -34,12 +34,32 @@ jobs:
           path: benchmark-results
           run-id: ${{ github.event.workflow_run.id }}
           github-token: ${{ secrets.GITHUB_TOKEN }}
+      - name: Run default branch baseline
+        continue-on-error: true
+        run: |
+          set -euo pipefail
+          python3 scripts/benchmarks/compare.py \
+            --build-runnel \
+            --backends runnel \
+            --runnel-image runnel:main-baseline \
+            --messages 1000 \
+            --payload-sizes 100 \
+            --cpus 2 \
+            --memory 2g \
+            --client-cpus 2 \
+            --client-memory 2g \
+            --output benchmark-results/main.json
       - name: Generate benchmark comment
         run: |
           set -euo pipefail
-          python3 scripts/benchmarks/pr_report.py \
-            --input benchmark-results/pr.json \
+          report_args=(
+            --input benchmark-results/pr.json
             --output benchmark-results/pr-comment.md
+          )
+          if [ -s benchmark-results/main.json ]; then
+            report_args+=(--baseline benchmark-results/main.json)
+          fi
+          python3 scripts/benchmarks/pr_report.py "${report_args[@]}"
       - name: Publish benchmark comment
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
