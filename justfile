@@ -38,7 +38,7 @@ isolated workflow="test":
     python3 scripts/isolated.py {{workflow}}
 
 cluster-test:
-    RUST_TEST_THREADS=1 cargo test --locked -p runnel-server --test cluster_smoke -- --nocapture
+    cargo test --locked -p runnel-server --test cluster_smoke -- --nocapture --test-threads=1
 
 bench:
     cargo bench --locked --workspace
