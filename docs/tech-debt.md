@@ -76,14 +76,14 @@ This register records known implementation shortcuts in the current vertical sli
 
 - Status: open
 - Impact: the Criterion suite remains focused on local in-process paths, while the end-to-end benchmark harness does not yet establish clustered, statistically stable, equivalent competitor, or complete tail-latency baselines.
-- Context: microbenchmarks were added first to catch local regressions while the broker semantics and cluster recovery behavior were still changing. Containerized, clustered Runnel, single-node native competitor, and first RF=3 competitor-publish measurements now exist, including scenario-scoped resource efficiency and optional Linux profiles. Pull requests now get a short Runnel-only report, daily and `main` runs provide the primary longer Runnel history, and competitor comparisons are kept in separate weekly/manual suites; their semantic and statistical limitations remain.
+- Context: microbenchmarks were added first to catch local regressions while the broker semantics and cluster recovery behavior were still changing. Containerized, clustered Runnel, single-node native competitor, and first RF=3 competitor-publish measurements now exist, including scenario-scoped resource efficiency and optional Linux profiles. Pull requests now get a short Runnel-only report, daily and `main` runs provide the primary longer Runnel history, and competitor comparisons are kept in separate weekly/manual suites. Repeated summaries now retain median, observed range, and relative range evidence; workload equivalence, tail-latency coverage, and the policy for interpreting noisy runs remain incomplete.
 - Retirement condition: the performance backlog outcomes provide repeatable machine-readable local, container, clustered, and comparable-broker measurements with explicit workload and durability semantics, plus enough repeated samples and profiling evidence to distinguish regressions from host noise.
 
-## TD-012: Peer RPC connections are short-lived
+## TD-012: Peer RPC connection strategy remains incomplete
 
 - Status: open
-- Impact: the current distributed transport opens a new TCP connection for each internal RPC. Connection setup and teardown can dominate small-message coordination latency and add avoidable scheduling and allocation work under load.
-- Context: short-lived framed connections keep the first group-addressed transport simple and make request boundaries easy to inspect.
+- Impact: forwarding and data-group setup traffic now reuses a bounded pool, but control-plane Raft RPCs and snapshot transfers remain separate, and pool ownership is still process-wide. Connection setup, contention, and framing costs therefore remain incompletely characterized for small-message coordination and failure recovery.
+- Context: the initial short-lived framed transport kept request boundaries easy to inspect. A bounded four-connection-per-peer pool now reuses forwarding and data-group setup connections, discards failed or timed-out connections, and has focused reuse, replacement, timeout, and concurrency tests. The optimization is merged, but the transport architecture and end-to-end latency evidence are not yet complete.
 - Retirement condition: transport benchmarks demonstrate whether connection reuse, multiplexing, or another bounded communication strategy improves throughput and p99/p99.9 latency without changing failure or fencing behavior.
 
 ## TD-013: Native competitor benchmark semantics are not equivalent
@@ -124,8 +124,8 @@ This register records known implementation shortcuts in the current vertical sli
 ## TD-019: Delivery bookkeeping synchronizes consumer state per delivery
 
 - Status: open
-- Impact: the current durable attempt and acknowledgement bookkeeping replaces and syncs a consumer state file for each delivery path. The current 100-byte local benchmark run measured roughly 31 thousand shared-consumer messages per second in this configuration, but this cost will limit throughput and tail-latency headroom as concurrency and membership grow.
-- Context: persisting the attempt before returning a message makes retry behavior survive restart and keeps the first correctness model straightforward.
+- Impact: the current durable attempt and acknowledgement bookkeeping still replaces and synchronously syncs a consumer state file on each delivery path. An in-memory cache now avoids repeated reads and JSON parsing while a consumer has active deliveries, but the durable write cost remains a throughput and tail-latency limit as concurrency and membership grow.
+- Context: persisting the attempt before returning a message makes retry behavior survive restart and keeps the first correctness model straightforward. The active-state cache preserves that durability behavior, adds restart coverage for out-of-order acknowledgements and retry state, and produced an observed roughly 8% improvement in the focused benchmark; it does not yet remove per-delivery durable persistence.
 - Retirement condition: benchmarked batching, group commit, or another bounded bookkeeping strategy reduces delivery overhead without losing durable retry state, acknowledgement safety, or predictable recovery.
 
 ## TD-020: Clustered shared-consumer policy is only a semantic baseline
