@@ -3453,13 +3453,14 @@ mod tests {
     async fn persistent_raft_recovers_group_delivery_after_restart() {
         let directory = tempfile::tempdir().unwrap();
         let peers = BTreeMap::from([(1, "127.0.0.1:0".to_owned())]);
+        let ack_timeout = Duration::from_secs(2);
         let engine = PersistentEngine::open_with_ack_timeout(
             1,
             "runnel-group-restart-test".to_owned(),
             directory.path(),
             peers.clone(),
             true,
-            Duration::from_millis(100),
+            ack_timeout,
         )
         .await
         .unwrap();
@@ -3482,14 +3483,14 @@ mod tests {
         assert_eq!(old_attempt, 1);
         drop(engine);
 
-        tokio::time::sleep(Duration::from_millis(250)).await;
+        tokio::time::sleep(ack_timeout + Duration::from_millis(100)).await;
         let reopened = PersistentEngine::open_with_ack_timeout(
             1,
             "runnel-group-restart-test".to_owned(),
             directory.path(),
             peers,
             true,
-            Duration::from_millis(100),
+            ack_timeout,
         )
         .await
         .unwrap();
