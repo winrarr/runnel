@@ -20,6 +20,10 @@ const REQUEST_READ_TIMEOUT: Duration = CLUSTER_WAIT_TIMEOUT;
 const REQUEST_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(10);
 #[cfg(feature = "test-replacement-recovery")]
 const RECOVERY_REQUEST_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(5);
+// This scenario checks stale-token fencing before acknowledging the current
+// delivery. A longer lease keeps a loaded CI runner from expiring the current
+// token while the intentionally stale acknowledgement is being committed.
+const REASSIGN_ACK_TIMEOUT_MS: u64 = 5_000;
 
 struct RunningNode {
     node_id: u64,
@@ -28,6 +32,7 @@ struct RunningNode {
     peer_addr: SocketAddr,
     data_dir: PathBuf,
     cluster_nodes: Vec<(u64, SocketAddr)>,
+    ack_timeout_ms: u64,
     child: Option<Child>,
 }
 
@@ -41,6 +46,31 @@ impl RunningNode {
         cluster_nodes: Vec<(u64, SocketAddr)>,
         bootstrap: bool,
     ) -> Self {
+        Self::start_with_ack_timeout(
+            node_id,
+            broker_addr,
+            http_addr,
+            peer_addr,
+            data_dir,
+            cluster_nodes,
+            bootstrap,
+            50,
+        )
+    }
+
+    // Keep process-launch parameters explicit so each test documents its node
+    // topology and lease configuration at the call site.
+    #[allow(clippy::too_many_arguments)]
+    fn start_with_ack_timeout(
+        node_id: u64,
+        broker_addr: SocketAddr,
+        http_addr: SocketAddr,
+        peer_addr: SocketAddr,
+        data_dir: PathBuf,
+        cluster_nodes: Vec<(u64, SocketAddr)>,
+        bootstrap: bool,
+        ack_timeout_ms: u64,
+    ) -> Self {
         let child = Some(spawn_node(
             node_id,
             broker_addr,
@@ -49,6 +79,7 @@ impl RunningNode {
             &data_dir,
             &cluster_nodes,
             bootstrap,
+            ack_timeout_ms,
         ));
         Self {
             node_id,
@@ -57,6 +88,7 @@ impl RunningNode {
             peer_addr,
             data_dir,
             cluster_nodes,
+            ack_timeout_ms,
             child,
         }
     }
@@ -71,6 +103,7 @@ impl RunningNode {
             &self.data_dir,
             &self.cluster_nodes,
             false,
+            self.ack_timeout_ms,
         ));
         wait_for_http(self.http_addr);
     }
@@ -87,6 +120,7 @@ impl RunningNode {
             &self.data_dir,
             &self.cluster_nodes,
             false,
+            self.ack_timeout_ms,
         ));
         wait_for_http(self.http_addr);
     }
@@ -528,7 +562,7 @@ fn three_process_cluster_reassigns_group_delivery_after_node_failure() {
     let addresses = (0..9).map(|_| free_addr()).collect::<Vec<_>>();
     let cluster_nodes = vec![(1, addresses[6]), (2, addresses[7]), (3, addresses[8])];
     let mut nodes = vec![
-        RunningNode::start(
+        RunningNode::start_with_ack_timeout(
             1,
             addresses[0],
             addresses[3],
@@ -536,8 +570,9 @@ fn three_process_cluster_reassigns_group_delivery_after_node_failure() {
             directory.path().join("node-1"),
             cluster_nodes.clone(),
             true,
+            REASSIGN_ACK_TIMEOUT_MS,
         ),
-        RunningNode::start(
+        RunningNode::start_with_ack_timeout(
             2,
             addresses[1],
             addresses[4],
@@ -545,8 +580,9 @@ fn three_process_cluster_reassigns_group_delivery_after_node_failure() {
             directory.path().join("node-2"),
             cluster_nodes.clone(),
             false,
+            REASSIGN_ACK_TIMEOUT_MS,
         ),
-        RunningNode::start(
+        RunningNode::start_with_ack_timeout(
             3,
             addresses[2],
             addresses[5],
@@ -554,6 +590,7 @@ fn three_process_cluster_reassigns_group_delivery_after_node_failure() {
             directory.path().join("node-3"),
             cluster_nodes,
             false,
+            REASSIGN_ACK_TIMEOUT_MS,
         ),
     ];
     for node in &nodes {
@@ -603,7 +640,7 @@ fn three_process_cluster_reassigns_group_delivery_after_node_failure() {
     };
 
     nodes[0].stop();
-    sleep(Duration::from_millis(100));
+    sleep(Duration::from_millis(REASSIGN_ACK_TIMEOUT_MS + 100));
     let survivor = nodes
         .iter()
         .enumerate()
@@ -702,7 +739,7 @@ fn three_process_cluster_reassigns_group_delivery_after_node_failure() {
             ..
         }
     ));
-    sleep(Duration::from_millis(100));
+    sleep(Duration::from_millis(REASSIGN_ACK_TIMEOUT_MS + 100));
     assert!(matches!(
         wait_for_response_at(
             nodes[survivor].broker_addr,
@@ -726,7 +763,7 @@ fn three_process_cluster_reassigns_group_delivery_after_node_failure() {
             ..
         }
     ));
-    sleep(Duration::from_millis(100));
+    sleep(Duration::from_millis(REASSIGN_ACK_TIMEOUT_MS + 100));
     assert!(matches!(
         wait_for_response_at(
             nodes[survivor].broker_addr,
@@ -918,6 +955,9 @@ fn replacement_node_recovers_from_compacted_snapshot() {
     assert_live_nodes(&mut nodes);
 }
 
+// Keep process-launch parameters explicit so the test's process and topology
+// configuration remains visible without a second configuration abstraction.
+#[allow(clippy::too_many_arguments)]
 fn spawn_node(
     node_id: u64,
     broker_addr: SocketAddr,
@@ -926,14 +966,16 @@ fn spawn_node(
     data_dir: &Path,
     cluster_nodes: &[(u64, SocketAddr)],
     bootstrap: bool,
+    ack_timeout_ms: u64,
 ) -> Child {
     let mut command = Command::new(server_binary());
+    let ack_timeout_ms = ack_timeout_ms.to_string();
     command
         .args([
             "--engine",
             "raft",
             "--ack-timeout-ms",
-            "50",
+            &ack_timeout_ms,
             "--max-delivery-attempts",
             "2",
             "--node-id",
