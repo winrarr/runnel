@@ -13,8 +13,10 @@ use tempfile::TempDir;
 // successful recovery.
 const CLUSTER_WAIT_TIMEOUT: Duration = Duration::from_secs(120);
 // Durable publishes and snapshot recovery can overlap while a node rejoins;
-// allow one request to span the bounded cluster recovery window.
+// keep ordinary request helpers tolerant of the bounded cluster recovery
+// window. Retrying helpers use a shorter per-attempt timeout below.
 const REQUEST_READ_TIMEOUT: Duration = CLUSTER_WAIT_TIMEOUT;
+const REQUEST_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(2);
 
 struct RunningNode {
     node_id: u64,
@@ -1016,7 +1018,9 @@ fn wait_for_response_at(
     let deadline = Instant::now() + CLUSTER_WAIT_TIMEOUT;
     let mut last_response = None;
     while Instant::now() < deadline {
-        match request(address, request_builder()) {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        let attempt_timeout = remaining.min(REQUEST_ATTEMPT_TIMEOUT);
+        match request_with_timeout(address, request_builder(), attempt_timeout) {
             Ok(response) => {
                 if predicate(&response) {
                     return response;
