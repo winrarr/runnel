@@ -16,9 +16,9 @@ const CLUSTER_WAIT_TIMEOUT: Duration = Duration::from_secs(120);
 // keep ordinary request helpers tolerant of the bounded cluster recovery
 // window. Retrying helpers use a shorter per-attempt timeout below.
 const REQUEST_READ_TIMEOUT: Duration = CLUSTER_WAIT_TIMEOUT;
-// A forwarded request can traverse the bounded peer-forwarding retry window;
-// allow that work to finish before the test opens another request.
-const REQUEST_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(10);
+// A recovery request may wait for a Raft write and bounded peer forwarding;
+// allow that complete operation to finish before opening another request.
+const REQUEST_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(45);
 
 struct RunningNode {
     node_id: u64,
@@ -1019,6 +1019,9 @@ fn wait_for_response_at(
     let mut last_response = None;
     while Instant::now() < deadline {
         let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            break;
+        }
         let attempt_timeout = remaining.min(REQUEST_ATTEMPT_TIMEOUT);
         match request_with_timeout(address, request_builder(), attempt_timeout) {
             Ok(response) => {
@@ -1050,6 +1053,9 @@ fn wait_for_response_on_any(
                 continue;
             }
             let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                break;
+            }
             let attempt_timeout = remaining.min(REQUEST_ATTEMPT_TIMEOUT);
             match request_with_timeout(node.broker_addr, request_builder(), attempt_timeout) {
                 Ok(response) => {

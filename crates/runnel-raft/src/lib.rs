@@ -3431,18 +3431,22 @@ mod tests {
     async fn persistent_raft_fences_expired_group_delivery() {
         let directory = tempfile::tempdir().unwrap();
         let peers = BTreeMap::from([(1, "127.0.0.1:0".to_owned())]);
+        let ack_timeout = Duration::from_secs(2);
         let engine = PersistentEngine::open_with_ack_timeout(
             1,
             "runnel-group-expiry-test".to_owned(),
             directory.path(),
             peers,
             true,
-            Duration::from_millis(100),
+            ack_timeout,
         )
         .await
         .unwrap();
-        runnel_test_support::assert_expired_delivery_is_fenced(&engine, Duration::from_millis(250))
-            .await;
+        runnel_test_support::assert_expired_delivery_is_fenced(
+            &engine,
+            ack_timeout + Duration::from_millis(100),
+        )
+        .await;
     }
 
     #[tokio::test]
