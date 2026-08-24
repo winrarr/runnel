@@ -137,6 +137,7 @@ def command_for(workflow: str, isolation: Isolation) -> list[str]:
             "cluster_smoke",
             "--",
             "--nocapture",
+            "--test-threads=1",
         ]
     if workflow == "bench":
         return ["cargo", "bench", "--locked", "--workspace"]
