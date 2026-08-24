@@ -6,7 +6,7 @@ This register records known implementation shortcuts in the current vertical sli
 
 - Status: open
 - Impact: all publishes, polls, acknowledgements, recovery-related state access, and health reads serialize behind one mutex. This limits throughput and makes tail-latency work impossible to evaluate against the intended architecture.
-- Context: the lock keeps the first crash/recovery path easy to inspect and correct.
+- Context: the lock keeps the first crash/recovery path easy to inspect and correct. A bounded Criterion baseline now measures same-stream durable publishing with 1, 2, 4, and 8 workers; the observed median throughput stayed around 347–373 thousand elements per second while batch time increased from 179 microseconds to 1.45 milliseconds. This is an end-to-end persistence and scheduling measurement, not an isolated mutex-wait measurement.
 - Retirement condition: replace it with measured ownership boundaries and concurrency tests without weakening acknowledgement or recovery invariants. This is part of the storage and clustered-core backlog work.
 
 ## TD-002: One file and an in-memory index per stream
