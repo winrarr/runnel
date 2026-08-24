@@ -17,6 +17,9 @@ test:
 doc-test:
     cargo test --locked --workspace --doc
 
+script-test:
+    python3 -m unittest discover --start-directory scripts --pattern 'test_*.py'
+
 shellcheck:
     shellcheck scripts/*.sh
 
@@ -26,7 +29,7 @@ build:
 release:
     cargo build --locked --workspace --release
 
-verify: fmt-check lint test doc-test shellcheck bench-test build
+verify: fmt-check lint test doc-test shellcheck script-test bench-test build
 
 run:
     cargo run -p runnel-server -- --data-dir ./data
@@ -72,6 +75,9 @@ bench-dashboard:
 
 bench-test:
     python3 -m unittest discover --start-directory scripts/benchmarks --pattern 'test_*.py'
+
+check-commits range="HEAD~1..HEAD":
+    python3 scripts/check_conventional_commits.py --range {{range}}
 
 audit:
     command -v cargo-audit >/dev/null || { echo "cargo-audit is required; install it with: cargo install --locked cargo-audit" >&2; exit 1; }

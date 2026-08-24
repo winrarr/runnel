@@ -34,6 +34,6 @@ The three-node static topology intentionally limits the first implementation's s
 
 ## References
 
-- [Distributed architecture alternatives](../design/distributed-architecture-options.md)
+- [Distributed architecture alternatives](../research/distributed-architecture-options.md)
 - [Proposed Multi-Raft implementation plan](../design/multi-raft-implementation-plan.md)
 - [OpenRaft project](https://github.com/databendlabs/openraft)

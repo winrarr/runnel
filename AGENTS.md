@@ -20,12 +20,14 @@ Runnel is a Rust message broker intended to offer durable streams, low operation
 - scripts/benchmarks/pr_report.py: renders the short Runnel pull-request benchmark artifact as a Markdown report.
 - scripts/benchmarks/aggregate.py: median aggregation and observed-range summaries for repeated benchmark runs.
 - scripts/isolated.py: canonical isolated workflow runner for concurrent local tests and benchmarks.
+- scripts/check_conventional_commits.py: local and CI validation for commit subjects and pull-request titles.
 - scripts/benchmarks/normalize.py: strips raw tool output and adds provenance for durable benchmark history.
 - scripts/benchmarks/build_history.py: aggregates normalized benchmark runs into generated history data.
 - docs/benchmarks/: hand-authored static benchmark dashboard served by GitHub Pages.
 - scripts/benchmarks/README.md: benchmark scope, semantics, and comparison guidance.
 - docs/architecture.md: current data flow and boundaries.
 - docs/design/: active architecture explorations, alternatives, and proposed implementation plans that are not accepted decisions.
+- docs/research/: source-backed investigations, competitor comparisons, and measured evidence that inform design without becoming decisions by themselves.
 - docs/decisions/: consequential decisions that should not be rediscovered from code.
 - docs/backlog.md: explicitly intended product outcomes that are not implemented yet.
 - docs/tech-debt.md: known implementation shortcuts, their impact, and retirement conditions.
@@ -57,6 +59,7 @@ The current implementation serializes broker operations behind one in-process lo
 - Treat `just` recipes, development scripts, and CLI flags as part of the developer-facing interface. When changing a test, benchmark, or operational workflow, expose useful workload, wait, timeout, retry, isolation, and output controls when they have a real use; keep defaults sensible, document them, and test them. If a task requires a repeatable script or workaround, consider whether that behavior is useful enough to promote into the normal user-facing interface as a recipe, script, or CLI option. Prefer explicit options over hard-coded values, without adding speculative configuration.
 - Keep network behavior covered by tests that start the real server process.
 - Keep the pinned development toolchain separate from compatibility policy; do not infer a supported compiler floor from the pinned version.
+- Use Conventional Commits for project commits and pull-request titles. Keep the type meaningful, use a scope when it clarifies ownership, and mark breaking changes explicitly with `!` and migration details.
 
 ## Canonical commands
 
@@ -66,7 +69,7 @@ Linux development uses `just` as the canonical command runner. Install it once w
 
 Run these from the repository root:
 
-- just verify runs formatting, Clippy, all-target tests, documentation tests, ShellCheck, benchmark-script tests, and a workspace build.
+- just verify runs formatting, Clippy, all-target tests, documentation tests, Python script tests, ShellCheck, benchmark-script tests, and a workspace build.
 - just ci runs verification, the real broker smoke test, the Docker build, and the container benchmark smoke check.
 - just run starts a local broker with data in ./data.
 - just smoke starts a real broker and uses runnelctl to exercise publish, consume, acknowledgement, restart recovery, readiness, and metrics with temporary state.
@@ -83,6 +86,8 @@ Run these from the repository root:
 - just bench-compare-cluster runs the documented RF=3 durable-publish comparison against three-node Kafka, Redpanda, and JetStream clusters.
 - just bench-dashboard builds local history data from JSON files under benchmark-results/.
 - just bench-test runs the benchmark normalization and dashboard tests.
+- just script-test runs the Python helper and benchmark-script tests.
+- just check-commits validates a commit range using the project's Conventional Commit format.
 - python3 scripts/benchmarks/pr_report.py renders a pull-request benchmark JSON artifact as a Markdown report.
 - just audit runs cargo-audit when it is installed.
 - ./scripts/verify.sh is a thin compatibility wrapper for just verify.
@@ -99,6 +104,6 @@ The required CI path is .github/workflows/ci.yml. It runs the pinned toolchain c
 
 ## Knowledge routing
 
-Put implementation behavior in code and tests, current boundaries in docs/architecture.md, unsettled alternatives in docs/design/, durable accepted rationale in a dated decision record, external or user-mandated guardrails in docs/constraints.md, intended unfinished outcomes in docs/backlog.md, known implementation shortcuts in docs/tech-debt.md, verification workflows in docs/testing.md, and operational deployment guidance beside its deployment artifact. Put workflow changes in justfile and CI changes in .github/workflows. Remove stale guidance instead of appending exceptions.
+Put implementation behavior in code and tests, current boundaries in docs/architecture.md, source-backed investigations in docs/research/, unsettled alternatives and implementation proposals in docs/design/, durable accepted rationale in a dated decision record, external or user-mandated guardrails in docs/constraints.md, intended unfinished outcomes in docs/backlog.md, known implementation shortcuts in docs/tech-debt.md, verification workflows in docs/testing.md, and operational deployment guidance beside its deployment artifact. Put workflow changes in justfile and CI changes in .github/workflows. Remove stale guidance instead of appending exceptions.
 
 When parallel delegated work is authorized, follow .codex/skills/parallel-worktrees/SKILL.md. Keep task ownership disjoint, isolate process and container resources, and treat concurrent performance measurements as exploratory unless CPU, storage, and workload interference are controlled.
