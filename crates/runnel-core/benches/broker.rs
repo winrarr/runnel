@@ -2,11 +2,15 @@ use std::time::Duration;
 
 use std::hint::black_box;
 
-use criterion::{BatchSize, Criterion, Throughput, criterion_group, criterion_main};
+use criterion::{BatchSize, BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 use runnel_core::{Broker, BrokerConfig, PollResult};
+use std::sync::{Arc, Barrier};
+use std::thread;
 use tempfile::TempDir;
 
 const MESSAGE_COUNT: u64 = 100;
+const CONCURRENT_MESSAGES_PER_WORKER: u64 = 64;
+const CONCURRENT_WORKER_COUNTS: &[usize] = &[1, 2, 4, 8];
 const PAYLOAD: &[u8] = &[b'x'; 100];
 
 fn durable_publish(c: &mut Criterion) {
@@ -174,6 +178,60 @@ fn shared_consumer_keyed_poll_ack(c: &mut Criterion) {
     group.finish();
 }
 
+fn concurrent_publish_same_stream(c: &mut Criterion) {
+    let mut group = c.benchmark_group("concurrent_publish_same_stream");
+    group.sample_size(10);
+    group.warm_up_time(Duration::from_secs(1));
+    group.measurement_time(Duration::from_secs(2));
+
+    for &worker_count in CONCURRENT_WORKER_COUNTS {
+        let message_count = worker_count as u64 * CONCURRENT_MESSAGES_PER_WORKER;
+        group.throughput(Throughput::ElementsAndBytes {
+            elements: message_count,
+            bytes: message_count * PAYLOAD.len() as u64,
+        });
+        group.bench_with_input(
+            BenchmarkId::from_parameter(format!(
+                "{worker_count}_workers_{CONCURRENT_MESSAGES_PER_WORKER}_messages_each"
+            )),
+            &worker_count,
+            |benchmark, &worker_count| {
+                benchmark.iter_batched(
+                    || {
+                        let directory = TempDir::new().unwrap();
+                        let broker =
+                            Broker::open(directory.path(), BrokerConfig::default()).unwrap();
+                        broker.create_stream("bench").unwrap();
+                        (directory, broker)
+                    },
+                    |(_directory, broker)| {
+                        let start = Arc::new(Barrier::new(worker_count));
+                        thread::scope(|scope| {
+                            for _ in 0..worker_count {
+                                let broker = broker.clone();
+                                let start = Arc::clone(&start);
+                                scope.spawn(move || {
+                                    start.wait();
+                                    for _ in 0..CONCURRENT_MESSAGES_PER_WORKER {
+                                        black_box(
+                                            broker
+                                                .publish("bench", None, PAYLOAD.to_vec())
+                                                .unwrap(),
+                                        );
+                                    }
+                                });
+                            }
+                        });
+                    },
+                    BatchSize::PerIteration,
+                );
+            },
+        );
+    }
+
+    group.finish();
+}
+
 fn grouped_delivery(result: PollResult) -> (u64, String) {
     match result {
         PollResult::Message(message) => (
@@ -191,6 +249,7 @@ criterion_group!(
     durable_publish,
     publish_poll_ack,
     shared_consumer_poll_ack,
-    shared_consumer_keyed_poll_ack
+    shared_consumer_keyed_poll_ack,
+    concurrent_publish_same_stream
 );
 criterion_main!(benches);
