@@ -17,10 +17,7 @@ const CLUSTER_WAIT_TIMEOUT: Duration = Duration::from_secs(120);
 // window. Retrying helpers use a shorter per-attempt timeout below.
 const REQUEST_READ_TIMEOUT: Duration = CLUSTER_WAIT_TIMEOUT;
 const REQUEST_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(10);
-// Snapshot recovery publishes may wait for a slow Raft write while a node
-// rejoins; give this one workload a longer request budget without slowing all
-// cluster assertions.
-const SNAPSHOT_REQUEST_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(45);
+const RECOVERY_REQUEST_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(5);
 
 struct RunningNode {
     node_id: u64,
@@ -885,7 +882,7 @@ fn replacement_node_recovers_from_compacted_snapshot() {
             wait_for_response_on_any_with_timeout(
                 &nodes,
                 replacement,
-                SNAPSHOT_REQUEST_ATTEMPT_TIMEOUT,
+                RECOVERY_REQUEST_ATTEMPT_TIMEOUT,
                 || Request::Publish {
                     stream: "events".to_owned(),
                     key: None,
