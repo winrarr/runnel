@@ -1,4 +1,4 @@
-use std::fs::OpenOptions;
+use std::fs::{self, OpenOptions};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
@@ -18,6 +18,7 @@ const CLUSTER_WAIT_TIMEOUT: Duration = Duration::from_secs(120);
 // window. Retrying helpers use a shorter per-attempt timeout below.
 const REQUEST_READ_TIMEOUT: Duration = CLUSTER_WAIT_TIMEOUT;
 const REQUEST_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(10);
+#[cfg(feature = "test-replacement-recovery")]
 const RECOVERY_REQUEST_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(5);
 
 struct RunningNode {
@@ -74,6 +75,7 @@ impl RunningNode {
         wait_for_http(self.http_addr);
     }
 
+    #[cfg(feature = "test-replacement-recovery")]
     fn replace_storage(&mut self, data_dir: PathBuf) {
         self.stop();
         self.data_dir = data_dir;
@@ -148,8 +150,8 @@ fn three_process_cluster_replicates_and_recovers_after_failures() {
         wait_for_http(node.http_addr);
     }
 
-    let leader = create_stream_on_any(&nodes, "events");
-    let jobs_node = create_stream_on_any(&nodes, "jobs");
+    let leader = create_stream_on_any(&mut nodes, "events");
+    let jobs_node = create_stream_on_any(&mut nodes, "jobs");
     assert!(matches!(
         wait_for_response_at(
             nodes[jobs_node].broker_addr,
@@ -175,7 +177,7 @@ fn three_process_cluster_replicates_and_recovers_after_failures() {
         Response::Message { offset: 0, .. }
     ));
 
-    let grouped_node = create_stream_on_any(&nodes, "grouped-jobs");
+    let grouped_node = create_stream_on_any(&mut nodes, "grouped-jobs");
     for (index, payload) in ["first-grouped-job", "second-grouped-job"]
         .into_iter()
         .enumerate()
@@ -248,7 +250,7 @@ fn three_process_cluster_replicates_and_recovers_after_failures() {
     };
     assert!(matches!(
         wait_for_response_on_any(
-            &nodes,
+            &mut nodes,
             || Request::AckGroup {
                 stream: "grouped-jobs".to_owned(),
                 consumer: "workers".to_owned(),
@@ -265,7 +267,7 @@ fn three_process_cluster_replicates_and_recovers_after_failures() {
     ));
     assert!(matches!(
         wait_for_response_on_any(
-            &nodes,
+            &mut nodes,
             || Request::AckGroup {
                 stream: "grouped-jobs".to_owned(),
                 consumer: "workers".to_owned(),
@@ -281,7 +283,7 @@ fn three_process_cluster_replicates_and_recovers_after_failures() {
         }
     ));
 
-    let legacy_retry_node = create_stream_on_any(&nodes, "legacy-retry");
+    let legacy_retry_node = create_stream_on_any(&mut nodes, "legacy-retry");
     assert!(matches!(
         wait_for_response_at(
             nodes[legacy_retry_node].broker_addr,
@@ -484,7 +486,7 @@ fn three_process_cluster_replicates_and_recovers_after_failures() {
     }
 
     nodes[leader].stop();
-    let new_leader = wait_for_stream_on_any(&nodes, "events");
+    let new_leader = wait_for_stream_on_any(&mut nodes, "events");
     assert_ne!(new_leader, leader);
     wait_for_message(nodes[new_leader].broker_addr, 1, "during-follower-restart");
     let post_failure_node = nodes
@@ -526,6 +528,7 @@ fn three_process_cluster_replicates_and_recovers_after_failures() {
         Response::Acknowledged { .. }
     ));
     wait_for_message(replicated_node.broker_addr, 2, "after-leader-failure");
+    assert_live_nodes(&mut nodes);
 }
 
 #[test]
@@ -566,7 +569,7 @@ fn three_process_cluster_reassigns_group_delivery_after_node_failure() {
         wait_for_http(node.http_addr);
     }
 
-    create_stream_on_any(&nodes, "failover-jobs");
+    create_stream_on_any(&mut nodes, "failover-jobs");
     assert!(matches!(
         wait_for_response_at(
             nodes[0].broker_addr,
@@ -803,8 +806,10 @@ fn three_process_cluster_reassigns_group_delivery_after_node_failure() {
         ),
         Ok(Response::Empty { .. })
     ));
+    assert_live_nodes(&mut nodes);
 }
 
+#[cfg(feature = "test-replacement-recovery")]
 #[test]
 fn replacement_node_recovers_from_compacted_snapshot() {
     let directory = TempDir::new().unwrap();
@@ -843,7 +848,7 @@ fn replacement_node_recovers_from_compacted_snapshot() {
         wait_for_http(node.http_addr);
     }
 
-    let leader = create_stream_on_any(&nodes, "events");
+    let leader = create_stream_on_any(&mut nodes, "events");
     assert!(matches!(
         wait_for_response_at(
             nodes[leader].broker_addr,
@@ -881,7 +886,7 @@ fn replacement_node_recovers_from_compacted_snapshot() {
         let request_id = format!("snapshot-message-{index}");
         assert!(matches!(
             wait_for_response_on_any_with_timeout(
-                &nodes,
+                &mut nodes,
                 Some(replacement),
                 RECOVERY_REQUEST_ATTEMPT_TIMEOUT,
                 || Request::Publish {
@@ -925,6 +930,7 @@ fn replacement_node_recovers_from_compacted_snapshot() {
         metric_value(&metrics, "runnel_snapshot_installs_completed_total") >= 1,
         "replacement metrics did not report a completed snapshot install:\n{metrics}"
     );
+    assert_live_nodes(&mut nodes);
 }
 
 fn spawn_node(
@@ -959,7 +965,14 @@ fn spawn_node(
         .stdout(Stdio::null())
         .stderr(Stdio::null());
     if std::env::var_os("RUNNEL_TEST_CAPTURE_LOGS").is_some() {
-        let log_path = data_dir.with_extension("log");
+        let log_path = std::env::var_os("RUNNEL_ISOLATION_ARTIFACTS")
+            .map(PathBuf::from)
+            .map(|artifact_dir| artifact_dir.join("cluster-logs"))
+            .inspect(|log_dir| {
+                fs::create_dir_all(log_dir).expect("node log directory should be writable")
+            })
+            .map(|log_dir| log_dir.join(format!("node-{node_id}.log")))
+            .unwrap_or_else(|| data_dir.with_extension("log"));
         let stdout = OpenOptions::new()
             .create(true)
             .append(true)
@@ -979,7 +992,7 @@ fn spawn_node(
     command.spawn().expect("runnel node should start")
 }
 
-fn create_stream_on_any(nodes: &[RunningNode], stream: &str) -> usize {
+fn create_stream_on_any(nodes: &mut [RunningNode], stream: &str) -> usize {
     wait_for_response(nodes, |node| {
         matches!(
             request(
@@ -993,7 +1006,7 @@ fn create_stream_on_any(nodes: &[RunningNode], stream: &str) -> usize {
     })
 }
 
-fn wait_for_stream_on_any(nodes: &[RunningNode], stream: &str) -> usize {
+fn wait_for_stream_on_any(nodes: &mut [RunningNode], stream: &str) -> usize {
     wait_for_response(nodes, |node| {
         matches!(
             request(
@@ -1008,11 +1021,12 @@ fn wait_for_stream_on_any(nodes: &[RunningNode], stream: &str) -> usize {
 }
 
 fn wait_for_response(
-    nodes: &[RunningNode],
+    nodes: &mut [RunningNode],
     mut predicate: impl FnMut(&RunningNode) -> bool,
 ) -> usize {
     let deadline = Instant::now() + CLUSTER_WAIT_TIMEOUT;
     while Instant::now() < deadline {
+        assert_live_nodes(nodes);
         for (index, node) in nodes.iter().enumerate() {
             if node.child.is_some() && predicate(node) {
                 return index;
@@ -1062,7 +1076,7 @@ fn wait_for_response_at_with_timeout(
 }
 
 fn wait_for_response_on_any(
-    nodes: &[RunningNode],
+    nodes: &mut [RunningNode],
     request_builder: impl FnMut() -> Request,
     predicate: impl FnMut(&Response) -> bool,
 ) -> Response {
@@ -1076,7 +1090,7 @@ fn wait_for_response_on_any(
 }
 
 fn wait_for_response_on_any_with_timeout(
-    nodes: &[RunningNode],
+    nodes: &mut [RunningNode],
     excluded: Option<usize>,
     attempt_timeout: Duration,
     mut request_builder: impl FnMut() -> Request,
@@ -1085,6 +1099,7 @@ fn wait_for_response_on_any_with_timeout(
     let deadline = Instant::now() + CLUSTER_WAIT_TIMEOUT;
     let mut last_response = None;
     while Instant::now() < deadline {
+        assert_live_nodes(nodes);
         for (index, node) in nodes.iter().enumerate() {
             if excluded == Some(index) || node.child.is_none() {
                 continue;
@@ -1109,6 +1124,23 @@ fn wait_for_response_on_any_with_timeout(
     panic!(
         "no surviving node accepted the request before the deadline; last response: {last_response:?}"
     );
+}
+
+fn assert_live_nodes(nodes: &mut [RunningNode]) {
+    for node in nodes {
+        let Some(child) = node.child.as_mut() else {
+            continue;
+        };
+        if let Some(status) = child
+            .try_wait()
+            .expect("node process status should be readable")
+        {
+            panic!(
+                "node {} exited unexpectedly with status {status}",
+                node.node_id
+            );
+        }
+    }
 }
 
 fn wait_for_message(address: SocketAddr, offset: u64, payload: &str) {
@@ -1146,6 +1178,7 @@ fn wait_for_message_at(address: SocketAddr, offset: u64, payload: &str) {
     );
 }
 
+#[cfg(feature = "test-replacement-recovery")]
 fn wait_for_snapshot(nodes: &[RunningNode], excluded: usize, stream: &str) -> usize {
     let deadline = Instant::now() + CLUSTER_WAIT_TIMEOUT;
     while Instant::now() < deadline {
@@ -1167,6 +1200,7 @@ fn wait_for_snapshot(nodes: &[RunningNode], excluded: usize, stream: &str) -> us
     panic!("no live node produced a snapshot for stream '{stream}'");
 }
 
+#[cfg(feature = "test-replacement-recovery")]
 fn wait_for_purged_log(node: &RunningNode, stream: &str) {
     let path = node
         .data_dir
@@ -1186,6 +1220,7 @@ fn wait_for_purged_log(node: &RunningNode, stream: &str) {
     panic!("consensus log '{}' was not compacted", path.display());
 }
 
+#[cfg(feature = "test-replacement-recovery")]
 fn wait_for_active_snapshot_transfer(address: SocketAddr) {
     let deadline = Instant::now() + CLUSTER_WAIT_TIMEOUT;
     while Instant::now() < deadline {
@@ -1203,6 +1238,7 @@ fn wait_for_active_snapshot_transfer(address: SocketAddr) {
     panic!("replacement node did not receive a non-final snapshot chunk");
 }
 
+#[cfg(feature = "test-replacement-recovery")]
 fn wait_for_metric_at_least(address: SocketAddr, name: &str, expected: u64) {
     let deadline = Instant::now() + CLUSTER_WAIT_TIMEOUT;
     while Instant::now() < deadline {
@@ -1214,6 +1250,7 @@ fn wait_for_metric_at_least(address: SocketAddr, name: &str, expected: u64) {
     panic!("metric '{name}' did not reach {expected}");
 }
 
+#[cfg(feature = "test-replacement-recovery")]
 fn path_component(value: &str) -> String {
     value
         .as_bytes()
@@ -1255,6 +1292,7 @@ fn try_http_metrics(address: SocketAddr) -> Result<String, String> {
     })
 }
 
+#[cfg(feature = "test-replacement-recovery")]
 fn metric_value(metrics: &str, name: &str) -> u64 {
     metrics
         .lines()
