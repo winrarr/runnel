@@ -70,7 +70,8 @@ Linux development uses `just` as the canonical command runner. Install it once w
 Run these from the repository root:
 
 - just verify runs formatting, Clippy, all-target tests, documentation tests, ShellCheck, benchmark-script tests, and a workspace build.
-- just ci runs verification, the real broker smoke test, the Docker build, and the container benchmark smoke check.
+- just ci runs verification and the full local integration sequence.
+- just integration runs the same smoke, clustered, Docker, and container-smoke sequence used by the CI integration job.
 - just run starts a local broker with data in ./data.
 - just smoke starts a real broker and uses runnelctl to exercise publish, consume, acknowledgement, restart recovery, readiness, and metrics with temporary state.
 - just isolated runs the default workspace test with a unique Cargo target, temporary directory, and benchmark artifact directory; pass a supported workflow such as `just isolated cluster-test` or `just isolated bench-container-smoke` for concurrent work.

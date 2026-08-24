@@ -81,6 +81,10 @@ audit:
 docker-build:
     docker build --tag runnel:dev .
 
-ci: verify docker-build
-    python3 scripts/isolated.py smoke
-    python3 scripts/isolated.py bench-container-smoke
+integration:
+    RUNNEL_TEST_CAPTURE_LOGS=1 python3 scripts/isolated.py smoke
+    RUNNEL_TEST_CAPTURE_LOGS=1 python3 scripts/isolated.py cluster-test
+    just docker-build
+    RUNNEL_TEST_CAPTURE_LOGS=1 python3 scripts/isolated.py bench-container-smoke
+
+ci: verify integration

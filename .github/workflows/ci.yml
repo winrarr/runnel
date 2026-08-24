@@ -42,12 +42,7 @@ jobs:
       - uses: taiki-e/install-action@v2.86.3
         with:
           tool: just
-      - name: Enable integration diagnostics
-        run: echo "RUNNEL_TEST_CAPTURE_LOGS=1" >> "$GITHUB_ENV"
-      - run: just isolated smoke
-      - run: just isolated cluster-test
-      - run: just docker-build
-      - run: just isolated bench-container-smoke
+      - run: just integration
       - name: Capture integration diagnostics
         if: failure()
         run: |
