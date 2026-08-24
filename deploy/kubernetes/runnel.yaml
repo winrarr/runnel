@@ -83,6 +83,13 @@ spec:
               containerPort: 8080
             - name: peer
               containerPort: 7000
+          startupProbe:
+            httpGet:
+              path: /health/live
+              port: http
+            periodSeconds: 5
+            timeoutSeconds: 2
+            failureThreshold: 60
           readinessProbe:
             httpGet:
               path: /health/ready
