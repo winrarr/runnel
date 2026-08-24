@@ -76,7 +76,7 @@ This register records known implementation shortcuts in the current vertical sli
 
 - Status: open
 - Impact: the Criterion suite remains focused on local in-process paths, while the end-to-end benchmark harness does not yet establish clustered, statistically stable, equivalent competitor, or complete tail-latency baselines.
-- Context: microbenchmarks were added first to catch local regressions while the broker semantics and cluster recovery behavior were still changing. Containerized, clustered Runnel, single-node native competitor, and first RF=3 competitor-publish measurements now exist, including scenario-scoped resource efficiency and optional Linux profiles, but their semantic and statistical limitations remain.
+- Context: microbenchmarks were added first to catch local regressions while the broker semantics and cluster recovery behavior were still changing. Containerized, clustered Runnel, single-node native competitor, and first RF=3 competitor-publish measurements now exist, including scenario-scoped resource efficiency and optional Linux profiles. Pull requests now get a short Runnel-only report, daily and `main` runs provide the primary longer Runnel history, and competitor comparisons are kept in separate weekly/manual suites; their semantic and statistical limitations remain.
 - Retirement condition: the performance backlog outcomes provide repeatable machine-readable local, container, clustered, and comparable-broker measurements with explicit workload and durability semantics, plus enough repeated samples and profiling evidence to distinguish regressions from host noise.
 
 ## TD-012: Peer RPC connections are short-lived

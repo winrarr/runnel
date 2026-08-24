@@ -17,6 +17,7 @@ Runnel is a Rust message broker intended to offer durable streams, low operation
 - scripts/benchmarks/cluster.py: real three-node clustered benchmark runner with machine-readable results.
 - scripts/benchmarks/profile.py: optional Linux `perf` workflow for clustered CPU hotspot profiles.
 - scripts/benchmarks/compare.py: first-pass single-node and three-node native-tool comparison runner for Runnel, Kafka, Redpanda, and JetStream.
+- scripts/benchmarks/pr_report.py: renders the short Runnel pull-request benchmark artifact as a Markdown report.
 - scripts/benchmarks/aggregate.py: median aggregation and observed-range summaries for repeated benchmark runs.
 - scripts/isolated.py: canonical isolated workflow runner for concurrent local tests and benchmarks.
 - scripts/benchmarks/normalize.py: strips raw tool output and adds provenance for durable benchmark history.
@@ -82,6 +83,7 @@ Run these from the repository root:
 - just bench-compare-cluster runs the documented RF=3 durable-publish comparison against three-node Kafka, Redpanda, and JetStream clusters.
 - just bench-dashboard builds local history data from JSON files under benchmark-results/.
 - just bench-test runs the benchmark normalization and dashboard tests.
+- python3 scripts/benchmarks/pr_report.py renders a pull-request benchmark JSON artifact as a Markdown report.
 - just audit runs cargo-audit when it is installed.
 - ./scripts/verify.sh is a thin compatibility wrapper for just verify.
 
@@ -93,7 +95,7 @@ Do not add a second task runner. Keep README commands and CI wired to just recip
 
 The required CI path is .github/workflows/ci.yml. It runs the pinned toolchain checks, the real network integration test, and the container smoke build. .github/workflows/security.yml audits the dependency lockfile on pull requests and weekly. Dependabot keeps Cargo and GitHub Actions dependencies visible for review.
 
-.github/workflows/benchmarks.yml runs repeated native competitor comparisons, three-node competitor comparisons, and three-node Runnel benchmarks on pushes to main, weekly, and manually. It keeps raw and aggregated results as workflow artifacts and appends one median aggregate per benchmark suite plus generated data to the benchmark-history branch. GitHub Pages serves the hand-authored `docs/benchmarks/` directory from `main` and reads the public history data at runtime. Treat benchmark-history as generated output; change the scripts, dashboard assets, and workflow rather than editing that branch manually.
+.github/workflows/benchmarks.yml runs the longer Runnel-only single-node and three-node history suites on pushes to `main`, daily, and manually. `.github/workflows/benchmark-competitors.yml` runs the separate native and three-node competitor comparisons weekly or manually. `.github/workflows/benchmark-pr.yml` produces a short, read-only Runnel artifact for pull requests, and `.github/workflows/benchmark-pr-comment.yml` turns a successful artifact into an informational PR comment. The Runnel history is the primary optimization signal; competitor suites are separate ranking evidence. The history workflows keep raw and aggregated results as artifacts and append generated data to the `benchmark-history` branch. GitHub Pages serves the hand-authored `docs/benchmarks/` directory from `main` and reads the public history data at runtime. Treat `benchmark-history` as generated output; change the scripts, dashboard assets, and workflows rather than editing that branch manually.
 
 ## Knowledge routing
 

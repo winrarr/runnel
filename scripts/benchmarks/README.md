@@ -116,7 +116,7 @@ Run the replicated three-node competitor baseline with:
 just bench-compare-cluster
 ```
 
-This records one publish scenario per payload size for Kafka, Redpanda, and NATS JetStream with replication factor three. It is deliberately a separate `cluster-comparison` history suite: the current Runnel cluster runner measures the public protocol and consumer acknowledgement paths, while this first competitor slice has only equivalent durable-publish adapters. The GitHub Actions history workflow repeats and aggregates this suite alongside the single-node native comparison and the Runnel cluster baseline.
+This records one publish scenario per payload size for Kafka, Redpanda, and NATS JetStream with replication factor three. It is deliberately a separate `cluster-comparison` history suite: the current Runnel cluster runner measures the public protocol and consumer acknowledgement paths, while this first competitor slice has only equivalent durable-publish adapters. The weekly competitor workflow repeats and aggregates this suite independently from the Runnel optimization history.
 
 `--nodes 3` starts three Kafka KRaft brokers/controllers, three Redpanda brokers, or three NATS servers with JetStream clustering. Kafka topics use one partition, replication factor 3, `min.insync.replicas=3`, `acks=all`, and producer idempotence. JetStream streams use file storage and `--replicas=3`; the native synchronous publisher measures the PubAck boundary. Each broker container receives the broker limits and the short-lived native client receives the client limits, so a three-node run consumes up to three times the per-container broker budget plus the client budget. The result keeps per-node resource summaries and aggregate CPU/memory fields.
 
@@ -142,7 +142,17 @@ python3 scripts/benchmarks/build_history.py \
   --output benchmark-results/site
 ```
 
-The normalized schema intentionally excludes native tool logs. It retains workload, limits, image identifiers, semantic boundaries, scenario resource samples, source revision, workflow provenance, and measured points. `build_history.py` aggregates these records into `site/data.json` on the generated `benchmark-history` branch. The hand-authored HTML, CSS, and JavaScript in `docs/benchmarks/` are served directly by GitHub Pages and read that public history data from the raw GitHub URL. Invalid or unrelated JSON files are skipped.
+The normalized schema intentionally excludes native tool logs. It retains workload, limits, image identifiers, semantic boundaries, scenario resource samples, source revision, workflow provenance, and measured points. `build_history.py` aggregates these records into `site/data.json` on the generated `benchmark-history` branch. The hand-authored HTML, CSS, and JavaScript in `docs/benchmarks/` are served directly by GitHub Pages and read that public history data from the raw GitHub URL. The longer Runnel-only history is the primary optimization series; native and three-node competitor records are kept as separate suites. Invalid or unrelated JSON files are skipped.
+
+For pull-request feedback, render a short Runnel result as Markdown:
+
+```text
+python3 scripts/benchmarks/pr_report.py \
+  --input benchmark-results/pr.json \
+  --output benchmark-results/pr-comment.md
+```
+
+The report is deliberately informational and does not mix PR points into the long-term history unless a history workflow records them.
 
 For repeated measurements, normalize each independent result and aggregate the
 normalized files with the median as the displayed value:
@@ -154,9 +164,9 @@ python3 scripts/benchmarks/aggregate.py \
 ```
 
 The aggregate records the repetition count and min/median/max observed range
-for each measured metric. The automatic workflow performs this for the
-native comparison, the three-node competitor comparison, and the clustered
-Runnel suite. A benchmark history point is
+for each measured metric. The daily and `main` workflow performs this for the
+Runnel-only single-node and clustered suites; the weekly competitor workflow
+does the same for the native and three-node competitor suites. A benchmark history point is
 compared only with the previous run that has the same suite, workload, resource
 limits, broker image, measurement boundary, and comparison mode.
 

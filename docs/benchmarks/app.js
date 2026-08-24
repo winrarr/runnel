@@ -234,6 +234,7 @@ function populateOperations() {
 
 function suiteLabel(value) {
   return {
+    runnel: 'Runnel benchmark',
     'native-comparison': 'Native broker comparison',
     'cluster-comparison': 'Three-node competitor comparison',
     cluster: 'Runnel cluster',
@@ -246,7 +247,8 @@ function populate() {
     new Option('All suites', 'all'),
     ...suites.map((value) => new Option(suiteLabel(value), value)),
   );
-  if (suites.includes('native-comparison')) suiteSelect.value = 'native-comparison';
+  if (suites.includes('runnel')) suiteSelect.value = 'runnel';
+  else if (suites.includes('native-comparison')) suiteSelect.value = 'native-comparison';
 
   const profiles = unique(data.points.map((point) => point.profile));
   profileSelect.replaceChildren(
