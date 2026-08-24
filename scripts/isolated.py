@@ -31,6 +31,7 @@ WORKFLOWS = (
     "test",
     "smoke",
     "cluster-test",
+    "cluster-replacement-test",
     "bench",
     "bench-container",
     "bench-container-smoke",
@@ -126,15 +127,19 @@ def command_for(workflow: str, isolation: Isolation) -> list[str]:
         return ["cargo", "test", "--locked", "--workspace", "--all-targets"]
     if workflow == "smoke":
         return ["./scripts/smoke.sh"]
-    if workflow == "cluster-test":
+    if workflow in {"cluster-test", "cluster-replacement-test"}:
+        recovery_args = (
+            ["--features", "test-replacement-recovery"]
+            if workflow == "cluster-replacement-test"
+            else []
+        )
         return [
             "cargo",
             "test",
             "--locked",
             "-p",
             "runnel-server",
-            "--features",
-            "test-replacement-recovery",
+            *recovery_args,
             "--test",
             "cluster_smoke",
             "--",
