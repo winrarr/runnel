@@ -234,6 +234,65 @@ fn concurrent_publish_same_stream(c: &mut Criterion) {
     group.finish();
 }
 
+fn concurrent_publish_independent_streams(c: &mut Criterion) {
+    let mut group = c.benchmark_group("concurrent_publish_independent_streams");
+    group.sample_size(10);
+    group.warm_up_time(Duration::from_secs(1));
+    group.measurement_time(Duration::from_secs(2));
+
+    for &worker_count in CONCURRENT_WORKER_COUNTS {
+        let message_count = worker_count as u64 * CONCURRENT_MESSAGES_PER_WORKER;
+        group.throughput(Throughput::ElementsAndBytes {
+            elements: message_count,
+            bytes: message_count * PAYLOAD.len() as u64,
+        });
+        group.bench_with_input(
+            BenchmarkId::from_parameter(format!(
+                "{worker_count}_workers_{CONCURRENT_MESSAGES_PER_WORKER}_messages_each"
+            )),
+            &worker_count,
+            |benchmark, &worker_count| {
+                benchmark.iter_batched(
+                    || {
+                        let directory = TempDir::new().unwrap();
+                        let broker =
+                            Broker::open(directory.path(), BrokerConfig::default()).unwrap();
+                        for worker_index in 0..worker_count {
+                            broker
+                                .create_stream(&format!("bench-{worker_index}"))
+                                .unwrap();
+                        }
+                        (directory, broker)
+                    },
+                    |(_directory, broker)| {
+                        let start = Arc::new(Barrier::new(worker_count));
+                        thread::scope(|scope| {
+                            for worker_index in 0..worker_count {
+                                let broker = broker.clone();
+                                let start = Arc::clone(&start);
+                                scope.spawn(move || {
+                                    start.wait();
+                                    let stream = format!("bench-{worker_index}");
+                                    for _ in 0..CONCURRENT_MESSAGES_PER_WORKER {
+                                        black_box(
+                                            broker
+                                                .publish(&stream, None, PAYLOAD.to_vec())
+                                                .unwrap(),
+                                        );
+                                    }
+                                });
+                            }
+                        });
+                    },
+                    BatchSize::PerIteration,
+                );
+            },
+        );
+    }
+
+    group.finish();
+}
+
 fn reopen_recovery_retained_messages(c: &mut Criterion) {
     let mut group = c.benchmark_group("streaming_recovery_retained_messages");
     group.sample_size(10);
@@ -298,6 +357,7 @@ criterion_group!(
     shared_consumer_poll_ack,
     shared_consumer_keyed_poll_ack,
     concurrent_publish_same_stream,
+    concurrent_publish_independent_streams,
     reopen_recovery_retained_messages,
 );
 criterion_main!(benches);

@@ -2,7 +2,8 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 #[cfg(feature = "instrumentation")]
@@ -53,34 +54,33 @@ impl Default for BrokerConfig {
 
 #[derive(Clone)]
 pub struct Broker {
-    inner: Arc<Mutex<BrokerState>>,
+    inner: Arc<BrokerState>,
 }
 
 struct BrokerState {
     root: PathBuf,
     durable_format: DurableFormat,
-    streams: HashMap<String, StreamLog>,
-    // Entries are retained only while a consumer has active deliveries; the file remains the
-    // durable source of truth across restart and cache eviction.
-    consumer_states: HashMap<ConsumerKey, ConsumerState>,
-    in_flight: HashMap<DeliveryKey, InFlight>,
+    streams: RwLock<HashMap<String, Arc<Mutex<StreamState>>>>,
     ack_timeout: Duration,
     max_delivery_attempts: Option<u32>,
-    redeliveries: u64,
-    dead_letters: u64,
+    redeliveries: AtomicU64,
+    dead_letters: AtomicU64,
     delivery_epoch: u128,
-    next_delivery_id: u64,
+    next_delivery_id: AtomicU64,
 }
 
-#[derive(Debug, Clone, Hash, PartialEq, Eq)]
-struct ConsumerKey {
-    stream: String,
-    consumer: String,
+struct StreamState {
+    log: StreamLog,
+    // Consumer state and in-flight deliveries are owned by the stream so independent streams
+    // do not contend on a process-wide broker lock. The durable checkpoint remains the source
+    // of truth across restart and cache eviction.
+    consumer_states: HashMap<String, ConsumerState>,
+    in_flight: HashMap<DeliveryKey, InFlight>,
 }
 
 #[derive(Debug, Clone, Hash, PartialEq, Eq)]
 struct DeliveryKey {
-    consumer: ConsumerKey,
+    consumer: String,
     offset: Offset,
 }
 
@@ -101,6 +101,16 @@ struct StreamLog {
     // bounded while older replay requests fall back to a streaming scan.
     records: VecDeque<RecordIndex>,
     next_offset: Offset,
+}
+
+impl StreamState {
+    fn new(log: StreamLog) -> Self {
+        Self {
+            log,
+            consumer_states: HashMap::new(),
+            in_flight: HashMap::new(),
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -172,23 +182,21 @@ impl Broker {
             };
             validate_name("stream", name)?;
             let log = StreamLog::open(&path, durable_format)?;
-            streams.insert(name.to_owned(), log);
+            streams.insert(name.to_owned(), Arc::new(Mutex::new(StreamState::new(log))));
         }
 
         Ok(Self {
-            inner: Arc::new(Mutex::new(BrokerState {
+            inner: Arc::new(BrokerState {
                 root,
                 durable_format,
-                streams,
-                consumer_states: HashMap::new(),
-                in_flight: HashMap::new(),
+                streams: RwLock::new(streams),
                 ack_timeout: config.ack_timeout,
                 max_delivery_attempts: config.max_delivery_attempts,
-                redeliveries: 0,
-                dead_letters: 0,
+                redeliveries: AtomicU64::new(0),
+                dead_letters: AtomicU64::new(0),
                 delivery_epoch: delivery_epoch(),
-                next_delivery_id: 0,
-            })),
+                next_delivery_id: AtomicU64::new(0),
+            }),
         })
     }
 
@@ -196,14 +204,21 @@ impl Broker {
         #[cfg(feature = "instrumentation")]
         let _stage_timer = StageTimer::new("core.create_stream");
         validate_name("stream", stream)?;
-        let mut state = self.lock()?;
-        if state.streams.contains_key(stream) {
+        let mut streams = self
+            .inner
+            .streams
+            .write()
+            .map_err(|_| BrokerError::LockPoisoned)?;
+        if streams.contains_key(stream) {
             return Ok(false);
         }
 
-        let path = stream_path(&state.root, stream);
-        let log = StreamLog::create(&path, state.durable_format)?;
-        state.streams.insert(stream.to_owned(), log);
+        let path = stream_path(&self.inner.root, stream);
+        let log = StreamLog::create(&path, self.inner.durable_format)?;
+        streams.insert(
+            stream.to_owned(),
+            Arc::new(Mutex::new(StreamState::new(log))),
+        );
         Ok(true)
     }
 
@@ -216,18 +231,9 @@ impl Broker {
         #[cfg(feature = "instrumentation")]
         let _stage_timer = StageTimer::new("core.publish");
         validate_name("stream", stream)?;
-        let mut state = self.lock()?;
-        if !state.streams.contains_key(stream) {
-            let path = stream_path(&state.root, stream);
-            let log = StreamLog::create(&path, state.durable_format)?;
-            state.streams.insert(stream.to_owned(), log);
-        }
-
-        let stream_log = state
-            .streams
-            .get_mut(stream)
-            .ok_or_else(|| BrokerError::StreamNotFound(stream.to_owned()))?;
-        stream_log.append(key, payload)
+        let stream_state = self.get_or_create_stream(stream)?;
+        let mut stream_state = self.lock_stream(&stream_state)?;
+        stream_state.log.append(key, payload)
     }
 
     pub fn poll(&self, stream: &str, consumer: &str) -> Result<PollResult, BrokerError> {
@@ -245,69 +251,59 @@ impl Broker {
         validate_name("stream", stream)?;
         validate_name("consumer", consumer)?;
         validate_name("member", member)?;
-        let mut state = self.lock()?;
-        let consumer_key = ConsumerKey {
-            stream: stream.to_owned(),
-            consumer: consumer.to_owned(),
-        };
-        let root = state.root.clone();
+        let stream_state = self.get_stream(stream)?;
+        let mut stream_state = self.lock_stream(&stream_state)?;
+        let root = self.inner.root.clone();
         let now = Instant::now();
-        state
+        stream_state
             .in_flight
             .retain(|_, in_flight| in_flight.deadline > now);
-        if !state.consumer_states.is_empty() {
-            let active_consumers: HashSet<_> = state
+        if !stream_state.consumer_states.is_empty() {
+            let active_consumers: HashSet<_> = stream_state
                 .in_flight
                 .keys()
                 .map(|delivery_key| delivery_key.consumer.clone())
                 .collect();
-            state
+            stream_state
                 .consumer_states
-                .retain(|consumer_key, _| active_consumers.contains(consumer_key));
+                .retain(|consumer, _| active_consumers.contains(consumer));
         }
 
-        let existing = state
+        let existing = stream_state
             .in_flight
             .iter()
             .find(|(delivery_key, in_flight)| {
-                delivery_key.consumer == consumer_key && in_flight.member == member
+                delivery_key.consumer == consumer && in_flight.member == member
             })
             .map(|(delivery_key, in_flight)| (delivery_key.clone(), in_flight.clone()));
         if let Some(in_flight) = existing {
-            let stream_log = state
-                .streams
-                .get_mut(stream)
-                .ok_or_else(|| BrokerError::StreamNotFound(stream.to_owned()))?;
-            let mut message = stream_log.read_message(stream, in_flight.1.offset)?;
+            let mut message = stream_state.log.read_message(stream, in_flight.1.offset)?;
             message.delivery_token = Some(in_flight.1.delivery_token);
             message.delivery_attempt = Some(in_flight.1.delivery_attempt);
             return Ok(PollResult::Message(message));
         }
 
-        let mut consumer_state = load_consumer_state_for_request(&mut state, &consumer_key)?;
+        let mut consumer_state =
+            load_consumer_state_for_request(&mut stream_state, &root, stream, consumer)?;
         loop {
-            let in_flight_offsets: HashSet<_> = state
+            let in_flight_offsets: HashSet<_> = stream_state
                 .in_flight
                 .keys()
-                .filter(|delivery_key| delivery_key.consumer == consumer_key)
+                .filter(|delivery_key| delivery_key.consumer == consumer)
                 .map(|delivery_key| delivery_key.offset)
                 .collect();
-            let in_flight_keys: HashSet<_> = state
+            let in_flight_keys: HashSet<_> = stream_state
                 .in_flight
                 .iter()
-                .filter(|(delivery_key, _)| delivery_key.consumer == consumer_key)
+                .filter(|(delivery_key, _)| delivery_key.consumer == consumer)
                 .filter_map(|(_, in_flight)| in_flight.key.clone())
                 .collect();
-            let candidate = state
-                .streams
-                .get_mut(stream)
-                .ok_or_else(|| BrokerError::StreamNotFound(stream.to_owned()))?
-                .find_candidate(
-                    consumer_state.committed_offset,
-                    &consumer_state.acknowledged_offsets,
-                    &in_flight_offsets,
-                    &in_flight_keys,
-                )?;
+            let candidate = stream_state.log.find_candidate(
+                consumer_state.committed_offset,
+                &consumer_state.acknowledged_offsets,
+                &in_flight_offsets,
+                &in_flight_keys,
+            )?;
             let Some(candidate) = candidate else {
                 return Ok(PollResult::Empty);
             };
@@ -317,45 +313,42 @@ impl Broker {
                 .get(&candidate.offset)
                 .copied()
                 .unwrap_or(0);
-            if state
+            if self
+                .inner
                 .max_delivery_attempts
                 .is_some_and(|max_attempts| attempts >= max_attempts)
                 && !stream.ends_with(DEAD_LETTER_SUFFIX)
             {
-                dead_letter_record(&mut state, stream, &candidate)?;
+                self.dead_letter_record(&mut stream_state, stream, &candidate)?;
                 consumer_state.acknowledge(candidate.offset);
                 persist_consumer_state(&root, &consumer_state)?;
-                state
+                stream_state
                     .consumer_states
-                    .insert(consumer_key.clone(), consumer_state.clone());
-                state.dead_letters += 1;
+                    .insert(consumer.to_owned(), consumer_state.clone());
+                self.inner.dead_letters.fetch_add(1, Ordering::Relaxed);
                 continue;
             }
 
             let delivery_attempt = attempts.saturating_add(1);
-            let stream_log = state
-                .streams
-                .get_mut(stream)
-                .ok_or_else(|| BrokerError::StreamNotFound(stream.to_owned()))?;
-            let mut message = stream_log.read_message(stream, candidate.offset)?;
+            let mut message = stream_state.log.read_message(stream, candidate.offset)?;
             let mut next_state = consumer_state;
             next_state
                 .delivery_attempts
                 .insert(candidate.offset, delivery_attempt);
             persist_consumer_state(&root, &next_state)?;
-            state
+            stream_state
                 .consumer_states
-                .insert(consumer_key.clone(), next_state);
-            let delivery_token = next_delivery_token(&mut state);
+                .insert(consumer.to_owned(), next_state);
+            let delivery_token = self.next_delivery_token();
             message.delivery_token = Some(delivery_token.clone());
             message.delivery_attempt = Some(delivery_attempt);
             if delivery_attempt > 1 {
-                state.redeliveries += 1;
+                self.inner.redeliveries.fetch_add(1, Ordering::Relaxed);
             }
-            let ack_timeout = state.ack_timeout;
-            state.in_flight.insert(
+            let ack_timeout = self.inner.ack_timeout;
+            stream_state.in_flight.insert(
                 DeliveryKey {
-                    consumer: consumer_key,
+                    consumer: consumer.to_owned(),
                     offset: candidate.offset,
                 },
                 InFlight {
@@ -393,17 +386,11 @@ impl Broker {
         validate_name("stream", stream)?;
         validate_name("consumer", consumer)?;
         validate_name("member", member)?;
-        let mut state = self.lock()?;
-        if !state.streams.contains_key(stream) {
-            return Err(BrokerError::StreamNotFound(stream.to_owned()));
-        }
-
-        let root = state.root.clone();
-        let consumer_key = ConsumerKey {
-            stream: stream.to_owned(),
-            consumer: consumer.to_owned(),
-        };
-        let consumer_state = load_consumer_state_for_request(&mut state, &consumer_key)?;
+        let stream_state = self.get_stream(stream)?;
+        let mut stream_state = self.lock_stream(&stream_state)?;
+        let root = self.inner.root.clone();
+        let consumer_state =
+            load_consumer_state_for_request(&mut stream_state, &root, stream, consumer)?;
         if offset < consumer_state.committed_offset {
             return Ok(AckResult::AlreadyAcknowledged);
         }
@@ -411,10 +398,10 @@ impl Broker {
             return Ok(AckResult::AlreadyAcknowledged);
         }
         let delivery_key = DeliveryKey {
-            consumer: consumer_key.clone(),
+            consumer: consumer.to_owned(),
             offset,
         };
-        let Some(in_flight) = state.in_flight.get(&delivery_key) else {
+        let Some(in_flight) = stream_state.in_flight.get(&delivery_key) else {
             if !delivery_token.is_empty() {
                 return Err(BrokerError::StaleDelivery {
                     consumer: consumer.to_owned(),
@@ -443,16 +430,16 @@ impl Broker {
             ..next_state
         };
         persist_consumer_state(&root, &next_state)?;
-        state
+        stream_state
             .consumer_states
-            .insert(consumer_key.clone(), next_state);
-        state.in_flight.remove(&delivery_key);
-        if !state
+            .insert(consumer.to_owned(), next_state);
+        stream_state.in_flight.remove(&delivery_key);
+        if !stream_state
             .in_flight
             .keys()
-            .any(|remaining| remaining.consumer == consumer_key)
+            .any(|remaining| remaining.consumer == consumer)
         {
-            state.consumer_states.remove(&consumer_key);
+            stream_state.consumer_states.remove(consumer);
         }
         Ok(AckResult::Acknowledged)
     }
@@ -460,23 +447,96 @@ impl Broker {
     pub fn health(&self) -> Result<HealthSnapshot, BrokerError> {
         #[cfg(feature = "instrumentation")]
         let _stage_timer = StageTimer::new("core.health");
-        let state = self.lock()?;
+        let streams = self
+            .inner
+            .streams
+            .read()
+            .map_err(|_| BrokerError::LockPoisoned)?
+            .values()
+            .cloned()
+            .collect::<Vec<_>>();
         let mut storage_bytes = 0;
-        for stream in state.streams.values() {
-            storage_bytes += stream.file.metadata()?.len();
+        for stream in &streams {
+            let stream = self.lock_stream(stream)?;
+            storage_bytes += stream.log.file.metadata()?.len();
         }
         Ok(HealthSnapshot {
-            streams: state.streams.len(),
+            streams: streams.len(),
             storage_bytes,
-            redeliveries: state.redeliveries,
-            dead_letters: state.dead_letters,
+            redeliveries: self.inner.redeliveries.load(Ordering::Relaxed),
+            dead_letters: self.inner.dead_letters.load(Ordering::Relaxed),
         })
     }
 
-    fn lock(&self) -> Result<std::sync::MutexGuard<'_, BrokerState>, BrokerError> {
+    fn get_stream(&self, stream: &str) -> Result<Arc<Mutex<StreamState>>, BrokerError> {
+        let streams = self
+            .inner
+            .streams
+            .read()
+            .map_err(|_| BrokerError::LockPoisoned)?;
+        streams
+            .get(stream)
+            .cloned()
+            .ok_or_else(|| BrokerError::StreamNotFound(stream.to_owned()))
+    }
+
+    fn get_or_create_stream(&self, stream: &str) -> Result<Arc<Mutex<StreamState>>, BrokerError> {
+        {
+            let streams = self
+                .inner
+                .streams
+                .read()
+                .map_err(|_| BrokerError::LockPoisoned)?;
+            if let Some(stream_state) = streams.get(stream) {
+                return Ok(Arc::clone(stream_state));
+            }
+        }
+
+        let mut streams = self
+            .inner
+            .streams
+            .write()
+            .map_err(|_| BrokerError::LockPoisoned)?;
+        if let Some(stream_state) = streams.get(stream) {
+            return Ok(Arc::clone(stream_state));
+        }
+        let path = stream_path(&self.inner.root, stream);
+        let log = StreamLog::create(&path, self.inner.durable_format)?;
+        let stream_state = Arc::new(Mutex::new(StreamState::new(log)));
+        streams.insert(stream.to_owned(), Arc::clone(&stream_state));
+        Ok(stream_state)
+    }
+
+    fn lock_stream<'a>(
+        &self,
+        stream: &'a Arc<Mutex<StreamState>>,
+    ) -> Result<std::sync::MutexGuard<'a, StreamState>, BrokerError> {
         #[cfg(feature = "instrumentation")]
-        let _stage_timer = StageTimer::new("core.lock_wait");
-        self.inner.lock().map_err(|_| BrokerError::LockPoisoned)
+        let _stage_timer = StageTimer::new("core.stream_lock_wait");
+        stream.lock().map_err(|_| BrokerError::LockPoisoned)
+    }
+
+    fn dead_letter_record(
+        &self,
+        source: &mut StreamState,
+        stream: &str,
+        record: &RecordIndex,
+    ) -> Result<(), BrokerError> {
+        let dead_letter_stream = dead_letter_stream_name(stream)?;
+        let message = source.log.read_message(stream, record.offset)?;
+        let target = self.get_or_create_stream(&dead_letter_stream)?;
+        let mut target = self.lock_stream(&target)?;
+        target.log.append(message.key, message.payload)?;
+        Ok(())
+    }
+
+    fn next_delivery_token(&self) -> String {
+        let next_id = self
+            .inner
+            .next_delivery_id
+            .fetch_add(1, Ordering::Relaxed)
+            .wrapping_add(1);
+        format!("{:x}-{:x}", self.inner.delivery_epoch, next_id)
     }
 }
 
@@ -1026,36 +1086,6 @@ fn record_is_candidate(
         .is_none_or(|key| !in_flight_keys.contains(key))
 }
 
-fn dead_letter_record(
-    state: &mut BrokerState,
-    stream: &str,
-    record: &RecordIndex,
-) -> Result<(), BrokerError> {
-    let dead_letter_stream = dead_letter_stream_name(stream)?;
-    let message = state
-        .streams
-        .get_mut(stream)
-        .ok_or_else(|| BrokerError::StreamNotFound(stream.to_owned()))?
-        .read_message(stream, record.offset)?;
-
-    if !state.streams.contains_key(&dead_letter_stream) {
-        let path = stream_path(&state.root, &dead_letter_stream);
-        let durable_format = state
-            .streams
-            .get(stream)
-            .map(|stream_log| stream_log.durable_format)
-            .unwrap_or(state.durable_format);
-        let log = StreamLog::create(&path, durable_format)?;
-        state.streams.insert(dead_letter_stream.clone(), log);
-    }
-    state
-        .streams
-        .get_mut(&dead_letter_stream)
-        .ok_or_else(|| BrokerError::StreamNotFound(dead_letter_stream.clone()))?
-        .append(message.key, message.payload)?;
-    Ok(())
-}
-
 fn stream_path(root: &Path, stream: &str) -> PathBuf {
     root.join("streams").join(format!("{stream}.log"))
 }
@@ -1101,18 +1131,16 @@ fn load_consumer_state(
 }
 
 fn load_consumer_state_for_request(
-    broker_state: &mut BrokerState,
-    consumer_key: &ConsumerKey,
+    stream_state: &mut StreamState,
+    root: &Path,
+    stream: &str,
+    consumer: &str,
 ) -> Result<ConsumerState, BrokerError> {
-    if let Some(cached) = broker_state.consumer_states.get(consumer_key) {
+    if let Some(cached) = stream_state.consumer_states.get(consumer) {
         return Ok(cached.clone());
     }
 
-    load_consumer_state(
-        &broker_state.root,
-        &consumer_key.stream,
-        &consumer_key.consumer,
-    )
+    load_consumer_state(root, stream, consumer)
 }
 
 fn persist_consumer_state(root: &Path, state: &ConsumerState) -> Result<(), BrokerError> {
@@ -1167,14 +1195,11 @@ fn delivery_epoch() -> u128 {
         .as_nanos()
 }
 
-fn next_delivery_token(state: &mut BrokerState) -> String {
-    state.next_delivery_id = state.next_delivery_id.wrapping_add(1);
-    format!("{:x}-{:x}", state.delivery_epoch, state.next_delivery_id)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::{Arc, Barrier};
+    use std::thread;
     use tempfile::tempdir;
 
     #[test]
@@ -1212,6 +1237,60 @@ mod tests {
             second,
             PollResult::Message(Message { offset: 0, .. })
         ));
+    }
+
+    #[test]
+    fn independent_streams_publish_concurrently_and_recover() {
+        const STREAM_COUNT: usize = 4;
+        const MESSAGES_PER_STREAM: usize = 32;
+
+        let directory = tempdir().unwrap();
+        let broker = Broker::open(directory.path(), BrokerConfig::default()).unwrap();
+        let start = Arc::new(Barrier::new(STREAM_COUNT));
+
+        thread::scope(|scope| {
+            for stream_index in 0..STREAM_COUNT {
+                let broker = broker.clone();
+                let start = Arc::clone(&start);
+                scope.spawn(move || {
+                    let stream = format!("stream-{stream_index}");
+                    start.wait();
+                    for message_index in 0..MESSAGES_PER_STREAM {
+                        let offset = broker
+                            .publish(
+                                &stream,
+                                Some(format!("key-{stream_index}")),
+                                format!("payload-{message_index}").into_bytes(),
+                            )
+                            .unwrap();
+                        assert_eq!(offset, message_index as Offset);
+                    }
+                });
+            }
+        });
+
+        drop(broker);
+        let broker = Broker::open(directory.path(), BrokerConfig::default()).unwrap();
+        assert_eq!(broker.health().unwrap().streams, STREAM_COUNT);
+        for stream_index in 0..STREAM_COUNT {
+            let stream = format!("stream-{stream_index}");
+            for message_index in 0..MESSAGES_PER_STREAM {
+                let message = match broker.poll(&stream, "replayer").unwrap() {
+                    PollResult::Message(message) => message,
+                    PollResult::Empty => panic!("expected message {message_index} in {stream}"),
+                };
+                assert_eq!(message.offset, message_index as Offset);
+                assert_eq!(
+                    message.payload,
+                    format!("payload-{message_index}").as_bytes()
+                );
+                assert_eq!(
+                    broker.ack(&stream, "replayer", message.offset).unwrap(),
+                    AckResult::Acknowledged
+                );
+            }
+            assert_eq!(broker.poll(&stream, "replayer").unwrap(), PollResult::Empty);
+        }
     }
 
     #[test]
@@ -1449,8 +1528,11 @@ mod tests {
                 );
             }
 
-            let state = broker.inner.lock().unwrap();
-            let log = state.streams.get("events").unwrap();
+            let streams = broker.inner.streams.read().unwrap();
+            let stream = streams.get("events").unwrap().clone();
+            drop(streams);
+            let stream = stream.lock().unwrap();
+            let log = &stream.log;
             assert_eq!(log.records.len(), MAX_IN_MEMORY_RECORDS);
             assert_eq!(log.records.front().unwrap().offset, 8);
             assert_eq!(log.next_offset, retained_message_count);
