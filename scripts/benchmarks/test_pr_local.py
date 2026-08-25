@@ -11,9 +11,11 @@ sys.path.insert(0, str(SCRIPT_DIR))
 from pr_local import (  # noqa: E402
     BenchmarkOptions,
     BenchmarkTarget,
+    LocalBenchmarkError,
     assess_stability,
     benchmark_command,
     reportable_result,
+    require_stable,
     stamp_resource_limits,
 )
 
@@ -129,6 +131,13 @@ class PrLocalTests(unittest.TestCase):
         stability = assess_stability(result, result, self.options(), 7)
 
         self.assertEqual(stability["status"], "inconclusive")
+
+    def test_authoritative_run_rejects_inconclusive_result(self) -> None:
+        with self.assertRaisesRegex(LocalBenchmarkError, "stable repeated measurements are required"):
+            require_stable({"status": "inconclusive"}, allow_inconclusive=False)
+
+    def test_diagnostic_override_allows_non_stable_result(self) -> None:
+        require_stable({"status": "inconclusive"}, allow_inconclusive=True)
 
     def test_stamps_resource_limits_for_an_older_base_result(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

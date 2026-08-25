@@ -1,6 +1,6 @@
 # ADR 0017: Separate optimization and competitor benchmark cadences
 
-- Status: accepted
+- Status: accepted; pull-request acceptance criterion superseded by [ADR 0020](0020-stable-optimization-evidence.md)
 - Date: 2026-08-24
 
 ## Decision

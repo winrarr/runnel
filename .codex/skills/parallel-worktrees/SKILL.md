@@ -55,12 +55,14 @@ For any worker task that can affect throughput, latency, CPU, memory, batching,
 I/O, or scheduling, the worker must run the canonical local benchmark before
 claiming an improvement. Use `just bench-pr-local` after committing: it applies
 the same explicit CPU and memory limits to the current and baseline revisions,
-repeats paired runs until its stability thresholds are met or reports
-inconclusive at the maximum, and records the workload and provenance. A
-one-pair command such as `just bench-pr-local-quick` is a diagnostic only.
-Never treat a hosted PR benchmark or concurrent worker measurements as proof of
-a performance change. If the result is inconclusive, report that status and
-investigate or rerun rather than selecting a favorable sample.
+repeats paired runs until its stability thresholds are met, records the
+workload and provenance, and exits nonzero if the maximum is reached without
+stable measurements. A one-pair command such as `just bench-pr-local-quick` is
+an explicit diagnostic only. Never treat a hosted PR benchmark or concurrent
+worker measurements as proof of a performance change. Do not claim or merge an
+optimization from an inconclusive authoritative result; investigate or rerun
+it under the same controlled conditions rather than selecting a favorable
+sample.
 
 ## Worker instructions
 
@@ -69,7 +71,7 @@ Tell each worker to:
 - stay inside its assigned worktree and write scope;
 - use the repository's canonical `just` commands and existing benchmark harnesses;
 - record the exact revision, workload, resource limits, isolation settings, and commands;
-- for performance-sensitive work, run the local benchmark sequentially with a fixed CPU/memory budget and record the actual repetition count, stability thresholds, and stable/inconclusive status;
+- for performance-sensitive work, run the local benchmark sequentially with a fixed CPU/memory budget and record the actual repetition count, stability thresholds, and stable status; treat an inconclusive authoritative run as unfinished evidence;
 - distinguish a confirmed improvement from noise, a blocked run, and an inconclusive result;
 - report changed files, correctness and crash-recovery considerations, test results, benchmark results, and remaining risks;
 - commit the result on its task branch when code is ready, or leave a clearly documented uncommitted patch when it is not.
