@@ -13,7 +13,7 @@ const CONCURRENT_MESSAGES_PER_WORKER: u64 = 64;
 const CONCURRENT_WORKER_COUNTS: &[usize] = &[1, 2, 4, 8];
 const PAYLOAD: &[u8] = &[b'x'; 100];
 const RECOVERY_PAYLOAD: &[u8] = &[b'r'; 100];
-const RECOVERY_RETAINED_MESSAGE_COUNTS: &[u64] = &[100, 1_000, 5_000];
+const RECOVERY_RETAINED_MESSAGE_COUNTS: &[u64] = &[100, 1_000, 5_000, 20_000];
 
 fn durable_publish(c: &mut Criterion) {
     let mut group = c.benchmark_group("durable_publish");
@@ -235,7 +235,7 @@ fn concurrent_publish_same_stream(c: &mut Criterion) {
 }
 
 fn reopen_recovery_retained_messages(c: &mut Criterion) {
-    let mut group = c.benchmark_group("reopen_recovery_retained_messages");
+    let mut group = c.benchmark_group("streaming_recovery_retained_messages");
     group.sample_size(10);
     group.warm_up_time(Duration::from_secs(1));
     group.measurement_time(Duration::from_secs(3));
@@ -258,7 +258,7 @@ fn reopen_recovery_retained_messages(c: &mut Criterion) {
         group.throughput(Throughput::Elements(retained_message_count));
         group.bench_function(
             BenchmarkId::new(
-                "sync_data_per_publish_100_byte_payload",
+                "streaming_scan_100_byte_payload",
                 format!("{retained_message_count}_retained_messages"),
             ),
             |benchmark| {
