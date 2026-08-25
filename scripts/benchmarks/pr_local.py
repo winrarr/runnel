@@ -275,6 +275,11 @@ def parse_args() -> argparse.Namespace:
         help="exact runs per revision; diagnostic override that disables stability-based stopping",
     )
     parser.add_argument(
+        "--allow-inconclusive",
+        action="store_true",
+        help="allow a non-stable result for diagnostics; never use it as optimization evidence",
+    )
+    parser.add_argument(
         "--min-repetitions",
         type=int,
         default=DEFAULT_MIN_REPETITIONS,
@@ -414,6 +419,20 @@ def assess_stability(
     }
 
 
+def require_stable(stability: dict[str, object], *, allow_inconclusive: bool) -> None:
+    """Reject non-authoritative results unless the caller explicitly requests diagnostics."""
+    if allow_inconclusive or stability.get("status") == "stable":
+        return
+
+    status = stability.get("status", "unknown")
+    raise LocalBenchmarkError(
+        "authoritative benchmark finished with "
+        f"{status}; stable repeated measurements are required. "
+        "Rerun under the same controlled conditions or use --allow-inconclusive "
+        "only for a diagnostic run."
+    )
+
+
 def main() -> int:
     args = parse_args()
     try:
@@ -492,6 +511,7 @@ def main() -> int:
         print(f"Artifacts: {run_dir}")
         print(f"Current revision: {current_revision[:12]}")
         print(f"Base revision: {base_revision[:12]} ({args.base_ref})")
+        require_stable(stability, allow_inconclusive=args.allow_inconclusive)
         return 0
     except (LocalBenchmarkError, ResourceScopeError, OSError, subprocess.CalledProcessError) as error:
         raise SystemExit(f"pr_local.py: error: {error}") from error

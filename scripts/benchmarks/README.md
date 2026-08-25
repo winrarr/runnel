@@ -150,7 +150,9 @@ The dashboard uses the dedicated Runnel suite as the primary optimization histor
 
 ## Local performance evidence
 
-For a performance-sensitive change, use the same-host comparison helper:
+Evaluate benchmark requirements case by case. For a change intended to improve
+throughput, latency, or tail latency—or one that changes a hot path with a
+plausible runtime effect—use the same-host comparison helper:
 
 ```text
 just bench-pr-local
@@ -165,8 +167,10 @@ throughput range is at most 10% and every p99 range is at most 20%. It
 aggregates medians and writes a report plus raw JSON and logs under
 `benchmark-results/pr-local/<run>/`. The report includes revisions, workload,
 limits, stability status, throughput, latency, CPU, memory, and relative
-deltas. Paste it into the PR description when the change can affect
-performance.
+deltas. The authoritative command exits nonzero after writing those artifacts
+unless the result is stable. Rerun or investigate an inconclusive result
+before claiming or accepting an optimization, and paste the stable report into
+the PR description.
 
 The scope is deliberately shared by the client and all three broker nodes, so
 the two revisions receive the same total budget while retaining native process
@@ -174,12 +178,13 @@ and network behavior. Pass `--cpus` and `--memory` after `--` to run a
 different explicitly recorded budget. Pass workload or stability flags after
 `--` when a controlled experiment needs them.
 
-`just bench-pr-local-quick` (or `just bench-pr-local -- --repetitions 1`)
-performs one pair for a fast diagnostic. It is useful for checking that a
-workload starts or for rough profiling, but it is not performance evidence.
-If the normal helper reaches its maximum without meeting the stability
-thresholds, keep the report and mark the result inconclusive rather than
-choosing a favorable run.
+`just bench-pr-local-quick` performs one pair with an explicit
+`--allow-inconclusive` override for a fast diagnostic. A direct fixed-
+repetition invocation must pass the same override. These runs are useful for
+checking that a workload starts or for rough profiling, but they are not
+performance evidence. If the normal helper reaches its maximum without
+meeting the stability thresholds, keep the report for diagnosis and rerun or
+investigate the environment; do not choose a favorable run.
 
 For repeated measurements, normalize each independent result and aggregate the
 normalized files with the median as the displayed value:
