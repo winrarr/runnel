@@ -10,13 +10,31 @@ use runnel_engine::StageTimer;
 use runnel_engine::{Engine, EngineFuture};
 use serde::{Deserialize, Serialize};
 
-const MAGIC: &[u8; 4] = b"RNL1";
-const HEADER_LEN: usize = 28;
+const LEGACY_MAGIC: &[u8; 4] = b"RNL1";
+const VERSIONED_MAGIC: &[u8; 4] = b"RNL2";
+const LEGACY_HEADER_LEN: usize = 28;
+const VERSIONED_HEADER_LEN: usize = 44;
+const VERSIONED_FORMAT_VERSION: u8 = 1;
+const VERSIONED_ENCODING_BYTES: u8 = 0;
+const VERSIONED_COMPRESSION_NONE: u8 = 0;
+const VERSIONED_MAX_KEY_LEN: u32 = 128;
+const VERSIONED_MAX_BODY_LEN: u32 = 64 * 1024 * 1024;
 const MAX_IN_MEMORY_RECORDS: usize = 1024;
 const DEFAULT_ACK_TIMEOUT: Duration = Duration::from_secs(30);
 const DEAD_LETTER_SUFFIX: &str = ".dead-letter";
 
 pub use runnel_engine::{AckResult, BrokerError, HealthSnapshot, Message, Offset, PollResult};
+
+/// Selects the durable record format used for new appends.
+///
+/// Readers accept both the legacy `RNL1` format and versioned `RNL2` frames.
+/// The versioned format is deliberately opt-in until its compatibility policy
+/// is accepted for normal broker deployments.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DurableFormat {
+    Rnl1,
+    VersionedV1,
+}
 
 #[derive(Debug, Clone)]
 pub struct BrokerConfig {
@@ -40,6 +58,7 @@ pub struct Broker {
 
 struct BrokerState {
     root: PathBuf,
+    durable_format: DurableFormat,
     streams: HashMap<String, StreamLog>,
     // Entries are retained only while a consumer has active deliveries; the file remains the
     // durable source of truth across restart and cache eviction.
@@ -77,6 +96,7 @@ struct InFlight {
 
 struct StreamLog {
     file: File,
+    durable_format: DurableFormat,
     // The durable log retains the complete history; this tail cache keeps normal delivery
     // bounded while older replay requests fall back to a streaming scan.
     records: VecDeque<RecordIndex>,
@@ -120,6 +140,14 @@ impl ConsumerState {
 
 impl Broker {
     pub fn open(root: impl AsRef<Path>, config: BrokerConfig) -> Result<Self, BrokerError> {
+        Self::open_with_format(root, config, DurableFormat::Rnl1)
+    }
+
+    pub fn open_with_format(
+        root: impl AsRef<Path>,
+        config: BrokerConfig,
+        durable_format: DurableFormat,
+    ) -> Result<Self, BrokerError> {
         if config.max_delivery_attempts == Some(0) {
             return Err(BrokerError::Configuration(
                 "max delivery attempts must be greater than zero".to_owned(),
@@ -143,13 +171,14 @@ impl Broker {
                 continue;
             };
             validate_name("stream", name)?;
-            let log = StreamLog::open(&path)?;
+            let log = StreamLog::open(&path, durable_format)?;
             streams.insert(name.to_owned(), log);
         }
 
         Ok(Self {
             inner: Arc::new(Mutex::new(BrokerState {
                 root,
+                durable_format,
                 streams,
                 consumer_states: HashMap::new(),
                 in_flight: HashMap::new(),
@@ -173,7 +202,7 @@ impl Broker {
         }
 
         let path = stream_path(&state.root, stream);
-        let log = StreamLog::create(&path)?;
+        let log = StreamLog::create(&path, state.durable_format)?;
         state.streams.insert(stream.to_owned(), log);
         Ok(true)
     }
@@ -190,7 +219,7 @@ impl Broker {
         let mut state = self.lock()?;
         if !state.streams.contains_key(stream) {
             let path = stream_path(&state.root, stream);
-            let log = StreamLog::create(&path)?;
+            let log = StreamLog::create(&path, state.durable_format)?;
             state.streams.insert(stream.to_owned(), log);
         }
 
@@ -507,7 +536,7 @@ impl Engine for Broker {
 }
 
 impl StreamLog {
-    fn create(path: &Path) -> Result<Self, BrokerError> {
+    fn create(path: &Path, durable_format: DurableFormat) -> Result<Self, BrokerError> {
         let file = OpenOptions::new()
             .create_new(true)
             .read(true)
@@ -515,12 +544,13 @@ impl StreamLog {
             .open(path)?;
         Ok(Self {
             file,
+            durable_format,
             records: VecDeque::with_capacity(MAX_IN_MEMORY_RECORDS),
             next_offset: 0,
         })
     }
 
-    fn open(path: &Path) -> Result<Self, BrokerError> {
+    fn open(path: &Path, durable_format: DurableFormat) -> Result<Self, BrokerError> {
         let mut file = OpenOptions::new().read(true).append(true).open(path)?;
         let file_len = file.metadata()?.len();
         let mut records = VecDeque::with_capacity(MAX_IN_MEMORY_RECORDS);
@@ -538,6 +568,7 @@ impl StreamLog {
         file.seek(SeekFrom::End(0))?;
         Ok(Self {
             file,
+            durable_format,
             records,
             next_offset,
         })
@@ -546,6 +577,10 @@ impl StreamLog {
     fn append(&mut self, key: Option<String>, payload: Vec<u8>) -> Result<Offset, BrokerError> {
         #[cfg(feature = "instrumentation")]
         let _stage_timer = StageTimer::new("core.storage_append");
+        if self.durable_format == DurableFormat::VersionedV1 {
+            return self.append_versioned(key, payload);
+        }
+
         let key_bytes = key.as_deref().unwrap_or_default().as_bytes();
         let key_len = u32::try_from(key_bytes.len()).map_err(|_| {
             BrokerError::Io(io::Error::new(
@@ -562,8 +597,8 @@ impl StreamLog {
         let offset = self.next_offset;
         let published_at_ms = now_ms();
 
-        let mut header = Vec::with_capacity(HEADER_LEN);
-        header.extend_from_slice(MAGIC);
+        let mut header = Vec::with_capacity(LEGACY_HEADER_LEN);
+        header.extend_from_slice(LEGACY_MAGIC);
         header.extend_from_slice(&offset.to_le_bytes());
         header.extend_from_slice(&published_at_ms.to_le_bytes());
         header.extend_from_slice(&key_len.to_le_bytes());
@@ -581,6 +616,73 @@ impl StreamLog {
                 offset,
                 payload_offset,
                 payload_len,
+                key,
+                published_at_ms,
+            },
+        );
+        self.next_offset = offset.saturating_add(1);
+        Ok(offset)
+    }
+
+    fn append_versioned(
+        &mut self,
+        key: Option<String>,
+        payload: Vec<u8>,
+    ) -> Result<Offset, BrokerError> {
+        let key_bytes = key.as_deref().unwrap_or_default().as_bytes();
+        let key_len = u32::try_from(key_bytes.len()).map_err(|_| {
+            BrokerError::Io(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "message key exceeds u32 length",
+            ))
+        })?;
+        if key_len > VERSIONED_MAX_KEY_LEN {
+            return Err(BrokerError::Io(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "message key exceeds versioned storage limit",
+            )));
+        }
+        let body_len = u32::try_from(payload.len()).map_err(|_| {
+            BrokerError::Io(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "message payload exceeds u32 length",
+            ))
+        })?;
+        if body_len > VERSIONED_MAX_BODY_LEN {
+            return Err(BrokerError::Io(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "message payload exceeds versioned storage limit",
+            )));
+        }
+
+        let offset = self.next_offset;
+        let published_at_ms = now_ms();
+        let mut header = [0; VERSIONED_HEADER_LEN];
+        header[..4].copy_from_slice(VERSIONED_MAGIC);
+        header[4] = VERSIONED_FORMAT_VERSION;
+        header[6..8].copy_from_slice(&(VERSIONED_HEADER_LEN as u16).to_le_bytes());
+        header[8..12].copy_from_slice(&body_len.to_le_bytes());
+        header[12..16].copy_from_slice(&body_len.to_le_bytes());
+        header[16..24].copy_from_slice(&offset.to_le_bytes());
+        header[24..32].copy_from_slice(&published_at_ms.to_le_bytes());
+        header[32..36].copy_from_slice(&key_len.to_le_bytes());
+        header[36] = VERSIONED_ENCODING_BYTES;
+        header[37] = VERSIONED_COMPRESSION_NONE;
+        let checksum = versioned_checksum(&header, key_bytes, &payload);
+        header[40..44].copy_from_slice(&checksum.to_le_bytes());
+
+        self.file.write_all(&header)?;
+        self.file.write_all(key_bytes)?;
+        self.file.write_all(&payload)?;
+        self.file.sync_data()?;
+
+        let payload_offset = self.file.stream_position()? - payload.len() as u64;
+        remember_record(
+            &mut self.records,
+            RecordIndex {
+                offset,
+                payload_offset,
+                payload_len: body_len,
                 key,
                 published_at_ms,
             },
@@ -681,22 +783,41 @@ fn read_record(
     cursor: u64,
     file_len: u64,
 ) -> Result<Option<ParsedRecord>, BrokerError> {
-    if file_len.saturating_sub(cursor) < HEADER_LEN as u64 {
+    if file_len.saturating_sub(cursor) < 4 {
         return Ok(None);
     }
 
     file.seek(SeekFrom::Start(cursor))?;
-    let mut header = [0; HEADER_LEN];
-    file.read_exact(&mut header)?;
-    if &header[..4] != MAGIC {
+    let mut magic = [0; 4];
+    file.read_exact(&mut magic)?;
+    if &magic == VERSIONED_MAGIC {
+        return read_versioned_record(file, cursor, file_len);
+    }
+    if &magic != LEGACY_MAGIC {
+        return Err(invalid_record_data("unsupported record magic"));
+    }
+    read_legacy_record(file, cursor, file_len, magic)
+}
+
+fn read_legacy_record(
+    file: &mut File,
+    cursor: u64,
+    file_len: u64,
+    magic: [u8; 4],
+) -> Result<Option<ParsedRecord>, BrokerError> {
+    if file_len.saturating_sub(cursor) < LEGACY_HEADER_LEN as u64 {
         return Ok(None);
     }
+
+    let mut header = [0; LEGACY_HEADER_LEN];
+    header[..4].copy_from_slice(&magic);
+    file.read_exact(&mut header[4..])?;
 
     let offset = u64::from_le_bytes(header[4..12].try_into().unwrap());
     let published_at_ms = u64::from_le_bytes(header[12..20].try_into().unwrap());
     let key_len = u32::from_le_bytes(header[20..24].try_into().unwrap());
     let payload_len = u32::from_le_bytes(header[24..28].try_into().unwrap());
-    let record_len = (HEADER_LEN as u64)
+    let record_len = (LEGACY_HEADER_LEN as u64)
         .checked_add(u64::from(key_len))
         .and_then(|length| length.checked_add(u64::from(payload_len)))
         .ok_or_else(|| {
@@ -719,7 +840,7 @@ fn read_record(
         };
         Some(key.to_owned())
     };
-    let payload_offset = cursor + HEADER_LEN as u64 + u64::from(key_len);
+    let payload_offset = cursor + LEGACY_HEADER_LEN as u64 + u64::from(key_len);
     file.seek(SeekFrom::Start(payload_offset + u64::from(payload_len)))?;
     Ok(Some(ParsedRecord {
         index: RecordIndex {
@@ -731,6 +852,156 @@ fn read_record(
         },
         next_cursor: cursor + record_len,
     }))
+}
+
+fn read_versioned_record(
+    file: &mut File,
+    cursor: u64,
+    file_len: u64,
+) -> Result<Option<ParsedRecord>, BrokerError> {
+    if file_len.saturating_sub(cursor) < VERSIONED_HEADER_LEN as u64 {
+        return Ok(None);
+    }
+
+    file.seek(SeekFrom::Start(cursor))?;
+    let mut header = [0; VERSIONED_HEADER_LEN];
+    file.read_exact(&mut header)?;
+    if header[4] != VERSIONED_FORMAT_VERSION {
+        return Err(invalid_record_data("unsupported versioned record version"));
+    }
+    if header[5] != 0 {
+        return Err(invalid_record_data("unsupported versioned record flags"));
+    }
+    let header_len = u16::from_le_bytes(header[6..8].try_into().unwrap()) as usize;
+    if header_len != VERSIONED_HEADER_LEN {
+        return Err(invalid_record_data(
+            "invalid versioned record header length",
+        ));
+    }
+    let stored_len = u32::from_le_bytes(header[8..12].try_into().unwrap());
+    let logical_len = u32::from_le_bytes(header[12..16].try_into().unwrap());
+    let key_len = u32::from_le_bytes(header[32..36].try_into().unwrap());
+    if stored_len > VERSIONED_MAX_BODY_LEN || logical_len > VERSIONED_MAX_BODY_LEN {
+        return Err(invalid_record_data(
+            "versioned record exceeds storage limit",
+        ));
+    }
+    if logical_len != stored_len {
+        return Err(invalid_record_data(
+            "compressed versioned records are not supported",
+        ));
+    }
+    if key_len > VERSIONED_MAX_KEY_LEN {
+        return Err(invalid_record_data(
+            "versioned record key exceeds storage limit",
+        ));
+    }
+    if header[36] != VERSIONED_ENCODING_BYTES {
+        return Err(invalid_record_data("unsupported versioned record encoding"));
+    }
+    if header[37] != VERSIONED_COMPRESSION_NONE {
+        return Err(invalid_record_data(
+            "unsupported versioned record compression",
+        ));
+    }
+    if u16::from_le_bytes(header[38..40].try_into().unwrap()) != 0 {
+        return Err(invalid_record_data(
+            "unsupported versioned record header fields",
+        ));
+    }
+
+    let record_len = (VERSIONED_HEADER_LEN as u64)
+        .checked_add(u64::from(key_len))
+        .and_then(|length| length.checked_add(u64::from(stored_len)))
+        .ok_or_else(|| invalid_record_data("versioned record length overflows u64"))?;
+    if file_len.saturating_sub(cursor) < record_len {
+        return Ok(None);
+    }
+
+    let mut key_bytes = vec![0; key_len as usize];
+    file.read_exact(&mut key_bytes)?;
+    let key = if key_bytes.is_empty() {
+        None
+    } else {
+        let key = std::str::from_utf8(&key_bytes)
+            .map_err(|_| invalid_record_data("versioned record key is not UTF-8"))?;
+        Some(key.to_owned())
+    };
+
+    let mut checksum_header = header;
+    let expected_checksum = u32::from_le_bytes(header[40..44].try_into().unwrap());
+    checksum_header[40..44].fill(0);
+    let mut checksum = crc32c_update(!0, &checksum_header);
+    checksum = crc32c_update(checksum, &key_bytes);
+    let mut remaining = u64::from(stored_len);
+    let mut buffer = [0; 8192];
+    while remaining > 0 {
+        let read_len = remaining.min(buffer.len() as u64) as usize;
+        file.read_exact(&mut buffer[..read_len])?;
+        checksum = crc32c_update(checksum, &buffer[..read_len]);
+        remaining -= read_len as u64;
+    }
+    if !crc32c_finalize(checksum).eq(&expected_checksum) {
+        return Err(invalid_record_data("versioned record checksum mismatch"));
+    }
+
+    let payload_offset = cursor + VERSIONED_HEADER_LEN as u64 + u64::from(key_len);
+    Ok(Some(ParsedRecord {
+        index: RecordIndex {
+            offset: u64::from_le_bytes(header[16..24].try_into().unwrap()),
+            payload_offset,
+            payload_len: stored_len,
+            key,
+            published_at_ms: u64::from_le_bytes(header[24..32].try_into().unwrap()),
+        },
+        next_cursor: cursor + record_len,
+    }))
+}
+
+fn invalid_record_data(message: &'static str) -> BrokerError {
+    BrokerError::Io(io::Error::new(io::ErrorKind::InvalidData, message))
+}
+
+const CRC32C_TABLE: [u32; 256] = crc32c_table();
+
+const fn crc32c_table() -> [u32; 256] {
+    let mut table = [0; 256];
+    let mut index = 0;
+    while index < table.len() {
+        let mut value = index as u32;
+        let mut bit = 0;
+        while bit < 8 {
+            value = if value & 1 == 1 {
+                (value >> 1) ^ 0x82f6_3b78
+            } else {
+                value >> 1
+            };
+            bit += 1;
+        }
+        table[index] = value;
+        index += 1;
+    }
+    table
+}
+
+fn crc32c_update(mut checksum: u32, bytes: &[u8]) -> u32 {
+    for &byte in bytes {
+        let table_index = ((checksum ^ u32::from(byte)) & 0xff) as usize;
+        checksum = (checksum >> 8) ^ CRC32C_TABLE[table_index];
+    }
+    checksum
+}
+
+fn crc32c_finalize(checksum: u32) -> u32 {
+    !checksum
+}
+
+fn versioned_checksum(header: &[u8; VERSIONED_HEADER_LEN], key: &[u8], body: &[u8]) -> u32 {
+    let mut checksum_header = *header;
+    checksum_header[40..44].fill(0);
+    let checksum = crc32c_update(!0, &checksum_header);
+    let checksum = crc32c_update(checksum, key);
+    crc32c_finalize(crc32c_update(checksum, body))
 }
 
 fn remember_record(records: &mut VecDeque<RecordIndex>, record: RecordIndex) {
@@ -769,7 +1040,12 @@ fn dead_letter_record(
 
     if !state.streams.contains_key(&dead_letter_stream) {
         let path = stream_path(&state.root, &dead_letter_stream);
-        let log = StreamLog::create(&path)?;
+        let durable_format = state
+            .streams
+            .get(stream)
+            .map(|stream_log| stream_log.durable_format)
+            .unwrap_or(state.durable_format);
+        let log = StreamLog::create(&path, durable_format)?;
         state.streams.insert(dead_letter_stream.clone(), log);
     }
     state
@@ -1300,5 +1576,216 @@ mod tests {
                 ..
             }) if payload == b"complete"
         ));
+    }
+
+    #[test]
+    fn versioned_frames_round_trip_and_recover_after_restart() {
+        let directory = tempdir().unwrap();
+        {
+            let broker = Broker::open_with_format(
+                directory.path(),
+                BrokerConfig::default(),
+                DurableFormat::VersionedV1,
+            )
+            .unwrap();
+            assert_eq!(
+                broker
+                    .publish("events", Some("order-1".to_owned()), b"payload".to_vec())
+                    .unwrap(),
+                0
+            );
+        }
+
+        let path = directory.path().join("streams/events.log");
+        let bytes = fs::read(&path).unwrap();
+        assert_eq!(&bytes[..4], VERSIONED_MAGIC);
+        assert_eq!(
+            u16::from_le_bytes(bytes[6..8].try_into().unwrap()) as usize,
+            VERSIONED_HEADER_LEN
+        );
+        assert_eq!(u32::from_le_bytes(bytes[8..12].try_into().unwrap()), 7);
+
+        let broker = Broker::open_with_format(
+            directory.path(),
+            BrokerConfig::default(),
+            DurableFormat::VersionedV1,
+        )
+        .unwrap();
+        let message = match broker.poll("events", "reader").unwrap() {
+            PollResult::Message(message) => message,
+            PollResult::Empty => panic!("expected versioned message"),
+        };
+        assert_eq!(message.offset, 0);
+        assert_eq!(message.key.as_deref(), Some("order-1"));
+        assert_eq!(message.payload, b"payload");
+        assert_eq!(
+            broker.ack("events", "reader", 0).unwrap(),
+            AckResult::Acknowledged
+        );
+    }
+
+    #[test]
+    fn versioned_reader_replays_mixed_legacy_and_versioned_frames() {
+        let directory = tempdir().unwrap();
+        {
+            let broker = Broker::open(directory.path(), BrokerConfig::default()).unwrap();
+            broker.publish("events", None, b"legacy".to_vec()).unwrap();
+        }
+        {
+            let broker = Broker::open_with_format(
+                directory.path(),
+                BrokerConfig::default(),
+                DurableFormat::VersionedV1,
+            )
+            .unwrap();
+            broker
+                .publish("events", None, b"versioned".to_vec())
+                .unwrap();
+        }
+
+        let broker = Broker::open_with_format(
+            directory.path(),
+            BrokerConfig::default(),
+            DurableFormat::VersionedV1,
+        )
+        .unwrap();
+        for (offset, payload) in [(0, b"legacy".as_slice()), (1, b"versioned".as_slice())] {
+            let message = match broker.poll("events", "reader").unwrap() {
+                PollResult::Message(message) => message,
+                PollResult::Empty => panic!("expected retained offset {offset}"),
+            };
+            assert_eq!(message.offset, offset);
+            assert_eq!(message.payload, payload);
+            assert_eq!(
+                broker.ack("events", "reader", offset).unwrap(),
+                AckResult::Acknowledged
+            );
+        }
+        assert_eq!(broker.poll("events", "reader").unwrap(), PollResult::Empty);
+    }
+
+    #[test]
+    fn versioned_checksum_corruption_fails_recovery() {
+        let directory = tempdir().unwrap();
+        {
+            let broker = Broker::open_with_format(
+                directory.path(),
+                BrokerConfig::default(),
+                DurableFormat::VersionedV1,
+            )
+            .unwrap();
+            broker.publish("events", None, b"payload".to_vec()).unwrap();
+        }
+        let path = directory.path().join("streams/events.log");
+        let mut bytes = fs::read(&path).unwrap();
+        bytes[VERSIONED_HEADER_LEN] ^= 1;
+        fs::write(&path, bytes).unwrap();
+
+        let result = Broker::open_with_format(
+            directory.path(),
+            BrokerConfig::default(),
+            DurableFormat::VersionedV1,
+        );
+        assert!(matches!(
+            result,
+            Err(BrokerError::Io(error)) if error.kind() == io::ErrorKind::InvalidData
+        ));
+    }
+
+    #[test]
+    fn incomplete_versioned_frame_is_discarded_on_recovery() {
+        let directory = tempdir().unwrap();
+        {
+            let broker = Broker::open_with_format(
+                directory.path(),
+                BrokerConfig::default(),
+                DurableFormat::VersionedV1,
+            )
+            .unwrap();
+            broker
+                .publish("events", None, b"complete".to_vec())
+                .unwrap();
+        }
+        let path = directory.path().join("streams/events.log");
+        let complete_len = fs::metadata(&path).unwrap().len();
+        let mut file = OpenOptions::new().append(true).open(&path).unwrap();
+        file.write_all(VERSIONED_MAGIC).unwrap();
+        file.write_all(&[VERSIONED_FORMAT_VERSION]).unwrap();
+        file.sync_all().unwrap();
+
+        let broker = Broker::open_with_format(
+            directory.path(),
+            BrokerConfig::default(),
+            DurableFormat::VersionedV1,
+        )
+        .unwrap();
+        assert_eq!(fs::metadata(&path).unwrap().len(), complete_len);
+        assert!(matches!(
+            broker.poll("events", "reader").unwrap(),
+            PollResult::Message(Message { offset: 0, .. })
+        ));
+    }
+
+    #[test]
+    fn versioned_storage_rejects_oversized_records_before_allocation() {
+        let directory = tempdir().unwrap();
+        {
+            let broker = Broker::open_with_format(
+                directory.path(),
+                BrokerConfig::default(),
+                DurableFormat::VersionedV1,
+            )
+            .unwrap();
+            broker.create_stream("events").unwrap();
+        }
+        let path = directory.path().join("streams/events.log");
+        let mut header = [0; VERSIONED_HEADER_LEN];
+        header[..4].copy_from_slice(VERSIONED_MAGIC);
+        header[4] = VERSIONED_FORMAT_VERSION;
+        header[6..8].copy_from_slice(&(VERSIONED_HEADER_LEN as u16).to_le_bytes());
+        header[8..12].copy_from_slice(&(VERSIONED_MAX_BODY_LEN + 1).to_le_bytes());
+        header[12..16].copy_from_slice(&(VERSIONED_MAX_BODY_LEN + 1).to_le_bytes());
+        let mut file = OpenOptions::new().append(true).open(&path).unwrap();
+        file.write_all(&header).unwrap();
+        file.sync_all().unwrap();
+
+        let result = Broker::open_with_format(
+            directory.path(),
+            BrokerConfig::default(),
+            DurableFormat::VersionedV1,
+        );
+        assert!(matches!(
+            result,
+            Err(BrokerError::Io(error)) if error.kind() == io::ErrorKind::InvalidData
+        ));
+    }
+
+    #[test]
+    fn versioned_writer_rejects_oversized_payloads_and_keys() {
+        let directory = tempdir().unwrap();
+        let broker = Broker::open_with_format(
+            directory.path(),
+            BrokerConfig::default(),
+            DurableFormat::VersionedV1,
+        )
+        .unwrap();
+
+        let key_error = broker
+            .publish(
+                "events",
+                Some("k".repeat(VERSIONED_MAX_KEY_LEN as usize + 1)),
+                b"payload".to_vec(),
+            )
+            .unwrap_err();
+        assert!(
+            matches!(key_error, BrokerError::Io(error) if error.kind() == io::ErrorKind::InvalidInput)
+        );
+
+        let payload_error = broker
+            .publish("events", None, vec![0; VERSIONED_MAX_BODY_LEN as usize + 1])
+            .unwrap_err();
+        assert!(
+            matches!(payload_error, BrokerError::Io(error) if error.kind() == io::ErrorKind::InvalidInput)
+        );
     }
 }
