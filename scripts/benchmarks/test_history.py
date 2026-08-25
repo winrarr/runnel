@@ -129,12 +129,12 @@ class HistoryTests(unittest.TestCase):
             aggregated["repetition_runs"],
             [
                 {
-                    "run_id": None,
+                    "run_id": first["source"]["run_id"],
                     "generated_at": "2026-08-20T08:57:56.024168+00:00",
                     "source_result": "first.json",
                 },
                 {
-                    "run_id": None,
+                    "run_id": second["source"]["run_id"],
                     "generated_at": "2026-08-20T08:58:56.024168+00:00",
                     "source_result": "second.json",
                 },
