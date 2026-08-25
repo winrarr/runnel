@@ -1,5 +1,7 @@
 set shell := ["bash", "-euo", "pipefail", "-c"]
 
+benchmark_lock := "/tmp/runnel-benchmark.lock"
+
 default: verify
 
 fmt:
@@ -45,37 +47,37 @@ cluster-replacement-test:
     cargo test --locked -p runnel-server --features test-replacement-recovery --test cluster_smoke -- --nocapture --test-threads=1
 
 bench:
-    cargo bench --locked --workspace
+    python3 scripts/benchmarks/lock.py --path {{benchmark_lock}} --mode shared -- cargo bench --locked --workspace
 
 bench-container:
-    python3 scripts/benchmarks/run.py --build
+    python3 scripts/benchmarks/lock.py --path {{benchmark_lock}} --mode exclusive -- python3 scripts/benchmarks/run.py --build
 
 bench-container-smoke:
-    python3 scripts/benchmarks/run.py --image runnel:dev --messages 20 --warmup 2 --concurrency 2 --payload-sizes 100
+    python3 scripts/benchmarks/lock.py --path {{benchmark_lock}} --mode shared -- python3 scripts/benchmarks/run.py --image runnel:dev --messages 20 --warmup 2 --concurrency 2 --payload-sizes 100
 
 bench-cluster:
-    python3 scripts/benchmarks/cluster.py --build
+    python3 scripts/benchmarks/lock.py --path {{benchmark_lock}} --mode exclusive -- python3 scripts/benchmarks/cluster.py --build
 
 bench-cluster-smoke:
-    python3 scripts/benchmarks/cluster.py --build --messages 20 --warmup 2 --payload-sizes 100 --skip-recovery
+    python3 scripts/benchmarks/lock.py --path {{benchmark_lock}} --mode shared -- python3 scripts/benchmarks/cluster.py --build --messages 20 --warmup 2 --payload-sizes 100 --skip-recovery
 
 bench-pr-local *args:
-    python3 scripts/benchmarks/pr_local.py {{args}}
+    python3 scripts/benchmarks/lock.py --path {{benchmark_lock}} --mode exclusive -- python3 scripts/benchmarks/pr_local.py {{args}}
 
 bench-pr-local-quick *args:
-    python3 scripts/benchmarks/pr_local.py --repetitions 1 {{args}}
+    python3 scripts/benchmarks/lock.py --path {{benchmark_lock}} --mode shared -- python3 scripts/benchmarks/pr_local.py --repetitions 1 {{args}}
 
 profile-cluster:
-    python3 scripts/benchmarks/profile.py --build
+    python3 scripts/benchmarks/lock.py --path {{benchmark_lock}} --mode exclusive -- python3 scripts/benchmarks/profile.py --build
 
 profile-cluster-instrumented:
     RUST_LOG=runnel::timing=trace python3 scripts/benchmarks/profile.py --build --features instrumentation --skip-perf
 
 bench-compare:
-    python3 scripts/benchmarks/compare.py --build-runnel
+    python3 scripts/benchmarks/lock.py --path {{benchmark_lock}} --mode exclusive -- python3 scripts/benchmarks/compare.py --build-runnel
 
 bench-compare-cluster:
-    python3 scripts/benchmarks/compare.py --nodes 3 --backends kafka,redpanda,nats --messages 1000 --payload-sizes 100,1024 --cpus 2 --memory 2g --client-cpus 1 --client-memory 512m
+    python3 scripts/benchmarks/lock.py --path {{benchmark_lock}} --mode exclusive -- python3 scripts/benchmarks/compare.py --nodes 3 --backends kafka,redpanda,nats --messages 1000 --payload-sizes 100,1024 --cpus 2 --memory 2g --client-cpus 1 --client-memory 512m
 
 bench-dashboard:
     python3 scripts/benchmarks/build_history.py --runs benchmark-results --output benchmark-results/site

@@ -24,6 +24,8 @@ import uuid
 from dataclasses import dataclass
 from pathlib import Path
 
+from benchmarks.lock import lock_command
+
 
 ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_WORKFLOW = "test"
@@ -229,7 +231,7 @@ def remove_owned_image(isolation: Isolation) -> None:
 def run(workflow: str, *, keep: bool) -> int:
     isolation = create_isolation()
     env = environment(isolation)
-    command = command_for(workflow, isolation)
+    command = lock_command(workflow, command_for(workflow, isolation))
     print(f"isolated run {isolation.run_id}: {shlex.join(command)}", flush=True)
     print(f"benchmark artifacts: {isolation.artifact_dir}", flush=True)
     completed = False

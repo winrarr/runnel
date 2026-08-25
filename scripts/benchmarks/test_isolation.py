@@ -58,6 +58,23 @@ class IsolationRunnerTests(unittest.TestCase):
         self.assertNotIn("--all-features", isolated.command_for("test", run))
         self.assertIn("--test-threads=1", isolated.command_for("cluster-test", run))
 
+    def test_benchmark_workflows_use_the_shared_lock_wrapper(self) -> None:
+        run = self.new_run()
+        command = isolated.lock_command(
+            "bench-cluster-smoke", isolated.command_for("bench-cluster-smoke", run)
+        )
+
+        self.assertEqual(command[0], sys.executable)
+        self.assertEqual(command[1].split("/")[-1], "lock.py")
+        self.assertIn("--mode", command)
+        self.assertIn("shared", command)
+
+    def test_non_benchmark_workflows_are_not_locked(self) -> None:
+        run = self.new_run()
+        command = isolated.lock_command("test", isolated.command_for("test", run))
+
+        self.assertEqual(command, isolated.command_for("test", run))
+
 
 if __name__ == "__main__":
     unittest.main()
