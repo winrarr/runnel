@@ -1,5 +1,6 @@
 use std::collections::{BTreeMap, HashMap};
 use std::io;
+use std::mem::size_of;
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
@@ -22,6 +23,7 @@ use runnel_engine::StageTimer;
 use runnel_engine::{AckResult, BrokerError, Offset, PollResult};
 
 const MAX_FRAME_SIZE: u32 = 64 * 1024 * 1024;
+const MAX_REUSABLE_FRAME_BUFFER_SIZE: usize = 1024 * 1024;
 // Topology-free forwarding and stateless control RPCs receive no long-lived
 // network object on which to scope their connections. Keep this compatibility
 // bridge process-wide but bounded until that ownership moves into the engine.
@@ -58,6 +60,7 @@ impl RaftNetworkFactory<TypeConfig> for TcpNetwork {
             address,
             group_id: self.group_id.clone(),
             stream: None,
+            read_buffer: Vec::new(),
         }
     }
 }
@@ -67,6 +70,7 @@ pub struct TcpConnection {
     address: Option<String>,
     group_id: String,
     stream: Option<TcpStream>,
+    read_buffer: Vec<u8>,
 }
 
 impl TcpConnection {
@@ -76,6 +80,7 @@ impl TcpConnection {
             address: Some(address.into()),
             group_id: METADATA_GROUP_ID.to_owned(),
             stream: None,
+            read_buffer: Vec::new(),
         }
     }
 
@@ -107,6 +112,7 @@ impl TcpConnection {
             )
         })?;
         let stream = self.stream.take();
+        let mut read_buffer = std::mem::take(&mut self.read_buffer);
         let result = tokio::time::timeout(ttl, async move {
             let mut stream = match stream {
                 Some(stream) => stream,
@@ -125,14 +131,15 @@ impl TcpConnection {
             drop(_write_timer);
             #[cfg(feature = "instrumentation")]
             let _read_timer = StageTimer::new("raft.peer_rpc.read");
-            let response = read_frame(&mut stream).await?;
-            Ok::<_, io::Error>((stream, response))
+            let response = read_frame(&mut stream, &mut read_buffer).await?;
+            Ok::<_, io::Error>((stream, response, read_buffer))
         })
         .await;
 
         match result {
-            Ok(Ok((stream, response))) => {
+            Ok(Ok((stream, response, read_buffer))) => {
                 self.stream = Some(stream);
+                self.read_buffer = read_buffer;
                 Ok(response)
             }
             Ok(Err(error)) => Err(error),
@@ -449,8 +456,9 @@ async fn handle_connection(
     mut stream: TcpStream,
     manager: Arc<GroupManager>,
 ) -> Result<(), io::Error> {
+    let mut read_buffer = Vec::new();
     loop {
-        let request: PeerRequest = match read_frame(&mut stream).await {
+        let request: PeerRequest = match read_frame(&mut stream, &mut read_buffer).await {
             Ok(request) => request,
             Err(error) if error.kind() == io::ErrorKind::UnexpectedEof => return Ok(()),
             Err(error) => return Err(error),
@@ -643,8 +651,10 @@ fn forward_error(error: BrokerError) -> ForwardError {
 }
 
 async fn write_frame<T: Serialize>(stream: &mut TcpStream, value: &T) -> Result<(), io::Error> {
-    let payload = serde_json::to_vec(value).map_err(io::Error::other)?;
-    let length = u32::try_from(payload.len())
+    let mut frame = Vec::with_capacity(size_of::<u32>());
+    frame.extend_from_slice(&[0; size_of::<u32>()]);
+    serde_json::to_writer(&mut frame, value).map_err(io::Error::other)?;
+    let length = u32::try_from(frame.len() - size_of::<u32>())
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "peer RPC is too large"))?;
     if length > MAX_FRAME_SIZE {
         return Err(io::Error::new(
@@ -652,12 +662,14 @@ async fn write_frame<T: Serialize>(stream: &mut TcpStream, value: &T) -> Result<
             "peer RPC exceeds the frame limit",
         ));
     }
-    stream.write_u32(length).await?;
-    stream.write_all(&payload).await?;
-    stream.flush().await
+    frame[..size_of::<u32>()].copy_from_slice(&length.to_be_bytes());
+    stream.write_all(&frame).await
 }
 
-async fn read_frame<T: DeserializeOwned>(stream: &mut TcpStream) -> Result<T, io::Error> {
+async fn read_frame<T: DeserializeOwned>(
+    stream: &mut TcpStream,
+    payload: &mut Vec<u8>,
+) -> Result<T, io::Error> {
     let length = stream.read_u32().await?;
     if length > MAX_FRAME_SIZE {
         return Err(io::Error::new(
@@ -665,9 +677,13 @@ async fn read_frame<T: DeserializeOwned>(stream: &mut TcpStream) -> Result<T, io
             "peer RPC exceeds the frame limit",
         ));
     }
-    let mut payload = vec![0; length as usize];
-    stream.read_exact(&mut payload).await?;
-    serde_json::from_slice(&payload).map_err(io::Error::other)
+    payload.resize(length as usize, 0);
+    stream.read_exact(payload).await?;
+    let value = serde_json::from_slice(payload).map_err(io::Error::other)?;
+    if payload.capacity() > MAX_REUSABLE_FRAME_BUFFER_SIZE {
+        *payload = Vec::new();
+    }
+    Ok(value)
 }
 
 fn unreachable_error(error: &io::Error) -> RPCError<u64, BasicNode, RaftError<u64>> {
@@ -727,9 +743,15 @@ mod tests {
                             let request_count = Arc::clone(&request_count);
                             let framed_byte_count = Arc::clone(&framed_byte_count);
                             handlers.spawn(async move {
+                                let mut read_buffer = Vec::new();
                                 let mut requests = 0;
                                 loop {
-                                    let request = match read_frame::<PeerRequest>(&mut stream).await {
+                                    let request = match read_frame::<PeerRequest>(
+                                        &mut stream,
+                                        &mut read_buffer,
+                                    )
+                                    .await
+                                    {
                                         Ok(request) => request,
                                         Err(_) => break,
                                     };
@@ -785,6 +807,7 @@ mod tests {
                 address: Some(self.address.clone()),
                 group_id: "test".to_owned(),
                 stream: None,
+                read_buffer: Vec::new(),
             }
         }
     }
@@ -826,6 +849,40 @@ mod tests {
             started.elapsed()
         );
         assert_eq!(peer.connections.load(Ordering::Relaxed), 1);
+    }
+
+    #[tokio::test]
+    async fn repeated_framed_reads_reuse_the_payload_buffer() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            write_frame(&mut stream, &request()).await.unwrap();
+            write_frame(&mut stream, &request()).await.unwrap();
+            write_frame(
+                &mut stream,
+                &PeerRequest::Forward(ForwardedOperation::Publish {
+                    stream: "test".to_owned(),
+                    key: None,
+                    payload: vec![0; MAX_REUSABLE_FRAME_BUFFER_SIZE + 1],
+                    request_id: None,
+                    published_at_ms: 0,
+                }),
+            )
+            .await
+            .unwrap();
+        });
+
+        let mut stream = TcpStream::connect(address).await.unwrap();
+        let mut payload = Vec::new();
+        let _: PeerRequest = read_frame(&mut stream, &mut payload).await.unwrap();
+        let capacity = payload.capacity();
+        let _: PeerRequest = read_frame(&mut stream, &mut payload).await.unwrap();
+
+        assert_eq!(payload.capacity(), capacity);
+        let _: PeerRequest = read_frame(&mut stream, &mut payload).await.unwrap();
+        assert!(payload.is_empty());
+        server.await.unwrap();
     }
 
     #[tokio::test]
