@@ -51,13 +51,15 @@ def benchmark_lock(
 
 def lock_command(workflow: str, command: list[str]) -> list[str]:
     mode = {
-        "bench": "shared",
+        "bench": "exclusive",
         "bench-container": "exclusive",
         "bench-container-smoke": "shared",
         "bench-cluster": "exclusive",
         "bench-cluster-smoke": "shared",
         "profile-cluster": "exclusive",
+        "profile-cluster-instrumented": "exclusive",
         "bench-compare": "exclusive",
+        "bench-compare-cluster": "exclusive",
     }.get(workflow)
     if mode is None:
         return command

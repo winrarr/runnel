@@ -47,7 +47,7 @@ cluster-replacement-test:
     cargo test --locked -p runnel-server --features test-replacement-recovery --test cluster_smoke -- --nocapture --test-threads=1
 
 bench:
-    python3 scripts/benchmarks/lock.py --path {{benchmark_lock}} --mode shared -- cargo bench --locked --workspace
+    python3 scripts/benchmarks/lock.py --path {{benchmark_lock}} --mode exclusive -- cargo bench --locked --workspace
 
 bench-container:
     python3 scripts/benchmarks/lock.py --path {{benchmark_lock}} --mode exclusive -- python3 scripts/benchmarks/run.py --build
@@ -71,7 +71,7 @@ profile-cluster:
     python3 scripts/benchmarks/lock.py --path {{benchmark_lock}} --mode exclusive -- python3 scripts/benchmarks/profile.py --build
 
 profile-cluster-instrumented:
-    RUST_LOG=runnel::timing=trace python3 scripts/benchmarks/profile.py --build --features instrumentation --skip-perf
+    RUST_LOG=runnel::timing=trace python3 scripts/benchmarks/lock.py --path {{benchmark_lock}} --mode exclusive -- python3 scripts/benchmarks/profile.py --build --features instrumentation --skip-perf
 
 bench-compare:
     python3 scripts/benchmarks/lock.py --path {{benchmark_lock}} --mode exclusive -- python3 scripts/benchmarks/compare.py --build-runnel

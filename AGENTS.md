@@ -80,7 +80,7 @@ Run these from the repository root:
 - just isolated runs the default workspace test with a unique Cargo target, temporary directory, and benchmark artifact directory; pass a supported workflow such as `just isolated cluster-test`, `just isolated cluster-replacement-test`, `just isolated bench-container-smoke`, or `just isolated bench-cluster-smoke` for concurrent work.
 - just cluster-test starts three real broker processes, exercises quorum replication, follower restart, leader failure, and recovery through the public protocol.
 - just cluster-replacement-test runs the opt-in snapshot replacement experiment that depends on the test-only permissive recovery feature.
-- just bench runs the Criterion performance benchmarks, including shared-consumer delivery and keyed-ordering baselines.
+- just bench runs the authoritative Criterion performance benchmarks, including shared-consumer delivery and keyed-ordering baselines, under the exclusive host benchmark lock.
 - just bench-container builds and benchmarks the broker image with explicit CPU and memory limits.
 - just bench-container-smoke exercises the container benchmark path with a small workload for CI.
 - just bench-cluster runs the real three-node clustered performance baseline.
@@ -88,7 +88,7 @@ Run these from the repository root:
 - just bench-pr-local waits for the exclusive host benchmark lock, then benchmarks the current commit and `origin/main` on the same host under the same default 2-CPU/2-GiB Linux systemd user scope, repeats paired three-node results until stability or a seven-pair maximum, and writes paste-ready Markdown under `benchmark-results/pr-local/`.
 - just bench-pr-local-quick uses a shared lock with other diagnostic benchmark workflows and performs one paired run for a diagnostic smoke measurement only; it must not be used to support an optimization claim.
 - just profile-cluster captures optional Linux `perf` samples and reports for all clustered broker processes.
-- just profile-cluster-instrumented builds the opt-in Rust timing instrumentation and records internal stage timings without requiring `perf` permissions.
+- just profile-cluster-instrumented builds the opt-in Rust timing instrumentation and records internal stage timings without requiring `perf` permissions; it uses the exclusive host benchmark lock.
 - just bench-compare builds Runnel and runs the documented first-pass comparison against Kafka, Redpanda, and JetStream.
 - just bench-compare-cluster runs the documented RF=3 durable-publish comparison against three-node Kafka, Redpanda, and JetStream clusters.
 - just bench-dashboard builds local history data from JSON files under benchmark-results/.
