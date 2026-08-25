@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
@@ -12,6 +12,7 @@ use serde::{Deserialize, Serialize};
 
 const MAGIC: &[u8; 4] = b"RNL1";
 const HEADER_LEN: usize = 28;
+const MAX_IN_MEMORY_RECORDS: usize = 1024;
 const DEFAULT_ACK_TIMEOUT: Duration = Duration::from_secs(30);
 const DEAD_LETTER_SUFFIX: &str = ".dead-letter";
 
@@ -76,7 +77,10 @@ struct InFlight {
 
 struct StreamLog {
     file: File,
-    records: Vec<RecordIndex>,
+    // The durable log retains the complete history; this tail cache keeps normal delivery
+    // bounded while older replay requests fall back to a streaming scan.
+    records: VecDeque<RecordIndex>,
+    next_offset: Offset,
 }
 
 #[derive(Debug, Clone)]
@@ -253,31 +257,28 @@ impl Broker {
 
         let mut consumer_state = load_consumer_state_for_request(&mut state, &consumer_key)?;
         loop {
+            let in_flight_offsets: HashSet<_> = state
+                .in_flight
+                .keys()
+                .filter(|delivery_key| delivery_key.consumer == consumer_key)
+                .map(|delivery_key| delivery_key.offset)
+                .collect();
+            let in_flight_keys: HashSet<_> = state
+                .in_flight
+                .iter()
+                .filter(|(delivery_key, _)| delivery_key.consumer == consumer_key)
+                .filter_map(|(_, in_flight)| in_flight.key.clone())
+                .collect();
             let candidate = state
                 .streams
-                .get(stream)
+                .get_mut(stream)
                 .ok_or_else(|| BrokerError::StreamNotFound(stream.to_owned()))?
-                .records
-                .iter()
-                .filter(|record| record.offset >= consumer_state.committed_offset)
-                .find(|record| {
-                    if consumer_state.acknowledged_offsets.contains(&record.offset) {
-                        return false;
-                    }
-                    if state.in_flight.keys().any(|delivery_key| {
-                        delivery_key.consumer == consumer_key
-                            && delivery_key.offset == record.offset
-                    }) {
-                        return false;
-                    }
-                    record.key.as_ref().is_none_or(|key| {
-                        !state.in_flight.iter().any(|(delivery_key, in_flight)| {
-                            delivery_key.consumer == consumer_key
-                                && in_flight.key.as_ref() == Some(key)
-                        })
-                    })
-                })
-                .cloned();
+                .find_candidate(
+                    consumer_state.committed_offset,
+                    &consumer_state.acknowledged_offsets,
+                    &in_flight_offsets,
+                    &in_flight_keys,
+                )?;
             let Some(candidate) = candidate else {
                 return Ok(PollResult::Empty);
             };
@@ -514,62 +515,32 @@ impl StreamLog {
             .open(path)?;
         Ok(Self {
             file,
-            records: Vec::new(),
+            records: VecDeque::with_capacity(MAX_IN_MEMORY_RECORDS),
+            next_offset: 0,
         })
     }
 
     fn open(path: &Path) -> Result<Self, BrokerError> {
         let mut file = OpenOptions::new().read(true).append(true).open(path)?;
-        let mut bytes = Vec::new();
-        file.read_to_end(&mut bytes)?;
-
-        let mut records = Vec::new();
-        let mut cursor = 0usize;
-        while bytes.len().saturating_sub(cursor) >= HEADER_LEN {
-            let header = &bytes[cursor..cursor + HEADER_LEN];
-            if &header[..4] != MAGIC {
-                break;
-            }
-
-            let offset = u64::from_le_bytes(header[4..12].try_into().unwrap());
-            let published_at_ms = u64::from_le_bytes(header[12..20].try_into().unwrap());
-            let key_len = u32::from_le_bytes(header[20..24].try_into().unwrap()) as usize;
-            let payload_len = u32::from_le_bytes(header[24..28].try_into().unwrap()) as usize;
-            let Some(record_len) = HEADER_LEN
-                .checked_add(key_len)
-                .and_then(|length| length.checked_add(payload_len))
-            else {
-                break;
-            };
-            if bytes.len().saturating_sub(cursor) < record_len {
-                break;
-            }
-
-            let key_start = cursor + HEADER_LEN;
-            let payload_start = key_start + key_len;
-            let key = if key_len == 0 {
-                None
-            } else {
-                match std::str::from_utf8(&bytes[key_start..payload_start]) {
-                    Ok(key) => Some(key.to_owned()),
-                    Err(_) => break,
-                }
-            };
-            records.push(RecordIndex {
-                offset,
-                payload_offset: payload_start as u64,
-                payload_len: payload_len as u32,
-                key,
-                published_at_ms,
-            });
-            cursor += record_len;
+        let file_len = file.metadata()?.len();
+        let mut records = VecDeque::with_capacity(MAX_IN_MEMORY_RECORDS);
+        let mut cursor = 0;
+        let mut next_offset = 0;
+        while let Some(parsed) = read_record(&mut file, cursor, file_len)? {
+            cursor = parsed.next_cursor;
+            next_offset = parsed.index.offset.saturating_add(1);
+            remember_record(&mut records, parsed.index);
         }
 
-        if cursor != bytes.len() {
-            file.set_len(cursor as u64)?;
+        if cursor != file_len {
+            file.set_len(cursor)?;
         }
         file.seek(SeekFrom::End(0))?;
-        Ok(Self { file, records })
+        Ok(Self {
+            file,
+            records,
+            next_offset,
+        })
     }
 
     fn append(&mut self, key: Option<String>, payload: Vec<u8>) -> Result<Offset, BrokerError> {
@@ -588,7 +559,7 @@ impl StreamLog {
                 "message payload exceeds u32 length",
             ))
         })?;
-        let offset = self.records.last().map_or(0, |record| record.offset + 1);
+        let offset = self.next_offset;
         let published_at_ms = now_ms();
 
         let mut header = Vec::with_capacity(HEADER_LEN);
@@ -604,22 +575,24 @@ impl StreamLog {
         self.file.sync_data()?;
 
         let payload_offset = self.file.stream_position()? - payload.len() as u64;
-        self.records.push(RecordIndex {
-            offset,
-            payload_offset,
-            payload_len,
-            key,
-            published_at_ms,
-        });
+        remember_record(
+            &mut self.records,
+            RecordIndex {
+                offset,
+                payload_offset,
+                payload_len,
+                key,
+                published_at_ms,
+            },
+        );
+        self.next_offset = offset.saturating_add(1);
         Ok(offset)
     }
 
     fn read_message(&mut self, stream: &str, offset: Offset) -> Result<Message, BrokerError> {
         #[cfg(feature = "instrumentation")]
         let _stage_timer = StageTimer::new("core.storage_read");
-        let Some(index) = self.records.iter().find(|record| record.offset == offset) else {
-            return Err(BrokerError::CorruptRecord(offset));
-        };
+        let index = self.find_record(offset)?;
         let mut payload = vec![0; index.payload_len as usize];
         self.file.seek(SeekFrom::Start(index.payload_offset))?;
         self.file.read_exact(&mut payload)?;
@@ -633,6 +606,153 @@ impl StreamLog {
             delivery_attempt: None,
         })
     }
+
+    fn find_candidate(
+        &mut self,
+        committed_offset: Offset,
+        acknowledged_offsets: &BTreeSet<Offset>,
+        in_flight_offsets: &HashSet<Offset>,
+        in_flight_keys: &HashSet<String>,
+    ) -> Result<Option<RecordIndex>, BrokerError> {
+        let Some(first_indexed_offset) = self.records.front().map(|record| record.offset) else {
+            return Ok(None);
+        };
+        if committed_offset >= first_indexed_offset {
+            return Ok(self
+                .records
+                .iter()
+                .filter(|record| record.offset >= committed_offset)
+                .find(|record| {
+                    record_is_candidate(
+                        record,
+                        acknowledged_offsets,
+                        in_flight_offsets,
+                        in_flight_keys,
+                    )
+                })
+                .cloned());
+        }
+
+        // A consumer that has fallen behind the bounded tail index still has the same replay
+        // rights. Scan only as a fallback so the common current-tail path stays in memory.
+        let file_len = self.file.metadata()?.len();
+        let mut cursor = 0;
+        while let Some(parsed) = read_record(&mut self.file, cursor, file_len)? {
+            cursor = parsed.next_cursor;
+            if parsed.index.offset < committed_offset {
+                continue;
+            }
+            if record_is_candidate(
+                &parsed.index,
+                acknowledged_offsets,
+                in_flight_offsets,
+                in_flight_keys,
+            ) {
+                return Ok(Some(parsed.index));
+            }
+        }
+        Ok(None)
+    }
+
+    fn find_record(&mut self, offset: Offset) -> Result<RecordIndex, BrokerError> {
+        if let Some(record) = self.records.iter().find(|record| record.offset == offset) {
+            return Ok(record.clone());
+        }
+
+        let file_len = self.file.metadata()?.len();
+        let mut cursor = 0;
+        while let Some(parsed) = read_record(&mut self.file, cursor, file_len)? {
+            cursor = parsed.next_cursor;
+            if parsed.index.offset == offset {
+                return Ok(parsed.index);
+            }
+        }
+        Err(BrokerError::CorruptRecord(offset))
+    }
+}
+
+struct ParsedRecord {
+    index: RecordIndex,
+    next_cursor: u64,
+}
+
+fn read_record(
+    file: &mut File,
+    cursor: u64,
+    file_len: u64,
+) -> Result<Option<ParsedRecord>, BrokerError> {
+    if file_len.saturating_sub(cursor) < HEADER_LEN as u64 {
+        return Ok(None);
+    }
+
+    file.seek(SeekFrom::Start(cursor))?;
+    let mut header = [0; HEADER_LEN];
+    file.read_exact(&mut header)?;
+    if &header[..4] != MAGIC {
+        return Ok(None);
+    }
+
+    let offset = u64::from_le_bytes(header[4..12].try_into().unwrap());
+    let published_at_ms = u64::from_le_bytes(header[12..20].try_into().unwrap());
+    let key_len = u32::from_le_bytes(header[20..24].try_into().unwrap());
+    let payload_len = u32::from_le_bytes(header[24..28].try_into().unwrap());
+    let record_len = (HEADER_LEN as u64)
+        .checked_add(u64::from(key_len))
+        .and_then(|length| length.checked_add(u64::from(payload_len)))
+        .ok_or_else(|| {
+            BrokerError::Io(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "record length overflows u64",
+            ))
+        })?;
+    if file_len.saturating_sub(cursor) < record_len {
+        return Ok(None);
+    }
+
+    let mut key_bytes = vec![0; key_len as usize];
+    file.read_exact(&mut key_bytes)?;
+    let key = if key_bytes.is_empty() {
+        None
+    } else {
+        let Ok(key) = std::str::from_utf8(&key_bytes) else {
+            return Ok(None);
+        };
+        Some(key.to_owned())
+    };
+    let payload_offset = cursor + HEADER_LEN as u64 + u64::from(key_len);
+    file.seek(SeekFrom::Start(payload_offset + u64::from(payload_len)))?;
+    Ok(Some(ParsedRecord {
+        index: RecordIndex {
+            offset,
+            payload_offset,
+            payload_len,
+            key,
+            published_at_ms,
+        },
+        next_cursor: cursor + record_len,
+    }))
+}
+
+fn remember_record(records: &mut VecDeque<RecordIndex>, record: RecordIndex) {
+    if records.len() == MAX_IN_MEMORY_RECORDS {
+        records.pop_front();
+    }
+    records.push_back(record);
+}
+
+fn record_is_candidate(
+    record: &RecordIndex,
+    acknowledged_offsets: &BTreeSet<Offset>,
+    in_flight_offsets: &HashSet<Offset>,
+    in_flight_keys: &HashSet<String>,
+) -> bool {
+    if acknowledged_offsets.contains(&record.offset) || in_flight_offsets.contains(&record.offset) {
+        return false;
+    }
+    record
+        .key
+        .as_ref()
+        .is_none_or(|key| !in_flight_keys.contains(key))
 }
 
 fn dead_letter_record(
@@ -1036,6 +1156,47 @@ mod tests {
             result,
             PollResult::Message(Message { offset: 0, .. })
         ));
+    }
+
+    #[test]
+    fn retained_history_replays_beyond_the_bounded_index_after_restart() {
+        let directory = tempdir().unwrap();
+        let retained_message_count = MAX_IN_MEMORY_RECORDS as u64 + 8;
+        {
+            let broker = Broker::open(directory.path(), BrokerConfig::default()).unwrap();
+            for offset in 0..retained_message_count {
+                assert_eq!(
+                    broker
+                        .publish("events", None, format!("payload-{offset}").into_bytes())
+                        .unwrap(),
+                    offset
+                );
+            }
+
+            let state = broker.inner.lock().unwrap();
+            let log = state.streams.get("events").unwrap();
+            assert_eq!(log.records.len(), MAX_IN_MEMORY_RECORDS);
+            assert_eq!(log.records.front().unwrap().offset, 8);
+            assert_eq!(log.next_offset, retained_message_count);
+        }
+
+        let broker = Broker::open(directory.path(), BrokerConfig::default()).unwrap();
+        for offset in 0..retained_message_count {
+            let message = match broker.poll("events", "replayer").unwrap() {
+                PollResult::Message(message) => message,
+                PollResult::Empty => panic!("expected retained offset {offset}"),
+            };
+            assert_eq!(message.offset, offset);
+            assert_eq!(message.payload, format!("payload-{offset}").as_bytes());
+            assert_eq!(
+                broker.ack("events", "replayer", offset).unwrap(),
+                AckResult::Acknowledged
+            );
+        }
+        assert_eq!(
+            broker.poll("events", "replayer").unwrap(),
+            PollResult::Empty
+        );
     }
 
     #[test]
