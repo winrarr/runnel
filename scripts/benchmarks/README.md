@@ -191,7 +191,17 @@ python3 scripts/benchmarks/aggregate.py \
 ```
 
 The aggregate records the repetition count and min/median/max observed range
-for each measured metric. The daily and `main` workflow performs this for the
+for each measured metric. It also retains the individual numeric samples,
+descriptive standard deviation, and the source/timestamp of each repetition.
+Generated points expose this as additive `evidence` metadata containing the
+median aggregation method, sample count, repetition count, coverage, and
+sample values when the aggregate has them. These are observed measurements,
+not confidence intervals or a claim that the host noise has been eliminated;
+outliers remain in the samples and in the observed range. Older normalized and
+aggregate artifacts without these fields continue to load, but naturally
+cannot expose sample values that were not retained.
+
+The daily and `main` workflow performs this for the
 Runnel-only single-node and clustered suites; the weekly competitor workflow
 does the same for the native and three-node competitor suites. A benchmark history point is
 compared only with the previous run that has the same suite, workload, resource

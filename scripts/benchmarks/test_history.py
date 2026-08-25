@@ -95,6 +95,7 @@ class HistoryTests(unittest.TestCase):
         first = normalize_result(comparison_result(), source_name="first.json")
         second = copy.deepcopy(first)
         second["generated_at"] = "2026-08-20T08:58:56.024168+00:00"
+        second["source_result"] = "second.json"
         second["backends"]["runnel"]["scenarios"][0][
             "throughput_messages_per_second"
         ] = 2000.0
@@ -114,6 +115,31 @@ class HistoryTests(unittest.TestCase):
             ],
             66.6666666667,
         )
+        self.assertEqual(
+            scenario["repetition_summary"]["throughput_messages_per_second"]["samples"],
+            [1000.0, 2000.0],
+        )
+        self.assertEqual(
+            scenario["repetition_summary"]["throughput_messages_per_second"][
+                "standard_deviation"
+            ],
+            500.0,
+        )
+        self.assertEqual(
+            aggregated["repetition_runs"],
+            [
+                {
+                    "run_id": None,
+                    "generated_at": "2026-08-20T08:57:56.024168+00:00",
+                    "source_result": "first.json",
+                },
+                {
+                    "run_id": None,
+                    "generated_at": "2026-08-20T08:58:56.024168+00:00",
+                    "source_result": "second.json",
+                },
+            ],
+        )
 
         generated = site_data(
             [{**aggregated, "_path": "aggregate.json"}]
@@ -125,6 +151,38 @@ class HistoryTests(unittest.TestCase):
             and point["metric"] == "throughput_messages_per_second"
         )
         self.assertAlmostEqual(current["range"]["relative_range_percent"], 66.6666666667)
+        self.assertEqual(current["evidence"]["aggregation"], "median")
+        self.assertEqual(current["evidence"]["sample_count"], 2)
+        self.assertEqual(current["evidence"]["repetition_count"], 2)
+        self.assertEqual(current["evidence"]["sample_coverage_percent"], 100.0)
+        self.assertEqual(current["evidence"]["sample_values"], [1000.0, 2000.0])
+
+    def test_legacy_aggregate_without_samples_remains_readable(self) -> None:
+        first = normalize_result(comparison_result(), source_name="first.json")
+        second = copy.deepcopy(first)
+        second["generated_at"] = "2026-08-20T08:58:56.024168+00:00"
+        legacy = aggregate_results([first, second])
+        for backend in legacy["backends"].values():
+            for metric_summary in backend.get("repetition_summary", {}).values():
+                metric_summary.pop("samples", None)
+                metric_summary.pop("standard_deviation", None)
+                metric_summary.pop("relative_standard_deviation_percent", None)
+            for scenario in backend.get("scenarios", []):
+                for metric_summary in scenario.get("repetition_summary", {}).values():
+                    metric_summary.pop("samples", None)
+                    metric_summary.pop("standard_deviation", None)
+                    metric_summary.pop("relative_standard_deviation_percent", None)
+        legacy.pop("repetition_runs", None)
+
+        generated = site_data([{**legacy, "_path": "legacy-aggregate.json"}])
+        current = next(
+            point
+            for point in generated["points"]
+            if point["metric"] == "throughput_messages_per_second"
+        )
+        self.assertEqual(current["range"]["min"], 1000.0)
+        self.assertNotIn("sample_values", current["evidence"])
+        self.assertEqual(current["evidence"]["sample_count"], 2)
 
     def test_site_data_compares_only_compatible_runs(self) -> None:
         first = normalize_result(comparison_result(), source_name="first.json")
