@@ -12,7 +12,7 @@ import argparse
 import copy
 import json
 from pathlib import Path
-from statistics import median
+from statistics import median, pstdev
 from typing import Any
 
 
@@ -32,20 +32,25 @@ def numeric_values(values: list[Any]) -> list[float]:
     return [float(value) for value in values if isinstance(value, (int, float))]
 
 
-def summary(values: list[Any]) -> dict[str, float | int]:
+def summary(values: list[Any]) -> dict[str, Any]:
     numbers = numeric_values(values)
     if not numbers:
         return {}
     median_value = float(median(numbers))
-    result: dict[str, float | int] = {
+    result: dict[str, Any] = {
         "count": len(numbers),
         "min": min(numbers),
         "median": median_value,
         "max": max(numbers),
+        "samples": numbers,
+        "standard_deviation": pstdev(numbers),
     }
     if median_value != 0:
         result["relative_range_percent"] = (
             (max(numbers) - min(numbers)) / abs(median_value) * 100
+        )
+        result["relative_standard_deviation_percent"] = (
+            result["standard_deviation"] / abs(median_value) * 100
         )
     return result
 
@@ -88,6 +93,16 @@ def scenario_summary(scenarios: list[dict[str, Any]]) -> dict[str, Any]:
         metric_summary = summary(values)
         if metric_summary:
             result[f"latency_{percentile}"] = metric_summary
+
+    for metric in ("cpu_seconds", "cpu_percent_max", "memory_bytes_max"):
+        values = [
+            scenario.get("resource_samples", {}).get(metric)
+            for scenario in scenarios
+            if isinstance(scenario.get("resource_samples"), dict)
+        ]
+        metric_summary = summary(values)
+        if metric_summary:
+            result[metric] = metric_summary
 
     cpu_efficiency = []
     for scenario in scenarios:
@@ -200,6 +215,14 @@ def aggregate_results(results: list[dict[str, Any]]) -> dict[str, Any]:
             "first_generated_at": min(result.get("generated_at", "") for result in results),
             "last_generated_at": generated_at,
         },
+        "repetition_runs": [
+            {
+                "run_id": result.get("source", {}).get("run_id"),
+                "generated_at": result.get("generated_at"),
+                "source_result": result.get("source_result"),
+            }
+            for result in results
+        ],
         "backends": backends,
         "source_result": "aggregate",
     }

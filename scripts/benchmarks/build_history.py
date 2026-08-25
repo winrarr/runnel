@@ -94,9 +94,32 @@ def add_point(
         if isinstance(metric_summary, dict):
             point["range"] = {
                 key: metric_summary[key]
-                for key in ("min", "median", "max", "relative_range_percent")
+                for key in (
+                    "min",
+                    "median",
+                    "max",
+                    "relative_range_percent",
+                    "standard_deviation",
+                    "relative_standard_deviation_percent",
+                )
                 if key in metric_summary
             }
+            sample_count = metric_summary.get("count")
+            evidence: dict[str, Any] = {
+                "aggregation": "median",
+            }
+            if isinstance(sample_count, (int, float)):
+                evidence["sample_count"] = sample_count
+            if isinstance(repetitions, (int, float)):
+                evidence["repetition_count"] = repetitions
+                if isinstance(sample_count, (int, float)) and repetitions > 0:
+                    evidence["sample_coverage_percent"] = (
+                        sample_count / repetitions * 100
+                    )
+            sample_values = metric_summary.get("samples")
+            if isinstance(sample_values, list):
+                evidence["sample_values"] = sample_values
+            point["evidence"] = evidence
     points.append(point)
 
 
@@ -266,6 +289,7 @@ def site_data(runs: list[dict[str, Any]]) -> dict[str, Any]:
                 "repetitions": run.get("aggregate", {}).get(
                     "repetitions", source.get("repetitions", 1)
                 ),
+                "repetition_runs": run.get("repetition_runs", []),
                 "backends": sorted(run.get("backends", {}).keys()),
                 "resource_limits": run.get("resource_limits", {}),
                 "workload": run.get("workload", {}),
