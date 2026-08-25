@@ -1,9 +1,10 @@
 use std::collections::BTreeMap;
+use std::fmt::Write as _;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use axum::extract::State;
 use axum::http::StatusCode;
@@ -66,9 +67,165 @@ struct HttpState {
     shutting_down: Arc<AtomicBool>,
 }
 
-#[derive(Default)]
 struct ServerMetrics {
+    active_connections: AtomicU64,
+    active_requests: AtomicU64,
+    requests: [AtomicU64; REQUEST_OPERATION_COUNT],
+    request_failures: [AtomicU64; REQUEST_OPERATION_COUNT],
+    request_durations: [RequestDuration; REQUEST_OPERATION_COUNT],
+    stream_creations: AtomicU64,
+    publishes: AtomicU64,
+    published_bytes: AtomicU64,
     deliveries: AtomicU64,
+    delivered_bytes: AtomicU64,
+    acknowledgements: AtomicU64,
+    metrics_scrapes: AtomicU64,
+    metrics_scrape_failures: AtomicU64,
+    health_check_failures: AtomicU64,
+}
+
+const REQUEST_OPERATION_COUNT: usize = 8;
+const LATENCY_BUCKET_MICROS: [u64; 6] = [100, 1_000, 10_000, 100_000, 1_000_000, 10_000_000];
+const LATENCY_BUCKET_LABELS: [&str; LATENCY_BUCKET_MICROS.len()] =
+    ["0.0001", "0.001", "0.01", "0.1", "1", "10"];
+
+#[derive(Clone, Copy)]
+enum RequestOperation {
+    CreateStream,
+    Publish,
+    Poll,
+    PollGroup,
+    Ack,
+    AckGroup,
+    Health,
+    InvalidRequest,
+}
+
+impl RequestOperation {
+    const ALL: [Self; REQUEST_OPERATION_COUNT] = [
+        Self::CreateStream,
+        Self::Publish,
+        Self::Poll,
+        Self::PollGroup,
+        Self::Ack,
+        Self::AckGroup,
+        Self::Health,
+        Self::InvalidRequest,
+    ];
+
+    const fn index(self) -> usize {
+        match self {
+            Self::CreateStream => 0,
+            Self::Publish => 1,
+            Self::Poll => 2,
+            Self::PollGroup => 3,
+            Self::Ack => 4,
+            Self::AckGroup => 5,
+            Self::Health => 6,
+            Self::InvalidRequest => 7,
+        }
+    }
+
+    const fn name(self) -> &'static str {
+        match self {
+            Self::CreateStream => "create_stream",
+            Self::Publish => "publish",
+            Self::Poll => "poll",
+            Self::PollGroup => "poll_group",
+            Self::Ack => "ack",
+            Self::AckGroup => "ack_group",
+            Self::Health => "health",
+            Self::InvalidRequest => "invalid_request",
+        }
+    }
+
+    fn from_request(request: &Request) -> Self {
+        match request {
+            Request::CreateStream { .. } => Self::CreateStream,
+            Request::Publish { .. } => Self::Publish,
+            Request::Poll { .. } => Self::Poll,
+            Request::PollGroup { .. } => Self::PollGroup,
+            Request::Ack { .. } => Self::Ack,
+            Request::AckGroup { .. } => Self::AckGroup,
+            Request::Health => Self::Health,
+        }
+    }
+}
+
+struct RequestDuration {
+    buckets: [AtomicU64; LATENCY_BUCKET_MICROS.len()],
+    count: AtomicU64,
+    sum_micros: AtomicU64,
+}
+
+impl Default for RequestDuration {
+    fn default() -> Self {
+        Self {
+            buckets: std::array::from_fn(|_| AtomicU64::new(0)),
+            count: AtomicU64::new(0),
+            sum_micros: AtomicU64::new(0),
+        }
+    }
+}
+
+impl Default for ServerMetrics {
+    fn default() -> Self {
+        Self {
+            active_connections: AtomicU64::new(0),
+            active_requests: AtomicU64::new(0),
+            requests: std::array::from_fn(|_| AtomicU64::new(0)),
+            request_failures: std::array::from_fn(|_| AtomicU64::new(0)),
+            request_durations: std::array::from_fn(|_| RequestDuration::default()),
+            stream_creations: AtomicU64::new(0),
+            publishes: AtomicU64::new(0),
+            published_bytes: AtomicU64::new(0),
+            deliveries: AtomicU64::new(0),
+            delivered_bytes: AtomicU64::new(0),
+            acknowledgements: AtomicU64::new(0),
+            metrics_scrapes: AtomicU64::new(0),
+            metrics_scrape_failures: AtomicU64::new(0),
+            health_check_failures: AtomicU64::new(0),
+        }
+    }
+}
+
+impl ServerMetrics {
+    fn record_request(&self, operation: RequestOperation, elapsed: Duration, failed: bool) {
+        let index = operation.index();
+        self.requests[index].fetch_add(1, Ordering::Relaxed);
+        if failed {
+            self.request_failures[index].fetch_add(1, Ordering::Relaxed);
+        }
+
+        let duration = &self.request_durations[index];
+        let elapsed_micros = elapsed.as_micros().min(u64::MAX as u128) as u64;
+        duration.count.fetch_add(1, Ordering::Relaxed);
+        duration
+            .sum_micros
+            .fetch_add(elapsed_micros, Ordering::Relaxed);
+        if let Some(bucket) = LATENCY_BUCKET_MICROS
+            .iter()
+            .position(|limit| elapsed_micros <= *limit)
+        {
+            duration.buckets[bucket].fetch_add(1, Ordering::Relaxed);
+        }
+    }
+}
+
+struct ActiveConnection(Arc<ServerMetrics>);
+
+impl Drop for ActiveConnection {
+    fn drop(&mut self) {
+        self.0.active_connections.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
+struct ActiveRequest(Arc<ServerMetrics>);
+
+impl Drop for ActiveRequest {
+    fn drop(&mut self) {
+        self.0.active_requests.fetch_sub(1, Ordering::Relaxed);
+    }
 }
 
 #[derive(serde::Serialize)]
@@ -286,18 +443,32 @@ async fn handle_connection(
     engine: Arc<dyn Engine>,
     metrics: Arc<ServerMetrics>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    metrics.active_connections.fetch_add(1, Ordering::Relaxed);
+    let _active_connection = ActiveConnection(Arc::clone(&metrics));
     let (reader, mut writer) = stream.into_split();
     let mut lines = BufReader::new(reader).lines();
     while let Some(line) = lines.next_line().await? {
         #[cfg(feature = "instrumentation")]
         let _stage_timer = StageTimer::new("server.protocol_round_trip");
-        let response = match serde_json::from_str::<Request>(&line) {
-            Ok(request) => handle_request(engine.as_ref(), request, &metrics).await,
-            Err(error) => Response::Error {
-                code: "invalid_request".to_owned(),
-                message: error.to_string(),
-            },
+        metrics.active_requests.fetch_add(1, Ordering::Relaxed);
+        let _active_request = ActiveRequest(Arc::clone(&metrics));
+        let started = Instant::now();
+        let (operation, response) = match serde_json::from_str::<Request>(&line) {
+            Ok(request) => {
+                let operation = RequestOperation::from_request(&request);
+                let response = handle_request(engine.as_ref(), request, &metrics).await;
+                (operation, response)
+            }
+            Err(error) => (
+                RequestOperation::InvalidRequest,
+                Response::Error {
+                    code: "invalid_request".to_owned(),
+                    message: error.to_string(),
+                },
+            ),
         };
+        let failed = matches!(&response, Response::Error { .. });
+        metrics.record_request(operation, started.elapsed(), failed);
         let mut encoded = serde_json::to_vec(&response)?;
         encoded.push(b'\n');
         writer.write_all(&encoded).await?;
@@ -313,19 +484,30 @@ async fn handle_request(
     #[cfg(feature = "instrumentation")]
     let _stage_timer = StageTimer::new("server.engine_request");
     let result = match request {
-        Request::CreateStream { stream } => engine
-            .create_stream(&stream)
-            .await
-            .map(|created| Response::StreamCreated { stream, created }),
+        Request::CreateStream { stream } => engine.create_stream(&stream).await.map(|created| {
+            if created {
+                metrics.stream_creations.fetch_add(1, Ordering::Relaxed);
+            }
+            Response::StreamCreated { stream, created }
+        }),
         Request::Publish {
             stream,
             key,
             payload,
             request_id,
-        } => engine
-            .publish(&stream, key, payload.into_bytes(), request_id)
-            .await
-            .map(|offset| Response::Published { stream, offset }),
+        } => {
+            let payload_bytes = payload.len() as u64;
+            engine
+                .publish(&stream, key, payload.into_bytes(), request_id)
+                .await
+                .map(|offset| {
+                    metrics.publishes.fetch_add(1, Ordering::Relaxed);
+                    metrics
+                        .published_bytes
+                        .fetch_add(payload_bytes, Ordering::Relaxed);
+                    Response::Published { stream, offset }
+                })
+        }
         Request::Poll { stream, consumer } => {
             let result = engine.poll(&stream, &consumer).await;
             record_delivery(metrics, &result);
@@ -370,15 +552,15 @@ async fn handle_request(
             stream,
             consumer,
             offset,
-        } => engine
-            .ack(&stream, &consumer, offset)
-            .await
-            .map(|result| Response::Acknowledged {
+        } => engine.ack(&stream, &consumer, offset).await.map(|result| {
+            metrics.acknowledgements.fetch_add(1, Ordering::Relaxed);
+            Response::Acknowledged {
                 stream,
                 consumer,
                 offset,
                 already_acknowledged: result == AckResult::AlreadyAcknowledged,
-            }),
+            }
+        }),
         Request::AckGroup {
             stream,
             consumer,
@@ -388,11 +570,14 @@ async fn handle_request(
         } => engine
             .ack_group(&stream, &consumer, &member, offset, &delivery_token)
             .await
-            .map(|result| Response::Acknowledged {
-                stream,
-                consumer,
-                offset,
-                already_acknowledged: result == AckResult::AlreadyAcknowledged,
+            .map(|result| {
+                metrics.acknowledgements.fetch_add(1, Ordering::Relaxed);
+                Response::Acknowledged {
+                    stream,
+                    consumer,
+                    offset,
+                    already_acknowledged: result == AckResult::AlreadyAcknowledged,
+                }
             }),
         Request::Health => engine.health().await.map(|health| Response::Health {
             status: "ok".to_owned(),
@@ -405,8 +590,11 @@ async fn handle_request(
 }
 
 fn record_delivery(metrics: &ServerMetrics, result: &Result<PollResult, BrokerError>) {
-    if matches!(result, Ok(PollResult::Message(_))) {
+    if let Ok(PollResult::Message(message)) = result {
         metrics.deliveries.fetch_add(1, Ordering::Relaxed);
+        metrics
+            .delivered_bytes
+            .fetch_add(message.payload.len() as u64, Ordering::Relaxed);
     }
 }
 
@@ -486,6 +674,10 @@ async fn readiness(State(state): State<HttpState>) -> (StatusCode, Json<HealthBo
             }),
         ),
         Err(error) => {
+            state
+                .metrics
+                .health_check_failures
+                .fetch_add(1, Ordering::Relaxed);
             error!(%error, "readiness check failed");
             (
                 StatusCode::SERVICE_UNAVAILABLE,
@@ -500,6 +692,10 @@ async fn readiness(State(state): State<HttpState>) -> (StatusCode, Json<HealthBo
 }
 
 async fn metrics(State(state): State<HttpState>) -> (StatusCode, String) {
+    state
+        .metrics
+        .metrics_scrapes
+        .fetch_add(1, Ordering::Relaxed);
     match bounded_health(&state.engine).await {
         Ok(health) => {
             let snapshot_metrics = match &state.cluster {
@@ -508,17 +704,18 @@ async fn metrics(State(state): State<HttpState>) -> (StatusCode, String) {
             };
             (
                 StatusCode::OK,
-                format_metrics(
-                    health.streams,
-                    health.storage_bytes,
-                    health.redeliveries,
-                    health.dead_letters,
-                    state.metrics.deliveries.load(Ordering::Relaxed),
-                    snapshot_metrics,
-                ),
+                format_metrics(health, snapshot_metrics, &state.metrics),
             )
         }
         Err(error) => {
+            state
+                .metrics
+                .metrics_scrape_failures
+                .fetch_add(1, Ordering::Relaxed);
+            state
+                .metrics
+                .health_check_failures
+                .fetch_add(1, Ordering::Relaxed);
             error!(%error, "metrics check failed");
             (StatusCode::SERVICE_UNAVAILABLE, String::new())
         }
@@ -526,25 +723,268 @@ async fn metrics(State(state): State<HttpState>) -> (StatusCode, String) {
 }
 
 fn format_metrics(
-    streams: usize,
-    storage_bytes: u64,
-    redeliveries: u64,
-    dead_letters: u64,
-    deliveries: u64,
+    health: runnel_engine::HealthSnapshot,
     snapshot_metrics: SnapshotMetricsSnapshot,
+    metrics: &ServerMetrics,
 ) -> String {
-    format!(
-        "# TYPE runnel_streams gauge\nrunnel_streams {streams}\n# TYPE runnel_storage_bytes gauge\nrunnel_storage_bytes {storage_bytes}\n# TYPE runnel_redeliveries_total counter\nrunnel_redeliveries_total {redeliveries}\n# TYPE runnel_dead_letters_total counter\nrunnel_dead_letters_total {dead_letters}\n# HELP runnel_deliveries_total Number of messages returned by successful poll operations.\n# TYPE runnel_deliveries_total counter\nrunnel_deliveries_total {deliveries}\n# TYPE runnel_snapshot_builds_started_total counter\nrunnel_snapshot_builds_started_total {}\n# TYPE runnel_snapshot_builds_completed_total counter\nrunnel_snapshot_builds_completed_total {}\n# TYPE runnel_snapshot_build_failures_total counter\nrunnel_snapshot_build_failures_total {}\n# TYPE runnel_snapshot_installs_started_total counter\nrunnel_snapshot_installs_started_total {}\n# TYPE runnel_snapshot_installs_completed_total counter\nrunnel_snapshot_installs_completed_total {}\n# TYPE runnel_snapshot_install_failures_total counter\nrunnel_snapshot_install_failures_total {}\n# TYPE runnel_snapshot_install_bytes_total counter\nrunnel_snapshot_install_bytes_total {}\n# TYPE runnel_snapshot_installs_in_progress gauge\nrunnel_snapshot_installs_in_progress {}\n# TYPE runnel_snapshot_transfer_chunks_received_total counter\nrunnel_snapshot_transfer_chunks_received_total {}\n# TYPE runnel_snapshot_transfer_final_chunks_received_total counter\nrunnel_snapshot_transfer_final_chunks_received_total {}\n# TYPE runnel_snapshot_transfer_bytes_received_total counter\nrunnel_snapshot_transfer_bytes_received_total {}\n",
-        snapshot_metrics.builds_started,
-        snapshot_metrics.builds_completed,
-        snapshot_metrics.build_failures,
-        snapshot_metrics.installs_started,
-        snapshot_metrics.installs_completed,
-        snapshot_metrics.install_failures,
-        snapshot_metrics.install_bytes,
-        snapshot_metrics.installs_in_progress,
-        snapshot_metrics.transfer_chunks,
-        snapshot_metrics.transfer_final_chunks,
-        snapshot_metrics.transfer_bytes,
+    let mut output = String::with_capacity(5_000);
+    writeln!(
+        output,
+        "# HELP runnel_streams Number of streams currently known to the broker."
     )
+    .unwrap();
+    writeln!(
+        output,
+        "# TYPE runnel_streams gauge\nrunnel_streams {}",
+        health.streams
+    )
+    .unwrap();
+    writeln!(
+        output,
+        "# HELP runnel_storage_bytes Bytes currently occupied by broker storage."
+    )
+    .unwrap();
+    writeln!(
+        output,
+        "# TYPE runnel_storage_bytes gauge\nrunnel_storage_bytes {}",
+        health.storage_bytes
+    )
+    .unwrap();
+    writeln!(
+        output,
+        "# HELP runnel_active_connections Broker protocol connections currently being served."
+    )
+    .unwrap();
+    writeln!(
+        output,
+        "# TYPE runnel_active_connections gauge\nrunnel_active_connections {}",
+        metrics.active_connections.load(Ordering::Relaxed)
+    )
+    .unwrap();
+    writeln!(
+        output,
+        "# HELP runnel_active_requests Broker protocol requests currently executing."
+    )
+    .unwrap();
+    writeln!(
+        output,
+        "# TYPE runnel_active_requests gauge\nrunnel_active_requests {}",
+        metrics.active_requests.load(Ordering::Relaxed)
+    )
+    .unwrap();
+    writeln!(
+        output,
+        "# HELP runnel_redeliveries_total Messages delivered again after an acknowledgement timeout."
+    )
+    .unwrap();
+    writeln!(
+        output,
+        "# TYPE runnel_redeliveries_total counter\nrunnel_redeliveries_total {}",
+        health.redeliveries
+    )
+    .unwrap();
+    writeln!(
+        output,
+        "# HELP runnel_dead_letters_total Messages moved to a dead-letter stream after reaching the delivery limit."
+    )
+    .unwrap();
+    writeln!(
+        output,
+        "# TYPE runnel_dead_letters_total counter\nrunnel_dead_letters_total {}",
+        health.dead_letters
+    )
+    .unwrap();
+    writeln!(
+        output,
+        "# HELP runnel_deliveries_total Messages returned by successful poll operations."
+    )
+    .unwrap();
+    writeln!(
+        output,
+        "# TYPE runnel_deliveries_total counter\nrunnel_deliveries_total {}",
+        metrics.deliveries.load(Ordering::Relaxed)
+    )
+    .unwrap();
+    writeln!(
+        output,
+        "# HELP runnel_delivered_bytes_total Payload bytes returned by successful poll operations."
+    )
+    .unwrap();
+    writeln!(
+        output,
+        "# TYPE runnel_delivered_bytes_total counter\nrunnel_delivered_bytes_total {}",
+        metrics.delivered_bytes.load(Ordering::Relaxed)
+    )
+    .unwrap();
+    writeln!(
+        output,
+        "# HELP runnel_stream_creations_total Successful stream creation requests."
+    )
+    .unwrap();
+    writeln!(
+        output,
+        "# TYPE runnel_stream_creations_total counter\nrunnel_stream_creations_total {}",
+        metrics.stream_creations.load(Ordering::Relaxed)
+    )
+    .unwrap();
+    writeln!(
+        output,
+        "# HELP runnel_publishes_total Messages durably accepted by publish requests."
+    )
+    .unwrap();
+    writeln!(
+        output,
+        "# TYPE runnel_publishes_total counter\nrunnel_publishes_total {}",
+        metrics.publishes.load(Ordering::Relaxed)
+    )
+    .unwrap();
+    writeln!(
+        output,
+        "# HELP runnel_published_bytes_total Payload bytes durably accepted by publish requests."
+    )
+    .unwrap();
+    writeln!(
+        output,
+        "# TYPE runnel_published_bytes_total counter\nrunnel_published_bytes_total {}",
+        metrics.published_bytes.load(Ordering::Relaxed)
+    )
+    .unwrap();
+    writeln!(
+        output,
+        "# HELP runnel_acknowledgements_total Successful acknowledgement requests."
+    )
+    .unwrap();
+    writeln!(
+        output,
+        "# TYPE runnel_acknowledgements_total counter\nrunnel_acknowledgements_total {}",
+        metrics.acknowledgements.load(Ordering::Relaxed)
+    )
+    .unwrap();
+    writeln!(
+        output,
+        "# HELP runnel_metrics_scrapes_total Metrics endpoint requests."
+    )
+    .unwrap();
+    writeln!(
+        output,
+        "# TYPE runnel_metrics_scrapes_total counter\nrunnel_metrics_scrapes_total {}",
+        metrics.metrics_scrapes.load(Ordering::Relaxed)
+    )
+    .unwrap();
+    writeln!(
+        output,
+        "# HELP runnel_metrics_scrape_failures_total Metrics endpoint requests that could not complete a bounded health check."
+    )
+    .unwrap();
+    writeln!(
+        output,
+        "# TYPE runnel_metrics_scrape_failures_total counter\nrunnel_metrics_scrape_failures_total {}",
+        metrics.metrics_scrape_failures.load(Ordering::Relaxed)
+    )
+    .unwrap();
+    writeln!(
+        output,
+        "# HELP runnel_health_check_failures_total Readiness or metrics health checks that failed or timed out."
+    )
+    .unwrap();
+    writeln!(
+        output,
+        "# TYPE runnel_health_check_failures_total counter\nrunnel_health_check_failures_total {}",
+        metrics.health_check_failures.load(Ordering::Relaxed)
+    )
+    .unwrap();
+    writeln!(
+        output,
+        "# HELP runnel_broker_requests_total Broker protocol requests by fixed operation kind."
+    )
+    .unwrap();
+    writeln!(output, "# TYPE runnel_broker_requests_total counter").unwrap();
+    for operation in RequestOperation::ALL {
+        let index = operation.index();
+        writeln!(
+            output,
+            "runnel_broker_requests_total{{operation=\"{}\"}} {}",
+            operation.name(),
+            metrics.requests[index].load(Ordering::Relaxed)
+        )
+        .unwrap();
+    }
+    writeln!(
+        output,
+        "# HELP runnel_broker_request_failures_total Broker protocol requests that returned an error by fixed operation kind."
+    )
+    .unwrap();
+    writeln!(
+        output,
+        "# TYPE runnel_broker_request_failures_total counter"
+    )
+    .unwrap();
+    for operation in RequestOperation::ALL {
+        let index = operation.index();
+        writeln!(
+            output,
+            "runnel_broker_request_failures_total{{operation=\"{}\"}} {}",
+            operation.name(),
+            metrics.request_failures[index].load(Ordering::Relaxed)
+        )
+        .unwrap();
+    }
+    writeln!(
+        output,
+        "# HELP runnel_broker_request_duration_seconds Broker protocol request duration by fixed operation kind."
+    )
+    .unwrap();
+    writeln!(
+        output,
+        "# TYPE runnel_broker_request_duration_seconds histogram"
+    )
+    .unwrap();
+    for operation in RequestOperation::ALL {
+        let duration = &metrics.request_durations[operation.index()];
+        let mut cumulative = 0;
+        for (index, label) in LATENCY_BUCKET_LABELS.iter().enumerate() {
+            cumulative += duration.buckets[index].load(Ordering::Relaxed);
+            writeln!(
+                output,
+                "runnel_broker_request_duration_seconds_bucket{{operation=\"{}\",le=\"{}\"}} {}",
+                operation.name(),
+                label,
+                cumulative
+            )
+            .unwrap();
+        }
+        writeln!(
+            output,
+            "runnel_broker_request_duration_seconds_bucket{{operation=\"{}\",le=\"+Inf\"}} {}",
+            operation.name(),
+            duration.count.load(Ordering::Relaxed)
+        )
+        .unwrap();
+        writeln!(
+            output,
+            "runnel_broker_request_duration_seconds_sum{{operation=\"{}\"}} {:.6}",
+            operation.name(),
+            duration.sum_micros.load(Ordering::Relaxed) as f64 / 1_000_000.0
+        )
+        .unwrap();
+        writeln!(
+            output,
+            "runnel_broker_request_duration_seconds_count{{operation=\"{}\"}} {}",
+            operation.name(),
+            duration.count.load(Ordering::Relaxed)
+        )
+        .unwrap();
+    }
+    writeln!(output, "# TYPE runnel_snapshot_builds_started_total counter\nrunnel_snapshot_builds_started_total {}", snapshot_metrics.builds_started).unwrap();
+    writeln!(output, "# TYPE runnel_snapshot_builds_completed_total counter\nrunnel_snapshot_builds_completed_total {}", snapshot_metrics.builds_completed).unwrap();
+    writeln!(output, "# TYPE runnel_snapshot_build_failures_total counter\nrunnel_snapshot_build_failures_total {}", snapshot_metrics.build_failures).unwrap();
+    writeln!(output, "# TYPE runnel_snapshot_installs_started_total counter\nrunnel_snapshot_installs_started_total {}", snapshot_metrics.installs_started).unwrap();
+    writeln!(output, "# TYPE runnel_snapshot_installs_completed_total counter\nrunnel_snapshot_installs_completed_total {}", snapshot_metrics.installs_completed).unwrap();
+    writeln!(output, "# TYPE runnel_snapshot_install_failures_total counter\nrunnel_snapshot_install_failures_total {}", snapshot_metrics.install_failures).unwrap();
+    writeln!(output, "# TYPE runnel_snapshot_install_bytes_total counter\nrunnel_snapshot_install_bytes_total {}", snapshot_metrics.install_bytes).unwrap();
+    writeln!(output, "# TYPE runnel_snapshot_installs_in_progress gauge\nrunnel_snapshot_installs_in_progress {}", snapshot_metrics.installs_in_progress).unwrap();
+    writeln!(output, "# TYPE runnel_snapshot_transfer_chunks_received_total counter\nrunnel_snapshot_transfer_chunks_received_total {}", snapshot_metrics.transfer_chunks).unwrap();
+    writeln!(output, "# TYPE runnel_snapshot_transfer_final_chunks_received_total counter\nrunnel_snapshot_transfer_final_chunks_received_total {}", snapshot_metrics.transfer_final_chunks).unwrap();
+    writeln!(output, "# TYPE runnel_snapshot_transfer_bytes_received_total counter\nrunnel_snapshot_transfer_bytes_received_total {}", snapshot_metrics.transfer_bytes).unwrap();
+    output
 }
