@@ -243,10 +243,16 @@ fn metrics_report_messages_returned_by_polls() {
 
     let initial_metrics = http_metrics(server.http_addr);
     assert_eq!(metric_value(&initial_metrics, "runnel_deliveries_total"), 0);
+    assert_eq!(
+        metric_value(&initial_metrics, "runnel_active_connections"),
+        0
+    );
+    assert_eq!(metric_value(&initial_metrics, "runnel_active_requests"), 0);
     assert!(initial_metrics.contains(
-        "# HELP runnel_deliveries_total Number of messages returned by successful poll operations."
+        "# HELP runnel_deliveries_total Messages returned by successful poll operations."
     ));
     assert!(initial_metrics.contains("# TYPE runnel_deliveries_total counter"));
+    assert!(initial_metrics.contains("# TYPE runnel_broker_request_duration_seconds histogram"));
 
     assert!(matches!(
         request(
@@ -270,9 +276,91 @@ fn metrics_report_messages_returned_by_polls() {
         ),
         Response::Message { offset: 0, .. }
     ));
+    assert!(matches!(
+        request(
+            server.broker_addr,
+            Request::Ack {
+                stream: "events".to_owned(),
+                consumer: "worker".to_owned(),
+                offset: 0,
+            },
+        ),
+        Response::Acknowledged {
+            already_acknowledged: false,
+            ..
+        }
+    ));
 
     let metrics = http_metrics(server.http_addr);
     assert_eq!(metric_value(&metrics, "runnel_deliveries_total"), 1);
+    assert_eq!(metric_value(&metrics, "runnel_delivered_bytes_total"), 5);
+    assert_eq!(metric_value(&metrics, "runnel_publishes_total"), 1);
+    assert_eq!(metric_value(&metrics, "runnel_published_bytes_total"), 5);
+    assert_eq!(metric_value(&metrics, "runnel_acknowledgements_total"), 1);
+    assert_eq!(
+        labeled_metric_value(
+            &metrics,
+            "runnel_broker_requests_total",
+            "operation=\"publish\""
+        ),
+        1
+    );
+    assert_eq!(
+        labeled_metric_value(
+            &metrics,
+            "runnel_broker_request_failures_total",
+            "operation=\"publish\""
+        ),
+        0
+    );
+    assert_eq!(
+        labeled_metric_value(
+            &metrics,
+            "runnel_broker_request_duration_seconds_count",
+            "operation=\"poll\""
+        ),
+        1
+    );
+    assert!(metric_value(&metrics, "runnel_metrics_scrapes_total") >= 2);
+}
+
+#[test]
+fn metrics_report_protocol_failures_without_stream_labels() {
+    let directory = TempDir::new().unwrap();
+    let server = RunningServer::start(directory.path());
+
+    assert!(matches!(
+        request(
+            server.broker_addr,
+            Request::Poll {
+                stream: "missing-stream".to_owned(),
+                consumer: "worker".to_owned(),
+            },
+        ),
+        Response::Error { code, .. } if code == "stream_not_found"
+    ));
+
+    let metrics = http_metrics(server.http_addr);
+    assert_eq!(
+        labeled_metric_value(
+            &metrics,
+            "runnel_broker_requests_total",
+            "operation=\"poll\""
+        ),
+        1
+    );
+    assert_eq!(
+        labeled_metric_value(
+            &metrics,
+            "runnel_broker_request_failures_total",
+            "operation=\"poll\""
+        ),
+        1
+    );
+    assert!(metric_value(&metrics, "runnel_active_connections") <= 1);
+    assert_eq!(metric_value(&metrics, "runnel_active_requests"), 0);
+    assert!(!metrics.contains("missing-stream"));
+    assert!(!metrics.contains("worker"));
 }
 
 #[test]
@@ -570,6 +658,14 @@ fn metric_value(metrics: &str, name: &str) -> u64 {
     metrics
         .lines()
         .find_map(|line| line.strip_prefix(&format!("{name} ")))
+        .and_then(|value| value.parse().ok())
+        .unwrap_or_default()
+}
+
+fn labeled_metric_value(metrics: &str, name: &str, labels: &str) -> u64 {
+    metrics
+        .lines()
+        .find_map(|line| line.strip_prefix(&format!("{name}{{{labels}}} ")))
         .and_then(|value| value.parse().ok())
         .unwrap_or_default()
 }
