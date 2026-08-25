@@ -85,8 +85,8 @@ Run these from the repository root:
 - just bench-container-smoke exercises the container benchmark path with a small workload for CI.
 - just bench-cluster runs the real three-node clustered performance baseline.
 - just bench-cluster-smoke exercises the clustered benchmark lifecycle with a small workload.
-- just bench-pr-local benchmarks the current commit and `origin/main` on the same host under the same default 2-CPU/2-GiB Linux systemd user scope, repeats paired three-node results until stability or a seven-pair maximum, and writes paste-ready Markdown under `benchmark-results/pr-local/`.
-- just bench-pr-local-quick performs one paired run for a diagnostic smoke measurement only; it must not be used to support an optimization claim.
+- just bench-pr-local waits for the exclusive host benchmark lock, then benchmarks the current commit and `origin/main` on the same host under the same default 2-CPU/2-GiB Linux systemd user scope, repeats paired three-node results until stability or a seven-pair maximum, and writes paste-ready Markdown under `benchmark-results/pr-local/`.
+- just bench-pr-local-quick uses a shared lock with other diagnostic benchmark workflows and performs one paired run for a diagnostic smoke measurement only; it must not be used to support an optimization claim.
 - just profile-cluster captures optional Linux `perf` samples and reports for all clustered broker processes.
 - just profile-cluster-instrumented builds the opt-in Rust timing instrumentation and records internal stage timings without requiring `perf` permissions.
 - just bench-compare builds Runnel and runs the documented first-pass comparison against Kafka, Redpanda, and JetStream.
