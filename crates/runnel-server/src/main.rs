@@ -2,7 +2,7 @@ use std::collections::BTreeMap;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
 
 use axum::extract::State;
@@ -19,7 +19,10 @@ use runnel_raft::{GroupManager, NodeId, PersistentEngine, SnapshotMetricsSnapsho
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::watch;
+use tokio::task::JoinSet;
 use tracing::{error, info, warn};
+
+const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(25);
 
 #[derive(Debug, Parser)]
 #[command(name = "runnel", about = "A lightweight durable message broker")]
@@ -59,6 +62,7 @@ struct HttpState {
     engine: Arc<dyn Engine>,
     cluster: Option<Arc<GroupManager>>,
     metrics: Arc<ServerMetrics>,
+    shutting_down: Arc<AtomicBool>,
 }
 
 #[derive(Default)]
@@ -137,24 +141,28 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
 
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
+    let shutting_down = Arc::new(AtomicBool::new(false));
     let tcp_engine = Arc::clone(&engine);
     let server_metrics = Arc::new(ServerMetrics::default());
     let tcp_metrics = Arc::clone(&server_metrics);
-    let tcp_task = tokio::spawn(run_tcp(
+    let mut tcp_task = tokio::spawn(run_tcp(
         tcp_listener,
         tcp_engine,
         tcp_metrics,
         shutdown_rx.clone(),
     ));
-    if let Some((peer_listener, group)) = peer {
+    let mut peer_task = if let Some((peer_listener, group)) = peer {
         let peer_shutdown = shutdown_rx.clone();
-        tokio::spawn(async move {
+        Some(tokio::spawn(async move {
             if let Err(error) = runnel_raft::serve_peer(peer_listener, group, peer_shutdown).await {
                 error!(%error, "raft peer listener stopped");
             }
-        });
-    }
+        }))
+    } else {
+        None
+    };
 
+    let http_shutting_down = Arc::clone(&shutting_down);
     let app = Router::new()
         .route("/health/live", get(liveness))
         .route("/health/ready", get(readiness))
@@ -163,26 +171,48 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             engine,
             cluster,
             metrics: server_metrics,
+            shutting_down: http_shutting_down,
         });
-    let http_task = tokio::spawn(async move {
+    let mut http_task = tokio::spawn(async move {
         axum::serve(http_listener, app)
             .with_graceful_shutdown(wait_for_shutdown(shutdown_rx))
             .await
     });
 
-    tokio::select! {
-        result = tcp_task => {
+    let shutdown_reason = tokio::select! {
+        result = &mut tcp_task => {
             result??;
+            "broker listener stopped"
         }
-        result = http_task => {
+        result = &mut http_task => {
             result??;
+            "http listener stopped"
         }
         result = shutdown_signal() => {
             result?;
-            info!("shutdown signal received");
+            "shutdown signal received"
+        }
+    };
+
+    shutting_down.store(true, Ordering::Release);
+    let _ = shutdown_tx.send(true);
+    info!(reason = shutdown_reason, "runnel shutting down");
+
+    let drain = async {
+        let _ = (&mut tcp_task).await;
+        let _ = (&mut http_task).await;
+        if let Some(peer_task) = peer_task.as_mut() {
+            let _ = peer_task.await;
+        }
+    };
+    if tokio::time::timeout(SHUTDOWN_TIMEOUT, drain).await.is_err() {
+        warn!(?SHUTDOWN_TIMEOUT, "runnel shutdown drain timed out");
+        tcp_task.abort();
+        http_task.abort();
+        if let Some(peer_task) = peer_task {
+            peer_task.abort();
         }
     }
-    let _ = shutdown_tx.send(true);
     Ok(())
 }
 
@@ -215,18 +245,32 @@ async fn run_tcp(
     metrics: Arc<ServerMetrics>,
     mut shutdown: watch::Receiver<bool>,
 ) -> Result<(), std::io::Error> {
+    let mut connections = JoinSet::new();
     loop {
         tokio::select! {
             changed = shutdown.changed() => {
                 if changed.is_err() || *shutdown.borrow() {
+                    while let Some(result) = connections.join_next().await {
+                        if let Err(error) = result {
+                            warn!(%error, "broker connection task stopped during shutdown");
+                        }
+                    }
                     return Ok(());
+                }
+            }
+            Some(result) = connections.join_next(), if !connections.is_empty() => {
+                if let Err(error) = result {
+                    warn!(%error, "broker connection task stopped");
                 }
             }
             result = listener.accept() => {
                 let (stream, peer) = result?;
+                if *shutdown.borrow() {
+                    continue;
+                }
                 let engine = Arc::clone(&engine);
                 let metrics = Arc::clone(&metrics);
-                tokio::spawn(async move {
+                connections.spawn(async move {
                     if let Err(error) = handle_connection(stream, engine, metrics).await {
                         warn!(%peer, %error, "connection closed with error");
                     }
@@ -412,6 +456,17 @@ async fn liveness() -> StatusCode {
 }
 
 async fn readiness(State(state): State<HttpState>) -> (StatusCode, Json<HealthBody>) {
+    if state.shutting_down.load(Ordering::Acquire) {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(HealthBody {
+                status: "not_ready",
+                streams: 0,
+                storage_bytes: 0,
+            }),
+        );
+    }
+
     match state.engine.health().await {
         Ok(health) => (
             StatusCode::OK,
