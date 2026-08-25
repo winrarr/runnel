@@ -2,12 +2,20 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 sys.path.insert(0, str(SCRIPT_DIR))
 
-from cluster import metric, percentile, poll_until_redelivered, process_stats  # noqa: E402
+from cluster import (  # noqa: E402
+    metric,
+    parse_args,
+    parse_nonnegative_int,
+    percentile,
+    poll_until_redelivered,
+    process_stats,
+)
 from profile import summarize_timing_logs  # noqa: E402
 
 
@@ -57,6 +65,34 @@ class ClusterBenchmarkTests(unittest.TestCase):
         self.assertIsNotNone(sample)
         self.assertGreaterEqual(sample[0], 0)
         self.assertGreaterEqual(sample[1], 0)
+
+    def test_slow_consumer_delay_is_configurable_and_recorded(self) -> None:
+        with patch.object(
+            sys,
+            "argv",
+            [
+                "cluster.py",
+                "--messages",
+                "3",
+                "--slow-consumer-delay-ms",
+                "25",
+                "--ack-timeout-ms",
+                "100",
+            ],
+        ):
+            args = parse_args()
+        self.assertEqual(args.slow_consumer_delay_ms, 25)
+        self.assertEqual(args.ack_timeout_ms, 100)
+        self.assertEqual(parse_nonnegative_int("0"), 0)
+
+    def test_slow_consumer_delay_cannot_reach_ack_timeout(self) -> None:
+        with patch.object(
+            sys,
+            "argv",
+            ["cluster.py", "--slow-consumer-delay-ms", "100", "--ack-timeout-ms", "100"],
+        ):
+            with self.assertRaises(SystemExit):
+                parse_args()
 
     def test_timing_summary_normalizes_tracing_stage_names(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

@@ -46,6 +46,7 @@ DEFAULT_NODES = 3
 # Match the broker's default so constrained benchmark hosts do not turn slow
 # but valid operations into redeliveries while measuring unrelated scenarios.
 DEFAULT_ACK_TIMEOUT_MS = 30_000
+DEFAULT_SLOW_CONSUMER_DELAY_MS = 10
 COMMAND_TIMEOUT_SECONDS = 30.0
 
 
@@ -550,6 +551,57 @@ def run_consume_ack(
             client.close()
 
 
+def run_slow_consumer(
+    cluster: Cluster,
+    stream: str,
+    payload: str,
+    messages: int,
+    processing_delay_ms: int,
+) -> dict[str, Any]:
+    """Drain a bounded preloaded backlog with a fixed delay before each ack.
+
+    The intentional processing delay is excluded from request latency samples
+    but included in drain throughput. This keeps broker request latency
+    comparable with the normal consume/ack scenario while making the slow
+    consumer condition explicit in the result metadata.
+    """
+    preload(cluster, stream, payload, messages)
+    clients = [cluster.client(index) for index in range(cluster.node_count)]
+    try:
+        def operation() -> dict[str, Any]:
+            request_latencies: list[int] = []
+            started = time.perf_counter_ns()
+            for offset in range(messages):
+                client = clients[offset % len(clients)]
+                response, poll_elapsed = poll(client, stream, "slow-consumer", offset)
+                time.sleep(processing_delay_ms / 1_000)
+                ack_elapsed = acknowledge(client, stream, "slow-consumer", offset)
+                request_latencies.append(poll_elapsed + ack_elapsed)
+                if response.get("payload") != payload:
+                    raise BenchmarkError(f"slow consumer received unexpected payload at offset {offset}")
+            result = metric(
+                "cluster_slow_consumer",
+                request_latencies,
+                time.perf_counter_ns() - started,
+                message_size=len(payload),
+                metadata={
+                    "nodes": cluster.node_count,
+                    "processing_delay_ms": processing_delay_ms,
+                    "preloaded_messages": messages,
+                    "publish_setup_excluded": True,
+                    "redelivery_expected": False,
+                    "latency_scope": "poll_and_ack_request_time_excludes_processing_delay",
+                    "throughput_scope": "preloaded_backlog_drain_includes_processing_delay",
+                },
+            )
+            return result
+
+        return measured(cluster, operation)
+    finally:
+        for client in clients:
+            client.close()
+
+
 def run_grouped_consume_ack(
     cluster: Cluster, stream: str, payload: str, messages: int
 ) -> dict[str, Any]:
@@ -734,6 +786,16 @@ def parse_sizes(value: str) -> list[int]:
     return sizes
 
 
+def parse_nonnegative_int(value: str) -> int:
+    try:
+        number = int(value)
+    except ValueError as error:
+        raise argparse.ArgumentTypeError("must be an integer") from error
+    if number < 0:
+        raise argparse.ArgumentTypeError("must be non-negative")
+    return number
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--binary", type=Path, default=DEFAULT_BINARY)
@@ -743,6 +805,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--nodes", type=int, default=DEFAULT_NODES)
     parser.add_argument("--concurrency", type=int, default=2)
     parser.add_argument("--ack-timeout-ms", type=int, default=DEFAULT_ACK_TIMEOUT_MS)
+    parser.add_argument(
+        "--slow-consumer-delay-ms",
+        type=parse_nonnegative_int,
+        default=DEFAULT_SLOW_CONSUMER_DELAY_MS,
+        help="fixed processing delay before each slow-consumer acknowledgement",
+    )
     parser.add_argument("--payload-sizes", type=parse_sizes, default=[100, 1024])
     parser.add_argument("--skip-recovery", action="store_true")
     parser.add_argument("--output", type=Path)
@@ -752,6 +820,8 @@ def parse_args() -> argparse.Namespace:
         parser.error("messages, nodes, and concurrency must be positive; at least three nodes are required")
     if args.ack_timeout_ms <= 0:
         parser.error("ack timeout must be positive")
+    if args.slow_consumer_delay_ms >= args.ack_timeout_ms:
+        parser.error("slow consumer delay must be shorter than the acknowledgement timeout")
     return args
 
 
@@ -785,6 +855,15 @@ def main() -> int:
             )
             scenarios.append(
                 run_consume_ack(cluster, f"cluster_{run_id}_consume_{size}", payload, args.messages)
+            )
+            scenarios.append(
+                run_slow_consumer(
+                    cluster,
+                    f"cluster_{run_id}_slow_consumer_{size}",
+                    payload,
+                    args.messages,
+                    args.slow_consumer_delay_ms,
+                )
             )
             scenarios.append(
                 run_grouped_consume_ack(cluster, f"cluster_{run_id}_grouped_{size}", payload, args.messages)
@@ -825,6 +904,7 @@ def main() -> int:
             "concurrency": args.concurrency,
             "nodes": args.nodes,
             "ack_timeout_ms": args.ack_timeout_ms,
+            "slow_consumer_delay_ms": args.slow_consumer_delay_ms,
             "payload_sizes_bytes": args.payload_sizes,
             "protocol": "line-delimited JSON with UTF-8 string payloads",
             "durability": "committed by the current three-node Raft quorum and local durable state",
