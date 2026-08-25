@@ -59,11 +59,11 @@ bench-cluster:
 bench-cluster-smoke:
     python3 scripts/benchmarks/cluster.py --build --messages 20 --warmup 2 --payload-sizes 100 --skip-recovery
 
-bench-pr:
-    python3 scripts/benchmarks/cluster.py --build --binary target/release/runnel --messages 200 --warmup 100 --concurrency 2 --payload-sizes 100 --skip-recovery --output benchmark-results/pr-cluster.json --log-dir benchmark-results/logs/pr-cluster
-
 bench-pr-local *args:
     python3 scripts/benchmarks/pr_local.py {{args}}
+
+bench-pr-local-quick *args:
+    python3 scripts/benchmarks/pr_local.py --repetitions 1 {{args}}
 
 profile-cluster:
     python3 scripts/benchmarks/profile.py --build

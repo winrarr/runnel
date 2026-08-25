@@ -37,7 +37,6 @@ WORKFLOWS = (
     "bench-container-smoke",
     "bench-cluster",
     "bench-cluster-smoke",
-    "bench-pr",
     "profile-cluster",
     "bench-compare",
 )
@@ -184,19 +183,6 @@ def command_for(workflow: str, isolation: Isolation) -> list[str]:
             "--messages",
             "20",
             "--warmup",
-            "2",
-            "--payload-sizes",
-            "100",
-            "--skip-recovery",
-        ]
-    if workflow == "bench-pr":
-        return [
-            *cluster,
-            "--messages",
-            "200",
-            "--warmup",
-            "100",
-            "--concurrency",
             "2",
             "--payload-sizes",
             "100",
