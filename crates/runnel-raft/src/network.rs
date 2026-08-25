@@ -22,13 +22,13 @@ use runnel_engine::StageTimer;
 use runnel_engine::{AckResult, BrokerError, Offset, PollResult};
 
 const MAX_FRAME_SIZE: u32 = 64 * 1024 * 1024;
-// Forwarding currently receives only a peer address, so there is no long-lived
-// network object on which to scope its connections. Keep the compatibility
+// Topology-free forwarding and stateless control RPCs receive no long-lived
+// network object on which to scope their connections. Keep this compatibility
 // bridge process-wide but bounded until that ownership moves into the engine.
 const MAX_POOLED_PEERS: usize = 64;
 const MAX_CONNECTIONS_PER_POOLED_PEER: usize = 4;
 
-static FORWARD_POOLS: OnceLock<std::sync::Mutex<HashMap<String, Arc<ForwardConnectionPool>>>> =
+static PEER_POOLS: OnceLock<std::sync::Mutex<HashMap<String, Arc<PeerConnectionPool>>>> =
     OnceLock::new();
 
 #[derive(Clone)]
@@ -79,6 +79,20 @@ impl TcpConnection {
         }
     }
 
+    async fn pooled_request<Req, Res>(&self, request: Req, ttl: Duration) -> Result<Res, io::Error>
+    where
+        Req: Serialize,
+        Res: DeserializeOwned,
+    {
+        let address = self.address.clone().ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("node {} has no valid peer address", self.target),
+            )
+        })?;
+        peer_request(&address, request, ttl).await
+    }
+
     async fn request<Req, Res>(&mut self, request: Req, ttl: Duration) -> Result<Res, io::Error>
     where
         Req: Serialize,
@@ -127,12 +141,12 @@ impl TcpConnection {
     }
 }
 
-struct ForwardConnectionPool {
+struct PeerConnectionPool {
     permits: Arc<Semaphore>,
     idle: Mutex<Vec<TcpConnection>>,
 }
 
-impl ForwardConnectionPool {
+impl PeerConnectionPool {
     fn new() -> Self {
         Self {
             permits: Arc::new(Semaphore::new(MAX_CONNECTIONS_PER_POOLED_PEER)),
@@ -171,8 +185,8 @@ impl ForwardConnectionPool {
     }
 }
 
-fn forward_pool(address: &str) -> Option<Arc<ForwardConnectionPool>> {
-    let pools = FORWARD_POOLS.get_or_init(|| std::sync::Mutex::new(HashMap::new()));
+fn peer_pool(address: &str) -> Option<Arc<PeerConnectionPool>> {
+    let pools = PEER_POOLS.get_or_init(|| std::sync::Mutex::new(HashMap::new()));
     let mut pools = pools
         .lock()
         .expect("peer RPC pool registry is not poisoned");
@@ -182,7 +196,7 @@ fn forward_pool(address: &str) -> Option<Arc<ForwardConnectionPool>> {
     if pools.len() >= MAX_POOLED_PEERS {
         return None;
     }
-    let pool = Arc::new(ForwardConnectionPool::new());
+    let pool = Arc::new(PeerConnectionPool::new());
     pools.insert(address.to_owned(), Arc::clone(&pool));
     Some(pool)
 }
@@ -196,7 +210,7 @@ where
     Req: Serialize,
     Res: DeserializeOwned,
 {
-    if let Some(pool) = forward_pool(address) {
+    if let Some(pool) = peer_pool(address) {
         return pool.request(address, request, ttl).await;
     }
 
@@ -230,16 +244,16 @@ impl RaftNetwork<TypeConfig> for TcpConnection {
         rpc: AppendEntriesRequest<TypeConfig>,
         option: RPCOption,
     ) -> Result<AppendEntriesResponse<u64>, RPCError<u64, BasicNode, RaftError<u64>>> {
-        let response: PeerResponse = self
-            .request(
-                PeerRequest::AppendEntries {
-                    group_id: self.group_id.clone(),
-                    request: rpc,
-                },
-                option.hard_ttl(),
-            )
-            .await
-            .map_err(|error| unreachable_error(&error))?;
+        let request = PeerRequest::AppendEntries {
+            group_id: self.group_id.clone(),
+            request: rpc,
+        };
+        let response: PeerResponse = if request_is_heartbeat(&request) && self.stream.is_none() {
+            self.pooled_request(request, option.hard_ttl()).await
+        } else {
+            self.request(request, option.hard_ttl()).await
+        }
+        .map_err(|error| unreachable_error(&error))?;
         match response {
             PeerResponse::AppendEntries(response) => Ok(response),
             PeerResponse::Error(error) => Err(unreachable_error(&io::Error::other(error))),
@@ -283,16 +297,16 @@ impl RaftNetwork<TypeConfig> for TcpConnection {
         rpc: VoteRequest<u64>,
         option: RPCOption,
     ) -> Result<VoteResponse<u64>, RPCError<u64, BasicNode, RaftError<u64>>> {
-        let response: PeerResponse = self
-            .request(
-                PeerRequest::Vote {
-                    group_id: self.group_id.clone(),
-                    request: rpc,
-                },
-                option.hard_ttl(),
-            )
-            .await
-            .map_err(|error| unreachable_error(&error))?;
+        let request = PeerRequest::Vote {
+            group_id: self.group_id.clone(),
+            request: rpc,
+        };
+        let response: PeerResponse = if self.stream.is_none() {
+            self.pooled_request(request, option.hard_ttl()).await
+        } else {
+            self.request(request, option.hard_ttl()).await
+        }
+        .map_err(|error| unreachable_error(&error))?;
         match response {
             PeerResponse::Vote(response) => Ok(response),
             PeerResponse::Error(error) => Err(unreachable_error(&io::Error::other(error))),
@@ -302,6 +316,16 @@ impl RaftNetwork<TypeConfig> for TcpConnection {
             ))),
         }
     }
+}
+
+fn request_is_heartbeat(request: &PeerRequest) -> bool {
+    matches!(
+        request,
+        PeerRequest::AppendEntries {
+            request,
+            ..
+        } if request.entries.is_empty()
+    )
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -658,6 +682,7 @@ fn unreachable_snapshot_error(
 
 #[cfg(test)]
 mod tests {
+    use std::mem::size_of;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Instant;
@@ -667,6 +692,8 @@ mod tests {
     struct TestPeer {
         address: String,
         connections: Arc<AtomicUsize>,
+        requests: Arc<AtomicUsize>,
+        framed_bytes: Arc<AtomicUsize>,
         server: tokio::task::JoinHandle<()>,
     }
 
@@ -683,6 +710,10 @@ mod tests {
             let address = listener.local_addr().unwrap().to_string();
             let connections = Arc::new(AtomicUsize::new(0));
             let connection_count = Arc::clone(&connections);
+            let requests = Arc::new(AtomicUsize::new(0));
+            let request_count = Arc::clone(&requests);
+            let framed_bytes = Arc::new(AtomicUsize::new(0));
+            let framed_byte_count = Arc::clone(&framed_bytes);
             let server = tokio::spawn(async move {
                 let mut handlers = tokio::task::JoinSet::new();
                 loop {
@@ -693,6 +724,8 @@ mod tests {
                             };
                             stream.set_nodelay(true).unwrap();
                             connection_count.fetch_add(1, Ordering::Relaxed);
+                            let request_count = Arc::clone(&request_count);
+                            let framed_byte_count = Arc::clone(&framed_byte_count);
                             handlers.spawn(async move {
                                 let mut requests = 0;
                                 loop {
@@ -701,7 +734,21 @@ mod tests {
                                         Err(_) => break,
                                     };
                                     requests += 1;
+                                    request_count.fetch_add(1, Ordering::Relaxed);
+                                    let frame_size = serde_json::to_vec(&request).unwrap().len()
+                                        + size_of::<u32>();
+                                    framed_byte_count.fetch_add(frame_size, Ordering::Relaxed);
                                     let response = match request {
+                                        PeerRequest::AppendEntries { .. } => {
+                                            PeerResponse::AppendEntries(AppendEntriesResponse::Success)
+                                        }
+                                        PeerRequest::Vote { request, .. } => {
+                                            PeerResponse::Vote(VoteResponse::new(
+                                                request.vote,
+                                                request.last_log_id,
+                                                true,
+                                            ))
+                                        }
                                         PeerRequest::Forward(_) => {
                                             PeerResponse::Forward(ForwardedResponse::CreateStream(Ok(true)))
                                         }
@@ -726,6 +773,8 @@ mod tests {
             Self {
                 address,
                 connections,
+                requests,
+                framed_bytes,
                 server,
             }
         }
@@ -800,6 +849,90 @@ mod tests {
             started.elapsed()
         );
         assert_eq!(connections, 1);
+    }
+
+    #[tokio::test]
+    async fn control_plane_heartbeats_and_votes_reuse_a_bounded_connection() {
+        const REQUESTS: usize = 64;
+
+        let peer = TestPeer::start(None).await;
+        let mut network = TcpNetwork::new(BTreeMap::from([(1, peer.address.clone())]), "test");
+        let started = Instant::now();
+        for request_number in 0..REQUESTS {
+            let mut client = network.new_client(1, &BasicNode::new(&peer.address)).await;
+            if request_number % 2 == 0 {
+                let response = client
+                    .append_entries(
+                        AppendEntriesRequest {
+                            vote: openraft::Vote::new(1, 1),
+                            prev_log_id: None,
+                            entries: Vec::new(),
+                            leader_commit: None,
+                        },
+                        RPCOption::new(Duration::from_secs(1)),
+                    )
+                    .await
+                    .unwrap();
+                assert!(response.is_success());
+            } else {
+                let response = client
+                    .vote(
+                        VoteRequest::new(openraft::Vote::new(1, 1), None),
+                        RPCOption::new(Duration::from_secs(1)),
+                    )
+                    .await
+                    .unwrap();
+                assert!(response.vote_granted);
+            }
+        }
+
+        let connections = peer.connections.load(Ordering::Relaxed);
+        let requests = peer.requests.load(Ordering::Relaxed);
+        let framed_bytes = peer.framed_bytes.load(Ordering::Relaxed);
+        eprintln!(
+            "control-plane framing: requests={requests}, framed_bytes={framed_bytes}, connections={connections}, elapsed={:?}",
+            started.elapsed()
+        );
+        assert_eq!(requests, REQUESTS);
+        assert!(framed_bytes > REQUESTS * size_of::<u32>());
+        assert_eq!(connections, 1);
+    }
+
+    #[tokio::test]
+    async fn failed_control_plane_connection_is_replaced_before_next_request() {
+        let peer = TestPeer::start(Some(1)).await;
+        let mut network = TcpNetwork::new(BTreeMap::from([(1, peer.address.clone())]), "test");
+
+        let mut client = network.new_client(1, &BasicNode::new(&peer.address)).await;
+        client
+            .vote(
+                VoteRequest::new(openraft::Vote::new(1, 1), None),
+                RPCOption::new(Duration::from_secs(1)),
+            )
+            .await
+            .unwrap();
+
+        let mut client = network.new_client(1, &BasicNode::new(&peer.address)).await;
+        assert!(
+            client
+                .vote(
+                    VoteRequest::new(openraft::Vote::new(1, 1), None),
+                    RPCOption::new(Duration::from_secs(1)),
+                )
+                .await
+                .is_err()
+        );
+
+        let mut client = network.new_client(1, &BasicNode::new(&peer.address)).await;
+        client
+            .vote(
+                VoteRequest::new(openraft::Vote::new(1, 1), None),
+                RPCOption::new(Duration::from_secs(1)),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(peer.connections.load(Ordering::Relaxed), 2);
     }
 
     #[tokio::test]
