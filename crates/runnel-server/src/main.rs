@@ -23,6 +23,7 @@ use tokio::task::JoinSet;
 use tracing::{error, info, warn};
 
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(25);
+const HEALTH_CHECK_TIMEOUT: Duration = Duration::from_secs(1);
 
 #[derive(Debug, Parser)]
 #[command(name = "runnel", about = "A lightweight durable message broker")]
@@ -455,6 +456,14 @@ async fn liveness() -> StatusCode {
     StatusCode::OK
 }
 
+async fn bounded_health(
+    engine: &Arc<dyn Engine>,
+) -> Result<runnel_engine::HealthSnapshot, BrokerError> {
+    tokio::time::timeout(HEALTH_CHECK_TIMEOUT, engine.health())
+        .await
+        .map_err(|_| BrokerError::Cluster("health check timed out".to_owned()))?
+}
+
 async fn readiness(State(state): State<HttpState>) -> (StatusCode, Json<HealthBody>) {
     if state.shutting_down.load(Ordering::Acquire) {
         return (
@@ -467,7 +476,7 @@ async fn readiness(State(state): State<HttpState>) -> (StatusCode, Json<HealthBo
         );
     }
 
-    match state.engine.health().await {
+    match bounded_health(&state.engine).await {
         Ok(health) => (
             StatusCode::OK,
             Json(HealthBody {
@@ -491,7 +500,7 @@ async fn readiness(State(state): State<HttpState>) -> (StatusCode, Json<HealthBo
 }
 
 async fn metrics(State(state): State<HttpState>) -> (StatusCode, String) {
-    match state.engine.health().await {
+    match bounded_health(&state.engine).await {
         Ok(health) => {
             let snapshot_metrics = match &state.cluster {
                 Some(cluster) => cluster.snapshot_metrics().await,
