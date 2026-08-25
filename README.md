@@ -66,14 +66,13 @@ Useful workflows:
     just isolated cluster-test
     just isolated cluster-replacement-test
     just isolated bench-container-smoke
-    just isolated bench-pr
     just cluster-test
     just cluster-replacement-test
     just bench
     just bench-container
     just bench-cluster
-    just bench-pr
     just bench-pr-local
+    just bench-pr-local-quick
     just profile-cluster
     just profile-cluster-instrumented
     just bench-compare
@@ -99,11 +98,11 @@ The test suite includes core persistence and recovery tests, wire-format round-t
 
 `just profile-cluster-instrumented` enables the opt-in Rust timing feature and records stage timing summaries for protocol handling, lock waits, storage, Raft quorum operations, state-machine application, and peer RPCs. The default build does not compile these timing calls. It is useful on hosts where `perf` is unavailable or restricted; combine `--features instrumentation` with the normal profile command when both internal timings and `perf` are available.
 
-`just bench-pr` runs the short three-node clustered benchmark used by pull requests as an informational sanity check. For a performance-sensitive change, run `just bench-pr-local`: it benchmarks the current commit and `origin/main` on the same host, repeats each workload, aggregates medians, and writes a paste-ready Markdown report under `benchmark-results/pr-local/`. Use `just bench-pr-local -- --repetitions 1` for a quick measurement. The local benchmark skips restart recovery by default to keep feedback practical; the longer clustered history benchmark includes recovery separately.
+For a performance-sensitive change, run `just bench-pr-local`: it benchmarks the current commit and `origin/main` on the same host inside the same 2-CPU/2-GiB Linux systemd user scope, alternates paired runs, and repeats until throughput and p99 ranges are stable or the seven-pair maximum is reached. It aggregates medians and writes a paste-ready Markdown report under `benchmark-results/pr-local/`. The report marks results as stable, inconclusive, or diagnostic. `just bench-pr-local-quick` performs one pair for a fast diagnostic only; do not use it as evidence for an optimization. The local benchmark skips restart recovery by default to keep feedback practical; the longer clustered history benchmark includes recovery separately.
 
 `just bench-compare` builds Runnel and runs an isolated first-pass native-tool comparison against pinned Kafka, Redpanda, and NATS JetStream containers. It uses a 2 CPU/2 GiB broker and client budget by default because Redpanda's development container needs more than a 1 GiB cgroup. Results are written under the ignored `benchmark-results/` directory and must be read with the recorded measurement boundaries; this is an engineering baseline, not a final apples-to-apples claim. Missing pinned benchmark images are pulled automatically.
 
-`just bench-compare-cluster` runs the verified first three-node RF=3 publish comparison against Kafka, Redpanda, and NATS JetStream with explicit resource limits. `just bench-dashboard` generates local benchmark history data from JSON results under `benchmark-results/`. The GitHub Actions benchmark workflows keep the suites separate: pull requests receive short clustered and single-node Runnel sanity checks, daily and `main` runs record the longer Runnel-only history, and a weekly or manual workflow records the competitor comparisons. Use same-host `just bench-pr-local` results in performance-sensitive pull requests; Runnel history is the primary long-term signal for evaluating optimizations, while competitor series are separate ranking evidence. Each history suite is aggregated by median while retaining observed ranges and compatible-run comparisons, and the generated data is appended to the `benchmark-history` branch. GitHub Pages serves the hand-authored dashboard in `docs/benchmarks/` from `main`; the dashboard reads the public history data directly from that branch.
+`just bench-compare-cluster` runs the verified first three-node RF=3 publish comparison against Kafka, Redpanda, and NATS JetStream with explicit resource limits. `just bench-dashboard` generates local benchmark history data from JSON results under `benchmark-results/`. GitHub Actions keeps the longer Runnel-only history suite on pushes to `main` and daily, and runs competitor comparisons weekly or manually; it does not run noisy PR benchmark jobs. Use same-host `just bench-pr-local` results in performance-sensitive pull requests; Runnel history is the primary long-term signal for evaluating optimizations, while competitor series are separate ranking evidence. Each history suite is aggregated by median while retaining observed ranges and compatible-run comparisons, and the generated data is appended to the `benchmark-history` branch. GitHub Pages serves the hand-authored dashboard in `docs/benchmarks/` from `main`; the dashboard reads the public history data directly from that branch.
 
 The current protocol accepts one JSON request per TCP line. For example:
 

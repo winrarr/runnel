@@ -216,6 +216,30 @@ def _repetitions(result: dict[str, Any], sources: list[dict[str, Any]]) -> int |
     return None
 
 
+def _format_stability(result: dict[str, Any]) -> tuple[str | None, bool]:
+    value = result.get("benchmark_stability")
+    if not isinstance(value, dict):
+        return None, True
+    status = _bounded_text(value.get("status", "unknown"))
+    repetitions = _format_number(value.get("repetitions")) or "?"
+    parts = [f"{status} after {repetitions} paired runs"]
+    for key, label in (
+        ("observed_throughput_range_percent", "throughput range"),
+        ("observed_p99_range_percent", "p99 range"),
+    ):
+        formatted = _format_percent(value.get(key))
+        if formatted is not None:
+            parts.append(f"{label} {formatted}")
+    for key, label in (
+        ("maximum_throughput_range_percent", "throughput limit"),
+        ("maximum_p99_range_percent", "p99 limit"),
+    ):
+        formatted = _format_percent(value.get(key))
+        if formatted is not None:
+            parts.append(f"{label} {formatted}")
+    return "; ".join(parts), status == "stable"
+
+
 def _format_host(result: dict[str, Any]) -> str | None:
     environment = result.get("environment")
     host = result.get("host")
@@ -533,6 +557,11 @@ def render_report(
     repetitions = _repetitions(result, current_sources)
     if repetitions is not None:
         lines.append(f"- Repetitions: {repetitions} (displayed values are medians)")
+    stability, stable = _format_stability(result)
+    if stability is not None:
+        lines.append(f"- Measurement stability: {stability}")
+        if not stable:
+            lines.append("> Treat this result as diagnostic rather than confirmed performance evidence.")
     host = _format_host(result)
     if host is not None:
         lines.append(f"- Host: {host}")

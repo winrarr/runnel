@@ -707,6 +707,19 @@ def build_binary(binary: Path, *, features: str | None = None) -> None:
         raise BenchmarkError(f"release build did not produce {binary}")
 
 
+def resource_limits() -> dict[str, str]:
+    """Describe the optional cgroup budget supplied by a local harness."""
+    cpu = os.environ.get("RUNNEL_BENCHMARK_CPU_LIMIT")
+    memory = os.environ.get("RUNNEL_BENCHMARK_MEMORY_LIMIT")
+    if cpu and memory:
+        return {
+            "processes": "systemd user scope; benchmark client and broker nodes",
+            "cpu": cpu,
+            "memory": memory,
+        }
+    return {"processes": "host-scheduled; no cgroup limit"}
+
+
 def git_revision() -> str:
     result = subprocess.run(
         ["git", "rev-parse", "--short", "HEAD"], cwd=ROOT, capture_output=True, text=True, check=False
@@ -805,7 +818,7 @@ def main() -> int:
             "python": platform.python_version(),
             "cpus": os.cpu_count(),
         },
-        "resource_limits": {"processes": "host-scheduled; no cgroup limit"},
+        "resource_limits": resource_limits(),
         "workload": {
             "messages": args.messages,
             "warmup": args.warmup,

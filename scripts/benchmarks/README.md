@@ -146,58 +146,38 @@ The normalized schema intentionally excludes native tool logs. It retains worklo
 
 The dashboard uses the dedicated Runnel suite as the primary optimization history. Older Runnel points recorded by the native-comparison workflow remain available as a separate history, because their measurement boundary can differ. Charts keep benchmark suite, backend, operation, and payload size in separate visual series, so selecting all sizes or suites does not connect unrelated measurements or hide which point belongs to which workload. Raw run medians are shown as dots, while a five-run rolling median makes the direction of change easier to see; repetition ranges are shown as a band when available.
 
-## Pull-request performance
+## Local performance evidence
 
-Run the short pull-request sanity workload locally with:
-
-```text
-just bench-pr
-```
-
-This starts three real Runnel nodes and measures durable publish, non-grouped
-consume/acknowledge, sequential shared-consumer delivery, and parallel
-shared-consumer delivery through the public protocol. It uses 200 messages,
-100 warmup messages, two parallel members, and 100-byte payloads, and skips
-restart recovery to keep feedback fast. Use `just isolated bench-pr` when
-running it alongside another process-heavy workflow.
-
-The pull-request workflow runs this clustered benchmark as an informational
-sanity check and retains the existing single-node container benchmark as a
-secondary diagnostic. Shared hosted runners can vary substantially, so these
-points should not be treated as authoritative optimization evidence. The
-trusted comment workflow runs both exact workloads against the default branch
-and publishes separate reports with relative deltas.
-The clustered runner uses host-scheduled processes rather than cgroup limits,
-so its CPU and memory values are useful for matching PR-to-default-branch runs
-on the same hosted-runner class, not for direct comparison with the
-resource-limited single-node container result. The PR cluster workload skips
-restart recovery; the longer clustered history suite includes it.
-
-For pull-request feedback, render a short Runnel result as Markdown:
-
-```text
-python3 scripts/benchmarks/pr_report.py \
-  --input benchmark-results/pr.json \
-  --output benchmark-results/pr-comment.md
-```
-
-The report is deliberately informational and does not mix PR points into the long-term history unless a history workflow records them. For a performance-sensitive PR, use the same-host comparison helper:
+For a performance-sensitive change, use the same-host comparison helper:
 
 ```text
 just bench-pr-local
 ```
 
-It requires a clean current worktree and an available `origin/main` ref. The
-helper creates a detached base worktree, alternates the same three-node
-workload between the current commit and the base, repeats each side three
-times, aggregates medians, and writes a report plus raw JSON and logs under
-`benchmark-results/pr-local/<run>/`. The report includes the revisions,
-workload, host, repetition count, throughput, latency, CPU, memory, and
-relative deltas. Use `just bench-pr-local -- --repetitions 1` for a quick
-measurement, and paste the generated Markdown into the PR description. The
-trusted pull-request comment workflow also runs each exact hosted workload
-against the default branch and passes it as `--baseline`; a missing or failed
-baseline never suppresses the hosted result.
+This requires a clean current worktree and an available `origin/main` ref. The
+helper creates a detached base worktree and builds both revisions. Each paired
+three-node workload runs inside a Linux systemd user scope with the same
+default 2-CPU/2-GiB budget for the benchmark client and broker nodes. It runs
+at least three and at most seven pairs, stopping early when every measured
+throughput range is at most 10% and every p99 range is at most 20%. It
+aggregates medians and writes a report plus raw JSON and logs under
+`benchmark-results/pr-local/<run>/`. The report includes revisions, workload,
+limits, stability status, throughput, latency, CPU, memory, and relative
+deltas. Paste it into the PR description when the change can affect
+performance.
+
+The scope is deliberately shared by the client and all three broker nodes, so
+the two revisions receive the same total budget while retaining native process
+and network behavior. Pass `--cpus` and `--memory` after `--` to run a
+different explicitly recorded budget. Pass workload or stability flags after
+`--` when a controlled experiment needs them.
+
+`just bench-pr-local-quick` (or `just bench-pr-local -- --repetitions 1`)
+performs one pair for a fast diagnostic. It is useful for checking that a
+workload starts or for rough profiling, but it is not performance evidence.
+If the normal helper reaches its maximum without meeting the stability
+thresholds, keep the report and mark the result inconclusive rather than
+choosing a favorable run.
 
 For repeated measurements, normalize each independent result and aggregate the
 normalized files with the median as the displayed value:

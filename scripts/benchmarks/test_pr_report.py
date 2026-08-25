@@ -169,6 +169,22 @@ class PrReportTests(unittest.TestCase):
         self.assertIn("Repetitions: 3 (displayed values are medians)", report)
         self.assertIn("Host: platform `Linux-test`; CPUs `8`; Python `3.14.0`", report)
 
+    def test_reports_measurement_stability_and_warns_for_diagnostic_runs(self) -> None:
+        result = container_result()
+        result["benchmark_stability"] = {
+            "status": "fixed-repetitions",
+            "repetitions": 1,
+            "observed_throughput_range_percent": 0.0,
+            "observed_p99_range_percent": 0.0,
+            "maximum_throughput_range_percent": 10.0,
+            "maximum_p99_range_percent": 20.0,
+        }
+
+        report = pr_report.render_report(result)
+
+        self.assertIn("Measurement stability: fixed-repetitions after 1 paired runs", report)
+        self.assertIn("Treat this result as diagnostic", report)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -1,4 +1,6 @@
+import json
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 
@@ -9,8 +11,10 @@ sys.path.insert(0, str(SCRIPT_DIR))
 from pr_local import (  # noqa: E402
     BenchmarkOptions,
     BenchmarkTarget,
+    assess_stability,
     benchmark_command,
     reportable_result,
+    stamp_resource_limits,
 )
 
 
@@ -27,7 +31,13 @@ class PrLocalTests(unittest.TestCase):
     def options(self, *, include_recovery: bool = False) -> BenchmarkOptions:
         return BenchmarkOptions(
             base_ref="origin/main",
-            repetitions=3,
+            repetitions=None,
+            min_repetitions=3,
+            max_repetitions=7,
+            max_throughput_range_percent=10.0,
+            max_p99_range_percent=20.0,
+            cpu_limit="2",
+            memory_limit="2g",
             messages=1000,
             warmup=200,
             nodes=3,
@@ -79,6 +89,57 @@ class PrLocalTests(unittest.TestCase):
             "local release binary",
         )
         self.assertEqual(result["backends"]["runnel-cluster"]["image"], "/home/user/project/target/runnel")
+
+    def test_stability_requires_both_throughput_and_p99_ranges(self) -> None:
+        result = {
+            "backends": {
+                "runnel-cluster": {
+                    "scenarios": [
+                        {
+                            "repetition_summary": {
+                                "throughput_messages_per_second": {"relative_range_percent": 5.0},
+                                "latency_p99": {"relative_range_percent": 15.0},
+                            }
+                        }
+                    ]
+                }
+            }
+        }
+
+        stability = assess_stability(result, result, self.options(), 3)
+
+        self.assertEqual(stability["status"], "stable")
+
+    def test_stability_reports_inconclusive_after_maximum(self) -> None:
+        result = {
+            "backends": {
+                "runnel-cluster": {
+                    "scenarios": [
+                        {
+                            "repetition_summary": {
+                                "throughput_messages_per_second": {"relative_range_percent": 50.0},
+                                "latency_p99": {"relative_range_percent": 50.0},
+                            }
+                        }
+                    ]
+                }
+            }
+        }
+
+        stability = assess_stability(result, result, self.options(), 7)
+
+        self.assertEqual(stability["status"], "inconclusive")
+
+    def test_stamps_resource_limits_for_an_older_base_result(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "result.json"
+            path.write_text(json.dumps({"resource_limits": {"processes": "host-scheduled"}}), encoding="utf-8")
+
+            stamp_resource_limits(path, self.options())
+
+            result = json.loads(path.read_text(encoding="utf-8"))
+        self.assertEqual(result["resource_limits"]["cpu"], "2")
+        self.assertEqual(result["resource_limits"]["memory"], "2G")
 
 
 if __name__ == "__main__":

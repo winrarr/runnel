@@ -51,6 +51,17 @@ Shared Cargo registries are normally acceptable as caches, but shared target dir
 
 Parallel runs are suitable for exploratory correctness checks and rough optimization feedback. Host CPU scheduling, disk bandwidth, page cache, and kernel socket resources are still shared, so authoritative latency or throughput comparisons must run sequentially or with explicitly isolated CPU and storage resources.
 
+For any worker task that can affect throughput, latency, CPU, memory, batching,
+I/O, or scheduling, the worker must run the canonical local benchmark before
+claiming an improvement. Use `just bench-pr-local` after committing: it applies
+the same explicit CPU and memory limits to the current and baseline revisions,
+repeats paired runs until its stability thresholds are met or reports
+inconclusive at the maximum, and records the workload and provenance. A
+one-pair command such as `just bench-pr-local-quick` is a diagnostic only.
+Never treat a hosted PR benchmark or concurrent worker measurements as proof of
+a performance change. If the result is inconclusive, report that status and
+investigate or rerun rather than selecting a favorable sample.
+
 ## Worker instructions
 
 Tell each worker to:
@@ -58,6 +69,7 @@ Tell each worker to:
 - stay inside its assigned worktree and write scope;
 - use the repository's canonical `just` commands and existing benchmark harnesses;
 - record the exact revision, workload, resource limits, isolation settings, and commands;
+- for performance-sensitive work, run the local benchmark sequentially with a fixed CPU/memory budget and record the actual repetition count, stability thresholds, and stable/inconclusive status;
 - distinguish a confirmed improvement from noise, a blocked run, and an inconclusive result;
 - report changed files, correctness and crash-recovery considerations, test results, benchmark results, and remaining risks;
 - commit the result on its task branch when code is ready, or leave a clearly documented uncommitted patch when it is not.
