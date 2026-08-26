@@ -29,3 +29,9 @@ this rule and is not rewritten.
 The check is enforced by GitHub Actions for pull-request titles and new
 commits pushed to `main`. Automated dependency updates use a Conventional
 Commit prefix through Dependabot's commit-message configuration.
+
+## Branches and pull requests
+
+Create a non-`main` branch for each independently reviewable change and deliver
+it through a separate pull request. Direct pushes to `main` and bypassing
+repository rulesets or required checks are not allowed.
