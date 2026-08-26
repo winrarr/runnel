@@ -20,6 +20,8 @@ const REQUEST_READ_TIMEOUT: Duration = CLUSTER_WAIT_TIMEOUT;
 const REQUEST_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(10);
 #[cfg(feature = "test-replacement-recovery")]
 const RECOVERY_REQUEST_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(5);
+// Keep replication probes from holding the worker's delivery lease across failover.
+const REPLICATION_OBSERVER: &str = "replication-observer";
 #[cfg(feature = "test-replacement-recovery")]
 const SNAPSHOT_INTERRUPTION_ATTEMPTS: usize = 3;
 // This scenario checks stale-token fencing before acknowledging the current
@@ -505,17 +507,47 @@ fn three_process_cluster_replicates_and_recovers_after_failures() {
         Response::Published { offset: 1, .. }
     ));
     nodes[1].restart();
-    wait_for_message(nodes[1].broker_addr, 1, "during-follower-restart");
+    wait_for_message_for_consumer_at(
+        nodes[1].broker_addr,
+        "events",
+        REPLICATION_OBSERVER,
+        1,
+        "during-follower-restart",
+    );
     for node in &nodes {
         if node.child.is_some() {
-            wait_for_message(node.broker_addr, 1, "during-follower-restart");
+            wait_for_message_for_consumer_at(
+                node.broker_addr,
+                "events",
+                REPLICATION_OBSERVER,
+                1,
+                "during-follower-restart",
+            );
         }
     }
 
     nodes[leader].stop();
     let new_leader = wait_for_stream_on_any(&mut nodes, "events");
     assert_ne!(new_leader, leader);
-    wait_for_message(nodes[new_leader].broker_addr, 1, "during-follower-restart");
+    wait_for_message_for_consumer_at(
+        nodes[new_leader].broker_addr,
+        "events",
+        "worker",
+        1,
+        "during-follower-restart",
+    );
+    assert!(matches!(
+        wait_for_response_at(
+            nodes[new_leader].broker_addr,
+            || Request::Ack {
+                stream: "events".to_owned(),
+                consumer: "worker".to_owned(),
+                offset: 1,
+            },
+            |response| matches!(response, Response::Acknowledged { .. }),
+        ),
+        Response::Acknowledged { .. }
+    ));
     let post_failure_node = nodes
         .iter()
         .enumerate()
@@ -542,19 +574,13 @@ fn three_process_cluster_replicates_and_recovers_after_failures() {
         .find(|(index, node)| *index != new_leader && node.child.is_some())
         .expect("a follower should remain available")
         .1;
-    assert!(matches!(
-        wait_for_response_at(
-            nodes[post_failure_node].broker_addr,
-            || Request::Ack {
-                stream: "events".to_owned(),
-                consumer: "worker".to_owned(),
-                offset: 1,
-            },
-            |response| matches!(response, Response::Acknowledged { .. }),
-        ),
-        Response::Acknowledged { .. }
-    ));
-    wait_for_message(replicated_node.broker_addr, 2, "after-leader-failure");
+    wait_for_message_for_consumer_at(
+        replicated_node.broker_addr,
+        "events",
+        REPLICATION_OBSERVER,
+        2,
+        "after-leader-failure",
+    );
     assert_live_nodes(&mut nodes);
 }
 
@@ -1251,10 +1277,7 @@ fn assert_live_nodes(nodes: &mut [RunningNode]) {
     }
 }
 
-fn wait_for_message(address: SocketAddr, offset: u64, payload: &str) {
-    wait_for_message_at(address, offset, payload);
-}
-
+#[cfg(feature = "test-replacement-recovery")]
 fn wait_for_message_at(address: SocketAddr, offset: u64, payload: &str) {
     wait_for_message_for_consumer_at(address, "events", "worker", offset, payload);
 }
