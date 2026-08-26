@@ -652,7 +652,7 @@ async fn handle_connection(
                 send_response(
                     &mut writer,
                     &request_size_response(protocol_admission.max_request_bytes),
-                    remaining_timeout(started, protocol_admission.request_timeout),
+                    protocol_admission.request_timeout,
                     &metrics,
                 )
                 .await?;
@@ -666,7 +666,7 @@ async fn handle_connection(
                 send_response(
                     &mut writer,
                     &invalid_request_response("request frame must end with a newline"),
-                    remaining_timeout(started, protocol_admission.request_timeout),
+                    protocol_admission.request_timeout,
                     &metrics,
                 )
                 .await?;
@@ -694,10 +694,7 @@ async fn handle_connection(
                                         send_response(
                                             &mut writer,
                                             &response,
-                                            remaining_timeout(
-                                                started,
-                                                protocol_admission.request_timeout,
-                                            ),
+                                            protocol_admission.request_timeout,
                                             &metrics,
                                         )
                                         .await?;
@@ -744,7 +741,7 @@ async fn handle_connection(
                             (
                                 RequestOperation::InvalidRequest,
                                 invalid_request_response(&error.to_string()),
-                                remaining_timeout(started, protocol_admission.request_timeout),
+                                protocol_admission.request_timeout,
                             )
                         }
                     };
