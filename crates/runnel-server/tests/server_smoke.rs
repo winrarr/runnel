@@ -248,6 +248,26 @@ fn metrics_report_messages_returned_by_polls() {
         0
     );
     assert_eq!(metric_value(&initial_metrics, "runnel_active_requests"), 0);
+    assert_eq!(
+        metric_value(&initial_metrics, "runnel_broker_connections_accepted_total"),
+        0
+    );
+    assert_eq!(
+        metric_value(&initial_metrics, "runnel_broker_connections_closed_total"),
+        0
+    );
+    assert_eq!(
+        metric_value(&initial_metrics, "runnel_broker_connection_errors_total"),
+        0
+    );
+    assert_eq!(
+        metric_value(&initial_metrics, "runnel_broker_request_bytes_total"),
+        0
+    );
+    assert_eq!(
+        metric_value(&initial_metrics, "runnel_broker_response_bytes_total"),
+        0
+    );
     assert!(initial_metrics.contains(
         "# HELP runnel_deliveries_total Messages returned by successful poll operations."
     ));
@@ -297,6 +317,12 @@ fn metrics_report_messages_returned_by_polls() {
     assert_eq!(metric_value(&metrics, "runnel_publishes_total"), 1);
     assert_eq!(metric_value(&metrics, "runnel_published_bytes_total"), 5);
     assert_eq!(metric_value(&metrics, "runnel_acknowledgements_total"), 1);
+    assert!(
+        metric_value(&metrics, "runnel_broker_connections_accepted_total") >= 3,
+        "each broker request should be served by an accepted connection"
+    );
+    assert!(metric_value(&metrics, "runnel_broker_request_bytes_total") > 0);
+    assert!(metric_value(&metrics, "runnel_broker_response_bytes_total") > 0);
     assert_eq!(
         labeled_metric_value(
             &metrics,
@@ -322,6 +348,28 @@ fn metrics_report_messages_returned_by_polls() {
         1
     );
     assert!(metric_value(&metrics, "runnel_metrics_scrapes_total") >= 2);
+}
+
+#[test]
+fn metrics_report_connection_lifecycle_and_framing_errors() {
+    let directory = TempDir::new().unwrap();
+    let server = RunningServer::start(directory.path());
+
+    let mut connection = TcpStream::connect(server.broker_addr).unwrap();
+    connection
+        .write_all(&[0xff, b'\n'])
+        .expect("invalid UTF-8 should be written");
+    drop(connection);
+
+    let metrics =
+        wait_for_metric_at_least(server.http_addr, "runnel_broker_connection_errors_total", 1);
+    assert_eq!(
+        metric_value(&metrics, "runnel_broker_connection_errors_total"),
+        1
+    );
+    assert!(metric_value(&metrics, "runnel_broker_connections_accepted_total") >= 1);
+    assert!(metric_value(&metrics, "runnel_broker_connections_closed_total") >= 1);
+    assert_eq!(metric_value(&metrics, "runnel_active_connections"), 0);
 }
 
 #[test]
@@ -690,4 +738,18 @@ fn wait_for_http(address: SocketAddr) {
         sleep(Duration::from_millis(25));
     }
     panic!("runnel HTTP endpoint did not become ready");
+}
+
+fn wait_for_metric_at_least(address: SocketAddr, name: &str, expected: u64) -> String {
+    let deadline = Instant::now() + Duration::from_secs(2);
+    loop {
+        let metrics = http_metrics(address);
+        if metric_value(&metrics, name) >= expected {
+            return metrics;
+        }
+        if Instant::now() >= deadline {
+            panic!("metric {name} did not reach {expected}");
+        }
+        sleep(Duration::from_millis(25));
+    }
 }

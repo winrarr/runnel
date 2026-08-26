@@ -69,7 +69,12 @@ struct HttpState {
 
 struct ServerMetrics {
     active_connections: AtomicU64,
+    connections_accepted: AtomicU64,
+    connections_closed: AtomicU64,
+    connection_errors: AtomicU64,
     active_requests: AtomicU64,
+    request_bytes: AtomicU64,
+    response_bytes: AtomicU64,
     requests: [AtomicU64; REQUEST_OPERATION_COUNT],
     request_failures: [AtomicU64; REQUEST_OPERATION_COUNT],
     request_durations: [RequestDuration; REQUEST_OPERATION_COUNT],
@@ -172,7 +177,12 @@ impl Default for ServerMetrics {
     fn default() -> Self {
         Self {
             active_connections: AtomicU64::new(0),
+            connections_accepted: AtomicU64::new(0),
+            connections_closed: AtomicU64::new(0),
+            connection_errors: AtomicU64::new(0),
             active_requests: AtomicU64::new(0),
+            request_bytes: AtomicU64::new(0),
+            response_bytes: AtomicU64::new(0),
             requests: std::array::from_fn(|_| AtomicU64::new(0)),
             request_failures: std::array::from_fn(|_| AtomicU64::new(0)),
             request_durations: std::array::from_fn(|_| RequestDuration::default()),
@@ -217,6 +227,7 @@ struct ActiveConnection(Arc<ServerMetrics>);
 impl Drop for ActiveConnection {
     fn drop(&mut self) {
         self.0.active_connections.fetch_sub(1, Ordering::Relaxed);
+        self.0.connections_closed.fetch_add(1, Ordering::Relaxed);
     }
 }
 
@@ -426,10 +437,22 @@ async fn run_tcp(
                 if *shutdown.borrow() {
                     continue;
                 }
+                metrics
+                    .connections_accepted
+                    .fetch_add(1, Ordering::Relaxed);
                 let engine = Arc::clone(&engine);
-                let metrics = Arc::clone(&metrics);
+                let connection_metrics = Arc::clone(&metrics);
                 connections.spawn(async move {
-                    if let Err(error) = handle_connection(stream, engine, metrics).await {
+                    if let Err(error) = handle_connection(
+                        stream,
+                        engine,
+                        Arc::clone(&connection_metrics),
+                    )
+                    .await
+                    {
+                        connection_metrics
+                            .connection_errors
+                            .fetch_add(1, Ordering::Relaxed);
                         warn!(%peer, %error, "connection closed with error");
                     }
                 });
@@ -450,6 +473,9 @@ async fn handle_connection(
     while let Some(line) = lines.next_line().await? {
         #[cfg(feature = "instrumentation")]
         let _stage_timer = StageTimer::new("server.protocol_round_trip");
+        metrics
+            .request_bytes
+            .fetch_add((line.len() + 1) as u64, Ordering::Relaxed);
         metrics.active_requests.fetch_add(1, Ordering::Relaxed);
         let _active_request = ActiveRequest(Arc::clone(&metrics));
         let started = Instant::now();
@@ -472,6 +498,9 @@ async fn handle_connection(
         let mut encoded = serde_json::to_vec(&response)?;
         encoded.push(b'\n');
         writer.write_all(&encoded).await?;
+        metrics
+            .response_bytes
+            .fetch_add(encoded.len() as u64, Ordering::Relaxed);
     }
     Ok(())
 }
@@ -763,6 +792,39 @@ fn format_metrics(
     .unwrap();
     writeln!(
         output,
+        "# HELP runnel_broker_connections_accepted_total Broker protocol connections accepted."
+    )
+    .unwrap();
+    writeln!(
+        output,
+        "# TYPE runnel_broker_connections_accepted_total counter\nrunnel_broker_connections_accepted_total {}",
+        metrics.connections_accepted.load(Ordering::Relaxed)
+    )
+    .unwrap();
+    writeln!(
+        output,
+        "# HELP runnel_broker_connections_closed_total Broker protocol connections closed."
+    )
+    .unwrap();
+    writeln!(
+        output,
+        "# TYPE runnel_broker_connections_closed_total counter\nrunnel_broker_connections_closed_total {}",
+        metrics.connections_closed.load(Ordering::Relaxed)
+    )
+    .unwrap();
+    writeln!(
+        output,
+        "# HELP runnel_broker_connection_errors_total Broker protocol connections closed because of a transport or framing error."
+    )
+    .unwrap();
+    writeln!(
+        output,
+        "# TYPE runnel_broker_connection_errors_total counter\nrunnel_broker_connection_errors_total {}",
+        metrics.connection_errors.load(Ordering::Relaxed)
+    )
+    .unwrap();
+    writeln!(
+        output,
         "# HELP runnel_active_requests Broker protocol requests currently executing."
     )
     .unwrap();
@@ -770,6 +832,28 @@ fn format_metrics(
         output,
         "# TYPE runnel_active_requests gauge\nrunnel_active_requests {}",
         metrics.active_requests.load(Ordering::Relaxed)
+    )
+    .unwrap();
+    writeln!(
+        output,
+        "# HELP runnel_broker_request_bytes_total Bytes received in broker protocol request lines, including line delimiters."
+    )
+    .unwrap();
+    writeln!(
+        output,
+        "# TYPE runnel_broker_request_bytes_total counter\nrunnel_broker_request_bytes_total {}",
+        metrics.request_bytes.load(Ordering::Relaxed)
+    )
+    .unwrap();
+    writeln!(
+        output,
+        "# HELP runnel_broker_response_bytes_total Bytes written in broker protocol responses, including line delimiters."
+    )
+    .unwrap();
+    writeln!(
+        output,
+        "# TYPE runnel_broker_response_bytes_total counter\nrunnel_broker_response_bytes_total {}",
+        metrics.response_bytes.load(Ordering::Relaxed)
     )
     .unwrap();
     writeln!(
