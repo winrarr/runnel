@@ -44,10 +44,15 @@ DEFAULT_MAX_P99_RANGE_PERCENT = 20.0
 DEFAULT_PAYLOAD_SIZES = "100"
 DEFAULT_CPUS = "2"
 DEFAULT_MEMORY = "2g"
+INCONCLUSIVE_EXIT_CODE = 2
 
 
 class LocalBenchmarkError(RuntimeError):
     """An expected local benchmark setup or execution failure."""
+
+
+class InconclusiveBenchmarkError(LocalBenchmarkError):
+    """The benchmark completed but did not meet its stability thresholds."""
 
 
 @dataclass(frozen=True)
@@ -425,7 +430,7 @@ def require_stable(stability: dict[str, object], *, allow_inconclusive: bool) ->
         return
 
     status = stability.get("status", "unknown")
-    raise LocalBenchmarkError(
+    raise InconclusiveBenchmarkError(
         "authoritative benchmark finished with "
         f"{status}; stable repeated measurements are required. "
         "Rerun under the same controlled conditions or use --allow-inconclusive "
@@ -513,8 +518,12 @@ def main() -> int:
         print(f"Base revision: {base_revision[:12]} ({args.base_ref})")
         require_stable(stability, allow_inconclusive=args.allow_inconclusive)
         return 0
+    except InconclusiveBenchmarkError as error:
+        print(f"pr_local.py: error: {error}", file=sys.stderr)
+        return INCONCLUSIVE_EXIT_CODE
     except (LocalBenchmarkError, ResourceScopeError, OSError, subprocess.CalledProcessError) as error:
-        raise SystemExit(f"pr_local.py: error: {error}") from error
+        print(f"pr_local.py: error: {error}", file=sys.stderr)
+        return 1
 
 
 def run_target_once(

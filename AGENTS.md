@@ -123,6 +123,7 @@ Run these from the repository root:
 - just bench-cluster runs the real three-node clustered performance baseline.
 - just bench-cluster-smoke exercises the clustered benchmark lifecycle with a small workload.
 - just bench-pr-local waits for the exclusive host benchmark lock, then benchmarks the current commit and `origin/main` on the same host under the same default 2-CPU/2-GiB Linux systemd user scope, repeats paired three-node results until stability or a seven-pair maximum, writes paste-ready Markdown under `benchmark-results/pr-local/`, and exits nonzero unless the report is stable.
+- just bench-pr-local-until-stable holds the exclusive benchmark lock while rerunning complete authoritative comparisons after inconclusive results, preserving every attempt report and stopping only at stable evidence, a hard failure, or its explicit maximum-attempt budget.
 - just bench-pr-local-quick uses a shared lock with other diagnostic benchmark workflows and performs one paired run with an explicit diagnostic override; it must not be used to support an optimization claim.
 - just profile-cluster captures optional Linux `perf` samples and reports for all clustered broker processes.
 - just profile-cluster-instrumented builds the opt-in Rust timing instrumentation and records internal stage timings without requiring `perf` permissions; it uses the exclusive host benchmark lock.

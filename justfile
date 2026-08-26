@@ -64,6 +64,9 @@ bench-cluster-smoke:
 bench-pr-local *args:
     python3 scripts/benchmarks/lock.py --path {{benchmark_lock}} --mode exclusive -- python3 scripts/benchmarks/pr_local.py {{args}}
 
+bench-pr-local-until-stable *args:
+    python3 scripts/benchmarks/lock.py --path {{benchmark_lock}} --mode exclusive -- python3 scripts/benchmarks/pr_local_until_stable.py {{args}}
+
 bench-pr-local-quick *args:
     python3 scripts/benchmarks/lock.py --path {{benchmark_lock}} --mode shared -- python3 scripts/benchmarks/pr_local.py --repetitions 1 --allow-inconclusive {{args}}
 
