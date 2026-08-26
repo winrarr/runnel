@@ -17,14 +17,20 @@ use runnel_engine::StageTimer;
 use runnel_engine::{AckResult, BrokerError, Engine, PollResult};
 use runnel_protocol::{Request, Response};
 use runnel_raft::{GroupManager, NodeId, PersistentEngine, SnapshotMetricsSnapshot};
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::watch;
+use tokio::sync::{OwnedSemaphorePermit, Semaphore, watch};
 use tokio::task::JoinSet;
 use tracing::{error, info, warn};
 
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(25);
 const HEALTH_CHECK_TIMEOUT: Duration = Duration::from_secs(1);
+const DEFAULT_MAX_CONNECTIONS: usize = 1_024;
+const DEFAULT_MAX_REQUEST_BYTES: usize = 1_048_576;
+const DEFAULT_MAX_IN_FLIGHT_REQUESTS: usize = 256;
+const DEFAULT_REQUEST_TIMEOUT_MS: u64 = 30_000;
+const MAX_CONFIGURED_REQUEST_BYTES: usize = 64 * 1024 * 1024;
+const CONNECTION_REJECTION_WRITE_TIMEOUT: Duration = Duration::from_millis(10);
 
 #[derive(Debug, Parser)]
 #[command(name = "runnel", about = "A lightweight durable message broker")]
@@ -39,6 +45,28 @@ struct Args {
     http_listen: SocketAddr,
     #[arg(long, default_value_t = 30_000)]
     ack_timeout_ms: u64,
+    #[arg(
+        long,
+        visible_alias = "max-client-connections",
+        default_value_t = DEFAULT_MAX_CONNECTIONS
+    )]
+    max_connections: usize,
+    #[arg(
+        long = "max-request-bytes",
+        visible_alias = "max-frame-bytes",
+        default_value_t = DEFAULT_MAX_REQUEST_BYTES
+    )]
+    max_request_bytes: usize,
+    #[arg(
+        long,
+        default_value_t = DEFAULT_MAX_IN_FLIGHT_REQUESTS
+    )]
+    max_in_flight_requests: usize,
+    #[arg(
+        long,
+        default_value_t = DEFAULT_REQUEST_TIMEOUT_MS
+    )]
+    request_timeout_ms: u64,
     #[arg(long)]
     max_delivery_attempts: Option<u32>,
     #[arg(long)]
@@ -70,9 +98,14 @@ struct HttpState {
 struct ServerMetrics {
     active_connections: AtomicU64,
     connections_accepted: AtomicU64,
+    connections_rejected: AtomicU64,
     connections_closed: AtomicU64,
     connection_errors: AtomicU64,
     active_requests: AtomicU64,
+    requests_rejected: AtomicU64,
+    request_size_rejections: AtomicU64,
+    request_saturation_rejections: AtomicU64,
+    request_timeouts: AtomicU64,
     request_bytes: AtomicU64,
     response_bytes: AtomicU64,
     requests: [AtomicU64; REQUEST_OPERATION_COUNT],
@@ -87,6 +120,12 @@ struct ServerMetrics {
     metrics_scrapes: AtomicU64,
     metrics_scrape_failures: AtomicU64,
     health_check_failures: AtomicU64,
+}
+
+#[derive(Clone, Copy)]
+struct ProtocolAdmission {
+    max_request_bytes: usize,
+    request_timeout: Duration,
 }
 
 const REQUEST_OPERATION_COUNT: usize = 8;
@@ -178,9 +217,14 @@ impl Default for ServerMetrics {
         Self {
             active_connections: AtomicU64::new(0),
             connections_accepted: AtomicU64::new(0),
+            connections_rejected: AtomicU64::new(0),
             connections_closed: AtomicU64::new(0),
             connection_errors: AtomicU64::new(0),
             active_requests: AtomicU64::new(0),
+            requests_rejected: AtomicU64::new(0),
+            request_size_rejections: AtomicU64::new(0),
+            request_saturation_rejections: AtomicU64::new(0),
+            request_timeouts: AtomicU64::new(0),
             request_bytes: AtomicU64::new(0),
             response_bytes: AtomicU64::new(0),
             requests: std::array::from_fn(|_| AtomicU64::new(0)),
@@ -256,6 +300,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .init();
 
     let args = Args::parse();
+    validate_admission_config(&args)?;
     let tcp_listener = TcpListener::bind(args.listen).await?;
     let http_listener = TcpListener::bind(args.http_listen).await?;
 
@@ -314,10 +359,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let tcp_engine = Arc::clone(&engine);
     let server_metrics = Arc::new(ServerMetrics::default());
     let tcp_metrics = Arc::clone(&server_metrics);
+    let connection_slots = Arc::new(Semaphore::new(args.max_connections));
+    let request_slots = Arc::new(Semaphore::new(args.max_in_flight_requests));
+    let protocol_admission = ProtocolAdmission {
+        max_request_bytes: args.max_request_bytes,
+        request_timeout: Duration::from_millis(args.request_timeout_ms),
+    };
     let mut tcp_task = tokio::spawn(run_tcp(
         tcp_listener,
         tcp_engine,
         tcp_metrics,
+        connection_slots,
+        request_slots,
+        protocol_admission,
         shutdown_rx.clone(),
     ));
     let mut peer_task = if let Some((peer_listener, group)) = peer {
@@ -385,6 +439,25 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
+fn validate_admission_config(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
+    if args.max_connections == 0 {
+        return Err("--max-connections must be greater than zero".into());
+    }
+    if args.max_request_bytes == 0 || args.max_request_bytes > MAX_CONFIGURED_REQUEST_BYTES {
+        return Err(format!(
+            "--max-request-bytes must be between 1 and {MAX_CONFIGURED_REQUEST_BYTES}"
+        )
+        .into());
+    }
+    if args.max_in_flight_requests == 0 {
+        return Err("--max-in-flight-requests must be greater than zero".into());
+    }
+    if args.request_timeout_ms == 0 {
+        return Err("--request-timeout-ms must be greater than zero".into());
+    }
+    Ok(())
+}
+
 fn parse_cluster_nodes(
     values: &[String],
 ) -> Result<BTreeMap<NodeId, String>, Box<dyn std::error::Error>> {
@@ -412,6 +485,9 @@ async fn run_tcp(
     listener: TcpListener,
     engine: Arc<dyn Engine>,
     metrics: Arc<ServerMetrics>,
+    connection_slots: Arc<Semaphore>,
+    request_slots: Arc<Semaphore>,
+    protocol_admission: ProtocolAdmission,
     mut shutdown: watch::Receiver<bool>,
 ) -> Result<(), std::io::Error> {
     let mut connections = JoinSet::new();
@@ -440,13 +516,33 @@ async fn run_tcp(
                 metrics
                     .connections_accepted
                     .fetch_add(1, Ordering::Relaxed);
+                let connection_permit = match Arc::clone(&connection_slots).try_acquire_owned() {
+                    Ok(permit) => permit,
+                    Err(_) => {
+                        metrics
+                            .connections_rejected
+                            .fetch_add(1, Ordering::Relaxed);
+                        metrics
+                            .connections_closed
+                            .fetch_add(1, Ordering::Relaxed);
+                        reject_connection(stream).await;
+                        warn!(%peer, "broker connection rejected at connection limit");
+                        continue;
+                    }
+                };
                 let engine = Arc::clone(&engine);
                 let connection_metrics = Arc::clone(&metrics);
+                let connection_request_slots = Arc::clone(&request_slots);
+                let connection_shutdown = shutdown.clone();
                 connections.spawn(async move {
                     if let Err(error) = handle_connection(
                         stream,
                         engine,
                         Arc::clone(&connection_metrics),
+                        connection_permit,
+                        connection_request_slots,
+                        protocol_admission,
+                        connection_shutdown,
                     )
                     .await
                     {
@@ -465,44 +561,329 @@ async fn handle_connection(
     stream: TcpStream,
     engine: Arc<dyn Engine>,
     metrics: Arc<ServerMetrics>,
+    _connection_permit: OwnedSemaphorePermit,
+    request_slots: Arc<Semaphore>,
+    protocol_admission: ProtocolAdmission,
+    mut shutdown: watch::Receiver<bool>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     metrics.active_connections.fetch_add(1, Ordering::Relaxed);
     let _active_connection = ActiveConnection(Arc::clone(&metrics));
     let (reader, mut writer) = stream.into_split();
-    let mut lines = BufReader::new(reader).lines();
-    while let Some(line) = lines.next_line().await? {
-        #[cfg(feature = "instrumentation")]
-        let _stage_timer = StageTimer::new("server.protocol_round_trip");
-        metrics
-            .request_bytes
-            .fetch_add((line.len() + 1) as u64, Ordering::Relaxed);
-        metrics.active_requests.fetch_add(1, Ordering::Relaxed);
-        let _active_request = ActiveRequest(Arc::clone(&metrics));
-        let started = Instant::now();
-        let (operation, response) = match serde_json::from_str::<Request>(&line) {
-            Ok(request) => {
-                let operation = RequestOperation::from_request(&request);
-                let response = handle_request(engine.as_ref(), request, &metrics).await;
-                (operation, response)
+    let mut reader = BufReader::new(reader);
+    let mut served_request = false;
+    loop {
+        if *shutdown.borrow() && !served_request {
+            return Ok(());
+        }
+
+        // Waiting for the first byte is intentionally not timed. An idle
+        // persistent connection is valid; once a request starts, its frame
+        // must complete within the request deadline.
+        let has_data = if served_request {
+            !reader.fill_buf().await?.is_empty()
+        } else {
+            tokio::select! {
+                result = reader.fill_buf() => !result?.is_empty(),
+                changed = shutdown.changed() => {
+                    if changed.is_err() || *shutdown.borrow() {
+                        return Ok(());
+                    }
+                    continue;
+                }
             }
-            Err(error) => (
-                RequestOperation::InvalidRequest,
-                Response::Error {
-                    code: "invalid_request".to_owned(),
-                    message: error.to_string(),
-                },
-            ),
         };
-        let failed = matches!(&response, Response::Error { .. });
-        metrics.record_request(operation, started.elapsed(), failed);
-        let mut encoded = serde_json::to_vec(&response)?;
-        encoded.push(b'\n');
-        writer.write_all(&encoded).await?;
-        metrics
-            .response_bytes
-            .fetch_add(encoded.len() as u64, Ordering::Relaxed);
+        if !has_data {
+            return Ok(());
+        }
+
+        let started = Instant::now();
+        let frame_result = if served_request {
+            Some(
+                tokio::time::timeout(
+                    protocol_admission.request_timeout,
+                    read_frame(&mut reader, protocol_admission.max_request_bytes),
+                )
+                .await,
+            )
+        } else {
+            tokio::select! {
+                result = tokio::time::timeout(
+                    protocol_admission.request_timeout,
+                    read_frame(&mut reader, protocol_admission.max_request_bytes),
+                ) => Some(result),
+                changed = shutdown.changed() => {
+                    if changed.is_err() || *shutdown.borrow() {
+                        return Ok(());
+                    }
+                    None
+                }
+            }
+        };
+        let Some(frame_result) = frame_result else {
+            continue;
+        };
+        let frame = match frame_result {
+            Ok(result) => result?,
+            Err(_) => {
+                metrics.request_timeouts.fetch_add(1, Ordering::Relaxed);
+                metrics.record_request(RequestOperation::InvalidRequest, started.elapsed(), true);
+                send_response(
+                    &mut writer,
+                    &timeout_response(),
+                    protocol_admission.request_timeout,
+                    &metrics,
+                )
+                .await?;
+                return Ok(());
+            }
+        };
+
+        match frame {
+            Frame::End => return Ok(()),
+            Frame::TooLarge { bytes } => {
+                metrics
+                    .request_bytes
+                    .fetch_add(bytes.len() as u64, Ordering::Relaxed);
+                metrics.requests_rejected.fetch_add(1, Ordering::Relaxed);
+                metrics
+                    .request_size_rejections
+                    .fetch_add(1, Ordering::Relaxed);
+                metrics.record_request(RequestOperation::InvalidRequest, started.elapsed(), true);
+                send_response(
+                    &mut writer,
+                    &request_size_response(protocol_admission.max_request_bytes),
+                    remaining_timeout(started, protocol_admission.request_timeout),
+                    &metrics,
+                )
+                .await?;
+                return Ok(());
+            }
+            Frame::Unterminated { bytes } => {
+                metrics
+                    .request_bytes
+                    .fetch_add(bytes.len() as u64, Ordering::Relaxed);
+                metrics.record_request(RequestOperation::InvalidRequest, started.elapsed(), true);
+                send_response(
+                    &mut writer,
+                    &invalid_request_response("request frame must end with a newline"),
+                    remaining_timeout(started, protocol_admission.request_timeout),
+                    &metrics,
+                )
+                .await?;
+                return Ok(());
+            }
+            Frame::Complete { bytes } => {
+                metrics
+                    .request_bytes
+                    .fetch_add(bytes.len() as u64, Ordering::Relaxed);
+                let line = request_line(&bytes);
+                let (operation, response, response_timeout) =
+                    match serde_json::from_slice::<Request>(line) {
+                        Ok(request) => {
+                            let operation = RequestOperation::from_request(&request);
+                            let request_permit =
+                                match Arc::clone(&request_slots).try_acquire_owned() {
+                                    Ok(permit) => permit,
+                                    Err(_) => {
+                                        metrics.requests_rejected.fetch_add(1, Ordering::Relaxed);
+                                        metrics
+                                            .request_saturation_rejections
+                                            .fetch_add(1, Ordering::Relaxed);
+                                        let response = saturated_response();
+                                        metrics.record_request(operation, started.elapsed(), true);
+                                        send_response(
+                                            &mut writer,
+                                            &response,
+                                            remaining_timeout(
+                                                started,
+                                                protocol_admission.request_timeout,
+                                            ),
+                                            &metrics,
+                                        )
+                                        .await?;
+                                        continue;
+                                    }
+                                };
+                            let _request_permit = request_permit;
+                            metrics.active_requests.fetch_add(1, Ordering::Relaxed);
+                            let _active_request = ActiveRequest(Arc::clone(&metrics));
+                            #[cfg(feature = "instrumentation")]
+                            let _stage_timer = StageTimer::new("server.protocol_round_trip");
+                            let mut response_timeout =
+                                remaining_timeout(started, protocol_admission.request_timeout);
+                            let response = match tokio::time::timeout(
+                                response_timeout,
+                                handle_request(engine.as_ref(), request, &metrics),
+                            )
+                            .await
+                            {
+                                Ok(response) => response,
+                                Err(_) => {
+                                    metrics.request_timeouts.fetch_add(1, Ordering::Relaxed);
+                                    // Preserve a client-visible timeout response
+                                    // after the engine deadline has elapsed.
+                                    response_timeout = protocol_admission.request_timeout;
+                                    timeout_response()
+                                }
+                            };
+                            (operation, response, response_timeout)
+                        }
+                        Err(error) => {
+                            if std::str::from_utf8(line).is_err() {
+                                metrics.record_request(
+                                    RequestOperation::InvalidRequest,
+                                    started.elapsed(),
+                                    true,
+                                );
+                                return Err(std::io::Error::new(
+                                    std::io::ErrorKind::InvalidData,
+                                    "request frame was not valid UTF-8",
+                                )
+                                .into());
+                            }
+                            (
+                                RequestOperation::InvalidRequest,
+                                invalid_request_response(&error.to_string()),
+                                remaining_timeout(started, protocol_admission.request_timeout),
+                            )
+                        }
+                    };
+                let failed = matches!(&response, Response::Error { .. });
+                metrics.record_request(operation, started.elapsed(), failed);
+                send_response(&mut writer, &response, response_timeout, &metrics).await?;
+                served_request = true;
+            }
+        }
     }
+}
+
+enum Frame {
+    End,
+    Complete { bytes: Vec<u8> },
+    Unterminated { bytes: Vec<u8> },
+    TooLarge { bytes: Vec<u8> },
+}
+
+async fn read_frame<R>(
+    reader: &mut BufReader<R>,
+    max_request_bytes: usize,
+) -> std::io::Result<Frame>
+where
+    R: AsyncRead + Unpin,
+{
+    let max_frame_bytes = max_request_bytes
+        .checked_add(1)
+        .ok_or_else(|| std::io::Error::other("maximum request size is too large"))?;
+    let mut bytes = Vec::with_capacity(max_frame_bytes.min(8 * 1024));
+
+    loop {
+        let buffered = reader.fill_buf().await?;
+        if buffered.is_empty() {
+            return Ok(if bytes.is_empty() {
+                Frame::End
+            } else {
+                Frame::Unterminated { bytes }
+            });
+        }
+
+        let newline = buffered.iter().position(|byte| *byte == b'\n');
+        let bytes_to_consume = newline.map_or(buffered.len(), |index| index + 1);
+        if bytes.len().saturating_add(bytes_to_consume) > max_frame_bytes {
+            let remaining = max_frame_bytes - bytes.len();
+            bytes.extend_from_slice(&buffered[..remaining]);
+            reader.consume(remaining);
+            return Ok(Frame::TooLarge { bytes });
+        }
+
+        bytes.extend_from_slice(&buffered[..bytes_to_consume]);
+        reader.consume(bytes_to_consume);
+        if newline.is_some() {
+            return Ok(Frame::Complete { bytes });
+        }
+        if bytes.len() == max_frame_bytes {
+            return Ok(Frame::TooLarge { bytes });
+        }
+    }
+}
+
+fn request_line(bytes: &[u8]) -> &[u8] {
+    let line = &bytes[..bytes.len() - 1];
+    line.strip_suffix(b"\r").unwrap_or(line)
+}
+
+fn remaining_timeout(started: Instant, timeout: Duration) -> Duration {
+    timeout.saturating_sub(started.elapsed())
+}
+
+async fn send_response<W>(
+    writer: &mut W,
+    response: &Response,
+    timeout: Duration,
+    metrics: &ServerMetrics,
+) -> std::io::Result<()>
+where
+    W: AsyncWrite + Unpin,
+{
+    let mut encoded = serde_json::to_vec(response).map_err(|error| {
+        std::io::Error::other(format!("response serialization failed: {error}"))
+    })?;
+    encoded.push(b'\n');
+    match tokio::time::timeout(timeout, writer.write_all(&encoded)).await {
+        Ok(result) => result?,
+        Err(_) => {
+            metrics.request_timeouts.fetch_add(1, Ordering::Relaxed);
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "response write timed out",
+            ));
+        }
+    }
+    metrics
+        .response_bytes
+        .fetch_add(encoded.len() as u64, Ordering::Relaxed);
     Ok(())
+}
+
+async fn reject_connection(stream: TcpStream) {
+    // A rejected connection is not assigned a task. try_write keeps the
+    // accept loop from being held by a client that will not read the error.
+    let response = b"{\"type\":\"error\",\"code\":\"connection_limit\",\"message\":\"maximum client connections reached\"}\n";
+    if let Err(error) = stream.try_write(response)
+        && error.kind() == std::io::ErrorKind::WouldBlock
+    {
+        let _ = tokio::time::timeout(CONNECTION_REJECTION_WRITE_TIMEOUT, stream.writable()).await;
+        let _ = stream.try_write(response);
+    }
+}
+
+fn invalid_request_response(message: &str) -> Response {
+    Response::Error {
+        code: "invalid_request".to_owned(),
+        message: message.to_owned(),
+    }
+}
+
+fn request_size_response(max_request_bytes: usize) -> Response {
+    Response::Error {
+        code: "request_too_large".to_owned(),
+        message: format!(
+            "request frame exceeds the configured maximum of {max_request_bytes} bytes"
+        ),
+    }
+}
+
+fn saturated_response() -> Response {
+    Response::Error {
+        code: "request_saturated".to_owned(),
+        message: "maximum in-flight request work is currently active".to_owned(),
+    }
+}
+
+fn timeout_response() -> Response {
+    Response::Error {
+        code: "request_timeout".to_owned(),
+        message: "request exceeded the configured timeout".to_owned(),
+    }
 }
 
 async fn handle_request(
@@ -803,6 +1184,17 @@ fn format_metrics(
     .unwrap();
     writeln!(
         output,
+        "# HELP runnel_broker_connections_rejected_total Broker protocol connections rejected because the connection limit was reached."
+    )
+    .unwrap();
+    writeln!(
+        output,
+        "# TYPE runnel_broker_connections_rejected_total counter\nrunnel_broker_connections_rejected_total {}",
+        metrics.connections_rejected.load(Ordering::Relaxed)
+    )
+    .unwrap();
+    writeln!(
+        output,
         "# HELP runnel_broker_connections_closed_total Broker protocol connections closed."
     )
     .unwrap();
@@ -832,6 +1224,52 @@ fn format_metrics(
         output,
         "# TYPE runnel_active_requests gauge\nrunnel_active_requests {}",
         metrics.active_requests.load(Ordering::Relaxed)
+    )
+    .unwrap();
+    writeln!(
+        output,
+        "# HELP runnel_broker_requests_rejected_total Broker protocol requests rejected before engine execution."
+    )
+    .unwrap();
+    writeln!(
+        output,
+        "# TYPE runnel_broker_requests_rejected_total counter\nrunnel_broker_requests_rejected_total {}",
+        metrics.requests_rejected.load(Ordering::Relaxed)
+    )
+    .unwrap();
+    writeln!(
+        output,
+        "# HELP runnel_broker_request_size_rejections_total Broker protocol requests rejected because their frame exceeded the configured maximum."
+    )
+    .unwrap();
+    writeln!(
+        output,
+        "# TYPE runnel_broker_request_size_rejections_total counter\nrunnel_broker_request_size_rejections_total {}",
+        metrics.request_size_rejections.load(Ordering::Relaxed)
+    )
+    .unwrap();
+    writeln!(
+        output,
+        "# HELP runnel_broker_request_saturation_total Broker protocol requests rejected because all in-flight request permits were occupied."
+    )
+    .unwrap();
+    writeln!(
+        output,
+        "# TYPE runnel_broker_request_saturation_total counter\nrunnel_broker_request_saturation_total {}",
+        metrics
+            .request_saturation_rejections
+            .load(Ordering::Relaxed)
+    )
+    .unwrap();
+    writeln!(
+        output,
+        "# HELP runnel_broker_request_timeouts_total Broker protocol requests whose frame, engine work, or response write exceeded its timeout."
+    )
+    .unwrap();
+    writeln!(
+        output,
+        "# TYPE runnel_broker_request_timeouts_total counter\nrunnel_broker_request_timeouts_total {}",
+        metrics.request_timeouts.load(Ordering::Relaxed)
     )
     .unwrap();
     writeln!(
