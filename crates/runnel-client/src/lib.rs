@@ -73,6 +73,74 @@ pub enum ClientError {
     },
 }
 
+/// The result classification for one request attempt.
+///
+/// The classification is deliberately not serialized. It describes what the
+/// client can safely infer about an attempt from the existing provisional
+/// protocol and transport behavior.
+#[derive(Debug)]
+pub enum AttemptOutcome {
+    /// The broker returned a non-error response, so the operation is confirmed.
+    Confirmed(Response),
+    /// The broker definitely rejected the request or the request could not be encoded locally.
+    Rejected(AttemptFailure),
+    /// Retrying on a new connection is safe according to the response or failure boundary.
+    Retryable(AttemptFailure),
+    /// The broker may have processed the request, so retrying can duplicate it.
+    Unknown(AttemptFailure),
+}
+
+/// The response or client error behind a non-confirmed attempt classification.
+#[derive(Debug)]
+pub enum AttemptFailure {
+    Broker(Response),
+    Client(ClientError),
+}
+
+impl AttemptOutcome {
+    /// Classify a failure that occurred before a request was attempted.
+    ///
+    /// Connection failures are retryable because no request bytes were sent.
+    /// Callers should use [`Client::request_with_outcome`] for an established
+    /// connection; failures from that method are classified conservatively as
+    /// unknown once request writing may have started.
+    pub fn from_client_error(error: ClientError) -> Self {
+        match &error {
+            ClientError::ConnectTimeout { .. } | ClientError::Connect { .. } => {
+                Self::Retryable(AttemptFailure::Client(error))
+            }
+            ClientError::EncodeRequest { .. } => Self::Rejected(AttemptFailure::Client(error)),
+            _ => Self::Unknown(AttemptFailure::Client(error)),
+        }
+    }
+
+    /// Return the broker response carried by this outcome, if one exists.
+    pub fn response(&self) -> Option<&Response> {
+        match self {
+            Self::Confirmed(response)
+            | Self::Rejected(AttemptFailure::Broker(response))
+            | Self::Retryable(AttemptFailure::Broker(response))
+            | Self::Unknown(AttemptFailure::Broker(response)) => Some(response),
+            Self::Rejected(AttemptFailure::Client(_))
+            | Self::Retryable(AttemptFailure::Client(_))
+            | Self::Unknown(AttemptFailure::Client(_)) => None,
+        }
+    }
+
+    /// Return the client error carried by this outcome, if one exists.
+    pub fn client_error(&self) -> Option<&ClientError> {
+        match self {
+            Self::Rejected(AttemptFailure::Client(error))
+            | Self::Retryable(AttemptFailure::Client(error))
+            | Self::Unknown(AttemptFailure::Client(error)) => Some(error),
+            Self::Confirmed(_)
+            | Self::Rejected(AttemptFailure::Broker(_))
+            | Self::Retryable(AttemptFailure::Broker(_))
+            | Self::Unknown(AttemptFailure::Broker(_)) => None,
+        }
+    }
+}
+
 /// A persistent, sequential TCP client for the provisional JSON-lines protocol.
 ///
 /// A client sends one request and reads one response per [`Client::request`] call.
@@ -108,6 +176,21 @@ impl Client {
             writer,
             config,
         })
+    }
+
+    /// Connect to a broker while classifying connection failures as retryable.
+    pub async fn connect_with_outcome(address: impl ToSocketAddrs) -> Result<Self, AttemptOutcome> {
+        Self::connect_with_config_outcome(address, ClientConfig::default()).await
+    }
+
+    /// Connect with explicit timeouts while classifying connection failures.
+    pub async fn connect_with_config_outcome(
+        address: impl ToSocketAddrs,
+        config: ClientConfig,
+    ) -> Result<Self, AttemptOutcome> {
+        Self::connect_with_config(address, config)
+            .await
+            .map_err(AttemptOutcome::from_client_error)
     }
 
     /// Send one request and read exactly one response from this connection.
@@ -147,6 +230,43 @@ impl Client {
 
         serde_json::from_str(&response_line)
             .map_err(|source| ClientError::InvalidResponse { source })
+    }
+
+    /// Send one request and classify what can safely be inferred about its outcome.
+    ///
+    /// A successful non-error response is confirmed. Deterministic broker
+    /// rejections are rejected, admission responses that are safe to retry on a
+    /// new connection are retryable, and transport failures after this method
+    /// starts writing are unknown. In particular, `request_timeout` remains
+    /// unknown because the server uses it for both incomplete frames and
+    /// engine work that may already have been applied.
+    pub async fn request_with_outcome(&mut self, request: &Request) -> AttemptOutcome {
+        match self.request(request).await {
+            Ok(response) => classify_response(response),
+            Err(error @ ClientError::EncodeRequest { .. }) => {
+                AttemptOutcome::Rejected(AttemptFailure::Client(error))
+            }
+            Err(error) => AttemptOutcome::Unknown(AttemptFailure::Client(error)),
+        }
+    }
+}
+
+fn classify_response(response: Response) -> AttemptOutcome {
+    let Response::Error { ref code, .. } = response else {
+        return AttemptOutcome::Confirmed(response);
+    };
+
+    match code.as_str() {
+        "connection_limit" | "request_saturated" | "stream_not_ready" => {
+            AttemptOutcome::Retryable(AttemptFailure::Broker(response))
+        }
+        "request_timeout"
+        | "storage_error"
+        | "consumer_state_error"
+        | "internal_error"
+        | "cluster_error"
+        | "corrupt_record" => AttemptOutcome::Unknown(AttemptFailure::Broker(response)),
+        _ => AttemptOutcome::Rejected(AttemptFailure::Broker(response)),
     }
 }
 
@@ -281,5 +401,91 @@ mod tests {
         let result = client.request(&Request::Health).await;
         assert!(matches!(result, Err(ClientError::InvalidResponse { .. })));
         server.await.unwrap();
+    }
+
+    async fn request_outcome(response: Response) -> AttemptOutcome {
+        let (listener, address) = listener().await;
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut reader = BufReader::new(stream);
+            let mut request = String::new();
+            reader.read_line(&mut request).await.unwrap();
+            let mut encoded = serde_json::to_vec(&response).unwrap();
+            encoded.push(b'\n');
+            reader.get_mut().write_all(&encoded).await.unwrap();
+        });
+
+        let mut client = Client::connect_with_config(address, test_config())
+            .await
+            .unwrap();
+        let outcome = client.request_with_outcome(&Request::Health).await;
+        server.await.unwrap();
+        outcome
+    }
+
+    #[tokio::test]
+    async fn classifies_success_as_confirmed() {
+        let outcome = request_outcome(Response::Health {
+            status: "ok".to_owned(),
+            streams: 0,
+            storage_bytes: 0,
+        })
+        .await;
+
+        assert!(matches!(
+            outcome,
+            AttemptOutcome::Confirmed(Response::Health { .. })
+        ));
+    }
+
+    #[tokio::test]
+    async fn classifies_deterministic_broker_rejection() {
+        let outcome = request_outcome(Response::Error {
+            code: "invalid_name".to_owned(),
+            message: "invalid stream".to_owned(),
+        })
+        .await;
+
+        assert!(
+            matches!(outcome, AttemptOutcome::Rejected(AttemptFailure::Broker(Response::Error { code, .. })) if code == "invalid_name")
+        );
+    }
+
+    #[tokio::test]
+    async fn classifies_admission_response_as_retryable() {
+        let outcome = request_outcome(Response::Error {
+            code: "request_saturated".to_owned(),
+            message: "busy".to_owned(),
+        })
+        .await;
+
+        assert!(
+            matches!(outcome, AttemptOutcome::Retryable(AttemptFailure::Broker(Response::Error { code, .. })) if code == "request_saturated")
+        );
+    }
+
+    #[tokio::test]
+    async fn classifies_timeout_response_as_unknown() {
+        let outcome = request_outcome(Response::Error {
+            code: "request_timeout".to_owned(),
+            message: "deadline exceeded".to_owned(),
+        })
+        .await;
+
+        assert!(
+            matches!(outcome, AttemptOutcome::Unknown(AttemptFailure::Broker(Response::Error { code, .. })) if code == "request_timeout")
+        );
+    }
+
+    #[test]
+    fn classifies_connection_failure_before_writing_as_retryable() {
+        let outcome = AttemptOutcome::from_client_error(ClientError::Connect {
+            source: io::Error::new(io::ErrorKind::ConnectionRefused, "refused"),
+        });
+
+        assert!(matches!(
+            outcome,
+            AttemptOutcome::Retryable(AttemptFailure::Client(ClientError::Connect { .. }))
+        ));
     }
 }
