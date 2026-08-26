@@ -13,13 +13,19 @@ use serde::{Deserialize, Serialize};
 
 const LEGACY_MAGIC: &[u8; 4] = b"RNL1";
 const VERSIONED_MAGIC: &[u8; 4] = b"RNL2";
+const REQUEST_ID_MAGIC: &[u8; 4] = b"RNL3";
 const LEGACY_HEADER_LEN: usize = 28;
 const VERSIONED_HEADER_LEN: usize = 44;
+const REQUEST_ID_HEADER_LEN: usize = 48;
 const VERSIONED_FORMAT_VERSION: u8 = 1;
+const REQUEST_ID_FORMAT_VERSION: u8 = 1;
 const VERSIONED_ENCODING_BYTES: u8 = 0;
 const VERSIONED_COMPRESSION_NONE: u8 = 0;
 const VERSIONED_MAX_KEY_LEN: u32 = 128;
 const VERSIONED_MAX_BODY_LEN: u32 = 64 * 1024 * 1024;
+const REQUEST_ID_MAX_LEN: u32 = 1024;
+const REQUEST_ID_MAX_KEY_LEN: u32 = 128;
+const REQUEST_ID_MAX_BODY_LEN: u32 = 64 * 1024 * 1024;
 const MAX_IN_MEMORY_RECORDS: usize = 1024;
 const DEFAULT_ACK_TIMEOUT: Duration = Duration::from_secs(30);
 const DEAD_LETTER_SUFFIX: &str = ".dead-letter";
@@ -35,6 +41,27 @@ pub use runnel_engine::{AckResult, BrokerError, HealthSnapshot, Message, Offset,
 pub enum DurableFormat {
     Rnl1,
     VersionedV1,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct RequestAwareLimits {
+    max_key_len: u32,
+    max_body_len: u32,
+}
+
+fn request_aware_limits(durable_format: DurableFormat) -> RequestAwareLimits {
+    match durable_format {
+        // Keep the legacy no-request-id writer and reader unchanged. Request-aware frames have
+        // their own bounded limits so malformed headers cannot force unbounded allocations.
+        DurableFormat::Rnl1 => RequestAwareLimits {
+            max_key_len: REQUEST_ID_MAX_KEY_LEN,
+            max_body_len: REQUEST_ID_MAX_BODY_LEN,
+        },
+        DurableFormat::VersionedV1 => RequestAwareLimits {
+            max_key_len: VERSIONED_MAX_KEY_LEN,
+            max_body_len: VERSIONED_MAX_BODY_LEN,
+        },
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -100,6 +127,7 @@ struct StreamLog {
     // The durable log retains the complete history; this tail cache keeps normal delivery
     // bounded while older replay requests fall back to a streaming scan.
     records: VecDeque<RecordIndex>,
+    request_ids: HashMap<String, Offset>,
     next_offset: Offset,
 }
 
@@ -119,6 +147,7 @@ struct RecordIndex {
     payload_offset: u64,
     payload_len: u32,
     key: Option<String>,
+    request_id: Option<String>,
     published_at_ms: u64,
 }
 
@@ -228,12 +257,34 @@ impl Broker {
         key: Option<String>,
         payload: Vec<u8>,
     ) -> Result<Offset, BrokerError> {
+        self.publish_with_request_id(stream, key, payload, None)
+    }
+
+    fn publish_with_request_id(
+        &self,
+        stream: &str,
+        key: Option<String>,
+        payload: Vec<u8>,
+        request_id: Option<String>,
+    ) -> Result<Offset, BrokerError> {
         #[cfg(feature = "instrumentation")]
         let _stage_timer = StageTimer::new("core.publish");
         validate_name("stream", stream)?;
         let stream_state = self.get_or_create_stream(stream)?;
         let mut stream_state = self.lock_stream(&stream_state)?;
-        stream_state.log.append(key, payload)
+        if let Some(request_id) = request_id.as_ref()
+            && let Some(offset) = stream_state.log.request_ids.get(request_id)
+        {
+            // As with the clustered engine, a repeated identity resolves to its original
+            // offset; payload and key mismatches are intentionally ignored for compatibility.
+            return Ok(*offset);
+        }
+        match request_id {
+            Some(request_id) => stream_state
+                .log
+                .append_with_request_id(key, payload, request_id),
+            None => stream_state.log.append(key, payload),
+        }
     }
 
     pub fn poll(&self, stream: &str, consumer: &str) -> Result<PollResult, BrokerError> {
@@ -550,9 +601,11 @@ impl Engine for Broker {
         stream: &'a str,
         key: Option<String>,
         payload: Vec<u8>,
-        _request_id: Option<String>,
+        request_id: Option<String>,
     ) -> EngineFuture<'a, Offset> {
-        Box::pin(async move { Broker::publish(self, stream, key, payload) })
+        Box::pin(
+            async move { Broker::publish_with_request_id(self, stream, key, payload, request_id) },
+        )
     }
 
     fn poll<'a>(&'a self, stream: &'a str, consumer: &'a str) -> EngineFuture<'a, PollResult> {
@@ -606,6 +659,7 @@ impl StreamLog {
             file,
             durable_format,
             records: VecDeque::with_capacity(MAX_IN_MEMORY_RECORDS),
+            request_ids: HashMap::new(),
             next_offset: 0,
         })
     }
@@ -614,11 +668,17 @@ impl StreamLog {
         let mut file = OpenOptions::new().read(true).append(true).open(path)?;
         let file_len = file.metadata()?.len();
         let mut records = VecDeque::with_capacity(MAX_IN_MEMORY_RECORDS);
+        let mut request_ids = HashMap::new();
         let mut cursor = 0;
         let mut next_offset = 0;
-        while let Some(parsed) = read_record(&mut file, cursor, file_len)? {
+        while let Some(parsed) = read_record(&mut file, cursor, file_len, durable_format)? {
             cursor = parsed.next_cursor;
             next_offset = parsed.index.offset.saturating_add(1);
+            if let Some(request_id) = parsed.index.request_id.as_ref() {
+                request_ids
+                    .entry(request_id.clone())
+                    .or_insert(parsed.index.offset);
+            }
             remember_record(&mut records, parsed.index);
         }
 
@@ -630,6 +690,7 @@ impl StreamLog {
             file,
             durable_format,
             records,
+            request_ids,
             next_offset,
         })
     }
@@ -677,6 +738,7 @@ impl StreamLog {
                 payload_offset,
                 payload_len,
                 key,
+                request_id: None,
                 published_at_ms,
             },
         );
@@ -744,9 +806,93 @@ impl StreamLog {
                 payload_offset,
                 payload_len: body_len,
                 key,
+                request_id: None,
                 published_at_ms,
             },
         );
+        self.next_offset = offset.saturating_add(1);
+        Ok(offset)
+    }
+
+    fn append_with_request_id(
+        &mut self,
+        key: Option<String>,
+        payload: Vec<u8>,
+        request_id: String,
+    ) -> Result<Offset, BrokerError> {
+        let limits = request_aware_limits(self.durable_format);
+        let key_bytes = key.as_deref().unwrap_or_default().as_bytes();
+        let key_len = u32::try_from(key_bytes.len()).map_err(|_| {
+            BrokerError::Io(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "message key exceeds u32 length",
+            ))
+        })?;
+        if key_len > limits.max_key_len {
+            return Err(BrokerError::Io(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "message key exceeds request-aware storage limit",
+            )));
+        }
+        let request_id_bytes = request_id.as_bytes();
+        let request_id_len = u32::try_from(request_id_bytes.len()).map_err(|_| {
+            BrokerError::Io(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "request ID exceeds u32 length",
+            ))
+        })?;
+        if request_id_len > REQUEST_ID_MAX_LEN {
+            return Err(BrokerError::Io(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "request ID exceeds request-aware storage limit",
+            )));
+        }
+        let payload_len = u32::try_from(payload.len()).map_err(|_| {
+            BrokerError::Io(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "message payload exceeds u32 length",
+            ))
+        })?;
+        if payload_len > limits.max_body_len {
+            return Err(BrokerError::Io(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "message payload exceeds request-aware storage limit",
+            )));
+        }
+        let offset = self.next_offset;
+        let published_at_ms = now_ms();
+        let mut header = [0; REQUEST_ID_HEADER_LEN];
+        header[..4].copy_from_slice(REQUEST_ID_MAGIC);
+        header[4] = REQUEST_ID_FORMAT_VERSION;
+        header[6..8].copy_from_slice(&(REQUEST_ID_HEADER_LEN as u16).to_le_bytes());
+        header[8..12].copy_from_slice(&payload_len.to_le_bytes());
+        header[12..16].copy_from_slice(&payload_len.to_le_bytes());
+        header[16..24].copy_from_slice(&offset.to_le_bytes());
+        header[24..32].copy_from_slice(&published_at_ms.to_le_bytes());
+        header[32..36].copy_from_slice(&key_len.to_le_bytes());
+        header[36..40].copy_from_slice(&request_id_len.to_le_bytes());
+        let checksum = request_id_checksum(&header, key_bytes, request_id_bytes, &payload);
+        header[44..48].copy_from_slice(&checksum.to_le_bytes());
+
+        self.file.write_all(&header)?;
+        self.file.write_all(key_bytes)?;
+        self.file.write_all(request_id_bytes)?;
+        self.file.write_all(&payload)?;
+        self.file.sync_data()?;
+
+        let payload_offset = self.file.stream_position()? - payload.len() as u64;
+        remember_record(
+            &mut self.records,
+            RecordIndex {
+                offset,
+                payload_offset,
+                payload_len,
+                key,
+                request_id: Some(request_id.clone()),
+                published_at_ms,
+            },
+        );
+        self.request_ids.insert(request_id, offset);
         self.next_offset = offset.saturating_add(1);
         Ok(offset)
     }
@@ -799,7 +945,8 @@ impl StreamLog {
         // rights. Scan only as a fallback so the common current-tail path stays in memory.
         let file_len = self.file.metadata()?.len();
         let mut cursor = 0;
-        while let Some(parsed) = read_record(&mut self.file, cursor, file_len)? {
+        while let Some(parsed) = read_record(&mut self.file, cursor, file_len, self.durable_format)?
+        {
             cursor = parsed.next_cursor;
             if parsed.index.offset < committed_offset {
                 continue;
@@ -823,7 +970,8 @@ impl StreamLog {
 
         let file_len = self.file.metadata()?.len();
         let mut cursor = 0;
-        while let Some(parsed) = read_record(&mut self.file, cursor, file_len)? {
+        while let Some(parsed) = read_record(&mut self.file, cursor, file_len, self.durable_format)?
+        {
             cursor = parsed.next_cursor;
             if parsed.index.offset == offset {
                 return Ok(parsed.index);
@@ -842,6 +990,7 @@ fn read_record(
     file: &mut File,
     cursor: u64,
     file_len: u64,
+    durable_format: DurableFormat,
 ) -> Result<Option<ParsedRecord>, BrokerError> {
     if file_len.saturating_sub(cursor) < 4 {
         return Ok(None);
@@ -852,6 +1001,9 @@ fn read_record(
     file.read_exact(&mut magic)?;
     if &magic == VERSIONED_MAGIC {
         return read_versioned_record(file, cursor, file_len);
+    }
+    if &magic == REQUEST_ID_MAGIC {
+        return read_request_id_record(file, cursor, file_len, durable_format);
     }
     if &magic != LEGACY_MAGIC {
         return Err(invalid_record_data("unsupported record magic"));
@@ -908,6 +1060,7 @@ fn read_legacy_record(
             payload_offset,
             payload_len,
             key,
+            request_id: None,
             published_at_ms,
         },
         next_cursor: cursor + record_len,
@@ -1012,6 +1165,127 @@ fn read_versioned_record(
             payload_offset,
             payload_len: stored_len,
             key,
+            request_id: None,
+            published_at_ms: u64::from_le_bytes(header[24..32].try_into().unwrap()),
+        },
+        next_cursor: cursor + record_len,
+    }))
+}
+
+fn read_request_id_record(
+    file: &mut File,
+    cursor: u64,
+    file_len: u64,
+    durable_format: DurableFormat,
+) -> Result<Option<ParsedRecord>, BrokerError> {
+    if file_len.saturating_sub(cursor) < REQUEST_ID_HEADER_LEN as u64 {
+        return Ok(None);
+    }
+
+    file.seek(SeekFrom::Start(cursor))?;
+    let mut header = [0; REQUEST_ID_HEADER_LEN];
+    file.read_exact(&mut header)?;
+    if header[4] != REQUEST_ID_FORMAT_VERSION {
+        return Err(invalid_record_data(
+            "unsupported request-aware record version",
+        ));
+    }
+    if header[5] != 0 {
+        return Err(invalid_record_data(
+            "unsupported request-aware record flags",
+        ));
+    }
+    let header_len = u16::from_le_bytes(header[6..8].try_into().unwrap()) as usize;
+    if header_len != REQUEST_ID_HEADER_LEN {
+        return Err(invalid_record_data(
+            "invalid request-aware record header length",
+        ));
+    }
+    let stored_len = u32::from_le_bytes(header[8..12].try_into().unwrap());
+    let logical_len = u32::from_le_bytes(header[12..16].try_into().unwrap());
+    let key_len = u32::from_le_bytes(header[32..36].try_into().unwrap());
+    let request_id_len = u32::from_le_bytes(header[36..40].try_into().unwrap());
+    let limits = request_aware_limits(durable_format);
+    if key_len > limits.max_key_len {
+        return Err(invalid_record_data(
+            "request-aware record key exceeds storage limit",
+        ));
+    }
+    if request_id_len > REQUEST_ID_MAX_LEN {
+        return Err(invalid_record_data(
+            "request-aware record ID exceeds storage limit",
+        ));
+    }
+    if stored_len > limits.max_body_len || logical_len > limits.max_body_len {
+        return Err(invalid_record_data(
+            "request-aware record exceeds storage limit",
+        ));
+    }
+    if logical_len != stored_len {
+        return Err(invalid_record_data(
+            "compressed request-aware records are not supported",
+        ));
+    }
+    if header[40..44] != [0; 4] {
+        return Err(invalid_record_data(
+            "unsupported request-aware record header fields",
+        ));
+    }
+
+    let record_len = (REQUEST_ID_HEADER_LEN as u64)
+        .checked_add(u64::from(key_len))
+        .and_then(|length| length.checked_add(u64::from(request_id_len)))
+        .and_then(|length| length.checked_add(u64::from(stored_len)))
+        .ok_or_else(|| invalid_record_data("request-aware record length overflows u64"))?;
+    if file_len.saturating_sub(cursor) < record_len {
+        return Ok(None);
+    }
+
+    let mut key_bytes = vec![0; key_len as usize];
+    file.read_exact(&mut key_bytes)?;
+    let key = if key_bytes.is_empty() {
+        None
+    } else {
+        let key = std::str::from_utf8(&key_bytes)
+            .map_err(|_| invalid_record_data("request-aware record key is not UTF-8"))?;
+        Some(key.to_owned())
+    };
+
+    let mut request_id_bytes = vec![0; request_id_len as usize];
+    file.read_exact(&mut request_id_bytes)?;
+    let request_id = std::str::from_utf8(&request_id_bytes)
+        .map_err(|_| invalid_record_data("request-aware record ID is not UTF-8"))?
+        .to_owned();
+
+    let expected_checksum = u32::from_le_bytes(header[44..48].try_into().unwrap());
+    let mut checksum_header = header;
+    checksum_header[44..48].fill(0);
+    let mut checksum = crc32c_update(!0, &checksum_header);
+    checksum = crc32c_update(checksum, &key_bytes);
+    checksum = crc32c_update(checksum, &request_id_bytes);
+    let mut remaining = u64::from(stored_len);
+    let mut buffer = [0; 8192];
+    while remaining > 0 {
+        let read_len = remaining.min(buffer.len() as u64) as usize;
+        file.read_exact(&mut buffer[..read_len])?;
+        checksum = crc32c_update(checksum, &buffer[..read_len]);
+        remaining -= read_len as u64;
+    }
+    if crc32c_finalize(checksum) != expected_checksum {
+        return Err(invalid_record_data(
+            "request-aware record checksum mismatch",
+        ));
+    }
+
+    let payload_offset =
+        cursor + REQUEST_ID_HEADER_LEN as u64 + u64::from(key_len) + u64::from(request_id_len);
+    Ok(Some(ParsedRecord {
+        index: RecordIndex {
+            offset: u64::from_le_bytes(header[16..24].try_into().unwrap()),
+            payload_offset,
+            payload_len: stored_len,
+            key,
+            request_id: Some(request_id),
             published_at_ms: u64::from_le_bytes(header[24..32].try_into().unwrap()),
         },
         next_cursor: cursor + record_len,
@@ -1061,6 +1335,20 @@ fn versioned_checksum(header: &[u8; VERSIONED_HEADER_LEN], key: &[u8], body: &[u
     checksum_header[40..44].fill(0);
     let checksum = crc32c_update(!0, &checksum_header);
     let checksum = crc32c_update(checksum, key);
+    crc32c_finalize(crc32c_update(checksum, body))
+}
+
+fn request_id_checksum(
+    header: &[u8; REQUEST_ID_HEADER_LEN],
+    key: &[u8],
+    request_id: &[u8],
+    body: &[u8],
+) -> u32 {
+    let mut checksum_header = *header;
+    checksum_header[44..48].fill(0);
+    let mut checksum = crc32c_update(!0, &checksum_header);
+    checksum = crc32c_update(checksum, key);
+    checksum = crc32c_update(checksum, request_id);
     crc32c_finalize(crc32c_update(checksum, body))
 }
 
@@ -1237,6 +1525,215 @@ mod tests {
             second,
             PollResult::Message(Message { offset: 0, .. })
         ));
+    }
+
+    #[tokio::test]
+    async fn repeated_request_id_returns_original_offset_without_appending() {
+        let directory = tempdir().unwrap();
+        let broker = Broker::open(directory.path(), BrokerConfig::default()).unwrap();
+
+        let first = Engine::publish(
+            &broker,
+            "events",
+            Some("original-key".to_owned()),
+            b"original".to_vec(),
+            Some("request-1".to_owned()),
+        )
+        .await
+        .unwrap();
+        let retry = Engine::publish(
+            &broker,
+            "events",
+            Some("retry-key".to_owned()),
+            b"retry-payload".to_vec(),
+            Some("request-1".to_owned()),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!((first, retry), (0, 0));
+        assert!(matches!(
+            broker.poll("events", "reader").unwrap(),
+            PollResult::Message(Message {
+                offset: 0,
+                key: Some(key),
+                payload,
+                ..
+            }) if key == "original-key" && payload == b"original"
+        ));
+        assert_eq!(
+            broker.ack("events", "reader", 0).unwrap(),
+            AckResult::Acknowledged
+        );
+        assert_eq!(broker.poll("events", "reader").unwrap(), PollResult::Empty);
+    }
+
+    #[tokio::test]
+    async fn request_ids_are_scoped_per_stream() {
+        let directory = tempdir().unwrap();
+        let broker = Broker::open(directory.path(), BrokerConfig::default()).unwrap();
+
+        let events_offset = Engine::publish(
+            &broker,
+            "events",
+            None,
+            b"events".to_vec(),
+            Some("same-request".to_owned()),
+        )
+        .await
+        .unwrap();
+        let audit_offset = Engine::publish(
+            &broker,
+            "audit",
+            None,
+            b"audit".to_vec(),
+            Some("same-request".to_owned()),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!((events_offset, audit_offset), (0, 0));
+        assert_eq!(
+            Engine::publish(
+                &broker,
+                "events",
+                None,
+                b"events-retry".to_vec(),
+                Some("same-request".to_owned()),
+            )
+            .await
+            .unwrap(),
+            0
+        );
+        assert_eq!(
+            Engine::publish(
+                &broker,
+                "audit",
+                None,
+                b"audit-retry".to_vec(),
+                Some("same-request".to_owned()),
+            )
+            .await
+            .unwrap(),
+            0
+        );
+        assert!(matches!(
+            broker.poll("events", "reader").unwrap(),
+            PollResult::Message(Message { payload, .. }) if payload == b"events"
+        ));
+        assert!(matches!(
+            broker.poll("audit", "reader").unwrap(),
+            PollResult::Message(Message { payload, .. }) if payload == b"audit"
+        ));
+    }
+
+    #[tokio::test]
+    async fn request_id_deduplication_survives_restart() {
+        let directory = tempdir().unwrap();
+        let first = {
+            let broker = Broker::open(directory.path(), BrokerConfig::default()).unwrap();
+            Engine::publish(
+                &broker,
+                "events",
+                Some("original-key".to_owned()),
+                b"original".to_vec(),
+                Some("request-1".to_owned()),
+            )
+            .await
+            .unwrap()
+        };
+        assert_eq!(first, 0);
+
+        let broker = Broker::open(directory.path(), BrokerConfig::default()).unwrap();
+        assert_eq!(
+            Engine::publish(
+                &broker,
+                "events",
+                Some("retry-key".to_owned()),
+                b"retry-payload".to_vec(),
+                Some("request-1".to_owned()),
+            )
+            .await
+            .unwrap(),
+            0
+        );
+        assert_eq!(
+            Engine::publish(&broker, "events", None, b"ordinary".to_vec(), None)
+                .await
+                .unwrap(),
+            1
+        );
+        assert!(matches!(
+            broker.poll("events", "reader").unwrap(),
+            PollResult::Message(Message {
+                offset: 0,
+                payload,
+                ..
+            }) if payload == b"original"
+        ));
+        assert_eq!(
+            broker.ack("events", "reader", 0).unwrap(),
+            AckResult::Acknowledged
+        );
+        assert!(matches!(
+            broker.poll("events", "reader").unwrap(),
+            PollResult::Message(Message {
+                offset: 1,
+                payload,
+                ..
+            }) if payload == b"ordinary"
+        ));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_duplicate_requests_append_once() {
+        const CALL_COUNT: usize = 32;
+
+        let directory = tempdir().unwrap();
+        let broker = Broker::open(directory.path(), BrokerConfig::default()).unwrap();
+        let mut calls = Vec::with_capacity(CALL_COUNT);
+        for call in 0..CALL_COUNT {
+            let broker = broker.clone();
+            calls.push(tokio::spawn(async move {
+                Engine::publish(
+                    &broker,
+                    "events",
+                    Some(format!("key-{call}")),
+                    format!("payload-{call}").into_bytes(),
+                    Some("request-1".to_owned()),
+                )
+                .await
+                .unwrap()
+            }));
+        }
+
+        for call in calls {
+            assert_eq!(call.await.unwrap(), 0);
+        }
+        assert!(matches!(
+            broker.poll("events", "reader").unwrap(),
+            PollResult::Message(Message { offset: 0, .. })
+        ));
+        assert_eq!(
+            broker.ack("events", "reader", 0).unwrap(),
+            AckResult::Acknowledged
+        );
+        assert_eq!(broker.poll("events", "reader").unwrap(), PollResult::Empty);
+    }
+
+    #[tokio::test]
+    async fn publishes_without_request_id_are_not_deduplicated() {
+        let directory = tempdir().unwrap();
+        let broker = Broker::open(directory.path(), BrokerConfig::default()).unwrap();
+
+        let first = Engine::publish(&broker, "events", None, b"same".to_vec(), None)
+            .await
+            .unwrap();
+        let second = Engine::publish(&broker, "events", None, b"same".to_vec(), None)
+            .await
+            .unwrap();
+
+        assert_eq!((first, second), (0, 1));
     }
 
     #[test]
@@ -1658,6 +2155,118 @@ mod tests {
                 ..
             }) if payload == b"complete"
         ));
+    }
+
+    #[tokio::test]
+    async fn incomplete_request_id_frame_is_discarded_on_recovery() {
+        let directory = tempdir().unwrap();
+        {
+            let broker = Broker::open(directory.path(), BrokerConfig::default()).unwrap();
+            assert_eq!(
+                Engine::publish(
+                    &broker,
+                    "events",
+                    None,
+                    b"complete".to_vec(),
+                    Some("request-1".to_owned()),
+                )
+                .await
+                .unwrap(),
+                0
+            );
+        }
+
+        let path = directory.path().join("streams/events.log");
+        let complete_len = fs::metadata(&path).unwrap().len();
+        let mut file = OpenOptions::new().append(true).open(&path).unwrap();
+        file.write_all(REQUEST_ID_MAGIC).unwrap();
+        file.sync_all().unwrap();
+
+        let broker = Broker::open(directory.path(), BrokerConfig::default()).unwrap();
+        assert_eq!(fs::metadata(&path).unwrap().len(), complete_len);
+        assert_eq!(
+            Engine::publish(
+                &broker,
+                "events",
+                None,
+                b"retry".to_vec(),
+                Some("request-1".to_owned()),
+            )
+            .await
+            .unwrap(),
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn request_id_writer_rejects_oversized_fields_for_versioned_storage() {
+        let directory = tempdir().unwrap();
+        let broker = Broker::open_with_format(
+            directory.path(),
+            BrokerConfig::default(),
+            DurableFormat::VersionedV1,
+        )
+        .unwrap();
+
+        let key_error = Engine::publish(
+            &broker,
+            "events",
+            Some("k".repeat(VERSIONED_MAX_KEY_LEN as usize + 1)),
+            b"payload".to_vec(),
+            Some("request-1".to_owned()),
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            matches!(key_error, BrokerError::Io(error) if error.kind() == io::ErrorKind::InvalidInput)
+        );
+
+        let request_id_error = Engine::publish(
+            &broker,
+            "events",
+            None,
+            b"payload".to_vec(),
+            Some("r".repeat(REQUEST_ID_MAX_LEN as usize + 1)),
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(
+            request_id_error,
+            BrokerError::Io(error) if error.kind() == io::ErrorKind::InvalidInput
+        ));
+    }
+
+    #[test]
+    fn request_id_recovery_rejects_oversized_lengths_before_allocation() {
+        for (key_len, request_id_len, body_len) in [
+            (REQUEST_ID_MAX_KEY_LEN + 1, 0, 0),
+            (0, REQUEST_ID_MAX_LEN + 1, 0),
+            (0, 0, REQUEST_ID_MAX_BODY_LEN + 1),
+        ] {
+            let directory = tempdir().unwrap();
+            {
+                let broker = Broker::open(directory.path(), BrokerConfig::default()).unwrap();
+                broker.create_stream("events").unwrap();
+            }
+            let path = directory.path().join("streams/events.log");
+            let mut header = [0; REQUEST_ID_HEADER_LEN];
+            header[..4].copy_from_slice(REQUEST_ID_MAGIC);
+            header[4] = REQUEST_ID_FORMAT_VERSION;
+            header[6..8].copy_from_slice(&(REQUEST_ID_HEADER_LEN as u16).to_le_bytes());
+            header[8..12].copy_from_slice(&body_len.to_le_bytes());
+            header[12..16].copy_from_slice(&body_len.to_le_bytes());
+            header[32..36].copy_from_slice(&key_len.to_le_bytes());
+            header[36..40].copy_from_slice(&request_id_len.to_le_bytes());
+            let mut file = OpenOptions::new().append(true).open(&path).unwrap();
+            file.write_all(&header).unwrap();
+            file.sync_all().unwrap();
+
+            let result = Broker::open(directory.path(), BrokerConfig::default());
+            assert!(matches!(
+                result,
+                Err(BrokerError::Io(error)) if error.kind() == io::ErrorKind::InvalidData
+            ));
+        }
     }
 
     #[test]

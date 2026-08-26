@@ -128,13 +128,6 @@ This register records known implementation shortcuts in the current vertical sli
 - Context: replicated absolute deadlines establish a simple failover baseline without adding a separate lease service. Retry configuration and dead-letter provenance are tracked independently in TD-018, while retained delivery-state growth is covered by TD-010.
 - Retirement condition: the supported clock assumptions and maximum timing error are documented and tested under leader changes, clock skew, and clock jumps, or delivery eligibility moves to a mechanism that does not depend on comparable node wall clocks while preserving stale-delivery fencing and at-least-once behavior.
 
-## TD-021: Local publish retry identity is ignored
-
-- Status: open
-- Impact: the public request accepts a stable publish `request_id`, and the clustered engine durably deduplicates it, but the local engine discards it. A client retry after an unknown local outcome can therefore create an unintended duplicate even when the caller requested deduplication, making the same client contract mean different things across engines.
-- Context: request identity was introduced with replicated publish state while the smallest local append path remained unchanged.
-- Retirement condition: the local engine either durably resolves repeated request identities to the original outcome under documented bounds or rejects unsupported deduplication explicitly; local restart and ambiguous-outcome tests enforce the same public outcome classification as the clustered engine.
-
 ## TD-022: Local durable I/O blocks asynchronous server workers
 
 - Status: open
