@@ -66,6 +66,36 @@ The current implementation serializes broker operations behind one in-process lo
 - Use Conventional Commits for project commits and pull-request titles. Keep the type meaningful, use a scope when it clarifies ownership, and mark breaking changes explicitly with `!` and migration details.
 - Deliver every independently reviewable change through its own pull request on a non-`main` branch. Never push directly to `main` or bypass repository rulesets and required checks.
 
+## Branch freshness and coordination
+
+Check the default branch at both ends of a task so local work does not silently
+start from or finish against stale project state:
+
+- Before starting implementation, run `git fetch origin main`, record
+  `git rev-parse origin/main`, and inspect the latest `ci.yml` run for that SHA
+  when GitHub access is available. Treat that commit as the task baseline; do
+  not assume the local `main` checkout is current.
+- Before opening or updating a pull request, fetch `origin/main` again and
+  repeat the check. Inspect commits added since the recorded baseline. If
+  `main` changed in owned paths, shared contracts, generated files,
+  dependencies, or integration behavior, update the branch and rerun relevant
+  checks. A disjoint branch may remain based on the earlier baseline when it
+  is cleanly mergeable; record both revisions in the handoff.
+- When work is delegated to disjoint worktrees, the coordinator gives every
+  worker the same baseline revision and start/end checks. Workers report their
+  baseline, the newest `origin/main` revision, and whether an update was
+  needed. Do not make independent branches chase unrelated merges solely to
+  satisfy branch age.
+- Before merging, check the newest `origin/main` revision and its default-branch
+  CI status again. Required pull-request checks still must pass, and the CI run
+  on `main` after a merge is the final check of the combined state.
+
+When checking a remote baseline, compare the `headSha`, `status`, and
+`conclusion` from
+`gh run list --workflow ci.yml --branch main --limit 1 --json headSha,status,conclusion,url`
+with the revision reported by `git rev-parse origin/main`; a successful older
+run does not prove that the newest commit has passed.
+
 ## Canonical commands
 
 Linux development uses `just` as the canonical command runner. Install it once with:

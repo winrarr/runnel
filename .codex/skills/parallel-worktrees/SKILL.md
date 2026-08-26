@@ -12,7 +12,8 @@ Use this workflow only when the user has authorized parallel delegation. Paralle
 - Identify the immediate local task and keep it on the critical path.
 - Split work by responsibility and file ownership. Do not assign two workers overlapping source, test, workflow, or generated-output paths.
 - Establish a committed baseline revision. Do not assume that uncommitted edits in the main worktree are visible in another worktree; if they matter, create a clearly identified local baseline or provide an explicit patch.
-- Give every worker the baseline revision, its owned paths, its expected result, and the instruction not to revert unrelated work.
+- Before spawning, fetch `origin/main`, record its revision, and inspect the latest `ci.yml` run for that SHA when GitHub access is available. Give every worker the baseline revision, its owned paths, its expected result, and the instruction not to revert unrelated work.
+- Tell workers to repeat the `origin/main` and default-branch CI check before handoff. A newer `main` commit requires an update only when it overlaps the worker's paths or shared contracts, dependencies, generated output, or integration behavior; disjoint work may remain based on the original baseline when it is cleanly mergeable.
 
 ## Worktree and branch isolation
 
@@ -20,7 +21,7 @@ Use this workflow only when the user has authorized parallel delegation. Paralle
 - Keep the main worktree for integration and verification; workers must not edit it directly.
 - Workers must inspect status and diff before committing and stage only their owned paths.
 - Prefer one focused commit and one pull request per independently reviewable improvement.
-- Rebase or update a pending branch after another pull request changes the base, then rerun required checks before merging.
+- Do not rebase or update a pending branch solely because another disjoint pull request changed the base. Recheck the newest `origin/main` revision after merges and update the branch when the changed commits overlap or affect shared behavior; rerun relevant checks after any update.
 
 ## Test and benchmark isolation
 
@@ -74,13 +75,14 @@ Tell each worker to:
 - for performance-sensitive work, run the local benchmark sequentially with a fixed CPU/memory budget and record the actual repetition count, stability thresholds, and stable status; treat an inconclusive authoritative run as unfinished evidence;
 - distinguish a confirmed improvement from noise, a blocked run, and an inconclusive result;
 - report changed files, correctness and crash-recovery considerations, test results, benchmark results, and remaining risks;
+- report the recorded baseline revision, newest `origin/main` revision, default-branch CI status when available, and whether the branch was refreshed;
 - commit the result on its task branch when code is ready, or leave a clearly documented uncommitted patch when it is not.
 
 ## Integration
 
-Review each branch independently before integration. Check the diff against the baseline, rerun focused tests in a clean worktree, and run the repository verification path. Do not merge an optimization solely because a microbenchmark improved: preserve durability, ordering, timeout, ambiguous-outcome, bounded-resource, and recovery guarantees.
+Review each branch independently before integration. Check the diff against the recorded baseline, inspect the newest `origin/main` revision and its default-branch CI status, rerun focused tests in a clean worktree, and run the repository verification path. Do not merge an optimization solely because a microbenchmark improved: preserve durability, ordering, timeout, ambiguous-outcome, bounded-resource, and recovery guarantees.
 
-Merge pull requests one at a time. After each merge, update remaining branches and rerun required checks because the base revision and required status checks have changed. Never bypass required checks to compensate for a flaky test; diagnose whether the failure is in the implementation, test harness, environment, or resource isolation.
+Merge pull requests one at a time. After each merge, fetch `origin/main` and inspect the newest commit and its CI status; update remaining branches and rerun required checks only when the merge affects their paths or shared behavior. Never bypass required checks to compensate for a flaky test; diagnose whether the failure is in the implementation, test harness, environment, or resource isolation.
 
 ## Cleanup and handoff
 
