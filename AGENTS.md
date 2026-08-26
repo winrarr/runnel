@@ -5,6 +5,7 @@ Runnel is a Rust message broker intended to offer durable streams, low operation
 ## Repository map
 
 - crates/runnel-protocol: provisional line-delimited JSON request and response types. This is the boundary for future language clients.
+- crates/runnel-client: reusable async persistent client for the provisional protocol.
 - crates/runnel-engine: topology-free broker engine contract and shared messaging outcomes.
 - crates/runnel-test-support: reusable engine-level contract assertions for local and future distributed implementations.
 - crates/runnel-core: local broker engine, append-only durable stream log, consumer checkpoints, acknowledgements, and recovery.
