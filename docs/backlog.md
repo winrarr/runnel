@@ -2,9 +2,29 @@
 
 These are unfinished product outcomes derived from the project brief. They describe goals, rationale, constraints, and observable acceptance criteria; they intentionally do not prescribe an implementation. Agents should inspect the current system, evaluate alternatives, benchmark material assumptions, and record consequential choices in ADRs.
 
-The recommended sequence is to complete the dependable single-node product first, then establish the design and verification needed for a three-node development deployment. Distributed work must preserve the single-node crash and durability guarantees rather than introduce a separate application model.
+The recommended sequence is to complete the dependable single-node product and stable client contract first, while using the three-node development deployment to retire distributed-systems risks early. Do not expand cluster topology or placement sophistication ahead of the storage, overload, compatibility, and usability foundations needed by the initial audience. This sequencing is not a limit on Runnel's intended scale: implement the placement, replication, recovery, and balancing capabilities required for larger dependable deployments as the foundations and evidence justify them. Distributed work must preserve the single-node crash and durability guarantees rather than introduce a separate application model.
 
 The `##` sections are parent outcomes. When a parent becomes large enough to require coordinated work, add unfinished child outcomes as nested `###` sections beneath it. Keep each child goal-oriented with its own rationale, constraints, and verifiable acceptance criteria. Use descriptive headings instead of identifiers; refer to another child by its heading when a dependency matters. Remove a child once its outcome is complete, leaving durable rationale in the relevant ADR and implementation history in the repository. Do not turn children into implementation checklists.
+
+## Validate the initial product fit and operating envelope
+
+Goal: validate that the audience and workloads in [product-fit.md](product-fit.md) experience Runnel as a dependable, focused broker and establish the limits or alternatives they should understand before adoption.
+
+Rationale: the initial product thesis is specific enough to guide development, but its workload budgets, usability, and operating envelope are not yet supported by intended-user evidence. Without that validation, infrastructure work can expand faster than evidence of user value.
+
+Constraints:
+
+- validate real application workflows rather than optimizing only synthetic broker operations;
+- state unsupported workloads and guarantees as clearly as supported ones;
+- keep the initial operating model viable for one developer or a small team without dedicated broker expertise;
+- treat performance comparisons as engineering evidence, not as a substitute for adoption and operability evidence.
+
+Acceptance criteria:
+
+- two or three representative end-to-end workloads validate their documented durability, ordering, replay, scale, and operational needs;
+- each representative workload meets an explicit latency, throughput, memory, storage-growth, recovery, and operator-effort budget;
+- onboarding and failure-recovery exercises with intended users identify where the public model or operational workflow is unclear;
+- documentation states when Runnel is a good fit, when it is not, and what product evidence supports those boundaries.
 
 ## Make client interactions dependable and evolvable
 
@@ -25,6 +45,25 @@ Acceptance criteria:
 - a producer can safely retry according to documented semantics without creating an unintended duplicate when deduplication is requested;
 - the contract has a documented compatibility policy;
 - behavior is covered by interoperability and compatibility tests.
+
+### Provide a production-usable client path
+
+Goal: let the initial audience integrate Runnel without implementing protocol framing, connection management, retries, and error classification themselves.
+
+Rationale: a development CLI and inspectable JSON protocol are effective for the current vertical slice, but they are not yet a safe or ergonomic application integration surface.
+
+Constraints:
+
+- client behavior must preserve explicit confirmed, rejected, retryable, and unknown outcomes;
+- timeouts, cancellation, reconnects, backpressure, and retry identity must have bounded and documented behavior;
+- the first supported client should validate the protocol without prematurely committing the project to many language SDKs.
+
+Acceptance criteria:
+
+- at least one supported client library exercises persistent connections, binary payloads, timeouts, cancellation, and safe publish retries;
+- a representative application uses the supported client in an end-to-end restart and ambiguous-outcome test;
+- client and broker compatibility ranges are documented and checked automatically;
+- connection and retry defaults are suitable for the documented initial workloads without requiring broker-internals knowledge.
 
 ## Make message processing complete
 
@@ -73,27 +112,6 @@ Acceptance criteria:
 - durable progress, replay, retry, and dead-letter behavior remain correct after restart and membership changes;
 - local and clustered engines share conformance tests for these outcomes.
 
-#### Complete local retry and dead-letter behavior
-
-Goal: let a single-node broker handle failed work predictably through retry, redelivery, and dead-letter outcomes without losing durable progress.
-
-Rationale: the current shared-consumer slice establishes assignment, ordering, and stale-token safety, while the initial clustered slice establishes replicated ownership, expiry fencing, and dead-letter transitions. The remaining policy differences still need one coherent contract across engines.
-
-Constraints:
-
-- failed work must remain at least once unless an explicit documented policy says otherwise;
-- retry limits, delays, and dead-letter outcomes must be observable and durable where required by the guarantee;
-- unrelated ordering keys and healthy consumers must continue to make progress;
-- behavior after restart, acknowledgement races, and storage pressure must remain bounded and explicit.
-
-Acceptance criteria:
-
-- a failed delivery follows a documented retry policy and can eventually reach a documented dead-letter outcome;
-- retries and dead-letter transitions survive restart according to the stated durability guarantee;
-- stale or duplicate acknowledgements cannot skip retry or dead-letter state;
-- retry, redelivery, dead-letter, latency, and backlog behavior have focused tests and metrics;
-- representative shared-consumer workloads establish throughput and tail-latency baselines before scheduling or placement changes.
-
 #### Make retry policy application-aware
 
 Goal: let applications choose documented retry, backoff, dead-letter, and recovery behavior appropriate to each durable consumer without exposing storage or cluster topology.
@@ -114,24 +132,45 @@ Acceptance criteria:
 - dead-letter provenance and duplicate behavior are explicit;
 - policy state can be transferred when consumer ownership moves between nodes.
 
-#### Establish reusable shared-delivery verification
+### Make replay an explicit and safe consumer operation
 
-Goal: make the shared-consumer semantics precise enough to verify consistently in local and clustered engines.
+Goal: let an application deliberately reprocess a documented portion of retained history without editing broker files, inventing consumer names, or confusing replay progress with the consumer’s current durable position.
 
-Rationale: distributed implementation work should preserve observable delivery behavior rather than create a second interpretation of consumers, members, ordering, acknowledgement, and failure.
+Rationale: replay is part of the stated public model and a core reason to use durable streams, but the current poll contract only follows one forward checkpoint.
 
 Constraints:
 
-- tests must exercise public engine and network behavior where the outcome depends on transport or process boundaries;
-- failure scenarios must distinguish confirmed progress, redelivery, stale delivery, and uncertain outcomes;
-- the verification model must not assume a particular storage layout, shard count, or placement strategy.
+- replay eligibility must follow the selected retention policy;
+- reset and concurrent delivery behavior must not silently discard acknowledged progress;
+- local and clustered engines must expose the same intent without revealing storage or placement;
+- replay work must remain bounded and must not starve foreground consumers.
 
 Acceptance criteria:
 
-- local and clustered engines can be evaluated against the same documented shared-delivery outcomes;
-- restart, member replacement, slow-member, and concurrent-acknowledgement scenarios are repeatable;
-- the verification covers independent fan-out consumers as well as members sharing one consumer;
-- benchmark results identify workload, durability mode, message size, membership, and ordering-key distribution.
+- a consumer can request replay from supported time, offset, or checkpoint scopes with explicit validation and outcome semantics;
+- concurrent polls, acknowledgements, retries, and replay changes have deterministic fencing behavior;
+- restart and failover tests preserve the selected replay position and original durable progress as documented;
+- lag, replay progress, unavailable history, and replay-induced resource pressure are observable.
+
+### Make batching preserve per-record outcomes
+
+Goal: amortize protocol and durability overhead for publish and consume workloads while keeping ordering, retry, acknowledgement, and ambiguous outcomes safe for every record.
+
+Rationale: batching is necessary for efficient small-message workloads, but an underspecified batch can hide partial success or force unsafe retries.
+
+Constraints:
+
+- clients must be able to determine or resolve each record’s confirmed, rejected, retryable, or unknown outcome;
+- batch size and buffering must be bounded by bytes, records, and time;
+- batching must not broaden an ordering or atomicity guarantee implicitly;
+- local and clustered durability points must remain explicit.
+
+Acceptance criteria:
+
+- publish and delivery batches have documented partial-failure, ordering, acknowledgement, and retry semantics;
+- stable request identity resolves ambiguous publish outcomes without duplicating records when deduplication is requested;
+- timeout, disconnect, restart, leader-change, and oversized-batch tests cover partial outcomes;
+- representative workloads show the throughput, p99/p99.9 latency, memory, and durability tradeoffs across batch sizes.
 
 ## Make retained data operationally scalable
 
@@ -145,6 +184,35 @@ Constraints:
 - time- and size-based retention must respect active consumers and documented replay guarantees;
 - durability choices and their crash guarantees must be explicit;
 - memory and disk work must remain bounded by configured policy rather than unbounded by retained history.
+
+Acceptance criteria:
+
+- restart and recovery behavior remains predictable as retained data grows;
+- memory use remains within a documented bound for a documented workload;
+- retention does not remove data that a consumer is still entitled to replay under the selected policy;
+- compression, when enabled, preserves the documented delivery and recovery guarantees;
+- benchmarks report workload, message size, durability choice, throughput, latency, recovery behavior, memory, and storage usage.
+
+### Make retention and disk-pressure behavior safe
+
+Goal: bound retained storage and define what happens as consumers lag or usable disk capacity approaches its limit.
+
+Rationale: an append-only broker without enforceable retention and admission policy eventually turns ordinary consumer lag into an availability or data-loss incident.
+
+Constraints:
+
+- retention and admission decisions must preserve the selected replay and acknowledged-durability guarantees;
+- the broker must never silently discard committed data or accept a write it cannot durably complete;
+- time, size, consumer-lag, and reserved-capacity policies must have explicit precedence and observable effects;
+- cleanup work must remain interruptible and must not monopolize foreground latency.
+
+Acceptance criteria:
+
+- operators can configure and inspect time- and size-based retention and disk-usage limits;
+- documentation defines whether lagging consumers block deletion, lose replay eligibility, or cause new publishes to be rejected for each supported policy;
+- low-space, full-disk, deletion, restart, and interrupted-cleanup tests preserve the documented outcomes;
+- metrics and diagnostics expose retained bytes, reclaimable bytes, consumer lag that constrains retention, rejected writes, and cleanup progress;
+- sustained workloads demonstrate bounded disk and memory use with predictable foreground tail latency.
 
 ### Make durable storage upgrades safe
 
@@ -223,14 +291,6 @@ Acceptance criteria:
 - contention, queueing, and resource-pressure behavior are visible in metrics and repeatable tests;
 - improvements are supported by benchmarks rather than assumptions about scheduling or locking.
 
-Acceptance criteria:
-
-- restart and recovery behavior remains predictable as retained data grows;
-- memory use remains within a documented bound for a documented workload;
-- retention does not remove data that an active consumer is still entitled to receive;
-- compression, when enabled, preserves the documented delivery and recovery guarantees;
-- benchmarks report workload, message size, durability choice, throughput, latency, recovery behavior, memory, and storage usage.
-
 ## Make the single-node deployment ready for real use
 
 Goal: provide the security, resource, health, and observability behavior needed to operate one broker responsibly in a local, container, or small production environment.
@@ -253,6 +313,26 @@ Acceptance criteria:
 - graceful shutdown, full or slow storage, and restart behavior are covered by repeatable tests;
 - the container and single-node Kubernetes deployment document their persistence and resource assumptions.
 
+### Make overload and abusive-client behavior bounded
+
+Goal: keep the broker responsive and explicit when clients create more connections, requests, payload bytes, or outstanding work than the configured deployment can safely serve.
+
+Rationale: predictable resource usage requires admission limits before authentication or ordinary application mistakes can turn unbounded network input into memory exhaustion, runtime starvation, or storage failure.
+
+Constraints:
+
+- limits must apply before unbounded allocation or task creation;
+- rejection and timeout behavior must be visible to clients and operators;
+- one slow or malformed connection must not prevent unrelated health checks, shutdown, or durable traffic from progressing;
+- defaults must remain convenient for the documented initial workloads.
+
+Acceptance criteria:
+
+- request size, connection count, in-flight work, and relevant queue limits are configurable with safe defaults;
+- overload produces documented rejection or backpressure responses rather than silent loss or unbounded growth;
+- slow-reader, slow-writer, oversized-request, connection-flood, and storage-stall tests demonstrate bounded memory and recovery;
+- metrics distinguish active work, rejected admission, timeouts, and saturation by limiting resource.
+
 ## Run a reliable three-node development deployment
 
 Goal: deploy three Runnel nodes with persistent storage and exercise a coherent clustered broker while applications continue to use streams and consumers without learning the node layout.
@@ -266,23 +346,35 @@ Constraints:
 - ownership, membership, failover, and stale-state behavior must be correct under crashes and restarts;
 - the first clustered deployment is a development milestone, not an automatic promise of production-grade operations.
 
-### Make stream identity and lifecycle authoritative
+Acceptance criteria:
 
-Goal: ensure every node agrees on stream identity, lifecycle, and placement intent while applications continue to address streams normally.
+- the selected distributed model, failure assumptions, and durability choices are recorded in an ADR before implementation is treated as complete;
+- three nodes start with independent persistent storage and can form the documented deployment without application-level topology configuration;
+- acknowledged durable data survives the node failures promised by the selected durability mode;
+- stale participants cannot make conflicting progress after ownership changes;
+- node restart, membership change, and the promised node-failure scenario have repeatable integration tests;
+- existing stream, producer, consumer, group, acknowledgement, and replay intent remains usable without exposing physical placement;
+- Kubernetes readiness, disruption, persistence, upgrade, and control-plane assumptions are documented beside the deployment artifact.
 
-Rationale: a distributed broker cannot safely recover, move, or balance data if stream and consumer state exists only as an incidental property of one node.
+### Make growth from one node to a cluster non-disruptive
+
+Goal: let an application move its retained streams and durable consumer progress from a supported single-node deployment to a supported cluster without changing its messaging model or silently losing acknowledged state.
+
+Rationale: the promise of a credible path from one node to a distributed system is incomplete if only source compatibility exists and operators must invent a risky data migration.
 
 Constraints:
 
-- preserve the public stream and consumer model without exposing physical placement;
-- recover partial creation and restart transitions deterministically;
-- keep metadata independent from any one local file, process, or current replica layout.
+- migration must preserve documented offsets, ordering, replay eligibility, producer retry identity, and consumer progress;
+- cutover must have explicit writer fencing and rollback boundaries;
+- migration work and additional storage must remain bounded and observable for large retained streams;
+- applications must not need to learn Raft groups, replica placement, or storage paths.
 
 Acceptance criteria:
 
-- stream metadata survives full-cluster restart with one authoritative result;
-- partial lifecycle operations either complete or reject deterministically after recovery;
-- future placement and movement can use the same identities without changing application requests.
+- a documented procedure migrates representative retained data and active consumer state from the local engine to the clustered engine;
+- interrupted transfer, failed validation, process restart, and cutover races leave one clearly authoritative serving deployment;
+- post-migration conformance tests demonstrate the same public delivery behavior and resolve pre-cutover publish retry identities correctly;
+- diagnostics report migration progress, validation failures, fencing state, and rollback availability.
 
 ### Make placement scale independently of stream identity
 
@@ -431,24 +523,6 @@ Acceptance criteria:
 - process, storage, transport, and consensus failures are distinguishable in tests and diagnostics;
 - the behavior is supported by competitor/reference research, an ADR, process-level tests, and recovery benchmarks.
 
-### Make repeated interrupted replica recovery operationally complete
-
-Goal: make repeated snapshot-based recovery interruptions safe when transfer or installation is interrupted and retried.
-
-Rationale: a replacement replica can now recover without the full consensus history, and a single interrupted transfer safely restarts from the beginning, but recovery is not operationally complete until repeated interruption has explicit behavior and bounded operational cost.
-
-Constraints:
-
-- recovery must validate state before it becomes serving state;
-- snapshot and transfer work must remain bounded and observable through operational signals;
-- retained message history and consensus recovery state must remain separate concerns.
-
-Acceptance criteria:
-
-- repeated interrupted snapshot transfers restart without corrupting committed broker state;
-- recovery does not cause acknowledged messages or durable consumer progress to disappear under repeated interruption and restart tests.
-- repeated recovery tests remain reliable under CI and constrained-resource runs, and failures expose process, socket, or resource causes instead of only reporting a final connection error.
-
 ### Make clustered durability and outcomes explicit
 
 Goal: give applications an unambiguous contract for acknowledged writes, retryable failures, and outcomes that cannot yet be known.
@@ -543,35 +617,6 @@ Acceptance criteria:
 - results report throughput, p50, p99, p99.9, CPU efficiency, CPU and memory usage, storage, configuration, and failure state where applicable;
 - Kafka, Redpanda, and NATS JetStream comparisons document their acknowledgement, replication, and delivery semantics;
 - repeated runs can be compared without manually transcribing results.
-
-### Make benchmark history statistically trustworthy without making noisy benchmarks a gate
-
-Goal: make historical benchmark trends reliable enough to distinguish meaningful performance changes from runner noise.
-
-Rationale: the repository now has an automatic history and dashboard path, but repeated-run aggregation and variance analysis are still needed before trend changes can be treated as strong evidence.
-
-Constraints:
-
-- trend data must retain the workload, environment, and broker configuration needed to interpret it;
-- pull-request reporting should begin with informative artifacts and summaries before becoming a hard performance gate;
-- benchmark jobs must be isolated from correctness CI and have explicit time and resource budgets.
-
-Acceptance criteria:
-
-- reference profiles repeat measurements and preserve individual samples as well as summaries;
-- scheduled runs provide a stable comparison history for supported workloads;
-- the project can identify genuine regressions separately from runner noise;
-- enabling or changing a performance gate requires an explicit decision based on observed variance.
-
-Acceptance criteria:
-
-- the selected distributed model, failure assumptions, and durability choices are recorded in an ADR before implementation is treated as complete;
-- three nodes start with independent persistent storage and can form the documented deployment without application-level topology configuration;
-- acknowledged durable data survives the node failures promised by the selected durability mode;
-- stale participants cannot make conflicting progress after ownership changes;
-- node restart, membership change, and the promised node-failure scenario have repeatable integration tests;
-- existing stream, producer, consumer, group, acknowledgement, and replay intent remains usable without exposing physical placement;
-- Kubernetes readiness, disruption, persistence, upgrade, and control-plane assumptions are documented beside the deployment artifact.
 
 ## Extend the platform after the clustered core is sound
 

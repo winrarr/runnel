@@ -2,6 +2,8 @@
 
 Runnel is a Rust message broker focused on low latency, predictable resource usage, durable delivery, and simple operation. It is designed to feel closer to starting a local infrastructure tool than operating a distributed event platform.
 
+The initial product is aimed at small engineering teams that need durable background work and application-event streams, want a genuinely useful single-node deployment, and need a credible path to highly available and larger deployments without carrying avoidable broker-topology complexity in application code. See [docs/product-fit.md](docs/product-fit.md) for the intended audience, workloads, product boundaries, and evidence still required.
+
 This repository currently provides the first vertical slice:
 
 - a single-node broker process;
@@ -114,7 +116,7 @@ Grouped delivery uses `poll_group` and `ack_group` requests with a consumer name
 
 Message responses include a delivery attempt while retry state is being tracked. Dead-letter records are available on the source stream's .dead-letter stream and preserve the original key and payload.
 
-See [docs/architecture.md](docs/architecture.md) for the current boundaries, [docs/research/README.md](docs/research/README.md) for source-backed investigations, [docs/design/multi-raft-implementation-plan.md](docs/design/multi-raft-implementation-plan.md) for the proposed first clustered plan, [docs/backlog.md](docs/backlog.md) for intended next outcomes, and [docs/tech-debt.md](docs/tech-debt.md) for known implementation shortcuts. Repository operating guidance lives in AGENTS.md.
+See [docs/product-fit.md](docs/product-fit.md) for the initial audience and product boundaries, [docs/architecture.md](docs/architecture.md) for the current technical boundaries, [docs/research/README.md](docs/research/README.md) for source-backed investigations, [docs/design/multi-raft-implementation-plan.md](docs/design/multi-raft-implementation-plan.md) for the proposed first clustered plan, [docs/backlog.md](docs/backlog.md) for intended next outcomes, and [docs/tech-debt.md](docs/tech-debt.md) for known implementation shortcuts. Repository operating guidance lives in AGENTS.md.
 
 For dependency auditing, install cargo-audit and run:
 

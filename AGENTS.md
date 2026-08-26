@@ -27,6 +27,7 @@ Runnel is a Rust message broker intended to offer durable streams, low operation
 - docs/benchmarks/: hand-authored static benchmark dashboard served by GitHub Pages.
 - scripts/benchmarks/README.md: benchmark scope, semantics, and comparison guidance.
 - docs/architecture.md: current data flow and boundaries.
+- docs/product-fit.md: initial audience, representative workloads, product promise, non-goals, and validation needs.
 - docs/design/: active architecture explorations, alternatives, and proposed implementation plans that are not accepted decisions.
 - docs/research/: source-backed investigations, competitor comparisons, and measured evidence that inform design without becoming decisions by themselves.
 - docs/decisions/: consequential decisions that should not be rediscovered from code.
@@ -109,6 +110,6 @@ The required CI path is .github/workflows/ci.yml. It runs the pinned toolchain c
 
 ## Knowledge routing
 
-Put implementation behavior in code and tests, current boundaries in docs/architecture.md, source-backed investigations in docs/research/, unsettled alternatives and implementation proposals in docs/design/, durable accepted rationale in a dated decision record, external or user-mandated guardrails in docs/constraints.md, intended unfinished outcomes in docs/backlog.md, known implementation shortcuts in docs/tech-debt.md, verification workflows in docs/testing.md, and operational deployment guidance beside its deployment artifact. Put workflow changes in justfile and CI changes in .github/workflows. Remove stale guidance instead of appending exceptions.
+Put implementation behavior in code and tests, the initial audience and product boundaries in docs/product-fit.md, current technical boundaries in docs/architecture.md, source-backed investigations in docs/research/, unsettled alternatives and implementation proposals in docs/design/, durable accepted rationale in a dated decision record, external or user-mandated guardrails in docs/constraints.md, intended unfinished outcomes in docs/backlog.md, known implementation shortcuts in docs/tech-debt.md, verification workflows in docs/testing.md, and operational deployment guidance beside its deployment artifact. Put workflow changes in justfile and CI changes in .github/workflows. Remove stale guidance instead of appending exceptions.
 
 When parallel delegated work is authorized, follow .codex/skills/parallel-worktrees/SKILL.md. Keep task ownership disjoint, isolate process and container resources, and treat concurrent performance measurements as exploratory unless CPU, storage, and workload interference are controlled.

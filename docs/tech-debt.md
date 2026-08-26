@@ -1,19 +1,12 @@
 # Technical debt register
 
-This register records known implementation shortcuts in the current vertical slice. Product gaps belong in [backlog.md](backlog.md); an entry may link to the backlog item that will retire it.
+This register records known implementation shortcuts in the current vertical slice. Product gaps belong in [backlog.md](backlog.md); an entry may link to the backlog item that will retire it. Remove entries when the shortcut is retired, and do not reuse their identifiers.
 
-## TD-001: One process-wide broker lock
-
-- Status: open
-- Impact: all publishes, polls, acknowledgements, recovery-related state access, and health reads serialize behind one mutex. This limits throughput and makes tail-latency work impossible to evaluate against the intended architecture.
-- Context: the lock keeps the first crash/recovery path easy to inspect and correct. A bounded Criterion baseline now measures same-stream durable publishing with 1, 2, 4, and 8 workers; the observed median throughput stayed around 347–373 thousand elements per second while batch time increased from 179 microseconds to 1.45 milliseconds. This is an end-to-end persistence and scheduling measurement, not an isolated mutex-wait measurement.
-- Retirement condition: replace it with measured ownership boundaries and concurrency tests without weakening acknowledgement or recovery invariants. This is part of the storage and clustered-core backlog work.
-
-## TD-002: One file and an in-memory index per stream
+## TD-002: One file and a startup scan per local stream
 
 - Status: open
-- Impact: startup scans the complete file and the record index grows with retained data. This prevents bounded recovery and memory usage for large streams and makes retention awkward.
-- Context: the representation is intentionally the smallest durable log that can be tested end to end.
+- Impact: startup scans each complete stream file, older replay falls back to a linear scan, and retention cannot reclaim immutable regions independently. The bounded tail index prevents retained history from consuming unbounded index memory, but recovery and cold reads still grow with total retained data.
+- Context: the one-file representation is intentionally the smallest durable log that can be tested end to end. The local engine now keeps only the newest 1,024 record locations in memory and has recovery coverage beyond that cache.
 - Retirement condition: segmented, indexed storage with explicit format/version metadata, retention tests, and recovery benchmarks.
 
 ## TD-003: Provisional JSON-lines protocol and text-only server payload mapping
@@ -23,25 +16,25 @@ This register records known implementation shortcuts in the current vertical sli
 - Context: JSON makes the first vertical slice inspectable and easy to exercise from shell tools.
 - Retirement condition: a versioned protocol preserves binary payloads, explicit outcome classes, compatibility policy, and interoperability tests.
 
-## TD-004: Consumer checkpoints are local files without ownership metadata
+## TD-004: Local and clustered durable state have no supported migration path
 
 - Status: open
-- Impact: consumer state cannot yet be safely moved between brokers, fenced, or coordinated for consumer groups and failover.
-- Context: local durable checkpoints are sufficient for independent consumers in a single process.
-- Retirement condition: consumer state and ownership are represented independently from local files and have crash, fencing, and membership tests.
+- Impact: applications can keep the same public messaging intent when selecting the clustered engine, but retained local records, consumer progress, delivery attempts, and producer retry identity cannot be moved through a supported cutover. Growth from one node to three currently requires starting with empty clustered state or inventing an operational migration.
+- Context: local checkpoints and stream logs remain appropriate for the single-node engine, while clustered consumer ownership is already replicated and fenced inside each stream data group. Their durable representations were developed as separate vertical slices.
+- Retirement condition: the growth-from-one-node backlog outcome provides a versioned, validated, interruptible migration with explicit writer fencing, rollback boundaries, and end-to-end delivery tests.
 
 ## TD-005: Durability and delivery policies are hard-coded
 
 - Status: open
-- Impact: direct `sync_data` publishing and a fixed acknowledgement timeout are useful defaults but do not yet expose a documented durability mode, retry policy, retention policy, or backpressure budget.
+- Impact: direct `sync_data` publishing and broker-wide acknowledgement timeout and attempt-limit settings are useful defaults but do not yet expose a documented durability mode, consumer-scoped retry policy, retention policy, or backpressure budget.
 - Context: the current implementation intentionally chooses one conservative path while semantics are being established.
 - Retirement condition: each configurable policy has an explicit guarantee, bounded-resource behavior, and focused failure tests before it is exposed publicly.
 
 ## TD-006: Operational telemetry remains incomplete
 
 - Status: open
-- Impact: current metrics expose streams, storage bytes, and snapshot lifecycle counters, but cannot yet explain latency, throughput, consumer lag, redelivery, resource pressure, or most failure behavior under load.
-- Context: the metrics endpoint exists early so deployment checks have a real surface. An opt-in Rust timing feature and clustered profiling workflow now provide investigation data without adding timing calls to the default build, but these timings are not yet deployment-grade metrics.
+- Impact: current metrics expose request rates and latency buckets, connections, traffic bytes, publish/delivery/acknowledgement totals, redelivery, dead letters, storage bytes, health failures, and snapshot and peer-transport activity. They still cannot explain consumer lag, retained and reclaimable storage, admission rejection, queue saturation, replication progress, or resource pressure under load.
+- Context: the metrics endpoint now covers the basic broker and transport path. An opt-in Rust timing feature and clustered profiling workflow provide deeper investigation data without adding timing calls to the default build, but these timings are not deployment-grade metrics.
 - Retirement condition: the deployment-grade operations backlog item is implemented and its metrics are exercised by integration or benchmark tests.
 
 ## TD-007: Storage format compatibility is not yet defined
@@ -75,15 +68,15 @@ This register records known implementation shortcuts in the current vertical sli
 ## TD-011: End-to-end benchmark coverage is incomplete
 
 - Status: open
-- Impact: the Criterion suite remains focused on local in-process paths, while the end-to-end benchmark harness does not yet establish clustered, statistically stable, equivalent competitor, or complete tail-latency baselines.
-- Context: microbenchmarks were added first to catch local regressions while the broker semantics and cluster recovery behavior were still changing. Containerized, clustered Runnel, single-node native competitor, and first RF=3 competitor-publish measurements now exist, including scenario-scoped resource efficiency and optional Linux profiles. Pull requests now run a short three-node Runnel benchmark as the primary performance signal and retain a single-node diagnostic; daily and `main` runs provide the primary longer Runnel history, and competitor comparisons are kept in separate weekly/manual suites. Repeated summaries now retain median, observed range, and relative range evidence; workload equivalence, tail-latency coverage, and the policy for interpreting noisy runs remain incomplete.
+- Impact: the Criterion suite remains focused on local in-process paths. The end-to-end harness provides statistically screened same-host clustered comparisons and longer history runs, but it does not yet cover the complete fault, slow-consumer, batching, p99.9, or semantically equivalent competitor workload matrix.
+- Context: microbenchmarks were added first to catch local regressions while the broker semantics and cluster recovery behavior were still changing. Containerized, clustered Runnel, single-node native competitor, and first RF=3 competitor-publish measurements now exist, including scenario-scoped resource efficiency and optional Linux profiles. Performance-sensitive pull requests use a same-host current-versus-main clustered comparison as their primary evidence and retain a single-node diagnostic; hosted daily and `main` runs provide the longer Runnel history, and competitor comparisons are kept in separate weekly/manual suites. Repeated summaries retain median, observed range, and relative range evidence; workload equivalence and complete tail-latency and fault coverage remain incomplete.
 - Retirement condition: the performance backlog outcomes provide repeatable machine-readable local, container, clustered, and comparable-broker measurements with explicit workload and durability semantics, plus enough repeated samples and profiling evidence to distinguish regressions from host noise.
 
 ## TD-012: Peer RPC connection strategy remains incomplete
 
 - Status: open
-- Impact: forwarding and data-group setup traffic now reuses a bounded pool, but control-plane Raft RPCs and snapshot transfers remain separate, and pool ownership is still process-wide. Connection setup, contention, and framing costs therefore remain incompletely characterized for small-message coordination and failure recovery.
-- Context: the initial short-lived framed transport kept request boundaries easy to inspect. A bounded four-connection-per-peer pool now reuses forwarding and data-group setup connections, discards failed or timed-out connections, and has focused reuse, replacement, timeout, and concurrency tests. The optimization is merged, but the transport architecture and end-to-end latency evidence are not yet complete.
+- Impact: peer RPCs reuse connections, but ownership is split between streams retained by OpenRaft network clients and a process-wide compatibility pool for forwarding, data-group setup, and stateless first control requests. The global pool is capped at 64 peer addresses with four connections each; traffic beyond that bridge falls back to an unpooled connection, and there is no multiplexing or cluster-scoped lifecycle. Connection contention, head-of-line blocking, and snapshot interference therefore remain incompletely characterized.
+- Context: the initial short-lived framed transport kept request boundaries easy to inspect. Reuse now covers append traffic, heartbeats, votes, snapshots, forwarding, and data-group setup, discards failed or timed-out connections, and has focused reuse, replacement, timeout, and concurrency tests. The optimization is merged, but transport ownership and end-to-end latency evidence are not yet complete.
 - Retirement condition: transport benchmarks demonstrate whether connection reuse, multiplexing, or another bounded communication strategy improves throughput and p99/p99.9 latency without changing failure or fencing behavior.
 
 ## TD-013: Native competitor benchmark semantics are not equivalent
@@ -128,9 +121,30 @@ This register records known implementation shortcuts in the current vertical sli
 - Context: persisting the attempt before returning a message makes retry behavior survive restart and keeps the first correctness model straightforward. The active-state cache preserves that durability behavior, adds restart coverage for out-of-order acknowledgements and retry state, and produced an observed roughly 8% improvement in the focused benchmark; it does not yet remove per-delivery durable persistence.
 - Retirement condition: benchmarked batching, group commit, or another bounded bookkeeping strategy reduces delivery overhead without losing durable retry state, acknowledgement safety, or predictable recovery.
 
-## TD-020: Clustered shared-consumer policy is only a semantic baseline
+## TD-020: Clustered delivery leases use absolute wall-clock deadlines
 
 - Status: open
-- Impact: the clustered engine now replicates shared progress, in-flight ownership, lease expiry, stale-delivery fencing, broker-wide attempt limits, and atomic dead-letter transitions for grouped and non-grouped delivery. Backoff, provenance, consumer-scoped configuration, and final lease/fencing policy remain unfinished. Delivery state also remains part of the complete materialized stream-group state.
-- Context: the first multi-node implementation establishes the contract and failure boundary before policy and placement work are expanded.
-- Retirement condition: clustered consumers have a documented policy for backoff, provenance, consumer-scoped configuration, and stronger failover fencing semantics, with representative recovery and performance tests that preserve at-least-once delivery and scoped ordering.
+- Impact: a leader chooses an absolute expiry timestamp and replicates it with each delivery. Clock jumps or skew between successive leaders can make redelivery materially earlier or later than the configured acknowledgement timeout; delivery tokens prevent a stale acknowledgement from committing, but they do not make lease timing predictable.
+- Context: replicated absolute deadlines establish a simple failover baseline without adding a separate lease service. Retry configuration and dead-letter provenance are tracked independently in TD-018, while retained delivery-state growth is covered by TD-010.
+- Retirement condition: the supported clock assumptions and maximum timing error are documented and tested under leader changes, clock skew, and clock jumps, or delivery eligibility moves to a mechanism that does not depend on comparable node wall clocks while preserving stale-delivery fencing and at-least-once behavior.
+
+## TD-021: Local publish retry identity is ignored
+
+- Status: open
+- Impact: the public request accepts a stable publish `request_id`, and the clustered engine durably deduplicates it, but the local engine discards it. A client retry after an unknown local outcome can therefore create an unintended duplicate even when the caller requested deduplication, making the same client contract mean different things across engines.
+- Context: request identity was introduced with replicated publish state while the smallest local append path remained unchanged.
+- Retirement condition: the local engine either durably resolves repeated request identities to the original outcome under documented bounds or rejects unsupported deduplication explicitly; local restart and ambiguous-outcome tests enforce the same public outcome classification as the clustered engine.
+
+## TD-022: Local durable I/O blocks asynchronous server workers
+
+- Status: open
+- Impact: local engine futures execute synchronous log reads, writes, file replacement, and `sync_data` operations directly when polled by the Tokio connection task. A slow or stalled filesystem can therefore occupy runtime workers, inflate unrelated request and health latency, and undermine the intended predictable tail behavior.
+- Context: the local engine began as a synchronous library and is exposed through the shared asynchronous engine contract without a separate blocking-I/O boundary. Per-stream locking limits logical contention but does not isolate runtime scheduling from storage latency.
+- Retirement condition: measured storage execution boundaries keep filesystem stalls from starving unrelated network, health, and shutdown work while preserving per-stream ordering, durable acknowledgement semantics, bounded queues, and useful backpressure.
+
+## TD-023: External protocol admission is unbounded
+
+- Status: open
+- Impact: the server creates a task for every accepted client connection and reads newline-delimited requests without a maximum line length, connection cap, request deadline, or global in-flight admission budget. Slow, malformed, or numerous clients can consume memory and tasks before the broker can apply explicit backpressure.
+- Context: the development protocol favors a minimal persistent-connection loop, while bounded frame sizes and pooling were introduced only for the peer protocol.
+- Retirement condition: the overload backlog outcome establishes configurable safe defaults and tests for connection count, request size, request duration, in-flight work, slow readers and writers, and rejection metrics without weakening graceful shutdown or normal client ergonomics.

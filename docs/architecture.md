@@ -33,7 +33,7 @@ This establishes an at-least-once vertical slice for both independent consumers 
 
 The clustered state machine appends one framed, durable journal record per committed apply entry and replays records after the last durable checkpoint during recovery. Snapshot installation writes a checkpoint and compacts the journal with an atomic replacement, so normal message processing no longer pays for a complete state-file replacement per apply batch. The materialized state and journal are still JSON-based, so this is a correctness-preserving first storage step rather than a final performance architecture.
 
-The current baseline still uses JSON encodings, synchronous atomic file replacement for checkpoints and Raft-log persistence, and a new TCP connection for each internal RPC. Those costs should be measured before replacing them with pooled transport, binary formats, segmented storage, or more aggressive batching. Any optimization must report its durability point and p50/p99/p99.9 behavior, especially for 100-byte and 1-KiB messages.
+The current baseline still uses JSON encodings and synchronous file operations for local appends, checkpoints, and parts of Raft persistence. The local engine isolates stream state behind per-stream locks, but those operations execute inside asynchronous server request tasks. Peer traffic reuses connections through OpenRaft network clients or a bounded process-wide compatibility pool; connection ownership is split and the framed protocol is not multiplexed. Those costs should be measured before replacing them with dedicated storage execution, cluster-scoped pooled or multiplexed transport, binary formats, segmented storage, or more aggressive batching. Any optimization must report its durability point and p50/p99/p99.9 behavior, especially for 100-byte and 1-KiB messages.
 
 ## Deliberate boundaries
 
@@ -44,4 +44,4 @@ The current baseline still uses JSON encodings, synchronous atomic file replacem
 - runnel-server owns sockets, HTTP, shutdown, and mapping core errors into protocol responses.
 - runnel-cli is a development client and is not a compatibility reference for future language SDKs.
 
-The next architectural changes should preserve these boundaries while replacing the single process-wide lock, introducing segmented storage/indexing, making consumer ownership independently transferable, and adding dynamic membership and recovery without changing application intent.
+The next architectural changes should preserve these boundaries while introducing segmented storage and indexing, isolating synchronous storage latency from asynchronous request handling, bounding admission and overload behavior, supporting migration between local and clustered durable state, and adding dynamic membership and placement without changing application intent.
