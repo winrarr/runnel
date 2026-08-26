@@ -10,6 +10,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use runnel_engine::StageTimer;
 use runnel_engine::{Engine, EngineFuture};
 use serde::{Deserialize, Serialize};
+use tokio::sync::Semaphore;
 
 const LEGACY_MAGIC: &[u8; 4] = b"RNL1";
 const VERSIONED_MAGIC: &[u8; 4] = b"RNL2";
@@ -27,6 +28,7 @@ const REQUEST_ID_MAX_LEN: u32 = 1024;
 const REQUEST_ID_MAX_KEY_LEN: u32 = 128;
 const REQUEST_ID_MAX_BODY_LEN: u32 = 64 * 1024 * 1024;
 const MAX_IN_MEMORY_RECORDS: usize = 1024;
+const DEFAULT_STORAGE_EXECUTOR_CAPACITY: usize = 32;
 const DEFAULT_ACK_TIMEOUT: Duration = Duration::from_secs(30);
 const DEAD_LETTER_SUFFIX: &str = ".dead-letter";
 
@@ -94,6 +96,7 @@ struct BrokerState {
     dead_letters: AtomicU64,
     delivery_epoch: u128,
     next_delivery_id: AtomicU64,
+    storage_permits: Arc<Semaphore>,
 }
 
 struct StreamState {
@@ -225,6 +228,7 @@ impl Broker {
                 dead_letters: AtomicU64::new(0),
                 delivery_epoch: delivery_epoch(),
                 next_delivery_id: AtomicU64::new(0),
+                storage_permits: Arc::new(Semaphore::new(DEFAULT_STORAGE_EXECUTOR_CAPACITY)),
             }),
         })
     }
@@ -593,7 +597,11 @@ impl Broker {
 
 impl Engine for Broker {
     fn create_stream<'a>(&'a self, stream: &'a str) -> EngineFuture<'a, bool> {
-        Box::pin(async move { Broker::create_stream(self, stream) })
+        let broker = self.clone();
+        let stream = stream.to_owned();
+        dispatch_storage(Arc::clone(&self.inner.storage_permits), move || {
+            broker.create_stream(&stream)
+        })
     }
 
     fn publish<'a>(
@@ -603,13 +611,20 @@ impl Engine for Broker {
         payload: Vec<u8>,
         request_id: Option<String>,
     ) -> EngineFuture<'a, Offset> {
-        Box::pin(
-            async move { Broker::publish_with_request_id(self, stream, key, payload, request_id) },
-        )
+        let broker = self.clone();
+        let stream = stream.to_owned();
+        dispatch_storage(Arc::clone(&self.inner.storage_permits), move || {
+            broker.publish_with_request_id(&stream, key, payload, request_id)
+        })
     }
 
     fn poll<'a>(&'a self, stream: &'a str, consumer: &'a str) -> EngineFuture<'a, PollResult> {
-        Box::pin(async move { Broker::poll(self, stream, consumer) })
+        let broker = self.clone();
+        let stream = stream.to_owned();
+        let consumer = consumer.to_owned();
+        dispatch_storage(Arc::clone(&self.inner.storage_permits), move || {
+            broker.poll(&stream, &consumer)
+        })
     }
 
     fn poll_group<'a>(
@@ -618,7 +633,13 @@ impl Engine for Broker {
         consumer: &'a str,
         member: &'a str,
     ) -> EngineFuture<'a, PollResult> {
-        Box::pin(async move { Broker::poll_group(self, stream, consumer, member) })
+        let broker = self.clone();
+        let stream = stream.to_owned();
+        let consumer = consumer.to_owned();
+        let member = member.to_owned();
+        dispatch_storage(Arc::clone(&self.inner.storage_permits), move || {
+            broker.poll_group(&stream, &consumer, &member)
+        })
     }
 
     fn ack<'a>(
@@ -627,7 +648,12 @@ impl Engine for Broker {
         consumer: &'a str,
         offset: Offset,
     ) -> EngineFuture<'a, AckResult> {
-        Box::pin(async move { Broker::ack(self, stream, consumer, offset) })
+        let broker = self.clone();
+        let stream = stream.to_owned();
+        let consumer = consumer.to_owned();
+        dispatch_storage(Arc::clone(&self.inner.storage_permits), move || {
+            broker.ack(&stream, &consumer, offset)
+        })
     }
 
     fn ack_group<'a>(
@@ -638,14 +664,47 @@ impl Engine for Broker {
         offset: Offset,
         delivery_token: &'a str,
     ) -> EngineFuture<'a, AckResult> {
-        Box::pin(async move {
-            Broker::ack_group(self, stream, consumer, member, offset, delivery_token)
+        let broker = self.clone();
+        let stream = stream.to_owned();
+        let consumer = consumer.to_owned();
+        let member = member.to_owned();
+        let delivery_token = delivery_token.to_owned();
+        dispatch_storage(Arc::clone(&self.inner.storage_permits), move || {
+            broker.ack_group(&stream, &consumer, &member, offset, &delivery_token)
         })
     }
 
     fn health<'a>(&'a self) -> EngineFuture<'a, HealthSnapshot> {
-        Box::pin(async move { Broker::health(self) })
+        let broker = self.clone();
+        dispatch_storage(Arc::clone(&self.inner.storage_permits), move || {
+            broker.health()
+        })
     }
+}
+
+fn dispatch_storage<T, F>(permits: Arc<Semaphore>, operation: F) -> EngineFuture<'static, T>
+where
+    T: Send + 'static,
+    F: FnOnce() -> Result<T, BrokerError> + Send + 'static,
+{
+    Box::pin(async move {
+        let permit = permits.acquire_owned().await.map_err(|_| {
+            BrokerError::Io(io::Error::other("storage execution capacity was closed"))
+        })?;
+        tokio::task::spawn_blocking(move || {
+            let _permit = permit;
+            operation()
+        })
+        .await
+        .map_err(|error| {
+            let message = if error.is_panic() {
+                "storage execution task panicked"
+            } else {
+                "storage execution task was cancelled"
+            };
+            BrokerError::Io(io::Error::other(message))
+        })?
+    })
 }
 
 impl StreamLog {
@@ -1525,6 +1584,133 @@ mod tests {
             second,
             PollResult::Message(Message { offset: 0, .. })
         ));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn storage_dispatch_runs_off_the_async_runtime_thread() {
+        let runtime_thread = thread::current().id();
+        let storage_thread =
+            dispatch_storage(Arc::new(Semaphore::new(1)), || Ok(thread::current().id()))
+                .await
+                .unwrap();
+
+        assert_ne!(storage_thread, runtime_thread);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn storage_dispatch_does_not_block_unrelated_async_work() {
+        let permits = Arc::new(Semaphore::new(1));
+        let started = Arc::new(tokio::sync::Notify::new());
+        let (release_sender, release_receiver) = std::sync::mpsc::channel();
+        let storage_started = Arc::clone(&started);
+        let storage = tokio::spawn(dispatch_storage(Arc::clone(&permits), move || {
+            storage_started.notify_one();
+            release_receiver
+                .recv()
+                .expect("storage task should be released by the test");
+            Ok(())
+        }));
+
+        started.notified().await;
+        let unrelated = tokio::spawn(async { 42_u8 });
+        assert_eq!(unrelated.await.unwrap(), 42);
+
+        release_sender.send(()).unwrap();
+        storage.await.unwrap().unwrap();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn storage_dispatch_waits_when_capacity_is_exhausted() {
+        let permits = Arc::new(Semaphore::new(1));
+        let started = Arc::new(tokio::sync::Notify::new());
+        let (release_sender, release_receiver) = std::sync::mpsc::channel();
+        let storage_started = Arc::clone(&started);
+        let first = tokio::spawn(dispatch_storage(Arc::clone(&permits), move || {
+            storage_started.notify_one();
+            release_receiver
+                .recv()
+                .expect("storage task should be released by the test");
+            Ok(())
+        }));
+
+        started.notified().await;
+        let second = tokio::spawn(dispatch_storage(permits, || Ok(())));
+        tokio::task::yield_now().await;
+        assert!(!second.is_finished());
+
+        release_sender.send(()).unwrap();
+        first.await.unwrap().unwrap();
+        second.await.unwrap().unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn async_engine_preserves_order_and_ack_recovery_under_concurrent_publishes() {
+        const MESSAGE_COUNT: usize = 16;
+
+        let directory = tempdir().unwrap();
+        let broker = Broker::open(directory.path(), BrokerConfig::default()).unwrap();
+        let mut publishes = Vec::with_capacity(MESSAGE_COUNT);
+        for message in 0..MESSAGE_COUNT {
+            let broker = broker.clone();
+            publishes.push(tokio::spawn(async move {
+                let payload = format!("payload-{message}").into_bytes();
+                let offset = Engine::publish(&broker, "events", None, payload.clone(), None)
+                    .await
+                    .unwrap();
+                (offset, payload)
+            }));
+        }
+
+        let mut published = Vec::with_capacity(MESSAGE_COUNT);
+        for publish in publishes {
+            published.push(publish.await.unwrap());
+        }
+        published.sort_unstable_by_key(|(offset, _)| *offset);
+        for (expected_offset, (offset, _)) in published.iter().enumerate() {
+            assert_eq!(*offset, expected_offset as Offset);
+        }
+
+        let first = match Engine::poll(&broker, "events", "worker").await.unwrap() {
+            PollResult::Message(message) => message,
+            PollResult::Empty => panic!("expected the first message"),
+        };
+        assert_eq!(first.offset, 0);
+        assert_eq!(first.payload, published[0].1);
+        drop(broker);
+
+        let broker = Broker::open(directory.path(), BrokerConfig::default()).unwrap();
+        let redelivered = match Engine::poll(&broker, "events", "worker").await.unwrap() {
+            PollResult::Message(message) => message,
+            PollResult::Empty => panic!("expected the unacknowledged message after restart"),
+        };
+        assert_eq!(redelivered.offset, 0);
+        assert_eq!(redelivered.payload, published[0].1);
+        assert_eq!(redelivered.delivery_attempt, Some(2));
+        assert_eq!(
+            Engine::ack(&broker, "events", "worker", redelivered.offset)
+                .await
+                .unwrap(),
+            AckResult::Acknowledged
+        );
+
+        for (expected_offset, (_, payload)) in published.iter().enumerate().skip(1) {
+            let message = match Engine::poll(&broker, "events", "worker").await.unwrap() {
+                PollResult::Message(message) => message,
+                PollResult::Empty => panic!("expected message at offset {expected_offset}"),
+            };
+            assert_eq!(message.offset, expected_offset as Offset);
+            assert_eq!(message.payload, *payload);
+            assert_eq!(
+                Engine::ack(&broker, "events", "worker", message.offset)
+                    .await
+                    .unwrap(),
+                AckResult::Acknowledged
+            );
+        }
+        assert_eq!(
+            Engine::poll(&broker, "events", "worker").await.unwrap(),
+            PollResult::Empty
+        );
     }
 
     #[tokio::test]
