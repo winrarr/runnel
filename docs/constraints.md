@@ -12,3 +12,7 @@ These constraints come from the product brief and should guide implementation ch
 - Future clustering, replication, failover, fencing, rolling upgrades, and larger streams must not require an application programming-model rewrite.
 - The broker must remain correct without Kubernetes; container and Kubernetes support are operational surfaces, not correctness dependencies.
 
+## Repository workflow constraints
+
+- Changes must be delivered through separate pull requests, with each independently reviewable change on its own non-`main` branch.
+- Direct pushes to `main` and bypassing repository rulesets or required checks are not allowed.

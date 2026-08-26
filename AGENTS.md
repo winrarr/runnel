@@ -64,6 +64,7 @@ The current implementation serializes broker operations behind one in-process lo
 - Keep network behavior covered by tests that start the real server process.
 - Keep the pinned development toolchain separate from compatibility policy; do not infer a supported compiler floor from the pinned version.
 - Use Conventional Commits for project commits and pull-request titles. Keep the type meaningful, use a scope when it clarifies ownership, and mark breaking changes explicitly with `!` and migration details.
+- Deliver every independently reviewable change through its own pull request on a non-`main` branch. Never push directly to `main` or bypass repository rulesets and required checks.
 
 ## Canonical commands
 
