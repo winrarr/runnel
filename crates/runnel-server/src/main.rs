@@ -649,10 +649,11 @@ async fn handle_connection(
                     .request_size_rejections
                     .fetch_add(1, Ordering::Relaxed);
                 metrics.record_request(RequestOperation::InvalidRequest, started.elapsed(), true);
+                let response = request_size_response(protocol_admission.max_request_bytes);
                 send_response(
                     &mut writer,
-                    &request_size_response(protocol_admission.max_request_bytes),
-                    protocol_admission.request_timeout,
+                    &response,
+                    response_write_timeout(started, protocol_admission.request_timeout, &response),
                     &metrics,
                 )
                 .await?;
@@ -663,10 +664,11 @@ async fn handle_connection(
                     .request_bytes
                     .fetch_add(bytes.len() as u64, Ordering::Relaxed);
                 metrics.record_request(RequestOperation::InvalidRequest, started.elapsed(), true);
+                let response = invalid_request_response("request frame must end with a newline");
                 send_response(
                     &mut writer,
-                    &invalid_request_response("request frame must end with a newline"),
-                    protocol_admission.request_timeout,
+                    &response,
+                    response_write_timeout(started, protocol_admission.request_timeout, &response),
                     &metrics,
                 )
                 .await?;
@@ -677,77 +679,79 @@ async fn handle_connection(
                     .request_bytes
                     .fetch_add(bytes.len() as u64, Ordering::Relaxed);
                 let line = request_line(&bytes);
-                let (operation, response, response_timeout) =
-                    match serde_json::from_slice::<Request>(line) {
-                        Ok(request) => {
-                            let operation = RequestOperation::from_request(&request);
-                            let request_permit =
-                                match Arc::clone(&request_slots).try_acquire_owned() {
-                                    Ok(permit) => permit,
-                                    Err(_) => {
-                                        metrics.requests_rejected.fetch_add(1, Ordering::Relaxed);
-                                        metrics
-                                            .request_saturation_rejections
-                                            .fetch_add(1, Ordering::Relaxed);
-                                        let response = saturated_response();
-                                        metrics.record_request(operation, started.elapsed(), true);
-                                        send_response(
-                                            &mut writer,
-                                            &response,
-                                            protocol_admission.request_timeout,
-                                            &metrics,
-                                        )
-                                        .await?;
-                                        continue;
-                                    }
-                                };
-                            let _request_permit = request_permit;
-                            metrics.active_requests.fetch_add(1, Ordering::Relaxed);
-                            let _active_request = ActiveRequest(Arc::clone(&metrics));
-                            #[cfg(feature = "instrumentation")]
-                            let _stage_timer = StageTimer::new("server.protocol_round_trip");
-                            let mut response_timeout =
-                                remaining_timeout(started, protocol_admission.request_timeout);
-                            let response = match tokio::time::timeout(
-                                response_timeout,
-                                handle_request(engine.as_ref(), request, &metrics),
-                            )
-                            .await
-                            {
-                                Ok(response) => response,
-                                Err(_) => {
-                                    metrics.request_timeouts.fetch_add(1, Ordering::Relaxed);
-                                    // Preserve a client-visible timeout response
-                                    // after the engine deadline has elapsed.
-                                    response_timeout = protocol_admission.request_timeout;
-                                    timeout_response()
-                                }
-                            };
-                            (operation, response, response_timeout)
-                        }
-                        Err(error) => {
-                            if std::str::from_utf8(line).is_err() {
-                                metrics.record_request(
-                                    RequestOperation::InvalidRequest,
-                                    started.elapsed(),
-                                    true,
-                                );
-                                return Err(std::io::Error::new(
-                                    std::io::ErrorKind::InvalidData,
-                                    "request frame was not valid UTF-8",
+                let (operation, response) = match serde_json::from_slice::<Request>(line) {
+                    Ok(request) => {
+                        let operation = RequestOperation::from_request(&request);
+                        let request_permit = match Arc::clone(&request_slots).try_acquire_owned() {
+                            Ok(permit) => permit,
+                            Err(_) => {
+                                metrics.requests_rejected.fetch_add(1, Ordering::Relaxed);
+                                metrics
+                                    .request_saturation_rejections
+                                    .fetch_add(1, Ordering::Relaxed);
+                                let response = saturated_response();
+                                metrics.record_request(operation, started.elapsed(), true);
+                                send_response(
+                                    &mut writer,
+                                    &response,
+                                    response_write_timeout(
+                                        started,
+                                        protocol_admission.request_timeout,
+                                        &response,
+                                    ),
+                                    &metrics,
                                 )
-                                .into());
+                                .await?;
+                                continue;
                             }
-                            (
+                        };
+                        let _request_permit = request_permit;
+                        metrics.active_requests.fetch_add(1, Ordering::Relaxed);
+                        let _active_request = ActiveRequest(Arc::clone(&metrics));
+                        #[cfg(feature = "instrumentation")]
+                        let _stage_timer = StageTimer::new("server.protocol_round_trip");
+                        let response = match tokio::time::timeout(
+                            remaining_timeout(started, protocol_admission.request_timeout),
+                            handle_request(engine.as_ref(), request, &metrics),
+                        )
+                        .await
+                        {
+                            Ok(response) => response,
+                            Err(_) => {
+                                metrics.request_timeouts.fetch_add(1, Ordering::Relaxed);
+                                timeout_response()
+                            }
+                        };
+                        (operation, response)
+                    }
+                    Err(error) => {
+                        if std::str::from_utf8(line).is_err() {
+                            metrics.record_request(
                                 RequestOperation::InvalidRequest,
-                                invalid_request_response(&error.to_string()),
-                                protocol_admission.request_timeout,
+                                started.elapsed(),
+                                true,
+                            );
+                            return Err(std::io::Error::new(
+                                std::io::ErrorKind::InvalidData,
+                                "request frame was not valid UTF-8",
                             )
+                            .into());
                         }
-                    };
+                        (
+                            RequestOperation::InvalidRequest,
+                            invalid_request_response(&error.to_string()),
+                        )
+                    }
+                };
                 let failed = matches!(&response, Response::Error { .. });
                 metrics.record_request(operation, started.elapsed(), failed);
-                send_response(&mut writer, &response, response_timeout, &metrics).await?;
+                send_response(
+                    &mut writer,
+                    &response,
+                    response_write_timeout(started, protocol_admission.request_timeout, &response),
+                    &metrics,
+                )
+                .await?;
                 served_request = true;
             }
         }
@@ -810,6 +814,17 @@ fn request_line(bytes: &[u8]) -> &[u8] {
 
 fn remaining_timeout(started: Instant, timeout: Duration) -> Duration {
     timeout.saturating_sub(started.elapsed())
+}
+
+fn response_write_timeout(
+    started: Instant,
+    request_timeout: Duration,
+    response: &Response,
+) -> Duration {
+    if matches!(response, Response::Error { .. }) {
+        return request_timeout;
+    }
+    remaining_timeout(started, request_timeout)
 }
 
 async fn send_response<W>(
