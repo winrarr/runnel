@@ -35,3 +35,12 @@ Commit prefix through Dependabot's commit-message configuration.
 Create a non-`main` branch for each independently reviewable change and deliver
 it through a separate pull request. Direct pushes to `main` and bypassing
 repository rulesets or required checks are not allowed.
+
+Every human change run must begin by fetching `origin/main`, recording its
+revision, and checking the latest default-branch CI run for that exact commit.
+Repeat the check before handing work off or opening or updating a pull request.
+Pull-request branches do not need to be rebased solely because `main` advanced:
+update the branch and rerun relevant checks when changes overlap in owned paths,
+shared contracts, generated files, dependencies, or integration behavior;
+otherwise a cleanly mergeable disjoint branch may proceed from its recorded
+baseline.
