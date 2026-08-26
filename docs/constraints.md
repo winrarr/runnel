@@ -16,4 +16,4 @@ These constraints come from the product brief and should guide implementation ch
 
 - Changes must be delivered through separate pull requests, with each independently reviewable change on its own non-`main` branch.
 - Direct pushes to `main` and bypassing repository rulesets or required checks are not allowed.
-- The `main` ruleset requires pull-request checks but does not require every branch to contain the newest `main` commit. Contributors must check the recorded baseline and newest `origin/main` CI status before starting and before opening or updating a pull request, and refresh a branch when changes overlap in paths, contracts, dependencies, generated files, or integration behavior.
+- The `main` ruleset requires pull-request checks but does not require every branch to contain the newest `main` commit. Every agent and human change run must check the recorded baseline and newest `origin/main` CI status at the start and before handoff, and refresh a branch when changes overlap in paths, contracts, dependencies, generated files, or integration behavior.

@@ -7,6 +7,10 @@ description: Coordinate independent coding and benchmark tasks in isolated Git w
 
 Use this workflow only when the user has authorized parallel delegation. Parallelism is valuable only when tasks have disjoint responsibilities and isolated execution resources.
 
+The root `AGENTS.md` change-run baseline is mandatory for every run. This skill
+adds the same start and handoff checks to delegated workers; it does not limit
+the rule to parallel work.
+
 ## Before spawning
 
 - Identify the immediate local task and keep it on the critical path.
