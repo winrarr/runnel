@@ -142,9 +142,9 @@ This register records known implementation shortcuts in the current vertical sli
 - Context: the local engine began as a synchronous library and is exposed through the shared asynchronous engine contract without a separate blocking-I/O boundary. Per-stream locking limits logical contention but does not isolate runtime scheduling from storage latency.
 - Retirement condition: measured storage execution boundaries keep filesystem stalls from starving unrelated network, health, and shutdown work while preserving per-stream ordering, durable acknowledgement semantics, bounded queues, and useful backpressure.
 
-## TD-023: External protocol admission is unbounded
+## TD-023: External protocol admission remains incomplete
 
 - Status: open
-- Impact: the server creates a task for every accepted client connection and reads newline-delimited requests without a maximum line length, connection cap, request deadline, or global in-flight admission budget. Slow, malformed, or numerous clients can consume memory and tasks before the broker can apply explicit backpressure.
-- Context: the development protocol favors a minimal persistent-connection loop, while bounded frame sizes and pooling were introduced only for the peer protocol.
+- Impact: the server now bounds connection count, request frame size, in-flight request work, and request duration, with explicit rejection responses and metrics. Slow-writer behavior, storage-stall isolation, and the full resource-pressure test matrix remain incomplete.
+- Context: the development protocol favors a minimal persistent-connection loop. The admission layer now uses bounded frame reads, connection/request permits, and request deadlines while retaining graceful drain behavior for already-used connections.
 - Retirement condition: the overload backlog outcome establishes configurable safe defaults and tests for connection count, request size, request duration, in-flight work, slow readers and writers, and rejection metrics without weakening graceful shutdown or normal client ergonomics.
