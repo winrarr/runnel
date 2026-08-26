@@ -84,6 +84,7 @@ fn connection_flood_is_rejected_and_durable_traffic_recovers() {
 
     drop(first);
     drop(second);
+    wait_for_metric_at_most(server.http_addr, "runnel_active_connections", 0);
     let mut recovered = TcpStream::connect(server.broker_addr).unwrap();
     recovered
         .set_read_timeout(Some(Duration::from_secs(2)))
@@ -296,6 +297,20 @@ fn wait_for_metric_at_least(address: SocketAddr, name: &str, expected: u64) -> S
         }
         if Instant::now() >= deadline {
             panic!("metric {name} did not reach {expected}");
+        }
+        sleep(Duration::from_millis(25));
+    }
+}
+
+fn wait_for_metric_at_most(address: SocketAddr, name: &str, expected: u64) -> String {
+    let deadline = Instant::now() + Duration::from_secs(3);
+    loop {
+        let metrics = http_metrics(address);
+        if metric_value(&metrics, name) <= expected {
+            return metrics;
+        }
+        if Instant::now() >= deadline {
+            panic!("metric {name} did not fall to {expected}");
         }
         sleep(Duration::from_millis(25));
     }
