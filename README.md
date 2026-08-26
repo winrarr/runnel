@@ -16,12 +16,13 @@ This repository currently provides the first vertical slice:
 - redelivery after acknowledgement timeout or broker restart;
 - health and basic Prometheus-compatible metrics;
 - a small development CLI;
+- a reusable async client with persistent connections and bounded request timeouts;
 - an early three-node Multi-Raft development backend with any-node client routing;
 - Docker and Kubernetes starting points.
 
 The workspace also contains `runnel-engine`, the shared semantic engine contract, and `runnel-raft`, an early static Multi-Raft backend. `--engine raft` enables versioned durable Raft/state-machine files, framed TCP peer transport, topology-free client forwarding, replicated shared-consumer ownership, clustered attempt limits and dead-letter streams, and a three-node development cluster. The backend is not yet production-complete: dynamic membership, scalable placement, backoff and dead-letter provenance, security policy, and broader failure semantics remain unfinished.
 
-The workspace includes a reusable runnel-test-support crate containing storage- and topology-independent assertions for the Engine contract.
+The workspace includes reusable `runnel-client` and `runnel-test-support` crates. The client provides persistent sequential request/response transport with bounded connection, write, and response timeouts for the provisional protocol; the test-support crate contains storage- and topology-independent assertions for the Engine contract.
 
 Retention, batching, compression, authentication, and TLS remain planned product work. The current line-delimited JSON protocol is a development protocol and is not yet a compatibility promise. Retry limits and dead-letter streams are broker-wide configuration for local and clustered delivery; the early static Raft backend provides replicated ownership, expiry fencing, and dead-letter recovery without exposing its internal consumer state.
 

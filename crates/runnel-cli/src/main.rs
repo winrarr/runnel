@@ -1,9 +1,8 @@
 use std::net::SocketAddr;
 
 use clap::{Parser, Subcommand};
+use runnel_client::Client;
 use runnel_protocol::{Request, Response};
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::net::TcpStream;
 
 #[derive(Debug, Parser)]
 #[command(name = "runnelctl", about = "Development client for Runnel")]
@@ -97,14 +96,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Command::Health => Request::Health,
     };
 
-    let mut stream = TcpStream::connect(args.server).await?;
-    let mut request_bytes = serde_json::to_vec(&request)?;
-    request_bytes.push(b'\n');
-    stream.write_all(&request_bytes).await?;
-
-    let mut response_line = String::new();
-    BufReader::new(stream).read_line(&mut response_line).await?;
-    let response: Response = serde_json::from_str(&response_line)?;
+    let mut client = Client::connect(args.server).await?;
+    let response: Response = client.request(&request).await?;
     println!("{}", serde_json::to_string_pretty(&response)?);
     Ok(())
 }

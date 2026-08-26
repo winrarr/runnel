@@ -12,8 +12,8 @@ This register records known implementation shortcuts in the current vertical sli
 ## TD-003: Provisional JSON-lines protocol and text-only server payload mapping
 
 - Status: open
-- Impact: the current wire format is not a compatibility contract, opens one connection per CLI operation, and maps payloads through UTF-8 strings at the server boundary.
-- Context: JSON makes the first vertical slice inspectable and easy to exercise from shell tools.
+- Impact: the current wire format is not a compatibility contract, the development CLI still opens one connection per invocation, and payloads are mapped through UTF-8 strings at the server boundary. The reusable client now supports persistent sequential connections but does not change those protocol limitations.
+- Context: JSON makes the first vertical slice inspectable and easy to exercise from shell tools. A bounded reusable client transport now centralizes connection and request timeout behavior for applications that use the provisional protocol.
 - Retirement condition: a versioned protocol preserves binary payloads, explicit outcome classes, compatibility policy, and interoperability tests.
 
 ## TD-004: Local and clustered durable state have no supported migration path

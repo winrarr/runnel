@@ -1233,8 +1233,19 @@ name = "runnel-cli"
 version = "0.1.0"
 dependencies = [
  "clap",
+ "runnel-client",
  "runnel-protocol",
  "serde_json",
+ "tokio",
+]
+
+[[package]]
+name = "runnel-client"
+version = "0.1.0"
+dependencies = [
+ "runnel-protocol",
+ "serde_json",
+ "thiserror 2.0.20",
  "tokio",
 ]
 

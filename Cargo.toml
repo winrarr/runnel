@@ -6,6 +6,7 @@ members = [
     "crates/runnel-core",
     "crates/runnel-raft",
     "crates/runnel-protocol",
+    "crates/runnel-client",
     "crates/runnel-server",
     "crates/runnel-cli",
 ]
