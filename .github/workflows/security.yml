@@ -19,7 +19,15 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - name: Install pinned cargo-audit
         run: cargo install --locked cargo-audit --version 0.22.2
+      - name: Ensure ignored advisory is not active
+        run: |
+          active_path="$(cargo tree --all-features --all-targets --invert rkyv@0.7.46 2>/dev/null)"
+          if [[ -n "${active_path}" ]]; then
+            echo "::error::rkyv 0.7.46 is active in the dependency feature graph; remove the exception and resolve the advisory."
+            printf '%s\n' "${active_path}"
+            exit 1
+          fi
       - name: Audit dependencies
-        # rkyv is an unused optional/dev-only lockfile dependency pulled by rust_decimal;
-        # remove this exception when the dependency graph no longer contains the advisory.
+        # cargo audit scans the lockfile and reports rust_decimal's inactive optional rkyv
+        # dependency. Remove this exception when the lockfile no longer contains the advisory.
         run: cargo audit --ignore RUSTSEC-2026-0235
