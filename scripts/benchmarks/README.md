@@ -172,6 +172,19 @@ unless the result is stable. Rerun or investigate an inconclusive result
 before claiming or accepting an optimization, and paste the stable report into
 the PR description.
 
+When a complete run is inconclusive because the host remains noisy, use:
+
+```text
+just bench-pr-local-until-stable
+```
+
+This holds the exclusive benchmark lock while retrying complete authoritative
+comparisons, retains every attempt's report, and stops at the first stable
+result. It returns inconclusive after its default three-attempt budget, or a
+hard failure immediately; pass `--max-attempts 5` to raise the explicit budget.
+It rejects diagnostic and fixed-repetition options,
+so a successful command always corresponds to a stability-qualified report.
+
 The scope is deliberately shared by the client and all three broker nodes, so
 the two revisions receive the same total budget while retaining native process
 and network behavior. Pass `--cpus` and `--memory` after `--` to run a
