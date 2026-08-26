@@ -20,6 +20,8 @@ const REQUEST_READ_TIMEOUT: Duration = CLUSTER_WAIT_TIMEOUT;
 const REQUEST_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(10);
 #[cfg(feature = "test-replacement-recovery")]
 const RECOVERY_REQUEST_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(5);
+#[cfg(feature = "test-replacement-recovery")]
+const SNAPSHOT_INTERRUPTION_ATTEMPTS: usize = 3;
 // This scenario checks stale-token fencing before acknowledging the current
 // delivery. A longer lease keeps a loaded CI runner from expiring the current
 // token while the intentionally stale acknowledgement is being committed.
@@ -833,7 +835,7 @@ fn three_process_cluster_reassigns_group_delivery_after_node_failure() {
 
 #[cfg(feature = "test-replacement-recovery")]
 #[test]
-fn replacement_node_recovers_from_compacted_snapshot() {
+fn replacement_node_recovers_after_repeated_snapshot_interruptions() {
     let directory = TempDir::new().unwrap();
     let addresses = (0..9).map(|_| free_addr()).collect::<Vec<_>>();
     let cluster_nodes = vec![(1, addresses[6]), (2, addresses[7]), (3, addresses[8])];
@@ -925,10 +927,14 @@ fn replacement_node_recovers_from_compacted_snapshot() {
 
     let snapshot_node = wait_for_snapshot(&nodes, replacement, "events");
     wait_for_purged_log(&nodes[snapshot_node], "events");
-    let replacement_dir = directory.path().join("empty-replacement");
-    nodes[replacement].replace_storage(replacement_dir);
-    wait_for_active_snapshot_transfer(nodes[replacement].http_addr);
-    nodes[replacement].stop();
+    nodes[replacement].replace_storage(directory.path().join("empty-replacement"));
+    for attempt in 0..SNAPSHOT_INTERRUPTION_ATTEMPTS {
+        wait_for_active_snapshot_transfer(nodes[replacement].http_addr, attempt);
+        nodes[replacement].stop();
+        if attempt + 1 < SNAPSHOT_INTERRUPTION_ATTEMPTS {
+            nodes[replacement].restart();
+        }
+    }
     nodes[replacement].restart();
     wait_for_metric_at_least(
         nodes[replacement].http_addr,
@@ -936,10 +942,41 @@ fn replacement_node_recovers_from_compacted_snapshot() {
         1,
     );
     wait_for_message_at(nodes[replacement].broker_addr, 1, "snapshot-1");
+    wait_for_message_for_consumer_at(
+        nodes[replacement].broker_addr,
+        "events",
+        "inspector",
+        0,
+        "seed",
+    );
+    assert!(matches!(
+        wait_for_response_at(
+            nodes[replacement].broker_addr,
+            || Request::Ack {
+                stream: "events".to_owned(),
+                consumer: "inspector".to_owned(),
+                offset: 0,
+            },
+            |response| matches!(response, Response::Acknowledged { .. }),
+        ),
+        Response::Acknowledged { .. }
+    ));
+    assert!(matches!(
+        wait_for_response_at(
+            nodes[replacement].broker_addr,
+            || Request::Ack {
+                stream: "events".to_owned(),
+                consumer: "worker".to_owned(),
+                offset: 1,
+            },
+            |response| matches!(response, Response::Acknowledged { .. }),
+        ),
+        Response::Acknowledged { .. }
+    ));
     let metrics = http_metrics(nodes[replacement].http_addr);
     assert!(
-        metric_value(&metrics, "runnel_snapshot_transfer_chunks_received_total") >= 1,
-        "replacement metrics did not report snapshot chunks after retry:\n{metrics}"
+        metric_value(&metrics, "runnel_snapshot_transfer_chunks_received_total") >= 2,
+        "replacement metrics did not report a multi-chunk snapshot after repeated retries:\n{metrics}"
     );
     assert!(
         metric_value(
@@ -951,6 +988,50 @@ fn replacement_node_recovers_from_compacted_snapshot() {
     assert!(
         metric_value(&metrics, "runnel_snapshot_installs_completed_total") >= 1,
         "replacement metrics did not report a completed snapshot install:\n{metrics}"
+    );
+
+    nodes[leader].stop();
+    let recovered_leader = wait_for_stream_on_any(&mut nodes, "events");
+    assert_ne!(recovered_leader, leader);
+    assert!(matches!(
+        wait_for_response_at(
+            nodes[recovered_leader].broker_addr,
+            || Request::Publish {
+                stream: "events".to_owned(),
+                key: None,
+                payload: "after-recovery-leader-failure".to_owned(),
+                request_id: Some("after-recovery-leader-failure".to_owned()),
+            },
+            |response| matches!(response, Response::Published { offset: 49, .. }),
+        ),
+        Response::Published { offset: 49, .. }
+    ));
+    wait_for_message_for_consumer_at(
+        nodes[recovered_leader].broker_addr,
+        "events",
+        "worker",
+        2,
+        "snapshot-2",
+    );
+    assert!(matches!(
+        wait_for_response_at(
+            nodes[recovered_leader].broker_addr,
+            || Request::Ack {
+                stream: "events".to_owned(),
+                consumer: "worker".to_owned(),
+                offset: 2,
+            },
+            |response| matches!(response, Response::Acknowledged { .. }),
+        ),
+        Response::Acknowledged { .. }
+    ));
+    nodes[leader].restart();
+    wait_for_message_for_consumer_at(
+        nodes[leader].broker_addr,
+        "events",
+        "worker",
+        3,
+        "snapshot-3",
     );
     assert_live_nodes(&mut nodes);
 }
@@ -1175,14 +1256,24 @@ fn wait_for_message(address: SocketAddr, offset: u64, payload: &str) {
 }
 
 fn wait_for_message_at(address: SocketAddr, offset: u64, payload: &str) {
+    wait_for_message_for_consumer_at(address, "events", "worker", offset, payload);
+}
+
+fn wait_for_message_for_consumer_at(
+    address: SocketAddr,
+    stream: &str,
+    consumer: &str,
+    offset: u64,
+    payload: &str,
+) {
     let deadline = Instant::now() + CLUSTER_WAIT_TIMEOUT;
     let mut last_response = None;
     while Instant::now() < deadline {
         let response = request_with_timeout(
             address,
             Request::Poll {
-                stream: "events".to_owned(),
-                consumer: "worker".to_owned(),
+                stream: stream.to_owned(),
+                consumer: consumer.to_owned(),
             },
             REQUEST_ATTEMPT_TIMEOUT,
         );
@@ -1201,7 +1292,7 @@ fn wait_for_message_at(address: SocketAddr, offset: u64, payload: &str) {
     }
     let metrics = http_metrics(address);
     panic!(
-        "node {address} did not recover message at offset {offset}; last response: {last_response:?}; metrics:\n{metrics}"
+        "node {address} did not recover {stream}/{consumer} message at offset {offset}; expected payload {payload:?}; last response: {last_response:?}; metrics:\n{metrics}"
     );
 }
 
@@ -1248,8 +1339,9 @@ fn wait_for_purged_log(node: &RunningNode, stream: &str) {
 }
 
 #[cfg(feature = "test-replacement-recovery")]
-fn wait_for_active_snapshot_transfer(address: SocketAddr) {
+fn wait_for_active_snapshot_transfer(address: SocketAddr, attempt: usize) {
     let deadline = Instant::now() + CLUSTER_WAIT_TIMEOUT;
+    let mut last_metrics = None;
     while Instant::now() < deadline {
         let metrics = http_metrics(address);
         let chunks = metric_value(&metrics, "runnel_snapshot_transfer_chunks_received_total");
@@ -1260,9 +1352,13 @@ fn wait_for_active_snapshot_transfer(address: SocketAddr) {
         if chunks > final_chunks {
             return;
         }
+        last_metrics = Some(metrics);
         sleep(Duration::from_millis(10));
     }
-    panic!("replacement node did not receive a non-final snapshot chunk");
+    panic!(
+        "replacement node did not receive a non-final snapshot chunk during interruption attempt {attempt}; last metrics:\n{}",
+        last_metrics.as_deref().unwrap_or("<no metrics response>")
+    );
 }
 
 #[cfg(feature = "test-replacement-recovery")]
