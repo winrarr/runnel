@@ -1300,6 +1300,7 @@ version = "0.1.0"
 dependencies = [
  "axum",
  "clap",
+ "runnel-client",
  "runnel-core",
  "runnel-engine",
  "runnel-protocol",
