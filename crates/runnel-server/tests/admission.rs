@@ -1,3 +1,5 @@
+#[cfg(unix)]
+use std::fs;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
@@ -312,6 +314,139 @@ fn slow_writer_is_bounded_and_independent_traffic_continues() {
     wait_for_metric_at_most(server.http_addr, "runnel_active_connections", 0);
 }
 
+#[cfg(unix)]
+#[test]
+fn served_persistent_connection_drains_promptly_on_shutdown() {
+    let directory = TempDir::new().unwrap();
+    let mut server = RunningServer::start(directory.path(), &[]);
+    let mut connection = TcpStream::connect(server.broker_addr).unwrap();
+    connection
+        .set_read_timeout(Some(Duration::from_secs(2)))
+        .unwrap();
+
+    assert!(matches!(
+        send_on_connection(&mut connection, Request::Health),
+        Response::Health { .. }
+    ));
+    wait_for_metric_at_least(server.http_addr, "runnel_active_connections", 1);
+
+    send_sigterm(&server.child);
+    let deadline = Instant::now() + Duration::from_secs(2);
+    let status = loop {
+        if let Some(status) = server.child.try_wait().unwrap() {
+            break status;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "server did not drain a served persistent connection promptly"
+        );
+        sleep(Duration::from_millis(25));
+    };
+    assert!(status.success(), "server exited unsuccessfully: {status}");
+}
+
+#[cfg(unix)]
+#[test]
+fn storage_stall_is_bounded_and_durable_traffic_continues() {
+    let directory = TempDir::new().unwrap();
+    let server = RunningServer::start(
+        directory.path(),
+        &[
+            "--request-timeout-ms",
+            "500",
+            "--max-in-flight-requests",
+            "2",
+        ],
+    );
+
+    assert!(matches!(
+        request(
+            server.broker_addr,
+            Request::CreateStream {
+                stream: "stalled".to_owned(),
+            },
+        ),
+        Response::StreamCreated { .. }
+    ));
+    assert!(matches!(
+        request(
+            server.broker_addr,
+            Request::Publish {
+                stream: "stalled".to_owned(),
+                key: None,
+                payload: "blocked-state-write".to_owned(),
+                request_id: None,
+            },
+        ),
+        Response::Published { offset: 0, .. }
+    ));
+
+    let consumer_directory = directory.path().join("consumers/stalled");
+    fs::create_dir_all(&consumer_directory).unwrap();
+    let fifo = consumer_directory.join("blocked.json.tmp");
+    create_fifo(&fifo);
+
+    let started = Instant::now();
+    assert!(matches!(
+        request(
+            server.broker_addr,
+            Request::Poll {
+                stream: "stalled".to_owned(),
+                consumer: "blocked".to_owned(),
+            },
+        ),
+        Response::Error { code, .. } if code == "request_timeout"
+    ));
+    assert!(
+        started.elapsed() < Duration::from_secs(1),
+        "a storage stall must be bounded by the protocol request timeout"
+    );
+    let started = Instant::now();
+    assert!(http_ready(server.http_addr).starts_with("HTTP/1.1 503"));
+    assert!(
+        started.elapsed() < Duration::from_secs(2),
+        "readiness must report a stalled storage dependency within its health deadline"
+    );
+
+    let started = Instant::now();
+    assert!(matches!(
+        request(server.broker_addr, Request::Health),
+        Response::Error { code, .. } if code == "request_timeout"
+    ));
+    assert!(
+        started.elapsed() < Duration::from_secs(1),
+        "protocol health must be bounded by the request timeout"
+    );
+
+    let started = Instant::now();
+    assert!(matches!(
+        request(
+            server.broker_addr,
+            Request::Publish {
+                stream: "after-stall".to_owned(),
+                key: None,
+                payload: "durable-after-stall".to_owned(),
+                request_id: None,
+            },
+        ),
+        Response::Published { offset: 0, .. }
+    ));
+    assert!(matches!(
+        request(
+            server.broker_addr,
+            Request::Poll {
+                stream: "after-stall".to_owned(),
+                consumer: "reader".to_owned(),
+            },
+        ),
+        Response::Message { payload, .. } if payload == "durable-after-stall"
+    ));
+    assert!(
+        started.elapsed() < Duration::from_secs(1),
+        "durable traffic must not wait for one stalled storage operation"
+    );
+}
+
 fn server_binary() -> PathBuf {
     if let Some(binary) = std::env::var_os("CARGO_BIN_EXE_runnel") {
         return PathBuf::from(binary);
@@ -329,6 +464,29 @@ fn server_binary() -> PathBuf {
         binary.display()
     );
     binary
+}
+
+#[cfg(unix)]
+fn create_fifo(path: &Path) {
+    let status = Command::new("mkfifo")
+        .arg(path)
+        .status()
+        .expect("mkfifo should be available on Unix");
+    assert!(
+        status.success(),
+        "mkfifo failed for {}: {status}",
+        path.display()
+    );
+}
+
+#[cfg(unix)]
+fn send_sigterm(child: &Child) {
+    let pid = child.id().to_string();
+    let status = Command::new("kill")
+        .args(["-TERM", &pid])
+        .status()
+        .expect("kill should be available on Unix");
+    assert!(status.success(), "SIGTERM should be delivered: {status}");
 }
 
 fn decode_response(encoded: &str) -> Response {
@@ -377,6 +535,23 @@ fn http_metrics(address: SocketAddr) -> String {
     response
         .split_once("\r\n\r\n")
         .map_or(response.clone(), |(_, body)| body.to_owned())
+}
+
+#[cfg(unix)]
+fn http_ready(address: SocketAddr) -> String {
+    let mut stream =
+        TcpStream::connect(address).expect("health endpoint should accept connections");
+    stream
+        .set_read_timeout(Some(Duration::from_secs(2)))
+        .expect("health read timeout should be set");
+    stream
+        .write_all(b"GET /health/ready HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+        .expect("health request should be writable");
+    let mut response = String::new();
+    stream
+        .read_to_string(&mut response)
+        .expect("health response should be readable");
+    response
 }
 
 fn metric_value(metrics: &str, name: &str) -> u64 {
