@@ -11,6 +11,62 @@ import compare  # noqa: E402
 
 
 class ComparisonBenchmarkTests(unittest.TestCase):
+    def test_run_metadata_records_identity_source_environment_and_command(self) -> None:
+        with (
+            patch.object(compare, "source_metadata", return_value={"revision": "abc123"}),
+            patch.object(
+                compare,
+                "environment_metadata",
+                return_value={"host": "benchmark-host", "cpus": 2},
+            ),
+            patch.object(compare.sys, "argv", ["compare.py", "--messages", "100"]),
+        ):
+            metadata = compare.run_metadata("20260827010203000000")
+
+        self.assertEqual(metadata["run_id"], "20260827010203000000")
+        self.assertEqual(metadata["command"], ["compare.py", "--messages", "100"])
+        self.assertEqual(metadata["source"], {"revision": "abc123"})
+        self.assertEqual(metadata["environment"], {"host": "benchmark-host", "cpus": 2})
+
+    def test_source_metadata_uses_ci_identity_when_available(self) -> None:
+        with (
+            patch.object(compare, "git_revision", return_value="abc123"),
+            patch.dict(
+                compare.os.environ,
+                {
+                    "GITHUB_REPOSITORY": "example/runnel",
+                    "GITHUB_RUN_ID": "42",
+                    "GITHUB_SERVER_URL": "https://github.example",
+                    "GITHUB_REF_NAME": "main",
+                    "GITHUB_EVENT_NAME": "schedule",
+                    "GITHUB_WORKFLOW": "Competitor benchmark history",
+                    "BENCHMARK_PROFILE": "scheduled",
+                },
+                clear=True,
+            ),
+        ):
+            metadata = compare.source_metadata()
+
+        self.assertEqual(metadata["repository"], "example/runnel")
+        self.assertEqual(metadata["revision"], "abc123")
+        self.assertEqual(metadata["ref"], "main")
+        self.assertEqual(metadata["run_id"], "42")
+        self.assertEqual(
+            metadata["run_url"], "https://github.example/example/runnel/actions/runs/42"
+        )
+        self.assertEqual(metadata["profile"], "scheduled")
+
+    def test_backend_metadata_records_the_measurement_client_image(self) -> None:
+        self.assertEqual(
+            compare.backend_metadata("kafka", 1)["client_image"], compare.KAFKA_IMAGE
+        )
+        self.assertEqual(
+            compare.backend_metadata("nats", 3)["client_image"], compare.NATS_BOX_IMAGE
+        )
+        self.assertEqual(
+            compare.backend_metadata("runnel", 1)["client_image"], "host Python runtime"
+        )
+
     def test_comparison_suite_distinguishes_single_and_three_node_runs(self) -> None:
         self.assertEqual(compare.benchmark_suite(1, ["runnel"]), "runnel")
         self.assertEqual(compare.benchmark_suite(1, ["kafka", "redpanda", "nats"]), "native-comparison")
