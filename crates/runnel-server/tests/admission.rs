@@ -213,6 +213,103 @@ fn partial_request_times_out_and_unrelated_health_recovers() {
     ));
 }
 
+#[test]
+fn slow_writer_is_bounded_and_independent_traffic_continues() {
+    let directory = TempDir::new().unwrap();
+    let server = RunningServer::start(
+        directory.path(),
+        &[
+            "--max-request-bytes",
+            "8388608",
+            "--request-timeout-ms",
+            "500",
+            "--max-in-flight-requests",
+            "2",
+        ],
+    );
+    let payload = "x".repeat(6 * 1024 * 1024);
+
+    assert!(matches!(
+        request(
+            server.broker_addr,
+            Request::CreateStream {
+                stream: "slow-writer".to_owned(),
+            },
+        ),
+        Response::StreamCreated { .. }
+    ));
+    assert!(matches!(
+        request(
+            server.broker_addr,
+            Request::Publish {
+                stream: "slow-writer".to_owned(),
+                key: None,
+                payload,
+                request_id: None,
+            },
+        ),
+        Response::Published { offset: 0, .. }
+    ));
+
+    let metrics_before = http_metrics(server.http_addr);
+    let request_timeouts_before =
+        metric_value(&metrics_before, "runnel_broker_request_timeouts_total");
+    let response_write_timeouts_before = metric_value(
+        &metrics_before,
+        "runnel_broker_response_write_timeouts_total",
+    );
+
+    let mut slow_writer = TcpStream::connect(server.broker_addr).unwrap();
+    slow_writer
+        .write_all(
+            &serde_json::to_vec(&Request::Poll {
+                stream: "slow-writer".to_owned(),
+                consumer: "unread".to_owned(),
+            })
+            .unwrap(),
+        )
+        .unwrap();
+    slow_writer.write_all(b"\n").unwrap();
+
+    let metrics = wait_for_metric_at_least(server.http_addr, "runnel_active_requests", 1);
+    assert_eq!(metric_value(&metrics, "runnel_active_requests"), 1);
+
+    let started = Instant::now();
+    assert!(matches!(
+        request(server.broker_addr, Request::Health),
+        Response::Health { .. }
+    ));
+    assert!(matches!(
+        request(
+            server.broker_addr,
+            Request::Publish {
+                stream: "after-slow-writer".to_owned(),
+                key: None,
+                payload: "durable-after-slow-writer".to_owned(),
+                request_id: None,
+            },
+        ),
+        Response::Published { offset: 0, .. }
+    ));
+    assert!(
+        started.elapsed() < Duration::from_secs(1),
+        "independent health and durable traffic must not wait for a slow response writer"
+    );
+
+    let metrics = wait_for_metric_at_least(
+        server.http_addr,
+        "runnel_broker_response_write_timeouts_total",
+        response_write_timeouts_before + 1,
+    );
+    assert_eq!(
+        metric_value(&metrics, "runnel_broker_request_timeouts_total"),
+        request_timeouts_before,
+        "response-write timeout must not be reported as a request timeout"
+    );
+    assert_eq!(metric_value(&metrics, "runnel_active_requests"), 0);
+    wait_for_metric_at_most(server.http_addr, "runnel_active_connections", 0);
+}
+
 fn server_binary() -> PathBuf {
     if let Some(binary) = std::env::var_os("CARGO_BIN_EXE_runnel") {
         return PathBuf::from(binary);
