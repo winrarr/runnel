@@ -99,6 +99,6 @@ Merge pull requests one at a time. After each merge, fetch `origin/main` and ins
 
 ## Cleanup and handoff
 
-After a worker is complete, confirm its processes and containers are gone, preserve committed work and benchmark artifacts needed for review, and remove only clean temporary worktrees. Do not delete a worktree containing uncommitted user changes.
+After a worker is complete or cancelled, explicitly stop or close the worker and any nested workers before cleanup. Then confirm that the workers and their owned processes and containers are gone, preserve committed work and benchmark artifacts needed for review, and remove only clean temporary worktrees. A clean Git status is not sufficient. Do not delete a worktree containing uncommitted user changes or belonging to a worker that is still active; do not terminate unrelated processes.
 
 The final handoff should state which branches or pull requests were integrated, which remain open or blocked, the exact verification status, and any unresolved resource or benchmark reliability issue.
