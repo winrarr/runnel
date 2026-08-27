@@ -71,6 +71,109 @@ pub enum ClientError {
         #[source]
         source: serde_json::Error,
     },
+
+    #[error("unexpected response for {operation}: {response:?}")]
+    UnexpectedResponse {
+        operation: &'static str,
+        response: Box<Response>,
+    },
+}
+
+/// Optional fields for a text publish.
+///
+/// `request_id` is an application-provided identity. Reuse the same identity
+/// when explicitly resolving an ambiguous publish against a broker that
+/// supports request deduplication. This client never generates identities or
+/// retries publishes automatically.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PublishOptions {
+    /// Optional ordering key attached to the message.
+    pub key: Option<String>,
+    /// Optional stable identity for explicitly resolving an ambiguous publish.
+    pub request_id: Option<String>,
+}
+
+impl PublishOptions {
+    /// Set the optional ordering key.
+    pub fn with_key(mut self, key: impl Into<String>) -> Self {
+        self.key = Some(key.into());
+        self
+    }
+
+    /// Set the stable identity used for an explicitly retried publish.
+    pub fn with_request_id(mut self, request_id: impl Into<String>) -> Self {
+        self.request_id = Some(request_id.into());
+        self
+    }
+}
+
+/// The result of a stream-creation request.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StreamCreation {
+    /// The stream name acknowledged by the broker.
+    pub stream: String,
+    /// Whether this request created the stream (`false` means it already existed).
+    pub created: bool,
+}
+
+/// The broker-assigned offset returned by a successful publish.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PublishReceipt {
+    /// The stream that accepted the message.
+    pub stream: String,
+    /// The broker-assigned logical message offset.
+    pub offset: u64,
+}
+
+/// A message returned by a successful poll.
+///
+/// The provisional protocol exposes payloads as text. Consequently this type
+/// intentionally exposes `payload` as a `String`; it is not a binary payload
+/// API and does not promise arbitrary byte round-tripping.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Message {
+    /// The stream containing the message.
+    pub stream: String,
+    /// The consumer that received the message.
+    pub consumer: String,
+    /// The shared-consumer member that received the message, when grouped polling was used.
+    pub member: Option<String>,
+    /// The broker-assigned logical message offset.
+    pub offset: u64,
+    /// The optional ordering key attached to the message.
+    pub key: Option<String>,
+    /// The text payload returned by the provisional protocol.
+    pub payload: String,
+    /// The broker timestamp associated with the publish.
+    pub published_at_ms: u64,
+    /// The token required for a grouped acknowledgement, when present.
+    pub delivery_token: Option<String>,
+    /// The delivery attempt number, when the broker reports one.
+    pub delivery_attempt: Option<u32>,
+}
+
+/// The result of an acknowledgement request.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Acknowledgement {
+    /// The acknowledged stream.
+    pub stream: String,
+    /// The acknowledged consumer.
+    pub consumer: String,
+    /// The acknowledged logical message offset.
+    pub offset: u64,
+    /// Whether the broker had already durably acknowledged this offset.
+    pub already_acknowledged: bool,
+}
+
+/// The health snapshot returned by the broker.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Health {
+    /// The broker-reported health status.
+    pub status: String,
+    /// Number of streams known to the broker.
+    pub streams: usize,
+    /// Bytes currently occupied by broker storage.
+    pub storage_bytes: u64,
 }
 
 /// The result classification for one request attempt.
@@ -147,6 +250,15 @@ impl AttemptOutcome {
 /// Calls borrow the client mutably so responses cannot be interleaved. Use
 /// [`Client::reconnect`] to replace a connection explicitly after a
 /// connection-invalidating failure; reconnecting never retries a request.
+///
+/// The typed convenience methods use the same connection and outcome rules as
+/// [`Client::request_with_outcome`]. They return `Err(AttemptOutcome)` rather
+/// than retrying or converting an ambiguous result into an ordinary error. If
+/// a request future is cancelled after it may have started writing, treat its
+/// outcome as unknown, discard or reconnect the client, and decide explicitly
+/// whether a new request is safe. A cancelled reconnect leaves the existing
+/// connection unchanged because the replacement is installed only after the
+/// new connection succeeds.
 pub struct Client {
     reader: BufReader<ReadHalf<TcpStream>>,
     writer: WriteHalf<TcpStream>,
@@ -208,7 +320,10 @@ impl Client {
     ///
     /// After a write, response timeout, read, EOF, or response-decoding error,
     /// the connection may not be reusable. Drop this client and connect a new
-    /// one before retrying.
+    /// one before retrying. If this future is cancelled after it may have
+    /// started writing, apply the same conservative rule: the request outcome
+    /// is unknown and the connection should be replaced before another
+    /// request.
     pub async fn request(&mut self, request: &Request) -> Result<Response, ClientError> {
         let mut request_bytes =
             serde_json::to_vec(request).map_err(|source| ClientError::EncodeRequest { source })?;
@@ -250,7 +365,9 @@ impl Client {
     /// new connection are retryable, and transport failures after this method
     /// starts writing are unknown. In particular, `request_timeout` remains
     /// unknown because the server uses it for both incomplete frames and
-    /// engine work that may already have been applied.
+    /// engine work that may already have been applied. Cancellation does not
+    /// produce an [`AttemptOutcome`]; callers must apply the same unknown
+    /// outcome rule when cancellation may have followed a partial write.
     pub async fn request_with_outcome(&mut self, request: &Request) -> AttemptOutcome {
         match self.request(request).await {
             Ok(response) => classify_response(response),
@@ -258,6 +375,282 @@ impl Client {
                 AttemptOutcome::Rejected(AttemptFailure::Client(error))
             }
             Err(error) => AttemptOutcome::Unknown(AttemptFailure::Client(error)),
+        }
+    }
+
+    /// Create a stream and return whether it was newly created.
+    ///
+    /// No retry is performed. A retryable or unknown result is returned in
+    /// the [`AttemptOutcome`] error so callers can reconnect and decide what
+    /// to do explicitly.
+    pub async fn create_stream(
+        &mut self,
+        stream: impl Into<String>,
+    ) -> Result<StreamCreation, AttemptOutcome> {
+        let stream = stream.into();
+        self.request_typed(
+            "create_stream",
+            Request::CreateStream {
+                stream: stream.clone(),
+            },
+            move |response| match response {
+                Response::StreamCreated {
+                    stream: response_stream,
+                    created,
+                } if response_stream == stream => Ok(StreamCreation {
+                    stream: response_stream,
+                    created,
+                }),
+                response => Err(Box::new(response)),
+            },
+        )
+        .await
+    }
+
+    /// Publish a text payload with no ordering key or retry identity.
+    ///
+    /// The current provisional protocol accepts text only. This method does
+    /// not provide binary payload support. If the attempt is unknown, repeat
+    /// it only after reconnecting and only with a stable request identity when
+    /// the broker's deduplication behavior is part of the deployment contract.
+    pub async fn publish(
+        &mut self,
+        stream: impl Into<String>,
+        payload: impl Into<String>,
+    ) -> Result<PublishReceipt, AttemptOutcome> {
+        self.publish_with_options(stream, payload, PublishOptions::default())
+            .await
+    }
+
+    /// Publish a text payload with optional ordering and retry identity.
+    ///
+    /// This operation is never retried automatically. A stable
+    /// `PublishOptions::request_id` lets an application explicitly retry an
+    /// unknown publish against the current engines' deduplication path; use
+    /// the same identity for that retry. The provisional protocol and this
+    /// API do not claim binary payload support.
+    pub async fn publish_with_options(
+        &mut self,
+        stream: impl Into<String>,
+        payload: impl Into<String>,
+        options: PublishOptions,
+    ) -> Result<PublishReceipt, AttemptOutcome> {
+        let stream = stream.into();
+        self.request_typed(
+            "publish",
+            Request::Publish {
+                stream: stream.clone(),
+                key: options.key,
+                payload: payload.into(),
+                request_id: options.request_id,
+            },
+            move |response| match response {
+                Response::Published {
+                    stream: response_stream,
+                    offset,
+                } if response_stream == stream => Ok(PublishReceipt {
+                    stream: response_stream,
+                    offset,
+                }),
+                response => Err(Box::new(response)),
+            },
+        )
+        .await
+    }
+
+    /// Poll a consumer, returning `None` when the broker reports an empty poll.
+    ///
+    /// Polling does not retry automatically. A cancelled or transport-failed
+    /// poll must be treated according to its outcome and the connection should
+    /// be replaced before another request when the request may have been sent.
+    pub async fn poll(
+        &mut self,
+        stream: impl Into<String>,
+        consumer: impl Into<String>,
+    ) -> Result<Option<Message>, AttemptOutcome> {
+        self.poll_request("poll", stream.into(), consumer.into(), None)
+            .await
+    }
+
+    /// Poll a shared consumer member, returning `None` when the broker reports
+    /// an empty poll.
+    pub async fn poll_group(
+        &mut self,
+        stream: impl Into<String>,
+        consumer: impl Into<String>,
+        member: impl Into<String>,
+    ) -> Result<Option<Message>, AttemptOutcome> {
+        self.poll_request(
+            "poll_group",
+            stream.into(),
+            consumer.into(),
+            Some(member.into()),
+        )
+        .await
+    }
+
+    /// Acknowledge a message delivered to an ordinary consumer.
+    pub async fn ack(
+        &mut self,
+        stream: impl Into<String>,
+        consumer: impl Into<String>,
+        offset: u64,
+    ) -> Result<Acknowledgement, AttemptOutcome> {
+        let stream = stream.into();
+        let consumer = consumer.into();
+        self.request_typed(
+            "ack",
+            Request::Ack {
+                stream: stream.clone(),
+                consumer: consumer.clone(),
+                offset,
+            },
+            move |response| match response {
+                Response::Acknowledged {
+                    stream: response_stream,
+                    consumer: response_consumer,
+                    offset: response_offset,
+                    already_acknowledged,
+                } if response_stream == stream
+                    && response_consumer == consumer
+                    && response_offset == offset =>
+                {
+                    Ok(Acknowledgement {
+                        stream: response_stream,
+                        consumer: response_consumer,
+                        offset: response_offset,
+                        already_acknowledged,
+                    })
+                }
+                response => Err(Box::new(response)),
+            },
+        )
+        .await
+    }
+
+    /// Acknowledge a message delivered to a shared consumer member.
+    pub async fn ack_group(
+        &mut self,
+        stream: impl Into<String>,
+        consumer: impl Into<String>,
+        member: impl Into<String>,
+        offset: u64,
+        delivery_token: impl Into<String>,
+    ) -> Result<Acknowledgement, AttemptOutcome> {
+        let stream = stream.into();
+        let consumer = consumer.into();
+        self.request_typed(
+            "ack_group",
+            Request::AckGroup {
+                stream: stream.clone(),
+                consumer: consumer.clone(),
+                member: member.into(),
+                offset,
+                delivery_token: delivery_token.into(),
+            },
+            move |response| match response {
+                Response::Acknowledged {
+                    stream: response_stream,
+                    consumer: response_consumer,
+                    offset: response_offset,
+                    already_acknowledged,
+                } if response_stream == stream
+                    && response_consumer == consumer
+                    && response_offset == offset =>
+                {
+                    Ok(Acknowledgement {
+                        stream: response_stream,
+                        consumer: response_consumer,
+                        offset: response_offset,
+                        already_acknowledged,
+                    })
+                }
+                response => Err(Box::new(response)),
+            },
+        )
+        .await
+    }
+
+    /// Read the broker's current health snapshot.
+    pub async fn health(&mut self) -> Result<Health, AttemptOutcome> {
+        self.request_typed("health", Request::Health, |response| match response {
+            Response::Health {
+                status,
+                streams,
+                storage_bytes,
+            } => Ok(Health {
+                status,
+                streams,
+                storage_bytes,
+            }),
+            response => Err(Box::new(response)),
+        })
+        .await
+    }
+
+    async fn poll_request(
+        &mut self,
+        operation: &'static str,
+        stream: String,
+        consumer: String,
+        member: Option<String>,
+    ) -> Result<Option<Message>, AttemptOutcome> {
+        let request = match member.as_ref() {
+            Some(member) => Request::PollGroup {
+                stream: stream.clone(),
+                consumer: consumer.clone(),
+                member: member.clone(),
+            },
+            None => Request::Poll {
+                stream: stream.clone(),
+                consumer: consumer.clone(),
+            },
+        };
+        self.request_typed(operation, request, move |response| match response {
+            Response::Message {
+                stream: response_stream,
+                consumer: response_consumer,
+                member: response_member,
+                offset,
+                key,
+                payload,
+                published_at_ms,
+                delivery_token,
+                delivery_attempt,
+            } if response_stream == stream
+                && response_consumer == consumer
+                && response_member.as_ref() == member.as_ref() =>
+            {
+                Ok(Some(Message {
+                    stream: response_stream,
+                    consumer: response_consumer,
+                    member: response_member,
+                    offset,
+                    key,
+                    payload,
+                    published_at_ms,
+                    delivery_token,
+                    delivery_attempt,
+                }))
+            }
+            Response::Empty {
+                stream: response_stream,
+                consumer: response_consumer,
+            } if response_stream == stream && response_consumer == consumer => Ok(None),
+            response => Err(Box::new(response)),
+        })
+        .await
+    }
+
+    async fn request_typed<T>(
+        &mut self,
+        operation: &'static str,
+        request: Request,
+        parse: impl FnOnce(Response) -> Result<T, Box<Response>>,
+    ) -> Result<T, AttemptOutcome> {
+        match typed_response(operation, self.request_with_outcome(&request).await, parse) {
+            TypedResponse::Value(value) => Ok(value),
+            TypedResponse::Outcome(outcome) => Err(outcome),
         }
     }
 }
@@ -294,12 +687,37 @@ fn classify_response(response: Response) -> AttemptOutcome {
     }
 }
 
+enum TypedResponse<T> {
+    Value(T),
+    Outcome(AttemptOutcome),
+}
+
+fn typed_response<T>(
+    operation: &'static str,
+    outcome: AttemptOutcome,
+    parse: impl FnOnce(Response) -> Result<T, Box<Response>>,
+) -> TypedResponse<T> {
+    match outcome {
+        AttemptOutcome::Confirmed(response) => match parse(response) {
+            Ok(value) => TypedResponse::Value(value),
+            Err(response) => TypedResponse::Outcome(AttemptOutcome::Unknown(
+                AttemptFailure::Client(ClientError::UnexpectedResponse {
+                    operation,
+                    response,
+                }),
+            )),
+        },
+        outcome => TypedResponse::Outcome(outcome),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::net::SocketAddr;
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
+    use tokio::sync::oneshot;
 
     fn test_config() -> ClientConfig {
         ClientConfig {
@@ -313,6 +731,18 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         (listener, address)
+    }
+
+    async fn read_request(reader: &mut BufReader<tokio::net::TcpStream>) -> Request {
+        let mut line = String::new();
+        reader.read_line(&mut line).await.unwrap();
+        serde_json::from_str(&line).unwrap()
+    }
+
+    async fn write_response(reader: &mut BufReader<tokio::net::TcpStream>, response: Response) {
+        let mut encoded = serde_json::to_vec(&response).unwrap();
+        encoded.push(b'\n');
+        reader.get_mut().write_all(&encoded).await.unwrap();
     }
 
     #[tokio::test]
@@ -367,6 +797,451 @@ mod tests {
             created,
             Response::StreamCreated { stream, created } if stream == "events" && created
         ));
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn typed_operations_map_current_protocol_results() {
+        let (listener, address) = listener().await;
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut reader = BufReader::new(stream);
+
+            assert!(matches!(
+                read_request(&mut reader).await,
+                Request::CreateStream { stream } if stream == "events"
+            ));
+            write_response(
+                &mut reader,
+                Response::StreamCreated {
+                    stream: "events".to_owned(),
+                    created: true,
+                },
+            )
+            .await;
+
+            match read_request(&mut reader).await {
+                Request::Publish {
+                    stream,
+                    key,
+                    payload,
+                    request_id,
+                } => {
+                    assert_eq!(stream, "events");
+                    assert_eq!(key.as_deref(), Some("order-1"));
+                    assert_eq!(payload, "hello");
+                    assert_eq!(request_id.as_deref(), Some("publish-1"));
+                }
+                request => panic!("expected publish, got {request:?}"),
+            }
+            write_response(
+                &mut reader,
+                Response::Published {
+                    stream: "events".to_owned(),
+                    offset: 4,
+                },
+            )
+            .await;
+
+            assert!(matches!(
+                read_request(&mut reader).await,
+                Request::Poll { stream, consumer }
+                    if stream == "events" && consumer == "reader"
+            ));
+            write_response(
+                &mut reader,
+                Response::Message {
+                    stream: "events".to_owned(),
+                    consumer: "reader".to_owned(),
+                    member: None,
+                    offset: 4,
+                    key: Some("order-1".to_owned()),
+                    payload: "hello".to_owned(),
+                    published_at_ms: 123,
+                    delivery_token: None,
+                    delivery_attempt: None,
+                },
+            )
+            .await;
+
+            assert!(matches!(
+                read_request(&mut reader).await,
+                Request::Poll { stream, consumer }
+                    if stream == "events" && consumer == "reader"
+            ));
+            write_response(
+                &mut reader,
+                Response::Empty {
+                    stream: "events".to_owned(),
+                    consumer: "reader".to_owned(),
+                },
+            )
+            .await;
+
+            assert!(matches!(
+                read_request(&mut reader).await,
+                Request::PollGroup {
+                    stream,
+                    consumer,
+                    member,
+                } if stream == "events" && consumer == "workers" && member == "member-a"
+            ));
+            write_response(
+                &mut reader,
+                Response::Message {
+                    stream: "events".to_owned(),
+                    consumer: "workers".to_owned(),
+                    member: Some("member-a".to_owned()),
+                    offset: 5,
+                    key: None,
+                    payload: "grouped".to_owned(),
+                    published_at_ms: 456,
+                    delivery_token: Some("token-5".to_owned()),
+                    delivery_attempt: Some(2),
+                },
+            )
+            .await;
+
+            assert!(matches!(
+                read_request(&mut reader).await,
+                Request::Ack {
+                    stream,
+                    consumer,
+                    offset,
+                } if stream == "events" && consumer == "reader" && offset == 4
+            ));
+            write_response(
+                &mut reader,
+                Response::Acknowledged {
+                    stream: "events".to_owned(),
+                    consumer: "reader".to_owned(),
+                    offset: 4,
+                    already_acknowledged: false,
+                },
+            )
+            .await;
+
+            match read_request(&mut reader).await {
+                Request::AckGroup {
+                    stream,
+                    consumer,
+                    member,
+                    offset,
+                    delivery_token,
+                } => {
+                    assert_eq!(stream, "events");
+                    assert_eq!(consumer, "workers");
+                    assert_eq!(member, "member-a");
+                    assert_eq!(offset, 5);
+                    assert_eq!(delivery_token, "token-5");
+                }
+                request => panic!("expected grouped acknowledgement, got {request:?}"),
+            }
+            write_response(
+                &mut reader,
+                Response::Acknowledged {
+                    stream: "events".to_owned(),
+                    consumer: "workers".to_owned(),
+                    offset: 5,
+                    already_acknowledged: true,
+                },
+            )
+            .await;
+
+            assert!(matches!(read_request(&mut reader).await, Request::Health));
+            write_response(
+                &mut reader,
+                Response::Health {
+                    status: "ok".to_owned(),
+                    streams: 1,
+                    storage_bytes: 4096,
+                },
+            )
+            .await;
+        });
+
+        let mut client = Client::connect_with_config(address, test_config())
+            .await
+            .unwrap();
+        assert_eq!(
+            client.create_stream("events").await.unwrap(),
+            StreamCreation {
+                stream: "events".to_owned(),
+                created: true,
+            }
+        );
+        assert_eq!(
+            client
+                .publish_with_options(
+                    "events",
+                    "hello",
+                    PublishOptions::default()
+                        .with_key("order-1")
+                        .with_request_id("publish-1"),
+                )
+                .await
+                .unwrap(),
+            PublishReceipt {
+                stream: "events".to_owned(),
+                offset: 4,
+            }
+        );
+        assert_eq!(
+            client.poll("events", "reader").await.unwrap(),
+            Some(Message {
+                stream: "events".to_owned(),
+                consumer: "reader".to_owned(),
+                member: None,
+                offset: 4,
+                key: Some("order-1".to_owned()),
+                payload: "hello".to_owned(),
+                published_at_ms: 123,
+                delivery_token: None,
+                delivery_attempt: None,
+            })
+        );
+        assert_eq!(client.poll("events", "reader").await.unwrap(), None);
+        assert_eq!(
+            client
+                .poll_group("events", "workers", "member-a")
+                .await
+                .unwrap(),
+            Some(Message {
+                stream: "events".to_owned(),
+                consumer: "workers".to_owned(),
+                member: Some("member-a".to_owned()),
+                offset: 5,
+                key: None,
+                payload: "grouped".to_owned(),
+                published_at_ms: 456,
+                delivery_token: Some("token-5".to_owned()),
+                delivery_attempt: Some(2),
+            })
+        );
+        assert_eq!(
+            client.ack("events", "reader", 4).await.unwrap(),
+            Acknowledgement {
+                stream: "events".to_owned(),
+                consumer: "reader".to_owned(),
+                offset: 4,
+                already_acknowledged: false,
+            }
+        );
+        assert_eq!(
+            client
+                .ack_group("events", "workers", "member-a", 5, "token-5")
+                .await
+                .unwrap(),
+            Acknowledgement {
+                stream: "events".to_owned(),
+                consumer: "workers".to_owned(),
+                offset: 5,
+                already_acknowledged: true,
+            }
+        );
+        assert_eq!(
+            client.health().await.unwrap(),
+            Health {
+                status: "ok".to_owned(),
+                streams: 1,
+                storage_bytes: 4096,
+            }
+        );
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn typed_response_mismatch_is_an_unknown_outcome() {
+        let (listener, address) = listener().await;
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut reader = BufReader::new(stream);
+            assert!(matches!(
+                read_request(&mut reader).await,
+                Request::CreateStream { stream } if stream == "events"
+            ));
+            write_response(
+                &mut reader,
+                Response::Health {
+                    status: "ok".to_owned(),
+                    streams: 0,
+                    storage_bytes: 0,
+                },
+            )
+            .await;
+        });
+
+        let mut client = Client::connect_with_config(address, test_config())
+            .await
+            .unwrap();
+        let result = client.create_stream("events").await;
+        assert!(matches!(
+            result,
+            Err(AttemptOutcome::Unknown(AttemptFailure::Client(
+                ClientError::UnexpectedResponse {
+                    operation: "create_stream",
+                    response,
+                }
+            ))) if matches!(response.as_ref(), Response::Health { .. })
+        ));
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn typed_operation_preserves_broker_outcome_classification() {
+        let (listener, address) = listener().await;
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut reader = BufReader::new(stream);
+            assert!(matches!(
+                read_request(&mut reader).await,
+                Request::Publish { stream, payload, .. }
+                    if stream == "events" && payload == "hello"
+            ));
+            write_response(
+                &mut reader,
+                Response::Error {
+                    code: "request_saturated".to_owned(),
+                    message: "busy".to_owned(),
+                },
+            )
+            .await;
+        });
+
+        let mut client = Client::connect_with_config(address, test_config())
+            .await
+            .unwrap();
+        assert!(matches!(
+            client.publish("events", "hello").await,
+            Err(AttemptOutcome::Retryable(AttemptFailure::Broker(
+                Response::Error { code, .. }
+            ))) if code == "request_saturated"
+        ));
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn cancelled_typed_request_is_not_retried_and_reconnect_is_explicit() {
+        let (listener, address) = listener().await;
+        let (started_tx, started_rx) = oneshot::channel();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut reader = BufReader::new(stream);
+            assert!(matches!(read_request(&mut reader).await, Request::Health));
+            started_tx.send(()).unwrap();
+
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut reader = BufReader::new(stream);
+            assert!(matches!(read_request(&mut reader).await, Request::Health));
+            write_response(
+                &mut reader,
+                Response::Health {
+                    status: "ok".to_owned(),
+                    streams: 0,
+                    storage_bytes: 0,
+                },
+            )
+            .await;
+        });
+
+        let mut client = Client::connect_with_config(
+            address,
+            ClientConfig {
+                response_timeout: Duration::from_secs(5),
+                ..test_config()
+            },
+        )
+        .await
+        .unwrap();
+        let mut operation = Box::pin(client.health());
+        tokio::select! {
+            result = &mut operation => panic!("health request unexpectedly completed: {result:?}"),
+            _ = started_rx => {}
+        }
+        drop(operation);
+
+        client.reconnect(address).await.unwrap();
+        assert_eq!(
+            client.health().await.unwrap(),
+            Health {
+                status: "ok".to_owned(),
+                streams: 0,
+                storage_bytes: 0,
+            }
+        );
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn typed_publish_retry_requires_reconnect_and_stable_identity() {
+        let (listener, address) = listener().await;
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut reader = BufReader::new(stream);
+            match read_request(&mut reader).await {
+                Request::Publish {
+                    stream,
+                    payload,
+                    request_id,
+                    ..
+                } => {
+                    assert_eq!(stream, "events");
+                    assert_eq!(payload, "once");
+                    assert_eq!(request_id.as_deref(), Some("publish-1"));
+                }
+                request => panic!("expected publish, got {request:?}"),
+            }
+            drop(reader);
+
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut reader = BufReader::new(stream);
+            match read_request(&mut reader).await {
+                Request::Publish {
+                    stream,
+                    payload,
+                    request_id,
+                    ..
+                } => {
+                    assert_eq!(stream, "events");
+                    assert_eq!(payload, "once");
+                    assert_eq!(request_id.as_deref(), Some("publish-1"));
+                }
+                request => panic!("expected retried publish, got {request:?}"),
+            }
+            write_response(
+                &mut reader,
+                Response::Published {
+                    stream: "events".to_owned(),
+                    offset: 0,
+                },
+            )
+            .await;
+        });
+
+        let mut client = Client::connect_with_config(address, test_config())
+            .await
+            .unwrap();
+        let options = PublishOptions::default().with_request_id("publish-1");
+        assert!(matches!(
+            client
+                .publish_with_options("events", "once", options.clone())
+                .await,
+            Err(AttemptOutcome::Unknown(AttemptFailure::Client(
+                ClientError::Eof
+            )))
+        ));
+
+        client.reconnect(address).await.unwrap();
+        assert_eq!(
+            client
+                .publish_with_options("events", "once", options)
+                .await
+                .unwrap(),
+            PublishReceipt {
+                stream: "events".to_owned(),
+                offset: 0,
+            }
+        );
         server.await.unwrap();
     }
 
