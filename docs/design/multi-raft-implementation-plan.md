@@ -1,14 +1,14 @@
 # Multi-Raft implementation plan
 
 - Status: accepted direction; staged implementation plan
-- Last reviewed: 2026-08-19
+- Last reviewed: 2026-08-27
 - Scope: the smallest credible three-node implementation, designed to leave room for alternative distributed engines
 
 ADR 0004 accepts the distributed-engine direction and its initial defaults. This document records the staged implementation plan and the evidence gates that still apply before production clustering is enabled.
 
 ## Current implementation status
 
-The repository now has a metadata Raft group, one group-addressed data Raft runtime per stream, versioned durable Raft and state-machine files, reconciled `Creating` to `Active` stream creation, framed TCP peer transport, `--engine raft` server selection, hostname-capable peer addresses, automatic consensus-log snapshots and purge, bounded snapshot chunks, lazy group materialization for replacement nodes, snapshot lifecycle metrics, a real three-process failure test including interrupted-transfer retry, and a three-replica Kubernetes development manifest. All first-version groups use the same statically configured three-node membership. Repeated interruption cost, broader observability, dynamic membership, placement, fencing, and the later stages remain necessary before treating clustered operation as production-ready.
+The repository now has a metadata Raft group, one group-addressed data Raft runtime per stream, versioned durable Raft and state-machine files, reconciled `Creating` to `Active` stream creation, framed TCP peer transport, `--engine raft` server selection, hostname-capable peer addresses, durable publish request deduplication, replicated shared-consumer ownership and retry/dead-letter outcomes, automatic consensus-log snapshots and purge, bounded snapshot chunks, lazy group materialization for replacement nodes, clustered storage identity validation, snapshot lifecycle metrics, a real three-process failure test including interrupted-transfer retry, and a three-replica Kubernetes development manifest. All first-version groups use the same statically configured three-node membership. Repeated interruption cost, broader observability, dynamic membership, placement, fencing, and the later stages remain necessary before treating clustered operation as production-ready.
 
 ## Recommendation
 
@@ -281,4 +281,4 @@ ADR 0004 accepts the following defaults:
 7. Evaluate redb as the first transactional durable adapter, with a short evidence gate against Fjall and the current append log before accepting it.
 8. Keep local and Multi-Raft engines selectable only at process startup; defer mixed engines and live migration.
 
-The current implementation has completed the semantic seam, versioned durable Raft/state-machine files, framed TCP peer transport, topology-free client forwarding, leader-routed reads, durable publish request deduplication, server engine selection, and a real three-process failure test. The remaining Stage 2 evidence includes explicit stale-participant behavior and broader storage/transport fault coverage.
+The current implementation has completed the semantic seam, versioned durable Raft/state-machine files, framed TCP peer transport, topology-free client forwarding, leader-routed reads, durable publish request deduplication, replicated shared-consumer ownership, clustered retry and dead-letter outcomes, server engine selection, and a real three-process failure test. The remaining Stage 2 evidence includes explicit stale-participant behavior and broader storage/transport fault coverage.

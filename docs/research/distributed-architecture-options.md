@@ -1,15 +1,15 @@
 # Distributed architecture exploration
 
 - Status: exploratory
-- Last reviewed: 2026-08-19
+- Last reviewed: 2026-08-27
 
-This document records candidate architectures for Runnel's multi-node future. It is not an accepted decision and does not change the current single-node architecture. The product backlog describes the desired outcomes; this document explores ways to reach them. An ADR should record the first selected design before implementation is treated as the distributed architecture.
+This document records candidate architectures for Runnel's distributed future beyond the early static Multi-Raft backend. It remains exploratory and does not change the current implementation. The product backlog describes the desired outcomes; this document explores ways to reach them. [ADR 0004](../decisions/0004-multi-raft-first-distributed-engine.md) accepts Multi-Raft as the first distributed direction, while later architectural choices still require their own decisions.
 
 ## Working recommendation
 
 Use Multi-Raft for the first three-node implementation, behind a narrow distributed-log engine boundary shared with the existing local engine. Multi-Raft offers a well-understood path to quorum durability, leader fencing, recovery, and membership changes, making it a useful correctness baseline.
 
-The reviewable implementation proposal is recorded in [multi-raft-implementation-plan.md](../design/multi-raft-implementation-plan.md). It remains a proposal until an ADR accepts the consequential choices.
+The reviewable implementation plan is recorded in [multi-raft-implementation-plan.md](../design/multi-raft-implementation-plan.md). ADR 0004 accepts its initial distributed direction and defaults; the plan and this note retain the unresolved implementation and alternative-engine questions.
 
 Do not model the boundary as a generic consensus strategy. The broker should depend on durable messaging semantics, not on terms, leaders, quorums, sequencers, or copysets. Those concepts differ across candidate architectures and belong inside an engine.
 
@@ -315,7 +315,7 @@ Benchmark reports must identify the engine, durability guarantee, replica topolo
 6. Introduce dynamic virtual shards, extent placement, thread-per-core ownership, or alternate sequencing only when measurements identify the bottleneck they address.
 7. Decide whether alternative engines belong in one binary or separate engine-specific binaries after their runtime and dependency requirements are concrete.
 
-This sequence is a recommendation, not an accepted architecture decision. Each consequential selection should be captured in an ADR when made.
+This sequence is a recommendation for work beyond the accepted initial direction, not a replacement for an architecture decision. Each consequential selection should be captured in an ADR when made.
 
 ## Open questions
 

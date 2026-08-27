@@ -17,6 +17,7 @@ the rule to parallel work.
 - Split work by responsibility and file ownership. Do not assign two workers overlapping source, test, workflow, or generated-output paths.
 - Establish a committed baseline revision. Do not assume that uncommitted edits in the main worktree are visible in another worktree; if they matter, create a clearly identified local baseline or provide an explicit patch.
 - Before spawning, fetch `origin/main`, record its revision, and inspect the latest `ci.yml` run for that SHA when GitHub access is available. Give every worker the baseline revision, its owned paths, its expected result, and the instruction not to revert unrelated work.
+- Tell every worker, including nested subagents, to read the repository root `AGENTS.md` before starting. Do not assume the delegated environment loads project instructions automatically.
 - Tell workers to repeat the `origin/main` and default-branch CI check before handoff. A newer `main` commit requires an update only when it overlaps the worker's paths or shared contracts, dependencies, generated output, or integration behavior; disjoint work may remain based on the original baseline when it is cleanly mergeable.
 
 ## Worktree and branch isolation
@@ -57,14 +58,13 @@ Shared Cargo registries are normally acceptable as caches, but shared target dir
 Parallel runs are suitable for exploratory correctness checks and rough optimization feedback. Host CPU scheduling, disk bandwidth, page cache, and kernel socket resources are still shared, so authoritative latency or throughput comparisons must run sequentially or with explicitly isolated CPU and storage resources.
 
 For any worker task that can affect throughput, latency, CPU, memory, batching,
-I/O, or scheduling, the worker must run the canonical local benchmark before
-claiming an improvement. Use `just bench-pr-local` after committing: it applies
-the same explicit CPU and memory limits to the current and baseline revisions,
-repeats paired runs until its stability thresholds are met, records the
-workload and provenance, and exits nonzero if the maximum is reached without
-stable measurements. A one-pair command such as `just bench-pr-local-quick` is
-an explicit diagnostic only. Never treat a hosted PR benchmark or concurrent
-worker measurements as proof of a performance change. Do not claim or merge an
+I/O, or scheduling, follow [docs/benchmarking.md](../../../docs/benchmarking.md)
+and run the canonical local benchmark before claiming an improvement. Use
+`just bench-pr-local` after committing; if it is inconclusive, use
+`just bench-pr-local-until-stable` to retry complete authoritative comparisons.
+A one-pair command such as `just bench-pr-local-quick` is an explicit
+diagnostic only. Never treat a hosted PR benchmark or concurrent worker
+measurement as proof of a performance change. Do not claim or merge an
 optimization from an inconclusive authoritative result; investigate or rerun
 it under the same controlled conditions rather than selecting a favorable
 sample.
@@ -74,11 +74,12 @@ sample.
 Tell each worker to:
 
 - stay inside its assigned worktree and write scope;
+- read the repository root `AGENTS.md` before editing and follow its change-run baseline and handoff requirements;
 - use the repository's canonical `just` commands and existing benchmark harnesses;
 - record the exact revision, workload, resource limits, isolation settings, and commands;
 - for performance-sensitive work, run the local benchmark sequentially with a fixed CPU/memory budget and record the actual repetition count, stability thresholds, and stable status; treat an inconclusive authoritative run as unfinished evidence;
 - distinguish a confirmed improvement from noise, a blocked run, and an inconclusive result;
-- report changed files, correctness and crash-recovery considerations, test results, and remaining risks. State the expected effects and non-effects, including which behavior, runtime paths, workloads, and resource dimensions should change or remain unchanged; list non-performance improvements separately. For each benchmark, report applicability, coverage gaps, exact findings, repetition and stability results, directional medians, and outlier diagnostics when available; include blocked or inconclusive results rather than omitting them. End with an evidence-based recommendation to merge, revise, rerun, or defer;
+- report changed files, correctness and crash-recovery considerations, test results, and remaining risks. Follow [docs/benchmarking.md](../../../docs/benchmarking.md) for expected effects, non-performance improvements, benchmark applicability, exact findings, repetition and stability results, directional medians, outlier diagnostics, and the evidence-based recommendation to merge, revise, rerun, or defer. Include blocked or inconclusive results rather than omitting them;
 - report the recorded baseline revision, newest `origin/main` revision, default-branch CI status when available, and whether the branch was refreshed;
 - commit the result on its task branch when code is ready, or leave a clearly documented uncommitted patch when it is not.
 
