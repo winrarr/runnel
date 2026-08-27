@@ -1015,6 +1015,8 @@ def run_runnel(
         "1",
         "--payload-sizes",
         ",".join(str(size) for size in sizes),
+        "--scenarios",
+        "durable_publish,consume_ack",
         "--skip-restart",
         "--output",
         str(output),
