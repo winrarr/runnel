@@ -28,6 +28,8 @@ const REQUEST_ID_MAX_LEN: u32 = 1024;
 const REQUEST_ID_MAX_KEY_LEN: u32 = 128;
 const REQUEST_ID_MAX_BODY_LEN: u32 = 64 * 1024 * 1024;
 const MAX_IN_MEMORY_RECORDS: usize = 1024;
+const SPARSE_INDEX_STRIDE: Offset = 64;
+const MAX_SPARSE_INDEX_ENTRIES: usize = 1024;
 const DEFAULT_STORAGE_EXECUTOR_CAPACITY: usize = 32;
 const DEFAULT_ACK_TIMEOUT: Duration = Duration::from_secs(30);
 const DEAD_LETTER_SUFFIX: &str = ".dead-letter";
@@ -128,8 +130,9 @@ struct StreamLog {
     file: File,
     durable_format: DurableFormat,
     // The durable log retains the complete history; this tail cache keeps normal delivery
-    // bounded while older replay requests fall back to a streaming scan.
+    // bounded while older replay requests use the bounded sparse index as a scan starting point.
     records: VecDeque<RecordIndex>,
+    sparse_index: VecDeque<LogCheckpoint>,
     request_ids: HashMap<String, Offset>,
     next_offset: Offset,
 }
@@ -152,6 +155,12 @@ struct RecordIndex {
     key: Option<String>,
     request_id: Option<String>,
     published_at_ms: u64,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct LogCheckpoint {
+    offset: Offset,
+    cursor: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -718,6 +727,7 @@ impl StreamLog {
             file,
             durable_format,
             records: VecDeque::with_capacity(MAX_IN_MEMORY_RECORDS),
+            sparse_index: VecDeque::with_capacity(MAX_SPARSE_INDEX_ENTRIES),
             request_ids: HashMap::new(),
             next_offset: 0,
         })
@@ -727,10 +737,12 @@ impl StreamLog {
         let mut file = OpenOptions::new().read(true).append(true).open(path)?;
         let file_len = file.metadata()?.len();
         let mut records = VecDeque::with_capacity(MAX_IN_MEMORY_RECORDS);
+        let mut sparse_index = VecDeque::with_capacity(MAX_SPARSE_INDEX_ENTRIES);
         let mut request_ids = HashMap::new();
         let mut cursor = 0;
         let mut next_offset = 0;
         while let Some(parsed) = read_record(&mut file, cursor, file_len, durable_format)? {
+            remember_checkpoint(&mut sparse_index, parsed.index.offset, cursor);
             cursor = parsed.next_cursor;
             next_offset = parsed.index.offset.saturating_add(1);
             if let Some(request_id) = parsed.index.request_id.as_ref() {
@@ -749,6 +761,7 @@ impl StreamLog {
             file,
             durable_format,
             records,
+            sparse_index,
             request_ids,
             next_offset,
         })
@@ -790,6 +803,8 @@ impl StreamLog {
         self.file.sync_data()?;
 
         let payload_offset = self.file.stream_position()? - payload.len() as u64;
+        let record_cursor = payload_offset - key_bytes.len() as u64 - LEGACY_HEADER_LEN as u64;
+        remember_checkpoint(&mut self.sparse_index, offset, record_cursor);
         remember_record(
             &mut self.records,
             RecordIndex {
@@ -858,6 +873,8 @@ impl StreamLog {
         self.file.sync_data()?;
 
         let payload_offset = self.file.stream_position()? - payload.len() as u64;
+        let record_cursor = payload_offset - key_bytes.len() as u64 - VERSIONED_HEADER_LEN as u64;
+        remember_checkpoint(&mut self.sparse_index, offset, record_cursor);
         remember_record(
             &mut self.records,
             RecordIndex {
@@ -940,6 +957,11 @@ impl StreamLog {
         self.file.sync_data()?;
 
         let payload_offset = self.file.stream_position()? - payload.len() as u64;
+        let record_cursor = payload_offset
+            - request_id_bytes.len() as u64
+            - key_bytes.len() as u64
+            - REQUEST_ID_HEADER_LEN as u64;
+        remember_checkpoint(&mut self.sparse_index, offset, record_cursor);
         remember_record(
             &mut self.records,
             RecordIndex {
@@ -1001,9 +1023,10 @@ impl StreamLog {
         }
 
         // A consumer that has fallen behind the bounded tail index still has the same replay
-        // rights. Scan only as a fallback so the common current-tail path stays in memory.
+        // rights. Start at the nearest sparse checkpoint so cold replay does not always scan
+        // from byte zero.
         let file_len = self.file.metadata()?.len();
-        let mut cursor = 0;
+        let mut cursor = self.scan_start(committed_offset);
         while let Some(parsed) = read_record(&mut self.file, cursor, file_len, self.durable_format)?
         {
             cursor = parsed.next_cursor;
@@ -1028,7 +1051,7 @@ impl StreamLog {
         }
 
         let file_len = self.file.metadata()?.len();
-        let mut cursor = 0;
+        let mut cursor = self.scan_start(offset);
         while let Some(parsed) = read_record(&mut self.file, cursor, file_len, self.durable_format)?
         {
             cursor = parsed.next_cursor;
@@ -1037,6 +1060,14 @@ impl StreamLog {
             }
         }
         Err(BrokerError::CorruptRecord(offset))
+    }
+
+    fn scan_start(&self, offset: Offset) -> u64 {
+        self.sparse_index
+            .iter()
+            .rev()
+            .find(|checkpoint| checkpoint.offset <= offset)
+            .map_or(0, |checkpoint| checkpoint.cursor)
     }
 }
 
@@ -1416,6 +1447,16 @@ fn remember_record(records: &mut VecDeque<RecordIndex>, record: RecordIndex) {
         records.pop_front();
     }
     records.push_back(record);
+}
+
+fn remember_checkpoint(checkpoints: &mut VecDeque<LogCheckpoint>, offset: Offset, cursor: u64) {
+    if !offset.is_multiple_of(SPARSE_INDEX_STRIDE) {
+        return;
+    }
+    if checkpoints.len() == MAX_SPARSE_INDEX_ENTRIES {
+        checkpoints.pop_front();
+    }
+    checkpoints.push_back(LogCheckpoint { offset, cursor });
 }
 
 fn record_is_candidate(
@@ -2221,7 +2262,24 @@ mod tests {
             assert_eq!(log.next_offset, retained_message_count);
         }
 
+        let path = directory.path().join("streams/events.log");
+        let complete_len = fs::metadata(&path).unwrap().len();
+        let mut file = OpenOptions::new().append(true).open(&path).unwrap();
+        file.write_all(b"RNL1partial").unwrap();
+        file.sync_all().unwrap();
+
         let broker = Broker::open(directory.path(), BrokerConfig::default()).unwrap();
+        assert_eq!(fs::metadata(&path).unwrap().len(), complete_len);
+        let streams = broker.inner.streams.read().unwrap();
+        let stream = streams.get("events").unwrap().clone();
+        drop(streams);
+        let stream = stream.lock().unwrap();
+        assert_eq!(stream.log.sparse_index.len(), 17);
+        assert_eq!(stream.log.sparse_index.front().unwrap().offset, 0);
+        assert_eq!(stream.log.sparse_index.back().unwrap().offset, 1024);
+        assert!(stream.log.scan_start(512) > 0);
+        drop(stream);
+
         for offset in 0..retained_message_count {
             let message = match broker.poll("events", "replayer").unwrap() {
                 PollResult::Message(message) => message,
@@ -2237,6 +2295,26 @@ mod tests {
         assert_eq!(
             broker.poll("events", "replayer").unwrap(),
             PollResult::Empty
+        );
+    }
+
+    #[test]
+    fn sparse_lookup_index_keeps_only_a_bounded_recent_window() {
+        let mut checkpoints = VecDeque::new();
+        for index in 0..=MAX_SPARSE_INDEX_ENTRIES {
+            let offset = index as Offset * SPARSE_INDEX_STRIDE;
+            remember_checkpoint(&mut checkpoints, offset, offset * 10);
+        }
+
+        assert_eq!(checkpoints.len(), MAX_SPARSE_INDEX_ENTRIES);
+        assert_eq!(checkpoints.front().unwrap().offset, SPARSE_INDEX_STRIDE);
+        assert_eq!(
+            checkpoints.back().unwrap().offset,
+            MAX_SPARSE_INDEX_ENTRIES as Offset * SPARSE_INDEX_STRIDE
+        );
+        assert_eq!(
+            checkpoints.back().unwrap().cursor,
+            MAX_SPARSE_INDEX_ENTRIES as Offset * SPARSE_INDEX_STRIDE * 10
         );
     }
 
