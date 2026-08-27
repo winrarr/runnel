@@ -1,7 +1,9 @@
+import os
 import shutil
 import sys
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 
 SCRIPT_DIR = Path(__file__).resolve().parent
@@ -51,12 +53,26 @@ class IsolationRunnerTests(unittest.TestCase):
         for workflow in isolated.WORKFLOWS:
             command = isolated.command_for(workflow, run)
             self.assertTrue(command)
-            if workflow.startswith("bench-") or workflow == "profile-cluster":
+            if workflow.startswith("bench-") or workflow in {"profile-cluster", "integration"}:
                 self.assertIn(str(run.artifact_dir), " ".join(command))
         self.assertIn(str(run.target_dir), " ".join(isolated.command_for("bench-cluster", run)))
         self.assertIn(run.image, " ".join(isolated.command_for("bench-container", run)))
         self.assertNotIn("--all-features", isolated.command_for("test", run))
         self.assertIn("--test-threads=1", isolated.command_for("cluster-test", run))
+
+    def test_integration_can_use_a_prebuilt_ci_image(self) -> None:
+        run = self.new_run()
+        with patch.dict(
+            os.environ,
+            {
+                "RUNNEL_INTEGRATION_IMAGE": "runnel:dev",
+                "RUNNEL_INTEGRATION_IMAGE_READY": "1",
+            },
+        ):
+            command = isolated.command_for("integration", run)
+
+        self.assertIn("runnel:dev", command)
+        self.assertIn("--skip-image-build", command)
 
     def test_benchmark_workflows_use_the_shared_lock_wrapper(self) -> None:
         run = self.new_run()

@@ -117,10 +117,10 @@ Run these from the repository root:
 
 - just verify runs formatting, Clippy, all-target tests, documentation tests, ShellCheck, benchmark-script tests, and a workspace build.
 - just ci runs verification and the full local integration sequence.
-- just integration runs the same smoke, clustered, Docker, and container-smoke sequence used by the CI integration job.
+- just integration runs the same isolated smoke, clustered, Docker, and container-smoke sequence used by the CI integration job; its smoke and cluster checks reuse one Cargo target, and CI prebuilds the image with reusable Docker layers.
 - just run starts a local broker with data in ./data.
 - just smoke starts a real broker and uses runnelctl to exercise publish, consume, acknowledgement, restart recovery, readiness, and metrics with temporary state.
-- just isolated runs the default workspace test with a unique Cargo target, temporary directory, and benchmark artifact directory; pass a supported workflow such as `just isolated cluster-test`, `just isolated cluster-replacement-test`, `just isolated bench-container-smoke`, or `just isolated bench-cluster-smoke` for concurrent work.
+- just isolated runs the default workspace test with a unique Cargo target, temporary directory, and benchmark artifact directory; pass a supported workflow such as `just isolated cluster-test`, `just isolated cluster-replacement-test`, `just isolated integration`, `just isolated bench-container-smoke`, or `just isolated bench-cluster-smoke` for concurrent work.
 - just cluster-test starts three real broker processes, exercises quorum replication, follower restart, leader failure, and recovery through the public protocol.
 - just cluster-replacement-test runs the opt-in snapshot replacement experiment that depends on the test-only permissive recovery feature.
 - just bench, just bench-container, and just bench-cluster run the documented local, container, and clustered benchmark suites.

@@ -34,6 +34,7 @@ WORKFLOWS = (
     "smoke",
     "cluster-test",
     "cluster-replacement-test",
+    "integration",
     "bench",
     "bench-container",
     "bench-container-smoke",
@@ -148,6 +149,19 @@ def command_for(workflow: str, isolation: Isolation) -> list[str]:
             "--nocapture",
             "--test-threads=1",
         ]
+    if workflow == "integration":
+        image = os.environ.get("RUNNEL_INTEGRATION_IMAGE", isolation.image)
+        command = [
+            "python3",
+            "scripts/integration.py",
+            "--image",
+            image,
+            "--artifact-dir",
+            str(artifact),
+        ]
+        if os.environ.get("RUNNEL_INTEGRATION_IMAGE_READY") == "1":
+            command.append("--skip-image-build")
+        return command
     if workflow == "bench":
         return ["cargo", "bench", "--locked", "--workspace"]
     if workflow == "bench-container":
@@ -243,7 +257,7 @@ def run(workflow: str, *, keep: bool) -> int:
         if keep or not completed:
             print(f"isolated state retained at {isolation.runtime_dir}", file=sys.stderr, flush=True)
         else:
-            if workflow in {"bench-container", "bench-compare"}:
+            if workflow in {"bench-container", "bench-compare", "integration"}:
                 remove_owned_image(isolation)
             shutil.rmtree(isolation.runtime_dir, ignore_errors=True)
             try:
