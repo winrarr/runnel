@@ -125,7 +125,7 @@ This register records known implementation shortcuts in the current vertical sli
 
 - Status: open
 - Impact: a leader chooses an absolute expiry timestamp and replicates it with each delivery. Clock jumps or skew between successive leaders can make redelivery materially earlier or later than the configured acknowledgement timeout; delivery tokens prevent a stale acknowledgement from committing, but they do not make lease timing predictable.
-- Context: replicated absolute deadlines establish a simple failover baseline without adding a separate lease service. Retry configuration and dead-letter provenance are tracked independently in TD-018, while retained delivery-state growth is covered by TD-010.
+- Context: replicated absolute deadlines establish a simple failover baseline without adding a separate lease service. The state machine now persists a per-group maximum command-time observation and evaluates expiry against that floor, so a backward wall-clock step cannot delay expiry after recovery or a leader change. Forward jumps, inter-node clock offsets, delayed evaluation, and no-leader intervals remain outside the invariant; a full monotonic-timer/reclaim or bounded-clock policy is still unresolved. Retry configuration and dead-letter provenance are tracked independently in TD-018, while retained delivery-state growth is covered by TD-010.
 - Retirement condition: the supported clock assumptions and maximum timing error are documented and tested under leader changes, clock skew, and clock jumps, or delivery eligibility moves to a mechanism that does not depend on comparable node wall clocks while preserving stale-delivery fencing and at-least-once behavior.
 
 ## TD-022: Local durable I/O blocks asynchronous server workers

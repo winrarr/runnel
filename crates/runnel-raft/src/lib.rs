@@ -263,6 +263,11 @@ struct SnapshotState {
     consumers: BTreeMap<(String, String), Offset>,
     #[serde(default)]
     group_consumers: BTreeMap<(String, String), GroupConsumerState>,
+    // The lease evaluator is a replicated, persisted floor of command
+    // observations. It prevents a backward wall-clock step from moving
+    // expiry backwards after recovery or leader changes.
+    #[serde(default)]
+    lease_clock_ms: u64,
     dedup: BTreeMap<String, BTreeMap<String, Offset>>,
     #[serde(default)]
     redeliveries: u64,
@@ -295,6 +300,8 @@ struct PersistedState {
     #[serde(default)]
     group_consumers: Vec<PersistedGroupConsumer>,
     #[serde(default)]
+    lease_clock_ms: u64,
+    #[serde(default)]
     dedup: BTreeMap<String, BTreeMap<String, Offset>>,
     #[serde(default)]
     redeliveries: u64,
@@ -310,6 +317,8 @@ struct PersistedSnapshotState {
     consumers: Vec<PersistedConsumer>,
     #[serde(default)]
     group_consumers: Vec<PersistedGroupConsumer>,
+    #[serde(default)]
+    lease_clock_ms: u64,
     #[serde(default)]
     dedup: BTreeMap<String, BTreeMap<String, Offset>>,
     #[serde(default)]
@@ -504,6 +513,7 @@ impl StateMachineStore {
                         .into_iter()
                         .map(|consumer| ((consumer.stream, consumer.consumer), consumer.state))
                         .collect(),
+                    lease_clock_ms: persisted.lease_clock_ms,
                     dedup: persisted.dedup,
                     redeliveries: persisted.redeliveries,
                     dead_letters: persisted.dead_letters,
@@ -622,6 +632,7 @@ impl StateMachineStore {
                     state: state.clone(),
                 })
                 .collect(),
+            lease_clock_ms: state.state.lease_clock_ms,
             dedup: state.state.dedup.clone(),
             redeliveries: state.state.redeliveries,
             dead_letters: state.state.dead_letters,
@@ -1106,6 +1117,7 @@ fn persisted_snapshot_state(state: &SnapshotState) -> PersistedSnapshotState {
                 state: state.clone(),
             })
             .collect(),
+        lease_clock_ms: state.lease_clock_ms,
         dedup: state.dedup.clone(),
         redeliveries: state.redeliveries,
         dead_letters: state.dead_letters,
@@ -1144,6 +1156,7 @@ fn snapshot_state_from_persisted(persisted: PersistedSnapshotState) -> SnapshotS
             .into_iter()
             .map(|consumer| ((consumer.stream, consumer.consumer), consumer.state))
             .collect(),
+        lease_clock_ms: persisted.lease_clock_ms,
         dedup: persisted.dedup,
         redeliveries: persisted.redeliveries,
         dead_letters: persisted.dead_letters,
@@ -1361,6 +1374,7 @@ fn apply_group_poll(
     {
         return CommandResponse::StreamNotFound;
     }
+    let now_ms = observe_lease_clock(state, now_ms);
 
     let consumer_key = (stream.clone(), consumer.clone());
     if !state.group_consumers.contains_key(&consumer_key) {
@@ -1385,7 +1399,9 @@ fn apply_group_poll(
         let expired = consumer_state
             .in_flight
             .iter()
-            .filter_map(|(offset, delivery)| (delivery.deadline_ms <= now_ms).then_some(*offset))
+            .filter_map(|(offset, delivery)| {
+                lease_expired(delivery.deadline_ms, now_ms).then_some(*offset)
+            })
             .collect::<Vec<_>>();
         for offset in expired {
             consumer_state.in_flight.remove(&offset);
@@ -1556,12 +1572,15 @@ fn apply_group_ack(
         return CommandResponse::StreamNotFound;
     }
 
+    let now_ms = observe_lease_clock(state, now_ms);
     let consumer_key = (stream, consumer.clone());
     let consumer_state = state.group_consumers.entry(consumer_key).or_default();
     let expired = consumer_state
         .in_flight
         .iter()
-        .filter_map(|(offset, delivery)| (delivery.deadline_ms <= now_ms).then_some(*offset))
+        .filter_map(|(offset, delivery)| {
+            lease_expired(delivery.deadline_ms, now_ms).then_some(*offset)
+        })
         .collect::<Vec<_>>();
     for expired_offset in expired {
         consumer_state.in_flight.remove(&expired_offset);
@@ -1610,6 +1629,15 @@ fn acknowledge_group_offset(consumer_state: &mut GroupConsumerState, offset: Off
     } else {
         consumer_state.acknowledged_offsets.insert(offset);
     }
+}
+
+fn observe_lease_clock(state: &mut SnapshotState, observed_ms: u64) -> u64 {
+    state.lease_clock_ms = state.lease_clock_ms.max(observed_ms);
+    state.lease_clock_ms
+}
+
+fn lease_expired(deadline_ms: u64, now_ms: u64) -> bool {
+    deadline_ms <= now_ms
 }
 
 fn stream_identity(stream: &str) -> (String, String) {
@@ -3380,6 +3408,251 @@ fn atomic_write(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn grouped_test_state() -> SnapshotState {
+        let mut state = SnapshotState::default();
+        state.streams.insert(
+            "events".to_owned(),
+            StreamState::active("stream/events".to_owned(), "group/events/data".to_owned()),
+        );
+        state
+            .streams
+            .get_mut("events")
+            .unwrap()
+            .messages
+            .push(StoredMessage {
+                key: None,
+                payload: b"lease".to_vec(),
+                published_at_ms: 1,
+            });
+        state.streams.insert(
+            "clock".to_owned(),
+            StreamState::active("stream/clock".to_owned(), "group/clock/data".to_owned()),
+        );
+        state
+    }
+
+    fn data_group_kind(stream: &str) -> GroupKind {
+        GroupKind::Data {
+            stream: stream.to_owned(),
+            stream_id: format!("stream/{stream}"),
+            group_id: format!("group/{stream}/data"),
+        }
+    }
+
+    fn poll_group_for_test(
+        state: &mut SnapshotState,
+        stream: &str,
+        consumer: &str,
+        member: &str,
+        now_ms: u64,
+        lease_deadline_ms: u64,
+        log_index: u64,
+    ) -> PollResult {
+        match apply_command(
+            state,
+            Command::PollGroup {
+                stream: stream.to_owned(),
+                consumer: consumer.to_owned(),
+                member: member.to_owned(),
+                now_ms,
+                lease_deadline_ms,
+                max_delivery_attempts: None,
+            },
+            &data_group_kind(stream),
+            LogId {
+                leader_id: openraft::CommittedLeaderId::new(1, 1),
+                index: log_index,
+            },
+        ) {
+            CommandResponse::GroupPoll { result } => result,
+            response => panic!("unexpected grouped poll response: {response:?}"),
+        }
+    }
+
+    fn delivery_token_for_test(
+        state: &mut SnapshotState,
+        member: &str,
+        now_ms: u64,
+        lease_deadline_ms: u64,
+        log_index: u64,
+    ) -> String {
+        match poll_group_for_test(
+            state,
+            "events",
+            "workers",
+            member,
+            now_ms,
+            lease_deadline_ms,
+            log_index,
+        ) {
+            PollResult::Message(message) => message.delivery_token.unwrap(),
+            PollResult::Empty => panic!("expected grouped delivery"),
+        }
+    }
+
+    fn ack_group_for_test(
+        state: &mut SnapshotState,
+        stream: &str,
+        consumer: &str,
+        member: &str,
+        offset: Offset,
+        delivery_token: &str,
+        now_ms: u64,
+    ) -> CommandResponse {
+        apply_command(
+            state,
+            Command::AckGroup {
+                stream: stream.to_owned(),
+                consumer: consumer.to_owned(),
+                member: member.to_owned(),
+                offset,
+                delivery_token: delivery_token.to_owned(),
+                now_ms,
+            },
+            &data_group_kind(stream),
+            LogId {
+                leader_id: openraft::CommittedLeaderId::new(1, 1),
+                index: 100 + now_ms,
+            },
+        )
+    }
+
+    #[test]
+    fn grouped_lease_deadline_boundaries_are_future_past_and_equal() {
+        assert!(!lease_expired(200, 199));
+        assert!(lease_expired(200, 200));
+        assert!(lease_expired(200, 201));
+
+        let mut future_state = grouped_test_state();
+        let first_token = delivery_token_for_test(&mut future_state, "member-a", 100, 200, 0);
+        let same_delivery = poll_group_for_test(
+            &mut future_state,
+            "events",
+            "workers",
+            "member-a",
+            199,
+            299,
+            1,
+        );
+        assert!(matches!(
+            same_delivery,
+            PollResult::Message(Message {
+                delivery_attempt: Some(1),
+                delivery_token: Some(token),
+                ..
+            }) if token == first_token
+        ));
+
+        let mut equal_state = grouped_test_state();
+        let first_token = delivery_token_for_test(&mut equal_state, "member-a", 100, 200, 0);
+        let redelivery = poll_group_for_test(
+            &mut equal_state,
+            "events",
+            "workers",
+            "member-b",
+            200,
+            300,
+            1,
+        );
+        assert!(matches!(
+            redelivery,
+            PollResult::Message(Message {
+                delivery_attempt: Some(2),
+                delivery_token: Some(token),
+                ..
+            }) if token != first_token
+        ));
+
+        let mut past_state = grouped_test_state();
+        delivery_token_for_test(&mut past_state, "member-a", 100, 200, 0);
+        assert!(matches!(
+            poll_group_for_test(
+                &mut past_state,
+                "events",
+                "workers",
+                "member-b",
+                201,
+                301,
+                1,
+            ),
+            PollResult::Message(Message {
+                delivery_attempt: Some(2),
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn grouped_lease_clock_floor_survives_snapshot_recovery_and_backward_time() {
+        let mut state = grouped_test_state();
+        poll_group_for_test(&mut state, "events", "workers", "member-a", 100, 200, 0);
+        assert_eq!(state.lease_clock_ms, 100);
+        assert_eq!(
+            poll_group_for_test(&mut state, "clock", "workers", "member-a", 200, 300, 1),
+            PollResult::Empty
+        );
+        assert_eq!(state.lease_clock_ms, 200);
+
+        let persisted = persisted_snapshot_state(&state);
+        let recovered = serde_json::from_slice::<PersistedSnapshotState>(
+            &serde_json::to_vec(&persisted).unwrap(),
+        )
+        .unwrap();
+        let mut recovered = snapshot_state_from_persisted(recovered);
+        assert_eq!(recovered.lease_clock_ms, 200);
+
+        assert!(matches!(
+            poll_group_for_test(&mut recovered, "events", "workers", "member-b", 150, 250, 2,),
+            PollResult::Message(Message {
+                delivery_attempt: Some(2),
+                ..
+            })
+        ));
+        assert_eq!(recovered.lease_clock_ms, 200);
+    }
+
+    #[test]
+    fn grouped_ack_preserves_backward_clock_safety_and_fences_expired_tokens() {
+        let mut state = grouped_test_state();
+        let old_token = delivery_token_for_test(&mut state, "member-a", 100, 200, 0);
+
+        assert_eq!(
+            ack_group_for_test(
+                &mut state, "events", "workers", "member-a", 0, &old_token, 50,
+            ),
+            CommandResponse::GroupAcknowledged
+        );
+
+        let mut state = grouped_test_state();
+        let old_token = delivery_token_for_test(&mut state, "member-a", 100, 200, 0);
+        assert_eq!(
+            ack_group_for_test(
+                &mut state, "events", "workers", "member-a", 0, &old_token, 200,
+            ),
+            CommandResponse::GroupStaleDelivery {
+                consumer: "workers".to_owned(),
+                offset: 0,
+            }
+        );
+        let new_token = delivery_token_for_test(&mut state, "member-b", 150, 250, 2);
+        assert_ne!(old_token, new_token);
+        assert_eq!(
+            ack_group_for_test(
+                &mut state, "events", "workers", "member-a", 0, &old_token, 150,
+            ),
+            CommandResponse::GroupStaleDelivery {
+                consumer: "workers".to_owned(),
+                offset: 0,
+            }
+        );
+        assert_eq!(
+            ack_group_for_test(
+                &mut state, "events", "workers", "member-b", 0, &new_token, 150,
+            ),
+            CommandResponse::GroupAcknowledged
+        );
+    }
 
     #[tokio::test]
     async fn single_node_raft_commits_and_applies_messages() {
