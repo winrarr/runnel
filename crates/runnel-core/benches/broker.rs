@@ -5,6 +5,7 @@ use std::hint::black_box;
 
 use criterion::{BatchSize, BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 use runnel_core::{Broker, BrokerConfig, PollResult};
+use runnel_engine::Engine;
 use std::sync::{Arc, Barrier};
 use std::thread;
 use tempfile::TempDir;
@@ -35,6 +36,41 @@ fn durable_publish(c: &mut Criterion) {
                 for _ in 0..MESSAGE_COUNT {
                     black_box(broker.publish("bench", None, PAYLOAD.to_vec()).unwrap());
                 }
+            },
+            BatchSize::SmallInput,
+        );
+    });
+    group.finish();
+}
+
+fn async_engine_publish(c: &mut Criterion) {
+    let mut group = c.benchmark_group("async_engine_publish");
+    group.sample_size(20);
+    group.throughput(Throughput::ElementsAndBytes {
+        elements: MESSAGE_COUNT,
+        bytes: MESSAGE_COUNT * PAYLOAD.len() as u64,
+    });
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    group.bench_function("100-byte_messages", |benchmark| {
+        benchmark.iter_batched(
+            || {
+                let directory = TempDir::new().unwrap();
+                let broker = Broker::open(directory.path(), BrokerConfig::default()).unwrap();
+                (directory, broker)
+            },
+            |(_directory, broker)| {
+                runtime.block_on(async {
+                    for _ in 0..MESSAGE_COUNT {
+                        black_box(
+                            Engine::publish(&broker, "bench", None, PAYLOAD.to_vec(), None)
+                                .await
+                                .unwrap(),
+                        );
+                    }
+                });
             },
             BatchSize::SmallInput,
         );
@@ -457,6 +493,7 @@ fn grouped_delivery(result: PollResult) -> (u64, String) {
 criterion_group!(
     benches,
     durable_publish,
+    async_engine_publish,
     publish_poll_ack,
     shared_consumer_poll_ack,
     shared_consumer_keyed_poll_ack,
