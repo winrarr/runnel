@@ -34,6 +34,13 @@ DEFAULT_IMAGE = "runnel:bench"
 DEFAULT_MESSAGES = 1_000
 DEFAULT_WARMUP = 50
 DEFAULT_TIMEOUT_SECONDS = 15.0
+SCENARIO_NAMES = (
+    "durable_publish",
+    "concurrent_publish",
+    "consume_ack",
+    "publish_consume_ack_roundtrip",
+    "restart_recovery",
+)
 
 
 class BenchmarkError(RuntimeError):
@@ -483,6 +490,21 @@ def parse_sizes(value: str) -> list[int]:
     return sizes
 
 
+def parse_scenarios(value: str) -> list[str]:
+    scenarios = [part.strip() for part in value.split(",") if part.strip()]
+    if not scenarios:
+        raise argparse.ArgumentTypeError("scenarios must not be empty")
+    if len(set(scenarios)) != len(scenarios):
+        raise argparse.ArgumentTypeError("scenarios must not contain duplicates")
+    unknown = [scenario for scenario in scenarios if scenario not in SCENARIO_NAMES]
+    if unknown:
+        available = ", ".join(SCENARIO_NAMES)
+        raise argparse.ArgumentTypeError(
+            f"unknown scenario(s): {', '.join(unknown)}; choose from: {available}"
+        )
+    return scenarios
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--image", default=DEFAULT_IMAGE)
@@ -493,6 +515,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--warmup", type=int, default=DEFAULT_WARMUP)
     parser.add_argument("--concurrency", type=int, default=4)
     parser.add_argument("--payload-sizes", type=parse_sizes, default=[100, 1024])
+    parser.add_argument(
+        "--scenarios",
+        type=parse_scenarios,
+        default=list(SCENARIO_NAMES),
+        metavar="NAME,...",
+        help="comma-separated scenarios to run (default: all scenarios)",
+    )
     parser.add_argument("--skip-restart", action="store_true")
     parser.add_argument("--output", type=Path, help="result JSON path; defaults to benchmark-results/<timestamp>.json")
     args = parser.parse_args()
@@ -516,45 +545,54 @@ def main() -> int:
     output.parent.mkdir(parents=True, exist_ok=True)
     broker = DockerBroker(args.image, args.cpus, args.memory)
     scenarios: list[dict[str, Any]] = []
+    selected_scenarios = set(args.scenarios)
     try:
         broker.start()
         for size in args.payload_sizes:
             payload = "x" * size
-            scenarios.append(
-                run_durable_publish(
-                    broker,
-                    new_stream(run_id, "publish", size),
-                    payload,
-                    args.messages,
-                    args.warmup,
+            if "durable_publish" in selected_scenarios:
+                scenarios.append(
+                    run_durable_publish(
+                        broker,
+                        new_stream(run_id, "publish", size),
+                        payload,
+                        args.messages,
+                        args.warmup,
+                    )
                 )
-            )
-            scenarios.append(
-                run_concurrent_publish(
-                    broker,
-                    new_stream(run_id, "concurrent", size),
-                    payload,
-                    args.messages,
-                    args.concurrency,
+            if "concurrent_publish" in selected_scenarios:
+                scenarios.append(
+                    run_concurrent_publish(
+                        broker,
+                        new_stream(run_id, "concurrent", size),
+                        payload,
+                        args.messages,
+                        args.concurrency,
+                    )
                 )
-            )
-            scenarios.append(
-                run_consume_ack(
-                    broker,
-                    new_stream(run_id, "consume", size),
-                    payload,
-                    args.messages,
+            if "consume_ack" in selected_scenarios:
+                scenarios.append(
+                    run_consume_ack(
+                        broker,
+                        new_stream(run_id, "consume", size),
+                        payload,
+                        args.messages,
+                    )
                 )
-            )
-            scenarios.append(
-                run_roundtrip(
-                    broker,
-                    new_stream(run_id, "roundtrip", size),
-                    payload,
-                    args.messages,
+            if "publish_consume_ack_roundtrip" in selected_scenarios:
+                scenarios.append(
+                    run_roundtrip(
+                        broker,
+                        new_stream(run_id, "roundtrip", size),
+                        payload,
+                        args.messages,
+                    )
                 )
-            )
-            if not args.skip_restart and size == args.payload_sizes[0]:
+            if (
+                "restart_recovery" in selected_scenarios
+                and not args.skip_restart
+                and size == args.payload_sizes[0]
+            ):
                 scenarios.append(
                     run_restart_recovery(
                         broker,
@@ -590,6 +628,7 @@ def main() -> int:
             "warmup": args.warmup,
             "concurrency": args.concurrency,
             "payload_sizes_bytes": args.payload_sizes,
+            "scenarios": args.scenarios,
             "protocol": "line-delimited JSON with UTF-8 string payloads",
             "durability": "current broker default; see engine and implementation configuration",
         },
