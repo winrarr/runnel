@@ -85,6 +85,43 @@ explicitly versioned decision changes them:
 
 ## Proposed policy
 
+### Direct competitor and research comparison
+
+The proposal is informed by the following direct comparisons. These systems
+solve related but different problems; their behavior is evidence for tradeoffs,
+not a compatibility target for Runnel.
+
+| System | Relevant design | Implication for Runnel |
+| --- | --- | --- |
+| [Apache Kafka topic configuration](https://kafka.apache.org/42/configuration/topic-configs/) | The default `delete` policy removes old log segments when time or size retention is reached. `retention.bytes` is enforced per partition, and retention/cleaning is file-granular; `segment.ms` can roll an active segment so it becomes eligible for cleanup. | Segment-granular cleanup and independent time/size triggers are well-established, but Runnel also needs consumer-progress and active-delivery fences because its public contract exposes replay and acknowledgements. A physical disk reserve must remain separate from the logical topic limit. |
+| [Redpanda topic properties](https://docs.redpanda.com/streaming/current/reference/properties/topic-properties/) and [tiered-storage space management](https://docs.redpanda.com/streaming/26.1/manage/tiered-storage/) | Redpanda exposes per-partition `retention.ms` and `retention.bytes`, rolls segments with `segment.ms`, and, with tiered storage, separates local targets from topic-wide retention. Its local tier can purge using actual available volume space to avoid disk-full conditions caused by skew. | Keep logical retained-history policy distinct from physical local capacity. Runnel should reserve space for durable writes, snapshots, and cleanup even without tiered storage, and should measure pressure from effective free space rather than claim size alone. |
+| [NATS JetStream retention policies](https://docs.nats.io/learn/jetstream/retention-policies) | `Limits` retains messages until `MaxMsgs`, `MaxBytes`, or `MaxAge` is reached. `Interest` removes a message after every interested consumer acknowledges it, while `WorkQueue` removes it after the first consumer acknowledgement. The limits remain a backstop; a stalled interested consumer can still let storage grow. | Keep bounded-history retention and acknowledgement-driven work-queue semantics separate. Runnel's proposed `protect`/`expire` choice is narrower: it controls whether lagging consumers fence deletion, while explicit replay-unavailable outcomes avoid silently turning a gap into `Empty`. |
+
+The storage research supports the physical boundaries in this plan. The
+original [log-structured file-system design](https://web.stanford.edu/~ouster/cgi-bin/papers/lfs.pdf)
+uses segments as the unit of cleaning and relies on a cleaner to preserve
+large free areas for future writes. [Lomet and Luo's analysis of reclaiming
+space in log-structured stores](https://arxiv.org/abs/2005.00044) shows that
+cleaning consumes I/O and that the available slack space and cleaning order
+materially affect write amplification. Together these results support
+immutable segment deletion, bounded cleanup work, an explicit capacity reserve,
+and measurements of cleanup amplification. They do not establish Runnel's
+consumer fencing or client outcomes, which remain design hypotheses requiring
+failure tests and a future ADR.
+
+The comparison leaves three deliberate differences from the reference systems:
+
+- Runnel's retention floor is a logical, durable fact in the clustered state
+  machine and is constrained by contiguous consumer progress and active
+  delivery leases; local free-space inspection cannot independently advance it.
+- Physical cleanup is interruptible and may lag the logical floor. Admission
+  rejects or makes a publish retryable/unknown before reserved capacity is
+  violated; it does not silently convert a protected policy into destructive
+  expiry.
+- Work-queue behavior is not inferred from ordinary stream retention. If a
+  future API needs first-ack removal, it should be a separately named semantic
+  mode with its own compatibility and recovery decision.
+
 The following policy is the recommended starting point. It is deliberately
 not accepted until the implementation, failure tests, and measurements below
 exist and a dedicated ADR records the compatibility consequences.
@@ -895,8 +932,9 @@ exploratory records:
 - [Server admission and metrics](../../crates/runnel-server/src/main.rs)
 - [Illustrative Kubernetes deployment](../../deploy/kubernetes/runnel.yaml)
 
-The existing research notes contain the primary external references for
-consensus recovery, replicated-log behavior, and storage alternatives. This
-plan makes no additional external product or standards claims; implementation
-tradeoffs not yet measured are identified as hypotheses or unresolved
-decisions above.
+The existing research notes contain additional primary references for
+consensus recovery, replicated-log behavior, and storage alternatives. The
+direct retention comparison above records the competitor and storage-research
+evidence used for this plan. Implementation tradeoffs not yet measured remain
+hypotheses or unresolved decisions above; no competitor behavior is itself an
+accepted Runnel policy.
