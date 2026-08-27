@@ -28,6 +28,7 @@ const REQUEST_ID_MAX_LEN: u32 = 1024;
 const REQUEST_ID_MAX_KEY_LEN: u32 = 128;
 const REQUEST_ID_MAX_BODY_LEN: u32 = 64 * 1024 * 1024;
 const MAX_IN_MEMORY_RECORDS: usize = 1024;
+const MAX_CACHED_CONSUMER_STATES: usize = 1024;
 const SPARSE_INDEX_STRIDE: Offset = 64;
 const MAX_SPARSE_INDEX_ENTRIES: usize = 1024;
 const DEFAULT_STORAGE_EXECUTOR_CAPACITY: usize = 32;
@@ -104,8 +105,8 @@ struct BrokerState {
 struct StreamState {
     log: StreamLog,
     // Consumer state and in-flight deliveries are owned by the stream so independent streams
-    // do not contend on a process-wide broker lock. The durable checkpoint remains the source
-    // of truth across restart and cache eviction.
+    // do not contend on a process-wide broker lock. The bounded cache is only a best-effort
+    // fast path; the durable checkpoint remains the source of truth across restart and eviction.
     consumer_states: HashMap<String, ConsumerState>,
     in_flight: HashMap<DeliveryKey, InFlight>,
 }
@@ -322,16 +323,6 @@ impl Broker {
         stream_state
             .in_flight
             .retain(|_, in_flight| in_flight.deadline > now);
-        if !stream_state.consumer_states.is_empty() {
-            let active_consumers: HashSet<_> = stream_state
-                .in_flight
-                .keys()
-                .map(|delivery_key| delivery_key.consumer.clone())
-                .collect();
-            stream_state
-                .consumer_states
-                .retain(|consumer, _| active_consumers.contains(consumer));
-        }
 
         let existing = stream_state
             .in_flight
@@ -386,9 +377,11 @@ impl Broker {
                 self.dead_letter_record(&mut stream_state, stream, &candidate)?;
                 consumer_state.acknowledge(candidate.offset);
                 persist_consumer_state(&root, &consumer_state)?;
-                stream_state
-                    .consumer_states
-                    .insert(consumer.to_owned(), consumer_state.clone());
+                cache_consumer_state(
+                    &mut stream_state,
+                    consumer.to_owned(),
+                    consumer_state.clone(),
+                );
                 self.inner.dead_letters.fetch_add(1, Ordering::Relaxed);
                 continue;
             }
@@ -400,9 +393,6 @@ impl Broker {
                 .delivery_attempts
                 .insert(candidate.offset, delivery_attempt);
             persist_consumer_state(&root, &next_state)?;
-            stream_state
-                .consumer_states
-                .insert(consumer.to_owned(), next_state);
             let delivery_token = self.next_delivery_token();
             message.delivery_token = Some(delivery_token.clone());
             message.delivery_attempt = Some(delivery_attempt);
@@ -424,6 +414,7 @@ impl Broker {
                     deadline: Instant::now() + ack_timeout,
                 },
             );
+            cache_consumer_state(&mut stream_state, consumer.to_owned(), next_state);
             return Ok(PollResult::Message(message));
         }
     }
@@ -494,17 +485,8 @@ impl Broker {
             ..next_state
         };
         persist_consumer_state(&root, &next_state)?;
-        stream_state
-            .consumer_states
-            .insert(consumer.to_owned(), next_state);
         stream_state.in_flight.remove(&delivery_key);
-        if !stream_state
-            .in_flight
-            .keys()
-            .any(|remaining| remaining.consumer == consumer)
-        {
-            stream_state.consumer_states.remove(consumer);
-        }
+        cache_consumer_state(&mut stream_state, consumer.to_owned(), next_state);
         Ok(AckResult::Acknowledged)
     }
 
@@ -1531,6 +1513,29 @@ fn load_consumer_state_for_request(
     load_consumer_state(root, stream, consumer)
 }
 
+fn cache_consumer_state(stream_state: &mut StreamState, consumer: String, state: ConsumerState) {
+    stream_state.consumer_states.insert(consumer, state);
+    while stream_state.consumer_states.len() > MAX_CACHED_CONSUMER_STATES {
+        let evicted = {
+            let active_consumers: HashSet<&str> = stream_state
+                .in_flight
+                .keys()
+                .map(|delivery_key| delivery_key.consumer.as_str())
+                .collect();
+            stream_state
+                .consumer_states
+                .keys()
+                .find(|consumer| !active_consumers.contains((*consumer).as_str()))
+                .cloned()
+                .or_else(|| stream_state.consumer_states.keys().next().cloned())
+        };
+        let Some(evicted) = evicted else {
+            break;
+        };
+        stream_state.consumer_states.remove(&evicted);
+    }
+}
+
 fn persist_consumer_state(root: &Path, state: &ConsumerState) -> Result<(), BrokerError> {
     #[cfg(feature = "instrumentation")]
     let _stage_timer = StageTimer::new("core.consumer_state_persist");
@@ -1625,6 +1630,41 @@ mod tests {
             second,
             PollResult::Message(Message { offset: 0, .. })
         ));
+    }
+
+    #[test]
+    fn acknowledged_consumer_state_cache_is_bounded() {
+        let directory = tempdir().unwrap();
+        let broker = Broker::open(directory.path(), BrokerConfig::default()).unwrap();
+        broker.publish("events", None, b"payload".to_vec()).unwrap();
+
+        for index in 0..=MAX_CACHED_CONSUMER_STATES {
+            let consumer = format!("consumer-{index}");
+            assert!(matches!(
+                broker.poll("events", &consumer).unwrap(),
+                PollResult::Message(Message { offset: 0, .. })
+            ));
+            assert_eq!(
+                broker.ack("events", &consumer, 0).unwrap(),
+                AckResult::Acknowledged
+            );
+        }
+
+        let stream_state = broker.get_stream("events").unwrap();
+        let stream_state = broker.lock_stream(&stream_state).unwrap();
+        assert_eq!(
+            stream_state.consumer_states.len(),
+            MAX_CACHED_CONSUMER_STATES
+        );
+        let evicted_consumer = (0..=MAX_CACHED_CONSUMER_STATES)
+            .map(|index| format!("consumer-{index}"))
+            .find(|consumer| !stream_state.consumer_states.contains_key(consumer))
+            .expect("one consumer should have been evicted");
+        drop(stream_state);
+        assert_eq!(
+            broker.poll("events", &evicted_consumer).unwrap(),
+            PollResult::Empty
+        );
     }
 
     #[tokio::test(flavor = "current_thread")]
