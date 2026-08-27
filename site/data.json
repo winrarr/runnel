@@ -1,6 +1,6 @@
 {
   "schema_version": 1,
-  "generated_at": "2026-08-27T14:23:33.519690+00:00",
+  "generated_at": "2026-08-27T16:52:35.881348+00:00",
   "runs": [
     {
       "timestamp": "2026-08-20T10:02:05.031593+00:00",
@@ -4384,6 +4384,110 @@
         {
           "run_id": "33080437054",
           "generated_at": "2026-08-27T14:22:02.225279+00:00",
+          "source_result": "cluster-3.json"
+        }
+      ],
+      "backends": [
+        "runnel-cluster"
+      ],
+      "resource_limits": {
+        "processes": "host-scheduled; no cgroup limit"
+      },
+      "workload": {
+        "messages": 200,
+        "warmup": 100,
+        "concurrency": 2,
+        "nodes": 3,
+        "ack_timeout_ms": 30000,
+        "slow_consumer_delay_ms": 10,
+        "payload_sizes_bytes": [
+          100,
+          1024
+        ],
+        "protocol": "line-delimited JSON with UTF-8 string payloads",
+        "durability": "committed by the current three-node Raft quorum and local durable state"
+      }
+    },
+    {
+      "timestamp": "2026-08-27T16:46:57.035059+00:00",
+      "profile": "push",
+      "revision": "6fb0afce2aaf4b781cb72d61820a70bdf577f6cd",
+      "repository": "winrarr/runnel",
+      "run_url": "https://github.com/winrarr/runnel/actions/runs/33094464649",
+      "event": "push",
+      "workflow": "Runnel benchmark history",
+      "run_file": "2026-08-27T164657.035059+0000-6fb0afce2aaf-runnel.json",
+      "comparison_mode": "native broker tools; first-pass, not a final apples-to-apples claim",
+      "benchmark_suite": "runnel",
+      "repetitions": 3,
+      "repetition_runs": [
+        {
+          "run_id": "33094464649",
+          "generated_at": "2026-08-27T16:42:46.026582+00:00",
+          "source_result": "runnel-1.json"
+        },
+        {
+          "run_id": "33094464649",
+          "generated_at": "2026-08-27T16:44:52.559131+00:00",
+          "source_result": "runnel-2.json"
+        },
+        {
+          "run_id": "33094464649",
+          "generated_at": "2026-08-27T16:46:57.035059+00:00",
+          "source_result": "runnel-3.json"
+        }
+      ],
+      "backends": [
+        "runnel"
+      ],
+      "resource_limits": {
+        "broker_cpu": "2",
+        "broker_memory": "2g",
+        "client_cpu": "2",
+        "client_memory": "2g"
+      },
+      "workload": {
+        "messages": 10000,
+        "payload_sizes_bytes": [
+          100,
+          1024
+        ],
+        "single_node": true,
+        "nodes": 1,
+        "replication_factor": 1,
+        "operations": [
+          "publish",
+          "consume"
+        ],
+        "compression": "disabled where the native client exposes the setting"
+      }
+    },
+    {
+      "timestamp": "2026-08-27T16:51:28.568802+00:00",
+      "profile": "push",
+      "revision": "6fb0afce2aaf4b781cb72d61820a70bdf577f6cd",
+      "repository": "winrarr/runnel",
+      "run_url": "https://github.com/winrarr/runnel/actions/runs/33094464649",
+      "event": "push",
+      "workflow": "Runnel benchmark history",
+      "run_file": "2026-08-27T165128.568802+0000-6fb0afce2aaf-cluster.json",
+      "comparison_mode": "cluster-baseline",
+      "benchmark_suite": "cluster",
+      "repetitions": 3,
+      "repetition_runs": [
+        {
+          "run_id": "33094464649",
+          "generated_at": "2026-08-27T16:49:34.583482+00:00",
+          "source_result": "cluster-1.json"
+        },
+        {
+          "run_id": "33094464649",
+          "generated_at": "2026-08-27T16:50:31.797119+00:00",
+          "source_result": "cluster-2.json"
+        },
+        {
+          "run_id": "33094464649",
+          "generated_at": "2026-08-27T16:51:28.568802+00:00",
           "source_result": "cluster-3.json"
         }
       ],
@@ -177376,6 +177480,3942 @@
       "delta": 12058624.0,
       "delta_percent": 7.845854542547237,
       "improved": false
+    },
+    {
+      "timestamp": "2026-08-27T16:46:57.035059+00:00",
+      "timestamp_ms": 1787849217035.059,
+      "run_file": "2026-08-27T164657.035059+0000-6fb0afce2aaf-runnel.json",
+      "profile": "push",
+      "revision": "6fb0afce2aaf4b781cb72d61820a70bdf577f6cd",
+      "run_url": "https://github.com/winrarr/runnel/actions/runs/33094464649",
+      "comparison_mode": "native broker tools; first-pass, not a final apples-to-apples claim",
+      "benchmark_suite": "runnel",
+      "benchmark_series": "runnel",
+      "backend": "runnel",
+      "operation": "publish",
+      "message_size_bytes": 100,
+      "metric": "throughput_messages_per_second",
+      "value": 2011.7481335225127,
+      "unit": "messages/s",
+      "repetitions": 3,
+      "range": {
+        "min": 1843.9937914860698,
+        "median": 2011.7481335225127,
+        "max": 2024.7543104958577,
+        "relative_range_percent": 8.985246015527872,
+        "standard_deviation": 82.31716787606726,
+        "relative_standard_deviation_percent": 4.091822753772475
+      },
+      "evidence": {
+        "aggregation": "median",
+        "sample_count": 3,
+        "repetition_count": 3,
+        "sample_coverage_percent": 100.0,
+        "sample_values": [
+          1843.9937914860698,
+          2024.7543104958577,
+          2011.7481335225127
+        ]
+      },
+      "previous_value": 1063.5923351535541,
+      "delta": 948.1557983689586,
+      "delta_percent": 89.14654299685888,
+      "improved": true
+    },
+    {
+      "timestamp": "2026-08-27T16:46:57.035059+00:00",
+      "timestamp_ms": 1787849217035.059,
+      "run_file": "2026-08-27T164657.035059+0000-6fb0afce2aaf-runnel.json",
+      "profile": "push",
+      "revision": "6fb0afce2aaf4b781cb72d61820a70bdf577f6cd",
+      "run_url": "https://github.com/winrarr/runnel/actions/runs/33094464649",
+      "comparison_mode": "native broker tools; first-pass, not a final apples-to-apples claim",
+      "benchmark_suite": "runnel",
+      "benchmark_series": "runnel",
+      "backend": "runnel",
+      "operation": "publish",
+      "message_size_bytes": 100,
+      "metric": "latency_p50",
+      "value": 459.5655,
+      "unit": "\u00b5s",
+      "repetitions": 3,
+      "range": {
+        "min": 459.356,
+        "median": 459.5655,
+        "max": 461.733,
+        "relative_range_percent": 0.5172276857161839,
+        "standard_deviation": 1.0745580745383514,
+        "relative_standard_deviation_percent": 0.23382044007619185
+      },
+      "evidence": {
+        "aggregation": "median",
+        "sample_count": 3,
+        "repetition_count": 3,
+        "sample_coverage_percent": 100.0,
+        "sample_values": [
+          461.733,
+          459.5655,
+          459.356
+        ]
+      },
+      "previous_value": 419.3565,
+      "delta": 40.209,
+      "delta_percent": 9.588262015731248,
+      "improved": false
+    },
+    {
+      "timestamp": "2026-08-27T16:46:57.035059+00:00",
+      "timestamp_ms": 1787849217035.059,
+      "run_file": "2026-08-27T164657.035059+0000-6fb0afce2aaf-runnel.json",
+      "profile": "push",
+      "revision": "6fb0afce2aaf4b781cb72d61820a70bdf577f6cd",
+      "run_url": "https://github.com/winrarr/runnel/actions/runs/33094464649",
+      "comparison_mode": "native broker tools; first-pass, not a final apples-to-apples claim",
+      "benchmark_suite": "runnel",
+      "benchmark_series": "runnel",
+      "backend": "runnel",
+      "operation": "publish",
+      "message_size_bytes": 100,
+      "metric": "latency_p99",
+      "value": 1094.2871200000016,
+      "unit": "\u00b5s",
+      "repetitions": 3,
+      "range": {
+        "min": 905.5124900000084,
+        "median": 1094.2871200000016,
+        "max": 1121.7719000000013,
+        "relative_range_percent": 19.762583882006457,
+        "standard_deviation": 96.1245756972735,
+        "relative_standard_deviation_percent": 8.784218870937032
+      },
+      "evidence": {
+        "aggregation": "median",
+        "sample_count": 3,
+        "repetition_count": 3,
+        "sample_coverage_percent": 100.0,
+        "sample_values": [
+          1121.7719000000013,
+          1094.2871200000016,
+          905.5124900000084
+        ]
+      },
+      "previous_value": 2137.5848700000065,
+      "delta": -1043.297750000005,
+      "delta_percent": -48.807313554759666,
+      "improved": true
+    },
+    {
+      "timestamp": "2026-08-27T16:46:57.035059+00:00",
+      "timestamp_ms": 1787849217035.059,
+      "run_file": "2026-08-27T164657.035059+0000-6fb0afce2aaf-runnel.json",
+      "profile": "push",
+      "revision": "6fb0afce2aaf4b781cb72d61820a70bdf577f6cd",
+      "run_url": "https://github.com/winrarr/runnel/actions/runs/33094464649",
+      "comparison_mode": "native broker tools; first-pass, not a final apples-to-apples claim",
+      "benchmark_suite": "runnel",
+      "benchmark_series": "runnel",
+      "backend": "runnel",
+      "operation": "publish",
+      "message_size_bytes": 100,
+      "metric": "latency_p999",
+      "value": 2973.5600650000265,
+      "unit": "\u00b5s",
+      "repetitions": 3,
+      "range": {
+        "min": 2484.4979690000073,
+        "median": 2973.5600650000265,
+        "max": 20729.51853300001,
+        "relative_range_percent": 613.5749796599397,
+        "standard_deviation": 8487.860731865292,
+        "relative_standard_deviation_percent": 285.4444015364195
+      },
+      "evidence": {
+        "aggregation": "median",
+        "sample_count": 3,
+        "repetition_count": 3,
+        "sample_coverage_percent": 100.0,
+        "sample_values": [
+          20729.51853300001,
+          2484.4979690000073,
+          2973.5600650000265
+        ]
+      },
+      "previous_value": 115469.25917200315,
+      "delta": -112495.69910700312,
+      "delta_percent": -97.42480372150773,
+      "improved": true
+    },
+    {
+      "timestamp": "2026-08-27T16:46:57.035059+00:00",
+      "timestamp_ms": 1787849217035.059,
+      "run_file": "2026-08-27T164657.035059+0000-6fb0afce2aaf-runnel.json",
+      "profile": "push",
+      "revision": "6fb0afce2aaf4b781cb72d61820a70bdf577f6cd",
+      "run_url": "https://github.com/winrarr/runnel/actions/runs/33094464649",
+      "comparison_mode": "native broker tools; first-pass, not a final apples-to-apples claim",
+      "benchmark_suite": "runnel",
+      "benchmark_series": "runnel",
+      "backend": "runnel",
+      "operation": "publish",
+      "message_size_bytes": 100,
+      "metric": "cpu_percent_max",
+      "value": 15.16,
+      "unit": "%",
+      "repetitions": 3,
+      "range": {
+        "min": 14.49,
+        "median": 15.16,
+        "max": 15.76,
+        "relative_range_percent": 8.377308707124008,
+        "standard_deviation": 0.5187377843273889,
+        "relative_standard_deviation_percent": 3.421753194771695
+      },
+      "evidence": {
+        "aggregation": "median",
+        "sample_count": 3,
+        "repetition_count": 3,
+        "sample_coverage_percent": 100.0,
+        "sample_values": [
+          14.49,
+          15.16,
+          15.76
+        ]
+      },
+      "previous_value": 16.65,
+      "delta": -1.4899999999999984,
+      "delta_percent": -8.94894894894894,
+      "improved": true
+    },
+    {
+      "timestamp": "2026-08-27T16:46:57.035059+00:00",
+      "timestamp_ms": 1787849217035.059,
+      "run_file": "2026-08-27T164657.035059+0000-6fb0afce2aaf-runnel.json",
+      "profile": "push",
+      "revision": "6fb0afce2aaf4b781cb72d61820a70bdf577f6cd",
+      "run_url": "https://github.com/winrarr/runnel/actions/runs/33094464649",
+      "comparison_mode": "native broker tools; first-pass, not a final apples-to-apples claim",
+      "benchmark_suite": "runnel",
+      "benchmark_series": "runnel",
+      "backend": "runnel",
+      "operation": "publish",
+      "message_size_bytes": 100,
+      "metric": "memory_bytes_max",
+      "value": 1818230.784,
+      "unit": "bytes",
+      "repetitions": 3,
+      "range": {
+        "min": 1753219.072,
+        "median": 1818230.784,
+        "max": 2105540.608,
+        "relative_range_percent": 19.37716262975779,
+        "standard_deviation": 153080.92354970705,
+        "relative_standard_deviation_percent": 8.419224055427007
+      },
+      "evidence": {
+        "aggregation": "median",
+        "sample_count": 3,
+        "repetition_count": 3,
+        "sample_coverage_percent": 100.0,
+        "sample_values": [
+          1818230.784,
+          1753219.072,
+          2105540.608
+        ]
+      },
+      "previous_value": 1970274.304,
+      "delta": -152043.52000000002,
+      "delta_percent": -7.716870675891433,
+      "improved": true
+    },
+    {
+      "timestamp": "2026-08-27T16:46:57.035059+00:00",
+      "timestamp_ms": 1787849217035.059,
+      "run_file": "2026-08-27T164657.035059+0000-6fb0afce2aaf-runnel.json",
+      "profile": "push",
+      "revision": "6fb0afce2aaf4b781cb72d61820a70bdf577f6cd",
+      "run_url": "https://github.com/winrarr/runnel/actions/runs/33094464649",
+      "comparison_mode": "native broker tools; first-pass, not a final apples-to-apples claim",
+      "benchmark_suite": "runnel",
+      "benchmark_series": "runnel",
+      "backend": "runnel",
+      "operation": "publish",
+      "message_size_bytes": 100,
+      "metric": "cpu_efficiency_messages_per_cpu_second",
+      "value": 12987.974434471123,
+      "unit": "messages/CPU-second",
+      "repetitions": 3,
+      "range": {
+        "min": 12772.41974769362,
+        "median": 12987.974434471123,
+        "max": 13119.348020880754,
+        "relative_range_percent": 2.6711499544252115,
+        "standard_deviation": 143.01595440699086,
+        "relative_standard_deviation_percent": 1.1011413298398176
+      },
+      "evidence": {
+        "aggregation": "median",
+        "sample_count": 3,
+        "repetition_count": 3,
+        "sample_coverage_percent": 100.0,
+        "sample_values": [
+          12772.41974769362,
+          13119.348020880754,
+          12987.974434471123
+        ]
+      },
+      "previous_value": 9840.282376743084,
+      "delta": 3147.69205772804,
+      "delta_percent": 31.987822475170237,
+      "improved": true
+    },
+    {
+      "timestamp": "2026-08-27T16:46:57.035059+00:00",
+      "timestamp_ms": 1787849217035.059,
+      "run_file": "2026-08-27T164657.035059+0000-6fb0afce2aaf-runnel.json",
+      "profile": "push",
+      "revision": "6fb0afce2aaf4b781cb72d61820a70bdf577f6cd",
+      "run_url": "https://github.com/winrarr/runnel/actions/runs/33094464649",
+      "comparison_mode": "native broker tools; first-pass, not a final apples-to-apples claim",
+      "benchmark_suite": "runnel",
+      "benchmark_series": "runnel",
+      "backend": "runnel",
+      "operation": "consume_ack",
+      "message_size_bytes": 100,
+      "metric": "throughput_messages_per_second",
+      "value": 788.6562077239213,
+      "unit": "messages/s",
+      "repetitions": 3,
+      "range": {
+        "min": 787.4296101493782,
+        "median": 788.6562077239213,
+        "max": 791.5923171993405,
+        "relative_range_percent": 0.5278227710875472,
+        "standard_deviation": 1.7465334060274338,
+        "relative_standard_deviation_percent": 0.22145687676357315
+      },
+      "evidence": {
+        "aggregation": "median",
+        "sample_count": 3,
+        "repetition_count": 3,
+        "sample_coverage_percent": 100.0,
+        "sample_values": [
+          788.6562077239213,
+          787.4296101493782,
+          791.5923171993405
+        ]
+      },
+      "previous_value": 401.31255228914944,
+      "delta": 387.34365543477185,
+      "delta_percent": 96.5191976242216,
+      "improved": true
+    },
+    {
+      "timestamp": "2026-08-27T16:46:57.035059+00:00",
+      "timestamp_ms": 1787849217035.059,
+      "run_file": "2026-08-27T164657.035059+0000-6fb0afce2aaf-runnel.json",
+      "profile": "push",
+      "revision": "6fb0afce2aaf4b781cb72d61820a70bdf577f6cd",
+      "run_url": "https://github.com/winrarr/runnel/actions/runs/33094464649",
+      "comparison_mode": "native broker tools; first-pass, not a final apples-to-apples claim",
+      "benchmark_suite": "runnel",
+      "benchmark_series": "runnel",
+      "backend": "runnel",
+      "operation": "consume_ack",
+      "message_size_bytes": 100,
+      "metric": "latency_p50",
+      "value": 1224.372,
+      "unit": "\u00b5s",
+      "repetitions": 3,
+      "range": {
+        "min": 1212.281,
+        "median": 1224.372,
+        "max": 1226.9685,
+        "relative_range_percent": 1.1995945676640758,
+        "standard_deviation": 6.400145393313797,
+        "relative_standard_deviation_percent": 0.5227288269671143
+      },
+      "evidence": {
+        "aggregation": "median",
+        "sample_count": 3,
+        "repetition_count": 3,
+        "sample_coverage_percent": 100.0,
+        "sample_values": [
+          1226.9685,
+          1224.372,
+          1212.281
+        ]
+      },
+      "previous_value": 1387.5995,
+      "delta": -163.22749999999996,
+      "delta_percent": -11.763300577724333,
+      "improved": true
+    },
+    {
+      "timestamp": "2026-08-27T16:46:57.035059+00:00",
+      "timestamp_ms": 1787849217035.059,
+      "run_file": "2026-08-27T164657.035059+0000-6fb0afce2aaf-runnel.json",
+      "profile": "push",
+      "revision": "6fb0afce2aaf4b781cb72d61820a70bdf577f6cd",
+      "run_url": "https://github.com/winrarr/runnel/actions/runs/33094464649",
+      "comparison_mode": "native broker tools; first-pass, not a final apples-to-apples claim",
+      "benchmark_suite": "runnel",
+      "benchmark_series": "runnel",
+      "backend": "runnel",
+      "operation": "consume_ack",
+      "message_size_bytes": 100,
+      "metric": "latency_p99",
+      "value": 2646.390510000002,
+      "unit": "\u00b5s",
+      "repetitions": 3,
+      "range": {
+        "min": 2333.156900000001,
+        "median": 2646.390510000002,
+        "max": 2684.9383600000006,
+        "relative_range_percent": 13.292877928284266,
+        "standard_deviation": 157.53356847668533,
+        "relative_standard_deviation_percent": 5.952771062373754
+      },
+      "evidence": {
+        "aggregation": "median",
+        "sample_count": 3,
+        "repetition_count": 3,
+        "sample_coverage_percent": 100.0,
+        "sample_values": [
+          2333.156900000001,
+          2684.9383600000006,
+          2646.390510000002
+        ]
+      },
+      "previous_value": 23708.546330000005,
+      "delta": -21062.155820000004,
+      "delta_percent": -88.83782045020894,
+      "improved": true
+    },
+    {
+      "timestamp": "2026-08-27T16:46:57.035059+00:00",
+      "timestamp_ms": 1787849217035.059,
+      "run_file": "2026-08-27T164657.035059+0000-6fb0afce2aaf-runnel.json",
+      "profile": "push",
+      "revision": "6fb0afce2aaf4b781cb72d61820a70bdf577f6cd",
+      "run_url": "https://github.com/winrarr/runnel/actions/runs/33094464649",
+      "comparison_mode": "native broker tools; first-pass, not a final apples-to-apples claim",
+      "benchmark_suite": "runnel",
+      "benchmark_series": "runnel",
+      "backend": "runnel",
+      "operation": "consume_ack",
+      "message_size_bytes": 100,
+      "metric": "latency_p999",
+      "value": 6365.651774000022,
+      "unit": "\u00b5s",
+      "repetitions": 3,
+      "range": {
+        "min": 6186.5560390000055,
+        "median": 6365.651774000022,
+        "max": 6427.86622200011,
+        "relative_range_percent": 3.790816581983257,
+        "standard_deviation": 102.29397954191496,
+        "relative_standard_deviation_percent": 1.6069678828447114
+      },
+      "evidence": {
+        "aggregation": "median",
+        "sample_count": 3,
+        "repetition_count": 3,
+        "sample_coverage_percent": 100.0,
+        "sample_values": [
+          6427.86622200011,
+          6365.651774000022,
+          6186.5560390000055
+        ]
+      },
+      "previous_value": 177933.91254400162,
+      "delta": -171568.2607700016,
+      "delta_percent": -96.42246287793742,
+      "improved": true
+    },
+    {
+      "timestamp": "2026-08-27T16:46:57.035059+00:00",
+      "timestamp_ms": 1787849217035.059,
+      "run_file": "2026-08-27T164657.035059+0000-6fb0afce2aaf-runnel.json",
+      "profile": "push",
+      "revision": "6fb0afce2aaf4b781cb72d61820a70bdf577f6cd",
+      "run_url": "https://github.com/winrarr/runnel/actions/runs/33094464649",
+      "comparison_mode": "native broker tools; first-pass, not a final apples-to-apples claim",
+      "benchmark_suite": "runnel",
+      "benchmark_series": "runnel",
+      "backend": "runnel",
+      "operation": "consume_ack",
+      "message_size_bytes": 100,
+      "metric": "cpu_percent_max",
+      "value": 29.18,
+      "unit": "%",
+      "repetitions": 3,
+      "range": {
+        "min": 28.54,
+        "median": 29.18,
+        "max": 29.34,
+        "relative_range_percent": 2.741603838245376,
+        "standard_deviation": 0.3456395039150862,
+        "relative_standard_deviation_percent": 1.184508238228534
+      },
+      "evidence": {
+        "aggregation": "median",
+        "sample_count": 3,
+        "repetition_count": 3,
+        "sample_coverage_percent": 100.0,
+        "sample_values": [
+          29.34,
+          29.18,
+          28.54
+        ]
+      },
+      "previous_value": 40.61,
+      "delta": -11.43,
+      "delta_percent": -28.145776902240826,
+      "improved": true
+    },
+    {
+      "timestamp": "2026-08-27T16:46:57.035059+00:00",
+      "timestamp_ms": 1787849217035.059,
+      "run_file": "2026-08-27T164657.035059+0000-6fb0afce2aaf-runnel.json",
+      "profile": "push",
+      "revision": "6fb0afce2aaf4b781cb72d61820a70bdf577f6cd",
+      "run_url": "https://github.com/winrarr/runnel/actions/runs/33094464649",
+      "comparison_mode": "native broker tools; first-pass, not a final apples-to-apples claim",
+      "benchmark_suite": "runnel",
+      "benchmark_series": "runnel",
+      "backend": "runnel",
+      "operation": "consume_ack",
+      "message_size_bytes": 100,
+      "metric": "memory_bytes_max",
+      "value": 2297430.016,
+      "unit": "bytes",
+      "repetitions": 3,
+      "range": {
+        "min": 2256535.552,
+        "median": 2297430.016,
+        "max": 2380267.52,
+        "relative_range_percent": 5.385668644454582,
+        "standard_deviation": 51471.68494527443,
+        "relative_standard_deviation_percent": 2.2404027363971917
+      },
+      "evidence": {
+        "aggregation": "median",
+        "sample_count": 3,
+        "repetition_count": 3,
+        "sample_coverage_percent": 100.0,
+        "sample_values": [
+          2297430.016,
+          2380267.52,
+          2256535.552
+        ]
+      },
+      "previous_value": 2477785.088,
+      "delta": -180355.07200000016,
+      "delta_percent": -7.2788827761320425,
+      "improved": true
+    },
+    {
+      "timestamp": "2026-08-27T16:46:57.035059+00:00",
+      "timestamp_ms": 1787849217035.059,
+      "run_file": "2026-08-27T164657.035059+0000-6fb0afce2aaf-runnel.json",
+      "profile": "push",
+      "revision": "6fb0afce2aaf4b781cb72d61820a70bdf577f6cd",
+      "run_url": "https://github.com/winrarr/runnel/actions/runs/33094464649",
+      "comparison_mode": "native broker tools; first-pass, not a final apples-to-apples claim",
+      "benchmark_suite": "runnel",
+      "benchmark_series": "runnel",
+      "backend": "runnel",
+      "operation": "consume_ack",
+      "message_size_bytes": 100,
+      "metric": "cpu_efficiency_messages_per_cpu_second",
+      "value": 2876.779755755645,
+      "unit": "messages/CPU-second",
+      "repetitions": 3,
+      "range": {
+        "min": 2868.344973555293,
+        "median": 2876.779755755645,
+        "max": 2889.154691120472,
+        "relative_range_percent": 0.7233684651577592,
+        "standard_deviation": 8.546142217356344,
+        "relative_standard_deviation_percent": 0.29707321877032344
+      },
+      "evidence": {
+        "aggregation": "median",
+        "sample_count": 3,
+        "repetition_count": 3,
+        "sample_coverage_percent": 100.0,
+        "sample_values": [
+          2876.779755755645,
+          2868.344973555293,
+          2889.154691120472
+        ]
+      },
+      "previous_value": 1661.4094134792804,
+      "delta": 1215.3703422763647,
+      "delta_percent": 73.15297074976648,
+      "improved": true
+    },
+    {
+      "timestamp": "2026-08-27T16:46:57.035059+00:00",
+      "timestamp_ms": 1787849217035.059,
+      "run_file": "2026-08-27T164657.035059+0000-6fb0afce2aaf-runnel.json",
+      "profile": "push",
+      "revision": "6fb0afce2aaf4b781cb72d61820a70bdf577f6cd",
+      "run_url": "https://github.com/winrarr/runnel/actions/runs/33094464649",
+      "comparison_mode": "native broker tools; first-pass, not a final apples-to-apples claim",
+      "benchmark_suite": "runnel",
+      "benchmark_series": "runnel",
+      "backend": "runnel",
+      "operation": "publish",
+      "message_size_bytes": 1024,
+      "metric": "throughput_messages_per_second",
+      "value": 1935.7469718264683,
+      "unit": "messages/s",
+      "repetitions": 3,
+      "range": {
+        "min": 1920.7511272763038,
+        "median": 1935.7469718264683,
+        "max": 1954.0530473444085,
+        "relative_range_percent": 1.7203653448922995,
+        "standard_deviation": 13.617821798672741,
+        "relative_standard_deviation_percent": 0.7034918301240417
+      },
+      "evidence": {
+        "aggregation": "median",
+        "sample_count": 3,
+        "repetition_count": 3,
+        "sample_coverage_percent": 100.0,
+        "sample_values": [
+          1954.0530473444085,
+          1920.7511272763038,
+          1935.7469718264683
+        ]
+      },
+      "previous_value": 1115.09619717282,
+      "delta": 820.6507746536483,
+      "delta_percent": 73.5946169249165,
+      "improved": true
+    },
+    {
+      "timestamp": "2026-08-27T16:46:57.035059+00:00",
+      "timestamp_ms": 1787849217035.059,
+      "run_file": "2026-08-27T164657.035059+0000-6fb0afce2aaf-runnel.json",
+      "profile": "push",
+      "revision": "6fb0afce2aaf4b781cb72d61820a70bdf577f6cd",
+      "run_url": "https://github.com/winrarr/runnel/actions/runs/33094464649",
+      "comparison_mode": "native broker tools; first-pass, not a final apples-to-apples claim",
+      "benchmark_suite": "runnel",
+      "benchmark_series": "runnel",
+      "backend": "runnel",
+      "operation": "publish",
+      "message_size_bytes": 1024,
+      "metric": "latency_p50",
+      "value": 475.305,
+      "unit": "\u00b5s",
+      "repetitions": 3,
+      "range": {
+        "min": 472.539,
+        "median": 475.305,
+        "max": 477.116,
+        "relative_range_percent": 0.9629606252827128,
+        "standard_deviation": 1.882061694584485,
+        "relative_standard_deviation_percent": 0.3959692607030191
+      },
+      "evidence": {
+        "aggregation": "median",
+        "sample_count": 3,
+        "repetition_count": 3,
+        "sample_coverage_percent": 100.0,
+        "sample_values": [
+          477.116,
+          475.305,
+          472.539
+        ]
+      },
+      "previous_value": 435.245,
+      "delta": 40.06,
+      "delta_percent": 9.204011533733874,
+      "improved": false
+    },
+    {
+      "timestamp": "2026-08-27T16:46:57.035059+00:00",
+      "timestamp_ms": 1787849217035.059,
+      "run_file": "2026-08-27T164657.035059+0000-6fb0afce2aaf-runnel.json",
+      "profile": "push",
+      "revision": "6fb0afce2aaf4b781cb72d61820a70bdf577f6cd",
+      "run_url": "https://github.com/winrarr/runnel/actions/runs/33094464649",
+      "comparison_mode": "native broker tools; first-pass, not a final apples-to-apples claim",
+      "benchmark_suite": "runnel",
+      "benchmark_series": "runnel",
+      "backend": "runnel",
+      "operation": "publish",
+      "message_size_bytes": 1024,
+      "metric": "latency_p99",
+      "value": 875.5934000000013,
+      "unit": "\u00b5s",
+      "repetitions": 3,
+      "range": {
+        "min": 808.5498400000026,
+        "median": 875.5934000000013,
+        "max": 1078.2142000000017,
+        "relative_range_percent": 30.79789774568866,
+        "standard_deviation": 114.63414974233012,
+        "relative_standard_deviation_percent": 13.092166951273269
+      },
+      "evidence": {
+        "aggregation": "median",
+        "sample_count": 3,
+        "repetition_count": 3,
+        "sample_coverage_percent": 100.0,
+        "sample_values": [
+          808.5498400000026,
+          1078.2142000000017,
+          875.5934000000013
+        ]
+      },
+      "previous_value": 3268.861260000011,
+      "delta": -2393.26786000001,
+      "delta_percent": -73.21411554799367,
+      "improved": true
+    },
+    {
+      "timestamp": "2026-08-27T16:46:57.035059+00:00",
+      "timestamp_ms": 1787849217035.059,
+      "run_file": "2026-08-27T164657.035059+0000-6fb0afce2aaf-runnel.json",
+      "profile": "push",
+      "revision": "6fb0afce2aaf4b781cb72d61820a70bdf577f6cd",
+      "run_url": "https://github.com/winrarr/runnel/actions/runs/33094464649",
+      "comparison_mode": "native broker tools; first-pass, not a final apples-to-apples claim",
+      "benchmark_suite": "runnel",
+      "benchmark_series": "runnel",
+      "backend": "runnel",
+      "operation": "publish",
+      "message_size_bytes": 1024,
+      "metric": "latency_p999",
+      "value": 2672.50106600019,
+      "unit": "\u00b5s",
+      "repetitions": 3,
+      "range": {
+        "min": 2405.778005000012,
+        "median": 2672.50106600019,
+        "max": 3072.4513570000267,
+        "relative_range_percent": 24.94567207031256,
+        "standard_deviation": 273.9737993975771,
+        "relative_standard_deviation_percent": 10.251588030519336
+      },
+      "evidence": {
+        "aggregation": "median",
+        "sample_count": 3,
+        "repetition_count": 3,
+        "sample_coverage_percent": 100.0,
+        "sample_values": [
+          2672.50106600019,
+          2405.778005000012,
+          3072.4513570000267
+        ]
+      },
+      "previous_value": 172417.43052200007,
+      "delta": -169744.92945599987,
+      "delta_percent": -98.44998208249068,
+      "improved": true
+    },
+    {
+      "timestamp": "2026-08-27T16:46:57.035059+00:00",
+      "timestamp_ms": 1787849217035.059,
+      "run_file": "2026-08-27T164657.035059+0000-6fb0afce2aaf-runnel.json",
+      "profile": "push",
+      "revision": "6fb0afce2aaf4b781cb72d61820a70bdf577f6cd",
+      "run_url": "https://github.com/winrarr/runnel/actions/runs/33094464649",
+      "comparison_mode": "native broker tools; first-pass, not a final apples-to-apples claim",
+      "benchmark_suite": "runnel",
+      "benchmark_series": "runnel",
+      "backend": "runnel",
+      "operation": "publish",
+      "message_size_bytes": 1024,
+      "metric": "cpu_percent_max",
+      "value": 16.14,
+      "unit": "%",
+      "repetitions": 3,
+      "range": {
+        "min": 15.89,
+        "median": 16.14,
+        "max": 18.6,
+        "relative_range_percent": 16.79058240396531,
+        "standard_deviation": 1.2228473148989438,
+        "relative_standard_deviation_percent": 7.576501331468053
+      },
+      "evidence": {
+        "aggregation": "median",
+        "sample_count": 3,
+        "repetition_count": 3,
+        "sample_coverage_percent": 100.0,
+        "sample_values": [
+          18.6,
+          15.89,
+          16.14
+        ]
+      },
+      "previous_value": 19.98,
+      "delta": -3.84,
+      "delta_percent": -19.21921921921922,
+      "improved": true
+    },
+    {
+      "timestamp": "2026-08-27T16:46:57.035059+00:00",
+      "timestamp_ms": 1787849217035.059,
+      "run_file": "2026-08-27T164657.035059+0000-6fb0afce2aaf-runnel.json",
+      "profile": "push",
+      "revision": "6fb0afce2aaf4b781cb72d61820a70bdf577f6cd",
+      "run_url": "https://github.com/winrarr/runnel/actions/runs/33094464649",
+      "comparison_mode": "native broker tools; first-pass, not a final apples-to-apples claim",
+      "benchmark_suite": "runnel",
+      "benchmark_series": "runnel",
+      "backend": "runnel",
+      "operation": "publish",
+      "message_size_bytes": 1024,
+      "metric": "memory_bytes_max",
+      "value": 2846883.84,
+      "unit": "bytes",
+      "repetitions": 3,
+      "range": {
+        "min": 2670723.072,
+        "median": 2846883.84,
+        "max": 2879389.696,
+        "relative_range_percent": 7.329650092081026,
+        "standard_deviation": 91670.30709631831,
+        "relative_standard_deviation_percent": 3.2200227423511008
+      },
+      "evidence": {
+        "aggregation": "median",
+        "sample_count": 3,
+        "repetition_count": 3,
+        "sample_coverage_percent": 100.0,
+        "sample_values": [
+          2670723.072,
+          2879389.696,
+          2846883.84
+        ]
+      },
+      "previous_value": 2773483.52,
+      "delta": 73400.31999999983,
+      "delta_percent": 2.6465028355387465,
+      "improved": false
+    },
+    {
+      "timestamp": "2026-08-27T16:46:57.035059+00:00",
+      "timestamp_ms": 1787849217035.059,
+      "run_file": "2026-08-27T164657.035059+0000-6fb0afce2aaf-runnel.json",
+      "profile": "push",
+      "revision": "6fb0afce2aaf4b781cb72d61820a70bdf577f6cd",
+      "run_url": "https://github.com/winrarr/runnel/actions/runs/33094464649",
+      "comparison_mode": "native broker tools; first-pass, not a final apples-to-apples claim",
+      "benchmark_suite": "runnel",
+      "benchmark_series": "runnel",
+      "backend": "runnel",
+      "operation": "publish",
+      "message_size_bytes": 1024,
+      "metric": "cpu_efficiency_messages_per_cpu_second",
+      "value": 11984.2862039294,
+      "unit": "messages/CPU-second",
+      "repetitions": 3,
+      "range": {
+        "min": 11353.75343734886,
+        "median": 11984.2862039294,
+        "max": 12044.434327119612,
+        "relative_range_percent": 5.763220921278502,
+        "standard_deviation": 312.3796582418282,
+        "relative_standard_deviation_percent": 2.6065770870809595
+      },
+      "evidence": {
+        "aggregation": "median",
+        "sample_count": 3,
+        "repetition_count": 3,
+        "sample_coverage_percent": 100.0,
+        "sample_values": [
+          11353.75343734886,
+          12044.434327119612,
+          11984.2862039294
+        ]
+      },
+      "previous_value": 9143.885438088126,
+      "delta": 2840.400765841274,
+      "delta_percent": 31.06338968344694,
+      "improved": true
+    },
+    {
+      "timestamp": "2026-08-27T16:46:57.035059+00:00",
+      "timestamp_ms": 1787849217035.059,
+      "run_file": "2026-08-27T164657.035059+0000-6fb0afce2aaf-runnel.json",
+      "profile": "push",
+      "revision": "6fb0afce2aaf4b781cb72d61820a70bdf577f6cd",
+      "run_url": "https://github.com/winrarr/runnel/actions/runs/33094464649",
+      "comparison_mode": "native broker tools; first-pass, not a final apples-to-apples claim",
+      "benchmark_suite": "runnel",
+      "benchmark_series": "runnel",
+      "backend": "runnel",
+      "operation": "consume_ack",
+      "message_size_bytes": 1024,
+      "metric": "throughput_messages_per_second",
+      "value": 790.09966474717,
+      "unit": "messages/s",
+      "repetitions": 3,
+      "range": {
+        "min": 783.4884791643948,
+        "median": 790.09966474717,
+        "max": 795.5906420285829,
+        "relative_range_percent": 1.5317261105357884,
+        "standard_deviation": 4.947737443701154,
+        "relative_standard_deviation_percent": 0.6262168767385085
+      },
+      "evidence": {
+        "aggregation": "median",
+        "sample_count": 3,
+        "repetition_count": 3,
+        "sample_coverage_percent": 100.0,
+        "sample_values": [
+          783.4884791643948,
+          790.09966474717,
+          795.5906420285829
+        ]
+      },
+      "previous_value": 380.08292263193766,
+      "delta": 410.0167421152323,
+      "delta_percent": 107.87560232278098,
+      "improved": true
+    },
+    {
+      "timestamp": "2026-08-27T16:46:57.035059+00:00",
+      "timestamp_ms": 1787849217035.059,
+      "run_file": "2026-08-27T164657.035059+0000-6fb0afce2aaf-runnel.json",
+      "profile": "push",
+      "revision": "6fb0afce2aaf4b781cb72d61820a70bdf577f6cd",
+      "run_url": "https://github.com/winrarr/runnel/actions/runs/33094464649",
+      "comparison_mode": "native broker tools; first-pass, not a final apples-to-apples claim",
+      "benchmark_suite": "runnel",
+      "benchmark_series": "runnel",
+      "backend": "runnel",
+      "operation": "consume_ack",
+      "message_size_bytes": 1024,
+      "metric": "latency_p50",
+      "value": 1217.9355,
+      "unit": "\u00b5s",
+      "repetitions": 3,
+      "range": {
+        "min": 1215.53,
+        "median": 1217.9355,
+        "max": 1234.465,
+        "relative_range_percent": 1.554680030264324,
+        "standard_deviation": 8.416551322641952,
+        "relative_standard_deviation_percent": 0.6910506609456701
+      },
+      "evidence": {
+        "aggregation": "median",
+        "sample_count": 3,
+        "repetition_count": 3,
+        "sample_coverage_percent": 100.0,
+        "sample_values": [
+          1234.465,
+          1217.9355,
+          1215.53
+        ]
+      },
+      "previous_value": 1414.7845,
+      "delta": -196.84899999999993,
+      "delta_percent": -13.913709119657442,
+      "improved": true
+    },
+    {
+      "timestamp": "2026-08-27T16:46:57.035059+00:00",
+      "timestamp_ms": 1787849217035.059,
+      "run_file": "2026-08-27T164657.035059+0000-6fb0afce2aaf-runnel.json",
+      "profile": "push",
+      "revision": "6fb0afce2aaf4b781cb72d61820a70bdf577f6cd",
+      "run_url": "https://github.com/winrarr/runnel/actions/runs/33094464649",
+      "comparison_mode": "native broker tools; first-pass, not a final apples-to-apples claim",
+      "benchmark_suite": "runnel",
+      "benchmark_series": "runnel",
+      "backend": "runnel",
+      "operation": "consume_ack",
+      "message_size_bytes": 1024,
+      "metric": "latency_p99",
+      "value": 2562.9312400000017,
+      "unit": "\u00b5s",
+      "repetitions": 3,
+      "range": {
+        "min": 2537.6216600000016,
+        "median": 2562.9312400000017,
+        "max": 2645.33545,
+        "relative_range_percent": 4.202757698641902,
+        "standard_deviation": 45.987062458024226,
+        "relative_standard_deviation_percent": 1.794315108431243
+      },
+      "evidence": {
+        "aggregation": "median",
+        "sample_count": 3,
+        "repetition_count": 3,
+        "sample_coverage_percent": 100.0,
+        "sample_values": [
+          2537.6216600000016,
+          2645.33545,
+          2562.9312400000017
+        ]
+      },
+      "previous_value": 37502.96759,
+      "delta": -34940.036349999995,
+      "delta_percent": -93.16605750238442,
+      "improved": true
+    },
+    {
+      "timestamp": "2026-08-27T16:46:57.035059+00:00",
+      "timestamp_ms": 1787849217035.059,
+      "run_file": "2026-08-27T164657.035059+0000-6fb0afce2aaf-runnel.json",
+      "profile": "push",
+      "revision": "6fb0afce2aaf4b781cb72d61820a70bdf577f6cd",
+      "run_url": "https://github.com/winrarr/runnel/actions/runs/33094464649",
+      "comparison_mode": "native broker tools; first-pass, not a final apples-to-apples claim",
+      "benchmark_suite": "runnel",
+      "benchmark_series": "runnel",
+      "backend": "runnel",
+      "operation": "consume_ack",
+      "message_size_bytes": 1024,
+      "metric": "latency_p999",
+      "value": 5322.687808000017,
+      "unit": "\u00b5s",
+      "repetitions": 3,
+      "range": {
+        "min": 4992.045953000053,
+        "median": 5322.687808000017,
+        "max": 5664.569556000054,
+        "relative_range_percent": 12.63503754605326,
+        "standard_deviation": 274.5693926629036,
+        "relative_standard_deviation_percent": 5.158472609462929
+      },
+      "evidence": {
+        "aggregation": "median",
+        "sample_count": 3,
+        "repetition_count": 3,
+        "sample_coverage_percent": 100.0,
+        "sample_values": [
+          4992.045953000053,
+          5664.569556000054,
+          5322.687808000017
+        ]
+      },
+      "previous_value": 171265.6582020004,
+      "delta": -165942.97039400038,
+      "delta_percent": -96.89214529995141,
+      "improved": true
+    },
+    {
+      "timestamp": "2026-08-27T16:46:57.035059+00:00",
+      "timestamp_ms": 1787849217035.059,
+      "run_file": "2026-08-27T164657.035059+0000-6fb0afce2aaf-runnel.json",
+      "profile": "push",
+      "revision": "6fb0afce2aaf4b781cb72d61820a70bdf577f6cd",
+      "run_url": "https://github.com/winrarr/runnel/actions/runs/33094464649",
+      "comparison_mode": "native broker tools; first-pass, not a final apples-to-apples claim",
+      "benchmark_suite": "runnel",
+      "benchmark_series": "runnel",
+      "backend": "runnel",
+      "operation": "consume_ack",
+      "message_size_bytes": 1024,
+      "metric": "cpu_percent_max",
+      "value": 29.62,
+      "unit": "%",
+      "repetitions": 3,
+      "range": {
+        "min": 29.46,
+        "median": 29.62,
+        "max": 29.94,
+        "relative_range_percent": 1.620526671168131,
+        "standard_deviation": 0.19955506062794373,
+        "relative_standard_deviation_percent": 0.6737172877378249
+      },
+      "evidence": {
+        "aggregation": "median",
+        "sample_count": 3,
+        "repetition_count": 3,
+        "sample_coverage_percent": 100.0,
+        "sample_values": [
+          29.94,
+          29.46,
+          29.62
+        ]
+      },
+      "previous_value": 43.01,
+      "delta": -13.389999999999997,
+      "delta_percent": -31.132294815159263,
+      "improved": true
+    },
+    {
+      "timestamp": "2026-08-27T16:46:57.035059+00:00",
+      "timestamp_ms": 1787849217035.059,
+      "run_file": "2026-08-27T164657.035059+0000-6fb0afce2aaf-runnel.json",
+      "profile": "push",
+      "revision": "6fb0afce2aaf4b781cb72d61820a70bdf577f6cd",
+      "run_url": "https://github.com/winrarr/runnel/actions/runs/33094464649",
+      "comparison_mode": "native broker tools; first-pass, not a final apples-to-apples claim",
+      "benchmark_suite": "runnel",
+      "benchmark_series": "runnel",
+      "backend": "runnel",
+      "operation": "consume_ack",
+      "message_size_bytes": 1024,
+      "metric": "memory_bytes_max",
+      "value": 3735027.712,
+      "unit": "bytes",
+      "repetitions": 3,
+      "range": {
+        "min": 3649044.48,
+        "median": 3735027.712,
+        "max": 3751804.928,
+        "relative_range_percent": 2.7512633352049374,
+        "standard_deviation": 45011.48104778642,
+        "relative_standard_deviation_percent": 1.2051177265210722
+      },
+      "evidence": {
+        "aggregation": "median",
+        "sample_count": 3,
+        "repetition_count": 3,
+        "sample_coverage_percent": 100.0,
+        "sample_values": [
+          3735027.712,
+          3649044.48,
+          3751804.928
+        ]
+      },
+      "previous_value": 3755999.232,
+      "delta": -20971.52000000002,
+      "delta_percent": -0.5583472920156343,
+      "improved": true
+    },
+    {
+      "timestamp": "2026-08-27T16:46:57.035059+00:00",
+      "timestamp_ms": 1787849217035.059,
+      "run_file": "2026-08-27T164657.035059+0000-6fb0afce2aaf-runnel.json",
+      "profile": "push",
+      "revision": "6fb0afce2aaf4b781cb72d61820a70bdf577f6cd",
+      "run_url": "https://github.com/winrarr/runnel/actions/runs/33094464649",
+      "comparison_mode": "native broker tools; first-pass, not a final apples-to-apples claim",
+      "benchmark_suite": "runnel",
+      "benchmark_series": "runnel",
+      "backend": "runnel",
+      "operation": "consume_ack",
+      "message_size_bytes": 1024,
+      "metric": "cpu_efficiency_messages_per_cpu_second",
+      "value": 2832.324412172311,
+      "unit": "messages/CPU-second",
+      "repetitions": 3,
+      "range": {
+        "min": 2750.0844275919267,
+        "median": 2832.324412172311,
+        "max": 2836.654914405357,
+        "relative_range_percent": 3.0565173410708715,
+        "standard_deviation": 39.82826676353614,
+        "relative_standard_deviation_percent": 1.4062042678574738
+      },
+      "evidence": {
+        "aggregation": "median",
+        "sample_count": 3,
+        "repetition_count": 3,
+        "sample_coverage_percent": 100.0,
+        "sample_values": [
+          2750.0844275919267,
+          2836.654914405357,
+          2832.324412172311
+        ]
+      },
+      "previous_value": 1646.4827095441508,
+      "delta": 1185.8417026281602,
+      "delta_percent": 72.02272430522366,
+      "improved": true
+    },
+    {
+      "timestamp": "2026-08-27T16:46:57.035059+00:00",
+      "timestamp_ms": 1787849217035.059,
+      "run_file": "2026-08-27T164657.035059+0000-6fb0afce2aaf-runnel.json",
+      "profile": "push",
+      "revision": "6fb0afce2aaf4b781cb72d61820a70bdf577f6cd",
+      "run_url": "https://github.com/winrarr/runnel/actions/runs/33094464649",
+      "comparison_mode": "native broker tools; first-pass, not a final apples-to-apples claim",
+      "benchmark_suite": "runnel",
+      "benchmark_series": "runnel",
+      "backend": "runnel",
+      "operation": "broker",
+      "message_size_bytes": null,
+      "metric": "cpu_percent_max",
+      "value": 29.62,
+      "unit": "%",
+      "repetitions": 3,
+      "range": {
+        "min": 29.46,
+        "median": 29.62,
+        "max": 29.94,
+        "relative_range_percent": 1.620526671168131,
+        "standard_deviation": 0.19955506062794373,
+        "relative_standard_deviation_percent": 0.6737172877378249
+      },
+      "evidence": {
+        "aggregation": "median",
+        "sample_count": 3,
+        "repetition_count": 3,
+        "sample_coverage_percent": 100.0,
+        "sample_values": [
+          29.94,
+          29.46,
+          29.62
+        ]
+      },
+      "previous_value": 43.01,
+      "delta": -13.389999999999997,
+      "delta_percent": -31.132294815159263,
+      "improved": true
+    },
+    {
+      "timestamp": "2026-08-27T16:46:57.035059+00:00",
+      "timestamp_ms": 1787849217035.059,
+      "run_file": "2026-08-27T164657.035059+0000-6fb0afce2aaf-runnel.json",
+      "profile": "push",
+      "revision": "6fb0afce2aaf4b781cb72d61820a70bdf577f6cd",
+      "run_url": "https://github.com/winrarr/runnel/actions/runs/33094464649",
+      "comparison_mode": "native broker tools; first-pass, not a final apples-to-apples claim",
+      "benchmark_suite": "runnel",
+      "benchmark_series": "runnel",
+      "backend": "runnel",
+      "operation": "broker",
+      "message_size_bytes": null,
+      "metric": "memory_bytes_max",
+      "value": 4165992.448,
+      "unit": "bytes",
+      "repetitions": 3,
+      "range": {
+        "min": 4054843.392,
+        "median": 4165992.448,
+        "max": 4259315.712,
+        "relative_range_percent": 4.9081298766675125,
+        "standard_deviation": 83581.1474619376,
+        "relative_standard_deviation_percent": 2.0062721789633353
+      },
+      "evidence": {
+        "aggregation": "median",
+        "sample_count": 3,
+        "repetition_count": 3,
+        "sample_coverage_percent": 100.0,
+        "sample_values": [
+          4259315.712,
+          4054843.392,
+          4165992.448
+        ]
+      },
+      "previous_value": 4067426.304,
+      "delta": 98566.14399999985,
+      "delta_percent": 2.423304975509148,
+      "improved": false
+    },
+    {
+      "timestamp": "2026-08-27T16:51:28.568802+00:00",
+      "timestamp_ms": 1787849488568.802,
+      "run_file": "2026-08-27T165128.568802+0000-6fb0afce2aaf-cluster.json",
+      "profile": "push",
+      "revision": "6fb0afce2aaf4b781cb72d61820a70bdf577f6cd",
+      "run_url": "https://github.com/winrarr/runnel/actions/runs/33094464649",
+      "comparison_mode": "cluster-baseline",
+      "benchmark_suite": "cluster",
+      "benchmark_series": "cluster",
+      "backend": "runnel-cluster",
+      "operation": "cluster_durable_publish",
+      "message_size_bytes": 100,
+      "metric": "throughput_messages_per_second",
+      "value": 257.7210328523985,
+      "unit": "messages/s",
+      "repetitions": 3,
+      "range": {
+        "min": 253.03711177782708,
+        "median": 257.7210328523985,
+        "max": 263.2373071978559,
+        "relative_range_percent": 3.957843605985646,
+        "standard_deviation": 4.168831249668887,
+        "relative_standard_deviation_percent": 1.617575097976754
+      },
+      "evidence": {
+        "aggregation": "median",
+        "sample_count": 3,
+        "repetition_count": 3,
+        "sample_coverage_percent": 100.0,
+        "sample_values": [
+          253.03711177782708,
+          263.2373071978559,
+          257.7210328523985
+        ]
+      },
+      "previous_value": 169.5394746354162,
+      "delta": 88.18155821698227,
+      "delta_percent": 52.01240502048922,
+      "improved": true
+    },
+    {
+      "timestamp": "2026-08-27T16:51:28.568802+00:00",
+      "timestamp_ms": 1787849488568.802,
+      "run_file": "2026-08-27T165128.568802+0000-6fb0afce2aaf-cluster.json",
+      "profile": "push",
+      "revision": "6fb0afce2aaf4b781cb72d61820a70bdf577f6cd",
+      "run_url": "https://github.com/winrarr/runnel/actions/runs/33094464649",
+      "comparison_mode": "cluster-baseline",
+      "benchmark_suite": "cluster",
+      "benchmark_series": "cluster",
+      "backend": "runnel-cluster",
+      "operation": "cluster_durable_publish",
+      "message_size_bytes": 100,
+      "metric": "latency_p50",
+      "value": 3559.177,
+      "unit": "\u00b5s",
+      "repetitions": 3,
+      "range": {
+        "min": 3489.055,
+        "median": 3559.177,
+        "max": 3708.015,
+        "relative_range_percent": 6.1519840120342435,
+        "standard_deviation": 91.29520294565803,
+        "relative_standard_deviation_percent": 2.565064984002145
+      },
+      "evidence": {
+        "aggregation": "median",
+        "sample_count": 3,
+        "repetition_count": 3,
+        "sample_coverage_percent": 100.0,
+        "sample_values": [
+          3708.015,
+          3559.177,
+          3489.055
+        ]
+      },
+      "previous_value": 3076.8365,
+      "delta": 482.34050000000025,
+      "delta_percent": 15.676507347725504,
+      "improved": false
+    },
+    {
+      "timestamp": "2026-08-27T16:51:28.568802+00:00",
+      "timestamp_ms": 1787849488568.802,
+      "run_file": "2026-08-27T165128.568802+0000-6fb0afce2aaf-cluster.json",
+      "profile": "push",
+      "revision": "6fb0afce2aaf4b781cb72d61820a70bdf577f6cd",
+      "run_url": "https://github.com/winrarr/runnel/actions/runs/33094464649",
+      "comparison_mode": "cluster-baseline",
+      "benchmark_suite": "cluster",
+      "benchmark_series": "cluster",
+      "backend": "runnel-cluster",
+      "operation": "cluster_durable_publish",
+      "message_size_bytes": 100,
+      "metric": "latency_p99",
+      "value": 9532.299389999962,
+      "unit": "\u00b5s",
+      "repetitions": 3,
+      "range": {
+        "min": 8463.619639999997,
+        "median": 9532.299389999962,
+        "max": 9609.682719999997,
+        "relative_range_percent": 12.0229446549098,
+        "standard_deviation": 522.9749485354562,
+        "relative_standard_deviation_percent": 5.486346233355752
+      },
+      "evidence": {
+        "aggregation": "median",
+        "sample_count": 3,
+        "repetition_count": 3,
+        "sample_coverage_percent": 100.0,
+        "sample_values": [
+          9609.682719999997,
+          8463.619639999997,
+          9532.299389999962
+        ]
+      },
+      "previous_value": 85973.49465999982,
+      "delta": -76441.19526999987,
+      "delta_percent": -88.9125137605521,
+      "improved": true
+    },
+    {
+      "timestamp": "2026-08-27T16:51:28.568802+00:00",
+      "timestamp_ms": 1787849488568.802,
+      "run_file": "2026-08-27T165128.568802+0000-6fb0afce2aaf-cluster.json",
+      "profile": "push",
+      "revision": "6fb0afce2aaf4b781cb72d61820a70bdf577f6cd",
+      "run_url": "https://github.com/winrarr/runnel/actions/runs/33094464649",
+      "comparison_mode": "cluster-baseline",
+      "benchmark_suite": "cluster",
+      "benchmark_series": "cluster",
+      "backend": "runnel-cluster",
+      "operation": "cluster_durable_publish",
+      "message_size_bytes": 100,
+      "metric": "latency_p999",
+      "value": 12360.449497000049,
+      "unit": "\u00b5s",
+      "repetitions": 3,
+      "range": {
+        "min": 9085.961162000007,
+        "median": 12360.449497000049,
+        "max": 18413.142414000093,
+        "relative_range_percent": 75.45988723358197,
+        "standard_deviation": 3863.701097123438,
+        "relative_standard_deviation_percent": 31.258580831232557
+      },
+      "evidence": {
+        "aggregation": "median",
+        "sample_count": 3,
+        "repetition_count": 3,
+        "sample_coverage_percent": 100.0,
+        "sample_values": [
+          12360.449497000049,
+          9085.961162000007,
+          18413.142414000093
+        ]
+      },
+      "previous_value": 109105.15039900008,
+      "delta": -96744.70090200003,
+      "delta_percent": -88.67106690032726,
+      "improved": true
+    },
+    {
+      "timestamp": "2026-08-27T16:51:28.568802+00:00",
+      "timestamp_ms": 1787849488568.802,
+      "run_file": "2026-08-27T165128.568802+0000-6fb0afce2aaf-cluster.json",
+      "profile": "push",
+      "revision": "6fb0afce2aaf4b781cb72d61820a70bdf577f6cd",
+      "run_url": "https://github.com/winrarr/runnel/actions/runs/33094464649",
+      "comparison_mode": "cluster-baseline",
+      "benchmark_suite": "cluster",
+      "benchmark_series": "cluster",
+      "backend": "runnel-cluster",
+      "operation": "cluster_durable_publish",
+      "message_size_bytes": 100,
+      "metric": "memory_bytes_max",
+      "value": 37883904.0,
+      "unit": "bytes",
+      "repetitions": 3,
+      "range": {
+        "min": 37421056.0,
+        "median": 37883904.0,
+        "max": 39051264.0,
+        "relative_range_percent": 4.303167910044329,
+        "standard_deviation": 685932.922211948,
+        "relative_standard_deviation_percent": 1.810618362384056
+      },
+      "evidence": {
+        "aggregation": "median",
+        "sample_count": 3,
+        "repetition_count": 3,
+        "sample_coverage_percent": 100.0,
+        "sample_values": [
+          37421056.0,
+          37883904.0,
+          39051264.0
+        ]
+      },
+      "previous_value": 38318080.0,
+      "delta": -434176.0,
+      "delta_percent": -1.133083912346339,
+      "improved": true
+    },
+    {
+      "timestamp": "2026-08-27T16:51:28.568802+00:00",
+      "timestamp_ms": 1787849488568.802,
+      "run_file": "2026-08-27T165128.568802+0000-6fb0afce2aaf-cluster.json",
+      "profile": "push",
+      "revision": "6fb0afce2aaf4b781cb72d61820a70bdf577f6cd",
+      "run_url": "https://github.com/winrarr/runnel/actions/runs/33094464649",
+      "comparison_mode": "cluster-baseline",
+      "benchmark_suite": "cluster",
+      "benchmark_series": "cluster",
+      "backend": "runnel-cluster",
+      "operation": "cluster_durable_publish",
+      "message_size_bytes": 100,
+      "metric": "cpu_efficiency_messages_per_cpu_second",
+      "value": 645.1612903225806,
+      "unit": "messages/CPU-second",
+      "repetitions": 3,
+      "range": {
+        "min": 625.0,
+        "median": 645.1612903225806,
+        "max": 666.6666666666665,
+        "relative_range_percent": 6.458333333333311,
+        "standard_deviation": 17.013295292157217,
+        "relative_standard_deviation_percent": 2.6370607702843687
+      },
+      "evidence": {
+        "aggregation": "median",
+        "sample_count": 3,
+        "repetition_count": 3,
+        "sample_coverage_percent": 100.0,
+        "sample_values": [
+          645.1612903225806,
+          666.6666666666665,
+          625.0
+        ]
+      },
+      "previous_value": 571.4285714285714,
+      "delta": 73.73271889400917,
+      "delta_percent": 12.903225806451605,
+      "improved": true
+    },
+    {
+      "timestamp": "2026-08-27T16:51:28.568802+00:00",
+      "timestamp_ms": 1787849488568.802,
+      "run_file": "2026-08-27T165128.568802+0000-6fb0afce2aaf-cluster.json",
+      "profile": "push",
+      "revision": "6fb0afce2aaf4b781cb72d61820a70bdf577f6cd",
+      "run_url": "https://github.com/winrarr/runnel/actions/runs/33094464649",
+      "comparison_mode": "cluster-baseline",
+      "benchmark_suite": "cluster",
+      "benchmark_series": "cluster",
+      "backend": "runnel-cluster",
+      "operation": "cluster_consume_ack",
+      "message_size_bytes": 100,
+      "metric": "throughput_messages_per_second",
+      "value": 135.30794861862503,
+      "unit": "messages/s",
+      "repetitions": 3,
+      "range": {
+        "min": 132.87034299139046,
+        "median": 135.30794861862503,
+        "max": 137.5650195046219,
+        "relative_range_percent": 3.469623596514425,
+        "standard_deviation": 1.9170659799178966,
+        "relative_standard_deviation_percent": 1.4168169715744356
+      },
+      "evidence": {
+        "aggregation": "median",
+        "sample_count": 3,
+        "repetition_count": 3,
+        "sample_coverage_percent": 100.0,
+        "sample_values": [
+          132.87034299139046,
+          137.5650195046219,
+          135.30794861862503
+        ]
+      },
+      "previous_value": 111.41305435314378,
+      "delta": 23.894894265481256,
+      "delta_percent": 21.447122515591467,
+      "improved": true
+    },
+    {
+      "timestamp": "2026-08-27T16:51:28.568802+00:00",
+      "timestamp_ms": 1787849488568.802,
+      "run_file": "2026-08-27T165128.568802+0000-6fb0afce2aaf-cluster.json",
+      "profile": "push",
+      "revision": "6fb0afce2aaf4b781cb72d61820a70bdf577f6cd",
+      "run_url": "https://github.com/winrarr/runnel/actions/runs/33094464649",
+      "comparison_mode": "cluster-baseline",
+      "benchmark_suite": "cluster",
+      "benchmark_series": "cluster",
+      "backend": "runnel-cluster",
+      "operation": "cluster_consume_ack",
+      "message_size_bytes": 100,
+      "metric": "latency_p50",
+      "value": 6997.1245,
+      "unit": "\u00b5s",
+      "repetitions": 3,
+      "range": {
+        "min": 6945.0645,
+        "median": 6997.1245,
+        "max": 7030.9835,
+        "relative_range_percent": 1.2279186971733869,
+        "standard_deviation": 35.33765703419882,
+        "relative_standard_deviation_percent": 0.5050311314912121
+      },
+      "evidence": {
+        "aggregation": "median",
+        "sample_count": 3,
+        "repetition_count": 3,
+        "sample_coverage_percent": 100.0,
+        "sample_values": [
+          6997.1245,
+          6945.0645,
+          7030.9835
+        ]
+      },
+      "previous_value": 5941.154,
+      "delta": 1055.9704999999994,
+      "delta_percent": 17.773828114874643,
+      "improved": false
+    },
+    {
+      "timestamp": "2026-08-27T16:51:28.568802+00:00",
+      "timestamp_ms": 1787849488568.802,
+      "run_file": "2026-08-27T165128.568802+0000-6fb0afce2aaf-cluster.json",
+      "profile": "push",
+      "revision": "6fb0afce2aaf4b781cb72d61820a70bdf577f6cd",
+      "run_url": "https://github.com/winrarr/runnel/actions/runs/33094464649",
+      "comparison_mode": "cluster-baseline",
+      "benchmark_suite": "cluster",
+      "benchmark_series": "cluster",
+      "backend": "runnel-cluster",
+      "operation": "cluster_consume_ack",
+      "message_size_bytes": 100,
+      "metric": "latency_p99",
+      "value": 16014.07965999999,
+      "unit": "\u00b5s",
+      "repetitions": 3,
+      "range": {
+        "min": 11432.86353999999,
+        "median": 16014.07965999999,
+        "max": 16471.545499999946,
+        "relative_range_percent": 31.46407453302227,
+        "standard_deviation": 2275.1100590458313,
+        "relative_standard_deviation_percent": 14.206936067194714
+      },
+      "evidence": {
+        "aggregation": "median",
+        "sample_count": 3,
+        "repetition_count": 3,
+        "sample_coverage_percent": 100.0,
+        "sample_values": [
+          16471.545499999946,
+          11432.86353999999,
+          16014.07965999999
+        ]
+      },
+      "previous_value": 30200.400569998135,
+      "delta": -14186.320909998145,
+      "delta_percent": -46.97394949155478,
+      "improved": true
+    },
+    {
+      "timestamp": "2026-08-27T16:51:28.568802+00:00",
+      "timestamp_ms": 1787849488568.802,
+      "run_file": "2026-08-27T165128.568802+0000-6fb0afce2aaf-cluster.json",
+      "profile": "push",
+      "revision": "6fb0afce2aaf4b781cb72d61820a70bdf577f6cd",
+      "run_url": "https://github.com/winrarr/runnel/actions/runs/33094464649",
+      "comparison_mode": "cluster-baseline",
+      "benchmark_suite": "cluster",
+      "benchmark_series": "cluster",
+      "backend": "runnel-cluster",
+      "operation": "cluster_consume_ack",
+      "message_size_bytes": 100,
+      "metric": "latency_p999",
+      "value": 17992.71052600002,
+      "unit": "\u00b5s",
+      "repetitions": 3,
+      "range": {
+        "min": 12859.141960000006,
+        "median": 17992.71052600002,
+        "max": 23185.779617000015,
+        "relative_range_percent": 57.39345187640127,
+        "standard_deviation": 4215.8554964785235,
+        "relative_standard_deviation_percent": 23.43090825802195
+      },
+      "evidence": {
+        "aggregation": "median",
+        "sample_count": 3,
+        "repetition_count": 3,
+        "sample_coverage_percent": 100.0,
+        "sample_values": [
+          23185.779617000015,
+          12859.141960000006,
+          17992.71052600002
+        ]
+      },
+      "previous_value": 264148.4022960006,
+      "delta": -246155.69177000062,
+      "delta_percent": -93.18840834560959,
+      "improved": true
+    },
+    {
+      "timestamp": "2026-08-27T16:51:28.568802+00:00",
+      "timestamp_ms": 1787849488568.802,
+      "run_file": "2026-08-27T165128.568802+0000-6fb0afce2aaf-cluster.json",
+      "profile": "push",
+      "revision": "6fb0afce2aaf4b781cb72d61820a70bdf577f6cd",
+      "run_url": "https://github.com/winrarr/runnel/actions/runs/33094464649",
+      "comparison_mode": "cluster-baseline",
+      "benchmark_suite": "cluster",
+      "benchmark_series": "cluster",
+      "backend": "runnel-cluster",
+      "operation": "cluster_consume_ack",
+      "message_size_bytes": 100,
+      "metric": "memory_bytes_max",
+      "value": 41943040.0,
+      "unit": "bytes",
+      "repetitions": 3,
+      "range": {
+        "min": 41861120.0,
+        "median": 41943040.0,
+        "max": 42893312.0,
+        "relative_range_percent": 2.4609375,
+        "standard_deviation": 468466.539211595,
+        "relative_standard_deviation_percent": 1.1169112663545488
+      },
+      "evidence": {
+        "aggregation": "median",
+        "sample_count": 3,
+        "repetition_count": 3,
+        "sample_coverage_percent": 100.0,
+        "sample_values": [
+          41861120.0,
+          41943040.0,
+          42893312.0
+        ]
+      },
+      "previous_value": 43118592.0,
+      "delta": -1175552.0,
+      "delta_percent": -2.7263227890187136,
+      "improved": true
+    },
+    {
+      "timestamp": "2026-08-27T16:51:28.568802+00:00",
+      "timestamp_ms": 1787849488568.802,
+      "run_file": "2026-08-27T165128.568802+0000-6fb0afce2aaf-cluster.json",
+      "profile": "push",
+      "revision": "6fb0afce2aaf4b781cb72d61820a70bdf577f6cd",
+      "run_url": "https://github.com/winrarr/runnel/actions/runs/33094464649",
+      "comparison_mode": "cluster-baseline",
+      "benchmark_suite": "cluster",
+      "benchmark_series": "cluster",
+      "backend": "runnel-cluster",
+      "operation": "cluster_consume_ack",
+      "message_size_bytes": 100,
+      "metric": "cpu_efficiency_messages_per_cpu_second",
+      "value": 350.8771929824561,
+      "unit": "messages/CPU-second",
+      "repetitions": 3,
+      "range": {
+        "min": 338.9830508474576,
+        "median": 350.8771929824561,
+        "max": 350.8771929824561,
+        "relative_range_percent": 3.3898305084745735,
+        "standard_deviation": 5.606952373369388,
+        "relative_standard_deviation_percent": 1.5979814264102756
+      },
+      "evidence": {
+        "aggregation": "median",
+        "sample_count": 3,
+        "repetition_count": 3,
+        "sample_coverage_percent": 100.0,
+        "sample_values": [
+          350.8771929824561,
+          350.8771929824561,
+          338.9830508474576
+        ]
+      },
+      "previous_value": 312.50000000000006,
+      "delta": 38.37719298245605,
+      "delta_percent": 12.280701754385934,
+      "improved": true
+    },
+    {
+      "timestamp": "2026-08-27T16:51:28.568802+00:00",
+      "timestamp_ms": 1787849488568.802,
+      "run_file": "2026-08-27T165128.568802+0000-6fb0afce2aaf-cluster.json",
+      "profile": "push",
+      "revision": "6fb0afce2aaf4b781cb72d61820a70bdf577f6cd",
+      "run_url": "https://github.com/winrarr/runnel/actions/runs/33094464649",
+      "comparison_mode": "cluster-baseline",
+      "benchmark_suite": "cluster",
+      "benchmark_series": "cluster",
+      "backend": "runnel-cluster",
+      "operation": "cluster_slow_consumer",
+      "message_size_bytes": 100,
+      "metric": "throughput_messages_per_second",
+      "value": 57.013987498400994,
+      "unit": "messages/s",
+      "repetitions": 3,
+      "range": {
+        "min": 56.88896601111097,
+        "median": 57.013987498400994,
+        "max": 57.2202285702771,
+        "relative_range_percent": 0.5810198053160515,
+        "standard_deviation": 0.13658559998855674,
+        "relative_standard_deviation_percent": 0.23956507162805865
+      },
+      "evidence": {
+        "aggregation": "median",
+        "sample_count": 3,
+        "repetition_count": 3,
+        "sample_coverage_percent": 100.0,
+        "sample_values": [
+          57.013987498400994,
+          57.2202285702771,
+          56.88896601111097
+        ]
+      },
+      "previous_value": 37.72503675499874,
+      "delta": 19.288950743402253,
+      "delta_percent": 51.13036964992852,
+      "improved": true
+    },
+    {
+      "timestamp": "2026-08-27T16:51:28.568802+00:00",
+      "timestamp_ms": 1787849488568.802,
+      "run_file": "2026-08-27T165128.568802+0000-6fb0afce2aaf-cluster.json",
+      "profile": "push",
+      "revision": "6fb0afce2aaf4b781cb72d61820a70bdf577f6cd",
+      "run_url": "https://github.com/winrarr/runnel/actions/runs/33094464649",
+      "comparison_mode": "cluster-baseline",
+      "benchmark_suite": "cluster",
+      "benchmark_series": "cluster",
+      "backend": "runnel-cluster",
+      "operation": "cluster_slow_consumer",
+      "message_size_bytes": 100,
+      "metric": "latency_p50",
+      "value": 7251.351,
+      "unit": "\u00b5s",
+      "repetitions": 3,
+      "range": {
+        "min": 7100.2995,
+        "median": 7251.351,
+        "max": 7256.423,
+        "relative_range_percent": 2.1530263808771593,
+        "standard_deviation": 72.43144505016816,
+        "relative_standard_deviation_percent": 0.9988682805475583
+      },
+      "evidence": {
+        "aggregation": "median",
+        "sample_count": 3,
+        "repetition_count": 3,
+        "sample_coverage_percent": 100.0,
+        "sample_values": [
+          7251.351,
+          7100.2995,
+          7256.423
+        ]
+      },
+      "previous_value": 6223.801,
+      "delta": 1027.5499999999993,
+      "delta_percent": 16.510007309038308,
+      "improved": false
+    },
+    {
+      "timestamp": "2026-08-27T16:51:28.568802+00:00",
+      "timestamp_ms": 1787849488568.802,
+      "run_file": "2026-08-27T165128.568802+0000-6fb0afce2aaf-cluster.json",
+      "profile": "push",
+      "revision": "6fb0afce2aaf4b781cb72d61820a70bdf577f6cd",
+      "run_url": "https://github.com/winrarr/runnel/actions/runs/33094464649",
+      "comparison_mode": "cluster-baseline",
+      "benchmark_suite": "cluster",
+      "benchmark_series": "cluster",
+      "backend": "runnel-cluster",
+      "operation": "cluster_slow_consumer",
+      "message_size_bytes": 100,
+      "metric": "latency_p99",
+      "value": 14517.687799999967,
+      "unit": "\u00b5s",
+      "repetitions": 3,
+      "range": {
+        "min": 14002.239949999985,
+        "median": 14517.687799999967,
+        "max": 14585.260169999992,
+        "relative_range_percent": 4.015930277822953,
+        "standard_deviation": 260.3768824407083,
+        "relative_standard_deviation_percent": 1.793514821559318
+      },
+      "evidence": {
+        "aggregation": "median",
+        "sample_count": 3,
+        "repetition_count": 3,
+        "sample_coverage_percent": 100.0,
+        "sample_values": [
+          14002.239949999985,
+          14585.260169999992,
+          14517.687799999967
+        ]
+      },
+      "previous_value": 193735.64674999617,
+      "delta": -179217.95894999622,
+      "delta_percent": -92.50644471291639,
+      "improved": true
+    },
+    {
+      "timestamp": "2026-08-27T16:51:28.568802+00:00",
+      "timestamp_ms": 1787849488568.802,
+      "run_file": "2026-08-27T165128.568802+0000-6fb0afce2aaf-cluster.json",
+      "profile": "push",
+      "revision": "6fb0afce2aaf4b781cb72d61820a70bdf577f6cd",
+      "run_url": "https://github.com/winrarr/runnel/actions/runs/33094464649",
+      "comparison_mode": "cluster-baseline",
+      "benchmark_suite": "cluster",
+      "benchmark_series": "cluster",
+      "backend": "runnel-cluster",
+      "operation": "cluster_slow_consumer",
+      "message_size_bytes": 100,
+      "metric": "latency_p999",
+      "value": 20392.4311680001,
+      "unit": "\u00b5s",
+      "repetitions": 3,
+      "range": {
+        "min": 16452.589751000014,
+        "median": 20392.4311680001,
+        "max": 20424.28077200005,
+        "relative_range_percent": 19.476299752000298,
+        "standard_deviation": 1864.8114100262408,
+        "relative_standard_deviation_percent": 9.144625251708643
+      },
+      "evidence": {
+        "aggregation": "median",
+        "sample_count": 3,
+        "repetition_count": 3,
+        "sample_coverage_percent": 100.0,
+        "sample_values": [
+          16452.589751000014,
+          20392.4311680001,
+          20424.28077200005
+        ]
+      },
+      "previous_value": 607906.815086,
+      "delta": -587514.3839179999,
+      "delta_percent": -96.64546758451536,
+      "improved": true
+    },
+    {
+      "timestamp": "2026-08-27T16:51:28.568802+00:00",
+      "timestamp_ms": 1787849488568.802,
+      "run_file": "2026-08-27T165128.568802+0000-6fb0afce2aaf-cluster.json",
+      "profile": "push",
+      "revision": "6fb0afce2aaf4b781cb72d61820a70bdf577f6cd",
+      "run_url": "https://github.com/winrarr/runnel/actions/runs/33094464649",
+      "comparison_mode": "cluster-baseline",
+      "benchmark_suite": "cluster",
+      "benchmark_series": "cluster",
+      "backend": "runnel-cluster",
+      "operation": "cluster_slow_consumer",
+      "message_size_bytes": 100,
+      "metric": "memory_bytes_max",
+      "value": 44687360.0,
+      "unit": "bytes",
+      "repetitions": 3,
+      "range": {
+        "min": 44503040.0,
+        "median": 44687360.0,
+        "max": 45211648.0,
+        "relative_range_percent": 1.5857011915673693,
+        "standard_deviation": 300180.883803231,
+        "relative_standard_deviation_percent": 0.6717355507311933
+      },
+      "evidence": {
+        "aggregation": "median",
+        "sample_count": 3,
+        "repetition_count": 3,
+        "sample_coverage_percent": 100.0,
+        "sample_values": [
+          44503040.0,
+          44687360.0,
+          45211648.0
+        ]
+      },
+      "previous_value": 45821952.0,
+      "delta": -1134592.0,
+      "delta_percent": -2.4760883167962815,
+      "improved": true
+    },
+    {
+      "timestamp": "2026-08-27T16:51:28.568802+00:00",
+      "timestamp_ms": 1787849488568.802,
+      "run_file": "2026-08-27T165128.568802+0000-6fb0afce2aaf-cluster.json",
+      "profile": "push",
+      "revision": "6fb0afce2aaf4b781cb72d61820a70bdf577f6cd",
+      "run_url": "https://github.com/winrarr/runnel/actions/runs/33094464649",
+      "comparison_mode": "cluster-baseline",
+      "benchmark_suite": "cluster",
+      "benchmark_series": "cluster",
+      "backend": "runnel-cluster",
+      "operation": "cluster_slow_consumer",
+      "message_size_bytes": 100,
+      "metric": "cpu_efficiency_messages_per_cpu_second",
+      "value": 333.33333333333314,
+      "unit": "messages/CPU-second",
+      "repetitions": 3,
+      "range": {
+        "min": 322.58064516129025,
+        "median": 333.33333333333314,
+        "max": 333.33333333333354,
+        "relative_range_percent": 3.22580645161299,
+        "standard_deviation": 5.068865814957369,
+        "relative_standard_deviation_percent": 1.5206597444872116
+      },
+      "evidence": {
+        "aggregation": "median",
+        "sample_count": 3,
+        "repetition_count": 3,
+        "sample_coverage_percent": 100.0,
+        "sample_values": [
+          333.33333333333354,
+          333.33333333333314,
+          322.58064516129025
+        ]
+      },
+      "previous_value": 277.77777777777777,
+      "delta": 55.55555555555537,
+      "delta_percent": 19.999999999999936,
+      "improved": true
+    },
+    {
+      "timestamp": "2026-08-27T16:51:28.568802+00:00",
+      "timestamp_ms": 1787849488568.802,
+      "run_file": "2026-08-27T165128.568802+0000-6fb0afce2aaf-cluster.json",
+      "profile": "push",
+      "revision": "6fb0afce2aaf4b781cb72d61820a70bdf577f6cd",
+      "run_url": "https://github.com/winrarr/runnel/actions/runs/33094464649",
+      "comparison_mode": "cluster-baseline",
+      "benchmark_suite": "cluster",
+      "benchmark_series": "cluster",
+      "backend": "runnel-cluster",
+      "operation": "cluster_grouped_consume_ack",
+      "message_size_bytes": 100,
+      "metric": "throughput_messages_per_second",
+      "value": 134.06537991184257,
+      "unit": "messages/s",
+      "repetitions": 3,
+      "range": {
+        "min": 133.43317568555,
+        "median": 134.06537991184257,
+        "max": 135.33542699494484,
+        "relative_range_percent": 1.418898235059421,
+        "standard_deviation": 0.791009328581961,
+        "relative_standard_deviation_percent": 0.590017593730839
+      },
+      "evidence": {
+        "aggregation": "median",
+        "sample_count": 3,
+        "repetition_count": 3,
+        "sample_coverage_percent": 100.0,
+        "sample_values": [
+          134.06537991184257,
+          133.43317568555,
+          135.33542699494484
+        ]
+      },
+      "previous_value": 93.66889432903673,
+      "delta": 40.39648558280584,
+      "delta_percent": 43.12689486960582,
+      "improved": true
+    },
+    {
+      "timestamp": "2026-08-27T16:51:28.568802+00:00",
+      "timestamp_ms": 1787849488568.802,
+      "run_file": "2026-08-27T165128.568802+0000-6fb0afce2aaf-cluster.json",
+      "profile": "push",
+      "revision": "6fb0afce2aaf4b781cb72d61820a70bdf577f6cd",
+      "run_url": "https://github.com/winrarr/runnel/actions/runs/33094464649",
+      "comparison_mode": "cluster-baseline",
+      "benchmark_suite": "cluster",
+      "benchmark_series": "cluster",
+      "backend": "runnel-cluster",
+      "operation": "cluster_grouped_consume_ack",
+      "message_size_bytes": 100,
+      "metric": "latency_p50",
+      "value": 7064.9955,
+      "unit": "\u00b5s",
+      "repetitions": 3,
+      "range": {
+        "min": 6996.8665,
+        "median": 7064.9955,
+        "max": 7125.469,
+        "relative_range_percent": 1.8202771679047773,
+        "standard_deviation": 52.53274941458474,
+        "relative_standard_deviation_percent": 0.7435638057318613
+      },
+      "evidence": {
+        "aggregation": "median",
+        "sample_count": 3,
+        "repetition_count": 3,
+        "sample_coverage_percent": 100.0,
+        "sample_values": [
+          7125.469,
+          7064.9955,
+          6996.8665
+        ]
+      },
+      "previous_value": 6100.2425,
+      "delta": 964.7529999999997,
+      "delta_percent": 15.814994239983077,
+      "improved": false
+    },
+    {
+      "timestamp": "2026-08-27T16:51:28.568802+00:00",
+      "timestamp_ms": 1787849488568.802,
+      "run_file": "2026-08-27T165128.568802+0000-6fb0afce2aaf-cluster.json",
+      "profile": "push",
+      "revision": "6fb0afce2aaf4b781cb72d61820a70bdf577f6cd",
+      "run_url": "https://github.com/winrarr/runnel/actions/runs/33094464649",
+      "comparison_mode": "cluster-baseline",
+      "benchmark_suite": "cluster",
+      "benchmark_series": "cluster",
+      "backend": "runnel-cluster",
+      "operation": "cluster_grouped_consume_ack",
+      "message_size_bytes": 100,
+      "metric": "latency_p99",
+      "value": 12907.33451,
+      "unit": "\u00b5s",
+      "repetitions": 3,
+      "range": {
+        "min": 12261.912289999995,
+        "median": 12907.33451,
+        "max": 13320.723989999999,
+        "relative_range_percent": 8.203178581756642,
+        "standard_deviation": 435.7041453276527,
+        "relative_standard_deviation_percent": 3.3756322421960125
+      },
+      "evidence": {
+        "aggregation": "median",
+        "sample_count": 3,
+        "repetition_count": 3,
+        "sample_coverage_percent": 100.0,
+        "sample_values": [
+          12261.912289999995,
+          13320.723989999999,
+          12907.33451
+        ]
+      },
+      "previous_value": 107397.90498999936,
+      "delta": -94490.57047999935,
+      "delta_percent": -87.98176322787498,
+      "improved": true
+    },
+    {
+      "timestamp": "2026-08-27T16:51:28.568802+00:00",
+      "timestamp_ms": 1787849488568.802,
+      "run_file": "2026-08-27T165128.568802+0000-6fb0afce2aaf-cluster.json",
+      "profile": "push",
+      "revision": "6fb0afce2aaf4b781cb72d61820a70bdf577f6cd",
+      "run_url": "https://github.com/winrarr/runnel/actions/runs/33094464649",
+      "comparison_mode": "cluster-baseline",
+      "benchmark_suite": "cluster",
+      "benchmark_series": "cluster",
+      "backend": "runnel-cluster",
+      "operation": "cluster_grouped_consume_ack",
+      "message_size_bytes": 100,
+      "metric": "latency_p999",
+      "value": 13079.187206000002,
+      "unit": "\u00b5s",
+      "repetitions": 3,
+      "range": {
+        "min": 13017.769469000008,
+        "median": 13079.187206000002,
+        "max": 14282.966766000018,
+        "relative_range_percent": 9.673363314347299,
+        "standard_deviation": 582.4833395641422,
+        "relative_standard_deviation_percent": 4.453513283279035
+      },
+      "evidence": {
+        "aggregation": "median",
+        "sample_count": 3,
+        "repetition_count": 3,
+        "sample_coverage_percent": 100.0,
+        "sample_values": [
+          13017.769469000008,
+          14282.966766000018,
+          13079.187206000002
+        ]
+      },
+      "previous_value": 198145.1610310004,
+      "delta": -185065.9738250004,
+      "delta_percent": -93.39918919142632,
+      "improved": true
+    },
+    {
+      "timestamp": "2026-08-27T16:51:28.568802+00:00",
+      "timestamp_ms": 1787849488568.802,
+      "run_file": "2026-08-27T165128.568802+0000-6fb0afce2aaf-cluster.json",
+      "profile": "push",
+      "revision": "6fb0afce2aaf4b781cb72d61820a70bdf577f6cd",
+      "run_url": "https://github.com/winrarr/runnel/actions/runs/33094464649",
+      "comparison_mode": "cluster-baseline",
+      "benchmark_suite": "cluster",
+      "benchmark_series": "cluster",
+      "backend": "runnel-cluster",
+      "operation": "cluster_grouped_consume_ack",
+      "message_size_bytes": 100,
+      "metric": "memory_bytes_max",
+      "value": 47190016.0,
+      "unit": "bytes",
+      "repetitions": 3,
+      "range": {
+        "min": 47173632.0,
+        "median": 47190016.0,
+        "max": 47419392.0,
+        "relative_range_percent": 0.5207881260307264,
+        "standard_deviation": 112190.19685436969,
+        "relative_standard_deviation_percent": 0.237741383377301
+      },
+      "evidence": {
+        "aggregation": "median",
+        "sample_count": 3,
+        "repetition_count": 3,
+        "sample_coverage_percent": 100.0,
+        "sample_values": [
+          47419392.0,
+          47190016.0,
+          47173632.0
+        ]
+      },
+      "previous_value": 48791552.0,
+      "delta": -1601536.0,
+      "delta_percent": -3.282404298186702,
+      "improved": true
+    },
+    {
+      "timestamp": "2026-08-27T16:51:28.568802+00:00",
+      "timestamp_ms": 1787849488568.802,
+      "run_file": "2026-08-27T165128.568802+0000-6fb0afce2aaf-cluster.json",
+      "profile": "push",
+      "revision": "6fb0afce2aaf4b781cb72d61820a70bdf577f6cd",
+      "run_url": "https://github.com/winrarr/runnel/actions/runs/33094464649",
+      "comparison_mode": "cluster-baseline",
+      "benchmark_suite": "cluster",
+      "benchmark_series": "cluster",
+      "backend": "runnel-cluster",
+      "operation": "cluster_grouped_consume_ack",
+      "message_size_bytes": 100,
+      "metric": "cpu_efficiency_messages_per_cpu_second",
+      "value": 333.33333333333354,
+      "unit": "messages/CPU-second",
+      "repetitions": 3,
+      "range": {
+        "min": 333.33333333333303,
+        "median": 333.33333333333354,
+        "max": 338.9830508474577,
+        "relative_range_percent": 1.6949152542374053,
+        "standard_deviation": 2.663302377350527,
+        "relative_standard_deviation_percent": 0.7989907132051576
+      },
+      "evidence": {
+        "aggregation": "median",
+        "sample_count": 3,
+        "repetition_count": 3,
+        "sample_coverage_percent": 100.0,
+        "sample_values": [
+          333.33333333333354,
+          333.33333333333303,
+          338.9830508474577
+        ]
+      },
+      "previous_value": 303.03030303030295,
+      "delta": 30.303030303030596,
+      "delta_percent": 10.0000000000001,
+      "improved": true
+    },
+    {
+      "timestamp": "2026-08-27T16:51:28.568802+00:00",
+      "timestamp_ms": 1787849488568.802,
+      "run_file": "2026-08-27T165128.568802+0000-6fb0afce2aaf-cluster.json",
+      "profile": "push",
+      "revision": "6fb0afce2aaf4b781cb72d61820a70bdf577f6cd",
+      "run_url": "https://github.com/winrarr/runnel/actions/runs/33094464649",
+      "comparison_mode": "cluster-baseline",
+      "benchmark_suite": "cluster",
+      "benchmark_series": "cluster",
+      "backend": "runnel-cluster",
+      "operation": "cluster_parallel_grouped_consume_ack",
+      "message_size_bytes": 100,
+      "metric": "throughput_messages_per_second",
+      "value": 160.84311399735034,
+      "unit": "messages/s",
+      "repetitions": 3,
+      "range": {
+        "min": 160.28076227257756,
+        "median": 160.84311399735034,
+        "max": 161.3228858653553,
+        "relative_range_percent": 0.6479130917565392,
+        "standard_deviation": 0.4258901906344504,
+        "relative_standard_deviation_percent": 0.26478608878553933
+      },
+      "evidence": {
+        "aggregation": "median",
+        "sample_count": 3,
+        "repetition_count": 3,
+        "sample_coverage_percent": 100.0,
+        "sample_values": [
+          161.3228858653553,
+          160.28076227257756,
+          160.84311399735034
+        ]
+      },
+      "previous_value": 129.8997081180188,
+      "delta": 30.94340587933155,
+      "delta_percent": 23.820997235204175,
+      "improved": true
+    },
+    {
+      "timestamp": "2026-08-27T16:51:28.568802+00:00",
+      "timestamp_ms": 1787849488568.802,
+      "run_file": "2026-08-27T165128.568802+0000-6fb0afce2aaf-cluster.json",
+      "profile": "push",
+      "revision": "6fb0afce2aaf4b781cb72d61820a70bdf577f6cd",
+      "run_url": "https://github.com/winrarr/runnel/actions/runs/33094464649",
+      "comparison_mode": "cluster-baseline",
+      "benchmark_suite": "cluster",
+      "benchmark_series": "cluster",
+      "backend": "runnel-cluster",
+      "operation": "cluster_parallel_grouped_consume_ack",
+      "message_size_bytes": 100,
+      "metric": "latency_p50",
+      "value": 11833.5385,
+      "unit": "\u00b5s",
+      "repetitions": 3,
+      "range": {
+        "min": 11795.318,
+        "median": 11833.5385,
+        "max": 11953.7625,
+        "relative_range_percent": 1.3389443909782472,
+        "standard_deviation": 67.51072044621307,
+        "relative_standard_deviation_percent": 0.5705032391301476
+      },
+      "evidence": {
+        "aggregation": "median",
+        "sample_count": 3,
+        "repetition_count": 3,
+        "sample_coverage_percent": 100.0,
+        "sample_values": [
+          11795.318,
+          11953.7625,
+          11833.5385
+        ]
+      },
+      "previous_value": 10674.1245,
+      "delta": 1159.4140000000007,
+      "delta_percent": 10.861911906686124,
+      "improved": false
+    },
+    {
+      "timestamp": "2026-08-27T16:51:28.568802+00:00",
+      "timestamp_ms": 1787849488568.802,
+      "run_file": "2026-08-27T165128.568802+0000-6fb0afce2aaf-cluster.json",
+      "profile": "push",
+      "revision": "6fb0afce2aaf4b781cb72d61820a70bdf577f6cd",
+      "run_url": "https://github.com/winrarr/runnel/actions/runs/33094464649",
+      "comparison_mode": "cluster-baseline",
+      "benchmark_suite": "cluster",
+      "benchmark_series": "cluster",
+      "backend": "runnel-cluster",
+      "operation": "cluster_parallel_grouped_consume_ack",
+      "message_size_bytes": 100,
+      "metric": "latency_p99",
+      "value": 18490.999529999997,
+      "unit": "\u00b5s",
+      "repetitions": 3,
+      "range": {
+        "min": 17991.392789999994,
+        "median": 18490.999529999997,
+        "max": 19579.435589999997,
+        "relative_range_percent": 8.588193393350885,
+        "standard_deviation": 663.0049342864487,
+        "relative_standard_deviation_percent": 3.585554870686045
+      },
+      "evidence": {
+        "aggregation": "median",
+        "sample_count": 3,
+        "repetition_count": 3,
+        "sample_coverage_percent": 100.0,
+        "sample_values": [
+          17991.392789999994,
+          18490.999529999997,
+          19579.435589999997
+        ]
+      },
+      "previous_value": 82317.51180999997,
+      "delta": -63826.512279999966,
+      "delta_percent": -77.5369795279044,
+      "improved": true
+    },
+    {
+      "timestamp": "2026-08-27T16:51:28.568802+00:00",
+      "timestamp_ms": 1787849488568.802,
+      "run_file": "2026-08-27T165128.568802+0000-6fb0afce2aaf-cluster.json",
+      "profile": "push",
+      "revision": "6fb0afce2aaf4b781cb72d61820a70bdf577f6cd",
+      "run_url": "https://github.com/winrarr/runnel/actions/runs/33094464649",
+      "comparison_mode": "cluster-baseline",
+      "benchmark_suite": "cluster",
+      "benchmark_series": "cluster",
+      "backend": "runnel-cluster",
+      "operation": "cluster_parallel_grouped_consume_ack",
+      "message_size_bytes": 100,
+      "metric": "latency_p999",
+      "value": 20409.791961000043,
+      "unit": "\u00b5s",
+      "repetitions": 3,
+      "range": {
+        "min": 18775.289298000003,
+        "median": 20409.791961000043,
+        "max": 20770.061682000014,
+        "relative_range_percent": 9.773604688434416,
+        "standard_deviation": 867.9804203624196,
+        "relative_standard_deviation_percent": 4.252764663260635
+      },
+      "evidence": {
+        "aggregation": "median",
+        "sample_count": 3,
+        "repetition_count": 3,
+        "sample_coverage_percent": 100.0,
+        "sample_values": [
+          20409.791961000043,
+          18775.289298000003,
+          20770.061682000014
+        ]
+      },
+      "previous_value": 121081.34506200004,
+      "delta": -100671.553101,
+      "delta_percent": -83.14373535365903,
+      "improved": true
+    },
+    {
+      "timestamp": "2026-08-27T16:51:28.568802+00:00",
+      "timestamp_ms": 1787849488568.802,
+      "run_file": "2026-08-27T165128.568802+0000-6fb0afce2aaf-cluster.json",
+      "profile": "push",
+      "revision": "6fb0afce2aaf4b781cb72d61820a70bdf577f6cd",
+      "run_url": "https://github.com/winrarr/runnel/actions/runs/33094464649",
+      "comparison_mode": "cluster-baseline",
+      "benchmark_suite": "cluster",
+      "benchmark_series": "cluster",
+      "backend": "runnel-cluster",
+      "operation": "cluster_parallel_grouped_consume_ack",
+      "message_size_bytes": 100,
+      "metric": "memory_bytes_max",
+      "value": 49012736.0,
+      "unit": "bytes",
+      "repetitions": 3,
+      "range": {
+        "min": 48828416.0,
+        "median": 49012736.0,
+        "max": 49586176.0,
+        "relative_range_percent": 1.5460471335450443,
+        "standard_deviation": 322663.8280866877,
+        "relative_standard_deviation_percent": 0.6583264971918477
+      },
+      "evidence": {
+        "aggregation": "median",
+        "sample_count": 3,
+        "repetition_count": 3,
+        "sample_coverage_percent": 100.0,
+        "sample_values": [
+          49012736.0,
+          49586176.0,
+          48828416.0
+        ]
+      },
+      "previous_value": 50905088.0,
+      "delta": -1892352.0,
+      "delta_percent": -3.7174122948181525,
+      "improved": true
+    },
+    {
+      "timestamp": "2026-08-27T16:51:28.568802+00:00",
+      "timestamp_ms": 1787849488568.802,
+      "run_file": "2026-08-27T165128.568802+0000-6fb0afce2aaf-cluster.json",
+      "profile": "push",
+      "revision": "6fb0afce2aaf4b781cb72d61820a70bdf577f6cd",
+      "run_url": "https://github.com/winrarr/runnel/actions/runs/33094464649",
+      "comparison_mode": "cluster-baseline",
+      "benchmark_suite": "cluster",
+      "benchmark_series": "cluster",
+      "backend": "runnel-cluster",
+      "operation": "cluster_parallel_grouped_consume_ack",
+      "message_size_bytes": 100,
+      "metric": "cpu_efficiency_messages_per_cpu_second",
+      "value": 333.33333333333354,
+      "unit": "messages/CPU-second",
+      "repetitions": 3,
+      "range": {
+        "min": 327.86885245901647,
+        "median": 333.33333333333354,
+        "max": 338.9830508474577,
+        "relative_range_percent": 3.3342595165323736,
+        "standard_deviation": 4.537562549710395,
+        "relative_standard_deviation_percent": 1.3612687649131177
+      },
+      "evidence": {
+        "aggregation": "median",
+        "sample_count": 3,
+        "repetition_count": 3,
+        "sample_coverage_percent": 100.0,
+        "sample_values": [
+          327.86885245901647,
+          333.33333333333354,
+          338.9830508474577
+        ]
+      },
+      "previous_value": 303.03030303030295,
+      "delta": 30.303030303030596,
+      "delta_percent": 10.0000000000001,
+      "improved": true
+    },
+    {
+      "timestamp": "2026-08-27T16:51:28.568802+00:00",
+      "timestamp_ms": 1787849488568.802,
+      "run_file": "2026-08-27T165128.568802+0000-6fb0afce2aaf-cluster.json",
+      "profile": "push",
+      "revision": "6fb0afce2aaf4b781cb72d61820a70bdf577f6cd",
+      "run_url": "https://github.com/winrarr/runnel/actions/runs/33094464649",
+      "comparison_mode": "cluster-baseline",
+      "benchmark_suite": "cluster",
+      "benchmark_series": "cluster",
+      "backend": "runnel-cluster",
+      "operation": "cluster_restart_recovery",
+      "message_size_bytes": 100,
+      "metric": "throughput_messages_per_second",
+      "value": 16.363608813269526,
+      "unit": "messages/s",
+      "repetitions": 3,
+      "range": {
+        "min": 16.22562339412977,
+        "median": 16.363608813269526,
+        "max": 16.37807864271849,
+        "relative_range_percent": 0.9316725321928416,
+        "standard_deviation": 0.068711922531444,
+        "relative_standard_deviation_percent": 0.4199069002170495
+      },
+      "evidence": {
+        "aggregation": "median",
+        "sample_count": 3,
+        "repetition_count": 3,
+        "sample_coverage_percent": 100.0,
+        "sample_values": [
+          16.37807864271849,
+          16.22562339412977,
+          16.363608813269526
+        ]
+      },
+      "previous_value": 4.995168847521587,
+      "delta": 11.368439965747939,
+      "delta_percent": 227.58870245974822,
+      "improved": true
+    },
+    {
+      "timestamp": "2026-08-27T16:51:28.568802+00:00",
+      "timestamp_ms": 1787849488568.802,
+      "run_file": "2026-08-27T165128.568802+0000-6fb0afce2aaf-cluster.json",
+      "profile": "push",
+      "revision": "6fb0afce2aaf4b781cb72d61820a70bdf577f6cd",
+      "run_url": "https://github.com/winrarr/runnel/actions/runs/33094464649",
+      "comparison_mode": "cluster-baseline",
+      "benchmark_suite": "cluster",
+      "benchmark_series": "cluster",
+      "backend": "runnel-cluster",
+      "operation": "cluster_restart_recovery",
+      "message_size_bytes": 100,
+      "metric": "latency_p50",
+      "value": 61111.214,
+      "unit": "\u00b5s",
+      "repetitions": 3,
+      "range": {
+        "min": 61057.223,
+        "median": 61111.214,
+        "max": 61630.914,
+        "relative_range_percent": 0.9387655103693389,
+        "standard_deviation": 258.6556014733783,
+        "relative_standard_deviation_percent": 0.42325390798713025
+      },
+      "evidence": {
+        "aggregation": "median",
+        "sample_count": 3,
+        "repetition_count": 3,
+        "sample_coverage_percent": 100.0,
+        "sample_values": [
+          61057.223,
+          61630.914,
+          61111.214
+        ]
+      },
+      "previous_value": 200193.433,
+      "delta": -139082.21899999998,
+      "delta_percent": -69.4739167592975,
+      "improved": true
+    },
+    {
+      "timestamp": "2026-08-27T16:51:28.568802+00:00",
+      "timestamp_ms": 1787849488568.802,
+      "run_file": "2026-08-27T165128.568802+0000-6fb0afce2aaf-cluster.json",
+      "profile": "push",
+      "revision": "6fb0afce2aaf4b781cb72d61820a70bdf577f6cd",
+      "run_url": "https://github.com/winrarr/runnel/actions/runs/33094464649",
+      "comparison_mode": "cluster-baseline",
+      "benchmark_suite": "cluster",
+      "benchmark_series": "cluster",
+      "backend": "runnel-cluster",
+      "operation": "cluster_restart_recovery",
+      "message_size_bytes": 100,
+      "metric": "latency_p99",
+      "value": 61111.214,
+      "unit": "\u00b5s",
+      "repetitions": 3,
+      "range": {
+        "min": 61057.223,
+        "median": 61111.214,
+        "max": 61630.914,
+        "relative_range_percent": 0.9387655103693389,
+        "standard_deviation": 258.6556014733783,
+        "relative_standard_deviation_percent": 0.42325390798713025
+      },
+      "evidence": {
+        "aggregation": "median",
+        "sample_count": 3,
+        "repetition_count": 3,
+        "sample_coverage_percent": 100.0,
+        "sample_values": [
+          61057.223,
+          61630.914,
+          61111.214
+        ]
+      },
+      "previous_value": 200193.433,
+      "delta": -139082.21899999998,
+      "delta_percent": -69.4739167592975,
+      "improved": true
+    },
+    {
+      "timestamp": "2026-08-27T16:51:28.568802+00:00",
+      "timestamp_ms": 1787849488568.802,
+      "run_file": "2026-08-27T165128.568802+0000-6fb0afce2aaf-cluster.json",
+      "profile": "push",
+      "revision": "6fb0afce2aaf4b781cb72d61820a70bdf577f6cd",
+      "run_url": "https://github.com/winrarr/runnel/actions/runs/33094464649",
+      "comparison_mode": "cluster-baseline",
+      "benchmark_suite": "cluster",
+      "benchmark_series": "cluster",
+      "backend": "runnel-cluster",
+      "operation": "cluster_restart_recovery",
+      "message_size_bytes": 100,
+      "metric": "latency_p999",
+      "value": 61111.214,
+      "unit": "\u00b5s",
+      "repetitions": 3,
+      "range": {
+        "min": 61057.223,
+        "median": 61111.214,
+        "max": 61630.914,
+        "relative_range_percent": 0.9387655103693389,
+        "standard_deviation": 258.6556014733783,
+        "relative_standard_deviation_percent": 0.42325390798713025
+      },
+      "evidence": {
+        "aggregation": "median",
+        "sample_count": 3,
+        "repetition_count": 3,
+        "sample_coverage_percent": 100.0,
+        "sample_values": [
+          61057.223,
+          61630.914,
+          61111.214
+        ]
+      },
+      "previous_value": 200193.433,
+      "delta": -139082.21899999998,
+      "delta_percent": -69.4739167592975,
+      "improved": true
+    },
+    {
+      "timestamp": "2026-08-27T16:51:28.568802+00:00",
+      "timestamp_ms": 1787849488568.802,
+      "run_file": "2026-08-27T165128.568802+0000-6fb0afce2aaf-cluster.json",
+      "profile": "push",
+      "revision": "6fb0afce2aaf4b781cb72d61820a70bdf577f6cd",
+      "run_url": "https://github.com/winrarr/runnel/actions/runs/33094464649",
+      "comparison_mode": "cluster-baseline",
+      "benchmark_suite": "cluster",
+      "benchmark_series": "cluster",
+      "backend": "runnel-cluster",
+      "operation": "cluster_restart_recovery",
+      "message_size_bytes": 100,
+      "metric": "memory_bytes_max",
+      "value": 45207552.0,
+      "unit": "bytes",
+      "repetitions": 3,
+      "range": {
+        "min": 44789760.0,
+        "median": 45207552.0,
+        "max": 45707264.0,
+        "relative_range_percent": 2.0295370118691674,
+        "standard_deviation": 375066.7834198183,
+        "relative_standard_deviation_percent": 0.8296551501391146
+      },
+      "evidence": {
+        "aggregation": "median",
+        "sample_count": 3,
+        "repetition_count": 3,
+        "sample_coverage_percent": 100.0,
+        "sample_values": [
+          44789760.0,
+          45707264.0,
+          45207552.0
+        ]
+      },
+      "previous_value": 46616576.0,
+      "delta": -1409024.0,
+      "delta_percent": -3.0225814954749146,
+      "improved": true
+    },
+    {
+      "timestamp": "2026-08-27T16:51:28.568802+00:00",
+      "timestamp_ms": 1787849488568.802,
+      "run_file": "2026-08-27T165128.568802+0000-6fb0afce2aaf-cluster.json",
+      "profile": "push",
+      "revision": "6fb0afce2aaf4b781cb72d61820a70bdf577f6cd",
+      "run_url": "https://github.com/winrarr/runnel/actions/runs/33094464649",
+      "comparison_mode": "cluster-baseline",
+      "benchmark_suite": "cluster",
+      "benchmark_series": "cluster",
+      "backend": "runnel-cluster",
+      "operation": "cluster_durable_publish",
+      "message_size_bytes": 1024,
+      "metric": "throughput_messages_per_second",
+      "value": 168.9953130789172,
+      "unit": "messages/s",
+      "repetitions": 3,
+      "range": {
+        "min": 165.73392840951095,
+        "median": 168.9953130789172,
+        "max": 172.18134783856962,
+        "relative_range_percent": 3.815146888747064,
+        "standard_deviation": 2.632207876495294,
+        "relative_standard_deviation_percent": 1.5575626498387614
+      },
+      "evidence": {
+        "aggregation": "median",
+        "sample_count": 3,
+        "repetition_count": 3,
+        "sample_coverage_percent": 100.0,
+        "sample_values": [
+          165.73392840951095,
+          172.18134783856962,
+          168.9953130789172
+        ]
+      },
+      "previous_value": 119.07711033685402,
+      "delta": 49.91820274206319,
+      "delta_percent": 41.92090537035282,
+      "improved": true
+    },
+    {
+      "timestamp": "2026-08-27T16:51:28.568802+00:00",
+      "timestamp_ms": 1787849488568.802,
+      "run_file": "2026-08-27T165128.568802+0000-6fb0afce2aaf-cluster.json",
+      "profile": "push",
+      "revision": "6fb0afce2aaf4b781cb72d61820a70bdf577f6cd",
+      "run_url": "https://github.com/winrarr/runnel/actions/runs/33094464649",
+      "comparison_mode": "cluster-baseline",
+      "benchmark_suite": "cluster",
+      "benchmark_series": "cluster",
+      "backend": "runnel-cluster",
+      "operation": "cluster_durable_publish",
+      "message_size_bytes": 1024,
+      "metric": "latency_p50",
+      "value": 4580.105,
+      "unit": "\u00b5s",
+      "repetitions": 3,
+      "range": {
+        "min": 4488.083,
+        "median": 4580.105,
+        "max": 4619.5795,
+        "relative_range_percent": 2.8710367993746915,
+        "standard_deviation": 55.093470218549754,
+        "relative_standard_deviation_percent": 1.202886619816571
+      },
+      "evidence": {
+        "aggregation": "median",
+        "sample_count": 3,
+        "repetition_count": 3,
+        "sample_coverage_percent": 100.0,
+        "sample_values": [
+          4619.5795,
+          4488.083,
+          4580.105
+        ]
+      },
+      "previous_value": 4206.7205,
+      "delta": 373.3844999999992,
+      "delta_percent": 8.87590463877976,
+      "improved": false
+    },
+    {
+      "timestamp": "2026-08-27T16:51:28.568802+00:00",
+      "timestamp_ms": 1787849488568.802,
+      "run_file": "2026-08-27T165128.568802+0000-6fb0afce2aaf-cluster.json",
+      "profile": "push",
+      "revision": "6fb0afce2aaf4b781cb72d61820a70bdf577f6cd",
+      "run_url": "https://github.com/winrarr/runnel/actions/runs/33094464649",
+      "comparison_mode": "cluster-baseline",
+      "benchmark_suite": "cluster",
+      "benchmark_series": "cluster",
+      "backend": "runnel-cluster",
+      "operation": "cluster_durable_publish",
+      "message_size_bytes": 1024,
+      "metric": "latency_p99",
+      "value": 46332.115609999906,
+      "unit": "\u00b5s",
+      "repetitions": 3,
+      "range": {
+        "min": 43639.77353999993,
+        "median": 46332.115609999906,
+        "max": 49166.55876999998,
+        "relative_range_percent": 11.928626951813962,
+        "standard_deviation": 2256.549204912219,
+        "relative_standard_deviation_percent": 4.870378084840111
+      },
+      "evidence": {
+        "aggregation": "median",
+        "sample_count": 3,
+        "repetition_count": 3,
+        "sample_coverage_percent": 100.0,
+        "sample_values": [
+          46332.115609999906,
+          49166.55876999998,
+          43639.77353999993
+        ]
+      },
+      "previous_value": 84695.7332899998,
+      "delta": -38363.617679999894,
+      "delta_percent": -45.295809115486534,
+      "improved": true
+    },
+    {
+      "timestamp": "2026-08-27T16:51:28.568802+00:00",
+      "timestamp_ms": 1787849488568.802,
+      "run_file": "2026-08-27T165128.568802+0000-6fb0afce2aaf-cluster.json",
+      "profile": "push",
+      "revision": "6fb0afce2aaf4b781cb72d61820a70bdf577f6cd",
+      "run_url": "https://github.com/winrarr/runnel/actions/runs/33094464649",
+      "comparison_mode": "cluster-baseline",
+      "benchmark_suite": "cluster",
+      "benchmark_series": "cluster",
+      "backend": "runnel-cluster",
+      "operation": "cluster_durable_publish",
+      "message_size_bytes": 1024,
+      "metric": "latency_p999",
+      "value": 54964.329207000075,
+      "unit": "\u00b5s",
+      "repetitions": 3,
+      "range": {
+        "min": 51303.599527000006,
+        "median": 54964.329207000075,
+        "max": 57822.05210000002,
+        "relative_range_percent": 11.859423497103005,
+        "standard_deviation": 2667.869434371012,
+        "relative_standard_deviation_percent": 4.853819691537764
+      },
+      "evidence": {
+        "aggregation": "median",
+        "sample_count": 3,
+        "repetition_count": 3,
+        "sample_coverage_percent": 100.0,
+        "sample_values": [
+          57822.05210000002,
+          51303.599527000006,
+          54964.329207000075
+        ]
+      },
+      "previous_value": 179551.79496300075,
+      "delta": -124587.46575600067,
+      "delta_percent": -69.38803690694027,
+      "improved": true
+    },
+    {
+      "timestamp": "2026-08-27T16:51:28.568802+00:00",
+      "timestamp_ms": 1787849488568.802,
+      "run_file": "2026-08-27T165128.568802+0000-6fb0afce2aaf-cluster.json",
+      "profile": "push",
+      "revision": "6fb0afce2aaf4b781cb72d61820a70bdf577f6cd",
+      "run_url": "https://github.com/winrarr/runnel/actions/runs/33094464649",
+      "comparison_mode": "cluster-baseline",
+      "benchmark_suite": "cluster",
+      "benchmark_series": "cluster",
+      "backend": "runnel-cluster",
+      "operation": "cluster_durable_publish",
+      "message_size_bytes": 1024,
+      "metric": "memory_bytes_max",
+      "value": 94556160.0,
+      "unit": "bytes",
+      "repetitions": 3,
+      "range": {
+        "min": 90480640.0,
+        "median": 94556160.0,
+        "max": 104280064.0,
+        "relative_range_percent": 14.593892137751787,
+        "standard_deviation": 5788765.700363957,
+        "relative_standard_deviation_percent": 6.122039749037987
+      },
+      "evidence": {
+        "aggregation": "median",
+        "sample_count": 3,
+        "repetition_count": 3,
+        "sample_coverage_percent": 100.0,
+        "sample_values": [
+          90480640.0,
+          94556160.0,
+          104280064.0
+        ]
+      },
+      "previous_value": 103383040.0,
+      "delta": -8826880.0,
+      "delta_percent": -8.538034865293186,
+      "improved": true
+    },
+    {
+      "timestamp": "2026-08-27T16:51:28.568802+00:00",
+      "timestamp_ms": 1787849488568.802,
+      "run_file": "2026-08-27T165128.568802+0000-6fb0afce2aaf-cluster.json",
+      "profile": "push",
+      "revision": "6fb0afce2aaf4b781cb72d61820a70bdf577f6cd",
+      "run_url": "https://github.com/winrarr/runnel/actions/runs/33094464649",
+      "comparison_mode": "cluster-baseline",
+      "benchmark_suite": "cluster",
+      "benchmark_series": "cluster",
+      "backend": "runnel-cluster",
+      "operation": "cluster_durable_publish",
+      "message_size_bytes": 1024,
+      "metric": "cpu_efficiency_messages_per_cpu_second",
+      "value": 322.58064516129025,
+      "unit": "messages/CPU-second",
+      "repetitions": 3,
+      "range": {
+        "min": 322.58064516129025,
+        "median": 322.58064516129025,
+        "max": 333.33333333333303,
+        "relative_range_percent": 3.3333333333332624,
+        "standard_deviation": 5.068865814957221,
+        "relative_standard_deviation_percent": 1.571348402636739
+      },
+      "evidence": {
+        "aggregation": "median",
+        "sample_count": 3,
+        "repetition_count": 3,
+        "sample_coverage_percent": 100.0,
+        "sample_values": [
+          333.33333333333303,
+          322.58064516129025,
+          322.58064516129025
+        ]
+      },
+      "previous_value": 285.71428571428567,
+      "delta": 36.866359447004584,
+      "delta_percent": 12.903225806451607,
+      "improved": true
+    },
+    {
+      "timestamp": "2026-08-27T16:51:28.568802+00:00",
+      "timestamp_ms": 1787849488568.802,
+      "run_file": "2026-08-27T165128.568802+0000-6fb0afce2aaf-cluster.json",
+      "profile": "push",
+      "revision": "6fb0afce2aaf4b781cb72d61820a70bdf577f6cd",
+      "run_url": "https://github.com/winrarr/runnel/actions/runs/33094464649",
+      "comparison_mode": "cluster-baseline",
+      "benchmark_suite": "cluster",
+      "benchmark_series": "cluster",
+      "backend": "runnel-cluster",
+      "operation": "cluster_consume_ack",
+      "message_size_bytes": 1024,
+      "metric": "throughput_messages_per_second",
+      "value": 109.47767740304761,
+      "unit": "messages/s",
+      "repetitions": 3,
+      "range": {
+        "min": 107.58973431280495,
+        "median": 109.47767740304761,
+        "max": 109.70937785586368,
+        "relative_range_percent": 1.9361422285706278,
+        "standard_deviation": 0.9493215683646418,
+        "relative_standard_deviation_percent": 0.8671371103989232
+      },
+      "evidence": {
+        "aggregation": "median",
+        "sample_count": 3,
+        "repetition_count": 3,
+        "sample_coverage_percent": 100.0,
+        "sample_values": [
+          107.58973431280495,
+          109.70937785586368,
+          109.47767740304761
+        ]
+      },
+      "previous_value": 53.82976093448207,
+      "delta": 55.64791646856554,
+      "delta_percent": 103.37760283999107,
+      "improved": true
+    },
+    {
+      "timestamp": "2026-08-27T16:51:28.568802+00:00",
+      "timestamp_ms": 1787849488568.802,
+      "run_file": "2026-08-27T165128.568802+0000-6fb0afce2aaf-cluster.json",
+      "profile": "push",
+      "revision": "6fb0afce2aaf4b781cb72d61820a70bdf577f6cd",
+      "run_url": "https://github.com/winrarr/runnel/actions/runs/33094464649",
+      "comparison_mode": "cluster-baseline",
+      "benchmark_suite": "cluster",
+      "benchmark_series": "cluster",
+      "backend": "runnel-cluster",
+      "operation": "cluster_consume_ack",
+      "message_size_bytes": 1024,
+      "metric": "latency_p50",
+      "value": 7181.2955,
+      "unit": "\u00b5s",
+      "repetitions": 3,
+      "range": {
+        "min": 7138.4475,
+        "median": 7181.2955,
+        "max": 7234.7365,
+        "relative_range_percent": 1.340830494999123,
+        "standard_deviation": 39.38903274601521,
+        "relative_standard_deviation_percent": 0.5484948049556687
+      },
+      "evidence": {
+        "aggregation": "median",
+        "sample_count": 3,
+        "repetition_count": 3,
+        "sample_coverage_percent": 100.0,
+        "sample_values": [
+          7234.7365,
+          7138.4475,
+          7181.2955
+        ]
+      },
+      "previous_value": 6160.179,
+      "delta": 1021.1165000000001,
+      "delta_percent": 16.576084883247713,
+      "improved": false
+    },
+    {
+      "timestamp": "2026-08-27T16:51:28.568802+00:00",
+      "timestamp_ms": 1787849488568.802,
+      "run_file": "2026-08-27T165128.568802+0000-6fb0afce2aaf-cluster.json",
+      "profile": "push",
+      "revision": "6fb0afce2aaf4b781cb72d61820a70bdf577f6cd",
+      "run_url": "https://github.com/winrarr/runnel/actions/runs/33094464649",
+      "comparison_mode": "cluster-baseline",
+      "benchmark_suite": "cluster",
+      "benchmark_series": "cluster",
+      "backend": "runnel-cluster",
+      "operation": "cluster_consume_ack",
+      "message_size_bytes": 1024,
+      "metric": "latency_p99",
+      "value": 38821.41458,
+      "unit": "\u00b5s",
+      "repetitions": 3,
+      "range": {
+        "min": 38768.77078999997,
+        "median": 38821.41458,
+        "max": 41762.620379999986,
+        "relative_range_percent": 7.711850849305174,
+        "standard_deviation": 1399.0710526839023,
+        "relative_standard_deviation_percent": 3.6038641760485337
+      },
+      "evidence": {
+        "aggregation": "median",
+        "sample_count": 3,
+        "repetition_count": 3,
+        "sample_coverage_percent": 100.0,
+        "sample_values": [
+          38768.77078999997,
+          38821.41458,
+          41762.620379999986
+        ]
+      },
+      "previous_value": 251184.0352399967,
+      "delta": -212362.6206599967,
+      "delta_percent": -84.54463296486672,
+      "improved": true
+    },
+    {
+      "timestamp": "2026-08-27T16:51:28.568802+00:00",
+      "timestamp_ms": 1787849488568.802,
+      "run_file": "2026-08-27T165128.568802+0000-6fb0afce2aaf-cluster.json",
+      "profile": "push",
+      "revision": "6fb0afce2aaf4b781cb72d61820a70bdf577f6cd",
+      "run_url": "https://github.com/winrarr/runnel/actions/runs/33094464649",
+      "comparison_mode": "cluster-baseline",
+      "benchmark_suite": "cluster",
+      "benchmark_series": "cluster",
+      "backend": "runnel-cluster",
+      "operation": "cluster_consume_ack",
+      "message_size_bytes": 1024,
+      "metric": "latency_p999",
+      "value": 42613.00218800008,
+      "unit": "\u00b5s",
+      "repetitions": 3,
+      "range": {
+        "min": 41861.52780200001,
+        "median": 42613.00218800008,
+        "max": 43943.81097000001,
+        "relative_range_percent": 4.8864972217009806,
+        "standard_deviation": 860.9858018443775,
+        "relative_standard_deviation_percent": 2.020476750372761
+      },
+      "evidence": {
+        "aggregation": "median",
+        "sample_count": 3,
+        "repetition_count": 3,
+        "sample_coverage_percent": 100.0,
+        "sample_values": [
+          41861.52780200001,
+          42613.00218800008,
+          43943.81097000001
+        ]
+      },
+      "previous_value": 672680.8456370013,
+      "delta": -630067.8434490012,
+      "delta_percent": -93.66519762464065,
+      "improved": true
+    },
+    {
+      "timestamp": "2026-08-27T16:51:28.568802+00:00",
+      "timestamp_ms": 1787849488568.802,
+      "run_file": "2026-08-27T165128.568802+0000-6fb0afce2aaf-cluster.json",
+      "profile": "push",
+      "revision": "6fb0afce2aaf4b781cb72d61820a70bdf577f6cd",
+      "run_url": "https://github.com/winrarr/runnel/actions/runs/33094464649",
+      "comparison_mode": "cluster-baseline",
+      "benchmark_suite": "cluster",
+      "benchmark_series": "cluster",
+      "backend": "runnel-cluster",
+      "operation": "cluster_consume_ack",
+      "message_size_bytes": 1024,
+      "metric": "memory_bytes_max",
+      "value": 126255104.0,
+      "unit": "bytes",
+      "repetitions": 3,
+      "range": {
+        "min": 114806784.0,
+        "median": 126255104.0,
+        "max": 132476928.0,
+        "relative_range_percent": 13.995587853620556,
+        "standard_deviation": 7318235.319241259,
+        "relative_standard_deviation_percent": 5.7963877002875535
+      },
+      "evidence": {
+        "aggregation": "median",
+        "sample_count": 3,
+        "repetition_count": 3,
+        "sample_coverage_percent": 100.0,
+        "sample_values": [
+          114806784.0,
+          126255104.0,
+          132476928.0
+        ]
+      },
+      "previous_value": 131588096.0,
+      "delta": -5332992.0,
+      "delta_percent": -4.052792130984249,
+      "improved": true
+    },
+    {
+      "timestamp": "2026-08-27T16:51:28.568802+00:00",
+      "timestamp_ms": 1787849488568.802,
+      "run_file": "2026-08-27T165128.568802+0000-6fb0afce2aaf-cluster.json",
+      "profile": "push",
+      "revision": "6fb0afce2aaf4b781cb72d61820a70bdf577f6cd",
+      "run_url": "https://github.com/winrarr/runnel/actions/runs/33094464649",
+      "comparison_mode": "cluster-baseline",
+      "benchmark_suite": "cluster",
+      "benchmark_series": "cluster",
+      "backend": "runnel-cluster",
+      "operation": "cluster_consume_ack",
+      "message_size_bytes": 1024,
+      "metric": "cpu_efficiency_messages_per_cpu_second",
+      "value": 243.90243902439042,
+      "unit": "messages/CPU-second",
+      "repetitions": 3,
+      "range": {
+        "min": 243.90243902439016,
+        "median": 243.90243902439042,
+        "max": 253.1645569620253,
+        "relative_range_percent": 3.797468354430404,
+        "standard_deviation": 4.3662042679008515,
+        "relative_standard_deviation_percent": 1.7901437498393478
+      },
+      "evidence": {
+        "aggregation": "median",
+        "sample_count": 3,
+        "repetition_count": 3,
+        "sample_coverage_percent": 100.0,
+        "sample_values": [
+          253.1645569620253,
+          243.90243902439042,
+          243.90243902439016
+        ]
+      },
+      "previous_value": 217.3913043478259,
+      "delta": 26.511134676564524,
+      "delta_percent": 12.195121951219692,
+      "improved": true
+    },
+    {
+      "timestamp": "2026-08-27T16:51:28.568802+00:00",
+      "timestamp_ms": 1787849488568.802,
+      "run_file": "2026-08-27T165128.568802+0000-6fb0afce2aaf-cluster.json",
+      "profile": "push",
+      "revision": "6fb0afce2aaf4b781cb72d61820a70bdf577f6cd",
+      "run_url": "https://github.com/winrarr/runnel/actions/runs/33094464649",
+      "comparison_mode": "cluster-baseline",
+      "benchmark_suite": "cluster",
+      "benchmark_series": "cluster",
+      "backend": "runnel-cluster",
+      "operation": "cluster_slow_consumer",
+      "message_size_bytes": 1024,
+      "metric": "throughput_messages_per_second",
+      "value": 52.68697494791822,
+      "unit": "messages/s",
+      "repetitions": 3,
+      "range": {
+        "min": 51.89070230343188,
+        "median": 52.68697494791822,
+        "max": 53.0393131117448,
+        "relative_range_percent": 2.1800659640230506,
+        "standard_deviation": 0.4804510722018549,
+        "relative_standard_deviation_percent": 0.9118972434397443
+      },
+      "evidence": {
+        "aggregation": "median",
+        "sample_count": 3,
+        "repetition_count": 3,
+        "sample_coverage_percent": 100.0,
+        "sample_values": [
+          51.89070230343188,
+          53.0393131117448,
+          52.68697494791822
+        ]
+      },
+      "previous_value": 27.923193980682406,
+      "delta": 24.763780967235817,
+      "delta_percent": 88.68534518066842,
+      "improved": true
+    },
+    {
+      "timestamp": "2026-08-27T16:51:28.568802+00:00",
+      "timestamp_ms": 1787849488568.802,
+      "run_file": "2026-08-27T165128.568802+0000-6fb0afce2aaf-cluster.json",
+      "profile": "push",
+      "revision": "6fb0afce2aaf4b781cb72d61820a70bdf577f6cd",
+      "run_url": "https://github.com/winrarr/runnel/actions/runs/33094464649",
+      "comparison_mode": "cluster-baseline",
+      "benchmark_suite": "cluster",
+      "benchmark_series": "cluster",
+      "backend": "runnel-cluster",
+      "operation": "cluster_slow_consumer",
+      "message_size_bytes": 1024,
+      "metric": "latency_p50",
+      "value": 7258.0295,
+      "unit": "\u00b5s",
+      "repetitions": 3,
+      "range": {
+        "min": 7218.4435,
+        "median": 7258.0295,
+        "max": 7405.3345,
+        "relative_range_percent": 2.5749550893944373,
+        "standard_deviation": 80.41148363400721,
+        "relative_standard_deviation_percent": 1.1078968972777972
+      },
+      "evidence": {
+        "aggregation": "median",
+        "sample_count": 3,
+        "repetition_count": 3,
+        "sample_coverage_percent": 100.0,
+        "sample_values": [
+          7405.3345,
+          7258.0295,
+          7218.4435
+        ]
+      },
+      "previous_value": 7023.0315,
+      "delta": 234.9979999999996,
+      "delta_percent": 3.3461048836246796,
+      "improved": false
+    },
+    {
+      "timestamp": "2026-08-27T16:51:28.568802+00:00",
+      "timestamp_ms": 1787849488568.802,
+      "run_file": "2026-08-27T165128.568802+0000-6fb0afce2aaf-cluster.json",
+      "profile": "push",
+      "revision": "6fb0afce2aaf4b781cb72d61820a70bdf577f6cd",
+      "run_url": "https://github.com/winrarr/runnel/actions/runs/33094464649",
+      "comparison_mode": "cluster-baseline",
+      "benchmark_suite": "cluster",
+      "benchmark_series": "cluster",
+      "backend": "runnel-cluster",
+      "operation": "cluster_slow_consumer",
+      "message_size_bytes": 1024,
+      "metric": "latency_p99",
+      "value": 34116.07742999999,
+      "unit": "\u00b5s",
+      "repetitions": 3,
+      "range": {
+        "min": 33123.36236,
+        "median": 34116.07742999999,
+        "max": 34391.05157999999,
+        "relative_range_percent": 3.715811768222949,
+        "standard_deviation": 544.4803793911628,
+        "relative_standard_deviation_percent": 1.595964191687447
+      },
+      "evidence": {
+        "aggregation": "median",
+        "sample_count": 3,
+        "repetition_count": 3,
+        "sample_coverage_percent": 100.0,
+        "sample_values": [
+          34391.05157999999,
+          34116.07742999999,
+          33123.36236
+        ]
+      },
+      "previous_value": 346668.39110999764,
+      "delta": -312552.31367999763,
+      "delta_percent": -90.15887277153716,
+      "improved": true
+    },
+    {
+      "timestamp": "2026-08-27T16:51:28.568802+00:00",
+      "timestamp_ms": 1787849488568.802,
+      "run_file": "2026-08-27T165128.568802+0000-6fb0afce2aaf-cluster.json",
+      "profile": "push",
+      "revision": "6fb0afce2aaf4b781cb72d61820a70bdf577f6cd",
+      "run_url": "https://github.com/winrarr/runnel/actions/runs/33094464649",
+      "comparison_mode": "cluster-baseline",
+      "benchmark_suite": "cluster",
+      "benchmark_series": "cluster",
+      "backend": "runnel-cluster",
+      "operation": "cluster_slow_consumer",
+      "message_size_bytes": 1024,
+      "metric": "latency_p999",
+      "value": 35205.758382,
+      "unit": "\u00b5s",
+      "repetitions": 3,
+      "range": {
+        "min": 34329.34616000002,
+        "median": 35205.758382,
+        "max": 37504.457244000056,
+        "relative_range_percent": 9.018726566115967,
+        "standard_deviation": 1338.8820061185024,
+        "relative_standard_deviation_percent": 3.803019925294511
+      },
+      "evidence": {
+        "aggregation": "median",
+        "sample_count": 3,
+        "repetition_count": 3,
+        "sample_coverage_percent": 100.0,
+        "sample_values": [
+          35205.758382,
+          37504.457244000056,
+          34329.34616000002
+        ]
+      },
+      "previous_value": 689674.1141880013,
+      "delta": -654468.3558060012,
+      "delta_percent": -94.8953052379746,
+      "improved": true
+    },
+    {
+      "timestamp": "2026-08-27T16:51:28.568802+00:00",
+      "timestamp_ms": 1787849488568.802,
+      "run_file": "2026-08-27T165128.568802+0000-6fb0afce2aaf-cluster.json",
+      "profile": "push",
+      "revision": "6fb0afce2aaf4b781cb72d61820a70bdf577f6cd",
+      "run_url": "https://github.com/winrarr/runnel/actions/runs/33094464649",
+      "comparison_mode": "cluster-baseline",
+      "benchmark_suite": "cluster",
+      "benchmark_series": "cluster",
+      "backend": "runnel-cluster",
+      "operation": "cluster_slow_consumer",
+      "message_size_bytes": 1024,
+      "metric": "memory_bytes_max",
+      "value": 137633792.0,
+      "unit": "bytes",
+      "repetitions": 3,
+      "range": {
+        "min": 126304256.0,
+        "median": 137633792.0,
+        "max": 139988992.0,
+        "relative_range_percent": 9.942860544015238,
+        "standard_deviation": 5973807.202232389,
+        "relative_standard_deviation_percent": 4.340363740201527
+      },
+      "evidence": {
+        "aggregation": "median",
+        "sample_count": 3,
+        "repetition_count": 3,
+        "sample_coverage_percent": 100.0,
+        "sample_values": [
+          126304256.0,
+          139988992.0,
+          137633792.0
+        ]
+      },
+      "previous_value": 144605184.0,
+      "delta": -6971392.0,
+      "delta_percent": -4.820983457965103,
+      "improved": true
+    },
+    {
+      "timestamp": "2026-08-27T16:51:28.568802+00:00",
+      "timestamp_ms": 1787849488568.802,
+      "run_file": "2026-08-27T165128.568802+0000-6fb0afce2aaf-cluster.json",
+      "profile": "push",
+      "revision": "6fb0afce2aaf4b781cb72d61820a70bdf577f6cd",
+      "run_url": "https://github.com/winrarr/runnel/actions/runs/33094464649",
+      "comparison_mode": "cluster-baseline",
+      "benchmark_suite": "cluster",
+      "benchmark_series": "cluster",
+      "backend": "runnel-cluster",
+      "operation": "cluster_slow_consumer",
+      "message_size_bytes": 1024,
+      "metric": "cpu_efficiency_messages_per_cpu_second",
+      "value": 238.09523809523813,
+      "unit": "messages/CPU-second",
+      "repetitions": 3,
+      "range": {
+        "min": 238.09523809523787,
+        "median": 238.09523809523813,
+        "max": 238.09523809523813,
+        "relative_range_percent": 1.0743406164692713e-13,
+        "standard_deviation": 1.2058310082691391e-13,
+        "relative_standard_deviation_percent": 5.064490234730384e-14
+      },
+      "evidence": {
+        "aggregation": "median",
+        "sample_count": 3,
+        "repetition_count": 3,
+        "sample_coverage_percent": 100.0,
+        "sample_values": [
+          238.09523809523787,
+          238.09523809523813,
+          238.09523809523813
+        ]
+      },
+      "previous_value": 204.08163265306115,
+      "delta": 34.01360544217698,
+      "delta_percent": 16.66666666666673,
+      "improved": true
+    },
+    {
+      "timestamp": "2026-08-27T16:51:28.568802+00:00",
+      "timestamp_ms": 1787849488568.802,
+      "run_file": "2026-08-27T165128.568802+0000-6fb0afce2aaf-cluster.json",
+      "profile": "push",
+      "revision": "6fb0afce2aaf4b781cb72d61820a70bdf577f6cd",
+      "run_url": "https://github.com/winrarr/runnel/actions/runs/33094464649",
+      "comparison_mode": "cluster-baseline",
+      "benchmark_suite": "cluster",
+      "benchmark_series": "cluster",
+      "backend": "runnel-cluster",
+      "operation": "cluster_grouped_consume_ack",
+      "message_size_bytes": 1024,
+      "metric": "throughput_messages_per_second",
+      "value": 107.30874980157807,
+      "unit": "messages/s",
+      "repetitions": 3,
+      "range": {
+        "min": 106.4365660242554,
+        "median": 107.30874980157807,
+        "max": 110.23891891285041,
+        "relative_range_percent": 3.5433763748304266,
+        "standard_deviation": 1.6263279378022875,
+        "relative_standard_deviation_percent": 1.5155594868167692
+      },
+      "evidence": {
+        "aggregation": "median",
+        "sample_count": 3,
+        "repetition_count": 3,
+        "sample_coverage_percent": 100.0,
+        "sample_values": [
+          106.4365660242554,
+          107.30874980157807,
+          110.23891891285041
+        ]
+      },
+      "previous_value": 82.83350083765109,
+      "delta": 24.475248963926987,
+      "delta_percent": 29.547524511727534,
+      "improved": true
+    },
+    {
+      "timestamp": "2026-08-27T16:51:28.568802+00:00",
+      "timestamp_ms": 1787849488568.802,
+      "run_file": "2026-08-27T165128.568802+0000-6fb0afce2aaf-cluster.json",
+      "profile": "push",
+      "revision": "6fb0afce2aaf4b781cb72d61820a70bdf577f6cd",
+      "run_url": "https://github.com/winrarr/runnel/actions/runs/33094464649",
+      "comparison_mode": "cluster-baseline",
+      "benchmark_suite": "cluster",
+      "benchmark_series": "cluster",
+      "backend": "runnel-cluster",
+      "operation": "cluster_grouped_consume_ack",
+      "message_size_bytes": 1024,
+      "metric": "latency_p50",
+      "value": 7197.656,
+      "unit": "\u00b5s",
+      "repetitions": 3,
+      "range": {
+        "min": 7077.4545,
+        "median": 7197.656,
+        "max": 7289.132,
+        "relative_range_percent": 2.9409227115049648,
+        "standard_deviation": 86.68180841092827,
+        "relative_standard_deviation_percent": 1.2043060742403955
+      },
+      "evidence": {
+        "aggregation": "median",
+        "sample_count": 3,
+        "repetition_count": 3,
+        "sample_coverage_percent": 100.0,
+        "sample_values": [
+          7197.656,
+          7289.132,
+          7077.4545
+        ]
+      },
+      "previous_value": 6156.106,
+      "delta": 1041.5500000000002,
+      "delta_percent": 16.918974429615087,
+      "improved": false
+    },
+    {
+      "timestamp": "2026-08-27T16:51:28.568802+00:00",
+      "timestamp_ms": 1787849488568.802,
+      "run_file": "2026-08-27T165128.568802+0000-6fb0afce2aaf-cluster.json",
+      "profile": "push",
+      "revision": "6fb0afce2aaf4b781cb72d61820a70bdf577f6cd",
+      "run_url": "https://github.com/winrarr/runnel/actions/runs/33094464649",
+      "comparison_mode": "cluster-baseline",
+      "benchmark_suite": "cluster",
+      "benchmark_series": "cluster",
+      "backend": "runnel-cluster",
+      "operation": "cluster_grouped_consume_ack",
+      "message_size_bytes": 1024,
+      "metric": "latency_p99",
+      "value": 39995.43998999999,
+      "unit": "\u00b5s",
+      "repetitions": 3,
+      "range": {
+        "min": 39609.55067,
+        "median": 39995.43998999999,
+        "max": 40544.57266999999,
+        "relative_range_percent": 2.3378215122368253,
+        "standard_deviation": 383.6554310573221,
+        "relative_standard_deviation_percent": 0.9592479321473822
+      },
+      "evidence": {
+        "aggregation": "median",
+        "sample_count": 3,
+        "repetition_count": 3,
+        "sample_coverage_percent": 100.0,
+        "sample_values": [
+          39609.55067,
+          39995.43998999999,
+          40544.57266999999
+        ]
+      },
+      "previous_value": 95045.33663999995,
+      "delta": -55049.89664999996,
+      "delta_percent": -57.91961877994143,
+      "improved": true
+    },
+    {
+      "timestamp": "2026-08-27T16:51:28.568802+00:00",
+      "timestamp_ms": 1787849488568.802,
+      "run_file": "2026-08-27T165128.568802+0000-6fb0afce2aaf-cluster.json",
+      "profile": "push",
+      "revision": "6fb0afce2aaf4b781cb72d61820a70bdf577f6cd",
+      "run_url": "https://github.com/winrarr/runnel/actions/runs/33094464649",
+      "comparison_mode": "cluster-baseline",
+      "benchmark_suite": "cluster",
+      "benchmark_series": "cluster",
+      "backend": "runnel-cluster",
+      "operation": "cluster_grouped_consume_ack",
+      "message_size_bytes": 1024,
+      "metric": "latency_p999",
+      "value": 44138.80743800008,
+      "unit": "\u00b5s",
+      "repetitions": 3,
+      "range": {
+        "min": 43937.09337300007,
+        "median": 44138.80743800008,
+        "max": 45877.15930400009,
+        "relative_range_percent": 4.395374600288301,
+        "standard_deviation": 870.9134151804516,
+        "relative_standard_deviation_percent": 1.9731240278835962
+      },
+      "evidence": {
+        "aggregation": "median",
+        "sample_count": 3,
+        "repetition_count": 3,
+        "sample_coverage_percent": 100.0,
+        "sample_values": [
+          44138.80743800008,
+          43937.09337300007,
+          45877.15930400009
+        ]
+      },
+      "previous_value": 159418.14097500144,
+      "delta": -115279.33353700137,
+      "delta_percent": -72.3125566713756,
+      "improved": true
+    },
+    {
+      "timestamp": "2026-08-27T16:51:28.568802+00:00",
+      "timestamp_ms": 1787849488568.802,
+      "run_file": "2026-08-27T165128.568802+0000-6fb0afce2aaf-cluster.json",
+      "profile": "push",
+      "revision": "6fb0afce2aaf4b781cb72d61820a70bdf577f6cd",
+      "run_url": "https://github.com/winrarr/runnel/actions/runs/33094464649",
+      "comparison_mode": "cluster-baseline",
+      "benchmark_suite": "cluster",
+      "benchmark_series": "cluster",
+      "backend": "runnel-cluster",
+      "operation": "cluster_grouped_consume_ack",
+      "message_size_bytes": 1024,
+      "metric": "memory_bytes_max",
+      "value": 143511552.0,
+      "unit": "bytes",
+      "repetitions": 3,
+      "range": {
+        "min": 132042752.0,
+        "median": 143511552.0,
+        "max": 150401024.0,
+        "relative_range_percent": 12.792191112252763,
+        "standard_deviation": 7572056.440952763,
+        "relative_standard_deviation_percent": 5.276269635041479
+      },
+      "evidence": {
+        "aggregation": "median",
+        "sample_count": 3,
+        "repetition_count": 3,
+        "sample_coverage_percent": 100.0,
+        "sample_values": [
+          132042752.0,
+          150401024.0,
+          143511552.0
+        ]
+      },
+      "previous_value": 154591232.0,
+      "delta": -11079680.0,
+      "delta_percent": -7.1670817656721955,
+      "improved": true
+    },
+    {
+      "timestamp": "2026-08-27T16:51:28.568802+00:00",
+      "timestamp_ms": 1787849488568.802,
+      "run_file": "2026-08-27T165128.568802+0000-6fb0afce2aaf-cluster.json",
+      "profile": "push",
+      "revision": "6fb0afce2aaf4b781cb72d61820a70bdf577f6cd",
+      "run_url": "https://github.com/winrarr/runnel/actions/runs/33094464649",
+      "comparison_mode": "cluster-baseline",
+      "benchmark_suite": "cluster",
+      "benchmark_series": "cluster",
+      "backend": "runnel-cluster",
+      "operation": "cluster_grouped_consume_ack",
+      "message_size_bytes": 1024,
+      "metric": "cpu_efficiency_messages_per_cpu_second",
+      "value": 240.96385542168647,
+      "unit": "messages/CPU-second",
+      "repetitions": 3,
+      "range": {
+        "min": 238.09523809523787,
+        "median": 240.96385542168647,
+        "max": 243.90243902439016,
+        "relative_range_percent": 2.409988385598202,
+        "standard_deviation": 2.370837207664726,
+        "relative_standard_deviation_percent": 0.9838974411808624
+      },
+      "evidence": {
+        "aggregation": "median",
+        "sample_count": 3,
+        "repetition_count": 3,
+        "sample_coverage_percent": 100.0,
+        "sample_values": [
+          238.09523809523787,
+          240.96385542168647,
+          243.90243902439016
+        ]
+      },
+      "previous_value": 212.76595744680841,
+      "delta": 28.19789797487806,
+      "delta_percent": 13.253012048192694,
+      "improved": true
+    },
+    {
+      "timestamp": "2026-08-27T16:51:28.568802+00:00",
+      "timestamp_ms": 1787849488568.802,
+      "run_file": "2026-08-27T165128.568802+0000-6fb0afce2aaf-cluster.json",
+      "profile": "push",
+      "revision": "6fb0afce2aaf4b781cb72d61820a70bdf577f6cd",
+      "run_url": "https://github.com/winrarr/runnel/actions/runs/33094464649",
+      "comparison_mode": "cluster-baseline",
+      "benchmark_suite": "cluster",
+      "benchmark_series": "cluster",
+      "backend": "runnel-cluster",
+      "operation": "cluster_parallel_grouped_consume_ack",
+      "message_size_bytes": 1024,
+      "metric": "throughput_messages_per_second",
+      "value": 125.13773049673878,
+      "unit": "messages/s",
+      "repetitions": 3,
+      "range": {
+        "min": 123.66062993950368,
+        "median": 125.13773049673878,
+        "max": 127.05498066631993,
+        "relative_range_percent": 2.7124918386662897,
+        "standard_deviation": 1.3896158991918617,
+        "relative_standard_deviation_percent": 1.1104691556061714
+      },
+      "evidence": {
+        "aggregation": "median",
+        "sample_count": 3,
+        "repetition_count": 3,
+        "sample_coverage_percent": 100.0,
+        "sample_values": [
+          127.05498066631993,
+          125.13773049673878,
+          123.66062993950368
+        ]
+      },
+      "previous_value": 64.79980695152553,
+      "delta": 60.33792354521326,
+      "delta_percent": 93.11435694607849,
+      "improved": true
+    },
+    {
+      "timestamp": "2026-08-27T16:51:28.568802+00:00",
+      "timestamp_ms": 1787849488568.802,
+      "run_file": "2026-08-27T165128.568802+0000-6fb0afce2aaf-cluster.json",
+      "profile": "push",
+      "revision": "6fb0afce2aaf4b781cb72d61820a70bdf577f6cd",
+      "run_url": "https://github.com/winrarr/runnel/actions/runs/33094464649",
+      "comparison_mode": "cluster-baseline",
+      "benchmark_suite": "cluster",
+      "benchmark_series": "cluster",
+      "backend": "runnel-cluster",
+      "operation": "cluster_parallel_grouped_consume_ack",
+      "message_size_bytes": 1024,
+      "metric": "latency_p50",
+      "value": 12079.7575,
+      "unit": "\u00b5s",
+      "repetitions": 3,
+      "range": {
+        "min": 11769.2385,
+        "median": 12079.7575,
+        "max": 12185.7085,
+        "relative_range_percent": 3.4476685479820364,
+        "standard_deviation": 176.72795309992426,
+        "relative_standard_deviation_percent": 1.4630091133859622
+      },
+      "evidence": {
+        "aggregation": "median",
+        "sample_count": 3,
+        "repetition_count": 3,
+        "sample_coverage_percent": 100.0,
+        "sample_values": [
+          11769.2385,
+          12079.7575,
+          12185.7085
+        ]
+      },
+      "previous_value": 11209.151,
+      "delta": 870.6064999999999,
+      "delta_percent": 7.766926326534453,
+      "improved": false
+    },
+    {
+      "timestamp": "2026-08-27T16:51:28.568802+00:00",
+      "timestamp_ms": 1787849488568.802,
+      "run_file": "2026-08-27T165128.568802+0000-6fb0afce2aaf-cluster.json",
+      "profile": "push",
+      "revision": "6fb0afce2aaf4b781cb72d61820a70bdf577f6cd",
+      "run_url": "https://github.com/winrarr/runnel/actions/runs/33094464649",
+      "comparison_mode": "cluster-baseline",
+      "benchmark_suite": "cluster",
+      "benchmark_series": "cluster",
+      "backend": "runnel-cluster",
+      "operation": "cluster_parallel_grouped_consume_ack",
+      "message_size_bytes": 1024,
+      "metric": "latency_p99",
+      "value": 49074.33332999998,
+      "unit": "\u00b5s",
+      "repetitions": 3,
+      "range": {
+        "min": 49048.34844999998,
+        "median": 49074.33332999998,
+        "max": 49704.9537,
+        "relative_range_percent": 1.3379809881158813,
+        "standard_deviation": 303.58738800021854,
+        "relative_standard_deviation_percent": 0.6186276356700506
+      },
+      "evidence": {
+        "aggregation": "median",
+        "sample_count": 3,
+        "repetition_count": 3,
+        "sample_coverage_percent": 100.0,
+        "sample_values": [
+          49704.9537,
+          49048.34844999998,
+          49074.33332999998
+        ]
+      },
+      "previous_value": 610161.3708500001,
+      "delta": -561087.0375200001,
+      "delta_percent": -91.95715499628635,
+      "improved": true
+    },
+    {
+      "timestamp": "2026-08-27T16:51:28.568802+00:00",
+      "timestamp_ms": 1787849488568.802,
+      "run_file": "2026-08-27T165128.568802+0000-6fb0afce2aaf-cluster.json",
+      "profile": "push",
+      "revision": "6fb0afce2aaf4b781cb72d61820a70bdf577f6cd",
+      "run_url": "https://github.com/winrarr/runnel/actions/runs/33094464649",
+      "comparison_mode": "cluster-baseline",
+      "benchmark_suite": "cluster",
+      "benchmark_series": "cluster",
+      "backend": "runnel-cluster",
+      "operation": "cluster_parallel_grouped_consume_ack",
+      "message_size_bytes": 1024,
+      "metric": "latency_p999",
+      "value": 52409.22141000002,
+      "unit": "\u00b5s",
+      "repetitions": 3,
+      "range": {
+        "min": 51894.01464700002,
+        "median": 52409.22141000002,
+        "max": 53911.43062500008,
+        "relative_range_percent": 3.849353078950962,
+        "standard_deviation": 855.8321332391449,
+        "relative_standard_deviation_percent": 1.6329800562079073
+      },
+      "evidence": {
+        "aggregation": "median",
+        "sample_count": 3,
+        "repetition_count": 3,
+        "sample_coverage_percent": 100.0,
+        "sample_values": [
+          53911.43062500008,
+          51894.01464700002,
+          52409.22141000002
+        ]
+      },
+      "previous_value": 620159.8702520002,
+      "delta": -567750.6488420002,
+      "delta_percent": -91.5490788869161,
+      "improved": true
+    },
+    {
+      "timestamp": "2026-08-27T16:51:28.568802+00:00",
+      "timestamp_ms": 1787849488568.802,
+      "run_file": "2026-08-27T165128.568802+0000-6fb0afce2aaf-cluster.json",
+      "profile": "push",
+      "revision": "6fb0afce2aaf4b781cb72d61820a70bdf577f6cd",
+      "run_url": "https://github.com/winrarr/runnel/actions/runs/33094464649",
+      "comparison_mode": "cluster-baseline",
+      "benchmark_suite": "cluster",
+      "benchmark_series": "cluster",
+      "backend": "runnel-cluster",
+      "operation": "cluster_parallel_grouped_consume_ack",
+      "message_size_bytes": 1024,
+      "metric": "memory_bytes_max",
+      "value": 147070976.0,
+      "unit": "bytes",
+      "repetitions": 3,
+      "range": {
+        "min": 144953344.0,
+        "median": 147070976.0,
+        "max": 163033088.0,
+        "relative_range_percent": 12.293210048459867,
+        "standard_deviation": 8070181.933055261,
+        "relative_standard_deviation_percent": 5.487270264022224
+      },
+      "evidence": {
+        "aggregation": "median",
+        "sample_count": 3,
+        "repetition_count": 3,
+        "sample_coverage_percent": 100.0,
+        "sample_values": [
+          144953344.0,
+          163033088.0,
+          147070976.0
+        ]
+      },
+      "previous_value": 165752832.0,
+      "delta": -18681856.0,
+      "delta_percent": -11.270912101218276,
+      "improved": true
+    },
+    {
+      "timestamp": "2026-08-27T16:51:28.568802+00:00",
+      "timestamp_ms": 1787849488568.802,
+      "run_file": "2026-08-27T165128.568802+0000-6fb0afce2aaf-cluster.json",
+      "profile": "push",
+      "revision": "6fb0afce2aaf4b781cb72d61820a70bdf577f6cd",
+      "run_url": "https://github.com/winrarr/runnel/actions/runs/33094464649",
+      "comparison_mode": "cluster-baseline",
+      "benchmark_suite": "cluster",
+      "benchmark_series": "cluster",
+      "backend": "runnel-cluster",
+      "operation": "cluster_parallel_grouped_consume_ack",
+      "message_size_bytes": 1024,
+      "metric": "cpu_efficiency_messages_per_cpu_second",
+      "value": 246.91358024691343,
+      "unit": "messages/CPU-second",
+      "repetitions": 3,
+      "range": {
+        "min": 246.9135802469129,
+        "median": 246.91358024691343,
+        "max": 246.91358024691343,
+        "relative_range_percent": 2.1870505406695897e-13,
+        "standard_deviation": 2.545643239679294e-13,
+        "relative_standard_deviation_percent": 1.0309855120701148e-13
+      },
+      "evidence": {
+        "aggregation": "median",
+        "sample_count": 3,
+        "repetition_count": 3,
+        "sample_coverage_percent": 100.0,
+        "sample_values": [
+          246.91358024691343,
+          246.9135802469129,
+          246.91358024691343
+        ]
+      },
+      "previous_value": 215.05376344086028,
+      "delta": 31.859816806053146,
+      "delta_percent": 14.814814814814708,
+      "improved": true
+    },
+    {
+      "timestamp": "2026-08-27T16:51:28.568802+00:00",
+      "timestamp_ms": 1787849488568.802,
+      "run_file": "2026-08-27T165128.568802+0000-6fb0afce2aaf-cluster.json",
+      "profile": "push",
+      "revision": "6fb0afce2aaf4b781cb72d61820a70bdf577f6cd",
+      "run_url": "https://github.com/winrarr/runnel/actions/runs/33094464649",
+      "comparison_mode": "cluster-baseline",
+      "benchmark_suite": "cluster",
+      "benchmark_series": "cluster",
+      "backend": "runnel-cluster",
+      "operation": "broker",
+      "message_size_bytes": null,
+      "metric": "memory_bytes_max",
+      "value": 147070976.0,
+      "unit": "bytes",
+      "repetitions": 3,
+      "range": {
+        "min": 144953344.0,
+        "median": 147070976.0,
+        "max": 163033088.0,
+        "relative_range_percent": 12.293210048459867,
+        "standard_deviation": 8070181.933055261,
+        "relative_standard_deviation_percent": 5.487270264022224
+      },
+      "evidence": {
+        "aggregation": "median",
+        "sample_count": 3,
+        "repetition_count": 3,
+        "sample_coverage_percent": 100.0,
+        "sample_values": [
+          144953344.0,
+          163033088.0,
+          147070976.0
+        ]
+      },
+      "previous_value": 165752832.0,
+      "delta": -18681856.0,
+      "delta_percent": -11.270912101218276,
+      "improved": true
     }
   ]
 }
