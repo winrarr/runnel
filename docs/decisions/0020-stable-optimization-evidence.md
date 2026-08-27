@@ -18,6 +18,23 @@ report and raw artifacts remain available when the result is inconclusive so
 that noise or environmental problems can be investigated, but an inconclusive
 result cannot support a performance claim or complete the optimization work.
 
+The throughput and p99 range thresholds are descriptive statistical
+repeatability requirements. They are not significance tests, confidence
+intervals, or a probability that a result is caused by host noise. An
+inconclusive result means that the raw range for at least one measured metric
+and revision exceeded its configured limit by the maximum repetition count (or
+that the minimum count was not reached). It does not establish that the change
+is generally better, generally worse, or random. The report provides that
+separate descriptive interpretation by comparing matched scenario medians and
+counting improvements, regressions, and ties.
+
+Reports include a Tukey 1.5×IQR outlier-sensitivity view. This is diagnostic:
+paired samples are marked when either revision's sample is outside its
+scenario's fence, but raw observations are retained and raw ranges remain the
+authoritative stability requirement. Automatic filtering is deliberately not a
+way to turn an inconclusive result into optimization evidence; with only three
+to seven repetitions, a real workload mode can be mistaken for an outlier.
+
 Changes that are reasonably performance-neutral use the normal correctness
 verification path. They do not need the pull-request benchmark unless their
 behavior plausibly affects runtime cost.

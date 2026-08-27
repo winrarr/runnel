@@ -21,6 +21,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
+from statistics import median
 from typing import Iterator
 
 
@@ -381,6 +382,200 @@ def _range_percent(result: dict[str, object], metric: str) -> float | None:
     return maximum
 
 
+def _scenario_key(backend_name: object, scenario: dict[str, object]) -> tuple[str, str, str, str, str]:
+    operation = scenario.get("operation", scenario.get("name", "unknown"))
+    return (
+        str(backend_name),
+        str(operation),
+        json.dumps(scenario.get("message_size_bytes"), sort_keys=True),
+        json.dumps(scenario.get("messages"), sort_keys=True),
+        json.dumps(scenario.get("metadata", {}), sort_keys=True),
+    )
+
+
+def _metric_samples(result: dict[str, object], metric: str) -> dict[tuple[str, str, str, str, str], list[float]]:
+    samples: dict[tuple[str, str, str, str, str], list[float]] = {}
+    backends = result.get("backends")
+    if not isinstance(backends, dict):
+        return samples
+    for backend_name, backend in backends.items():
+        if not isinstance(backend, dict):
+            continue
+        scenarios = backend.get("scenarios")
+        if not isinstance(scenarios, list):
+            continue
+        for scenario in scenarios:
+            if not isinstance(scenario, dict):
+                continue
+            repetition_summary = scenario.get("repetition_summary")
+            if not isinstance(repetition_summary, dict):
+                continue
+            metric_summary = (
+                repetition_summary.get("throughput_messages_per_second")
+                if metric == "throughput"
+                else repetition_summary.get("latency_p99")
+            )
+            if not isinstance(metric_summary, dict):
+                continue
+            values = metric_summary.get("samples")
+            if not isinstance(values, list):
+                continue
+            numeric = [
+                float(value)
+                for value in values
+                if isinstance(value, (int, float)) and not isinstance(value, bool)
+            ]
+            if numeric:
+                samples[_scenario_key(backend_name, scenario)] = numeric
+    return samples
+
+
+def _quartile(values: list[float], fraction: float) -> float:
+    ordered = sorted(values)
+    position = (len(ordered) - 1) * fraction
+    lower = int(position)
+    upper = min(lower + 1, len(ordered) - 1)
+    weight = position - lower
+    return ordered[lower] + (ordered[upper] - ordered[lower]) * weight
+
+
+def _tukey_outliers(values: list[float]) -> set[int]:
+    """Return Tukey-fence indices for a sample set large enough to filter."""
+    if len(values) < 4:
+        return set()
+    first_quartile = _quartile(values, 0.25)
+    third_quartile = _quartile(values, 0.75)
+    spread = third_quartile - first_quartile
+    lower_fence = first_quartile - 1.5 * spread
+    upper_fence = third_quartile + 1.5 * spread
+    return {
+        index
+        for index, value in enumerate(values)
+        if value < lower_fence or value > upper_fence
+    }
+
+
+def _range_for_samples(values: list[float]) -> float | None:
+    if len(values) < 2:
+        return None
+    center = float(median(values))
+    if center == 0:
+        return None
+    return (max(values) - min(values)) / abs(center) * 100
+
+
+def _direction_summary(
+    pairs: list[tuple[list[float], list[float], set[int]]],
+    *,
+    metric: str,
+) -> dict[str, object]:
+    deltas: list[float] = []
+    improved = worsened = neutral = 0
+    paired_samples = 0
+    for current, baseline, excluded in pairs:
+        retained_indices = [
+            index for index in range(min(len(current), len(baseline))) if index not in excluded
+        ]
+        if not retained_indices:
+            continue
+        current_median = float(median([current[index] for index in retained_indices]))
+        baseline_median = float(median([baseline[index] for index in retained_indices]))
+        if baseline_median == 0:
+            continue
+        delta = (current_median - baseline_median) / abs(baseline_median) * 100
+        deltas.append(delta)
+        paired_samples += len(retained_indices)
+        if delta == 0:
+            neutral += 1
+        elif (metric == "throughput" and delta > 0) or (metric == "p99" and delta < 0):
+            improved += 1
+        else:
+            worsened += 1
+
+    if not deltas:
+        return {"status": "unavailable"}
+    if improved > worsened:
+        direction = "generally improved"
+    elif worsened > improved:
+        direction = "generally worsened"
+    else:
+        direction = "mixed/unclear"
+    return {
+        "status": "available",
+        "direction": direction,
+        "median_delta_percent": float(median(deltas)),
+        "improved_scenarios": improved,
+        "worsened_scenarios": worsened,
+        "neutral_scenarios": neutral,
+        "scenario_count": len(deltas),
+        "paired_samples": paired_samples,
+    }
+
+
+def _metric_interpretation(
+    current: dict[str, object],
+    baseline: dict[str, object],
+    metric: str,
+) -> dict[str, object]:
+    current_samples = _metric_samples(current, metric)
+    baseline_samples = _metric_samples(baseline, metric)
+    pairs: list[tuple[list[float], list[float], set[int]]] = []
+    raw_ranges: list[float] = []
+    filtered_ranges: list[float] = []
+    candidate_outlier_pairs = 0
+    total_pairs = 0
+    for key in sorted(current_samples.keys() & baseline_samples.keys()):
+        current_values = current_samples[key]
+        baseline_values = baseline_samples[key]
+        pair_count = min(len(current_values), len(baseline_values))
+        if pair_count == 0:
+            continue
+        current_values = current_values[:pair_count]
+        baseline_values = baseline_values[:pair_count]
+        excluded = _tukey_outliers(current_values) | _tukey_outliers(baseline_values)
+        pairs.append((current_values, baseline_values, excluded))
+        total_pairs += pair_count
+        candidate_outlier_pairs += len(excluded)
+        for values in (current_values, baseline_values):
+            value_range = _range_for_samples(values)
+            if value_range is not None:
+                raw_ranges.append(value_range)
+            retained = [value for index, value in enumerate(values) if index not in excluded]
+            value_range = _range_for_samples(retained)
+            if value_range is not None:
+                filtered_ranges.append(value_range)
+
+    if not pairs:
+        return {"status": "unavailable"}
+    filtered_pairs = _direction_summary(pairs, metric=metric)
+    raw_pairs = _direction_summary(
+        [(current_values, baseline_values, set()) for current_values, baseline_values, _ in pairs],
+        metric=metric,
+    )
+    return {
+        "status": "available",
+        "raw": raw_pairs,
+        "filtered": filtered_pairs,
+        "total_pairs": total_pairs,
+        "candidate_outlier_pairs": candidate_outlier_pairs,
+        "retained_pairs": total_pairs - candidate_outlier_pairs,
+        "raw_max_range_percent": max(raw_ranges) if raw_ranges else None,
+        "filtered_max_range_percent": max(filtered_ranges) if filtered_ranges else None,
+    }
+
+
+def benchmark_interpretation(
+    current: dict[str, object], baseline: dict[str, object]
+) -> dict[str, object]:
+    """Describe direction and robust outlier sensitivity without making an inference claim."""
+    return {
+        "method": "Matched scenario medians; higher throughput and lower p99 are improvements.",
+        "throughput": _metric_interpretation(current, baseline, "throughput"),
+        "p99": _metric_interpretation(current, baseline, "p99"),
+        "outlier_method": "Diagnostic Tukey 1.5xIQR fences per scenario and revision; a pair is excluded if either side is flagged.",
+    }
+
+
 def assess_stability(
     current: dict[str, object],
     baseline: dict[str, object],
@@ -412,6 +607,17 @@ def assess_stability(
         status = "stable"
     else:
         status = "inconclusive"
+    reasons: list[str] = []
+    if repetitions < options.min_repetitions:
+        reasons.append("minimum repetitions were not reached")
+    if throughput_range is None:
+        reasons.append("no throughput range was available")
+    elif throughput_range > options.max_throughput_range_percent:
+        reasons.append("throughput range exceeded its limit")
+    if p99_range is None:
+        reasons.append("no p99 range was available")
+    elif p99_range > options.max_p99_range_percent:
+        reasons.append("p99 range exceeded its limit")
     return {
         "status": status,
         "repetitions": repetitions,
@@ -421,6 +627,8 @@ def assess_stability(
         "maximum_p99_range_percent": options.max_p99_range_percent,
         "observed_throughput_range_percent": throughput_range,
         "observed_p99_range_percent": p99_range,
+        "inconclusive_reasons": reasons,
+        "interpretation": benchmark_interpretation(current, baseline),
     }
 
 

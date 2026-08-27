@@ -178,12 +178,67 @@ class PrReportTests(unittest.TestCase):
             "observed_p99_range_percent": 0.0,
             "maximum_throughput_range_percent": 10.0,
             "maximum_p99_range_percent": 20.0,
+            "interpretation": {
+                "throughput": {
+                    "status": "available",
+                    "candidate_outlier_pairs": 1,
+                    "total_pairs": 9,
+                    "filtered_max_range_percent": 7.0,
+                    "raw": {
+                        "status": "available",
+                        "direction": "generally improved",
+                        "median_delta_percent": 4.5,
+                        "improved_scenarios": 2,
+                        "worsened_scenarios": 1,
+                        "neutral_scenarios": 0,
+                        "scenario_count": 3,
+                    },
+                    "filtered": {
+                        "status": "available",
+                        "direction": "generally improved",
+                        "median_delta_percent": 4.5,
+                        "improved_scenarios": 2,
+                        "worsened_scenarios": 1,
+                        "neutral_scenarios": 0,
+                        "scenario_count": 3,
+                    },
+                },
+                "p99": {
+                    "status": "available",
+                    "candidate_outlier_pairs": 0,
+                    "total_pairs": 9,
+                    "filtered_max_range_percent": 12.0,
+                    "raw": {
+                        "status": "available",
+                        "direction": "mixed/unclear",
+                        "median_delta_percent": -0.5,
+                        "improved_scenarios": 1,
+                        "worsened_scenarios": 1,
+                        "neutral_scenarios": 1,
+                        "scenario_count": 3,
+                    },
+                    "filtered": {
+                        "status": "available",
+                        "direction": "mixed/unclear",
+                        "median_delta_percent": -0.5,
+                        "improved_scenarios": 1,
+                        "worsened_scenarios": 1,
+                        "neutral_scenarios": 1,
+                        "scenario_count": 3,
+                    },
+                },
+            },
         }
 
         report = pr_report.render_report(result)
 
         self.assertIn("Measurement stability: fixed-repetitions after 1 paired runs", report)
         self.assertIn("Treat this result as diagnostic", report)
+        self.assertIn("Throughput: generally improved", report)
+        self.assertIn("p99: mixed/unclear", report)
+        self.assertIn("Outlier analysis (diagnostic)", report)
+        self.assertIn("Outlier-sensitive direction (diagnostic)", report)
+        self.assertIn("Raw samples and raw stability ranges remain authoritative", report)
 
 
 if __name__ == "__main__":
