@@ -78,15 +78,16 @@ Tell each worker to:
 - record the exact revision, workload, resource limits, isolation settings, and commands;
 - for performance-sensitive work, run the local benchmark sequentially with a fixed CPU/memory budget and record the actual repetition count, stability thresholds, and stable status; treat an inconclusive authoritative run as unfinished evidence;
 - distinguish a confirmed improvement from noise, a blocked run, and an inconclusive result;
-- report changed files, correctness and crash-recovery considerations, test results, benchmark applicability and findings, and remaining risks. For a feature that could affect performance, include the revision, workload, repetition and stability result, or the reason an authoritative run was not required; include blocked or inconclusive results rather than omitting them;
+- report changed files, correctness and crash-recovery considerations, test results, and remaining risks. State the expected effects and non-effects, including which behavior, runtime paths, workloads, and resource dimensions should change or remain unchanged; list non-performance improvements separately. For each benchmark, report applicability, coverage gaps, exact findings, repetition and stability results, directional medians, and outlier diagnostics when available; include blocked or inconclusive results rather than omitting them. End with an evidence-based recommendation to merge, revise, rerun, or defer;
 - report the recorded baseline revision, newest `origin/main` revision, default-branch CI status when available, and whether the branch was refreshed;
 - commit the result on its task branch when code is ready, or leave a clearly documented uncommitted patch when it is not.
 
 When coordinating delegated work, the orchestrator must collect each worker's
-benchmark applicability and findings and include them in the final status,
-review, or pull-request handoff. A worker's missing, blocked, or inconclusive
-benchmark report remains an explicit unresolved result; it must not be silently
-collapsed into the orchestrator's own summary.
+expected effects, non-performance improvements, benchmark applicability and
+findings, and recommendation and include them in the final status, review, or
+pull-request handoff. A worker's missing, blocked, or inconclusive benchmark
+report remains an explicit unresolved result; it must not be silently collapsed
+into the orchestrator's own summary.
 
 ## Integration
 
