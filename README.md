@@ -69,11 +69,14 @@ Useful workflows:
     just isolated cluster-test
     just isolated cluster-replacement-test
     just isolated bench-container-smoke
+    just isolated bench-cluster-smoke
     just cluster-test
     just cluster-replacement-test
     just bench
     just bench-container
+    just bench-container-smoke
     just bench-cluster
+    just bench-cluster-smoke
     just bench-pr-local
     just bench-pr-local-until-stable
     just bench-pr-local-quick
@@ -94,19 +97,9 @@ for the format; GitHub Actions enforces it on pull requests and new commits to
 
 When multiple local processes, containers, or test suites need to run at the same time, use `just isolated <workflow>`. Each invocation gets its own Cargo target directory, temporary-file directory, benchmark artifact directory, and workflow-specific Docker resources. The supported workflows are listed by `python3 scripts/isolated.py --help`; failed runs retain their temporary state for diagnosis, while successful build state is removed and benchmark results remain under `benchmark-results/isolated/`. This is intentionally a named-workflow interface rather than a wrapper for arbitrary commands whose ports or external state are unknown.
 
-The test suite includes core persistence and recovery tests, wire-format round-trip tests, and a network-level test that starts the real broker process and verifies acknowledgement state across restart. `just smoke` is the canonical local end-to-end test: it starts the broker itself and uses `runnelctl` to publish, consume, acknowledge, restart, and verify recovery. The benchmark suite measures durable publish and publish/poll/ack paths; benchmark results must always be interpreted with their durability settings and workload. See [docs/testing.md](docs/testing.md) for the interactive walkthrough and test layers.
+The test suite includes core persistence and recovery tests, wire-format round-trip tests, and a network-level test that starts the real broker process and verifies acknowledgement state across restart. `just smoke` is the canonical local end-to-end test: it starts the broker itself and uses `runnelctl` to publish, consume, acknowledge, restart, and verify recovery. See [docs/testing.md](docs/testing.md) for the interactive walkthrough and test layers.
 
-`just bench-container` builds a resource-limited Runnel container and runs repeatable end-to-end workload scenarios for 100-byte and 1-KiB messages. It writes machine-readable results under the ignored `benchmark-results/` directory. See [scripts/benchmarks/README.md](scripts/benchmarks/README.md) for workload semantics and comparison limitations.
-
-`just bench-cluster` builds the release broker and runs durable publish, non-grouped delivery, shared-consumer delivery, and restart-recovery scenarios against a real three-node cluster. `just profile-cluster` captures optional Linux `perf` call graphs for the broker processes under sustained traffic. Both workflows write ignored artifacts under `benchmark-results/`; profiling requires suitable Linux kernel permissions.
-
-`just profile-cluster-instrumented` enables the opt-in Rust timing feature and records stage timing summaries for protocol handling, lock waits, storage, Raft quorum operations, state-machine application, and peer RPCs. The default build does not compile these timing calls. It is useful on hosts where `perf` is unavailable or restricted; combine `--features instrumentation` with the normal profile command when both internal timings and `perf` are available.
-
-Evaluate benchmark requirements case by case. For a change intended to improve throughput, latency, or tail latency—or one that changes a hot path with a plausible runtime effect—run `just bench-pr-local`. It waits for the exclusive local benchmark lock, compares the current commit with `origin/main` on the same host inside the same 2-CPU/2-GiB Linux systemd user scope, alternates paired runs, and writes a report under `benchmark-results/pr-local/`. The authoritative command exits nonzero unless the throughput and p99 ranges become stable, so only a stable report supports an optimization claim. When host noise makes a complete run inconclusive, use `just bench-pr-local-until-stable` to hold the exclusive lock and retry complete comparisons up to its explicit attempt budget; it retains each report and never treats an inconclusive or fixed-repetition run as evidence. Performance-neutral changes need not run it unless runtime impact is plausible. `just bench-pr-local-quick` uses a shared lock and an explicit diagnostic override for one pair; do not use it as evidence. Full cluster, container, competitor, and profiling benchmarks use the exclusive lock. The local benchmark skips restart recovery by default to keep feedback practical; the longer clustered history benchmark includes recovery separately. Use the `just` recipes rather than invoking controllers directly so concurrent local benchmark sessions cannot contend for host resources.
-
-`just bench-compare` builds Runnel and runs an isolated first-pass native-tool comparison against pinned Kafka, Redpanda, and NATS JetStream containers. It uses a 2 CPU/2 GiB broker and client budget by default because Redpanda's development container needs more than a 1 GiB cgroup. Results are written under the ignored `benchmark-results/` directory and must be read with the recorded measurement boundaries; this is an engineering baseline, not a final apples-to-apples claim. Missing pinned benchmark images are pulled automatically.
-
-`just bench-compare-cluster` runs the verified first three-node RF=3 publish comparison against Kafka, Redpanda, and NATS JetStream with explicit resource limits. `just bench-dashboard` generates local benchmark history data from JSON results under `benchmark-results/`. GitHub Actions keeps the longer Runnel-only history suite on pushes to `main` and daily, and runs competitor comparisons weekly or manually; it does not run noisy PR benchmark jobs. Use same-host `just bench-pr-local` results in performance-sensitive pull requests; Runnel history is the primary long-term signal for evaluating optimizations, while competitor series are separate ranking evidence. Each history suite is aggregated by median while retaining observed ranges and compatible-run comparisons, and the generated data is appended to the `benchmark-history` branch. GitHub Pages serves the hand-authored dashboard in `docs/benchmarks/` from `main`; the dashboard reads the public history data directly from that branch.
+Benchmark workflows and interpretation are documented in [docs/benchmarking.md](docs/benchmarking.md). See [scripts/benchmarks/README.md](scripts/benchmarks/README.md) for harness semantics and comparison limitations.
 
 The current protocol accepts one JSON request per TCP line. For example:
 
@@ -118,7 +111,7 @@ Grouped delivery uses `poll_group` and `ack_group` requests with a consumer name
 
 Message responses include a delivery attempt while retry state is being tracked. Dead-letter records are available on the source stream's .dead-letter stream and preserve the original key and payload.
 
-See [docs/product-fit.md](docs/product-fit.md) for the initial audience and product boundaries, [docs/architecture.md](docs/architecture.md) for the current technical boundaries, [docs/research/README.md](docs/research/README.md) for source-backed investigations, [docs/design/multi-raft-implementation-plan.md](docs/design/multi-raft-implementation-plan.md) for the proposed first clustered plan, [docs/backlog.md](docs/backlog.md) for intended next outcomes, and [docs/tech-debt.md](docs/tech-debt.md) for known implementation shortcuts. Repository operating guidance lives in AGENTS.md.
+See [docs/product-fit.md](docs/product-fit.md) for the initial audience and product boundaries, [docs/architecture.md](docs/architecture.md) for the current technical boundaries, [docs/benchmarking.md](docs/benchmarking.md) for benchmark policy, [docs/research/README.md](docs/research/README.md) for source-backed investigations, [docs/design/multi-raft-implementation-plan.md](docs/design/multi-raft-implementation-plan.md) for the first clustered plan, [docs/backlog.md](docs/backlog.md) for intended next outcomes, and [docs/tech-debt.md](docs/tech-debt.md) for known implementation shortcuts. Repository operating guidance lives in AGENTS.md.
 
 For dependency auditing, install cargo-audit and run:
 

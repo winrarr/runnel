@@ -28,13 +28,14 @@ Runnel is a Rust message broker intended to offer durable streams, low operation
 - docs/benchmarks/: hand-authored static benchmark dashboard served by GitHub Pages.
 - scripts/benchmarks/README.md: benchmark scope, semantics, and comparison guidance.
 - docs/architecture.md: current data flow and boundaries.
+- docs/benchmarking.md: canonical benchmark applicability, interpretation, and handoff evidence policy.
 - docs/product-fit.md: initial audience, representative workloads, product promise, non-goals, and validation needs.
-- docs/design/: active architecture explorations, alternatives, and proposed implementation plans that are not accepted decisions.
+- docs/design/: active architecture explorations, alternatives, and implementation plans; accepted choices belong in docs/decisions/.
 - docs/research/: source-backed investigations, competitor comparisons, and measured evidence that inform design without becoming decisions by themselves.
 - docs/decisions/: consequential decisions that should not be rediscovered from code.
 - docs/backlog.md: explicitly intended product outcomes that are not implemented yet.
 - docs/tech-debt.md: known implementation shortcuts, their impact, and retirement conditions.
-- docs/testing.md: canonical local, interactive, integration, and benchmark workflows.
+- docs/testing.md: canonical local, interactive, integration, and test workflows.
 - deploy/kubernetes/: illustrative single-node and three-node StatefulSet deployments.
 - justfile: canonical Linux development command interface.
 - scripts/smoke.sh: repeatable broker/CLI/restart smoke test.
@@ -57,13 +58,9 @@ The current implementation serializes broker operations behind one in-process lo
 - Keep stream and consumer names validated before they become filesystem paths.
 - Prefer small domain types and explicit state transitions over transport-specific logic in the core.
 - Add a focused crash/recovery test before changing persistence, acknowledgement, or redelivery behavior.
-- Treat benchmarks as part of performance work; include the durability mode and workload in every result.
-- Evaluate benchmark requirements case by case. A change whose goal is to improve throughput, latency, or tail latency, or that changes a hot path with a plausible runtime effect, requires an authoritative `just bench-pr-local` run after committing. The helper compares the current revision with `origin/main` on the same host inside an explicit Linux CPU/memory scope and exits nonzero unless paired throughput and p99 measurements meet the stability thresholds. Rerun or investigate the environment until the result is stable before claiming or accepting a performance improvement. Performance-neutral changes need not run this benchmark unless their behavior plausibly affects runtime cost. `just bench-pr-local-quick` and explicit `--allow-inconclusive` runs are diagnostics only; hosted PR benchmarks are not proof.
-- Treat throughput and p99 ranges as descriptive repeatability requirements, not formal significance tests or confidence intervals. An inconclusive report must say which raw range did not meet its limit and must report descriptive direction from matched scenario medians (improved, worsened, tied, or mixed) when available. Reports may show a Tukey 1.5×IQR outlier-sensitive view, but must retain raw samples and keep raw ranges authoritative; never silently discard observations or select a favorable filtered result.
-- When completing a feature that could affect performance, report whether an authoritative benchmark was required and the findings, including the revision, workload, repetition and stability result, or the reason a run was not required. An orchestrating agent must collect and relay this benchmark report for every delegated subtask, including blocked or inconclusive results, rather than omitting it from the final handoff.
-- Every feature or bug-fix handoff must also state the expected effects and non-effects: which behavior, runtime paths, workloads, and resource dimensions should change or remain unchanged. List correctness, recovery, resource, operational, and test improvements separately from performance claims. For each benchmark, state whether it exercises the changed path and identify coverage gaps or mismatched workloads. Report the exact findings, including stable or inconclusive status, directional medians, and outlier diagnostics when available; distinguish noise, blocked runs, and regressions. End with an evidence-based recommendation to merge, revise, rerun, or defer. The orchestrating agent must consolidate these fields and recommendations from every delegated worker in its own handoff.
+- Treat benchmarks as part of performance work and follow [docs/benchmarking.md](docs/benchmarking.md) for applicability, authoritative commands, interpretation, and handoff evidence. Include the durability mode and workload in every result.
 - Treat anything that could improve throughput or latency as worth considering. Evaluate allocation, copying, lock scope, batching, I/O, scheduling, transport, and encoding effects when making changes, while preserving correctness, bounded resource use, and predictable tail latency. Benchmark material assumptions instead of optimizing on intuition alone.
-- When a failure or performance limitation could arise from an architectural design choice, investigate relevant competitor designs and primary research before changing broker semantics, storage, replication, ordering, or recovery behavior. Record the evidence, alternatives, and unresolved risks in `docs/research/` or `docs/design/`, and capture the accepted consequence in an ADR before treating the change as foundational.
+- For any non-trivial design that could change broker semantics, storage, replication, ordering, recovery, or operational safety, compare relevant competitor or reference designs and primary research before implementation. Record direct sources, the differences that matter to Runnel, alternatives considered, hypotheses, and unresolved risks in `docs/research/` or `docs/design/`, and capture the accepted consequence in an ADR before treating the change as foundational.
 - Treat `just` recipes, development scripts, and CLI flags as part of the developer-facing interface. When changing a test, benchmark, or operational workflow, expose useful workload, wait, timeout, retry, isolation, and output controls when they have a real use; keep defaults sensible, document them, and test them. If a task requires a repeatable script or workaround, consider whether that behavior is useful enough to promote into the normal user-facing interface as a recipe, script, or CLI option. Prefer explicit options over hard-coded values, without adding speculative configuration.
 - Keep network behavior covered by tests that start the real server process.
 - Keep the pinned development toolchain separate from compatibility policy; do not infer a supported compiler floor from the pinned version.
@@ -76,6 +73,11 @@ Every agent change run must check the default branch before doing work and
 again before handing work off. Human contributors must follow the same rule
 for every change run, as described in `CONTRIBUTING.md`, so local work does not
 silently start from or finish against stale project state:
+
+Every agent, including the coordinator and delegated subagents, must read this
+`AGENTS.md` before starting work. Coordinators must state that requirement
+explicitly in worker prompts and must not rely on automatic project-instruction
+loading.
 
 - At the beginning of every change run—including reviews, documentation or
   configuration changes, coordination, and delegated work—run `git fetch origin
@@ -120,14 +122,9 @@ Run these from the repository root:
 - just isolated runs the default workspace test with a unique Cargo target, temporary directory, and benchmark artifact directory; pass a supported workflow such as `just isolated cluster-test`, `just isolated cluster-replacement-test`, `just isolated bench-container-smoke`, or `just isolated bench-cluster-smoke` for concurrent work.
 - just cluster-test starts three real broker processes, exercises quorum replication, follower restart, leader failure, and recovery through the public protocol.
 - just cluster-replacement-test runs the opt-in snapshot replacement experiment that depends on the test-only permissive recovery feature.
-- just bench runs the authoritative Criterion performance benchmarks, including shared-consumer delivery and keyed-ordering baselines, under the exclusive host benchmark lock.
-- just bench-container builds and benchmarks the broker image with explicit CPU and memory limits.
-- just bench-container-smoke exercises the container benchmark path with a small workload for CI.
-- just bench-cluster runs the real three-node clustered performance baseline.
-- just bench-cluster-smoke exercises the clustered benchmark lifecycle with a small workload.
-- just bench-pr-local waits for the exclusive host benchmark lock, then benchmarks the current commit and `origin/main` on the same host under the same default 2-CPU/2-GiB Linux systemd user scope, repeats paired three-node results until stability or a seven-pair maximum, writes paste-ready Markdown under `benchmark-results/pr-local/`, and exits nonzero unless the report is stable.
-- just bench-pr-local-until-stable holds the exclusive benchmark lock while rerunning complete authoritative comparisons after inconclusive results, preserving every attempt report and stopping only at stable evidence, a hard failure, or its explicit maximum-attempt budget.
-- just bench-pr-local-quick uses a shared lock with other diagnostic benchmark workflows and performs one paired run with an explicit diagnostic override; it must not be used to support an optimization claim.
+- just bench, just bench-container, and just bench-cluster run the documented local, container, and clustered benchmark suites.
+- just bench-container-smoke and just bench-cluster-smoke exercise small benchmark lifecycles for CI and diagnostics.
+- just bench-pr-local runs the authoritative current-versus-`origin/main` comparison; just bench-pr-local-until-stable retries complete inconclusive comparisons; just bench-pr-local-quick is diagnostic only. See [docs/benchmarking.md](docs/benchmarking.md).
 - just profile-cluster captures optional Linux `perf` samples and reports for all clustered broker processes.
 - just profile-cluster-instrumented builds the opt-in Rust timing instrumentation and records internal stage timings without requiring `perf` permissions; it uses the exclusive host benchmark lock.
 - just bench-compare builds Runnel and runs the documented first-pass comparison against Kafka, Redpanda, and JetStream.
@@ -146,10 +143,10 @@ Do not add a second task runner. Keep README commands and CI wired to just recip
 
 The required CI path is .github/workflows/ci.yml. It runs the pinned toolchain checks, the supported real network integration test, and the container smoke build. The test-only replacement-recovery experiment is not part of the required CI path; run it explicitly with `just cluster-replacement-test` when investigating that recovery boundary. .github/workflows/security.yml audits the dependency lockfile on pull requests and weekly. Dependabot keeps Cargo and GitHub Actions dependencies visible for review.
 
-.github/workflows/benchmarks.yml runs the longer Runnel-only single-node and three-node history suites on pushes to `main`, daily, and manually. `.github/workflows/benchmark-competitors.yml` runs the separate native and three-node competitor comparisons weekly or manually. Hosted PR benchmark workflows are intentionally absent because shared runners are too noisy to establish optimization evidence. For performance-sensitive pull requests, the same-host `just bench-pr-local` report is the primary optimization evidence. The Runnel history is the primary long-term optimization signal; competitor suites are separate ranking evidence. The history workflows keep raw and aggregated results as artifacts and append generated data to the `benchmark-history` branch. GitHub Pages serves the hand-authored `docs/benchmarks/` directory from `main` and reads the public history data at runtime. Treat `benchmark-history` as generated output; change the scripts, dashboard assets, and workflows rather than editing that branch manually.
+.github/workflows/benchmarks.yml runs the longer Runnel-only single-node and three-node history suites on pushes to `main`, daily, and manually. `.github/workflows/benchmark-competitors.yml` runs the separate native and three-node competitor comparisons weekly or manually. Hosted PR benchmark workflows are intentionally absent because shared runners are too noisy to establish optimization evidence. See [docs/benchmarking.md](docs/benchmarking.md) for local evidence and comparison policy. The history workflows keep raw and aggregated results as artifacts and append generated data to the `benchmark-history` branch. GitHub Pages serves the hand-authored `docs/benchmarks/` directory from `main` and reads the public history data at runtime. Treat `benchmark-history` as generated output; change the scripts, dashboard assets, and workflows rather than editing that branch manually.
 
 ## Knowledge routing
 
-Put implementation behavior in code and tests, the initial audience and product boundaries in docs/product-fit.md, current technical boundaries in docs/architecture.md, source-backed investigations in docs/research/, unsettled alternatives and implementation proposals in docs/design/, durable accepted rationale in a dated decision record, external or user-mandated guardrails in docs/constraints.md, intended unfinished outcomes in docs/backlog.md, known implementation shortcuts in docs/tech-debt.md, verification workflows in docs/testing.md, and operational deployment guidance beside its deployment artifact. Put workflow changes in justfile and CI changes in .github/workflows. Remove stale guidance instead of appending exceptions.
+Put implementation behavior in code and tests, the initial audience and product boundaries in docs/product-fit.md, current technical boundaries in docs/architecture.md, source-backed investigations in docs/research/, unsettled alternatives and implementation proposals in docs/design/, durable accepted rationale in a dated decision record, external or user-mandated guardrails in docs/constraints.md, intended unfinished outcomes in docs/backlog.md, known implementation shortcuts in docs/tech-debt.md, verification workflows in docs/testing.md, benchmark evidence policy in docs/benchmarking.md, and operational deployment guidance beside its deployment artifact. Put workflow changes in justfile and CI changes in .github/workflows. Remove stale guidance instead of appending exceptions.
 
 When parallel delegated work is authorized, follow .codex/skills/parallel-worktrees/SKILL.md. Keep task ownership disjoint, isolate process and container resources, and treat concurrent performance measurements as exploratory unless CPU, storage, and workload interference are controlled.

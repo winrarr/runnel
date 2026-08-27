@@ -20,4 +20,4 @@ Use a 2 GiB default memory limit for the shared run because Redpanda's developme
 - A comparison can be rerun locally with one documented command and its exact image identifiers and limits are preserved in the result.
 - The baseline can expose large resource and throughput differences before a common client exists.
 - Kafka-family latency and consumer numbers must be read with their native client semantics; they are not directly comparable to Runnel's per-request latency or JetStream's explicit acknowledgement path.
-- The comparison harness remains separate from correctness CI and does not gate pull requests. A common semantic workload, recovery scenarios, trend reporting, and any performance gate require later work.
+- The comparison harness remains separate from correctness CI and does not gate pull requests. Trend reporting now exists in the benchmark history workflows. A common semantic workload and equivalent recovery scenarios remain later work, while stable same-host optimization evidence is defined separately by [ADR 0020](0020-stable-optimization-evidence.md).

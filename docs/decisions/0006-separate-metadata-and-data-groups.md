@@ -22,7 +22,7 @@ The lifecycle is intentionally reconciled rather than pretending that two Raft g
 - Stream creation currently requires the configured nodes to prepare the data-group runtime before activation.
 - Every initial data group uses the same static membership; dynamic placement, balancing, fencing, and membership changes remain future work.
 - A new clustered storage layout is not silently interpreted as the old single-group layout. Starting against legacy clustered files returns an explicit migration error until a safe migration path exists.
-- Consumer checkpoints are currently stored with their stream data group; transferable consumer ownership and consumer-group coordination are not yet implemented.
+- Consumer checkpoints, ownership, and delivery fencing are stored with the stream data group for the initial clustered shared-consumer path; its broader migration, placement, and membership policy remain future work. See [ADR 0015](0015-clustered-shared-consumer-ownership.md).
 - The group manager and group-addressed transport provide the adapter boundary for later distributed engines, but engine selection remains process-wide.
 
 ## References

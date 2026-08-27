@@ -76,58 +76,18 @@ The three-node process test exercises both grouped and non-grouped clustered pat
 
 ## Verification layers
 
-The Criterion suite includes durable publish, legacy publish/poll/ack, two-member shared-consumer, and keyed shared-consumer baselines. Interpret every result with its durability mode, message size, membership, and ordering-key distribution.
+The Criterion suite includes durable publish, legacy publish/poll/ack, two-member shared-consumer, keyed shared-consumer, and local concurrency-scaling baselines. Interpret every result with its durability mode, message size, membership, and ordering-key distribution.
 
 - `just test` runs workspace unit, integration, and benchmark-target tests.
 - `just doc-test` runs Rust documentation tests.
-- `just verify` runs formatting, Clippy, default-feature Rust tests, ShellCheck, benchmark-script tests, and a workspace build. Test-only recovery experiments are run explicitly by `just cluster-replacement-test` so an opt-in permissive recovery feature cannot silently become part of the normal verification contract.
-- `just integration` runs the same smoke, clustered recovery, Docker build, and container benchmark-smoke sequence as the CI integration job.
+- `just verify` runs formatting, Clippy, default-feature Rust tests, ShellCheck, benchmark-script tests, and a workspace build.
+- `just integration` runs the smoke, clustered recovery, Docker build, and container benchmark-smoke sequence used by the CI integration job.
 - `just smoke` exercises the running process and CLI across a restart.
-- `just cluster-test` starts three real Raft-backed broker processes and verifies quorum replication, grouped and non-grouped delivery through follower forwarding, grouped reassignment after node failure, clustered retry limits and dead-letter recovery, follower restart, leader election, post-failure recovery, and recovery metrics through the public protocol.
+- `just cluster-test` starts three real Raft-backed broker processes and verifies quorum replication, grouped and non-grouped delivery through follower forwarding, reassignment after node failure, retry limits, dead-letter recovery, follower restart, leader election, post-failure recovery, and recovery metrics through the public protocol.
 - `just cluster-replacement-test` explicitly enables the test-only permissive recovery feature and runs the experimental empty replacement-node snapshot recovery and interrupted snapshot transfer checks.
-- `just bench` runs the Criterion durable publish, publish/poll/ack, shared-consumer, keyed-ordering, and local concurrency-scaling benchmarks; interpret every result with its durability mode and workload.
-- `just bench-container` builds a Runnel image, applies explicit Docker CPU and memory limits, and runs repeatable end-to-end publish, concurrent publish, consume/acknowledge, round-trip, and restart-recovery scenarios for 100-byte and 1-KiB payloads. Results are written as ignored JSON artifacts under `benchmark-results/` and include scenario-scoped cgroup CPU time, CPU efficiency, memory samples, and p50/p99/p99.9 latency where applicable.
-- `just bench-container-smoke` runs the same container path with a small workload for CI. It verifies the benchmark harness and container lifecycle; it is not a performance gate.
-- `just bench-cluster` builds the release broker and measures a real three-node static Raft cluster through the public protocol. It covers durable publish, non-grouped consume/acknowledge, sequential shared-consumer delivery, parallel shared-consumer delivery, and restart recovery for 100-byte and 1-KiB payloads. Results are written as `cluster-*.json` under the ignored `benchmark-results/` directory and include aggregate broker CPU time and resident memory samples. The harness uses the broker's 30-second acknowledgement timeout by default; pass `--ack-timeout-ms` to measure a different retry window.
-- `just bench-cluster-smoke` runs the same clustered harness with a small workload and skips recovery. It verifies startup, quorum routing, delivery, and result generation; it is not a performance gate.
-- Authoritative benchmark workflows (`just bench`, `just bench-pr-local`, `just bench-cluster`, `just bench-container`, the competitor comparisons, and profiling) acquire an exclusive Linux benchmark lock at `/tmp/runnel-benchmark.lock`. They wait for active benchmark sessions and prevent another benchmark from starting until they finish. Diagnostic or test benchmark workflows (`just bench-pr-local-quick` and the smoke benchmark recipes) acquire a shared lock, so they may run together when no authoritative benchmark owns the host. The supported `just isolated` benchmark workflows use the same lock modes. Use the `just` recipes rather than invoking controllers directly so the host-level coordination is preserved.
-- `just bench-pr-local` is the canonical authoritative workflow for changes intended to improve throughput, latency, or tail latency, and for hot-path changes with a plausible runtime effect. It creates a detached worktree at `origin/main`, builds both revisions, and alternates paired three-node workloads inside the same Linux systemd user scope with a default 2-CPU/2-GiB budget. It repeats at least three and at most seven pairs, stopping early only when throughput ranges are at most 10% and p99 ranges are at most 20% for both revisions. It aggregates medians and writes raw results, logs, and a paste-ready Markdown report under `benchmark-results/pr-local/`; record a stable report in the PR description. After writing the artifacts, it exits nonzero unless the result is stable. The range checks are descriptive repeatability requirements, not formal significance tests. The report explains which raw range exceeded its limit, and when samples are available it reports whether matched scenario medians generally improved, worsened, tied, or were mixed. It also shows a diagnostic Tukey 1.5×IQR outlier view without changing the authoritative raw result. `just bench-pr-local-until-stable` holds the exclusive benchmark lock and reruns complete comparisons after an inconclusive result, retaining every attempt and stopping only at stable evidence, a hard failure, or its explicit maximum-attempt budget. It rejects fixed-repetition and diagnostic overrides, so it cannot accidentally turn a retry into non-evidence. Rerun or investigate an inconclusive result before completing an optimization change. `just bench-pr-local-quick` explicitly allows one-pair diagnostic output; a direct fixed-repetition invocation must pass `--allow-inconclusive`. Neither is performance evidence. Performance-neutral changes need not run this workflow unless runtime impact is plausible. Pass workload, resource, or stability flags after `--` when a change needs a different controlled experiment.
-- `just profile-cluster` builds the release broker, runs a sustained clustered publish/consume/acknowledge workload, and captures per-node Linux `perf` call-graph samples plus text reports under `benchmark-results/profile-*/`. It requires `perf` and suitable kernel profiling permissions; profiling is intentionally optional and is not part of correctness CI.
-- `just profile-cluster-instrumented` builds with the opt-in `instrumentation` feature, enables `runnel::timing` logs, and records internal stage timing summaries without attaching `perf`. Peer RPC timing is split into connection, write, and read stages. The profile workload performs one publish, poll, and acknowledgement per completed message. The default build compiles these timing paths out; use `--features instrumentation` with `profile.py` directly when both internal timings and Linux `perf` are available.
-- `just bench-compare` builds Runnel and runs one first-pass native-tool comparison against the pinned Kafka, Redpanda, and NATS JetStream images. It uses isolated single-node, replication-factor-one containers with explicit CPU and memory limits and writes a machine-readable comparison artifact. Each measured publish or consume scenario records its own broker CPU time and memory interval so the dashboard can show CPU efficiency and memory at the selected workload.
-- `just bench-compare-cluster` runs the three-node RF=3 durable-publish comparison for Kafka, Redpanda, and NATS JetStream with explicit CPU and memory limits. It is a publish-only first slice because equivalent replicated consume/acknowledgement adapters do not yet exist; each result records its topology and measurement boundary.
-- `python3 scripts/benchmarks/pr_report.py --input benchmark-results/cluster.json --output benchmark-results/cluster-report.md --heading 'Clustered Runnel benchmark'` renders a local clustered result as a compact Markdown report. Performance-sensitive changes should use `just bench-pr-local`, which includes the current-vs-default comparison and stability status.
-- `just bench-dashboard` generates local benchmark history data from comparison JSON files under `benchmark-results/`; the static dashboard source is in `docs/benchmarks/`.
 - `just bench-test` runs the benchmark normalization and dashboard tests.
 - `just ci` runs verification, the smoke test, the container build, and the container benchmark smoke check.
 
+Benchmark workflows, applicability, interpretation, and required handoff evidence are documented in [benchmarking.md](benchmarking.md). Workload semantics, comparison boundaries, and harness-specific options are documented in [scripts/benchmarks/README.md](../scripts/benchmarks/README.md).
+
 When a test depends on crash behavior, use a real process and persistent temporary storage. Keep mocks and unit tests for local domain logic, not as substitutes for process, filesystem, or protocol coverage.
-
-## Container benchmark interpretation
-
-The container benchmark measures the current Runnel development protocol with the selected broker image and Docker resource limits. The comparison harness now provides a first-pass cross-broker baseline using each product's native benchmark client. It deliberately records the semantic boundary: Runnel measures its current request/response protocol with durable publish and consume acknowledgement; NATS measures synchronous JetStream publish and explicit durable-consumer acknowledgement; Kafka and Redpanda measure Kafka producer publish with `acks=all` plus consumer fetch throughput without per-record application acknowledgement. CPU efficiency is reported as messages per broker CPU-second, while memory is reported as scenario peak memory; neither should be interpreted without the workload and latency charts. These results are useful for discovering orders of magnitude and resource costs, but they are not a final apples-to-apples claim. Record image versions, host, storage, CPU and memory limits, workload, batching, and failure state for every comparison.
-
-The comparison command is:
-
-```text
-just bench-compare
-```
-
-For a smaller or selected run:
-
-```text
-python3 scripts/benchmarks/compare.py \
-  --backends runnel,kafka,redpanda,nats \
-  --messages 10000 \
-  --payload-sizes 100,1024 \
-  --cpus 2 \
-  --memory 2g
-```
-
-The current pinned images are Apache Kafka `4.3.1`, Redpanda `v26.2.1`, NATS Server `2.14.5-alpine`, and `nats-box` `0.19.7`. Redpanda's development image cannot reliably start under the shared 1 GiB default, so the comparison defaults to 2 GiB. The image identifiers and limits are copied into each JSON result.
-
-## Automatic benchmark history
-
-`.github/workflows/benchmarks.yml` runs the longer Runnel-only single-node and three-node history suites on pushes to `main`, daily, and manually. `.github/workflows/benchmark-competitors.yml` runs the separate native single-node and three-node RF=3 competitor comparisons weekly or manually. Hosted pull-request benchmark workflows are intentionally not used: shared runners vary too much to establish optimization evidence. Same-host `just bench-pr-local` results are the primary evidence for performance-sensitive changes; Runnel history is the primary long-term optimization signal, while competitor suites remain separate ranking evidence. History runs normalize each repetition, aggregate by median while retaining min/max observed values, preserve raw and aggregate results as artifacts, and append generated `site/data.json` to the `benchmark-history` branch. The dashboard separates suites, displays repetition counts and ranges, and compares each run with the previous compatible workload, resource, broker-image, and measurement configuration. Set `messages`, `cluster_comparison_messages`, `cluster_messages`, and `repetitions` when dispatching the applicable workflow manually.
-
-GitHub Pages is configured to publish `/docs` from `main`. The benchmark workflow does not need Pages deployment permissions or a Pages environment. The data branch is generated output; change the benchmark scripts and dashboard assets rather than editing it manually.

@@ -44,3 +44,6 @@ update the branch and rerun relevant checks when changes overlap in owned paths,
 shared contracts, generated files, dependencies, or integration behavior;
 otherwise a cleanly mergeable disjoint branch may proceed from its recorded
 baseline.
+
+For performance-sensitive changes, follow [docs/benchmarking.md](docs/benchmarking.md)
+for benchmark applicability, result interpretation, and pull-request evidence.

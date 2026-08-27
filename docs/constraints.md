@@ -12,8 +12,6 @@ These constraints come from the product brief and should guide implementation ch
 - Future clustering, replication, failover, fencing, rolling upgrades, and larger streams must not require an application programming-model rewrite.
 - The broker must remain correct without Kubernetes; container and Kubernetes support are operational surfaces, not correctness dependencies.
 
-## Repository workflow constraints
-
-- Changes must be delivered through separate pull requests, with each independently reviewable change on its own non-`main` branch.
-- Direct pushes to `main` and bypassing repository rulesets or required checks are not allowed.
-- The `main` ruleset requires pull-request checks but does not require every branch to contain the newest `main` commit. Every agent and human change run must check the recorded baseline and newest `origin/main` CI status at the start and before handoff, and refresh a branch when changes overlap in paths, contracts, dependencies, generated files, or integration behavior.
+Repository workflow, pull requests, and branch-freshness checks are documented
+in [CONTRIBUTING.md](../CONTRIBUTING.md) and [AGENTS.md](../AGENTS.md), rather
+than repeated here as product constraints.
