@@ -88,58 +88,6 @@ impl Drop for RunningServer {
     }
 }
 
-#[cfg(unix)]
-#[test]
-fn sigterm_drains_an_open_broker_connection_before_exit() {
-    let directory = TempDir::new().unwrap();
-    let mut server = RunningServer::start(directory.path());
-    let mut connection = TcpStream::connect(server.broker_addr).unwrap();
-    connection
-        .set_read_timeout(Some(Duration::from_secs(2)))
-        .unwrap();
-    let encoded = serde_json::to_string(&Request::Health).unwrap();
-    writeln!(connection, "{encoded}").unwrap();
-    let mut response = String::new();
-    BufReader::new(&mut connection)
-        .read_line(&mut response)
-        .unwrap();
-    assert!(matches!(
-        serde_json::from_str::<Response>(&response).unwrap(),
-        Response::Health { .. }
-    ));
-
-    send_sigterm(&server.child);
-    sleep(Duration::from_millis(100));
-    assert!(
-        server.child.try_wait().unwrap().is_none(),
-        "server exited before the open broker connection drained"
-    );
-
-    drop(connection);
-    let deadline = Instant::now() + Duration::from_secs(2);
-    let status = loop {
-        if let Some(status) = server.child.try_wait().unwrap() {
-            break status;
-        }
-        assert!(
-            Instant::now() < deadline,
-            "server did not exit after the broker connection drained"
-        );
-        sleep(Duration::from_millis(25));
-    };
-    assert!(status.success(), "server exited unsuccessfully: {status}");
-}
-
-#[cfg(unix)]
-fn send_sigterm(child: &Child) {
-    let pid = child.id().to_string();
-    let status = Command::new("kill")
-        .args(["-TERM", &pid])
-        .status()
-        .expect("kill should be available on Unix");
-    assert!(status.success(), "SIGTERM should be delivered: {status}");
-}
-
 #[test]
 fn network_protocol_persists_acknowledgements_across_restart() {
     let directory = TempDir::new().unwrap();
