@@ -574,25 +574,14 @@ async fn handle_connection(
     let mut reader = BufReader::new(reader);
     let mut served_request = false;
     loop {
-        if *shutdown.borrow() && !served_request {
-            return Ok(());
-        }
-
         // Waiting for the first byte is intentionally not timed. An idle
         // persistent connection is valid; once a request starts, its frame
-        // must complete within the request deadline.
-        let has_data = if served_request {
-            !reader.fill_buf().await?.is_empty()
-        } else {
-            tokio::select! {
-                result = reader.fill_buf() => !result?.is_empty(),
-                changed = shutdown.changed() => {
-                    if changed.is_err() || *shutdown.borrow() {
-                        return Ok(());
-                    }
-                    continue;
-                }
-            }
+        // must complete within the request deadline. Every idle read still
+        // observes shutdown so an already-served persistent connection does
+        // not extend the graceful-drain window.
+        let has_data = match wait_for_request_data(&mut reader, &mut shutdown).await? {
+            Some(has_data) => has_data,
+            None => return Ok(()),
         };
         if !has_data {
             return Ok(());
@@ -773,6 +762,28 @@ async fn handle_connection(
                         .await?;
                         served_request = true;
                     }
+                }
+            }
+        }
+    }
+}
+
+async fn wait_for_request_data<R>(
+    reader: &mut BufReader<R>,
+    shutdown: &mut watch::Receiver<bool>,
+) -> std::io::Result<Option<bool>>
+where
+    R: AsyncRead + Unpin,
+{
+    loop {
+        if *shutdown.borrow() {
+            return Ok(None);
+        }
+        tokio::select! {
+            result = reader.fill_buf() => return Ok(Some(!result?.is_empty())),
+            changed = shutdown.changed() => {
+                if changed.is_err() || *shutdown.borrow() {
+                    return Ok(None);
                 }
             }
         }
