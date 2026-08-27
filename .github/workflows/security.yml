@@ -17,7 +17,14 @@ jobs:
     steps:
       - uses: actions/checkout@v7.0.1
       - uses: dtolnay/rust-toolchain@stable
+      - name: Cache pinned cargo-audit
+        id: cargo-audit-cache
+        uses: actions/cache@v6.1.0
+        with:
+          path: ~/.cargo/bin/cargo-audit
+          key: cargo-audit-0.22.2-ubuntu-24.04-${{ runner.arch }}
       - name: Install pinned cargo-audit
+        if: steps.cargo-audit-cache.outputs.cache-hit != 'true'
         run: cargo install --locked cargo-audit --version 0.22.2
       - name: Ensure ignored advisory is not active
         run: |
