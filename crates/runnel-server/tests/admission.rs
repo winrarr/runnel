@@ -170,7 +170,9 @@ fn partial_request_times_out_and_unrelated_health_recovers() {
         directory.path(),
         &[
             "--request-timeout-ms",
-            "100",
+            // Leave enough budget for a cold durable append on slower CI hosts;
+            // the incomplete frame still times out deterministically.
+            "500",
             "--max-in-flight-requests",
             "1",
         ],

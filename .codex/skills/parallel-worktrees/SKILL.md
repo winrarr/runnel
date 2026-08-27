@@ -75,6 +75,7 @@ Tell each worker to:
 
 - stay inside its assigned worktree and write scope;
 - read the repository root `AGENTS.md` before editing and follow its change-run baseline and handoff requirements;
+- for non-trivial architectural changes, follow `AGENTS.md`'s requirement to compare relevant competitor or reference designs and primary research, and include the sources, differences, alternatives, hypotheses, and unresolved risks in the handoff;
 - use the repository's canonical `just` commands and existing benchmark harnesses;
 - record the exact revision, workload, resource limits, isolation settings, and commands;
 - for performance-sensitive work, run the local benchmark sequentially with a fixed CPU/memory budget and record the actual repetition count, stability thresholds, and stable status; treat an inconclusive authoritative run as unfinished evidence;
