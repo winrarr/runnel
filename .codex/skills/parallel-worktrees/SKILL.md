@@ -76,11 +76,12 @@ Tell each worker to:
 - stay inside its assigned worktree and write scope;
 - read the repository root `AGENTS.md` before editing and follow its change-run baseline and handoff requirements;
 - for non-trivial architectural changes, follow `AGENTS.md`'s requirement to compare relevant competitor or reference designs and primary research, and include the sources, differences, alternatives, hypotheses, and unresolved risks in the handoff;
+- classify the work by one primary evidence class and optional secondary tags, follow the applicable gate in [docs/testing.md](../../../docs/testing.md), and do not use a classification to waive global safety, baseline, CI, pull-request, or cleanup requirements;
 - use the repository's canonical `just` commands and existing benchmark harnesses;
 - record the exact revision, workload, resource limits, isolation settings, and commands;
 - for performance-sensitive work, run the local benchmark sequentially with a fixed CPU/memory budget and record the actual repetition count, stability thresholds, and stable status; treat an inconclusive authoritative run as unfinished evidence;
 - distinguish a confirmed improvement from noise, a blocked run, and an inconclusive result;
-- report changed files, correctness and crash-recovery considerations, test results, and remaining risks. Follow [docs/benchmarking.md](../../../docs/benchmarking.md) for expected effects, non-performance improvements, benchmark applicability, exact findings, repetition and stability results, directional medians, outlier diagnostics, and the evidence-based recommendation to merge, revise, rerun, or defer. Include blocked or inconclusive results rather than omitting them;
+- report changed files, correctness and crash-recovery considerations, test results, and remaining risks. Follow [docs/testing.md](../../../docs/testing.md) for the class-specific merge gate and [docs/benchmarking.md](../../../docs/benchmarking.md) for expected effects, non-performance improvements, benchmark applicability, exact findings, repetition and stability results, directional medians, outlier diagnostics, and the evidence-based recommendation to merge, revise, rerun, or defer. Include blocked or inconclusive results rather than omitting them;
 - report the recorded baseline revision, newest `origin/main` revision, default-branch CI status when available, and whether the branch was refreshed;
 - commit the result on its task branch when code is ready, or leave a clearly documented uncommitted patch when it is not.
 
