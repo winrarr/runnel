@@ -27,10 +27,13 @@ const MAX_REUSABLE_FRAME_BUFFER_SIZE: usize = 1024 * 1024;
 // Topology-free forwarding and stateless control RPCs receive no long-lived
 // network object on which to scope their connections. Keep this compatibility
 // bridge process-wide but bounded until that ownership moves into the engine.
+// Full registries evict idle pools by recency; busy pools use the bounded
+// fallback path instead of allowing an address burst to create unbounded work.
 const MAX_POOLED_PEERS: usize = 64;
 const MAX_CONNECTIONS_PER_POOLED_PEER: usize = 4;
 
 static PEER_POOLS: OnceLock<std::sync::Mutex<PeerPoolRegistry>> = OnceLock::new();
+static FALLBACK_PERMITS: OnceLock<Arc<Semaphore>> = OnceLock::new();
 
 #[derive(Clone)]
 pub struct TcpNetwork {
@@ -154,20 +157,56 @@ struct PeerConnectionPool {
 
 #[derive(Default)]
 struct PeerPoolRegistry {
-    pools: HashMap<String, Arc<PeerConnectionPool>>,
+    pools: HashMap<String, PeerPoolEntry>,
+    access_counter: u64,
+}
+
+struct PeerPoolEntry {
+    pool: Arc<PeerConnectionPool>,
+    last_used: u64,
 }
 
 impl PeerPoolRegistry {
     fn pool(&mut self, address: &str) -> Option<Arc<PeerConnectionPool>> {
-        if let Some(pool) = self.pools.get(address) {
-            return Some(Arc::clone(pool));
+        let access = self.next_access();
+        if let Some(entry) = self.pools.get_mut(address) {
+            entry.last_used = access;
+            return Some(Arc::clone(&entry.pool));
+        }
+
+        if self.pools.len() >= MAX_POOLED_PEERS {
+            let idle_address = self
+                .pools
+                .iter()
+                .filter(|(_, entry)| Arc::strong_count(&entry.pool) == 1)
+                .min_by(|(left_address, left), (right_address, right)| {
+                    left.last_used
+                        .cmp(&right.last_used)
+                        .then_with(|| left_address.cmp(right_address))
+                })
+                .map(|(address, _)| address.clone());
+            if let Some(idle_address) = idle_address {
+                self.pools.remove(&idle_address);
+            }
         }
         if self.pools.len() >= MAX_POOLED_PEERS {
             return None;
         }
         let pool = Arc::new(PeerConnectionPool::new());
-        self.pools.insert(address.to_owned(), Arc::clone(&pool));
+        self.pools.insert(
+            address.to_owned(),
+            PeerPoolEntry {
+                pool: Arc::clone(&pool),
+                last_used: access,
+            },
+        );
         Some(pool)
+    }
+
+    fn next_access(&mut self) -> u64 {
+        let access = self.access_counter;
+        self.access_counter = self.access_counter.saturating_add(1);
+        access
     }
 }
 
@@ -244,8 +283,22 @@ where
         return pool.request(address, request, ttl).await;
     }
 
+    let started = tokio::time::Instant::now();
+    let permit = tokio::time::timeout(ttl, fallback_permits().acquire_owned())
+        .await
+        .map_err(|_| timed_out_error())?
+        .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "peer RPC fallback is closed"))?;
+    let remaining = ttl.saturating_sub(started.elapsed());
     let mut connection = TcpConnection::new(address);
-    connection.request(request, ttl).await
+    let result = connection.request(request, remaining).await;
+    drop(permit);
+    result
+}
+
+fn fallback_permits() -> Arc<Semaphore> {
+    Arc::clone(
+        FALLBACK_PERMITS.get_or_init(|| Arc::new(Semaphore::new(MAX_CONNECTIONS_PER_POOLED_PEER))),
+    )
 }
 
 fn timed_out_error() -> io::Error {
@@ -731,6 +784,7 @@ mod tests {
     struct TestPeer {
         address: String,
         connections: Arc<AtomicUsize>,
+        max_active_connections: Arc<AtomicUsize>,
         requests: Arc<AtomicUsize>,
         framed_bytes: Arc<AtomicUsize>,
         server: tokio::task::JoinHandle<()>,
@@ -749,6 +803,10 @@ mod tests {
             let address = listener.local_addr().unwrap().to_string();
             let connections = Arc::new(AtomicUsize::new(0));
             let connection_count = Arc::clone(&connections);
+            let active_connections = Arc::new(AtomicUsize::new(0));
+            let active_connection_count = Arc::clone(&active_connections);
+            let max_active_connections = Arc::new(AtomicUsize::new(0));
+            let max_active_connection_count = Arc::clone(&max_active_connections);
             let requests = Arc::new(AtomicUsize::new(0));
             let request_count = Arc::clone(&requests);
             let framed_bytes = Arc::new(AtomicUsize::new(0));
@@ -763,6 +821,10 @@ mod tests {
                             };
                             stream.set_nodelay(true).unwrap();
                             connection_count.fetch_add(1, Ordering::Relaxed);
+                            let active =
+                                active_connection_count.fetch_add(1, Ordering::Relaxed) + 1;
+                            max_active_connection_count.fetch_max(active, Ordering::Relaxed);
+                            let active_connection_count = Arc::clone(&active_connection_count);
                             let request_count = Arc::clone(&request_count);
                             let framed_byte_count = Arc::clone(&framed_byte_count);
                             handlers.spawn(async move {
@@ -809,6 +871,7 @@ mod tests {
                                         break;
                                     }
                                 }
+                                active_connection_count.fetch_sub(1, Ordering::Relaxed);
                             });
                         }
                         Some(_) = handlers.join_next(), if !handlers.is_empty() => {}
@@ -818,6 +881,7 @@ mod tests {
             Self {
                 address,
                 connections,
+                max_active_connections,
                 requests,
                 framed_bytes,
                 server,
@@ -857,6 +921,41 @@ mod tests {
             assert!(registry.pool(&format!("test-peer-{index}")).is_some());
         }
         registry
+    }
+
+    fn busy_registry() -> (PeerPoolRegistry, Vec<Arc<PeerConnectionPool>>) {
+        let mut registry = PeerPoolRegistry::default();
+        let mut pools = Vec::with_capacity(MAX_POOLED_PEERS);
+        for index in 0..MAX_POOLED_PEERS {
+            pools.push(registry.pool(&format!("test-peer-{index}")).unwrap());
+        }
+        (registry, pools)
+    }
+
+    #[test]
+    fn full_registry_evicts_the_oldest_idle_pool_deterministically() {
+        let mut registry = capped_registry();
+
+        assert!(registry.pool("new-peer-1").is_some());
+        assert_eq!(registry.pools.len(), MAX_POOLED_PEERS);
+        assert!(!registry.pools.contains_key("test-peer-0"));
+
+        assert!(registry.pool("test-peer-1").is_some());
+        assert!(registry.pool("new-peer-2").is_some());
+        assert_eq!(registry.pools.len(), MAX_POOLED_PEERS);
+        assert!(!registry.pools.contains_key("test-peer-2"));
+    }
+
+    #[test]
+    fn full_registry_keeps_busy_pools_for_bounded_fallback() {
+        let (mut registry, held_pools) = busy_registry();
+
+        assert!(registry.pool("busy-overflow-peer").is_none());
+        assert_eq!(registry.pools.len(), MAX_POOLED_PEERS);
+
+        drop(held_pools);
+        assert!(registry.pool("busy-overflow-peer").is_some());
+        assert_eq!(registry.pools.len(), MAX_POOLED_PEERS);
     }
 
     #[tokio::test]
@@ -1055,10 +1154,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn capped_peer_address_uses_one_fallback_connection_per_request() {
+    async fn busy_capped_peer_address_uses_bounded_fallback_connections() {
         const REQUESTS: usize = 16;
 
-        let mut registry = capped_registry();
+        let (mut registry, _held_pools) = busy_registry();
         let peer = TestPeer::start_with_delay(None, Some(Duration::from_millis(5))).await;
         let fallback_pool = registry.pool(&peer.address);
         assert!(fallback_pool.is_none());
@@ -1086,6 +1185,9 @@ mod tests {
 
         assert_eq!(peer.connections.load(Ordering::Relaxed), REQUESTS);
         assert_eq!(peer.requests.load(Ordering::Relaxed), REQUESTS);
+        assert!(
+            peer.max_active_connections.load(Ordering::Relaxed) <= MAX_CONNECTIONS_PER_POOLED_PEER
+        );
         assert_eq!(
             peer.framed_bytes.load(Ordering::Relaxed),
             REQUESTS * frame_size
@@ -1094,7 +1196,7 @@ mod tests {
 
     #[tokio::test]
     async fn capped_peer_fallback_timeout_drops_connection_before_next_request() {
-        let mut registry = capped_registry();
+        let (mut registry, _held_pools) = busy_registry();
         let peer = TestPeer::start_with_delay(None, Some(Duration::from_millis(50))).await;
         let error = peer_request_with_pool::<_, PeerResponse>(
             registry.pool(&peer.address),
@@ -1123,7 +1225,7 @@ mod tests {
 
     #[tokio::test]
     async fn capped_peer_fallback_drops_failed_connection_before_next_request() {
-        let mut registry = capped_registry();
+        let (mut registry, _held_pools) = busy_registry();
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap().to_string();
         let connections = Arc::new(AtomicUsize::new(0));
