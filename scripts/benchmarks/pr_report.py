@@ -99,6 +99,13 @@ def _format_percent(value: object) -> str | None:
     return f"{formatted}%" if formatted is not None else None
 
 
+def _format_signed_percent(value: object) -> str | None:
+    number = _number(value)
+    if number is None:
+        return None
+    return f"{number:+.1f}%"
+
+
 def _format_scalar(value: object) -> str:
     if isinstance(value, list):
         return ", ".join(_bounded_text(item) for item in value)
@@ -237,7 +244,81 @@ def _format_stability(result: dict[str, Any]) -> tuple[str | None, bool]:
         formatted = _format_percent(value.get(key))
         if formatted is not None:
             parts.append(f"{label} {formatted}")
+    if status == "inconclusive":
+        reasons = value.get("inconclusive_reasons")
+        if isinstance(reasons, list):
+            formatted_reasons = [_bounded_text(reason) for reason in reasons if reason]
+            if formatted_reasons:
+                parts.append("because " + ", ".join(formatted_reasons))
     return "; ".join(parts), status == "stable"
+
+
+def _format_direction(summary: object, label: str) -> str | None:
+    if not isinstance(summary, dict) or summary.get("status") != "available":
+        return None
+    direction = _bounded_text(summary.get("direction", "mixed/unclear"))
+    delta = _format_signed_percent(summary.get("median_delta_percent")) or "unknown delta"
+    improved = _format_number(summary.get("improved_scenarios")) or "0"
+    worsened = _format_number(summary.get("worsened_scenarios")) or "0"
+    neutral = _format_number(summary.get("neutral_scenarios")) or "0"
+    scenarios = _format_number(summary.get("scenario_count")) or "0"
+    return (
+        f"{label} {direction} (median delta {delta}; {improved} improved, "
+        f"{worsened} worsened, {neutral} tied across {scenarios} matched scenario medians)"
+    )
+
+
+def _format_interpretation(result: dict[str, Any]) -> list[str]:
+    stability = result.get("benchmark_stability")
+    if not isinstance(stability, dict):
+        return []
+    interpretation = stability.get("interpretation")
+    if not isinstance(interpretation, dict):
+        return []
+    lines: list[str] = []
+    directions = [
+        formatted
+        for formatted in (
+            _format_direction(
+                _mapping_or_empty(interpretation.get("throughput")).get("raw"),
+                "Throughput:",
+            ),
+            _format_direction(
+                _mapping_or_empty(interpretation.get("p99")).get("raw"),
+                "p99:",
+            ),
+        )
+        if formatted is not None
+    ]
+    if directions:
+        lines.append("- Direction (descriptive): " + "; ".join(directions))
+        lines.append(
+            "> Direction uses matched scenario medians; it is not a significance test or a random-effects estimate."
+        )
+
+    outlier_lines: list[str] = []
+    filtered_directions: list[str] = []
+    for metric, label in (("throughput", "throughput"), ("p99", "p99")):
+        metric_summary = interpretation.get(metric)
+        if not isinstance(metric_summary, dict) or metric_summary.get("status") != "available":
+            continue
+        candidates = _format_number(metric_summary.get("candidate_outlier_pairs")) or "0"
+        total = _format_number(metric_summary.get("total_pairs")) or "0"
+        filtered_range = _format_percent(metric_summary.get("filtered_max_range_percent"))
+        suffix = f"; filtered max range {filtered_range}" if filtered_range is not None else ""
+        outlier_lines.append(f"{label} would exclude {candidates}/{total} paired samples{suffix}")
+        if _number(metric_summary.get("candidate_outlier_pairs")):
+            filtered = _format_direction(metric_summary.get("filtered"), f"{label}:")
+            if filtered is not None:
+                filtered_directions.append(filtered)
+    if outlier_lines:
+        lines.append("- Outlier analysis (diagnostic): " + "; ".join(outlier_lines))
+        if filtered_directions:
+            lines.append("- Outlier-sensitive direction (diagnostic): " + "; ".join(filtered_directions))
+        lines.append(
+            "> Uses Tukey 1.5×IQR fences per scenario and revision. Raw samples and raw stability ranges remain authoritative; no samples are silently discarded."
+        )
+    return lines
 
 
 def _format_host(result: dict[str, Any]) -> str | None:
@@ -562,6 +643,7 @@ def render_report(
         lines.append(f"- Measurement stability: {stability}")
         if not stable:
             lines.append("> Treat this result as diagnostic rather than confirmed performance evidence.")
+    lines.extend(_format_interpretation(result))
     host = _format_host(result)
     if host is not None:
         lines.append(f"- Host: {host}")

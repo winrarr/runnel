@@ -14,6 +14,7 @@ from pr_local import (  # noqa: E402
     LocalBenchmarkError,
     assess_stability,
     benchmark_command,
+    benchmark_interpretation,
     reportable_result,
     require_stable,
     stamp_resource_limits,
@@ -131,6 +132,40 @@ class PrLocalTests(unittest.TestCase):
         stability = assess_stability(result, result, self.options(), 7)
 
         self.assertEqual(stability["status"], "inconclusive")
+        self.assertIn("throughput range exceeded its limit", stability["inconclusive_reasons"])
+        self.assertIn("p99 range exceeded its limit", stability["inconclusive_reasons"])
+
+    def test_interpretation_reports_direction_and_outlier_sensitivity(self) -> None:
+        def result(throughput: list[float], p99: list[float]) -> dict[str, object]:
+            return {
+                "backends": {
+                    "runnel-cluster": {
+                        "scenarios": [
+                            {
+                                "operation": "publish",
+                                "messages": 1000,
+                                "message_size_bytes": 100,
+                                "repetition_summary": {
+                                    "throughput_messages_per_second": {"samples": throughput},
+                                    "latency_p99": {"samples": p99},
+                                },
+                            }
+                        ]
+                    }
+                }
+            }
+
+        interpretation = benchmark_interpretation(
+            result([110.0, 110.0, 110.0, 110.0, 1000.0], [90.0, 90.0, 90.0, 90.0, 90.0]),
+            result([100.0] * 5, [100.0] * 5),
+        )
+
+        throughput = interpretation["throughput"]
+        self.assertEqual(throughput["raw"]["direction"], "generally improved")
+        self.assertEqual(throughput["raw"]["improved_scenarios"], 1)
+        self.assertEqual(throughput["candidate_outlier_pairs"], 1)
+        self.assertEqual(throughput["filtered"]["median_delta_percent"], 10.0)
+        self.assertEqual(interpretation["p99"]["raw"]["direction"], "generally improved")
 
     def test_authoritative_run_rejects_inconclusive_result(self) -> None:
         with self.assertRaisesRegex(LocalBenchmarkError, "stable repeated measurements are required"):

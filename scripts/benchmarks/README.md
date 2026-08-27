@@ -172,6 +172,26 @@ unless the result is stable. Rerun or investigate an inconclusive result
 before claiming or accepting an optimization, and paste the stable report into
 the PR description.
 
+The throughput and p99 range checks are descriptive repeatability requirements,
+not formal significance tests, confidence intervals, or estimates of the
+probability that host noise caused a result. An inconclusive report means that
+the raw observed range for at least one metric and revision exceeded its limit
+by the maximum repetition count (or that the minimum count was not reached); it
+does not by itself mean the change improved, worsened, or behaved randomly. The
+report separately summarizes the median deltas of matching scenarios and counts
+how many scenario medians improved, worsened, or tied. Treat that direction as
+descriptive evidence only, especially when the raw result is inconclusive.
+
+The report also performs a diagnostic outlier-sensitivity check using Tukey
+1.5×IQR fences independently for each scenario and revision. A paired sample is
+marked for exclusion when either revision's sample is outside its fence. This
+view can show whether a small number of extreme samples explains a wide range,
+but it does not replace the raw result: samples are retained, raw ranges remain
+the authoritative stability gate, and filtered output must never be selected
+as a favorable result. Small benchmark samples make automatic outlier removal
+especially fragile because a legitimate workload mode can look like host
+noise.
+
 When a complete run is inconclusive because the host remains noisy, use:
 
 ```text
