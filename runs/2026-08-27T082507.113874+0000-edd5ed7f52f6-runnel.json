@@ -1,0 +1,808 @@
+{
+  "history_schema_version": 1,
+  "generated_at": "2026-08-27T08:25:07.113874+00:00",
+  "source": {
+    "repository": "winrarr/runnel",
+    "revision": "edd5ed7f52f647808acf13988ded6f3fdc265bf7",
+    "ref": "main",
+    "event": "push",
+    "workflow": "Runnel benchmark history",
+    "run_id": "33050971530",
+    "run_url": "https://github.com/winrarr/runnel/actions/runs/33050971530",
+    "profile": "push",
+    "repetitions": 3,
+    "repetition_run_ids": [
+      "33050971530",
+      "33050971530",
+      "33050971530"
+    ]
+  },
+  "environment": {
+    "host": "runnervmgx7h7",
+    "platform": "Linux-6.17.0-1022-azure-x86_64-with-glibc2.39",
+    "python": "3.12.3",
+    "cpu_count": 4,
+    "docker_server": "28.0.4"
+  },
+  "comparison_mode": "native broker tools; first-pass, not a final apples-to-apples claim",
+  "benchmark_suite": "runnel",
+  "resource_limits": {
+    "broker_cpu": "2",
+    "broker_memory": "2g",
+    "client_cpu": "2",
+    "client_memory": "2g"
+  },
+  "workload": {
+    "messages": 10000,
+    "payload_sizes_bytes": [
+      100,
+      1024
+    ],
+    "single_node": true,
+    "nodes": 1,
+    "replication_factor": 1,
+    "operations": [
+      "publish",
+      "consume"
+    ],
+    "compression": "disabled where the native client exposes the setting"
+  },
+  "aggregate": {
+    "repetitions": 3,
+    "first_generated_at": "2026-08-27T08:03:43.125515+00:00",
+    "last_generated_at": "2026-08-27T08:25:07.113874+00:00"
+  },
+  "repetition_runs": [
+    {
+      "run_id": "33050971530",
+      "generated_at": "2026-08-27T08:03:43.125515+00:00",
+      "source_result": "runnel-1.json"
+    },
+    {
+      "run_id": "33050971530",
+      "generated_at": "2026-08-27T08:14:23.184360+00:00",
+      "source_result": "runnel-2.json"
+    },
+    {
+      "run_id": "33050971530",
+      "generated_at": "2026-08-27T08:25:07.113874+00:00",
+      "source_result": "runnel-3.json"
+    }
+  ],
+  "backends": {
+    "runnel": {
+      "image": "runnel:bench",
+      "image_id": "sha256:22a9e2dd45f7328bc398bbc2a6a19ecf5b3e9ec28cd9a85fb676efbc5ab1d9e9",
+      "acknowledgement": "request response after the current local durable append; consume acknowledgement persists a consumer checkpoint",
+      "replication": "single local broker engine",
+      "measurement_boundary": "Runnel's current line-delimited JSON protocol",
+      "measurement_client": "host Python socket client",
+      "startup_seconds": 0.422948074,
+      "resource_samples": {
+        "samples": 335.0,
+        "cpu_percent_avg": 81.89545994065281,
+        "cpu_percent_max": 99.1,
+        "memory_bytes_avg": 2755530.1564391693,
+        "memory_bytes_max": 4039114.752,
+        "memory_percent_avg": 0.12816023738872404,
+        "memory_percent_max": 0.19
+      },
+      "scenarios": [
+        {
+          "operation": "publish",
+          "messages": 10000.0,
+          "message_size_bytes": 100.0,
+          "throughput_messages_per_second": 2243.344945043803,
+          "latency_available": 1.0,
+          "latency_microseconds": {
+            "p50": 411.169,
+            "p99": 708.8971600000009,
+            "p999": 1242.3822530000004,
+            "max": 2987.528
+          },
+          "resource_samples": {
+            "samples": 5.0,
+            "cpu_percent_avg": 15.632,
+            "cpu_percent_max": 31.23,
+            "memory_bytes_avg": 1809632.4608,
+            "memory_bytes_max": 2032140.288,
+            "memory_percent_avg": 0.08399999999999999,
+            "memory_percent_max": 0.09,
+            "cpu_seconds": 1.322175,
+            "elapsed_seconds": 4.461858518
+          },
+          "repetitions": 3,
+          "repetition_summary": {
+            "throughput_messages_per_second": {
+              "count": 3,
+              "min": 2205.052705265681,
+              "median": 2243.344945043803,
+              "max": 2382.120547913529,
+              "samples": [
+                2382.120547913529,
+                2243.344945043803,
+                2205.052705265681
+              ],
+              "standard_deviation": 76.06867108010894,
+              "relative_range_percent": 7.893027910800879,
+              "relative_standard_deviation_percent": 3.390859316939493
+            },
+            "latency_p50": {
+              "count": 3,
+              "min": 384.2185,
+              "median": 411.169,
+              "max": 417.669,
+              "samples": [
+                384.2185,
+                411.169,
+                417.669
+              ],
+              "standard_deviation": 14.481848410644567,
+              "relative_range_percent": 8.135462547030535,
+              "relative_standard_deviation_percent": 3.5221158235773045
+            },
+            "latency_p99": {
+              "count": 3,
+              "min": 606.3035,
+              "median": 708.8971600000009,
+              "max": 726.7349300000004,
+              "samples": [
+                606.3035,
+                726.7349300000004,
+                708.8971600000009
+              ],
+              "standard_deviation": 53.069529280635095,
+              "relative_range_percent": 16.988561500232315,
+              "relative_standard_deviation_percent": 7.486209887007451
+            },
+            "latency_p999": {
+              "count": 3,
+              "min": 1238.464346000002,
+              "median": 1242.3822530000004,
+              "max": 1539.4844590000014,
+              "samples": [
+                1238.464346000002,
+                1242.3822530000004,
+                1539.4844590000014
+              ],
+              "standard_deviation": 140.98785575591648,
+              "relative_range_percent": 24.22926698068338,
+              "relative_standard_deviation_percent": 11.348186551721167
+            },
+            "latency_max": {
+              "count": 3,
+              "min": 1852.288,
+              "median": 2987.528,
+              "max": 9007.0,
+              "samples": [
+                9007.0,
+                1852.288,
+                2987.528
+              ],
+              "standard_deviation": 3139.580949025027,
+              "relative_range_percent": 239.48602322723,
+              "relative_standard_deviation_percent": 105.089590759485
+            },
+            "cpu_seconds": {
+              "count": 3,
+              "min": 1.316084,
+              "median": 1.322175,
+              "max": 1.346047,
+              "samples": [
+                1.346047,
+                1.316084,
+                1.322175
+              ],
+              "standard_deviation": 0.012930386408250371,
+              "relative_range_percent": 2.266190179061014,
+              "relative_standard_deviation_percent": 0.9779633110783649
+            },
+            "cpu_percent_max": {
+              "count": 3,
+              "min": 30.84,
+              "median": 31.23,
+              "max": 34.22,
+              "samples": [
+                34.22,
+                31.23,
+                30.84
+              ],
+              "standard_deviation": 1.5098417871493095,
+              "relative_range_percent": 10.822926673070763,
+              "relative_standard_deviation_percent": 4.834587855105058
+            },
+            "memory_bytes_max": {
+              "count": 3,
+              "min": 1847590.912,
+              "median": 2032140.288,
+              "max": 2109734.912,
+              "samples": [
+                1847590.912,
+                2109734.912,
+                2032140.288
+              ],
+              "standard_deviation": 109948.91469915105,
+              "relative_range_percent": 12.899896800825594,
+              "relative_standard_deviation_percent": 5.410498248984622
+            },
+            "cpu_efficiency_messages_per_cpu_second": {
+              "count": 3,
+              "min": 7429.1610917003645,
+              "median": 7563.295327774311,
+              "max": 7598.299196707809,
+              "samples": [
+                7429.1610917003645,
+                7598.299196707809,
+                7563.295327774311
+              ],
+              "standard_deviation": 72.89639732979028,
+              "relative_range_percent": 2.2363017398821756,
+              "relative_standard_deviation_percent": 0.9638179413951546
+            }
+          }
+        },
+        {
+          "operation": "consume_ack",
+          "messages": 10000.0,
+          "message_size_bytes": 100.0,
+          "throughput_messages_per_second": 37.49775585713422,
+          "latency_available": 1.0,
+          "latency_microseconds": {
+            "p50": 26383.345,
+            "p99": 56950.167420000005,
+            "p999": 64536.33081000018,
+            "max": 99031.199
+          },
+          "resource_samples": {
+            "samples": 135.0,
+            "cpu_percent_avg": 95.52592592592593,
+            "cpu_percent_max": 99.02,
+            "memory_bytes_avg": 2100880.2702222224,
+            "memory_bytes_max": 2477785.088,
+            "memory_percent_avg": 0.09785185185185186,
+            "memory_percent_max": 0.12,
+            "cpu_seconds": 257.26879099999996,
+            "elapsed_seconds": 266.685135018
+          },
+          "repetitions": 3,
+          "repetition_summary": {
+            "throughput_messages_per_second": {
+              "count": 3,
+              "min": 37.435757236876746,
+              "median": 37.49775585713422,
+              "max": 37.526807252009846,
+              "samples": [
+                37.526807252009846,
+                37.435757236876746,
+                37.49775585713422
+              ],
+              "standard_deviation": 0.03797355470702641,
+              "relative_range_percent": 0.2428145713039421,
+              "relative_standard_deviation_percent": 0.10126887286723231
+            },
+            "latency_p50": {
+              "count": 3,
+              "min": 26199.2785,
+              "median": 26383.345,
+              "max": 26395.073,
+              "samples": [
+                26199.2785,
+                26383.345,
+                26395.073
+              ],
+              "standard_deviation": 89.66202505737263,
+              "relative_range_percent": 0.7421140116994261,
+              "relative_standard_deviation_percent": 0.33984328013514825
+            },
+            "latency_p99": {
+              "count": 3,
+              "min": 56939.950840000005,
+              "median": 56950.167420000005,
+              "max": 57000.45171,
+              "samples": [
+                56939.950840000005,
+                57000.45171,
+                56950.167420000005
+              ],
+              "standard_deviation": 26.443322195166655,
+              "relative_range_percent": 0.10623475354130259,
+              "relative_standard_deviation_percent": 0.046432387108102116
+            },
+            "latency_p999": {
+              "count": 3,
+              "min": 61213.87212400007,
+              "median": 64536.33081000018,
+              "max": 65321.771665000386,
+              "samples": [
+                64536.33081000018,
+                61213.87212400007,
+                65321.771665000386
+              ],
+              "standard_deviation": 1780.4645990374938,
+              "relative_range_percent": 6.36525115301997,
+              "relative_standard_deviation_percent": 2.7588562545945097
+            },
+            "latency_max": {
+              "count": 3,
+              "min": 91482.844,
+              "median": 99031.199,
+              "max": 139582.501,
+              "samples": [
+                139582.501,
+                99031.199,
+                91482.844
+              ],
+              "standard_deviation": 21121.2445987943,
+              "relative_range_percent": 48.57020563792224,
+              "relative_standard_deviation_percent": 21.32786920896949
+            },
+            "cpu_seconds": {
+              "count": 3,
+              "min": 257.26239,
+              "median": 257.26879099999996,
+              "max": 257.754127,
+              "samples": [
+                257.26239,
+                257.754127,
+                257.26879099999996
+              ],
+              "standard_deviation": 0.23031314018238003,
+              "relative_range_percent": 0.1911374473711429,
+              "relative_standard_deviation_percent": 0.08952237824384228
+            },
+            "cpu_percent_max": {
+              "count": 3,
+              "min": 98.82,
+              "median": 99.02,
+              "max": 99.26,
+              "samples": [
+                99.02,
+                98.82,
+                99.26
+              ],
+              "standard_deviation": 0.17987650084309884,
+              "relative_range_percent": 0.44435467582307814,
+              "relative_standard_deviation_percent": 0.18165673686436964
+            },
+            "memory_bytes_max": {
+              "count": 3,
+              "min": 2449473.536,
+              "median": 2477785.088,
+              "max": 2535456.768,
+              "samples": [
+                2477785.088,
+                2449473.536,
+                2535456.768
+              ],
+              "standard_deviation": 35778.14794883263,
+              "relative_range_percent": 3.4701650444350527,
+              "relative_standard_deviation_percent": 1.443956867853772
+            },
+            "cpu_efficiency_messages_per_cpu_second": {
+              "count": 3,
+              "min": 38.796662991937275,
+              "median": 38.86985265927573,
+              "max": 38.87081978831029,
+              "samples": [
+                38.87081978831029,
+                38.796662991937275,
+                38.86985265927573
+              ],
+              "standard_deviation": 0.03473213880222348,
+              "relative_range_percent": 0.1907822934731943,
+              "relative_standard_deviation_percent": 0.08935495358492221
+            }
+          }
+        },
+        {
+          "operation": "publish",
+          "messages": 10000.0,
+          "message_size_bytes": 1024.0,
+          "throughput_messages_per_second": 2223.936033290821,
+          "latency_available": 1.0,
+          "latency_microseconds": {
+            "p50": 399.0405,
+            "p99": 754.681860000001,
+            "p999": 1494.2672730000018,
+            "max": 6426.074
+          },
+          "resource_samples": {
+            "samples": 4.0,
+            "cpu_percent_avg": 17.4825,
+            "cpu_percent_max": 32.25,
+            "memory_bytes_avg": 2456551.424,
+            "memory_bytes_max": 2666528.768,
+            "memory_percent_avg": 0.1125,
+            "memory_percent_max": 0.12,
+            "cpu_seconds": 1.4043179999999893,
+            "elapsed_seconds": 4.50067877
+          },
+          "repetitions": 3,
+          "repetition_summary": {
+            "throughput_messages_per_second": {
+              "count": 3,
+              "min": 2116.970835576687,
+              "median": 2223.936033290821,
+              "max": 2233.8817431029192,
+              "samples": [
+                2233.8817431029192,
+                2116.970835576687,
+                2223.936033290821
+              ],
+              "standard_deviation": 52.924087106279394,
+              "relative_range_percent": 5.256936610413019,
+              "relative_standard_deviation_percent": 2.3797486219945876
+            },
+            "latency_p50": {
+              "count": 3,
+              "min": 391.124,
+              "median": 399.0405,
+              "max": 415.611,
+              "samples": [
+                391.124,
+                415.611,
+                399.0405
+              ],
+              "standard_deviation": 10.202753503616329,
+              "relative_range_percent": 6.136469857069637,
+              "relative_standard_deviation_percent": 2.556821551600985
+            },
+            "latency_p99": {
+              "count": 3,
+              "min": 636.4596500000007,
+              "median": 754.681860000001,
+              "max": 1333.0077900000042,
+              "samples": [
+                636.4596500000007,
+                1333.0077900000042,
+                754.681860000001
+              ],
+              "standard_deviation": 304.34203776984526,
+              "relative_range_percent": 92.29692363349008,
+              "relative_standard_deviation_percent": 40.327196650764186
+            },
+            "latency_p999": {
+              "count": 3,
+              "min": 1239.1940390000038,
+              "median": 1494.2672730000018,
+              "max": 2306.107356000009,
+              "samples": [
+                1239.1940390000038,
+                2306.107356000009,
+                1494.2672730000018
+              ],
+              "standard_deviation": 454.90544818073397,
+              "relative_range_percent": 71.40043393026944,
+              "relative_standard_deviation_percent": 30.443378932299847
+            },
+            "latency_max": {
+              "count": 3,
+              "min": 4188.688,
+              "median": 6426.074,
+              "max": 44343.244,
+              "samples": [
+                44343.244,
+                4188.688,
+                6426.074
+              ],
+              "standard_deviation": 18424.33790301125,
+              "relative_range_percent": 624.8691814006498,
+              "relative_standard_deviation_percent": 286.71219632720147
+            },
+            "cpu_seconds": {
+              "count": 3,
+              "min": 1.4025399999999877,
+              "median": 1.4043179999999893,
+              "max": 1.437874000000022,
+              "samples": [
+                1.4043179999999893,
+                1.437874000000022,
+                1.4025399999999877
+              ],
+              "standard_deviation": 0.016253744785620042,
+              "relative_range_percent": 2.516096781500676,
+              "relative_standard_deviation_percent": 1.157411981162398
+            },
+            "cpu_percent_max": {
+              "count": 3,
+              "min": 32.23,
+              "median": 32.25,
+              "max": 33.85,
+              "samples": [
+                33.85,
+                32.23,
+                32.25
+              ],
+              "standard_deviation": 0.7590051968787112,
+              "relative_range_percent": 5.023255813953503,
+              "relative_standard_deviation_percent": 2.3535044864456163
+            },
+            "memory_bytes_max": {
+              "count": 3,
+              "min": 2473590.784,
+              "median": 2666528.768,
+              "max": 2830106.624,
+              "samples": [
+                2473590.784,
+                2666528.768,
+                2830106.624
+              ],
+              "standard_deviation": 145711.4061021711,
+              "relative_range_percent": 13.370035391270147,
+              "relative_standard_deviation_percent": 5.464460307002812
+            },
+            "cpu_efficiency_messages_per_cpu_second": {
+              "count": 3,
+              "min": 6954.712304415996,
+              "median": 7120.894270386107,
+              "max": 7129.921428265923,
+              "samples": [
+                7120.894270386107,
+                6954.712304415996,
+                7129.921428265923
+              ],
+              "standard_deviation": 80.55100004437296,
+              "relative_range_percent": 2.4604932638667987,
+              "relative_standard_deviation_percent": 1.1311921928031288
+            }
+          }
+        },
+        {
+          "operation": "consume_ack",
+          "messages": 10000.0,
+          "message_size_bytes": 1024.0,
+          "throughput_messages_per_second": 36.00322684720018,
+          "latency_available": 1.0,
+          "latency_microseconds": {
+            "p50": 27181.0225,
+            "p99": 60059.64138,
+            "p999": 64810.73545400008,
+            "max": 91865.164
+          },
+          "resource_samples": {
+            "samples": 141.0,
+            "cpu_percent_avg": 95.63241134751773,
+            "cpu_percent_max": 99.1,
+            "memory_bytes_avg": 3455816.4643404256,
+            "memory_bytes_max": 3768582.144,
+            "memory_percent_avg": 0.16056737588652484,
+            "memory_percent_max": 0.18,
+            "cpu_seconds": 268.287205,
+            "elapsed_seconds": 277.755563415
+          },
+          "repetitions": 3,
+          "repetition_summary": {
+            "throughput_messages_per_second": {
+              "count": 3,
+              "min": 35.94557495908907,
+              "median": 36.00322684720018,
+              "max": 36.58673069679497,
+              "samples": [
+                35.94557495908907,
+                36.00322684720018,
+                36.58673069679497
+              ],
+              "standard_deviation": 0.2896129913230787,
+              "relative_range_percent": 1.7808285363614877,
+              "relative_standard_deviation_percent": 0.8044084285895077
+            },
+            "latency_p50": {
+              "count": 3,
+              "min": 26935.011,
+              "median": 27181.0225,
+              "max": 27336.9125,
+              "samples": [
+                26935.011,
+                27181.0225,
+                27336.9125
+              ],
+              "standard_deviation": 165.444910581035,
+              "relative_range_percent": 1.4786106740465705,
+              "relative_standard_deviation_percent": 0.6086780237242179
+            },
+            "latency_p99": {
+              "count": 3,
+              "min": 58678.57125,
+              "median": 60059.64138,
+              "max": 60147.90731,
+              "samples": [
+                60147.90731,
+                60059.64138,
+                58678.57125
+              ],
+              "standard_deviation": 672.8128380656268,
+              "relative_range_percent": 2.4464615942400445,
+              "relative_standard_deviation_percent": 1.120241184606332
+            },
+            "latency_p999": {
+              "count": 3,
+              "min": 60934.059656000005,
+              "median": 64810.73545400008,
+              "max": 69202.21924600028,
+              "samples": [
+                69202.21924600028,
+                64810.73545400008,
+                60934.059656000005
+              ],
+              "standard_deviation": 3377.6423095919963,
+              "relative_range_percent": 12.757392015507477,
+              "relative_standard_deviation_percent": 5.2115475714502635
+            },
+            "latency_max": {
+              "count": 3,
+              "min": 78525.674,
+              "median": 91865.164,
+              "max": 96025.468,
+              "samples": [
+                96025.468,
+                91865.164,
+                78525.674
+              ],
+              "standard_deviation": 7464.679146747269,
+              "relative_range_percent": 19.049434233851684,
+              "relative_standard_deviation_percent": 8.125690764289354
+            },
+            "cpu_seconds": {
+              "count": 3,
+              "min": 264.220242,
+              "median": 268.287205,
+              "max": 269.19874,
+              "samples": [
+                269.19874,
+                268.287205,
+                264.220242
+              ],
+              "standard_deviation": 2.1642685814945,
+              "relative_range_percent": 1.8556598701753229,
+              "relative_standard_deviation_percent": 0.806698396777625
+            },
+            "cpu_percent_max": {
+              "count": 3,
+              "min": 99.02,
+              "median": 99.1,
+              "max": 99.32,
+              "samples": [
+                99.02,
+                99.1,
+                99.32
+              ],
+              "standard_deviation": 0.12684198393626858,
+              "relative_range_percent": 0.3027245206861727,
+              "relative_standard_deviation_percent": 0.1279939292999683
+            },
+            "memory_bytes_max": {
+              "count": 3,
+              "min": 3747610.624,
+              "median": 3768582.144,
+              "max": 3887071.232,
+              "samples": [
+                3887071.232,
+                3747610.624,
+                3768582.144
+              ],
+              "standard_deviation": 61399.17644209879,
+              "relative_range_percent": 3.7006121313299944,
+              "relative_standard_deviation_percent": 1.6292381085510657
+            },
+            "cpu_efficiency_messages_per_cpu_second": {
+              "count": 3,
+              "min": 37.14727639512726,
+              "median": 37.273488312646144,
+              "max": 37.847213840641324,
+              "samples": [
+                37.14727639512726,
+                37.273488312646144,
+                37.847213840641324
+              ],
+              "standard_deviation": 0.3045949691767193,
+              "relative_range_percent": 1.8778426093180878,
+              "relative_standard_deviation_percent": 0.8171893293748317
+            }
+          }
+        }
+      ],
+      "repetition_summary": {
+        "samples": {
+          "count": 3,
+          "min": 334.0,
+          "median": 335.0,
+          "max": 337.0,
+          "samples": [
+            335.0,
+            337.0,
+            334.0
+          ],
+          "standard_deviation": 1.247219128924647,
+          "relative_range_percent": 0.8955223880597015,
+          "relative_standard_deviation_percent": 0.3723042175894469
+        },
+        "cpu_percent_avg": {
+          "count": 3,
+          "min": 81.82991017964072,
+          "median": 81.89545994065281,
+          "max": 82.48602985074626,
+          "samples": [
+            82.48602985074626,
+            81.89545994065281,
+            81.82991017964072
+          ],
+          "standard_deviation": 0.2950635736937181,
+          "relative_range_percent": 0.8011673315969081,
+          "relative_standard_deviation_percent": 0.36029295629762853
+        },
+        "cpu_percent_max": {
+          "count": 3,
+          "min": 99.02,
+          "median": 99.1,
+          "max": 99.32,
+          "samples": [
+            99.02,
+            99.1,
+            99.32
+          ],
+          "standard_deviation": 0.12684198393626858,
+          "relative_range_percent": 0.3027245206861727,
+          "relative_standard_deviation_percent": 0.1279939292999683
+        },
+        "memory_bytes_avg": {
+          "count": 3,
+          "min": 2747630.1566467066,
+          "median": 2755530.1564391693,
+          "max": 2761345.0790208955,
+          "samples": [
+            2761345.0790208955,
+            2755530.1564391693,
+            2747630.1566467066
+          ],
+          "standard_deviation": 5620.620933297586,
+          "relative_range_percent": 0.4977235448554115,
+          "relative_standard_deviation_percent": 0.20397602690586505
+        },
+        "memory_bytes_max": {
+          "count": 3,
+          "min": 3985637.376,
+          "median": 4039114.752,
+          "max": 4084203.52,
+          "samples": [
+            3985637.376,
+            4039114.752,
+            4084203.52
+          ],
+          "standard_deviation": 40288.00688188303,
+          "relative_range_percent": 2.440290758047764,
+          "relative_standard_deviation_percent": 0.9974464543730556
+        },
+        "memory_percent_avg": {
+          "count": 3,
+          "min": 0.12796407185628744,
+          "median": 0.12816023738872404,
+          "max": 0.12838805970149253,
+          "samples": [
+            0.12838805970149253,
+            0.12816023738872404,
+            0.12796407185628744
+          ],
+          "standard_deviation": 0.00017325306320619576,
+          "relative_range_percent": 0.3308263575691465,
+          "relative_standard_deviation_percent": 0.13518472401131737
+        },
+        "memory_percent_max": {
+          "count": 3,
+          "min": 0.19,
+          "median": 0.19,
+          "max": 0.19,
+          "samples": [
+            0.19,
+            0.19,
+            0.19
+          ],
+          "standard_deviation": 0.0,
+          "relative_range_percent": 0.0,
+          "relative_standard_deviation_percent": 0.0
+        }
+      },
+      "repetitions": 3
+    }
+  },
+  "source_result": "aggregate"
+}
