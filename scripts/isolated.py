@@ -95,7 +95,12 @@ def environment(isolation: Isolation) -> dict[str, str]:
     env = os.environ.copy()
     env.update(
         {
-            "CARGO_TARGET_DIR": str(isolation.target_dir),
+            # A sequential caller such as CI may provide a shared target to
+            # reuse compilation across isolated workflows. The default stays
+            # unique so independent invocations remain safe to run together.
+            "CARGO_TARGET_DIR": os.environ.get(
+                "CARGO_TARGET_DIR", str(isolation.target_dir)
+            ),
             "TMPDIR": str(isolation.temp_dir),
             "TEMP": str(isolation.temp_dir),
             "TMP": str(isolation.temp_dir),
@@ -113,7 +118,8 @@ def environment(isolation: Isolation) -> dict[str, str]:
 
 def command_for(workflow: str, isolation: Isolation) -> list[str]:
     artifact = isolation.artifact_dir
-    binary = isolation.target_dir / "release" / "runnel"
+    target_dir = Path(os.environ.get("CARGO_TARGET_DIR", str(isolation.target_dir)))
+    binary = target_dir / "release" / "runnel"
     cluster = [
         "python3",
         "scripts/benchmarks/cluster.py",

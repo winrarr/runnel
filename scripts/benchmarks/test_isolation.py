@@ -1,7 +1,9 @@
+import os
 import shutil
 import sys
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 
 SCRIPT_DIR = Path(__file__).resolve().parent
@@ -44,6 +46,23 @@ class IsolationRunnerTests(unittest.TestCase):
         self.assertEqual(env["RUNNEL_ISOLATION_ID"], run.run_id)
         self.assertEqual(env["RUNNEL_ISOLATION_ARTIFACTS"], str(run.artifact_dir))
         self.assertEqual(env["RUST_TEST_THREADS"], "1")
+
+    def test_environment_can_reuse_a_caller_supplied_target(self) -> None:
+        run = self.new_run()
+        with patch.dict(os.environ, {"CARGO_TARGET_DIR": "/tmp/shared-runnel-target"}):
+            env = isolated.environment(run)
+
+        self.assertEqual(env["CARGO_TARGET_DIR"], "/tmp/shared-runnel-target")
+
+    def test_binary_workflows_use_a_caller_supplied_target(self) -> None:
+        run = self.new_run()
+        with patch.dict(os.environ, {"CARGO_TARGET_DIR": "/tmp/shared-runnel-target"}):
+            command = isolated.command_for("bench-cluster", run)
+
+        self.assertIn(
+            "/tmp/shared-runnel-target/release/runnel",
+            " ".join(command),
+        )
 
     def test_workflows_use_isolated_outputs_when_they_produce_them(self) -> None:
         run = self.new_run()
