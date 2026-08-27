@@ -30,8 +30,7 @@ const MAX_REUSABLE_FRAME_BUFFER_SIZE: usize = 1024 * 1024;
 const MAX_POOLED_PEERS: usize = 64;
 const MAX_CONNECTIONS_PER_POOLED_PEER: usize = 4;
 
-static PEER_POOLS: OnceLock<std::sync::Mutex<HashMap<String, Arc<PeerConnectionPool>>>> =
-    OnceLock::new();
+static PEER_POOLS: OnceLock<std::sync::Mutex<PeerPoolRegistry>> = OnceLock::new();
 
 #[derive(Clone)]
 pub struct TcpNetwork {
@@ -153,6 +152,25 @@ struct PeerConnectionPool {
     idle: Mutex<Vec<TcpConnection>>,
 }
 
+#[derive(Default)]
+struct PeerPoolRegistry {
+    pools: HashMap<String, Arc<PeerConnectionPool>>,
+}
+
+impl PeerPoolRegistry {
+    fn pool(&mut self, address: &str) -> Option<Arc<PeerConnectionPool>> {
+        if let Some(pool) = self.pools.get(address) {
+            return Some(Arc::clone(pool));
+        }
+        if self.pools.len() >= MAX_POOLED_PEERS {
+            return None;
+        }
+        let pool = Arc::new(PeerConnectionPool::new());
+        self.pools.insert(address.to_owned(), Arc::clone(&pool));
+        Some(pool)
+    }
+}
+
 impl PeerConnectionPool {
     fn new() -> Self {
         Self {
@@ -193,19 +211,11 @@ impl PeerConnectionPool {
 }
 
 fn peer_pool(address: &str) -> Option<Arc<PeerConnectionPool>> {
-    let pools = PEER_POOLS.get_or_init(|| std::sync::Mutex::new(HashMap::new()));
+    let pools = PEER_POOLS.get_or_init(|| std::sync::Mutex::new(PeerPoolRegistry::default()));
     let mut pools = pools
         .lock()
         .expect("peer RPC pool registry is not poisoned");
-    if let Some(pool) = pools.get(address) {
-        return Some(Arc::clone(pool));
-    }
-    if pools.len() >= MAX_POOLED_PEERS {
-        return None;
-    }
-    let pool = Arc::new(PeerConnectionPool::new());
-    pools.insert(address.to_owned(), Arc::clone(&pool));
-    Some(pool)
+    pools.pool(address)
 }
 
 async fn peer_request<Req, Res>(
@@ -217,7 +227,20 @@ where
     Req: Serialize,
     Res: DeserializeOwned,
 {
-    if let Some(pool) = peer_pool(address) {
+    peer_request_with_pool(peer_pool(address), address, request, ttl).await
+}
+
+async fn peer_request_with_pool<Req, Res>(
+    pool: Option<Arc<PeerConnectionPool>>,
+    address: &str,
+    request: Req,
+    ttl: Duration,
+) -> Result<Res, io::Error>
+where
+    Req: Serialize,
+    Res: DeserializeOwned,
+{
+    if let Some(pool) = pool {
         return pool.request(address, request, ttl).await;
     }
 
@@ -828,6 +851,14 @@ mod tests {
         }
     }
 
+    fn capped_registry() -> PeerPoolRegistry {
+        let mut registry = PeerPoolRegistry::default();
+        for index in 0..MAX_POOLED_PEERS {
+            assert!(registry.pool(&format!("test-peer-{index}")).is_some());
+        }
+        registry
+    }
+
     #[tokio::test]
     async fn repeated_requests_reuse_connection() {
         let peer = TestPeer::start(None).await;
@@ -1021,6 +1052,109 @@ mod tests {
         );
         assert!(connections > 1);
         assert!(connections <= MAX_CONNECTIONS_PER_POOLED_PEER);
+    }
+
+    #[tokio::test]
+    async fn capped_peer_address_uses_one_fallback_connection_per_request() {
+        const REQUESTS: usize = 16;
+
+        let mut registry = capped_registry();
+        let peer = TestPeer::start_with_delay(None, Some(Duration::from_millis(5))).await;
+        let fallback_pool = registry.pool(&peer.address);
+        assert!(fallback_pool.is_none());
+        let frame_size = serde_json::to_vec(&request()).unwrap().len() + size_of::<u32>();
+
+        let mut tasks = Vec::with_capacity(REQUESTS);
+        for _ in 0..REQUESTS {
+            let address = peer.address.clone();
+            let pool = fallback_pool.clone();
+            tasks.push(tokio::spawn(async move {
+                let response: PeerResponse =
+                    peer_request_with_pool(pool, &address, request(), Duration::from_secs(1))
+                        .await?;
+                Ok::<_, io::Error>(response)
+            }));
+        }
+
+        for task in tasks {
+            let response = task.await.unwrap().unwrap();
+            assert!(matches!(
+                response,
+                PeerResponse::Forward(ForwardedResponse::CreateStream(Ok(true)))
+            ));
+        }
+
+        assert_eq!(peer.connections.load(Ordering::Relaxed), REQUESTS);
+        assert_eq!(peer.requests.load(Ordering::Relaxed), REQUESTS);
+        assert_eq!(
+            peer.framed_bytes.load(Ordering::Relaxed),
+            REQUESTS * frame_size
+        );
+    }
+
+    #[tokio::test]
+    async fn capped_peer_fallback_timeout_drops_connection_before_next_request() {
+        let mut registry = capped_registry();
+        let peer = TestPeer::start_with_delay(None, Some(Duration::from_millis(50))).await;
+        let error = peer_request_with_pool::<_, PeerResponse>(
+            registry.pool(&peer.address),
+            &peer.address,
+            request(),
+            Duration::from_millis(1),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+
+        let response: PeerResponse = peer_request_with_pool(
+            registry.pool(&peer.address),
+            &peer.address,
+            request(),
+            Duration::from_secs(1),
+        )
+        .await
+        .unwrap();
+        assert!(matches!(
+            response,
+            PeerResponse::Forward(ForwardedResponse::CreateStream(Ok(true)))
+        ));
+        assert_eq!(peer.connections.load(Ordering::Relaxed), 2);
+    }
+
+    #[tokio::test]
+    async fn capped_peer_fallback_drops_failed_connection_before_next_request() {
+        let mut registry = capped_registry();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap().to_string();
+        let connections = Arc::new(AtomicUsize::new(0));
+        let connection_count = Arc::clone(&connections);
+        let server = tokio::spawn(async move {
+            for _ in 0..2 {
+                let (stream, _) = listener.accept().await.unwrap();
+                connection_count.fetch_add(1, Ordering::Relaxed);
+                drop(stream);
+            }
+        });
+
+        for _ in 0..2 {
+            let error = peer_request_with_pool::<_, PeerResponse>(
+                registry.pool(&address),
+                &address,
+                request(),
+                Duration::from_secs(1),
+            )
+            .await
+            .unwrap_err();
+            assert!(matches!(
+                error.kind(),
+                io::ErrorKind::BrokenPipe
+                    | io::ErrorKind::ConnectionReset
+                    | io::ErrorKind::UnexpectedEof
+            ));
+        }
+
+        server.await.unwrap();
+        assert_eq!(connections.load(Ordering::Relaxed), 2);
     }
 
     #[tokio::test]
