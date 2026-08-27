@@ -15,6 +15,7 @@ const CONCURRENT_WORKER_COUNTS: &[usize] = &[1, 2, 4, 8];
 const PAYLOAD: &[u8] = &[b'x'; 100];
 const RECOVERY_PAYLOAD: &[u8] = &[b'r'; 100];
 const RECOVERY_RETAINED_MESSAGE_COUNTS: &[u64] = &[100, 1_000, 5_000, 20_000];
+const SHARED_UNACKED_MEMBER_COUNT: u64 = 64;
 
 fn durable_publish(c: &mut Criterion) {
     let mut group = c.benchmark_group("durable_publish");
@@ -173,6 +174,49 @@ fn shared_consumer_keyed_poll_ack(c: &mut Criterion) {
                             .ack_group("bench", "workers", member, offset, &token)
                             .unwrap(),
                     );
+                }
+            },
+            BatchSize::SmallInput,
+        );
+    });
+    group.finish();
+}
+
+fn shared_consumer_many_in_flight(c: &mut Criterion) {
+    let mut group = c.benchmark_group("shared_consumer_many_in_flight");
+    group.sample_size(20);
+    group.throughput(Throughput::ElementsAndBytes {
+        elements: SHARED_UNACKED_MEMBER_COUNT,
+        bytes: SHARED_UNACKED_MEMBER_COUNT * PAYLOAD.len() as u64,
+    });
+    group.bench_function("100-byte_messages_64_unacked_members", |benchmark| {
+        benchmark.iter_batched(
+            || {
+                let directory = TempDir::new().unwrap();
+                let broker = Broker::open(
+                    directory.path(),
+                    BrokerConfig {
+                        ack_timeout: Duration::from_secs(60),
+                        max_delivery_attempts: None,
+                    },
+                )
+                .unwrap();
+                for _ in 0..SHARED_UNACKED_MEMBER_COUNT {
+                    broker.publish("bench", None, PAYLOAD.to_vec()).unwrap();
+                }
+                let members = (0..SHARED_UNACKED_MEMBER_COUNT)
+                    .map(|index| format!("member-{index}"))
+                    .collect::<Vec<_>>();
+                (directory, broker, members)
+            },
+            |(_directory, broker, members)| {
+                for (offset, member) in members.iter().enumerate() {
+                    let message = match broker.poll_group("bench", "workers", member).unwrap() {
+                        PollResult::Message(message) => message,
+                        PollResult::Empty => panic!("shared benchmark should have a message"),
+                    };
+                    assert_eq!(message.offset, offset as u64);
+                    black_box(message);
                 }
             },
             BatchSize::SmallInput,
@@ -416,6 +460,7 @@ criterion_group!(
     publish_poll_ack,
     shared_consumer_poll_ack,
     shared_consumer_keyed_poll_ack,
+    shared_consumer_many_in_flight,
     concurrent_publish_same_stream,
     concurrent_publish_independent_streams,
     reopen_recovery_retained_messages,
