@@ -24,3 +24,4 @@ Current decisions:
 - 0018-safe-replica-recovery-boundary.md: keep permissive empty-replica recovery test-only until a safe replacement lifecycle exists.
 - 0019-clustered-storage-identity.md: fail closed when persisted clustered state does not match its configured identity or format.
 - 0020-stable-optimization-evidence.md: benchmark requirements are evaluated by expected runtime impact, and optimization claims require stable authoritative evidence.
+- 0021-scheduled-benchmark-history.md: run the longer Runnel history suite on a schedule or manually instead of on every `main` push.

@@ -1,8 +1,6 @@
 name: Runnel benchmark history
 
 on:
-  push:
-    branches: [main]
   schedule:
     - cron: "17 3 * * *"
   workflow_dispatch:
@@ -33,7 +31,7 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 40
     env:
-      BENCHMARK_PROFILE: ${{ github.event_name == 'schedule' && 'scheduled' || github.event_name == 'workflow_dispatch' && 'manual' || 'push' }}
+      BENCHMARK_PROFILE: ${{ github.event_name == 'schedule' && 'scheduled' || 'manual' }}
       BENCHMARK_MESSAGES: ${{ inputs.messages || '10000' }}
       BENCHMARK_CLUSTER_MESSAGES: ${{ inputs.cluster_messages || '200' }}
       BENCHMARK_REPETITIONS: ${{ inputs.repetitions || '3' }}
