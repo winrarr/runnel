@@ -47,32 +47,35 @@ class IsolationRunnerTests(unittest.TestCase):
         self.assertEqual(env["RUNNEL_ISOLATION_ARTIFACTS"], str(run.artifact_dir))
         self.assertEqual(env["RUST_TEST_THREADS"], "1")
 
+    def test_environment_can_reuse_a_caller_supplied_target(self) -> None:
+        run = self.new_run()
+        with patch.dict(os.environ, {"CARGO_TARGET_DIR": "/tmp/shared-runnel-target"}):
+            env = isolated.environment(run)
+
+        self.assertEqual(env["CARGO_TARGET_DIR"], "/tmp/shared-runnel-target")
+
+    def test_binary_workflows_use_a_caller_supplied_target(self) -> None:
+        run = self.new_run()
+        with patch.dict(os.environ, {"CARGO_TARGET_DIR": "/tmp/shared-runnel-target"}):
+            command = isolated.command_for("bench-cluster", run)
+
+        self.assertIn(
+            "/tmp/shared-runnel-target/release/runnel",
+            " ".join(command),
+        )
+
     def test_workflows_use_isolated_outputs_when_they_produce_them(self) -> None:
         run = self.new_run()
 
         for workflow in isolated.WORKFLOWS:
             command = isolated.command_for(workflow, run)
             self.assertTrue(command)
-            if workflow.startswith("bench-") or workflow in {"profile-cluster", "integration"}:
+            if workflow.startswith("bench-") or workflow == "profile-cluster":
                 self.assertIn(str(run.artifact_dir), " ".join(command))
         self.assertIn(str(run.target_dir), " ".join(isolated.command_for("bench-cluster", run)))
         self.assertIn(run.image, " ".join(isolated.command_for("bench-container", run)))
         self.assertNotIn("--all-features", isolated.command_for("test", run))
         self.assertIn("--test-threads=1", isolated.command_for("cluster-test", run))
-
-    def test_integration_can_use_a_prebuilt_ci_image(self) -> None:
-        run = self.new_run()
-        with patch.dict(
-            os.environ,
-            {
-                "RUNNEL_INTEGRATION_IMAGE": "runnel:dev",
-                "RUNNEL_INTEGRATION_IMAGE_READY": "1",
-            },
-        ):
-            command = isolated.command_for("integration", run)
-
-        self.assertIn("runnel:dev", command)
-        self.assertIn("--skip-image-build", command)
 
     def test_benchmark_workflows_use_the_shared_lock_wrapper(self) -> None:
         run = self.new_run()

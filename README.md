@@ -68,7 +68,6 @@ Useful workflows:
     just isolated
     just isolated cluster-test
     just isolated cluster-replacement-test
-    just isolated integration
     just isolated bench-container-smoke
     just isolated bench-cluster-smoke
     just cluster-test

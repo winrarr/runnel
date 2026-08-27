@@ -51,7 +51,7 @@ jobs:
           tags: runnel:dev
           cache-from: type=gha,scope=runnel-ci
           cache-to: type=gha,mode=max,scope=runnel-ci,ignore-error=true
-      - run: RUNNEL_INTEGRATION_IMAGE=runnel:dev RUNNEL_INTEGRATION_IMAGE_READY=1 just integration
+      - run: CARGO_TARGET_DIR="$RUNNER_TEMP/runnel-target" RUNNEL_INTEGRATION_IMAGE_READY=1 just integration
       - name: Capture integration diagnostics
         if: failure()
         run: |
