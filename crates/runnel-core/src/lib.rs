@@ -109,6 +109,9 @@ struct StreamState {
     // fast path; the durable checkpoint remains the source of truth across restart and eviction.
     consumer_states: HashMap<String, ConsumerState>,
     in_flight: HashMap<DeliveryKey, InFlight>,
+    // This index mirrors only active deliveries and is removed when a consumer has no deliveries.
+    // It avoids rebuilding per-consumer offset/key sets and scanning members on every poll.
+    in_flight_by_consumer: HashMap<String, ConsumerInFlightIndex>,
 }
 
 #[derive(Debug, Clone, Hash, PartialEq, Eq)]
@@ -125,6 +128,13 @@ struct InFlight {
     delivery_attempt: u32,
     delivery_token: String,
     deadline: Instant,
+}
+
+#[derive(Default)]
+struct ConsumerInFlightIndex {
+    offsets: HashSet<Offset>,
+    keys: HashSet<String>,
+    members: HashMap<String, Offset>,
 }
 
 struct StreamLog {
@@ -144,7 +154,77 @@ impl StreamState {
             log,
             consumer_states: HashMap::new(),
             in_flight: HashMap::new(),
+            in_flight_by_consumer: HashMap::new(),
         }
+    }
+
+    fn expire_in_flight(&mut self, now: Instant) {
+        let expired = self
+            .in_flight
+            .iter()
+            .filter(|(_, in_flight)| in_flight.deadline <= now)
+            .map(|(delivery_key, _)| delivery_key.clone())
+            .collect::<Vec<_>>();
+        for delivery_key in expired {
+            self.remove_in_flight(&delivery_key);
+        }
+    }
+
+    fn insert_in_flight(&mut self, delivery_key: DeliveryKey, in_flight: InFlight) {
+        let consumer = delivery_key.consumer.clone();
+        let offset = delivery_key.offset;
+        let member = in_flight.member.clone();
+        let key = in_flight.key.clone();
+        debug_assert!(!self.in_flight.contains_key(&delivery_key));
+        self.in_flight.insert(delivery_key, in_flight);
+
+        let index = self.in_flight_by_consumer.entry(consumer).or_default();
+        index.offsets.insert(offset);
+        if let Some(key) = key {
+            index.keys.insert(key);
+        }
+        index.members.insert(member, offset);
+    }
+
+    fn remove_in_flight(&mut self, delivery_key: &DeliveryKey) -> Option<InFlight> {
+        let in_flight = self.in_flight.remove(delivery_key)?;
+        let mut remove_consumer_index = false;
+        if let Some(index) = self.in_flight_by_consumer.get_mut(&delivery_key.consumer) {
+            index.offsets.remove(&delivery_key.offset);
+            if let Some(key) = in_flight.key.as_ref() {
+                index.keys.remove(key);
+            }
+            if index
+                .members
+                .get(&in_flight.member)
+                .is_some_and(|offset| *offset == delivery_key.offset)
+            {
+                index.members.remove(&in_flight.member);
+            }
+            remove_consumer_index = index.offsets.is_empty();
+        }
+        if remove_consumer_index {
+            self.in_flight_by_consumer.remove(&delivery_key.consumer);
+        }
+        Some(in_flight)
+    }
+
+    fn find_candidate(
+        &mut self,
+        consumer: &str,
+        committed_offset: Offset,
+        acknowledged_offsets: &BTreeSet<Offset>,
+    ) -> Result<Option<RecordIndex>, BrokerError> {
+        let StreamState {
+            log,
+            in_flight_by_consumer,
+            ..
+        } = self;
+        log.find_candidate(
+            committed_offset,
+            acknowledged_offsets,
+            in_flight_by_consumer.get(consumer),
+        )
     }
 }
 
@@ -320,44 +400,34 @@ impl Broker {
         let mut stream_state = self.lock_stream(&stream_state)?;
         let root = self.inner.root.clone();
         let now = Instant::now();
-        stream_state
-            .in_flight
-            .retain(|_, in_flight| in_flight.deadline > now);
+        stream_state.expire_in_flight(now);
 
-        let existing = stream_state
-            .in_flight
-            .iter()
-            .find(|(delivery_key, in_flight)| {
-                delivery_key.consumer == consumer && in_flight.member == member
-            })
-            .map(|(delivery_key, in_flight)| (delivery_key.clone(), in_flight.clone()));
-        if let Some(in_flight) = existing {
-            let mut message = stream_state.log.read_message(stream, in_flight.1.offset)?;
-            message.delivery_token = Some(in_flight.1.delivery_token);
-            message.delivery_attempt = Some(in_flight.1.delivery_attempt);
+        let existing_offset = stream_state
+            .in_flight_by_consumer
+            .get(consumer)
+            .and_then(|index| index.members.get(member))
+            .copied();
+        if let Some(offset) = existing_offset {
+            let delivery_key = DeliveryKey {
+                consumer: consumer.to_owned(),
+                offset,
+            };
+            let Some(in_flight) = stream_state.in_flight.get(&delivery_key).cloned() else {
+                return Err(BrokerError::CorruptRecord(offset));
+            };
+            let mut message = stream_state.log.read_message(stream, in_flight.offset)?;
+            message.delivery_token = Some(in_flight.delivery_token);
+            message.delivery_attempt = Some(in_flight.delivery_attempt);
             return Ok(PollResult::Message(message));
         }
 
         let mut consumer_state =
             load_consumer_state_for_request(&mut stream_state, &root, stream, consumer)?;
         loop {
-            let in_flight_offsets: HashSet<_> = stream_state
-                .in_flight
-                .keys()
-                .filter(|delivery_key| delivery_key.consumer == consumer)
-                .map(|delivery_key| delivery_key.offset)
-                .collect();
-            let in_flight_keys: HashSet<_> = stream_state
-                .in_flight
-                .iter()
-                .filter(|(delivery_key, _)| delivery_key.consumer == consumer)
-                .filter_map(|(_, in_flight)| in_flight.key.clone())
-                .collect();
-            let candidate = stream_state.log.find_candidate(
+            let candidate = stream_state.find_candidate(
+                consumer,
                 consumer_state.committed_offset,
                 &consumer_state.acknowledged_offsets,
-                &in_flight_offsets,
-                &in_flight_keys,
             )?;
             let Some(candidate) = candidate else {
                 return Ok(PollResult::Empty);
@@ -400,7 +470,7 @@ impl Broker {
                 self.inner.redeliveries.fetch_add(1, Ordering::Relaxed);
             }
             let ack_timeout = self.inner.ack_timeout;
-            stream_state.in_flight.insert(
+            stream_state.insert_in_flight(
                 DeliveryKey {
                     consumer: consumer.to_owned(),
                     offset: candidate.offset,
@@ -485,7 +555,7 @@ impl Broker {
             ..next_state
         };
         persist_consumer_state(&root, &next_state)?;
-        stream_state.in_flight.remove(&delivery_key);
+        stream_state.remove_in_flight(&delivery_key);
         cache_consumer_state(&mut stream_state, consumer.to_owned(), next_state);
         Ok(AckResult::Acknowledged)
     }
@@ -982,8 +1052,7 @@ impl StreamLog {
         &mut self,
         committed_offset: Offset,
         acknowledged_offsets: &BTreeSet<Offset>,
-        in_flight_offsets: &HashSet<Offset>,
-        in_flight_keys: &HashSet<String>,
+        in_flight: Option<&ConsumerInFlightIndex>,
     ) -> Result<Option<RecordIndex>, BrokerError> {
         let Some(first_indexed_offset) = self.records.front().map(|record| record.offset) else {
             return Ok(None);
@@ -993,14 +1062,7 @@ impl StreamLog {
                 .records
                 .iter()
                 .filter(|record| record.offset >= committed_offset)
-                .find(|record| {
-                    record_is_candidate(
-                        record,
-                        acknowledged_offsets,
-                        in_flight_offsets,
-                        in_flight_keys,
-                    )
-                })
+                .find(|record| record_is_candidate(record, acknowledged_offsets, in_flight))
                 .cloned());
         }
 
@@ -1015,12 +1077,7 @@ impl StreamLog {
             if parsed.index.offset < committed_offset {
                 continue;
             }
-            if record_is_candidate(
-                &parsed.index,
-                acknowledged_offsets,
-                in_flight_offsets,
-                in_flight_keys,
-            ) {
+            if record_is_candidate(&parsed.index, acknowledged_offsets, in_flight) {
                 return Ok(Some(parsed.index));
             }
         }
@@ -1444,16 +1501,17 @@ fn remember_checkpoint(checkpoints: &mut VecDeque<LogCheckpoint>, offset: Offset
 fn record_is_candidate(
     record: &RecordIndex,
     acknowledged_offsets: &BTreeSet<Offset>,
-    in_flight_offsets: &HashSet<Offset>,
-    in_flight_keys: &HashSet<String>,
+    in_flight: Option<&ConsumerInFlightIndex>,
 ) -> bool {
-    if acknowledged_offsets.contains(&record.offset) || in_flight_offsets.contains(&record.offset) {
+    if acknowledged_offsets.contains(&record.offset)
+        || in_flight.is_some_and(|index| index.offsets.contains(&record.offset))
+    {
         return false;
     }
     record
         .key
         .as_ref()
-        .is_none_or(|key| !in_flight_keys.contains(key))
+        .is_none_or(|key| in_flight.is_none_or(|index| !index.keys.contains(key)))
 }
 
 fn stream_path(root: &Path, stream: &str) -> PathBuf {
@@ -2133,6 +2191,69 @@ mod tests {
             broker.poll_group("events", "workers", "b").unwrap(),
             PollResult::Message(Message { offset: 1, .. })
         ));
+    }
+
+    #[test]
+    fn grouped_dispatch_index_releases_keys_after_ack_and_expiry() {
+        let directory = tempdir().unwrap();
+        let broker = Broker::open(
+            directory.path(),
+            BrokerConfig {
+                ack_timeout: Duration::from_millis(100),
+                max_delivery_attempts: None,
+            },
+        )
+        .unwrap();
+        broker
+            .publish("events", Some("customer-a".to_owned()), b"a1".to_vec())
+            .unwrap();
+        broker
+            .publish("events", Some("customer-a".to_owned()), b"a2".to_vec())
+            .unwrap();
+        broker
+            .publish("events", Some("customer-b".to_owned()), b"b1".to_vec())
+            .unwrap();
+
+        let (first_offset, first_token) = delivery(broker.poll_group("events", "workers", "a"));
+        let (other_offset, _other_token) = delivery(broker.poll_group("events", "workers", "b"));
+        assert_eq!((first_offset, other_offset), (0, 2));
+
+        assert_eq!(
+            broker
+                .ack_group("events", "workers", "a", first_offset, &first_token)
+                .unwrap(),
+            AckResult::Acknowledged
+        );
+        let (next_offset, next_token) = delivery(broker.poll_group("events", "workers", "c"));
+        assert_eq!(next_offset, 1);
+        assert_eq!(
+            broker
+                .ack_group("events", "workers", "c", next_offset, &next_token)
+                .unwrap(),
+            AckResult::Acknowledged
+        );
+
+        std::thread::sleep(Duration::from_millis(250));
+        let (redelivered_offset, redelivered_token) =
+            delivery(broker.poll_group("events", "workers", "replacement"));
+        assert_eq!(redelivered_offset, other_offset);
+        assert_eq!(
+            broker
+                .ack_group(
+                    "events",
+                    "workers",
+                    "replacement",
+                    redelivered_offset,
+                    &redelivered_token,
+                )
+                .unwrap(),
+            AckResult::Acknowledged
+        );
+
+        let stream_state = broker.get_stream("events").unwrap();
+        let stream_state = broker.lock_stream(&stream_state).unwrap();
+        assert!(stream_state.in_flight.is_empty());
+        assert!(stream_state.in_flight_by_consumer.is_empty());
     }
 
     #[test]
