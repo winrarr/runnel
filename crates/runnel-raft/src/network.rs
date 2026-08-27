@@ -31,9 +31,16 @@ const MAX_REUSABLE_FRAME_BUFFER_SIZE: usize = 1024 * 1024;
 // fallback path instead of allowing an address burst to create unbounded work.
 const MAX_POOLED_PEERS: usize = 64;
 const MAX_CONNECTIONS_PER_POOLED_PEER: usize = 4;
+// Keep one connection available for Raft heartbeats and votes while forwarded
+// operations and data-group setup use the remaining bounded capacity. These
+// requests share a peer address, but control traffic must not wait behind a
+// slow data operation.
+const RESERVED_CONTROL_CONNECTIONS_PER_POOLED_PEER: usize = 1;
+const MAX_SHARED_CONNECTIONS_PER_POOLED_PEER: usize =
+    MAX_CONNECTIONS_PER_POOLED_PEER - RESERVED_CONTROL_CONNECTIONS_PER_POOLED_PEER;
 
 static PEER_POOLS: OnceLock<std::sync::Mutex<PeerPoolRegistry>> = OnceLock::new();
-static FALLBACK_PERMITS: OnceLock<Arc<Semaphore>> = OnceLock::new();
+static FALLBACK_PERMITS: OnceLock<PeerPoolPermits> = OnceLock::new();
 
 #[derive(Clone)]
 pub struct TcpNetwork {
@@ -86,9 +93,12 @@ impl TcpConnection {
         }
     }
 
-    async fn pooled_request<Req, Res>(&self, request: Req, ttl: Duration) -> Result<Res, io::Error>
+    async fn pooled_request<Res>(
+        &self,
+        request: PeerRequest,
+        ttl: Duration,
+    ) -> Result<Res, io::Error>
     where
-        Req: Serialize,
         Res: DeserializeOwned,
     {
         let address = self.address.clone().ok_or_else(|| {
@@ -151,8 +161,15 @@ impl TcpConnection {
 }
 
 struct PeerConnectionPool {
-    permits: Arc<Semaphore>,
+    control_permits: Arc<Semaphore>,
+    shared_permits: Arc<Semaphore>,
     idle: Mutex<Vec<TcpConnection>>,
+}
+
+#[derive(Clone, Copy)]
+enum PeerRequestLane {
+    Control,
+    Shared,
 }
 
 #[derive(Default)]
@@ -213,23 +230,24 @@ impl PeerPoolRegistry {
 impl PeerConnectionPool {
     fn new() -> Self {
         Self {
-            permits: Arc::new(Semaphore::new(MAX_CONNECTIONS_PER_POOLED_PEER)),
+            control_permits: Arc::new(Semaphore::new(RESERVED_CONTROL_CONNECTIONS_PER_POOLED_PEER)),
+            shared_permits: Arc::new(Semaphore::new(MAX_SHARED_CONNECTIONS_PER_POOLED_PEER)),
             idle: Mutex::new(Vec::with_capacity(MAX_CONNECTIONS_PER_POOLED_PEER)),
         }
     }
 
-    async fn request<Req, Res>(
+    async fn request<Res>(
         &self,
         address: &str,
-        request: Req,
+        request: PeerRequest,
         ttl: Duration,
     ) -> Result<Res, io::Error>
     where
-        Req: Serialize,
         Res: DeserializeOwned,
     {
         let started = tokio::time::Instant::now();
-        let permit = tokio::time::timeout(ttl, Arc::clone(&self.permits).acquire_owned())
+        let lane = request.lane();
+        let permit = tokio::time::timeout(ttl, self.permits(lane).acquire_owned())
             .await
             .map_err(|_| timed_out_error())?
             .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "peer RPC pool is closed"))?;
@@ -247,6 +265,13 @@ impl PeerConnectionPool {
         drop(permit);
         result
     }
+
+    fn permits(&self, lane: PeerRequestLane) -> Arc<Semaphore> {
+        match lane {
+            PeerRequestLane::Control => Arc::clone(&self.control_permits),
+            PeerRequestLane::Shared => Arc::clone(&self.shared_permits),
+        }
+    }
 }
 
 fn peer_pool(address: &str) -> Option<Arc<PeerConnectionPool>> {
@@ -257,26 +282,24 @@ fn peer_pool(address: &str) -> Option<Arc<PeerConnectionPool>> {
     pools.pool(address)
 }
 
-async fn peer_request<Req, Res>(
+async fn peer_request<Res>(
     address: &str,
-    request: Req,
+    request: PeerRequest,
     ttl: Duration,
 ) -> Result<Res, io::Error>
 where
-    Req: Serialize,
     Res: DeserializeOwned,
 {
     peer_request_with_pool(peer_pool(address), address, request, ttl).await
 }
 
-async fn peer_request_with_pool<Req, Res>(
+async fn peer_request_with_pool<Res>(
     pool: Option<Arc<PeerConnectionPool>>,
     address: &str,
-    request: Req,
+    request: PeerRequest,
     ttl: Duration,
 ) -> Result<Res, io::Error>
 where
-    Req: Serialize,
     Res: DeserializeOwned,
 {
     if let Some(pool) = pool {
@@ -284,7 +307,7 @@ where
     }
 
     let started = tokio::time::Instant::now();
-    let permit = tokio::time::timeout(ttl, fallback_permits().acquire_owned())
+    let permit = tokio::time::timeout(ttl, fallback_permits(request.lane()).acquire_owned())
         .await
         .map_err(|_| timed_out_error())?
         .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "peer RPC fallback is closed"))?;
@@ -295,10 +318,20 @@ where
     result
 }
 
-fn fallback_permits() -> Arc<Semaphore> {
-    Arc::clone(
-        FALLBACK_PERMITS.get_or_init(|| Arc::new(Semaphore::new(MAX_CONNECTIONS_PER_POOLED_PEER))),
-    )
+fn fallback_permits(lane: PeerRequestLane) -> Arc<Semaphore> {
+    let permits = FALLBACK_PERMITS.get_or_init(|| PeerPoolPermits {
+        control: Arc::new(Semaphore::new(RESERVED_CONTROL_CONNECTIONS_PER_POOLED_PEER)),
+        shared: Arc::new(Semaphore::new(MAX_SHARED_CONNECTIONS_PER_POOLED_PEER)),
+    });
+    match lane {
+        PeerRequestLane::Control => Arc::clone(&permits.control),
+        PeerRequestLane::Shared => Arc::clone(&permits.shared),
+    }
+}
+
+struct PeerPoolPermits {
+    control: Arc<Semaphore>,
+    shared: Arc<Semaphore>,
 }
 
 fn timed_out_error() -> io::Error {
@@ -431,6 +464,16 @@ enum PeerRequest {
         stream_id: String,
         group_id: String,
     },
+}
+
+impl PeerRequest {
+    fn lane(&self) -> PeerRequestLane {
+        if request_is_heartbeat(self) || matches!(self, Self::Vote { .. }) {
+            PeerRequestLane::Control
+        } else {
+            PeerRequestLane::Shared
+        }
+    }
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -909,6 +952,13 @@ mod tests {
         PeerRequest::Forward(forwarded_operation())
     }
 
+    fn control_request() -> PeerRequest {
+        PeerRequest::Vote {
+            group_id: "test".to_owned(),
+            request: VoteRequest::new(openraft::Vote::new(1, 1), None),
+        }
+    }
+
     fn forwarded_operation() -> ForwardedOperation {
         ForwardedOperation::CreateStream {
             stream: "test".to_owned(),
@@ -1150,7 +1200,78 @@ mod tests {
             started.elapsed()
         );
         assert!(connections > 1);
-        assert!(connections <= MAX_CONNECTIONS_PER_POOLED_PEER);
+        assert!(connections <= MAX_SHARED_CONNECTIONS_PER_POOLED_PEER);
+    }
+
+    async fn assert_reserved_control_connection(
+        peer: &TestPeer,
+        pool: Option<Arc<PeerConnectionPool>>,
+    ) {
+        let mut data_tasks = Vec::with_capacity(MAX_SHARED_CONNECTIONS_PER_POOLED_PEER);
+        for _ in 0..MAX_SHARED_CONNECTIONS_PER_POOLED_PEER {
+            let address = peer.address.clone();
+            let pool = pool.clone();
+            data_tasks.push(tokio::spawn(async move {
+                peer_request_with_pool::<PeerResponse>(
+                    pool,
+                    &address,
+                    request(),
+                    Duration::from_secs(5),
+                )
+                .await
+            }));
+        }
+
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while peer.connections.load(Ordering::Relaxed) < MAX_SHARED_CONNECTIONS_PER_POOLED_PEER
+            {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .expect("shared peer connections did not become active");
+
+        let address = peer.address.clone();
+        let control = tokio::spawn(async move {
+            peer_request_with_pool::<PeerResponse>(
+                pool,
+                &address,
+                control_request(),
+                Duration::from_millis(250),
+            )
+            .await
+        });
+
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while peer.connections.load(Ordering::Relaxed)
+                < MAX_SHARED_CONNECTIONS_PER_POOLED_PEER
+                    + RESERVED_CONTROL_CONNECTIONS_PER_POOLED_PEER
+            {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .expect("control traffic did not receive its reserved connection");
+
+        let error = control.await.unwrap().unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+
+        for task in data_tasks {
+            task.abort();
+            let _ = task.await;
+        }
+    }
+
+    #[tokio::test]
+    async fn control_plane_keeps_a_reserved_connection_during_forwarding_contention() {
+        let peer = TestPeer::start_with_delay(None, Some(Duration::from_secs(1))).await;
+        assert_reserved_control_connection(&peer, Some(Arc::new(PeerConnectionPool::new()))).await;
+    }
+
+    #[tokio::test]
+    async fn fallback_control_plane_keeps_a_reserved_connection_during_forwarding_contention() {
+        let peer = TestPeer::start_with_delay(None, Some(Duration::from_secs(1))).await;
+        assert_reserved_control_connection(&peer, None).await;
     }
 
     #[tokio::test]
@@ -1186,7 +1307,8 @@ mod tests {
         assert_eq!(peer.connections.load(Ordering::Relaxed), REQUESTS);
         assert_eq!(peer.requests.load(Ordering::Relaxed), REQUESTS);
         assert!(
-            peer.max_active_connections.load(Ordering::Relaxed) <= MAX_CONNECTIONS_PER_POOLED_PEER
+            peer.max_active_connections.load(Ordering::Relaxed)
+                <= MAX_SHARED_CONNECTIONS_PER_POOLED_PEER
         );
         assert_eq!(
             peer.framed_bytes.load(Ordering::Relaxed),
@@ -1198,7 +1320,7 @@ mod tests {
     async fn capped_peer_fallback_timeout_drops_connection_before_next_request() {
         let (mut registry, _held_pools) = busy_registry();
         let peer = TestPeer::start_with_delay(None, Some(Duration::from_millis(50))).await;
-        let error = peer_request_with_pool::<_, PeerResponse>(
+        let error = peer_request_with_pool::<PeerResponse>(
             registry.pool(&peer.address),
             &peer.address,
             request(),
@@ -1239,7 +1361,7 @@ mod tests {
         });
 
         for _ in 0..2 {
-            let error = peer_request_with_pool::<_, PeerResponse>(
+            let error = peer_request_with_pool::<PeerResponse>(
                 registry.pool(&address),
                 &address,
                 request(),
