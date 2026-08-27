@@ -13,6 +13,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import platform
 import re
 import shutil
 import subprocess
@@ -58,6 +59,66 @@ def benchmark_suite(nodes: int, backends: list[str]) -> str:
     if backends == ["runnel"]:
         return "runnel"
     return "native-comparison"
+
+
+def git_revision() -> str:
+    """Return the source revision used for the comparison, when available."""
+    try:
+        result = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            cwd=ROOT,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+    except OSError:
+        return "unknown"
+    revision = result.stdout.strip()
+    return revision if result.returncode == 0 and revision else "unknown"
+
+
+def source_metadata() -> dict[str, Any]:
+    """Capture source-control and CI identity in the raw result."""
+    repository = os.environ.get("GITHUB_REPOSITORY")
+    workflow_run_id = os.environ.get("GITHUB_RUN_ID")
+    server_url = os.environ.get("GITHUB_SERVER_URL", "https://github.com")
+    run_url = (
+        f"{server_url}/{repository}/actions/runs/{workflow_run_id}"
+        if repository and workflow_run_id
+        else None
+    )
+    return {
+        "repository": repository or "local",
+        "revision": git_revision(),
+        "ref": os.environ.get("GITHUB_REF_NAME")
+        or os.environ.get("GITHUB_REF", "local"),
+        "event": os.environ.get("GITHUB_EVENT_NAME", "local"),
+        "workflow": os.environ.get("GITHUB_WORKFLOW", "local"),
+        "run_id": workflow_run_id,
+        "run_url": run_url,
+        "profile": os.environ.get("BENCHMARK_PROFILE", "local"),
+    }
+
+
+def environment_metadata() -> dict[str, Any]:
+    """Capture host details needed to interpret resource measurements."""
+    return {
+        "host": platform.node() or "unknown",
+        "platform": platform.platform(),
+        "processor": platform.processor(),
+        "python": platform.python_version(),
+        "cpus": os.cpu_count(),
+    }
+
+
+def run_metadata(run_id: str) -> dict[str, Any]:
+    """Return stable identity and provenance for one raw comparison artifact."""
+    return {
+        "run_id": run_id,
+        "command": list(sys.argv),
+        "source": source_metadata(),
+        "environment": environment_metadata(),
+    }
 
 
 def bounded_read_stats(container: str) -> dict[str, float] | None:
@@ -1052,6 +1113,7 @@ def backend_metadata(name: str, nodes: int) -> dict[str, Any]:
             "acknowledgement": "request response after the current local durable append; consume acknowledgement persists a consumer checkpoint",
             "replication": "single local broker engine",
             "measurement_boundary": "Runnel's current line-delimited JSON protocol",
+            "client_image": "host Python runtime",
         }
     if name in {"kafka", "redpanda"}:
         if nodes == THREE_NODE_COUNT:
@@ -1059,22 +1121,26 @@ def backend_metadata(name: str, nodes: int) -> dict[str, Any]:
                 "acknowledgement": "Kafka producer performance client with acks=all and idempotence enabled; topic min.insync.replicas=3",
                 "replication": "three broker nodes, one partition, replication factor three, min.insync.replicas three",
                 "measurement_boundary": "Kafka native producer performance client over the Kafka protocol; durable publish only",
+                "client_image": KAFKA_IMAGE,
             }
         return {
             "acknowledgement": "Kafka producer performance client with acks=all; consumer perf client measures fetch throughput without per-record application acknowledgement",
             "replication": "single broker, one partition, replication factor one",
             "measurement_boundary": "Kafka producer/consumer performance clients over the Kafka protocol",
+            "client_image": KAFKA_IMAGE,
         }
     if nodes == THREE_NODE_COUNT:
         return {
             "acknowledgement": "JetStream synchronous publish PubAck to a file-backed stream configured with three replicas",
             "replication": "three NATS servers, file storage, three stream replicas",
             "measurement_boundary": "nats bench js native synchronous publisher; durable publish only",
+            "client_image": NATS_BOX_IMAGE,
         }
     return {
         "acknowledgement": "JetStream synchronous publish PubAck; durable consumer explicit acknowledgement with synchronous double acknowledgement",
         "replication": "single NATS server, file storage, one replica",
         "measurement_boundary": "nats bench js native benchmark client",
+        "client_image": NATS_BOX_IMAGE,
     }
 
 
@@ -1117,6 +1183,7 @@ def main() -> int:
         subprocess.run(["docker", "build", "--tag", args.runnel_image, str(ROOT)], check=True)
     timestamp = datetime.now(UTC)
     run_id = timestamp.strftime("%Y%m%d%H%M%S%f")
+    metadata = run_metadata(run_id)
     output = args.output or ROOT / "benchmark-results" / f"compare-{run_id}.json"
     output.parent.mkdir(parents=True, exist_ok=True)
     resource_prefix = f"runnel-compare-{os.getpid()}-{time.time_ns()}"
@@ -1186,6 +1253,7 @@ def main() -> int:
 
     summary = {
         "schema_version": 1,
+        **metadata,
         "generated_at": timestamp.isoformat(),
         "comparison_mode": (
             "three-node replicated durable publish; native broker tools; publish-only first slice"
