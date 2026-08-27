@@ -106,6 +106,7 @@ struct ServerMetrics {
     request_size_rejections: AtomicU64,
     request_saturation_rejections: AtomicU64,
     request_timeouts: AtomicU64,
+    response_write_timeouts: AtomicU64,
     request_bytes: AtomicU64,
     response_bytes: AtomicU64,
     requests: [AtomicU64; REQUEST_OPERATION_COUNT],
@@ -225,6 +226,7 @@ impl Default for ServerMetrics {
             request_size_rejections: AtomicU64::new(0),
             request_saturation_rejections: AtomicU64::new(0),
             request_timeouts: AtomicU64::new(0),
+            response_write_timeouts: AtomicU64::new(0),
             request_bytes: AtomicU64::new(0),
             response_bytes: AtomicU64::new(0),
             requests: std::array::from_fn(|_| AtomicU64::new(0)),
@@ -679,7 +681,7 @@ async fn handle_connection(
                     .request_bytes
                     .fetch_add(bytes.len() as u64, Ordering::Relaxed);
                 let line = request_line(&bytes);
-                let (operation, response) = match serde_json::from_slice::<Request>(line) {
+                match serde_json::from_slice::<Request>(line) {
                     Ok(request) => {
                         let operation = RequestOperation::from_request(&request);
                         let request_permit = match Arc::clone(&request_slots).try_acquire_owned() {
@@ -705,6 +707,8 @@ async fn handle_connection(
                                 continue;
                             }
                         };
+                        // Keep response serialization and socket writes inside the in-flight
+                        // bound so slow response writers cannot consume unbounded request work.
                         let _request_permit = request_permit;
                         metrics.active_requests.fetch_add(1, Ordering::Relaxed);
                         let _active_request = ActiveRequest(Arc::clone(&metrics));
@@ -722,7 +726,20 @@ async fn handle_connection(
                                 timeout_response()
                             }
                         };
-                        (operation, response)
+                        let failed = matches!(&response, Response::Error { .. });
+                        metrics.record_request(operation, started.elapsed(), failed);
+                        send_response(
+                            &mut writer,
+                            &response,
+                            response_write_timeout(
+                                started,
+                                protocol_admission.request_timeout,
+                                &response,
+                            ),
+                            &metrics,
+                        )
+                        .await?;
+                        served_request = true;
                     }
                     Err(error) => {
                         if std::str::from_utf8(line).is_err() {
@@ -737,22 +754,26 @@ async fn handle_connection(
                             )
                             .into());
                         }
-                        (
+                        let response = invalid_request_response(&error.to_string());
+                        metrics.record_request(
                             RequestOperation::InvalidRequest,
-                            invalid_request_response(&error.to_string()),
+                            started.elapsed(),
+                            true,
+                        );
+                        send_response(
+                            &mut writer,
+                            &response,
+                            response_write_timeout(
+                                started,
+                                protocol_admission.request_timeout,
+                                &response,
+                            ),
+                            &metrics,
                         )
+                        .await?;
+                        served_request = true;
                     }
-                };
-                let failed = matches!(&response, Response::Error { .. });
-                metrics.record_request(operation, started.elapsed(), failed);
-                send_response(
-                    &mut writer,
-                    &response,
-                    response_write_timeout(started, protocol_admission.request_timeout, &response),
-                    &metrics,
-                )
-                .await?;
-                served_request = true;
+                }
             }
         }
     }
@@ -843,7 +864,9 @@ where
     match tokio::time::timeout(timeout, writer.write_all(&encoded)).await {
         Ok(result) => result?,
         Err(_) => {
-            metrics.request_timeouts.fetch_add(1, Ordering::Relaxed);
+            metrics
+                .response_write_timeouts
+                .fetch_add(1, Ordering::Relaxed);
             return Err(std::io::Error::new(
                 std::io::ErrorKind::TimedOut,
                 "response write timed out",
@@ -1229,7 +1252,7 @@ fn format_metrics(
     .unwrap();
     writeln!(
         output,
-        "# HELP runnel_active_requests Broker protocol requests currently executing."
+        "# HELP runnel_active_requests Broker protocol requests executing or writing responses."
     )
     .unwrap();
     writeln!(
@@ -1275,7 +1298,18 @@ fn format_metrics(
     .unwrap();
     writeln!(
         output,
-        "# HELP runnel_broker_request_timeouts_total Broker protocol requests whose frame, engine work, or response write exceeded its timeout."
+        "# HELP runnel_broker_request_timeouts_total Broker protocol requests whose frame or engine work exceeded its timeout."
+    )
+    .unwrap();
+    writeln!(
+        output,
+        "# HELP runnel_broker_response_write_timeouts_total Broker protocol responses whose socket write exceeded the request timeout."
+    )
+    .unwrap();
+    writeln!(
+        output,
+        "# TYPE runnel_broker_response_write_timeouts_total counter\nrunnel_broker_response_write_timeouts_total {}",
+        metrics.response_write_timeouts.load(Ordering::Relaxed)
     )
     .unwrap();
     writeln!(
