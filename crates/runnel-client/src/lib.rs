@@ -144,8 +144,9 @@ impl AttemptOutcome {
 /// A persistent, sequential TCP client for the provisional JSON-lines protocol.
 ///
 /// A client sends one request and reads one response per [`Client::request`] call.
-/// Calls borrow the client mutably so responses cannot be interleaved. Drop the
-/// client and create another with [`Client::connect`] to close or reconnect.
+/// Calls borrow the client mutably so responses cannot be interleaved. Use
+/// [`Client::reconnect`] to replace a connection explicitly after a
+/// connection-invalidating failure; reconnecting never retries a request.
 pub struct Client {
     reader: BufReader<ReadHalf<TcpStream>>,
     writer: WriteHalf<TcpStream>,
@@ -163,13 +164,7 @@ impl Client {
         address: impl ToSocketAddrs,
         config: ClientConfig,
     ) -> Result<Self, ClientError> {
-        let stream = tokio::time::timeout(config.connect_timeout, TcpStream::connect(address))
-            .await
-            .map_err(|_| ClientError::ConnectTimeout {
-                timeout: config.connect_timeout,
-            })?
-            .map_err(|source| ClientError::Connect { source })?;
-        let (reader, writer) = tokio::io::split(stream);
+        let (reader, writer) = connect(address, config).await?;
 
         Ok(Self {
             reader: BufReader::new(reader),
@@ -191,6 +186,22 @@ impl Client {
         Self::connect_with_config(address, config)
             .await
             .map_err(AttemptOutcome::from_client_error)
+    }
+
+    /// Replace this client's TCP connection without retrying any request.
+    ///
+    /// The new connection is established before the current connection is
+    /// replaced. A failed or cancelled reconnect therefore leaves the client
+    /// unchanged. After a request has returned a transport error, callers must
+    /// treat that request's outcome according to [`AttemptOutcome`] and decide
+    /// explicitly whether to issue a new request after reconnecting. In
+    /// particular, this method never replays the failed request.
+    pub async fn reconnect(&mut self, address: impl ToSocketAddrs) -> Result<(), ClientError> {
+        let config = self.config;
+        let (reader, writer) = connect(address, config).await?;
+        self.reader = BufReader::new(reader);
+        self.writer = writer;
+        Ok(())
     }
 
     /// Send one request and read exactly one response from this connection.
@@ -249,6 +260,19 @@ impl Client {
             Err(error) => AttemptOutcome::Unknown(AttemptFailure::Client(error)),
         }
     }
+}
+
+async fn connect(
+    address: impl ToSocketAddrs,
+    config: ClientConfig,
+) -> Result<(ReadHalf<TcpStream>, WriteHalf<TcpStream>), ClientError> {
+    let stream = tokio::time::timeout(config.connect_timeout, TcpStream::connect(address))
+        .await
+        .map_err(|_| ClientError::ConnectTimeout {
+            timeout: config.connect_timeout,
+        })?
+        .map_err(|source| ClientError::Connect { source })?;
+    Ok(tokio::io::split(stream))
 }
 
 fn classify_response(response: Response) -> AttemptOutcome {
@@ -381,6 +405,97 @@ mod tests {
             .unwrap();
         let result = client.request(&Request::Health).await;
         assert!(matches!(result, Err(ClientError::Eof)));
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn reconnects_explicitly_after_unknown_response_failure() {
+        let (listener, address) = listener().await;
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut reader = BufReader::new(stream);
+            let mut first_request = String::new();
+            reader.read_line(&mut first_request).await.unwrap();
+            assert!(matches!(
+                serde_json::from_str::<Request>(&first_request).unwrap(),
+                Request::Health
+            ));
+            drop(reader);
+
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut reader = BufReader::new(stream);
+            let mut second_request = String::new();
+            reader.read_line(&mut second_request).await.unwrap();
+            assert!(matches!(
+                serde_json::from_str::<Request>(&second_request).unwrap(),
+                Request::Health
+            ));
+            reader
+                .get_mut()
+                .write_all(
+                    b"{\"type\":\"health\",\"status\":\"ok\",\"streams\":0,\"storage_bytes\":0}\n",
+                )
+                .await
+                .unwrap();
+        });
+
+        let mut client = Client::connect_with_config(address, test_config())
+            .await
+            .unwrap();
+        assert!(matches!(
+            client.request_with_outcome(&Request::Health).await,
+            AttemptOutcome::Unknown(AttemptFailure::Client(ClientError::Eof))
+        ));
+
+        client.reconnect(address).await.unwrap();
+        assert!(matches!(
+            client.request(&Request::Health).await,
+            Ok(Response::Health { status, .. }) if status == "ok"
+        ));
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn failed_reconnect_does_not_change_unknown_outcome() {
+        let (server_listener, address) = listener().await;
+        let server = tokio::spawn(async move {
+            let (stream, _) = server_listener.accept().await.unwrap();
+            let mut reader = BufReader::new(stream);
+            let mut request = String::new();
+            reader.read_line(&mut request).await.unwrap();
+            assert!(matches!(
+                serde_json::from_str::<Request>(&request).unwrap(),
+                Request::Publish { .. }
+            ));
+            drop(reader);
+        });
+
+        let mut client = Client::connect_with_config(address, test_config())
+            .await
+            .unwrap();
+        let outcome = client
+            .request_with_outcome(&Request::Publish {
+                stream: "events".to_owned(),
+                key: None,
+                payload: "once".to_owned(),
+                request_id: None,
+            })
+            .await;
+        assert!(matches!(
+            &outcome,
+            AttemptOutcome::Unknown(AttemptFailure::Client(ClientError::Eof))
+        ));
+
+        let (unavailable_listener, unavailable_address) = listener().await;
+        drop(unavailable_listener);
+        assert!(matches!(
+            client.reconnect(unavailable_address).await,
+            Err(ClientError::Connect { .. } | ClientError::ConnectTimeout { .. })
+        ));
+        assert!(matches!(
+            &outcome,
+            AttemptOutcome::Unknown(AttemptFailure::Client(ClientError::Eof))
+        ));
         server.await.unwrap();
     }
 
