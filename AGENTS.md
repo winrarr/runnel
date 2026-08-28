@@ -70,10 +70,10 @@ The current implementation serializes broker operations behind one in-process lo
 
 ## Change-run baseline and coordination
 
-Every agent change run must check the default branch before doing work and
-again before handing work off. Human contributors must follow the same rule
+Every agent change run must check the default branch before doing work. Human
+contributors must follow the same rule
 for every change run, as described in `CONTRIBUTING.md`, so local work does not
-silently start from or finish against stale project state:
+silently start from stale project state:
 
 Every agent, including the coordinator and delegated subagents, must read this
 `AGENTS.md` before starting work. Coordinators must state that requirement
@@ -85,21 +85,15 @@ loading.
   main`, record `git rev-parse origin/main`, and inspect the latest `ci.yml` run
   for that SHA when GitHub access is available. Treat that commit as the task
   baseline; do not assume the local `main` checkout is current.
-- Before declaring the change run complete or opening or updating a pull
-  request, fetch `origin/main` again and repeat the check. Inspect commits
-  added since the recorded baseline. If `main` changed in owned paths, shared
-  contracts, generated files, dependencies, or integration behavior, update the
-  branch and rerun relevant checks. A disjoint branch may remain based on the
-  earlier baseline when it is cleanly mergeable; record both revisions in the
-  handoff.
 - When work is delegated to disjoint worktrees, the coordinator gives every
-  worker the same baseline revision and requires the same start/end checks.
-  Workers report their baseline, the newest `origin/main` revision, and
-  whether an update was needed. Do not make independent branches chase
-  unrelated merges solely to satisfy branch age.
-- Before merging, check the newest `origin/main` revision and its default-branch
-  CI status again. Required pull-request checks still must pass, and the CI run
-  on `main` after a merge is the final check of the combined state.
+  worker the same baseline revision and requires the same starting-branch
+  check. Workers report their baseline and whether the branch was refreshed.
+  Do not make independent branches chase unrelated merges solely to satisfy
+  branch age.
+- Required pull-request checks still must pass before merging. Independently
+  reviewable disjoint pull requests may be merged in parallel; coordinate or
+  serialize changes that overlap in files, shared contracts, dependencies,
+  generated output, or integration behavior.
 
 When checking a remote baseline, compare the `headSha`, `status`, and
 `conclusion` from

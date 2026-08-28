@@ -18,7 +18,7 @@ the rule to parallel work.
 - Establish a committed baseline revision. Do not assume that uncommitted edits in the main worktree are visible in another worktree; if they matter, create a clearly identified local baseline or provide an explicit patch.
 - Before spawning, fetch `origin/main`, record its revision, and inspect the latest `ci.yml` run for that SHA when GitHub access is available. Give every worker the baseline revision, its owned paths, its expected result, and the instruction not to revert unrelated work.
 - Tell every worker, including nested subagents, to read the repository root `AGENTS.md` before starting. Do not assume the delegated environment loads project instructions automatically.
-- Tell workers to repeat the `origin/main` and default-branch CI check before handoff. A newer `main` commit requires an update only when it overlaps the worker's paths or shared contracts, dependencies, generated output, or integration behavior; disjoint work may remain based on the original baseline when it is cleanly mergeable.
+- Give workers the recorded starting baseline and its default-branch CI result; they do not need to repeat that check before handoff. A newer `main` commit requires an update only when it is known to overlap the worker's paths or shared contracts, dependencies, generated output, or integration behavior; disjoint work may remain based on the original baseline when it is cleanly mergeable.
 
 ## Worktree and branch isolation
 
@@ -82,7 +82,7 @@ Tell each worker to:
 - for performance-sensitive work, run the local benchmark sequentially with a fixed CPU/memory budget and record the actual repetition count, stability thresholds, and stable status; treat an inconclusive authoritative run as unfinished evidence;
 - distinguish a confirmed improvement from noise, a blocked run, and an inconclusive result;
 - report changed files, correctness and crash-recovery considerations, test results, and remaining risks. Follow [docs/testing.md](../../../docs/testing.md) for the class-specific merge gate and [docs/benchmarking.md](../../../docs/benchmarking.md) for expected effects, non-performance improvements, benchmark applicability, exact findings, repetition and stability results, directional medians, outlier diagnostics, and the evidence-based recommendation to merge, revise, rerun, or defer. Include blocked or inconclusive results rather than omitting them;
-- report the recorded baseline revision, newest `origin/main` revision, default-branch CI status when available, and whether the branch was refreshed;
+- report the recorded baseline revision and whether the branch was refreshed;
 - commit the result on its task branch when code is ready, or leave a clearly documented uncommitted patch when it is not.
 
 When coordinating delegated work, the orchestrator must collect each worker's
@@ -94,9 +94,9 @@ into the orchestrator's own summary.
 
 ## Integration
 
-Review each branch independently before integration. Check the diff against the recorded baseline, inspect the newest `origin/main` revision and its default-branch CI status, rerun focused tests in a clean worktree, and run the repository verification path. Do not merge an optimization solely because a microbenchmark improved: preserve durability, ordering, timeout, ambiguous-outcome, bounded-resource, and recovery guarantees.
+Review each branch independently before integration. Check the diff against the recorded baseline, rerun focused tests in a clean worktree, and run the repository verification path. Do not merge an optimization solely because a microbenchmark improved: preserve durability, ordering, timeout, ambiguous-outcome, bounded-resource, and recovery guarantees.
 
-Merge pull requests one at a time. After each merge, fetch `origin/main` and inspect the newest commit and its CI status; update remaining branches and rerun required checks only when the merge affects their paths or shared behavior. Never bypass required checks to compensate for a flaky test; diagnose whether the failure is in the implementation, test harness, environment, or resource isolation.
+Merge independently reviewable disjoint pull requests in parallel once their required pull-request checks pass. Coordinate or serialize changes that overlap in files, shared contracts, dependencies, generated output, or integration behavior. Never bypass required checks to compensate for a flaky test; diagnose whether the failure is in the implementation, test harness, environment, or resource isolation.
 
 ## Cleanup and handoff
 
