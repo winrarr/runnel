@@ -185,6 +185,104 @@ fn network_protocol_persists_acknowledgements_across_restart() {
 }
 
 #[test]
+fn network_protocol_round_trips_binary_payload_across_restart() {
+    let directory = TempDir::new().unwrap();
+    let server = RunningServer::start(directory.path());
+    let binary_json =
+        r#"{"op":"publish_bytes","stream":"binary","key":null,"payload_base64":"AAH/Cl8="}"#;
+
+    assert!(matches!(
+        request(
+            server.broker_addr,
+            Request::CreateStream {
+                stream: "binary".to_owned(),
+            },
+        ),
+        Response::StreamCreated { created: true, .. }
+    ));
+    assert!(matches!(
+        request_line(server.broker_addr, binary_json),
+        Response::Published { offset: 0, .. }
+    ));
+    assert!(matches!(
+        request_line(
+            server.broker_addr,
+            r#"{"op":"poll","stream":"binary","consumer":"worker"}"#,
+        ),
+        Response::MessageBytes {
+            offset: 0,
+            payload_base64,
+            ..
+        } if payload_base64.as_bytes() == [0, 1, 255, b'\n', b'_']
+    ));
+
+    server.stop();
+    let server = RunningServer::start(directory.path());
+    assert!(matches!(
+        request_line(
+            server.broker_addr,
+            r#"{"op":"poll","stream":"binary","consumer":"worker"}"#,
+        ),
+        Response::MessageBytes {
+            offset: 0,
+            payload_base64,
+            ..
+        } if payload_base64.as_bytes() == [0, 1, 255, b'\n', b'_']
+    ));
+    assert!(matches!(
+        request(
+            server.broker_addr,
+            Request::Ack {
+                stream: "binary".to_owned(),
+                consumer: "worker".to_owned(),
+                offset: 0,
+            },
+        ),
+        Response::Acknowledged {
+            already_acknowledged: false,
+            ..
+        }
+    ));
+}
+
+#[test]
+fn network_protocol_rejects_binary_conflicts_before_engine_execution() {
+    let directory = TempDir::new().unwrap();
+    let server = RunningServer::start(directory.path());
+
+    assert!(matches!(
+        request(
+            server.broker_addr,
+            Request::CreateStream {
+                stream: "binary".to_owned(),
+            },
+        ),
+        Response::StreamCreated { created: true, .. }
+    ));
+    assert!(matches!(
+        request_line(
+            server.broker_addr,
+            r#"{"op":"publish","stream":"binary","key":null,"payload":"text","payload_base64":"AA=="}"#,
+        ),
+        Response::Error { code, .. } if code == "invalid_request"
+    ));
+    assert!(matches!(
+        request_line(
+            server.broker_addr,
+            r#"{"op":"publish_bytes","stream":"binary","key":null,"payload_base64":"not base64"}"#,
+        ),
+        Response::Error { code, .. } if code == "invalid_request"
+    ));
+    assert!(matches!(
+        request_line(
+            server.broker_addr,
+            r#"{"op":"poll","stream":"binary","consumer":"worker"}"#,
+        ),
+        Response::Empty { .. }
+    ));
+}
+
+#[test]
 fn metrics_report_messages_returned_by_polls() {
     let directory = TempDir::new().unwrap();
     let server = RunningServer::start(directory.path());
@@ -614,11 +712,15 @@ fn network_protocol_reassigns_group_delivery_after_restart() {
 }
 
 fn request(address: SocketAddr, request: Request) -> Response {
+    let encoded = serde_json::to_string(&request).unwrap();
+    request_line(address, &encoded)
+}
+
+fn request_line(address: SocketAddr, encoded: &str) -> Response {
     let mut stream = TcpStream::connect(address).expect("broker should accept connections");
     stream
         .set_read_timeout(Some(Duration::from_secs(2)))
         .expect("read timeout should be set");
-    let encoded = serde_json::to_string(&request).unwrap();
     writeln!(stream, "{encoded}").unwrap();
     let mut response = String::new();
     BufReader::new(stream).read_line(&mut response).unwrap();

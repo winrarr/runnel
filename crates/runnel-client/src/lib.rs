@@ -1,7 +1,7 @@
 use std::io;
 use std::time::Duration;
 
-use runnel_protocol::{Request, Response};
+use runnel_protocol::{BinaryPayload, Request, Response};
 use thiserror::Error;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, ReadHalf, WriteHalf};
 use tokio::net::{TcpStream, ToSocketAddrs};
@@ -126,10 +126,6 @@ pub struct PublishReceipt {
 }
 
 /// A message returned by a successful poll.
-///
-/// The provisional protocol exposes payloads as text. Consequently this type
-/// intentionally exposes `payload` as a `String`; it is not a binary payload
-/// API and does not promise arbitrary byte round-tripping.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Message {
     /// The stream containing the message.
@@ -142,8 +138,31 @@ pub struct Message {
     pub offset: u64,
     /// The optional ordering key attached to the message.
     pub key: Option<String>,
-    /// The text payload returned by the provisional protocol.
+    /// The UTF-8 payload returned by the legacy text response.
     pub payload: String,
+    /// The broker timestamp associated with the publish.
+    pub published_at_ms: u64,
+    /// The token required for a grouped acknowledgement, when present.
+    pub delivery_token: Option<String>,
+    /// The delivery attempt number, when the broker reports one.
+    pub delivery_attempt: Option<u32>,
+}
+
+/// A message returned by a binary-aware poll.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BinaryMessage {
+    /// The stream containing the message.
+    pub stream: String,
+    /// The consumer that received the message.
+    pub consumer: String,
+    /// The shared-consumer member that received the message, when grouped polling was used.
+    pub member: Option<String>,
+    /// The broker-assigned logical message offset.
+    pub offset: u64,
+    /// The optional ordering key attached to the message.
+    pub key: Option<String>,
+    /// The exact application payload bytes returned by the broker.
+    pub payload: Vec<u8>,
     /// The broker timestamp associated with the publish.
     pub published_at_ms: u64,
     /// The token required for a grouped acknowledgement, when present.
@@ -407,12 +426,7 @@ impl Client {
         .await
     }
 
-    /// Publish a text payload with no ordering key or retry identity.
-    ///
-    /// The current provisional protocol accepts text only. This method does
-    /// not provide binary payload support. If the attempt is unknown, repeat
-    /// it only after reconnecting and only with a stable request identity when
-    /// the broker's deduplication behavior is part of the deployment contract.
+    /// Publish a UTF-8 text payload with no ordering key or retry identity.
     pub async fn publish(
         &mut self,
         stream: impl Into<String>,
@@ -422,13 +436,12 @@ impl Client {
             .await
     }
 
-    /// Publish a text payload with optional ordering and retry identity.
+    /// Publish a UTF-8 text payload with optional ordering and retry identity.
     ///
     /// This operation is never retried automatically. A stable
     /// `PublishOptions::request_id` lets an application explicitly retry an
     /// unknown publish against the current engines' deduplication path; use
-    /// the same identity for that retry. The provisional protocol and this
-    /// API do not claim binary payload support.
+    /// the same identity for that retry.
     pub async fn publish_with_options(
         &mut self,
         stream: impl Into<String>,
@@ -442,6 +455,46 @@ impl Client {
                 stream: stream.clone(),
                 key: options.key,
                 payload: payload.into(),
+                request_id: options.request_id,
+            },
+            move |response| match response {
+                Response::Published {
+                    stream: response_stream,
+                    offset,
+                } if response_stream == stream => Ok(PublishReceipt {
+                    stream: response_stream,
+                    offset,
+                }),
+                response => Err(Box::new(response)),
+            },
+        )
+        .await
+    }
+
+    /// Publish an opaque binary payload with no ordering key or retry identity.
+    pub async fn publish_bytes(
+        &mut self,
+        stream: impl Into<String>,
+        payload: impl Into<Vec<u8>>,
+    ) -> Result<PublishReceipt, AttemptOutcome> {
+        self.publish_bytes_with_options(stream, payload, PublishOptions::default())
+            .await
+    }
+
+    /// Publish an opaque binary payload with optional ordering and retry identity.
+    pub async fn publish_bytes_with_options(
+        &mut self,
+        stream: impl Into<String>,
+        payload: impl Into<Vec<u8>>,
+        options: PublishOptions,
+    ) -> Result<PublishReceipt, AttemptOutcome> {
+        let stream = stream.into();
+        self.request_typed(
+            "publish",
+            Request::PublishBytes {
+                stream: stream.clone(),
+                key: options.key,
+                payload_base64: BinaryPayload::new(payload),
                 request_id: options.request_id,
             },
             move |response| match response {
@@ -482,6 +535,35 @@ impl Client {
     ) -> Result<Option<Message>, AttemptOutcome> {
         self.poll_request(
             "poll_group",
+            stream.into(),
+            consumer.into(),
+            Some(member.into()),
+        )
+        .await
+    }
+
+    /// Poll a consumer and return the exact application payload bytes.
+    ///
+    /// Legacy UTF-8 responses are converted to their UTF-8 bytes. Messages
+    /// that require the binary representation are decoded from base64.
+    pub async fn poll_bytes(
+        &mut self,
+        stream: impl Into<String>,
+        consumer: impl Into<String>,
+    ) -> Result<Option<BinaryMessage>, AttemptOutcome> {
+        self.poll_bytes_request("poll_bytes", stream.into(), consumer.into(), None)
+            .await
+    }
+
+    /// Poll a shared consumer member and return the exact application payload bytes.
+    pub async fn poll_group_bytes(
+        &mut self,
+        stream: impl Into<String>,
+        consumer: impl Into<String>,
+        member: impl Into<String>,
+    ) -> Result<Option<BinaryMessage>, AttemptOutcome> {
+        self.poll_bytes_request(
+            "poll_group_bytes",
             stream.into(),
             consumer.into(),
             Some(member.into()),
@@ -628,6 +710,86 @@ impl Client {
                     offset,
                     key,
                     payload,
+                    published_at_ms,
+                    delivery_token,
+                    delivery_attempt,
+                }))
+            }
+            Response::Empty {
+                stream: response_stream,
+                consumer: response_consumer,
+            } if response_stream == stream && response_consumer == consumer => Ok(None),
+            response => Err(Box::new(response)),
+        })
+        .await
+    }
+
+    async fn poll_bytes_request(
+        &mut self,
+        operation: &'static str,
+        stream: String,
+        consumer: String,
+        member: Option<String>,
+    ) -> Result<Option<BinaryMessage>, AttemptOutcome> {
+        let request = match member.as_ref() {
+            Some(member) => Request::PollGroup {
+                stream: stream.clone(),
+                consumer: consumer.clone(),
+                member: member.clone(),
+            },
+            None => Request::Poll {
+                stream: stream.clone(),
+                consumer: consumer.clone(),
+            },
+        };
+        self.request_typed(operation, request, move |response| match response {
+            Response::Message {
+                stream: response_stream,
+                consumer: response_consumer,
+                member: response_member,
+                offset,
+                key,
+                payload,
+                published_at_ms,
+                delivery_token,
+                delivery_attempt,
+            } if response_stream == stream
+                && response_consumer == consumer
+                && response_member.as_ref() == member.as_ref() =>
+            {
+                Ok(Some(BinaryMessage {
+                    stream: response_stream,
+                    consumer: response_consumer,
+                    member: response_member,
+                    offset,
+                    key,
+                    payload: payload.into_bytes(),
+                    published_at_ms,
+                    delivery_token,
+                    delivery_attempt,
+                }))
+            }
+            Response::MessageBytes {
+                stream: response_stream,
+                consumer: response_consumer,
+                member: response_member,
+                offset,
+                key,
+                payload_base64,
+                published_at_ms,
+                delivery_token,
+                delivery_attempt,
+            } if response_stream == stream
+                && response_consumer == consumer
+                && response_member.as_ref() == member.as_ref() =>
+            {
+                Ok(Some(BinaryMessage {
+                    stream: response_stream,
+                    consumer: response_consumer,
+                    member: response_member,
+                    offset,
+                    key,
+                    payload: payload_base64.into_bytes(),
                     published_at_ms,
                     delivery_token,
                     delivery_attempt,
@@ -1046,6 +1208,96 @@ mod tests {
                 streams: 1,
                 storage_bytes: 4096,
             }
+        );
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn binary_publish_and_poll_preserve_payload_bytes() {
+        let (listener, address) = listener().await;
+        let payload = vec![0, 1, 255, b'\n', b'_'];
+        let server_payload = payload.clone();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut reader = BufReader::new(stream);
+
+            match read_request(&mut reader).await {
+                Request::PublishBytes {
+                    stream,
+                    key,
+                    payload_base64,
+                    request_id,
+                } => {
+                    assert_eq!(stream, "events");
+                    assert_eq!(key.as_deref(), Some("binary-key"));
+                    assert_eq!(payload_base64.as_bytes(), server_payload.as_slice());
+                    assert_eq!(request_id.as_deref(), Some("binary-publish-1"));
+                }
+                request => panic!("expected binary publish, got {request:?}"),
+            }
+            write_response(
+                &mut reader,
+                Response::Published {
+                    stream: "events".to_owned(),
+                    offset: 8,
+                },
+            )
+            .await;
+
+            assert!(matches!(
+                read_request(&mut reader).await,
+                Request::Poll { stream, consumer }
+                    if stream == "events" && consumer == "reader"
+            ));
+            write_response(
+                &mut reader,
+                Response::MessageBytes {
+                    stream: "events".to_owned(),
+                    consumer: "reader".to_owned(),
+                    member: None,
+                    offset: 8,
+                    key: Some("binary-key".to_owned()),
+                    payload_base64: BinaryPayload::new(server_payload),
+                    published_at_ms: 123,
+                    delivery_token: None,
+                    delivery_attempt: Some(1),
+                },
+            )
+            .await;
+        });
+
+        let mut client = Client::connect_with_config(address, test_config())
+            .await
+            .unwrap();
+        assert_eq!(
+            client
+                .publish_bytes_with_options(
+                    "events",
+                    payload,
+                    PublishOptions::default()
+                        .with_key("binary-key")
+                        .with_request_id("binary-publish-1"),
+                )
+                .await
+                .unwrap(),
+            PublishReceipt {
+                stream: "events".to_owned(),
+                offset: 8,
+            }
+        );
+        assert_eq!(
+            client.poll_bytes("events", "reader").await.unwrap(),
+            Some(BinaryMessage {
+                stream: "events".to_owned(),
+                consumer: "reader".to_owned(),
+                member: None,
+                offset: 8,
+                key: Some("binary-key".to_owned()),
+                payload: vec![0, 1, 255, b'\n', b'_'],
+                published_at_ms: 123,
+                delivery_token: None,
+                delivery_attempt: Some(1),
+            })
         );
         server.await.unwrap();
     }

@@ -15,7 +15,7 @@ use runnel_core::{Broker, BrokerConfig};
 #[cfg(feature = "instrumentation")]
 use runnel_engine::StageTimer;
 use runnel_engine::{AckResult, BrokerError, Engine, PollResult};
-use runnel_protocol::{Request, Response};
+use runnel_protocol::{BinaryPayload, Request, Response};
 use runnel_raft::{GroupManager, NodeId, PersistentEngine, SnapshotMetricsSnapshot};
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
@@ -191,6 +191,7 @@ impl RequestOperation {
         match request {
             Request::CreateStream { .. } => Self::CreateStream,
             Request::Publish { .. } => Self::Publish,
+            Request::PublishBytes { .. } => Self::Publish,
             Request::Poll { .. } => Self::Poll,
             Request::PollGroup { .. } => Self::PollGroup,
             Request::Ack { .. } => Self::Ack,
@@ -970,21 +971,39 @@ async fn handle_request(
                     Response::Published { stream, offset }
                 })
         }
+        Request::PublishBytes {
+            stream,
+            key,
+            payload_base64,
+            request_id,
+        } => {
+            let payload_bytes = payload_base64.as_bytes().len() as u64;
+            engine
+                .publish(&stream, key, payload_base64.into_bytes(), request_id)
+                .await
+                .map(|offset| {
+                    metrics.publishes.fetch_add(1, Ordering::Relaxed);
+                    metrics
+                        .published_bytes
+                        .fetch_add(payload_bytes, Ordering::Relaxed);
+                    Response::Published { stream, offset }
+                })
+        }
         Request::Poll { stream, consumer } => {
             let result = engine.poll(&stream, &consumer).await;
             record_delivery(metrics, &result);
             result.map(|result| match result {
-                PollResult::Message(message) => Response::Message {
+                PollResult::Message(message) => message_response(MessageResponse {
                     stream: message.stream,
                     consumer,
                     member: None,
                     offset: message.offset,
                     key: message.key,
-                    payload: String::from_utf8_lossy(&message.payload).into_owned(),
+                    payload: message.payload,
                     published_at_ms: message.published_at_ms,
                     delivery_token: None,
                     delivery_attempt: message.delivery_attempt,
-                },
+                }),
                 PollResult::Empty => Response::Empty { stream, consumer },
             })
         }
@@ -996,17 +1015,17 @@ async fn handle_request(
             let result = engine.poll_group(&stream, &consumer, &member).await;
             record_delivery(metrics, &result);
             result.map(|result| match result {
-                PollResult::Message(message) => Response::Message {
+                PollResult::Message(message) => message_response(MessageResponse {
                     stream: message.stream,
                     consumer,
                     member: Some(member),
                     offset: message.offset,
                     key: message.key,
-                    payload: String::from_utf8_lossy(&message.payload).into_owned(),
+                    payload: message.payload,
                     published_at_ms: message.published_at_ms,
                     delivery_token: message.delivery_token,
                     delivery_attempt: message.delivery_attempt,
-                },
+                }),
                 PollResult::Empty => Response::Empty { stream, consumer },
             })
         }
@@ -1057,6 +1076,56 @@ fn record_delivery(metrics: &ServerMetrics, result: &Result<PollResult, BrokerEr
         metrics
             .delivered_bytes
             .fetch_add(message.payload.len() as u64, Ordering::Relaxed);
+    }
+}
+
+struct MessageResponse {
+    stream: String,
+    consumer: String,
+    member: Option<String>,
+    offset: u64,
+    key: Option<String>,
+    payload: Vec<u8>,
+    published_at_ms: u64,
+    delivery_token: Option<String>,
+    delivery_attempt: Option<u32>,
+}
+
+fn message_response(message: MessageResponse) -> Response {
+    let MessageResponse {
+        stream,
+        consumer,
+        member,
+        offset,
+        key,
+        payload,
+        published_at_ms,
+        delivery_token,
+        delivery_attempt,
+    } = message;
+    match String::from_utf8(payload) {
+        Ok(payload) => Response::Message {
+            stream,
+            consumer,
+            member,
+            offset,
+            key,
+            payload,
+            published_at_ms,
+            delivery_token,
+            delivery_attempt,
+        },
+        Err(error) => Response::MessageBytes {
+            stream,
+            consumer,
+            member,
+            offset,
+            key,
+            payload_base64: BinaryPayload::new(error.into_bytes()),
+            published_at_ms,
+            delivery_token,
+            delivery_attempt,
+        },
     }
 }
 

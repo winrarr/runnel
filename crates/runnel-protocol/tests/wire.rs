@@ -1,4 +1,4 @@
-use runnel_protocol::{Request, Response};
+use runnel_protocol::{BinaryPayload, Request, Response};
 
 #[test]
 fn requests_and_responses_round_trip_as_json() {
@@ -9,6 +9,8 @@ fn requests_and_responses_round_trip_as_json() {
         request_id: Some("request-1".to_owned()),
     };
     let encoded = serde_json::to_string(&request).unwrap();
+    assert!(encoded.contains(r#""op":"publish""#));
+    assert!(encoded.contains(r#""payload":"hello""#));
     let decoded: Request = serde_json::from_str(&encoded).unwrap();
     assert!(matches!(
         decoded,
@@ -17,7 +19,10 @@ fn requests_and_responses_round_trip_as_json() {
             key: Some(key),
             payload,
             request_id: Some(request_id),
-        } if stream == "events" && key == "order-1" && payload == "hello" && request_id == "request-1"
+        } if stream == "events"
+            && key == "order-1"
+            && payload == "hello"
+            && request_id == "request-1"
     ));
 
     let response = Response::Acknowledged {
@@ -86,4 +91,72 @@ fn grouped_delivery_round_trips_member_and_token() {
             ..
         } if member == "worker-a" && token == "epoch-sequence"
     ));
+}
+
+#[test]
+fn binary_payloads_round_trip_without_utf8_conversion() {
+    let request: Request = serde_json::from_str(
+        r#"{"op":"publish_bytes","stream":"events","key":null,"payload_base64":"AAH/Cl8=","request_id":null}"#,
+    )
+    .unwrap();
+    assert!(matches!(
+        request,
+        Request::PublishBytes {
+            payload_base64, ..
+        } if payload_base64.as_bytes() == [0, 1, 255, b'\n', b'_']
+    ));
+
+    let encoded = serde_json::to_string(&Request::PublishBytes {
+        stream: "events".to_owned(),
+        key: None,
+        payload_base64: BinaryPayload::new(vec![0, 1, 255, b'\n', b'_']),
+        request_id: None,
+    })
+    .unwrap();
+    assert_eq!(
+        encoded,
+        r#"{"op":"publish_bytes","stream":"events","key":null,"payload_base64":"AAH/Cl8=","request_id":null}"#
+    );
+
+    let response: Response = serde_json::from_str(
+        r#"{"type":"message_bytes","stream":"events","consumer":"worker","offset":0,"key":null,"payload_base64":"AAH/Cl8=","published_at_ms":1}"#,
+    )
+    .unwrap();
+    assert!(matches!(
+        response,
+        Response::MessageBytes {
+            payload_base64, ..
+        } if payload_base64.as_bytes() == [0, 1, 255, b'\n', b'_']
+    ));
+
+    let encoded = serde_json::to_string(&Response::MessageBytes {
+        stream: "events".to_owned(),
+        consumer: "worker".to_owned(),
+        member: None,
+        offset: 0,
+        key: None,
+        payload_base64: BinaryPayload::new(vec![0, 1, 255, b'\n', b'_']),
+        published_at_ms: 1,
+        delivery_token: None,
+        delivery_attempt: None,
+    })
+    .unwrap();
+    assert_eq!(
+        encoded,
+        r#"{"type":"message_bytes","stream":"events","consumer":"worker","offset":0,"key":null,"payload_base64":"AAH/Cl8=","published_at_ms":1}"#
+    );
+}
+
+#[test]
+fn binary_payload_rejects_malformed_or_contradictory_json() {
+    for json in [
+        r#"{"op":"publish_bytes","stream":"events","key":null,"payload_base64":"not base64","request_id":null}"#,
+        r#"{"op":"publish","stream":"events","key":null,"payload":"text","payload_base64":"AA==","request_id":null}"#,
+    ] {
+        assert!(serde_json::from_str::<Request>(json).is_err());
+    }
+    assert!(serde_json::from_str::<Response>(
+        r#"{"type":"message_bytes","stream":"events","consumer":"worker","offset":0,"key":null,"payload_base64":"not base64","published_at_ms":1}"#,
+    )
+    .is_err());
 }
