@@ -67,6 +67,81 @@ class ComparisonBenchmarkTests(unittest.TestCase):
             compare.backend_metadata("runnel", 1)["client_image"], "host Python runtime"
         )
 
+    def _complete_backend_record(self, name: str, nodes: int = 1) -> dict:
+        record = compare.backend_metadata(name, nodes)
+        operations = {
+            "publish-only": "publish",
+            "consume-with-ack": "consume_ack",
+            "consume-without-ack": "consume",
+        }
+        record["scenarios"] = [
+            {"operation": operations[comparison_class]}
+            for comparison_class in record["semantic_metadata"]["scenario_classes"]
+        ]
+        compare.annotate_scenario_metadata(record)
+        return record
+
+    def test_backend_metadata_declares_semantic_boundaries_and_native_baseline(self) -> None:
+        metadata = compare.backend_metadata("kafka", 1)
+        semantic = metadata["semantic_metadata"]
+
+        self.assertEqual(
+            semantic["acknowledgement_boundary"], metadata["acknowledgement"]
+        )
+        self.assertEqual(semantic["replication_topology"], metadata["replication"])
+        self.assertEqual(
+            semantic["measurement_boundary"], metadata["measurement_boundary"]
+        )
+        self.assertEqual(
+            semantic["client_identity"],
+            {"name": metadata["measurement_client"], "image": compare.KAFKA_IMAGE},
+        )
+        self.assertEqual(
+            semantic["scenario_classes"], ["publish-only", "consume-without-ack"]
+        )
+        self.assertFalse(semantic["comparison"]["apples_to_apples"])
+        self.assertFalse(semantic["comparison"]["ranking_eligible"])
+
+    def test_semantic_validation_accepts_complete_backend_records(self) -> None:
+        cases = (
+            ("runnel", 1),
+            ("kafka", 1),
+            ("redpanda", 1),
+            ("nats", 1),
+            ("kafka", 3),
+            ("redpanda", 3),
+            ("nats", 3),
+        )
+        for name, nodes in cases:
+            with self.subTest(name=name, nodes=nodes):
+                record = self._complete_backend_record(name, nodes)
+                compare.validate_backend_record(name, record)
+
+    def test_semantic_validation_rejects_incomplete_backend_metadata(self) -> None:
+        record = self._complete_backend_record("runnel")
+        del record["semantic_metadata"]["client_identity"]
+
+        with self.assertRaisesRegex(compare.ComparisonError, "client_identity"):
+            compare.validate_backend_record("runnel", record)
+
+    def test_semantic_validation_rejects_mismatched_scenario_class(self) -> None:
+        record = self._complete_backend_record("runnel")
+        record["scenarios"][0]["metadata"]["comparison_class"] = "consume-with-ack"
+
+        with self.assertRaisesRegex(compare.ComparisonError, "comparison class"):
+            compare.validate_backend_record("runnel", record)
+
+    def test_summary_guardrail_explicitly_disallows_native_ranking(self) -> None:
+        summary = {
+            "workload": {"nodes": 1},
+            "comparison_guardrail": compare.comparison_guardrail_metadata(1),
+            "backends": {"runnel": self._complete_backend_record("runnel")},
+        }
+
+        compare.validate_comparison_summary(summary)
+        self.assertFalse(summary["comparison_guardrail"]["apples_to_apples"])
+        self.assertFalse(summary["comparison_guardrail"]["ranking_eligible"])
+
     def test_comparison_suite_distinguishes_single_and_three_node_runs(self) -> None:
         self.assertEqual(compare.benchmark_suite(1, ["runnel"]), "runnel")
         self.assertEqual(compare.benchmark_suite(1, ["kafka", "redpanda", "nats"]), "native-comparison")
