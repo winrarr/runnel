@@ -92,6 +92,7 @@ struct HttpState {
     engine: Arc<dyn Engine>,
     cluster: Option<Arc<GroupManager>>,
     metrics: Arc<ServerMetrics>,
+    admission: ProtocolAdmission,
     shutting_down: Arc<AtomicBool>,
 }
 
@@ -125,7 +126,9 @@ struct ServerMetrics {
 
 #[derive(Clone, Copy)]
 struct ProtocolAdmission {
+    max_connections: usize,
     max_request_bytes: usize,
+    max_in_flight_requests: usize,
     request_timeout: Duration,
 }
 
@@ -361,12 +364,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let tcp_engine = Arc::clone(&engine);
     let server_metrics = Arc::new(ServerMetrics::default());
     let tcp_metrics = Arc::clone(&server_metrics);
-    let connection_slots = Arc::new(Semaphore::new(args.max_connections));
-    let request_slots = Arc::new(Semaphore::new(args.max_in_flight_requests));
     let protocol_admission = ProtocolAdmission {
+        max_connections: args.max_connections,
         max_request_bytes: args.max_request_bytes,
+        max_in_flight_requests: args.max_in_flight_requests,
         request_timeout: Duration::from_millis(args.request_timeout_ms),
     };
+    let connection_slots = Arc::new(Semaphore::new(protocol_admission.max_connections));
+    let request_slots = Arc::new(Semaphore::new(protocol_admission.max_in_flight_requests));
     let mut tcp_task = tokio::spawn(run_tcp(
         tcp_listener,
         tcp_engine,
@@ -396,6 +401,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             engine,
             cluster,
             metrics: server_metrics,
+            admission: protocol_admission,
             shutting_down: http_shutting_down,
         });
     let mut http_task = tokio::spawn(async move {
@@ -1160,7 +1166,7 @@ async fn metrics(State(state): State<HttpState>) -> (StatusCode, String) {
             };
             (
                 StatusCode::OK,
-                format_metrics(health, snapshot_metrics, &state.metrics),
+                format_metrics(health, snapshot_metrics, &state.metrics, state.admission),
             )
         }
         Err(error) => {
@@ -1182,6 +1188,7 @@ fn format_metrics(
     health: runnel_engine::HealthSnapshot,
     snapshot_metrics: SnapshotMetricsSnapshot,
     metrics: &ServerMetrics,
+    admission: ProtocolAdmission,
 ) -> String {
     let mut output = String::with_capacity(5_000);
     writeln!(
@@ -1215,6 +1222,17 @@ fn format_metrics(
         output,
         "# TYPE runnel_active_connections gauge\nrunnel_active_connections {}",
         metrics.active_connections.load(Ordering::Relaxed)
+    )
+    .unwrap();
+    writeln!(
+        output,
+        "# HELP runnel_broker_max_connections Configured maximum number of broker protocol connections."
+    )
+    .unwrap();
+    writeln!(
+        output,
+        "# TYPE runnel_broker_max_connections gauge\nrunnel_broker_max_connections {}",
+        admission.max_connections
     )
     .unwrap();
     writeln!(
@@ -1270,6 +1288,39 @@ fn format_metrics(
         output,
         "# TYPE runnel_active_requests gauge\nrunnel_active_requests {}",
         metrics.active_requests.load(Ordering::Relaxed)
+    )
+    .unwrap();
+    writeln!(
+        output,
+        "# HELP runnel_broker_max_in_flight_requests Configured maximum number of broker protocol requests executing or writing responses."
+    )
+    .unwrap();
+    writeln!(
+        output,
+        "# TYPE runnel_broker_max_in_flight_requests gauge\nrunnel_broker_max_in_flight_requests {}",
+        admission.max_in_flight_requests
+    )
+    .unwrap();
+    writeln!(
+        output,
+        "# HELP runnel_broker_max_request_bytes Configured maximum broker protocol request frame size in bytes."
+    )
+    .unwrap();
+    writeln!(
+        output,
+        "# TYPE runnel_broker_max_request_bytes gauge\nrunnel_broker_max_request_bytes {}",
+        admission.max_request_bytes
+    )
+    .unwrap();
+    writeln!(
+        output,
+        "# HELP runnel_broker_request_timeout_seconds Configured maximum broker protocol request duration in seconds."
+    )
+    .unwrap();
+    writeln!(
+        output,
+        "# TYPE runnel_broker_request_timeout_seconds gauge\nrunnel_broker_request_timeout_seconds {:.9}",
+        admission.request_timeout.as_secs_f64()
     )
     .unwrap();
     writeln!(
