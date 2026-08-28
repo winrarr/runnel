@@ -3650,6 +3650,29 @@ mod tests {
         lease_deadline_ms: u64,
         log_index: u64,
     ) -> PollResult {
+        poll_group_with_log_id_for_test(
+            state,
+            stream,
+            consumer,
+            member,
+            now_ms,
+            lease_deadline_ms,
+            LogId {
+                leader_id: openraft::CommittedLeaderId::new(1, 1),
+                index: log_index,
+            },
+        )
+    }
+
+    fn poll_group_with_log_id_for_test(
+        state: &mut SnapshotState,
+        stream: &str,
+        consumer: &str,
+        member: &str,
+        now_ms: u64,
+        lease_deadline_ms: u64,
+        log_id: LogId<NodeId>,
+    ) -> PollResult {
         match apply_command(
             state,
             Command::PollGroup {
@@ -3661,14 +3684,20 @@ mod tests {
                 max_delivery_attempts: None,
             },
             &data_group_kind(stream),
-            LogId {
-                leader_id: openraft::CommittedLeaderId::new(1, 1),
-                index: log_index,
-            },
+            log_id,
         ) {
             CommandResponse::GroupPoll { result } => result,
             response => panic!("unexpected grouped poll response: {response:?}"),
         }
+    }
+
+    fn round_trip_snapshot_state_for_test(state: &SnapshotState) -> SnapshotState {
+        let persisted = persisted_snapshot_state(state);
+        let recovered = serde_json::from_slice::<PersistedSnapshotState>(
+            &serde_json::to_vec(&persisted).unwrap(),
+        )
+        .unwrap();
+        snapshot_state_from_persisted(recovered)
     }
 
     fn delivery_token_for_test(
@@ -3785,6 +3814,70 @@ mod tests {
     }
 
     #[test]
+    fn grouped_lease_forward_jump_and_fixed_leader_offset_expire_early() {
+        let mut forward_jump_state = grouped_test_state();
+        let old_token = delivery_token_for_test(&mut forward_jump_state, "member-a", 100, 200, 0);
+        let redelivery = poll_group_for_test(
+            &mut forward_jump_state,
+            "events",
+            "workers",
+            "member-b",
+            10_000,
+            10_100,
+            1,
+        );
+        let new_token = match redelivery {
+            PollResult::Message(message) => {
+                assert_eq!(message.delivery_attempt, Some(2));
+                message.delivery_token.unwrap()
+            }
+            PollResult::Empty => panic!("expected redelivery after a forward clock jump"),
+        };
+        assert_ne!(new_token, old_token);
+        assert_eq!(forward_jump_state.lease_clock_ms, 10_000);
+
+        // A successor whose clock is fixed 2 seconds ahead can expire a
+        // delivery even when its own new deadline is still in the future.
+        let mut offset_state = grouped_test_state();
+        let old_token = match poll_group_with_log_id_for_test(
+            &mut offset_state,
+            "events",
+            "workers",
+            "member-a",
+            1_000,
+            2_000,
+            LogId {
+                leader_id: openraft::CommittedLeaderId::new(1, 1),
+                index: 0,
+            },
+        ) {
+            PollResult::Message(message) => message.delivery_token.unwrap(),
+            PollResult::Empty => panic!("expected initial delivery"),
+        };
+        let redelivery = poll_group_with_log_id_for_test(
+            &mut offset_state,
+            "events",
+            "workers",
+            "member-b",
+            3_000,
+            4_000,
+            LogId {
+                leader_id: openraft::CommittedLeaderId::new(2, 2),
+                index: 0,
+            },
+        );
+        assert!(!lease_expired(4_000, 3_000));
+        match redelivery {
+            PollResult::Message(message) => {
+                assert_eq!(message.delivery_attempt, Some(2));
+                assert_ne!(message.delivery_token.as_deref(), Some(old_token.as_str()));
+            }
+            PollResult::Empty => panic!("expected redelivery after a fixed leader offset"),
+        }
+        assert_eq!(offset_state.lease_clock_ms, 3_000);
+    }
+
+    #[test]
     fn grouped_lease_clock_floor_survives_snapshot_recovery_and_backward_time() {
         let mut state = grouped_test_state();
         poll_group_for_test(&mut state, "events", "workers", "member-a", 100, 200, 0);
@@ -3795,12 +3888,7 @@ mod tests {
         );
         assert_eq!(state.lease_clock_ms, 200);
 
-        let persisted = persisted_snapshot_state(&state);
-        let recovered = serde_json::from_slice::<PersistedSnapshotState>(
-            &serde_json::to_vec(&persisted).unwrap(),
-        )
-        .unwrap();
-        let mut recovered = snapshot_state_from_persisted(recovered);
+        let mut recovered = round_trip_snapshot_state_for_test(&state);
         assert_eq!(recovered.lease_clock_ms, 200);
 
         assert!(matches!(
@@ -3811,6 +3899,35 @@ mod tests {
             })
         ));
         assert_eq!(recovered.lease_clock_ms, 200);
+    }
+
+    #[test]
+    fn grouped_lease_has_no_lazy_expiry_without_a_committed_command() {
+        let mut state = grouped_test_state();
+        let token = delivery_token_for_test(&mut state, "member-a", 100, 200, 0);
+
+        // This state machine has no timer callback. With no elected leader,
+        // no PollGroup/AckGroup command can be committed, so the delivery
+        // remains in flight until a later command supplies an observation.
+        let recovered = round_trip_snapshot_state_for_test(&state);
+        let delivery = recovered
+            .group_consumers
+            .get(&("events".to_owned(), "workers".to_owned()))
+            .and_then(|consumer| consumer.in_flight.get(&0))
+            .expect("snapshot recovery must retain the in-flight delivery");
+        assert_eq!(delivery.delivery_token, token);
+        assert_eq!(recovered.lease_clock_ms, 100);
+
+        let mut recovered = recovered;
+        assert!(matches!(
+            poll_group_for_test(&mut recovered, "events", "workers", "member-a", 50, 150, 1),
+            PollResult::Message(Message {
+                delivery_attempt: Some(1),
+                delivery_token: Some(ref current_token),
+                ..
+            }) if current_token == &token
+        ));
+        assert_eq!(recovered.lease_clock_ms, 100);
     }
 
     #[test]
@@ -3852,6 +3969,148 @@ mod tests {
                 &mut state, "events", "workers", "member-b", 0, &new_token, 150,
             ),
             CommandResponse::GroupAcknowledged
+        );
+    }
+
+    #[tokio::test]
+    async fn grouped_lease_survives_journal_restart_and_leader_change() {
+        let directory = tempfile::tempdir().unwrap();
+        let state_directory = directory.path().join("state-machine");
+        let store =
+            Arc::new(StateMachineStore::open(&state_directory, data_group_kind("events")).unwrap());
+        let mut state_machine = store.clone();
+        let first_responses = state_machine
+            .apply([
+                Entry {
+                    log_id: LogId {
+                        leader_id: openraft::CommittedLeaderId::new(1, 1),
+                        index: 0,
+                    },
+                    payload: EntryPayload::Normal(Command::Publish {
+                        stream: "events".to_owned(),
+                        key: None,
+                        payload: b"lease".to_vec(),
+                        published_at_ms: 1,
+                        request_id: None,
+                    }),
+                },
+                Entry {
+                    log_id: LogId {
+                        leader_id: openraft::CommittedLeaderId::new(1, 1),
+                        index: 1,
+                    },
+                    payload: EntryPayload::Normal(Command::PollGroup {
+                        stream: "events".to_owned(),
+                        consumer: "workers".to_owned(),
+                        member: "member-a".to_owned(),
+                        now_ms: 100,
+                        lease_deadline_ms: 200,
+                        max_delivery_attempts: None,
+                    }),
+                },
+            ])
+            .await
+            .unwrap();
+        let old_token = match &first_responses[1] {
+            CommandResponse::GroupPoll {
+                result: PollResult::Message(message),
+            } => message.delivery_token.clone().unwrap(),
+            response => panic!("unexpected initial poll response: {response:?}"),
+        };
+        drop(state_machine);
+        drop(store);
+
+        let reopened =
+            StateMachineStore::open(&state_directory, data_group_kind("events")).unwrap();
+        {
+            let state = reopened.state.read().await;
+            assert_eq!(state.state.lease_clock_ms, 100);
+            assert_eq!(
+                state
+                    .state
+                    .group_consumers
+                    .get(&("events".to_owned(), "workers".to_owned()))
+                    .and_then(|consumer| consumer.in_flight.get(&0))
+                    .map(|delivery| delivery.delivery_token.as_str()),
+                Some(old_token.as_str())
+            );
+        }
+
+        let reopened = Arc::new(reopened);
+        let mut state_machine = reopened.clone();
+        let redelivery_responses = state_machine
+            .apply(std::iter::once(Entry {
+                log_id: LogId {
+                    leader_id: openraft::CommittedLeaderId::new(2, 2),
+                    index: 0,
+                },
+                payload: EntryPayload::Normal(Command::PollGroup {
+                    stream: "events".to_owned(),
+                    consumer: "workers".to_owned(),
+                    member: "member-b".to_owned(),
+                    now_ms: 200,
+                    lease_deadline_ms: 300,
+                    max_delivery_attempts: None,
+                }),
+            }))
+            .await
+            .unwrap();
+        let new_token = match &redelivery_responses[0] {
+            CommandResponse::GroupPoll {
+                result: PollResult::Message(message),
+            } => {
+                assert_eq!(message.delivery_attempt, Some(2));
+                message.delivery_token.clone().unwrap()
+            }
+            response => panic!("unexpected redelivery response: {response:?}"),
+        };
+        assert_ne!(new_token, old_token);
+
+        let stale_response = state_machine
+            .apply(std::iter::once(Entry {
+                log_id: LogId {
+                    leader_id: openraft::CommittedLeaderId::new(2, 2),
+                    index: 1,
+                },
+                payload: EntryPayload::Normal(Command::AckGroup {
+                    stream: "events".to_owned(),
+                    consumer: "workers".to_owned(),
+                    member: "member-a".to_owned(),
+                    offset: 0,
+                    delivery_token: old_token,
+                    now_ms: 200,
+                }),
+            }))
+            .await
+            .unwrap();
+        assert_eq!(
+            stale_response,
+            vec![CommandResponse::GroupStaleDelivery {
+                consumer: "workers".to_owned(),
+                offset: 0,
+            }]
+        );
+
+        let acknowledged_response = state_machine
+            .apply(std::iter::once(Entry {
+                log_id: LogId {
+                    leader_id: openraft::CommittedLeaderId::new(2, 2),
+                    index: 2,
+                },
+                payload: EntryPayload::Normal(Command::AckGroup {
+                    stream: "events".to_owned(),
+                    consumer: "workers".to_owned(),
+                    member: "member-b".to_owned(),
+                    offset: 0,
+                    delivery_token: new_token,
+                    now_ms: 200,
+                }),
+            }))
+            .await
+            .unwrap();
+        assert_eq!(
+            acknowledged_response,
+            vec![CommandResponse::GroupAcknowledged]
         );
     }
 
