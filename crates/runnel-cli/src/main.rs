@@ -2,7 +2,7 @@ use std::net::SocketAddr;
 
 use clap::{Parser, Subcommand};
 use runnel_client::Client;
-use runnel_protocol::{Request, Response};
+use runnel_protocol::{BinaryPayload, Request, Response};
 
 #[derive(Debug, Parser)]
 #[command(name = "runnelctl", about = "Development client for Runnel")]
@@ -20,7 +20,9 @@ enum Command {
     },
     Publish {
         stream: String,
-        payload: String,
+        payload: Option<String>,
+        #[arg(long, conflicts_with = "payload")]
+        payload_base64: Option<String>,
         #[arg(long)]
         key: Option<String>,
         #[arg(long)]
@@ -52,13 +54,30 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Command::Publish {
             stream,
             payload,
+            payload_base64,
             key,
             request_id,
-        } => Request::Publish {
-            stream,
-            key,
-            payload,
-            request_id,
+        } => match (payload, payload_base64) {
+            (Some(payload), None) => Request::Publish {
+                stream,
+                key,
+                payload,
+                request_id,
+            },
+            (None, Some(payload_base64)) => {
+                let payload = BinaryPayload::from_base64(&payload_base64)
+                    .map_err(|error| format!("--payload-base64 is invalid: {error}"))?;
+                Request::PublishBytes {
+                    stream,
+                    key,
+                    payload_base64: payload,
+                    request_id,
+                }
+            }
+            (None, None) => {
+                return Err("publish requires a text payload argument or --payload-base64".into());
+            }
+            (Some(_), Some(_)) => unreachable!("clap rejects conflicting payload arguments"),
         },
         Command::Consume {
             stream,
