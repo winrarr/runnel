@@ -16,6 +16,8 @@ const CONCURRENT_WORKER_COUNTS: &[usize] = &[1, 2, 4, 8];
 const PAYLOAD: &[u8] = &[b'x'; 100];
 const RECOVERY_PAYLOAD: &[u8] = &[b'r'; 100];
 const RECOVERY_RETAINED_MESSAGE_COUNTS: &[u64] = &[100, 1_000, 5_000, 20_000];
+const BOUNDED_INDEX_RETAINED_MESSAGE_COUNTS: &[u64] = &[65_537, 131_072];
+const BOUNDED_INDEX_COLD_OFFSET: u64 = 1_024;
 const SHARED_UNACKED_MEMBER_COUNT: u64 = 64;
 
 fn durable_publish(c: &mut Criterion) {
@@ -478,6 +480,70 @@ fn cold_retained_history_poll(c: &mut Criterion) {
     group.finish();
 }
 
+fn reopen_then_cold_replay_beyond_bounded_index(c: &mut Criterion) {
+    let mut group = c.benchmark_group("retained_history_restart_cold_replay");
+    group.sample_size(10);
+    group.warm_up_time(Duration::from_secs(1));
+    group.measurement_time(Duration::from_secs(3));
+
+    for &retained_message_count in BOUNDED_INDEX_RETAINED_MESSAGE_COUNTS {
+        // Prepare the complete log and checkpoint once so the measured operation contains
+        // startup scan plus the first cold replay, not publish or checkpoint setup.
+        let directory = TempDir::new().unwrap();
+        let broker = Broker::open(directory.path(), BrokerConfig::default()).unwrap();
+        for offset in 0..retained_message_count {
+            assert_eq!(
+                broker
+                    .publish("recovery", None, RECOVERY_PAYLOAD.to_vec())
+                    .unwrap(),
+                offset
+            );
+        }
+        let consumer_directory = directory.path().join("consumers/recovery");
+        fs::create_dir_all(&consumer_directory).unwrap();
+        fs::write(
+            consumer_directory.join("cold.json"),
+            format!(
+                "{{\"stream\":\"recovery\",\"consumer\":\"cold\",\
+                 \"committed_offset\":{BOUNDED_INDEX_COLD_OFFSET},\
+                 \"acknowledged_offsets\":[],\"delivery_attempts\":{{}}}}"
+            ),
+        )
+        .unwrap();
+        drop(broker);
+
+        group.throughput(Throughput::ElementsAndBytes {
+            elements: retained_message_count,
+            bytes: retained_message_count * RECOVERY_PAYLOAD.len() as u64,
+        });
+        group.bench_function(
+            BenchmarkId::new(
+                "reopen_then_cold_poll_100_byte_payload",
+                format!("{retained_message_count}_retained_messages"),
+            ),
+            |benchmark| {
+                benchmark.iter_custom(|iterations| {
+                    let started = Instant::now();
+                    for _ in 0..iterations {
+                        let reopened =
+                            Broker::open(directory.path(), BrokerConfig::default()).unwrap();
+                        let message = match reopened.poll("recovery", "cold").unwrap() {
+                            PollResult::Message(message) => message,
+                            PollResult::Empty => {
+                                panic!("cold replay should find retained history")
+                            }
+                        };
+                        assert_eq!(message.offset, BOUNDED_INDEX_COLD_OFFSET);
+                        black_box(message);
+                    }
+                    started.elapsed()
+                });
+            },
+        );
+    }
+    group.finish();
+}
+
 fn grouped_delivery(result: PollResult) -> (u64, String) {
     match result {
         PollResult::Message(message) => (
@@ -502,5 +568,6 @@ criterion_group!(
     concurrent_publish_independent_streams,
     reopen_recovery_retained_messages,
     cold_retained_history_poll,
+    reopen_then_cold_replay_beyond_bounded_index,
 );
 criterion_main!(benches);
