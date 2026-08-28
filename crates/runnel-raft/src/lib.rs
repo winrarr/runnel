@@ -9,7 +9,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
-use std::io::{Cursor, Read, Write};
+use std::io::{Cursor, Write};
 use std::mem::size_of;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -73,6 +73,13 @@ const FORWARD_ATTEMPTS: usize = 3;
 const FORWARD_TIMEOUT: Duration = Duration::from_secs(2);
 const STORAGE_METADATA_FORMAT_VERSION: u32 = 1;
 const STORAGE_METADATA_FILE: &str = "storage.json";
+const LEGACY_SINGLE_GROUP_PATHS: &[&str] = &[
+    "raft-log.json",
+    "state-machine",
+    "state-machine.json",
+    "snapshot.json",
+    "state-machine.log",
+];
 const STATE_MACHINE_JOURNAL_FORMAT_VERSION: u32 = 1;
 const STATE_MACHINE_JOURNAL_FILE: &str = "state-machine.log";
 const MAX_STATE_MACHINE_JOURNAL_RECORD_SIZE: u32 = 64 * 1024 * 1024;
@@ -291,6 +298,7 @@ struct PersistedStorageMetadata {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct PersistedState {
     version: u32,
     last_applied_log: Option<LogId<NodeId>>,
@@ -310,6 +318,7 @@ struct PersistedState {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct PersistedSnapshotState {
     #[serde(default = "legacy_format_version")]
     version: u32,
@@ -335,6 +344,7 @@ enum PersistedStreamData {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct PersistedStream {
     #[serde(default)]
     stream_id: String,
@@ -377,6 +387,7 @@ impl PersistedStreamData {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct PersistedConsumer {
     stream: String,
     consumer: String,
@@ -384,6 +395,7 @@ struct PersistedConsumer {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct PersistedGroupConsumer {
     stream: String,
     consumer: String,
@@ -391,12 +403,14 @@ struct PersistedGroupConsumer {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct StoredSnapshot {
     meta: SnapshotMeta<NodeId, BasicNode>,
     data: Vec<u8>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct StateMachineJournalEntry {
     version: u32,
     log_id: LogId<NodeId>,
@@ -472,78 +486,105 @@ struct StateMachineStore {
     metrics: Arc<SnapshotMetrics>,
 }
 
+fn read_persisted_state(path: &Path) -> Result<Option<PersistedState>, BrokerError> {
+    if !path.exists() {
+        return Ok(None);
+    }
+    let bytes = fs::read(path).map_err(|error| {
+        BrokerError::Cluster(format!(
+            "could not read persisted state-machine '{}': {error}",
+            path.display()
+        ))
+    })?;
+    let persisted: PersistedState = serde_json::from_slice(&bytes).map_err(|error| {
+        BrokerError::Cluster(format!(
+            "invalid persisted state-machine '{}': {error}",
+            path.display()
+        ))
+    })?;
+    if !matches!(persisted.version, 1 | FORMAT_VERSION) {
+        return Err(BrokerError::Cluster(format!(
+            "unsupported state-machine format version {} in '{}' (checkpoint; supported versions: 1 and {})",
+            persisted.version,
+            path.display(),
+            FORMAT_VERSION
+        )));
+    }
+    Ok(Some(persisted))
+}
+
+fn state_machine_data_from_persisted(persisted: PersistedState) -> StateMachineData {
+    StateMachineData {
+        last_applied_log: persisted.last_applied_log,
+        last_membership: persisted.last_membership,
+        state: SnapshotState {
+            streams: persisted
+                .streams
+                .into_iter()
+                .map(|(stream, persisted)| {
+                    let state = persisted.into_state(&stream);
+                    (stream, state)
+                })
+                .collect(),
+            consumers: persisted
+                .consumers
+                .into_iter()
+                .map(|consumer| ((consumer.stream, consumer.consumer), consumer.offset))
+                .collect(),
+            group_consumers: persisted
+                .group_consumers
+                .into_iter()
+                .map(|consumer| ((consumer.stream, consumer.consumer), consumer.state))
+                .collect(),
+            lease_clock_ms: persisted.lease_clock_ms,
+            dedup: persisted.dedup,
+            redeliveries: persisted.redeliveries,
+            dead_letters: persisted.dead_letters,
+        },
+    }
+}
+
+fn read_persisted_snapshot(path: &Path) -> Result<Option<StoredSnapshot>, BrokerError> {
+    if !path.exists() {
+        return Ok(None);
+    }
+    let bytes = fs::read(path).map_err(|error| {
+        BrokerError::Cluster(format!(
+            "could not read persisted snapshot '{}': {error}",
+            path.display()
+        ))
+    })?;
+    serde_json::from_slice(&bytes).map(Some).map_err(|error| {
+        BrokerError::Cluster(format!(
+            "invalid persisted snapshot '{}': {error}",
+            path.display()
+        ))
+    })
+}
+
 impl StateMachineStore {
     fn open(path: impl AsRef<Path>, kind: GroupKind) -> Result<Self, BrokerError> {
         let path = path.as_ref().to_path_buf();
-        fs::create_dir_all(&path)?;
         let state_path = path.join("state-machine.json");
-        let mut state = if state_path.exists() {
-            let bytes = fs::read(&state_path)?;
-            let persisted: PersistedState = serde_json::from_slice(&bytes).map_err(|error| {
-                BrokerError::Cluster(format!(
-                    "invalid persisted state-machine '{}': {error}",
-                    state_path.display()
-                ))
-            })?;
-            if !matches!(persisted.version, 1 | FORMAT_VERSION) {
-                return Err(BrokerError::Cluster(format!(
-                    "unsupported state-machine format version {}",
-                    persisted.version
-                )));
-            }
-            StateMachineData {
-                last_applied_log: persisted.last_applied_log,
-                last_membership: persisted.last_membership,
-                state: SnapshotState {
-                    streams: persisted
-                        .streams
-                        .into_iter()
-                        .map(|(stream, persisted)| {
-                            let state = persisted.into_state(&stream);
-                            (stream, state)
-                        })
-                        .collect(),
-                    consumers: persisted
-                        .consumers
-                        .into_iter()
-                        .map(|consumer| ((consumer.stream, consumer.consumer), consumer.offset))
-                        .collect(),
-                    group_consumers: persisted
-                        .group_consumers
-                        .into_iter()
-                        .map(|consumer| ((consumer.stream, consumer.consumer), consumer.state))
-                        .collect(),
-                    lease_clock_ms: persisted.lease_clock_ms,
-                    dedup: persisted.dedup,
-                    redeliveries: persisted.redeliveries,
-                    dead_letters: persisted.dead_letters,
-                },
-            }
-        } else {
-            StateMachineData::default()
-        };
+        let mut state = read_persisted_state(&state_path)?
+            .map(state_machine_data_from_persisted)
+            .unwrap_or_default();
         let snapshot_path = path.join("snapshot.json");
-        let (current_snapshot, snapshot_state) = if snapshot_path.exists() {
-            let bytes = fs::read(&snapshot_path)?;
-            let snapshot: StoredSnapshot = serde_json::from_slice(&bytes).map_err(|error| {
-                BrokerError::Cluster(format!(
-                    "invalid persisted snapshot '{}': {error}",
-                    snapshot_path.display()
-                ))
-            })?;
-            let persisted = validate_snapshot_data(&snapshot.data).map_err(|error| {
-                BrokerError::Cluster(format!(
-                    "invalid persisted snapshot '{}': {error}",
-                    snapshot_path.display()
-                ))
-            })?;
-            (
-                Some(snapshot),
-                Some(snapshot_state_from_persisted(persisted)),
-            )
-        } else {
-            (None, None)
-        };
+        let (current_snapshot, snapshot_state) =
+            if let Some(snapshot) = read_persisted_snapshot(&snapshot_path)? {
+                let persisted = validate_snapshot_data(&snapshot.data).map_err(|error| {
+                    BrokerError::Cluster(format!(
+                        "invalid persisted snapshot '{}': {error}",
+                        snapshot_path.display()
+                    ))
+                })?;
+                (
+                    Some(snapshot),
+                    Some(snapshot_state_from_persisted(persisted)),
+                )
+            } else {
+                (None, None)
+            };
         if let (Some(snapshot), Some(snapshot_state)) = (&current_snapshot, snapshot_state)
             && is_optional_log_after(snapshot.meta.last_log_id, state.last_applied_log)
         {
@@ -556,6 +597,7 @@ impl StateMachineStore {
         let journal_path = path.join(STATE_MACHINE_JOURNAL_FILE);
         let journal_entries = read_state_machine_journal(&journal_path)?;
         replay_state_machine_journal(&mut state, &journal_entries, &kind)?;
+        fs::create_dir_all(&path)?;
         let journal = fs::OpenOptions::new()
             .create(true)
             .read(true)
@@ -811,19 +853,39 @@ impl StateMachineStore {
 }
 
 fn read_state_machine_journal(path: &Path) -> Result<Vec<StateMachineJournalEntry>, BrokerError> {
+    let (entries, truncated_at) = parse_state_machine_journal(path)?;
+    let Some(truncated_at) = truncated_at else {
+        return Ok(entries);
+    };
+    let file = fs::OpenOptions::new().read(true).write(true).open(path)?;
+    file.set_len(truncated_at as u64)?;
+    file.sync_data()?;
+    Ok(entries)
+}
+
+fn validate_state_machine_journal(path: &Path) -> Result<(), BrokerError> {
+    parse_state_machine_journal(path).map(|_| ())
+}
+
+fn parse_state_machine_journal(
+    path: &Path,
+) -> Result<(Vec<StateMachineJournalEntry>, Option<usize>), BrokerError> {
     if !path.exists() {
-        return Ok(Vec::new());
+        return Ok((Vec::new(), None));
     }
-    let mut file = fs::OpenOptions::new().read(true).write(true).open(path)?;
-    let mut bytes = Vec::new();
-    file.read_to_end(&mut bytes)?;
+    let bytes = fs::read(path).map_err(|error| {
+        BrokerError::Cluster(format!(
+            "could not read state-machine journal '{}': {error}",
+            path.display()
+        ))
+    })?;
     let mut cursor = 0usize;
-    let mut truncated = false;
+    let mut truncated_at = None;
     let mut entries = Vec::new();
     while cursor < bytes.len() {
         let record_start = cursor;
         if bytes.len() - cursor < size_of::<u32>() {
-            truncated = true;
+            truncated_at = Some(record_start);
             break;
         }
         let record_len = u32::from_le_bytes(
@@ -839,8 +901,7 @@ fn read_state_machine_journal(path: &Path) -> Result<Vec<StateMachineJournalEntr
         }
         let record_len = record_len as usize;
         if bytes.len() - cursor < record_len {
-            truncated = true;
-            cursor = record_start;
+            truncated_at = Some(record_start);
             break;
         }
         let entry: StateMachineJournalEntry =
@@ -852,18 +913,38 @@ fn read_state_machine_journal(path: &Path) -> Result<Vec<StateMachineJournalEntr
             })?;
         if entry.version != STATE_MACHINE_JOURNAL_FORMAT_VERSION {
             return Err(BrokerError::Cluster(format!(
-                "unsupported state-machine journal format version {}",
-                entry.version
+                "unsupported state-machine journal format version {} in '{}' (supported version {})",
+                entry.version,
+                path.display(),
+                STATE_MACHINE_JOURNAL_FORMAT_VERSION
             )));
         }
         entries.push(entry);
         cursor += record_len;
     }
-    if truncated {
-        file.set_len(cursor as u64)?;
-        file.sync_data()?;
+    Ok((entries, truncated_at))
+}
+
+fn validate_state_machine_storage(path: &Path) -> Result<(), BrokerError> {
+    if !path.exists() {
+        return Ok(());
     }
-    Ok(entries)
+    if !path.is_dir() {
+        return Err(BrokerError::Cluster(format!(
+            "invalid state-machine storage '{}': expected a directory",
+            path.display()
+        )));
+    }
+    let _ = read_persisted_state(&path.join("state-machine.json"))?;
+    if let Some(snapshot) = read_persisted_snapshot(&path.join("snapshot.json"))? {
+        validate_snapshot_data(&snapshot.data).map_err(|error| {
+            BrokerError::Cluster(format!(
+                "invalid persisted snapshot '{}': {error}",
+                path.join("snapshot.json").display()
+            ))
+        })?;
+    }
+    validate_state_machine_journal(&path.join(STATE_MACHINE_JOURNAL_FILE))
 }
 
 fn append_state_machine_journal_entry(
@@ -1130,7 +1211,10 @@ fn validate_snapshot_data(data: &[u8]) -> Result<PersistedSnapshotState, std::io
     if !matches!(persisted.version, 1 | FORMAT_VERSION) {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
-            format!("unsupported snapshot format version {}", persisted.version),
+            format!(
+                "unsupported snapshot format version {} (supported versions: 1 and {})",
+                persisted.version, FORMAT_VERSION
+            ),
         ));
     }
     Ok(persisted)
@@ -2290,6 +2374,7 @@ impl Engine for SingleNodeEngine {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct DataGroupManifest {
     stream: String,
     stream_id: String,
@@ -2382,11 +2467,17 @@ impl GroupManager {
         for entry in fs::read_dir(directory)? {
             let entry = entry?;
             if !entry.file_type()?.is_dir() {
-                continue;
+                return Err(BrokerError::Cluster(format!(
+                    "invalid data-group entry '{}': expected a directory",
+                    entry.path().display()
+                )));
             }
             let manifest_path = entry.path().join("group.json");
             if !manifest_path.exists() {
-                continue;
+                return Err(BrokerError::Cluster(format!(
+                    "missing data-group manifest '{}'",
+                    manifest_path.display()
+                )));
             }
             let manifest: DataGroupManifest = serde_json::from_slice(&fs::read(manifest_path)?)?;
             self.ensure_data_group_local(
@@ -2466,14 +2557,31 @@ impl GroupManager {
             return Ok(group);
         }
         let directory = self.data_group_directory(stream);
-        fs::create_dir_all(&directory)?;
+        let manifest_path = directory.join("group.json");
+        if directory.exists() && !directory.is_dir() {
+            return Err(BrokerError::Cluster(format!(
+                "invalid data-group storage '{}': expected a directory",
+                directory.display()
+            )));
+        }
+        if directory.exists() && !manifest_path.exists() {
+            let has_entries = fs::read_dir(&directory)?.next().transpose()?.is_some();
+            if has_entries {
+                return Err(BrokerError::Cluster(format!(
+                    "missing data-group manifest '{}'",
+                    manifest_path.display()
+                )));
+            }
+        }
         let manifest = DataGroupManifest {
             stream: stream.to_owned(),
             stream_id: metadata.stream_id.clone(),
             group_id: metadata.group_id.clone(),
         };
-        let bytes = serde_json::to_vec(&manifest)?;
-        atomic_write(&directory.join("group.json"), &bytes)?;
+        if !manifest_path.exists() {
+            let bytes = serde_json::to_vec(&manifest)?;
+            atomic_write(&manifest_path, &bytes)?;
+        }
         let group = self
             .open_group(
                 &metadata.group_id,
@@ -2787,6 +2895,87 @@ fn path_component(value: &str) -> String {
         .collect()
 }
 
+fn validate_persisted_group_storage(directory: &Path) -> Result<(), BrokerError> {
+    if !directory.exists() {
+        return Ok(());
+    }
+    if !directory.is_dir() {
+        return Err(BrokerError::Cluster(format!(
+            "invalid clustered group storage '{}': expected a directory",
+            directory.display()
+        )));
+    }
+    log_store::LogStore::<TypeConfig>::validate(directory.join("raft-log.json"))
+        .map_err(|error| BrokerError::Cluster(error.to_string()))?;
+    validate_state_machine_storage(&directory.join("state-machine"))
+}
+
+fn validate_persisted_cluster_storage(data_dir: &Path) -> Result<(), BrokerError> {
+    let groups_directory = data_dir.join("groups");
+    if !groups_directory.exists() {
+        return Ok(());
+    }
+    if !groups_directory.is_dir() {
+        return Err(BrokerError::Cluster(format!(
+            "invalid clustered storage '{}': expected a groups directory",
+            groups_directory.display()
+        )));
+    }
+    validate_persisted_group_storage(&groups_directory.join(METADATA_GROUP_ID))?;
+
+    let data_groups_directory = groups_directory.join("data");
+    if !data_groups_directory.exists() {
+        return Ok(());
+    }
+    if !data_groups_directory.is_dir() {
+        return Err(BrokerError::Cluster(format!(
+            "invalid clustered storage '{}': expected a data-groups directory",
+            data_groups_directory.display()
+        )));
+    }
+    for entry in fs::read_dir(&data_groups_directory)? {
+        let entry = entry?;
+        let entry_path = entry.path();
+        if !entry.file_type()?.is_dir() {
+            return Err(BrokerError::Cluster(format!(
+                "invalid data-group entry '{}': expected a directory",
+                entry_path.display()
+            )));
+        }
+        let manifest_path = entry_path.join("group.json");
+        if !manifest_path.exists() {
+            return Err(BrokerError::Cluster(format!(
+                "missing data-group manifest '{}'",
+                manifest_path.display()
+            )));
+        }
+        let manifest: DataGroupManifest = serde_json::from_slice(&fs::read(&manifest_path)?)
+            .map_err(|error| {
+                BrokerError::Cluster(format!(
+                    "invalid data-group manifest '{}': {error}",
+                    manifest_path.display()
+                ))
+            })?;
+        let expected_directory = data_groups_directory.join(path_component(&manifest.stream));
+        if entry_path != expected_directory {
+            return Err(BrokerError::Cluster(format!(
+                "data-group manifest '{}' does not match its directory '{}'",
+                manifest_path.display(),
+                entry_path.display()
+            )));
+        }
+        let (expected_stream_id, expected_group_id) = stream_identity(&manifest.stream);
+        if manifest.stream_id != expected_stream_id || manifest.group_id != expected_group_id {
+            return Err(BrokerError::Cluster(format!(
+                "data-group manifest '{}' has incompatible stream/group identity",
+                manifest_path.display()
+            )));
+        }
+        validate_persisted_group_storage(&entry_path)?;
+    }
+    Ok(())
+}
+
 fn ensure_storage_metadata(
     data_dir: &Path,
     cluster_name: &str,
@@ -2809,8 +2998,10 @@ fn ensure_storage_metadata(
             })?;
         if metadata.version != STORAGE_METADATA_FORMAT_VERSION {
             return Err(BrokerError::Cluster(format!(
-                "unsupported storage metadata format version {}",
-                metadata.version
+                "unsupported storage metadata format version {} in '{}' (supported version {})",
+                metadata.version,
+                metadata_path.display(),
+                STORAGE_METADATA_FORMAT_VERSION
             )));
         }
         if metadata.cluster_name != cluster_name {
@@ -2916,13 +3107,23 @@ impl PersistentEngine {
         }
         let data_dir = data_dir.as_ref();
         fs::create_dir_all(data_dir)?;
-        if data_dir.join("raft-log.json").exists() || data_dir.join("state-machine").exists() {
-            return Err(BrokerError::Cluster(
-                "legacy single-group storage detected; migrate the data directory before starting this clustered layout"
-                    .to_owned(),
-            ));
+        let legacy_paths = LEGACY_SINGLE_GROUP_PATHS
+            .iter()
+            .map(|relative| data_dir.join(relative))
+            .filter(|path| path.exists())
+            .collect::<Vec<_>>();
+        if !legacy_paths.is_empty() {
+            return Err(BrokerError::Cluster(format!(
+                "legacy single-group storage detected at {}; migrate the data directory before starting this clustered layout",
+                legacy_paths
+                    .iter()
+                    .map(|path| format!("'{}'", path.display()))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )));
         }
         ensure_storage_metadata(data_dir, &cluster_name, node_id)?;
+        validate_persisted_cluster_storage(data_dir)?;
         let manager = GroupManager::open(
             node_id,
             cluster_name,
@@ -4209,6 +4410,10 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let legacy_log = directory.path().join("raft-log.json");
         fs::write(&legacy_log, b"legacy acknowledged data").unwrap();
+        let legacy_state = directory.path().join("state-machine");
+        fs::create_dir_all(&legacy_state).unwrap();
+        let legacy_state_marker = legacy_state.join("state-machine.json");
+        fs::write(&legacy_state_marker, b"legacy state-machine data").unwrap();
         let peers = BTreeMap::from([(1, "127.0.0.1:0".to_owned())]);
 
         let error = match PersistentEngine::open(
@@ -4225,6 +4430,39 @@ mod tests {
         };
         assert!(error.contains("legacy single-group storage detected"));
         assert_eq!(fs::read(&legacy_log).unwrap(), b"legacy acknowledged data");
+        assert_eq!(
+            fs::read(&legacy_state_marker).unwrap(),
+            b"legacy state-machine data"
+        );
+        assert!(!directory.path().join(STORAGE_METADATA_FILE).exists());
+        assert!(!directory.path().join("groups").exists());
+    }
+
+    #[tokio::test]
+    async fn legacy_root_checkpoint_is_rejected_without_creating_new_layout() {
+        let directory = tempfile::tempdir().unwrap();
+        let legacy_checkpoint = directory.path().join("state-machine.json");
+        fs::write(&legacy_checkpoint, b"legacy state-machine data").unwrap();
+        let peers = BTreeMap::from([(1, "127.0.0.1:0".to_owned())]);
+
+        let error = match PersistentEngine::open(
+            1,
+            "runnel-legacy-root-checkpoint-test".to_owned(),
+            directory.path(),
+            peers,
+            true,
+        )
+        .await
+        {
+            Ok(_) => panic!("legacy root checkpoint must be rejected"),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains("legacy single-group storage detected"));
+        assert!(error.contains(legacy_checkpoint.to_str().unwrap()));
+        assert_eq!(
+            fs::read(&legacy_checkpoint).unwrap(),
+            b"legacy state-machine data"
+        );
         assert!(!directory.path().join(STORAGE_METADATA_FILE).exists());
         assert!(!directory.path().join("groups").exists());
     }
@@ -4261,6 +4499,150 @@ mod tests {
         assert!(error.contains("unsupported storage metadata format version"));
         assert_eq!(fs::read(&metadata_path).unwrap(), metadata_before);
         assert!(!directory.path().join("groups").exists());
+    }
+
+    #[tokio::test]
+    async fn unsupported_data_group_log_is_rejected_before_opening_new_groups() {
+        let directory = tempfile::tempdir().unwrap();
+        fs::write(
+            directory.path().join(STORAGE_METADATA_FILE),
+            serde_json::to_vec(&PersistedStorageMetadata {
+                version: STORAGE_METADATA_FORMAT_VERSION,
+                cluster_name: "runnel-data-group-version-test".to_owned(),
+                node_id: 1,
+            })
+            .unwrap(),
+        )
+        .unwrap();
+        let data_group_directory = directory
+            .path()
+            .join("groups/data")
+            .join(path_component("events"));
+        fs::create_dir_all(&data_group_directory).unwrap();
+        let manifest_path = data_group_directory.join("group.json");
+        let manifest = DataGroupManifest {
+            stream: "events".to_owned(),
+            stream_id: "stream/events".to_owned(),
+            group_id: "group/events/data".to_owned(),
+        };
+        let manifest_before = serde_json::to_vec(&manifest).unwrap();
+        fs::write(&manifest_path, &manifest_before).unwrap();
+        let log_path = data_group_directory.join("raft-log.json");
+        let log_before = serde_json::to_vec(&serde_json::json!({
+            "version": 2,
+            "last_purged_log_id": null,
+            "log": {},
+            "committed": null,
+            "vote": null,
+        }))
+        .unwrap();
+        fs::write(&log_path, &log_before).unwrap();
+        let peers = BTreeMap::from([(1, "127.0.0.1:0".to_owned())]);
+
+        let error = match PersistentEngine::open(
+            1,
+            "runnel-data-group-version-test".to_owned(),
+            directory.path(),
+            peers,
+            true,
+        )
+        .await
+        {
+            Ok(_) => panic!("unsupported data-group log must be rejected"),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains("unsupported log format version"));
+        assert!(error.contains(log_path.to_str().unwrap()));
+        assert_eq!(fs::read(&manifest_path).unwrap(), manifest_before);
+        assert_eq!(fs::read(&log_path).unwrap(), log_before);
+        assert!(!directory.path().join("groups/metadata").exists());
+    }
+
+    #[test]
+    fn unsupported_state_machine_checkpoint_is_rejected_without_creating_journal() {
+        let directory = tempfile::tempdir().unwrap();
+        let state_directory = directory.path().join("state-machine");
+        fs::create_dir_all(&state_directory).unwrap();
+        let state_path = state_directory.join("state-machine.json");
+        let state_before = serde_json::to_vec(&serde_json::json!({
+            "version": FORMAT_VERSION + 1,
+            "last_applied_log": null,
+            "last_membership": serde_json::to_value(
+                StoredMembership::<NodeId, BasicNode>::default()
+            )
+            .unwrap(),
+            "streams": {},
+            "consumers": [],
+        }))
+        .unwrap();
+        fs::write(&state_path, &state_before).unwrap();
+
+        let error = StateMachineStore::open(&state_directory, GroupKind::Metadata)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("unsupported state-machine format version"));
+        assert!(error.contains(state_path.to_str().unwrap()));
+        assert_eq!(fs::read(&state_path).unwrap(), state_before);
+        assert!(!state_directory.join(STATE_MACHINE_JOURNAL_FILE).exists());
+    }
+
+    #[test]
+    fn unsupported_state_machine_journal_is_rejected_without_truncating() {
+        let directory = tempfile::tempdir().unwrap();
+        let state_directory = directory.path().join("state-machine");
+        fs::create_dir_all(&state_directory).unwrap();
+        let journal_path = state_directory.join(STATE_MACHINE_JOURNAL_FILE);
+        let record = serde_json::to_vec(&StateMachineJournalEntry {
+            version: STATE_MACHINE_JOURNAL_FORMAT_VERSION + 1,
+            log_id: LogId {
+                leader_id: openraft::CommittedLeaderId::new(1, 1),
+                index: 0,
+            },
+            payload: EntryPayload::Blank,
+        })
+        .unwrap();
+        let mut journal_before = (record.len() as u32).to_le_bytes().to_vec();
+        journal_before.extend_from_slice(&record);
+        fs::write(&journal_path, &journal_before).unwrap();
+
+        let error = StateMachineStore::open(&state_directory, GroupKind::Metadata)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("unsupported state-machine journal format version"));
+        assert!(error.contains(journal_path.to_str().unwrap()));
+        assert_eq!(fs::read(&journal_path).unwrap(), journal_before);
+        assert!(!state_directory.join("state-machine.json").exists());
+    }
+
+    #[test]
+    fn unsupported_snapshot_version_is_rejected_without_creating_journal() {
+        let directory = tempfile::tempdir().unwrap();
+        let state_directory = directory.path().join("state-machine");
+        fs::create_dir_all(&state_directory).unwrap();
+        let snapshot_path = state_directory.join("snapshot.json");
+        let snapshot = StoredSnapshot {
+            meta: SnapshotMeta {
+                last_log_id: None,
+                last_membership: StoredMembership::default(),
+                snapshot_id: "unsupported".to_owned(),
+            },
+            data: serde_json::to_vec(&serde_json::json!({
+                "version": FORMAT_VERSION + 1,
+                "streams": {},
+                "consumers": [],
+            }))
+            .unwrap(),
+        };
+        let snapshot_before = serde_json::to_vec(&snapshot).unwrap();
+        fs::write(&snapshot_path, &snapshot_before).unwrap();
+
+        let error = StateMachineStore::open(&state_directory, GroupKind::Metadata)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("unsupported snapshot format version"));
+        assert!(error.contains(snapshot_path.to_str().unwrap()));
+        assert_eq!(fs::read(&snapshot_path).unwrap(), snapshot_before);
+        assert!(!state_directory.join(STATE_MACHINE_JOURNAL_FILE).exists());
     }
 
     #[tokio::test]
@@ -4425,7 +4807,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn legacy_stream_state_migrates_to_stable_metadata() {
+    async fn legacy_state_machine_format_recovers_metadata_messages_and_progress() {
         let directory = tempfile::tempdir().unwrap();
         let state_directory = directory.path().join("state-machine");
         fs::create_dir_all(&state_directory).unwrap();
@@ -4436,8 +4818,11 @@ mod tests {
                 StoredMembership::<NodeId, BasicNode>::default()
             )
             .unwrap(),
-            "streams": {"events": []},
-            "consumers": []
+            "streams": {"events": [
+                {"key": null, "payload": [115, 107, 105, 112], "published_at_ms": 1},
+                {"key": "key", "payload": [114, 101, 99, 111, 118, 101, 114], "published_at_ms": 2}
+            ]},
+            "consumers": [{"stream": "events", "consumer": "worker", "offset": 1}]
         });
         fs::write(
             state_directory.join("state-machine.json"),
@@ -4454,6 +4839,64 @@ mod tests {
                 lifecycle: StreamLifecycle::Active,
             }
         );
+        assert!(matches!(
+            store.poll("events", "worker").await.unwrap(),
+            PollResult::Message(Message {
+                offset: 1,
+                key: Some(key),
+                payload,
+                ..
+            }) if key == "key" && payload == b"recover"
+        ));
+    }
+
+    #[tokio::test]
+    async fn legacy_snapshot_format_recovers_metadata_messages_and_progress() {
+        let directory = tempfile::tempdir().unwrap();
+        let state_directory = directory.path().join("state-machine");
+        fs::create_dir_all(&state_directory).unwrap();
+        let snapshot_path = state_directory.join("snapshot.json");
+        let snapshot = StoredSnapshot {
+            meta: SnapshotMeta {
+                last_log_id: Some(LogId {
+                    leader_id: openraft::CommittedLeaderId::new(1, 1),
+                    index: 1,
+                }),
+                last_membership: StoredMembership::default(),
+                snapshot_id: "legacy".to_owned(),
+            },
+            data: serde_json::to_vec(&serde_json::json!({
+                "version": 1,
+                "streams": {"events": [
+                    {"key": null, "payload": [115, 107, 105, 112], "published_at_ms": 1},
+                    {"key": "key", "payload": [114, 101, 99, 111, 118, 101, 114], "published_at_ms": 2}
+                ]},
+                "consumers": [{"stream": "events", "consumer": "worker", "offset": 1}]
+            }))
+            .unwrap(),
+        };
+        let snapshot_before = serde_json::to_vec(&snapshot).unwrap();
+        fs::write(&snapshot_path, &snapshot_before).unwrap();
+
+        let store = StateMachineStore::open(&state_directory, GroupKind::Metadata).unwrap();
+        assert_eq!(fs::read(&snapshot_path).unwrap(), snapshot_before);
+        assert_eq!(
+            store.metadata("events").await.unwrap(),
+            StreamMetadata {
+                stream_id: "stream/events".to_owned(),
+                group_id: "group/events/data".to_owned(),
+                lifecycle: StreamLifecycle::Active,
+            }
+        );
+        assert!(matches!(
+            store.poll("events", "worker").await.unwrap(),
+            PollResult::Message(Message {
+                offset: 1,
+                key: Some(key),
+                payload,
+                ..
+            }) if key == "key" && payload == b"recover"
+        ));
     }
 
     #[test]

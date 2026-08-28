@@ -32,6 +32,7 @@ struct LogStoreInner<C: RaftTypeConfig> {
 }
 
 #[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 #[serde(bound(serialize = "E: Serialize", deserialize = "E: DeserializeOwned"))]
 struct PersistedLog<E> {
     version: u32,
@@ -69,32 +70,7 @@ where
 {
     pub fn open(path: impl AsRef<Path>) -> Result<Self, StorageError<NodeId>> {
         let path = path.as_ref().to_path_buf();
-        let inner = if path.exists() {
-            let bytes = fs::read(&path).map_err(|error| {
-                StorageError::from_io_error(
-                    openraft::ErrorSubject::Logs,
-                    openraft::ErrorVerb::Read,
-                    error,
-                )
-            })?;
-            let persisted: PersistedLog<C::Entry> =
-                serde_json::from_slice(&bytes).map_err(|error| {
-                    StorageError::from_io_error(
-                        openraft::ErrorSubject::Logs,
-                        openraft::ErrorVerb::Read,
-                        std::io::Error::new(std::io::ErrorKind::InvalidData, error),
-                    )
-                })?;
-            if persisted.version != FORMAT_VERSION {
-                return Err(StorageError::from_io_error(
-                    openraft::ErrorSubject::Logs,
-                    openraft::ErrorVerb::Read,
-                    std::io::Error::new(
-                        std::io::ErrorKind::InvalidData,
-                        format!("unsupported log format version {}", persisted.version),
-                    ),
-                ));
-            }
+        let inner = if let Some(persisted) = Self::read_persisted(&path)? {
             LogStoreInner {
                 last_purged_log_id: persisted.last_purged_log_id,
                 log: persisted.log,
@@ -112,6 +88,53 @@ where
         Ok(Self {
             inner: Arc::new(Mutex::new(inner)),
         })
+    }
+
+    pub(crate) fn validate(path: impl AsRef<Path>) -> Result<(), StorageError<NodeId>> {
+        Self::read_persisted(path.as_ref()).map(|_| ())
+    }
+
+    fn read_persisted(path: &Path) -> Result<Option<PersistedLog<C::Entry>>, StorageError<NodeId>> {
+        if !path.exists() {
+            return Ok(None);
+        }
+        let bytes = fs::read(path).map_err(|error| {
+            StorageError::from_io_error(
+                openraft::ErrorSubject::Logs,
+                openraft::ErrorVerb::Read,
+                std::io::Error::new(
+                    error.kind(),
+                    format!("could not read Raft log '{}': {error}", path.display()),
+                ),
+            )
+        })?;
+        let persisted: PersistedLog<C::Entry> =
+            serde_json::from_slice(&bytes).map_err(|error| {
+                StorageError::from_io_error(
+                    openraft::ErrorSubject::Logs,
+                    openraft::ErrorVerb::Read,
+                    std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        format!("invalid Raft log '{}': {error}", path.display()),
+                    ),
+                )
+            })?;
+        if persisted.version != FORMAT_VERSION {
+            return Err(StorageError::from_io_error(
+                openraft::ErrorSubject::Logs,
+                openraft::ErrorVerb::Read,
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!(
+                        "unsupported log format version {} in '{}' (Raft log; supported version {})",
+                        persisted.version,
+                        path.display(),
+                        FORMAT_VERSION
+                    ),
+                ),
+            ));
+        }
+        Ok(Some(persisted))
     }
 
     fn persist(inner: &LogStoreInner<C>) -> Result<(), StorageError<NodeId>> {
@@ -271,4 +294,50 @@ fn atomic_write(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     fs::rename(&temp, path)?;
     let directory = fs::File::open(parent)?;
     directory.sync_all()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn supported_raft_log_format_recovers_without_rewriting() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("raft-log.json");
+        let bytes = serde_json::to_vec(&serde_json::json!({
+            "version": FORMAT_VERSION,
+            "last_purged_log_id": null,
+            "log": {},
+            "committed": null,
+            "vote": null,
+        }))
+        .unwrap();
+        fs::write(&path, &bytes).unwrap();
+
+        let mut store = LogStore::<crate::TypeConfig>::open(&path).unwrap();
+        assert_eq!(store.get_log_state().await.unwrap().last_log_id, None);
+        assert_eq!(fs::read(&path).unwrap(), bytes);
+    }
+
+    #[test]
+    fn unsupported_raft_log_format_is_rejected_without_rewriting() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("raft-log.json");
+        let bytes = serde_json::to_vec(&serde_json::json!({
+            "version": FORMAT_VERSION + 1,
+            "last_purged_log_id": null,
+            "log": {},
+            "committed": null,
+            "vote": null,
+        }))
+        .unwrap();
+        fs::write(&path, &bytes).unwrap();
+
+        let error = LogStore::<crate::TypeConfig>::open(&path)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("unsupported log format version"));
+        assert!(error.contains(path.to_str().unwrap()));
+        assert_eq!(fs::read(&path).unwrap(), bytes);
+    }
 }
