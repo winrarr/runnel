@@ -54,6 +54,43 @@ impl Drop for RunningServer {
 }
 
 #[test]
+fn configured_admission_limits_are_exposed_as_gauges() {
+    let directory = TempDir::new().unwrap();
+    let server = RunningServer::start(
+        directory.path(),
+        &[
+            "--max-connections",
+            "3",
+            "--max-request-bytes",
+            "2048",
+            "--max-in-flight-requests",
+            "7",
+            "--request-timeout-ms",
+            "1250",
+        ],
+    );
+
+    let metrics = http_metrics(server.http_addr);
+    assert_eq!(metric_value(&metrics, "runnel_broker_max_connections"), 3);
+    assert_eq!(
+        metric_value(&metrics, "runnel_broker_max_request_bytes"),
+        2048
+    );
+    assert_eq!(
+        metric_value(&metrics, "runnel_broker_max_in_flight_requests"),
+        7
+    );
+    assert_eq!(
+        metric_float_value(&metrics, "runnel_broker_request_timeout_seconds"),
+        1.25
+    );
+    assert!(metrics.contains("# TYPE runnel_broker_max_connections gauge"));
+    assert!(metrics.contains("# TYPE runnel_broker_max_request_bytes gauge"));
+    assert!(metrics.contains("# TYPE runnel_broker_max_in_flight_requests gauge"));
+    assert!(metrics.contains("# TYPE runnel_broker_request_timeout_seconds gauge"));
+}
+
+#[test]
 fn connection_flood_is_rejected_and_durable_traffic_recovers() {
     let directory = TempDir::new().unwrap();
     let server = RunningServer::start(
@@ -555,6 +592,14 @@ fn http_ready(address: SocketAddr) -> String {
 }
 
 fn metric_value(metrics: &str, name: &str) -> u64 {
+    metrics
+        .lines()
+        .find_map(|line| line.strip_prefix(&format!("{name} ")))
+        .and_then(|value| value.parse().ok())
+        .unwrap_or_default()
+}
+
+fn metric_float_value(metrics: &str, name: &str) -> f64 {
     metrics
         .lines()
         .find_map(|line| line.strip_prefix(&format!("{name} ")))
