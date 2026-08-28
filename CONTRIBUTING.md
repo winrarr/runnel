@@ -38,7 +38,6 @@ repository rulesets or required checks are not allowed.
 
 Every human change run must begin by fetching `origin/main`, recording its
 revision, and checking the latest default-branch CI run for that exact commit.
-Repeat the check before handing work off or opening or updating a pull request.
 Pull-request branches do not need to be rebased solely because `main` advanced:
 update the branch and rerun relevant checks when changes overlap in owned paths,
 shared contracts, generated files, dependencies, or integration behavior;
