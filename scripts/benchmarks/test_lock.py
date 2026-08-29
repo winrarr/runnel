@@ -21,6 +21,8 @@ class BenchmarkLockTests(unittest.TestCase):
         self.assertEqual(mode_for("bench-compare-cluster"), "exclusive")
         self.assertEqual(mode_for("bench-container-smoke"), "shared")
         self.assertEqual(mode_for("bench-cluster-smoke"), "shared")
+        self.assertEqual(mode_for("bench-cluster-container"), "exclusive")
+        self.assertEqual(mode_for("bench-cluster-container-smoke"), "shared")
 
     def test_shared_commands_can_run(self) -> None:
         result = subprocess.run(

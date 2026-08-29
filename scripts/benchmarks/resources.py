@@ -11,6 +11,9 @@ import time
 from typing import Any
 
 
+DEFAULT_PROBE_TIMEOUT_SECONDS = 2.0
+
+
 def parse_size(value: str) -> float:
     match = re.fullmatch(r"\s*([0-9.]+)\s*([KMGT]?i?B)\s*", value)
     if match is None:
@@ -19,13 +22,21 @@ def parse_size(value: str) -> float:
     return float(match.group(1)) * units[match.group(2)]
 
 
-def read_stats(container: str) -> dict[str, float] | None:
-    result = subprocess.run(
-        ["docker", "stats", "--no-stream", "--format", "{{json .}}", container],
-        capture_output=True,
-        text=True,
-        check=False,
-    )
+def read_stats(
+    container: str,
+    *,
+    timeout_seconds: float = DEFAULT_PROBE_TIMEOUT_SECONDS,
+) -> dict[str, float] | None:
+    try:
+        result = subprocess.run(
+            ["docker", "stats", "--no-stream", "--format", "{{json .}}", container],
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=timeout_seconds,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
     if result.returncode != 0 or not result.stdout.strip():
         return None
     try:
@@ -57,15 +68,23 @@ def parse_cpu_stat(output: str) -> float | None:
     return None
 
 
-def read_cpu_seconds(container: str) -> float | None:
+def read_cpu_seconds(
+    container: str,
+    *,
+    timeout_seconds: float = DEFAULT_PROBE_TIMEOUT_SECONDS,
+) -> float | None:
     """Read cumulative CPU time from the container's cgroup."""
     for path in ("/sys/fs/cgroup/cpu.stat", "/sys/fs/cgroup/cpuacct/cpuacct.usage"):
-        result = subprocess.run(
-            ["docker", "exec", container, "cat", path],
-            capture_output=True,
-            text=True,
-            check=False,
-        )
+        try:
+            result = subprocess.run(
+                ["docker", "exec", container, "cat", path],
+                capture_output=True,
+                text=True,
+                check=False,
+                timeout=timeout_seconds,
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            continue
         if result.returncode == 0:
             usage = parse_cpu_stat(result.stdout)
             if usage is not None:
@@ -102,8 +121,16 @@ def summarize_stats(
 class StatsSampler:
     """Capture coarse memory samples and scenario-scoped cgroup CPU intervals."""
 
-    def __init__(self, container: str) -> None:
+    def __init__(
+        self,
+        container: str,
+        *,
+        probe_timeout_seconds: float = DEFAULT_PROBE_TIMEOUT_SECONDS,
+        interval_seconds: float = 0.25,
+    ) -> None:
         self.container = container
+        self.probe_timeout_seconds = probe_timeout_seconds
+        self.interval_seconds = interval_seconds
         self.samples: list[dict[str, float]] = []
         self.lock = threading.Lock()
         self.stop_event = threading.Event()
@@ -122,13 +149,19 @@ class StatsSampler:
         self._record()
         with self.lock:
             sample_index = len(self.samples)
-        return sample_index, read_cpu_seconds(self.container), time.perf_counter_ns()
+        return (
+            sample_index,
+            read_cpu_seconds(self.container, timeout_seconds=self.probe_timeout_seconds),
+            time.perf_counter_ns(),
+        )
 
     def end(self, token: tuple[int, float | None, int]) -> dict[str, Any]:
         """End a scenario interval and return its resource summary."""
         sample_index, cpu_start, started_ns = token
         ended_ns = time.perf_counter_ns()
-        cpu_end = read_cpu_seconds(self.container)
+        cpu_end = read_cpu_seconds(
+            self.container, timeout_seconds=self.probe_timeout_seconds
+        )
         self._record()
         with self.lock:
             samples = list(self.samples[sample_index:])
@@ -147,7 +180,7 @@ class StatsSampler:
         return summarize_stats(samples)
 
     def _record(self) -> None:
-        sample = read_stats(self.container)
+        sample = read_stats(self.container, timeout_seconds=self.probe_timeout_seconds)
         if sample is None:
             return
         with self.lock:
@@ -156,4 +189,4 @@ class StatsSampler:
     def _run(self) -> None:
         while not self.stop_event.is_set():
             self._record()
-            self.stop_event.wait(0.25)
+            self.stop_event.wait(self.interval_seconds)

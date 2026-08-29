@@ -26,7 +26,7 @@ just bench-pr-local-until-stable
 
 This command holds the exclusive benchmark lock and stops at the first stable result, a hard failure, or its explicit maximum-attempt budget. It rejects diagnostic and fixed-repetition options. `just bench-pr-local-quick` and fixed-repetition runs with `--allow-inconclusive` are diagnostics only and cannot support an optimization claim.
 
-Other benchmark workflows provide complementary evidence: `just bench` covers local Criterion paths, `just bench-container` covers the resource-limited container path, `just bench-cluster` covers the real clustered workload, and `just bench-compare` and `just bench-compare-cluster` provide separate native-tool comparison series. Their workload, durability, resource, and measurement boundaries must remain attached to each result. Use the exclusive benchmark lock for authoritative measurements and `just isolated <workflow>` for concurrent process-heavy diagnostics.
+Other benchmark workflows provide complementary evidence: `just bench` covers local Criterion paths, `just bench-container` covers the resource-limited single-node container path, `just bench-cluster` covers the real clustered workload with native broker processes, `just bench-cluster-container` runs the same clustered workload with one bounded container per broker, and `just bench-compare` and `just bench-compare-cluster` provide separate native-tool comparison series. Their workload, durability, resource, and measurement boundaries must remain attached to each result. Use the exclusive benchmark lock for authoritative measurements and `just isolated <workflow>` for concurrent process-heavy diagnostics.
 
 ## Interpreting results
 

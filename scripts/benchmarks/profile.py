@@ -11,7 +11,6 @@ from __future__ import annotations
 import argparse
 from collections import defaultdict
 import json
-import os
 import re
 import shutil
 import signal
@@ -22,28 +21,18 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
-from cluster import (
-    BenchmarkError as ClusterBenchmarkError,
-    Cluster,
+from cluster import Cluster, build_binary
+from common import (
+    BenchmarkError,
+    ROOT,
     acknowledge,
-    build_binary,
     create_stream,
+    default_binary,
     git_revision,
+    percentile,
     poll,
     publish,
-    percentile,
 )
-
-
-ROOT = Path(__file__).resolve().parents[2]
-
-
-def default_binary() -> Path:
-    target_dir = Path(os.environ.get("CARGO_TARGET_DIR", "target"))
-    if not target_dir.is_absolute():
-        target_dir = ROOT / target_dir
-    return target_dir / "release" / "runnel"
-
 
 DEFAULT_BINARY = default_binary()
 
@@ -292,5 +281,5 @@ def main() -> int:
 if __name__ == "__main__":
     try:
         raise SystemExit(main())
-    except (ClusterBenchmarkError, ProfilingError) as error:
+    except (BenchmarkError, ProfilingError) as error:
         raise SystemExit(f"profiling failed: {error}") from error

@@ -19,16 +19,15 @@ import shutil
 import subprocess
 import sys
 import tempfile
-import threading
 import time
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Callable
 
-from resources import parse_cpu_stat, parse_size, summarize_stats
+from common import ROOT, parse_sizes
+from resources import StatsSampler
 
 
-ROOT = Path(__file__).resolve().parents[2]
 KAFKA_IMAGE = "apache/kafka:4.3.1"
 REDPANDA_IMAGE = "docker.redpanda.com/redpandadata/redpanda:v26.2.1"
 NATS_IMAGE = "nats:2.14.5-alpine"
@@ -297,109 +296,6 @@ def run_metadata(run_id: str) -> dict[str, Any]:
     }
 
 
-def bounded_read_stats(container: str) -> dict[str, float] | None:
-    try:
-        result = subprocess.run(
-            ["docker", "stats", "--no-stream", "--format", "{{json .}}", container],
-            capture_output=True,
-            text=True,
-            check=False,
-            timeout=RESOURCE_COMMAND_TIMEOUT,
-        )
-    except (OSError, subprocess.TimeoutExpired):
-        return None
-    if result.returncode != 0 or not result.stdout.strip():
-        return None
-    try:
-        raw = json.loads(result.stdout)
-        return {
-            "cpu_percent": float(raw["CPUPerc"].rstrip("%")),
-            "memory_bytes": parse_size(raw["MemUsage"].split(" / ", 1)[0]),
-            "memory_percent": float(raw["MemPerc"].rstrip("%")),
-        }
-    except (KeyError, TypeError, ValueError, json.JSONDecodeError):
-        return None
-
-
-def bounded_read_cpu_seconds(container: str) -> float | None:
-    for path in ("/sys/fs/cgroup/cpu.stat", "/sys/fs/cgroup/cpuacct/cpuacct.usage"):
-        try:
-            result = subprocess.run(
-                ["docker", "exec", container, "cat", path],
-                capture_output=True,
-                text=True,
-                check=False,
-                timeout=RESOURCE_COMMAND_TIMEOUT,
-            )
-        except (OSError, subprocess.TimeoutExpired):
-            continue
-        if result.returncode == 0:
-            usage = parse_cpu_stat(result.stdout)
-            if usage is not None:
-                return usage
-    return None
-
-
-class BoundedStatsSampler:
-    """Collect comparison resources without allowing Docker probes to hang."""
-
-    def __init__(self, container: str) -> None:
-        self.container = container
-        self.samples: list[dict[str, float]] = []
-        self.lock = threading.Lock()
-        self.stop_event = threading.Event()
-        self.thread = threading.Thread(
-            target=self._run, name=f"docker-stats-{container}", daemon=True
-        )
-
-    def start(self) -> None:
-        self.thread.start()
-
-    def close(self) -> None:
-        self.stop_event.set()
-        if self.thread.ident is not None:
-            self.thread.join(timeout=2)
-
-    def begin(self) -> tuple[int, float | None, int]:
-        self._record()
-        with self.lock:
-            sample_index = len(self.samples)
-        return sample_index, bounded_read_cpu_seconds(self.container), time.perf_counter_ns()
-
-    def end(self, token: tuple[int, float | None, int]) -> dict[str, Any]:
-        sample_index, cpu_start, started_ns = token
-        ended_ns = time.perf_counter_ns()
-        cpu_end = bounded_read_cpu_seconds(self.container)
-        self._record()
-        with self.lock:
-            samples = list(self.samples[sample_index:])
-        cpu_seconds = None
-        if cpu_start is not None and cpu_end is not None:
-            cpu_seconds = cpu_end - cpu_start
-        return summarize_stats(
-            samples,
-            cpu_seconds=cpu_seconds,
-            elapsed_seconds=(ended_ns - started_ns) / 1_000_000_000,
-        )
-
-    def summary(self) -> dict[str, Any]:
-        with self.lock:
-            samples = list(self.samples)
-        return summarize_stats(samples)
-
-    def _record(self) -> None:
-        sample = bounded_read_stats(self.container)
-        if sample is None:
-            return
-        with self.lock:
-            self.samples.append(sample)
-
-    def _run(self) -> None:
-        while not self.stop_event.is_set():
-            self._record()
-            self.stop_event.wait(0.25)
-
-
 def ensure_image(image: str) -> str:
     """Return a local image ID, pulling the pinned image when necessary."""
     inspect = subprocess.run(
@@ -457,7 +353,7 @@ class Service:
         self.entrypoint = entrypoint
         self.image_id: str | None = None
         self.startup_ns: int | None = None
-        self.stats = BoundedStatsSampler(name)
+        self.stats = StatsSampler(name, probe_timeout_seconds=RESOURCE_COMMAND_TIMEOUT)
 
     def start(self) -> None:
         self.image_id = ensure_image(self.image)
@@ -615,16 +511,6 @@ def wait_for(check: Callable[[], None], description: str) -> None:
             last_error = error
         time.sleep(0.5)
     raise ComparisonError(f"{description} did not become ready: {last_error}")
-
-
-def parse_sizes(value: str) -> list[int]:
-    try:
-        sizes = [int(part) for part in value.split(",") if part.strip()]
-    except ValueError as error:
-        raise argparse.ArgumentTypeError("payload sizes must be integers") from error
-    if not sizes or any(size <= 0 for size in sizes):
-        raise argparse.ArgumentTypeError("payload sizes must be positive")
-    return sizes
 
 
 def parse_number(value: str) -> float:

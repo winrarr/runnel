@@ -19,6 +19,7 @@ just isolated
 just isolated cluster-test
 just isolated cluster-replacement-test
 just isolated bench-container-smoke
+just isolated bench-cluster-container-smoke
 ```
 
 Every invocation receives a unique Cargo target directory, temporary-file directory, and benchmark artifact directory. The smoke and cluster workflows already allocate ephemeral loopback ports; container benchmarks additionally use unique container names and private Docker networks. Successful benchmark artifacts remain under `benchmark-results/isolated/<run-id>/`, while failed runs retain their temporary build and process state so the failure can be inspected. Use only the named workflows shown by `python3 scripts/isolated.py --help`; arbitrary commands may use resources that cannot be isolated automatically.
@@ -81,7 +82,7 @@ The Criterion suite includes durable publish, legacy publish/poll/ack, two-membe
 - `just test` runs workspace unit, integration, and benchmark-target tests.
 - `just doc-test` runs Rust documentation tests.
 - `just verify` runs formatting, Clippy, default-feature Rust tests, ShellCheck, benchmark-script tests, and a workspace build.
-- `just integration` runs separate isolated smoke, clustered recovery, Docker image, and container benchmark-smoke steps. A caller may provide `CARGO_TARGET_DIR` to reuse compilation across the sequential smoke and cluster checks; temporary process, data, image, and benchmark resources remain isolated. CI also prebuilds the image with reusable Docker layers and skips the duplicate local image build.
+- `just integration` runs separate isolated smoke, clustered recovery, Docker image, single-node container benchmark-smoke, and three-node container benchmark-smoke steps. A caller may provide `CARGO_TARGET_DIR` to reuse compilation across the sequential smoke and cluster checks; temporary process, data, image, and benchmark resources remain isolated. CI also prebuilds the image with reusable Docker layers and skips the duplicate local image build.
 - `just smoke` exercises the running process and CLI across a restart.
 - `just cluster-test` starts three real Raft-backed broker processes and verifies quorum replication, grouped and non-grouped delivery through follower forwarding, reassignment after node failure, retry limits, dead-letter recovery, follower restart, leader election, post-failure recovery, and recovery metrics through the public protocol.
 - `just cluster-replacement-test` explicitly enables the test-only permissive recovery feature and runs the experimental empty replacement-node snapshot recovery and interrupted snapshot transfer checks.

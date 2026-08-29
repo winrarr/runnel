@@ -8,6 +8,7 @@ isolation runner:
 ```text
 just isolated bench-container-smoke
 just isolated bench-cluster-smoke
+just isolated bench-cluster-container-smoke
 ```
 
 Each run receives a unique Cargo target directory, temporary directory, output
@@ -52,7 +53,15 @@ Run the real three-node clustered baseline with:
 just bench-cluster
 ```
 
-The runner builds the release broker, starts three processes with independent durable directories, and exercises the public protocol through multiple nodes. It measures durable publish, non-grouped consume/acknowledge, a bounded slow-consumer backlog drain, sequential shared-consumer delivery, parallel shared-consumer delivery, and restart recovery for the selected payload sizes. Each result records the node count, acknowledgement timeout, quorum durability boundary, protocol boundary, workload, throughput, p50/p99/p99.9 latency, aggregate process CPU time, and resident memory samples. Results use the same `backends` shape as the container and comparison runners, so they can be normalized into the existing history dashboard.
+The runner defaults to native broker processes with independent durable directories and exercises the public protocol through multiple nodes. It measures durable publish, non-grouped consume/acknowledge, a bounded slow-consumer backlog drain, sequential shared-consumer delivery, parallel shared-consumer delivery, and restart recovery for the selected payload sizes. Each result records the node count, acknowledgement timeout, quorum durability boundary, protocol boundary, workload, throughput, p50/p99/p99.9 latency, aggregate broker CPU time, and resident memory samples. Results use the same `backends` shape as the single-node container and comparison runners, so they can be normalized into the existing history dashboard.
+
+Run the same three-node workload with one bounded Docker container per broker:
+
+```text
+just bench-cluster-container
+```
+
+This selects `--runtime container`, applies the `--cpus` and `--memory` limits to each broker, keeps the benchmark client on the host, and connects the brokers over a private Docker network. The containerized and native modes share the workload and result schema, but their numbers are separate measurements because process scheduling, networking, filesystem mounts, and resource boundaries differ. Use `--runtime container` directly with `cluster.py` to select a custom image, workload, or resource budget. The three-node container run is a Runnel cluster baseline, not a cross-product ranking; the competitor adapter remains a separate suite.
 
 The clustered runner uses the broker's 30-second acknowledgement-timeout default. This keeps a constrained benchmark host from interpreting scheduling or quorum delay as a delivery failure during throughput measurements. Override it with `--ack-timeout-ms` when intentionally measuring redelivery behavior.
 
@@ -66,7 +75,7 @@ For a quick lifecycle check:
 just bench-cluster-smoke
 ```
 
-This is not a performance gate. Host scheduling, background processes, filesystem, and kernel state can materially affect the numbers. Keep the host and workload metadata with any result used for comparison.
+For a container lifecycle check, use `just bench-cluster-container-smoke`. Neither smoke workflow is a performance gate. Host scheduling, background processes, filesystem, kernel state, Docker networking, and container resource enforcement can materially affect the numbers. Keep the host and workload metadata with any result used for comparison.
 
 ## Profiling
 

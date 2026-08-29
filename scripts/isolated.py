@@ -39,6 +39,8 @@ WORKFLOWS = (
     "bench-container-smoke",
     "bench-cluster",
     "bench-cluster-smoke",
+    "bench-cluster-container",
+    "bench-cluster-container-smoke",
     "profile-cluster",
     "bench-compare",
 )
@@ -196,6 +198,37 @@ def command_for(workflow: str, isolation: Isolation) -> list[str]:
             "100",
             "--skip-recovery",
         ]
+    if workflow == "bench-cluster-container":
+        return [
+            "python3",
+            "scripts/benchmarks/cluster.py",
+            "--runtime",
+            "container",
+            "--image",
+            isolation.image,
+            "--build",
+            "--output",
+            str(artifact / "cluster-container.json"),
+        ]
+    if workflow == "bench-cluster-container-smoke":
+        return [
+            "python3",
+            "scripts/benchmarks/cluster.py",
+            "--runtime",
+            "container",
+            "--image",
+            isolation.image,
+            "--build",
+            "--messages",
+            "20",
+            "--warmup",
+            "2",
+            "--payload-sizes",
+            "100",
+            "--skip-recovery",
+            "--output",
+            str(artifact / "cluster-container.json"),
+        ]
     if workflow == "profile-cluster":
         return [
             "python3",
@@ -249,7 +282,12 @@ def run(workflow: str, *, keep: bool) -> int:
         if keep or not completed:
             print(f"isolated state retained at {isolation.runtime_dir}", file=sys.stderr, flush=True)
         else:
-            if workflow in {"bench-container", "bench-compare"}:
+            if workflow in {
+                "bench-container",
+                "bench-cluster-container",
+                "bench-cluster-container-smoke",
+                "bench-compare",
+            }:
                 remove_owned_image(isolation)
             shutil.rmtree(isolation.runtime_dir, ignore_errors=True)
             try:

@@ -74,6 +74,11 @@ class IsolationRunnerTests(unittest.TestCase):
                 self.assertIn(str(run.artifact_dir), " ".join(command))
         self.assertIn(str(run.target_dir), " ".join(isolated.command_for("bench-cluster", run)))
         self.assertIn(run.image, " ".join(isolated.command_for("bench-container", run)))
+        container_cluster = " ".join(
+            isolated.command_for("bench-cluster-container", run)
+        )
+        self.assertIn(run.image, container_cluster)
+        self.assertIn("--runtime container", container_cluster)
         self.assertNotIn("--all-features", isolated.command_for("test", run))
         self.assertIn("--test-threads=1", isolated.command_for("cluster-test", run))
 

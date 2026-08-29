@@ -15,7 +15,7 @@ Runnel is a Rust message broker intended to offer durable streams, low operation
 - crates/runnel-core/benches: Criterion benchmarks for durable publish, legacy publish/poll/ack, and shared-consumer delivery paths.
 - crates/runnel-server/tests: network-level protocol and restart tests.
 - scripts/benchmarks/run.py: resource-limited container benchmark runner with machine-readable results.
-- scripts/benchmarks/cluster.py: real three-node clustered benchmark runner with machine-readable results.
+- scripts/benchmarks/cluster.py: real three-node clustered benchmark runner with native-process or bounded-container runtimes and machine-readable results.
 - scripts/benchmarks/pr_local.py: same-host current-vs-default-branch clustered benchmark and Markdown PR report generator.
 - scripts/benchmarks/resource_scope.py: Linux systemd user-scope wrapper for explicit native benchmark CPU and memory limits.
 - scripts/benchmarks/profile.py: optional Linux `perf` workflow for clustered CPU hotspot profiles.
@@ -111,14 +111,14 @@ Run these from the repository root:
 
 - just verify runs formatting, Clippy, all-target tests, documentation tests, ShellCheck, benchmark-script tests, and a workspace build.
 - just ci runs verification and the full local integration sequence.
-- just integration runs the same separate isolated smoke, clustered, Docker, and container-smoke sequence used by the CI integration job; callers may provide `CARGO_TARGET_DIR` to reuse compilation across the sequential smoke and cluster checks, and CI prebuilds the image with reusable Docker layers.
+- just integration runs the same separate isolated smoke, clustered, Docker, single-node container-smoke, and three-node container-smoke sequence used by the CI integration job; callers may provide `CARGO_TARGET_DIR` to reuse compilation across the sequential smoke and cluster checks, and CI prebuilds the image with reusable Docker layers.
 - just run starts a local broker with data in ./data.
 - just smoke starts a real broker and uses runnelctl to exercise publish, consume, acknowledgement, restart recovery, readiness, and metrics with temporary state.
-- just isolated runs the default workspace test with a unique Cargo target, temporary directory, and benchmark artifact directory; pass a supported workflow such as `just isolated cluster-test`, `just isolated cluster-replacement-test`, `just isolated bench-container-smoke`, or `just isolated bench-cluster-smoke` for concurrent work. An explicitly supplied `CARGO_TARGET_DIR` is for sequential workflows only.
+- just isolated runs the default workspace test with a unique Cargo target, temporary directory, and benchmark artifact directory; pass a supported workflow such as `just isolated cluster-test`, `just isolated cluster-replacement-test`, `just isolated bench-container-smoke`, or `just isolated bench-cluster-container-smoke` for concurrent work. An explicitly supplied `CARGO_TARGET_DIR` is for sequential workflows only.
 - just cluster-test starts three real broker processes, exercises quorum replication, follower restart, leader failure, and recovery through the public protocol.
 - just cluster-replacement-test runs the opt-in snapshot replacement experiment that depends on the test-only permissive recovery feature.
-- just bench, just bench-container, and just bench-cluster run the documented local, container, and clustered benchmark suites.
-- just bench-container-smoke and just bench-cluster-smoke exercise small benchmark lifecycles for CI and diagnostics.
+- just bench, just bench-container, just bench-cluster, and just bench-cluster-container run the documented local, single-node container, native clustered, and containerized clustered benchmark suites.
+- just bench-container-smoke, just bench-cluster-smoke, and just bench-cluster-container-smoke exercise small benchmark lifecycles for CI and diagnostics.
 - just bench-pr-local runs the authoritative current-versus-`origin/main` comparison; just bench-pr-local-until-stable retries complete inconclusive comparisons; just bench-pr-local-quick is diagnostic only. See [docs/benchmarking.md](docs/benchmarking.md).
 - just profile-cluster captures optional Linux `perf` samples and reports for all clustered broker processes.
 - just profile-cluster-instrumented builds the opt-in Rust timing instrumentation and records internal stage timings without requiring `perf` permissions; it uses the exclusive host benchmark lock.

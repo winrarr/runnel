@@ -70,6 +70,7 @@ Useful workflows:
     just isolated cluster-replacement-test
     just isolated bench-container-smoke
     just isolated bench-cluster-smoke
+    just isolated bench-cluster-container-smoke
     just cluster-test
     just cluster-replacement-test
     just bench
@@ -77,6 +78,8 @@ Useful workflows:
     just bench-container-smoke
     just bench-cluster
     just bench-cluster-smoke
+    just bench-cluster-container
+    just bench-cluster-container-smoke
     just bench-pr-local
     just bench-pr-local-until-stable
     just bench-pr-local-quick
