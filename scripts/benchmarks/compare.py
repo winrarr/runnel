@@ -61,6 +61,14 @@ class ComparisonError(RuntimeError):
     """A benchmark setup or native-tool failure."""
 
 
+def scenario_operation(scenario: dict[str, Any]) -> str:
+    """Read the current operation field while accepting older result artifacts."""
+    operation = scenario.get("operation", scenario.get("name"))
+    if not isinstance(operation, str):
+        raise ComparisonError(f"benchmark scenario has no operation: {scenario!r}")
+    return operation
+
+
 def scenario_comparison_class(operation: Any) -> str:
     """Return the explicit comparison class for a measured operation."""
     if not isinstance(operation, str) or operation not in SCENARIO_COMPARISON_CLASSES:
@@ -440,7 +448,6 @@ def run_tool(
     memory: str,
     timeout: int = COMMAND_TIMEOUT,
 ) -> str:
-    ensure_image(image)
     command = [
         "docker",
         "run",
@@ -782,6 +789,7 @@ def nats_server_command(name: str, names: list[str], cluster_name: str) -> list[
 def start_nats_services(
     network: str, cpus: str, memory: str, nodes: int, resource_prefix: str
 ) -> list[Service]:
+    ensure_image(NATS_BOX_IMAGE)
     names = [f"{resource_prefix}-nats-{index + 1}" for index in range(nodes)]
     cluster_name = f"{resource_prefix}-nats-cluster"
     services = []
@@ -818,18 +826,6 @@ def start_nats_services(
             service.close()
         raise
     return services
-
-
-def start_kafka_service(network: str, cpus: str, memory: str) -> Service:
-    return start_kafka_services(network, cpus, memory, 1, "bench")[0]
-
-
-def start_redpanda_service(network: str, cpus: str, memory: str) -> Service:
-    return start_redpanda_services(network, cpus, memory, 1, "bench")[0]
-
-
-def start_nats_service(network: str, cpus: str, memory: str) -> Service:
-    return start_nats_services(network, cpus, memory, 1, "bench")[0]
 
 
 def run_kafka_family(
@@ -1093,7 +1089,7 @@ def run_runnel(
     scenarios = [
         scenario
         for scenario in result["scenarios"]
-        if scenario["name"] in {"durable_publish", "consume_ack"}
+        if scenario_operation(scenario) in {"durable_publish", "consume_ack"}
     ]
     return {
         "image": result["container"]["image"],
@@ -1104,7 +1100,11 @@ def run_runnel(
         "resource_samples": result["container"]["resource_samples"],
         "scenarios": [
             {
-                "operation": "publish" if scenario["name"] == "durable_publish" else "consume_ack",
+                "operation": (
+                    "publish"
+                    if scenario_operation(scenario) == "durable_publish"
+                    else "consume_ack"
+                ),
                 "messages": scenario["messages"],
                 "message_size_bytes": scenario["message_size_bytes"],
                 "throughput_messages_per_second": scenario[

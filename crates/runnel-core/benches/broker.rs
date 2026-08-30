@@ -3,7 +3,10 @@ use std::time::{Duration, Instant};
 
 use std::hint::black_box;
 
-use criterion::{BatchSize, BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
+use criterion::measurement::Measurement;
+use criterion::{
+    BatchSize, BenchmarkGroup, BenchmarkId, Criterion, Throughput, criterion_group, criterion_main,
+};
 use runnel_core::{Broker, BrokerConfig, PollResult};
 use runnel_engine::Engine;
 use std::sync::{Arc, Barrier};
@@ -20,20 +23,69 @@ const BOUNDED_INDEX_RETAINED_MESSAGE_COUNTS: &[u64] = &[65_537, 131_072];
 const BOUNDED_INDEX_COLD_OFFSET: u64 = 1_024;
 const SHARED_UNACKED_MEMBER_COUNT: u64 = 64;
 
-fn durable_publish(c: &mut Criterion) {
-    let mut group = c.benchmark_group("durable_publish");
-    group.sample_size(20);
+fn configured_group<'a, M: Measurement>(
+    criterion: &'a mut Criterion<M>,
+    name: &str,
+    sample_size: usize,
+) -> BenchmarkGroup<'a, M> {
+    let mut group = criterion.benchmark_group(name);
+    group.sample_size(sample_size);
+    group
+}
+
+fn message_group<'a, M: Measurement>(
+    criterion: &'a mut Criterion<M>,
+    name: &str,
+    elements: u64,
+    sample_size: usize,
+) -> BenchmarkGroup<'a, M> {
+    let mut group = configured_group(criterion, name, sample_size);
     group.throughput(Throughput::ElementsAndBytes {
-        elements: MESSAGE_COUNT,
-        bytes: MESSAGE_COUNT * PAYLOAD.len() as u64,
+        elements,
+        bytes: elements * PAYLOAD.len() as u64,
     });
+    group
+}
+
+fn open_broker() -> (TempDir, Broker) {
+    let directory = TempDir::new().unwrap();
+    let broker = Broker::open(directory.path(), BrokerConfig::default()).unwrap();
+    (directory, broker)
+}
+
+fn open_delivery_broker() -> (TempDir, Broker) {
+    let directory = TempDir::new().unwrap();
+    let broker = Broker::open(
+        directory.path(),
+        BrokerConfig {
+            ack_timeout: Duration::from_secs(60),
+            max_delivery_attempts: None,
+        },
+    )
+    .unwrap();
+    (directory, broker)
+}
+
+fn publish_messages(broker: &Broker, stream: &str, messages: u64, payload: &[u8]) {
+    for offset in 0..messages {
+        assert_eq!(
+            broker.publish(stream, None, payload.to_vec()).unwrap(),
+            offset
+        );
+    }
+}
+
+fn create_streams(broker: &Broker, streams: impl IntoIterator<Item = String>) {
+    for stream in streams {
+        broker.create_stream(&stream).unwrap();
+    }
+}
+
+fn durable_publish(c: &mut Criterion) {
+    let mut group = message_group(c, "durable_publish", MESSAGE_COUNT, 20);
     group.bench_function("100-byte_messages", |benchmark| {
         benchmark.iter_batched(
-            || {
-                let directory = TempDir::new().unwrap();
-                let broker = Broker::open(directory.path(), BrokerConfig::default()).unwrap();
-                (directory, broker)
-            },
+            open_broker,
             |(_directory, broker)| {
                 for _ in 0..MESSAGE_COUNT {
                     black_box(broker.publish("bench", None, PAYLOAD.to_vec()).unwrap());
@@ -46,23 +98,14 @@ fn durable_publish(c: &mut Criterion) {
 }
 
 fn async_engine_publish(c: &mut Criterion) {
-    let mut group = c.benchmark_group("async_engine_publish");
-    group.sample_size(20);
-    group.throughput(Throughput::ElementsAndBytes {
-        elements: MESSAGE_COUNT,
-        bytes: MESSAGE_COUNT * PAYLOAD.len() as u64,
-    });
+    let mut group = message_group(c, "async_engine_publish", MESSAGE_COUNT, 20);
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
         .unwrap();
     group.bench_function("100-byte_messages", |benchmark| {
         benchmark.iter_batched(
-            || {
-                let directory = TempDir::new().unwrap();
-                let broker = Broker::open(directory.path(), BrokerConfig::default()).unwrap();
-                (directory, broker)
-            },
+            open_broker,
             |(_directory, broker)| {
                 runtime.block_on(async {
                     for _ in 0..MESSAGE_COUNT {
@@ -81,27 +124,12 @@ fn async_engine_publish(c: &mut Criterion) {
 }
 
 fn publish_poll_ack(c: &mut Criterion) {
-    let mut group = c.benchmark_group("publish_poll_ack");
-    group.sample_size(20);
-    group.throughput(Throughput::ElementsAndBytes {
-        elements: MESSAGE_COUNT,
-        bytes: MESSAGE_COUNT * PAYLOAD.len() as u64,
-    });
+    let mut group = message_group(c, "publish_poll_ack", MESSAGE_COUNT, 20);
     group.bench_function("100-byte_messages", |benchmark| {
         benchmark.iter_batched(
             || {
-                let directory = TempDir::new().unwrap();
-                let broker = Broker::open(
-                    directory.path(),
-                    BrokerConfig {
-                        ack_timeout: Duration::from_secs(60),
-                        max_delivery_attempts: None,
-                    },
-                )
-                .unwrap();
-                for _ in 0..MESSAGE_COUNT {
-                    broker.publish("bench", None, PAYLOAD.to_vec()).unwrap();
-                }
+                let (directory, broker) = open_delivery_broker();
+                publish_messages(&broker, "bench", MESSAGE_COUNT, PAYLOAD);
                 (directory, broker)
             },
             |(_directory, broker)| {
@@ -120,27 +148,12 @@ fn publish_poll_ack(c: &mut Criterion) {
 }
 
 fn shared_consumer_poll_ack(c: &mut Criterion) {
-    let mut group = c.benchmark_group("shared_consumer_poll_ack");
-    group.sample_size(20);
-    group.throughput(Throughput::ElementsAndBytes {
-        elements: MESSAGE_COUNT,
-        bytes: MESSAGE_COUNT * PAYLOAD.len() as u64,
-    });
+    let mut group = message_group(c, "shared_consumer_poll_ack", MESSAGE_COUNT, 20);
     group.bench_function("100-byte_messages_2_members", |benchmark| {
         benchmark.iter_batched(
             || {
-                let directory = TempDir::new().unwrap();
-                let broker = Broker::open(
-                    directory.path(),
-                    BrokerConfig {
-                        ack_timeout: Duration::from_secs(60),
-                        max_delivery_attempts: None,
-                    },
-                )
-                .unwrap();
-                for _ in 0..MESSAGE_COUNT {
-                    broker.publish("bench", None, PAYLOAD.to_vec()).unwrap();
-                }
+                let (directory, broker) = open_delivery_broker();
+                publish_messages(&broker, "bench", MESSAGE_COUNT, PAYLOAD);
                 (directory, broker)
             },
             |(_directory, broker)| {
@@ -167,24 +180,11 @@ fn shared_consumer_poll_ack(c: &mut Criterion) {
 }
 
 fn shared_consumer_keyed_poll_ack(c: &mut Criterion) {
-    let mut group = c.benchmark_group("shared_consumer_keyed_poll_ack");
-    group.sample_size(20);
-    group.throughput(Throughput::ElementsAndBytes {
-        elements: MESSAGE_COUNT,
-        bytes: MESSAGE_COUNT * PAYLOAD.len() as u64,
-    });
+    let mut group = message_group(c, "shared_consumer_keyed_poll_ack", MESSAGE_COUNT, 20);
     group.bench_function("100-byte_messages_4_keys_4_members", |benchmark| {
         benchmark.iter_batched(
             || {
-                let directory = TempDir::new().unwrap();
-                let broker = Broker::open(
-                    directory.path(),
-                    BrokerConfig {
-                        ack_timeout: Duration::from_secs(60),
-                        max_delivery_attempts: None,
-                    },
-                )
-                .unwrap();
+                let (directory, broker) = open_delivery_broker();
                 for offset in 0..MESSAGE_COUNT {
                     broker
                         .publish(
@@ -221,27 +221,17 @@ fn shared_consumer_keyed_poll_ack(c: &mut Criterion) {
 }
 
 fn shared_consumer_many_in_flight(c: &mut Criterion) {
-    let mut group = c.benchmark_group("shared_consumer_many_in_flight");
-    group.sample_size(20);
-    group.throughput(Throughput::ElementsAndBytes {
-        elements: SHARED_UNACKED_MEMBER_COUNT,
-        bytes: SHARED_UNACKED_MEMBER_COUNT * PAYLOAD.len() as u64,
-    });
+    let mut group = message_group(
+        c,
+        "shared_consumer_many_in_flight",
+        SHARED_UNACKED_MEMBER_COUNT,
+        20,
+    );
     group.bench_function("100-byte_messages_64_unacked_members", |benchmark| {
         benchmark.iter_batched(
             || {
-                let directory = TempDir::new().unwrap();
-                let broker = Broker::open(
-                    directory.path(),
-                    BrokerConfig {
-                        ack_timeout: Duration::from_secs(60),
-                        max_delivery_attempts: None,
-                    },
-                )
-                .unwrap();
-                for _ in 0..SHARED_UNACKED_MEMBER_COUNT {
-                    broker.publish("bench", None, PAYLOAD.to_vec()).unwrap();
-                }
+                let (directory, broker) = open_delivery_broker();
+                publish_messages(&broker, "bench", SHARED_UNACKED_MEMBER_COUNT, PAYLOAD);
                 let members = (0..SHARED_UNACKED_MEMBER_COUNT)
                     .map(|index| format!("member-{index}"))
                     .collect::<Vec<_>>();
@@ -263,11 +253,36 @@ fn shared_consumer_many_in_flight(c: &mut Criterion) {
     group.finish();
 }
 
-fn concurrent_publish_same_stream(c: &mut Criterion) {
-    let mut group = c.benchmark_group("concurrent_publish_same_stream");
-    group.sample_size(10);
+fn publish_concurrently(broker: &Broker, streams: &[String]) {
+    let worker_count = streams.len();
+    let start = Arc::new(Barrier::new(worker_count));
+    thread::scope(|scope| {
+        for stream in streams {
+            let broker = broker.clone();
+            let start = Arc::clone(&start);
+            let stream = stream.clone();
+            scope.spawn(move || {
+                start.wait();
+                for _ in 0..CONCURRENT_MESSAGES_PER_WORKER {
+                    black_box(broker.publish(&stream, None, PAYLOAD.to_vec()).unwrap());
+                }
+            });
+        }
+    });
+}
+
+fn concurrent_group<'a, M: Measurement>(
+    criterion: &'a mut Criterion<M>,
+    name: &str,
+) -> BenchmarkGroup<'a, M> {
+    let mut group = configured_group(criterion, name, 10);
     group.warm_up_time(Duration::from_secs(1));
     group.measurement_time(Duration::from_secs(2));
+    group
+}
+
+fn concurrent_publish_same_stream(c: &mut Criterion) {
+    let mut group = concurrent_group(c, "concurrent_publish_same_stream");
 
     for &worker_count in CONCURRENT_WORKER_COUNTS {
         let message_count = worker_count as u64 * CONCURRENT_MESSAGES_PER_WORKER;
@@ -283,30 +298,12 @@ fn concurrent_publish_same_stream(c: &mut Criterion) {
             |benchmark, &worker_count| {
                 benchmark.iter_batched(
                     || {
-                        let directory = TempDir::new().unwrap();
-                        let broker =
-                            Broker::open(directory.path(), BrokerConfig::default()).unwrap();
-                        broker.create_stream("bench").unwrap();
-                        (directory, broker)
+                        let (directory, broker) = open_broker();
+                        create_streams(&broker, std::iter::once("bench".to_owned()));
+                        (directory, broker, vec!["bench".to_owned(); worker_count])
                     },
-                    |(_directory, broker)| {
-                        let start = Arc::new(Barrier::new(worker_count));
-                        thread::scope(|scope| {
-                            for _ in 0..worker_count {
-                                let broker = broker.clone();
-                                let start = Arc::clone(&start);
-                                scope.spawn(move || {
-                                    start.wait();
-                                    for _ in 0..CONCURRENT_MESSAGES_PER_WORKER {
-                                        black_box(
-                                            broker
-                                                .publish("bench", None, PAYLOAD.to_vec())
-                                                .unwrap(),
-                                        );
-                                    }
-                                });
-                            }
-                        });
+                    |(_directory, broker, streams)| {
+                        publish_concurrently(&broker, &streams);
                     },
                     BatchSize::PerIteration,
                 );
@@ -318,10 +315,7 @@ fn concurrent_publish_same_stream(c: &mut Criterion) {
 }
 
 fn concurrent_publish_independent_streams(c: &mut Criterion) {
-    let mut group = c.benchmark_group("concurrent_publish_independent_streams");
-    group.sample_size(10);
-    group.warm_up_time(Duration::from_secs(1));
-    group.measurement_time(Duration::from_secs(2));
+    let mut group = concurrent_group(c, "concurrent_publish_independent_streams");
 
     for &worker_count in CONCURRENT_WORKER_COUNTS {
         let message_count = worker_count as u64 * CONCURRENT_MESSAGES_PER_WORKER;
@@ -337,35 +331,15 @@ fn concurrent_publish_independent_streams(c: &mut Criterion) {
             |benchmark, &worker_count| {
                 benchmark.iter_batched(
                     || {
-                        let directory = TempDir::new().unwrap();
-                        let broker =
-                            Broker::open(directory.path(), BrokerConfig::default()).unwrap();
-                        for worker_index in 0..worker_count {
-                            broker
-                                .create_stream(&format!("bench-{worker_index}"))
-                                .unwrap();
-                        }
-                        (directory, broker)
+                        let (directory, broker) = open_broker();
+                        let streams = (0..worker_count)
+                            .map(|index| format!("bench-{index}"))
+                            .collect::<Vec<_>>();
+                        create_streams(&broker, streams.iter().cloned());
+                        (directory, broker, streams)
                     },
-                    |(_directory, broker)| {
-                        let start = Arc::new(Barrier::new(worker_count));
-                        thread::scope(|scope| {
-                            for worker_index in 0..worker_count {
-                                let broker = broker.clone();
-                                let start = Arc::clone(&start);
-                                scope.spawn(move || {
-                                    start.wait();
-                                    let stream = format!("bench-{worker_index}");
-                                    for _ in 0..CONCURRENT_MESSAGES_PER_WORKER {
-                                        black_box(
-                                            broker
-                                                .publish(&stream, None, PAYLOAD.to_vec())
-                                                .unwrap(),
-                                        );
-                                    }
-                                });
-                            }
-                        });
+                    |(_directory, broker, streams)| {
+                        publish_concurrently(&broker, &streams);
                     },
                     BatchSize::PerIteration,
                 );
@@ -374,6 +348,30 @@ fn concurrent_publish_independent_streams(c: &mut Criterion) {
     }
 
     group.finish();
+}
+
+fn write_consumer_checkpoint(directory: &TempDir, committed_offset: u64) {
+    let consumer_directory = directory.path().join("consumers/recovery");
+    fs::create_dir_all(&consumer_directory).unwrap();
+    fs::write(
+        consumer_directory.join("cold.json"),
+        format!(
+            "{{\"stream\":\"recovery\",\"consumer\":\"cold\",\
+             \"committed_offset\":{committed_offset},\
+             \"acknowledged_offsets\":[],\"delivery_attempts\":{{}}}}"
+        ),
+    )
+    .unwrap();
+}
+
+fn prepare_retained_history(messages: u64, committed_offset: Option<u64>) -> TempDir {
+    let directory = TempDir::new().unwrap();
+    let broker = Broker::open(directory.path(), BrokerConfig::default()).unwrap();
+    publish_messages(&broker, "recovery", messages, RECOVERY_PAYLOAD);
+    if let Some(offset) = committed_offset {
+        write_consumer_checkpoint(&directory, offset);
+    }
+    directory
 }
 
 fn reopen_recovery_retained_messages(c: &mut Criterion) {
@@ -385,17 +383,7 @@ fn reopen_recovery_retained_messages(c: &mut Criterion) {
     for &retained_message_count in RECOVERY_RETAINED_MESSAGE_COUNTS {
         // The local publish path calls sync_data for every record. Keep all records
         // retained and prepare the bounded log outside the measured reopen loop.
-        let directory = TempDir::new().unwrap();
-        let broker = Broker::open(directory.path(), BrokerConfig::default()).unwrap();
-        for offset in 0..retained_message_count {
-            assert_eq!(
-                broker
-                    .publish("recovery", None, RECOVERY_PAYLOAD.to_vec())
-                    .unwrap(),
-                offset
-            );
-        }
-        drop(broker);
+        let directory = prepare_retained_history(retained_message_count, None);
 
         group.throughput(Throughput::Elements(retained_message_count));
         group.bench_function(
@@ -437,31 +425,12 @@ fn cold_retained_history_poll(c: &mut Criterion) {
             |benchmark| {
                 benchmark.iter_batched(
                     || {
-                        let directory = TempDir::new().unwrap();
+                        let directory = prepare_retained_history(
+                            retained_message_count,
+                            Some(committed_offset),
+                        );
                         let broker =
                             Broker::open(directory.path(), BrokerConfig::default()).unwrap();
-                        for offset in 0..retained_message_count {
-                            assert_eq!(
-                                broker
-                                    .publish("recovery", None, RECOVERY_PAYLOAD.to_vec())
-                                    .unwrap(),
-                                offset
-                            );
-                        }
-
-                        // Seed a durable consumer checkpoint so the measured operation is a
-                        // public cold poll in retained history, not setup-time consumption.
-                        let consumer_directory = directory.path().join("consumers/recovery");
-                        fs::create_dir_all(&consumer_directory).unwrap();
-                        fs::write(
-                            consumer_directory.join("cold.json"),
-                            format!(
-                                "{{\"stream\":\"recovery\",\"consumer\":\"cold\",\
-                                 \"committed_offset\":{committed_offset},\
-                                 \"acknowledged_offsets\":[],\"delivery_attempts\":{{}}}}"
-                            ),
-                        )
-                        .unwrap();
                         (directory, broker)
                     },
                     |(_directory, broker)| {
@@ -489,28 +458,8 @@ fn reopen_then_cold_replay_beyond_bounded_index(c: &mut Criterion) {
     for &retained_message_count in BOUNDED_INDEX_RETAINED_MESSAGE_COUNTS {
         // Prepare the complete log and checkpoint once so the measured operation contains
         // startup scan plus the first cold replay, not publish or checkpoint setup.
-        let directory = TempDir::new().unwrap();
-        let broker = Broker::open(directory.path(), BrokerConfig::default()).unwrap();
-        for offset in 0..retained_message_count {
-            assert_eq!(
-                broker
-                    .publish("recovery", None, RECOVERY_PAYLOAD.to_vec())
-                    .unwrap(),
-                offset
-            );
-        }
-        let consumer_directory = directory.path().join("consumers/recovery");
-        fs::create_dir_all(&consumer_directory).unwrap();
-        fs::write(
-            consumer_directory.join("cold.json"),
-            format!(
-                "{{\"stream\":\"recovery\",\"consumer\":\"cold\",\
-                 \"committed_offset\":{BOUNDED_INDEX_COLD_OFFSET},\
-                 \"acknowledged_offsets\":[],\"delivery_attempts\":{{}}}}"
-            ),
-        )
-        .unwrap();
-        drop(broker);
+        let directory =
+            prepare_retained_history(retained_message_count, Some(BOUNDED_INDEX_COLD_OFFSET));
 
         group.throughput(Throughput::ElementsAndBytes {
             elements: retained_message_count,

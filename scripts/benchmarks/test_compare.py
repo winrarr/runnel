@@ -1,6 +1,8 @@
+import json
 import sys
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 
@@ -11,6 +13,50 @@ import compare  # noqa: E402
 
 
 class ComparisonBenchmarkTests(unittest.TestCase):
+    def test_scenario_operation_reads_current_and_legacy_result_fields(self) -> None:
+        self.assertEqual(compare.scenario_operation({"operation": "publish"}), "publish")
+        self.assertEqual(compare.scenario_operation({"name": "durable_publish"}), "durable_publish")
+        with self.assertRaises(compare.ComparisonError):
+            compare.scenario_operation({"messages": 10})
+
+    def test_runnel_adapter_accepts_current_scenario_results(self) -> None:
+        def run(command: list[str], **_: object) -> SimpleNamespace:
+            output = Path(command[command.index("--output") + 1])
+            output.write_text(
+                json.dumps(
+                    {
+                        "container": {
+                            "image": "runnel:test",
+                            "image_id": "sha256:test",
+                            "startup_seconds": 0.1,
+                            "resource_samples": {},
+                        },
+                        "scenarios": [
+                            {
+                                "operation": "durable_publish",
+                                "messages": 1,
+                                "message_size_bytes": 100,
+                                "throughput_messages_per_second": 1,
+                                "latency_microseconds": {},
+                            }
+                        ],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+        with patch.object(compare.subprocess, "run", side_effect=run):
+            result = compare.run_runnel(
+                image="runnel:test",
+                cpus="2",
+                memory="2g",
+                messages=1,
+                sizes=[100],
+            )
+
+        self.assertEqual(result["scenarios"][0]["operation"], "publish")
+
     def test_run_metadata_records_identity_source_environment_and_command(self) -> None:
         with (
             patch.object(compare, "source_metadata", return_value={"revision": "abc123"}),

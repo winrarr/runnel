@@ -131,6 +131,11 @@ class DockerBroker:
         self.startup_ns = time.perf_counter_ns() - started
         self.stats.start()
 
+    def client(self) -> LineClient:
+        if self.client_port is None:
+            raise BenchmarkError("broker client port was not discovered")
+        return LineClient("127.0.0.1", self.client_port, DEFAULT_TIMEOUT_SECONDS)
+
     def restart(self) -> int:
         started = time.perf_counter_ns()
         subprocess.run(["docker", "restart", self.name], check=True, capture_output=True)
@@ -191,9 +196,7 @@ def new_stream(run_id: str, name: str, size: int) -> str:
 def run_durable_publish(
     broker: DockerBroker, stream: str, payload: str, messages: int, warmup: int
 ) -> dict[str, Any]:
-    if broker.client_port is None:
-        raise BenchmarkError("broker client port was not discovered")
-    client = LineClient("127.0.0.1", broker.client_port, DEFAULT_TIMEOUT_SECONDS)
+    client = broker.client()
     try:
         create_stream(client, stream)
         for _ in range(warmup):
@@ -218,15 +221,13 @@ def run_concurrent_publish(
     messages: int,
     concurrency: int,
 ) -> dict[str, Any]:
-    if broker.client_port is None:
-        raise BenchmarkError("broker client port was not discovered")
-    setup = LineClient("127.0.0.1", broker.client_port, DEFAULT_TIMEOUT_SECONDS)
+    setup = broker.client()
     create_stream(setup, stream)
     setup.close()
     per_worker = [(messages // concurrency) + (index < messages % concurrency) for index in range(concurrency)]
 
     def worker(worker_messages: int) -> list[int]:
-        client = LineClient("127.0.0.1", broker.client_port or 0, DEFAULT_TIMEOUT_SECONDS)
+        client = broker.client()
         try:
             return [
                 publish(client, stream, payload)[1] for _ in range(worker_messages)
@@ -254,15 +255,13 @@ def run_concurrent_publish(
 def run_consume_ack(
     broker: DockerBroker, stream: str, payload: str, messages: int
 ) -> dict[str, Any]:
-    if broker.client_port is None:
-        raise BenchmarkError("broker client port was not discovered")
-    producer = LineClient("127.0.0.1", broker.client_port, DEFAULT_TIMEOUT_SECONDS)
+    producer = broker.client()
     create_stream(producer, stream)
     for _ in range(messages):
         publish(producer, stream, payload)
     producer.close()
 
-    consumer = LineClient("127.0.0.1", broker.client_port, DEFAULT_TIMEOUT_SECONDS)
+    consumer = broker.client()
 
     def measured() -> dict[str, Any]:
         latencies: list[int] = []
@@ -290,10 +289,8 @@ def run_consume_ack(
 def run_roundtrip(
     broker: DockerBroker, stream: str, payload: str, messages: int
 ) -> dict[str, Any]:
-    if broker.client_port is None:
-        raise BenchmarkError("broker client port was not discovered")
-    producer = LineClient("127.0.0.1", broker.client_port, DEFAULT_TIMEOUT_SECONDS)
-    consumer = LineClient("127.0.0.1", broker.client_port, DEFAULT_TIMEOUT_SECONDS)
+    producer = broker.client()
+    consumer = broker.client()
     create_stream(producer, stream)
 
     def measured() -> dict[str, Any]:
@@ -318,16 +315,14 @@ def run_roundtrip(
 def run_restart_recovery(
     broker: DockerBroker, stream: str, payload: str
 ) -> dict[str, Any]:
-    if broker.client_port is None:
-        raise BenchmarkError("broker client port was not discovered")
-    client = LineClient("127.0.0.1", broker.client_port, DEFAULT_TIMEOUT_SECONDS)
+    client = broker.client()
     create_stream(client, stream)
     publish(client, stream, payload)
     poll(client, stream, "restart-consumer", 0)
     client.close()
     def measured() -> dict[str, Any]:
         restart_ns = broker.restart()
-        recovered = LineClient("127.0.0.1", broker.client_port or 0, DEFAULT_TIMEOUT_SECONDS)
+        recovered = broker.client()
         try:
             poll(recovered, stream, "restart-consumer", 0)
             acknowledge(recovered, stream, "restart-consumer", 0)

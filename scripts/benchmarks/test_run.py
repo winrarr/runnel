@@ -12,6 +12,13 @@ import run  # noqa: E402
 
 
 class RunBenchmarkArgumentTests(unittest.TestCase):
+    def test_broker_client_requires_a_discovered_port(self) -> None:
+        broker = run.DockerBroker.__new__(run.DockerBroker)
+        broker.client_port = None
+
+        with self.assertRaises(run.BenchmarkError):
+            broker.client()
+
     def test_parse_scenarios_accepts_named_workload_subset(self) -> None:
         self.assertEqual(
             run.parse_scenarios("durable_publish, consume_ack"),

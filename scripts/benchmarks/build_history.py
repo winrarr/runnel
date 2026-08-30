@@ -10,7 +10,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
-from normalize import normalize_result
+from normalize import benchmark_suite, normalize_result
 
 
 METRIC_DEFINITIONS = [
@@ -121,17 +121,6 @@ def add_point(
                 evidence["sample_values"] = sample_values
             point["evidence"] = evidence
     points.append(point)
-
-
-def benchmark_suite(run: dict[str, Any]) -> str:
-    explicit = run.get("benchmark_suite")
-    if isinstance(explicit, str) and explicit:
-        return explicit
-    if run.get("comparison_mode") == "cluster-baseline":
-        return "cluster"
-    if run.get("workload", {}).get("single_node") is True:
-        return "native-comparison"
-    return "other"
 
 
 def benchmark_series(run: dict[str, Any], backend: str) -> str:
