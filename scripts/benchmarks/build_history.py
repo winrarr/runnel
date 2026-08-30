@@ -123,6 +123,38 @@ def add_point(
     points.append(point)
 
 
+def add_resource_points(
+    points: list[dict[str, Any]],
+    *,
+    run: dict[str, Any],
+    backend: str,
+    operation: str,
+    size: int | None,
+    resources: dict[str, Any],
+    repetitions: int | None,
+    repetition_summary: dict[str, Any],
+) -> None:
+    units = {name: unit for name, _, unit, _ in METRIC_DEFINITIONS}
+    for metric, key in (
+        ("cpu_percent_max", "cpu_percent_max"),
+        ("memory_bytes_max", "memory_bytes_max"),
+    ):
+        value = resources.get(key)
+        if isinstance(value, (int, float)):
+            add_point(
+                points,
+                run=run,
+                backend=backend,
+                operation=operation,
+                size=size,
+                metric=metric,
+                value=float(value),
+                unit=units[metric],
+                repetitions=repetitions,
+                repetition_summary=repetition_summary,
+            )
+
+
 def benchmark_series(run: dict[str, Any], backend: str) -> str:
     """Return the user-facing history series for a backend measurement."""
     suite = benchmark_suite(run)
@@ -185,24 +217,16 @@ def build_points(runs: list[dict[str, Any]]) -> list[dict[str, Any]]:
                 resources = scenario.get("resource_samples", {})
                 if not isinstance(resources, dict):
                     continue
-                for metric, key in (
-                    ("cpu_percent_max", "cpu_percent_max"),
-                    ("memory_bytes_max", "memory_bytes_max"),
-                ):
-                    value = resources.get(key)
-                    if isinstance(value, (int, float)):
-                        add_point(
-                            points,
-                            run=run,
-                            backend=backend_name,
-                            operation=operation,
-                            size=size,
-                            metric=metric,
-                            value=float(value),
-                            unit=units[metric],
-                            repetitions=repetitions,
-                            repetition_summary=repetition_summary,
-                        )
+                add_resource_points(
+                    points,
+                    run=run,
+                    backend=backend_name,
+                    operation=operation,
+                    size=size,
+                    resources=resources,
+                    repetitions=repetitions,
+                    repetition_summary=repetition_summary,
+                )
 
                 cpu_seconds = resources.get("cpu_seconds")
                 messages = scenario.get("messages")
@@ -238,24 +262,17 @@ def build_points(runs: list[dict[str, Any]]) -> list[dict[str, Any]]:
                 "repetitions", run.get("aggregate", {}).get("repetitions")
             )
             backend_summary = backend.get("repetition_summary", {})
-            for metric, key in (
-                ("cpu_percent_max", "cpu_percent_max"),
-                ("memory_bytes_max", "memory_bytes_max"),
-            ):
-                value = resources.get(key) if isinstance(resources, dict) else None
-                if isinstance(value, (int, float)):
-                    add_point(
-                        points,
-                        run=run,
-                        backend=backend_name,
-                        operation="broker",
-                        size=None,
-                        metric=metric,
-                        value=float(value),
-                        unit=units[metric],
-                        repetitions=backend_repetitions,
-                        repetition_summary=backend_summary,
-                    )
+            if isinstance(resources, dict) and isinstance(backend_summary, dict):
+                add_resource_points(
+                    points,
+                    run=run,
+                    backend=backend_name,
+                    operation="broker",
+                    size=None,
+                    resources=resources,
+                    repetitions=backend_repetitions,
+                    repetition_summary=backend_summary,
+                )
     return points
 
 

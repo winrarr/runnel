@@ -101,16 +101,12 @@ def summarize_stats(
     """Summarize resource samples and an optional exact cgroup CPU interval."""
     summary: dict[str, Any] = {"samples": len(samples)}
     if samples:
-        summary.update(
-            {
-                "cpu_percent_avg": sum(sample["cpu_percent"] for sample in samples) / len(samples),
-                "cpu_percent_max": max(sample["cpu_percent"] for sample in samples),
-                "memory_bytes_avg": sum(sample["memory_bytes"] for sample in samples) / len(samples),
-                "memory_bytes_max": max(sample["memory_bytes"] for sample in samples),
-                "memory_percent_avg": sum(sample["memory_percent"] for sample in samples) / len(samples),
-                "memory_percent_max": max(sample["memory_percent"] for sample in samples),
-            }
-        )
+        for field in ("cpu_percent", "memory_bytes", "memory_percent"):
+            values = [sample.get(field) for sample in samples]
+            if not all(isinstance(value, (int, float)) for value in values):
+                continue
+            summary[f"{field}_avg"] = sum(values) / len(values)
+            summary[f"{field}_max"] = max(values)
     if cpu_seconds is not None:
         summary["cpu_seconds"] = max(0.0, cpu_seconds)
     if elapsed_seconds is not None:
@@ -118,7 +114,39 @@ def summarize_stats(
     return summary
 
 
-class StatsSampler:
+class PeriodicSampler:
+    """Collect samples in a background thread and summarize them safely."""
+
+    def __init__(self, name: str, *, interval_seconds: float) -> None:
+        self.interval_seconds = interval_seconds
+        self.samples: list[dict[str, float]] = []
+        self.lock = threading.Lock()
+        self.stop_event = threading.Event()
+        self.thread = threading.Thread(target=self._run, name=name, daemon=True)
+
+    def start(self) -> None:
+        self.thread.start()
+
+    def close(self) -> None:
+        self.stop_event.set()
+        if self.thread.ident is not None:
+            self.thread.join(timeout=2)
+
+    def summary(self) -> dict[str, Any]:
+        with self.lock:
+            samples = list(self.samples)
+        return summarize_stats(samples)
+
+    def _run(self) -> None:
+        while not self.stop_event.is_set():
+            self._record()
+            self.stop_event.wait(self.interval_seconds)
+
+    def _record(self) -> None:
+        raise NotImplementedError
+
+
+class StatsSampler(PeriodicSampler):
     """Capture coarse memory samples and scenario-scoped cgroup CPU intervals."""
 
     def __init__(
@@ -128,21 +156,9 @@ class StatsSampler:
         probe_timeout_seconds: float = DEFAULT_PROBE_TIMEOUT_SECONDS,
         interval_seconds: float = 0.25,
     ) -> None:
+        super().__init__(f"docker-stats-{container}", interval_seconds=interval_seconds)
         self.container = container
         self.probe_timeout_seconds = probe_timeout_seconds
-        self.interval_seconds = interval_seconds
-        self.samples: list[dict[str, float]] = []
-        self.lock = threading.Lock()
-        self.stop_event = threading.Event()
-        self.thread = threading.Thread(target=self._run, name=f"docker-stats-{container}", daemon=True)
-
-    def start(self) -> None:
-        self.thread.start()
-
-    def close(self) -> None:
-        self.stop_event.set()
-        if self.thread.ident is not None:
-            self.thread.join(timeout=2)
 
     def begin(self) -> tuple[int, float | None, int]:
         """Begin a scenario interval after discarding the boundary sample."""
@@ -174,19 +190,9 @@ class StatsSampler:
             elapsed_seconds=(ended_ns - started_ns) / 1_000_000_000,
         )
 
-    def summary(self) -> dict[str, Any]:
-        with self.lock:
-            samples = list(self.samples)
-        return summarize_stats(samples)
-
     def _record(self) -> None:
         sample = read_stats(self.container, timeout_seconds=self.probe_timeout_seconds)
         if sample is None:
             return
         with self.lock:
             self.samples.append(sample)
-
-    def _run(self) -> None:
-        while not self.stop_event.is_set():
-            self._record()
-            self.stop_event.wait(self.interval_seconds)

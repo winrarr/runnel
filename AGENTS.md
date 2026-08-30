@@ -15,6 +15,7 @@ Runnel is a Rust message broker intended to offer durable streams, low operation
 - crates/runnel-core/benches: Criterion benchmarks for durable publish, legacy publish/poll/ack, and shared-consumer delivery paths.
 - crates/runnel-server/tests: network-level protocol and restart tests.
 - scripts/benchmarks/run.py: resource-limited container benchmark runner with machine-readable results.
+- scripts/benchmarks/runtime.py: shared Docker lifecycle and sampled-container primitives for benchmark runners.
 - scripts/benchmarks/cluster.py: real three-node clustered benchmark runner with native-process or bounded-container runtimes and machine-readable results.
 - scripts/benchmarks/pr_local.py: same-host current-vs-default-branch clustered benchmark and Markdown PR report generator.
 - scripts/benchmarks/resource_scope.py: Linux systemd user-scope wrapper for explicit native benchmark CPU and memory limits.

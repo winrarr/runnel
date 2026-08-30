@@ -15,7 +15,6 @@ import json
 import os
 import platform
 import re
-import shutil
 import subprocess
 import sys
 import tempfile
@@ -24,8 +23,8 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Callable
 
-from common import ROOT, parse_sizes
-from resources import StatsSampler
+from common import ROOT, git_revision, parse_sizes, write_json_result
+from runtime import DockerContainer, MeasuredContainer, create_network, inspect_image, remove_network
 
 
 KAFKA_IMAGE = "apache/kafka:4.3.1"
@@ -244,22 +243,6 @@ def benchmark_suite(nodes: int, backends: list[str]) -> str:
     return "native-comparison"
 
 
-def git_revision() -> str:
-    """Return the source revision used for the comparison, when available."""
-    try:
-        result = subprocess.run(
-            ["git", "rev-parse", "HEAD"],
-            cwd=ROOT,
-            capture_output=True,
-            text=True,
-            check=False,
-        )
-    except OSError:
-        return "unknown"
-    revision = result.stdout.strip()
-    return revision if result.returncode == 0 and revision else "unknown"
-
-
 def source_metadata() -> dict[str, Any]:
     """Capture source-control and CI identity in the raw result."""
     repository = os.environ.get("GITHUB_REPOSITORY")
@@ -306,14 +289,8 @@ def run_metadata(run_id: str) -> dict[str, Any]:
 
 def ensure_image(image: str) -> str:
     """Return a local image ID, pulling the pinned image when necessary."""
-    inspect = subprocess.run(
-        ["docker", "image", "inspect", "--format", "{{.Id}}", image],
-        check=False,
-        capture_output=True,
-        text=True,
-    )
-    image_id = inspect.stdout.strip()
-    if inspect.returncode == 0 and image_id:
+    image_id = inspect_image(image)
+    if image_id is not None:
         return image_id
 
     try:
@@ -322,14 +299,8 @@ def ensure_image(image: str) -> str:
         detail = f"{error.stdout or ''}{error.stderr or ''}"
         raise ComparisonError(f"could not pull benchmark image {image}:\n{detail}") from error
 
-    inspect = subprocess.run(
-        ["docker", "image", "inspect", "--format", "{{.Id}}", image],
-        check=False,
-        capture_output=True,
-        text=True,
-    )
-    image_id = inspect.stdout.strip()
-    if inspect.returncode != 0 or not image_id:
+    image_id = inspect_image(image)
+    if image_id is None:
         raise ComparisonError(f"Docker pulled benchmark image {image} but it could not be inspected")
     return image_id
 
@@ -353,62 +324,43 @@ class Service:
         self.network = network
         self.cpus = cpus
         self.memory = memory
-        self.data_dir = Path(tempfile.mkdtemp(prefix=f"{name}-"))
-        self.data_dir.chmod(0o777)
-        self.data_target = data_target
-        self.command = command or []
-        self.environment = environment or {}
-        self.entrypoint = entrypoint
-        self.image_id: str | None = None
-        self.startup_ns: int | None = None
-        self.stats = StatsSampler(name, probe_timeout_seconds=RESOURCE_COMMAND_TIMEOUT)
+        self.container = MeasuredContainer(
+            DockerContainer(
+                name=name,
+                image=image,
+                network=network,
+                cpus=cpus,
+                memory=memory,
+                data_dir=Path(tempfile.mkdtemp(prefix=f"{name}-")),
+                data_target=data_target,
+                command=command or [],
+                environment=environment or {},
+                entrypoint=entrypoint,
+            ),
+            probe_timeout_seconds=RESOURCE_COMMAND_TIMEOUT,
+        )
+        self.stats = self.container.stats
+
+    @property
+    def image_id(self) -> str | None:
+        return self.container.image_id
+
+    @property
+    def startup_ns(self) -> int | None:
+        return self.container.startup_ns
 
     def start(self) -> None:
-        self.image_id = ensure_image(self.image)
-        command = [
-            "docker",
-            "run",
-            "--detach",
-            "--name",
-            self.name,
-            "--network",
-            self.network,
-            "--label",
-            "runnel.benchmark=true",
-            "--cpus",
-            self.cpus,
-            "--memory",
-            self.memory,
-            "--volume",
-            f"{self.data_dir}:{self.data_target}",
-        ]
-        if self.entrypoint:
-            command.extend(["--entrypoint", self.entrypoint])
-        for key, value in self.environment.items():
-            command.extend(["--env", f"{key}={value}"])
-        command.append(self.image)
-        command.extend(self.command)
-        started = time.perf_counter_ns()
+        image_id = ensure_image(self.image)
         try:
-            subprocess.run(command, check=True, capture_output=True, text=True)
-            self.startup_ns = time.perf_counter_ns() - started
-            self.stats.start()
+            self.container.start(image_id=image_id)
         except subprocess.CalledProcessError as error:
-            logs = subprocess.run(
-                ["docker", "logs", self.name], capture_output=True, text=True, check=False
-            )
             raise ComparisonError(
-                f"failed to start {self.name}: {error}\n{logs.stdout}{logs.stderr}"
+                f"failed to start {self.name}: {error}\n{self.container.logs()}"
             ) from error
 
     def close(self) -> dict[str, Any]:
-        self.stats.close()
+        logs = self.container.close()
         summary = self.stats.summary()
-        logs = subprocess.run(
-            ["docker", "logs", self.name], capture_output=True, text=True, check=False
-        )
-        subprocess.run(["docker", "rm", "--force", self.name], check=False, capture_output=True)
-        shutil.rmtree(self.data_dir, ignore_errors=True)
         return {
             "image": self.image,
             "image_id": self.image_id,
@@ -416,7 +368,7 @@ class Service:
             "memory_limit": self.memory,
             "startup_seconds": (self.startup_ns or 0) / 1_000_000_000,
             "resource_samples": summary,
-            "log_tail": (logs.stdout + logs.stderr)[-4000:],
+            "log_tail": logs[-4000:],
         }
 
 
@@ -437,6 +389,36 @@ def combine_resource_summaries(summaries: list[dict[str, Any]]) -> dict[str, Any
     if all(isinstance(value, (int, float)) for value in elapsed):
         combined["elapsed_seconds"] = max(elapsed)
     return combined
+
+
+def start_services(
+    services: list[Service], ready: Callable[[], None], description: str
+) -> list[Service]:
+    try:
+        for service in services:
+            service.start()
+        wait_for(ready, description)
+    except BaseException:
+        for service in services:
+            service.close()
+        raise
+    return services
+
+
+def record_tool_scenario(
+    scenarios: list[dict[str, Any]],
+    raw: dict[str, str],
+    key: str,
+    output: str,
+    resources: dict[str, Any],
+    parser: Callable[[str, int, int], dict[str, Any]],
+    size: int,
+    messages: int,
+) -> None:
+    scenario = parser(output, size, messages)
+    scenario["resource_samples"] = resources
+    scenarios.append(scenario)
+    raw[key] = output[-12_000:]
 
 
 def run_tool(
@@ -666,32 +648,23 @@ def start_kafka_services(
         )
         for index, name in enumerate(names)
     ]
-    try:
-        for service in services:
-            service.start()
+    def ready() -> None:
+        for name in names:
+            run_tool(
+                KAFKA_IMAGE,
+                network,
+                [
+                    "/opt/kafka/bin/kafka-topics.sh",
+                    "--bootstrap-server",
+                    f"{name}:9092",
+                    "--list",
+                ],
+                cpus=cpus,
+                memory=memory,
+                timeout=READINESS_COMMAND_TIMEOUT,
+            )
 
-        def ready() -> None:
-            for name in names:
-                run_tool(
-                    KAFKA_IMAGE,
-                    network,
-                    [
-                        "/opt/kafka/bin/kafka-topics.sh",
-                        "--bootstrap-server",
-                        f"{name}:9092",
-                        "--list",
-                    ],
-                    cpus=cpus,
-                    memory=memory,
-                    timeout=READINESS_COMMAND_TIMEOUT,
-                )
-
-        wait_for(ready, "Kafka")
-    except BaseException:
-        for service in services:
-            service.close()
-        raise
-    return services
+    return start_services(services, ready, "Kafka")
 
 
 def redpanda_command(name: str, node_id: int, seed_name: str | None) -> list[str]:
@@ -744,27 +717,18 @@ def start_redpanda_services(
                 environment={"REDPANDA_DATA_DIRECTORY": "/var/lib/redpanda/data"},
             )
         )
-    try:
-        for service in services:
-            service.start()
+    def ready() -> None:
+        output = run_tool(
+            REDPANDA_IMAGE,
+            network,
+            ["cluster", "info", "-X", f"brokers={','.join(f'{name}:9092' for name in names)}"],
+            cpus=cpus,
+            memory=memory,
+            timeout=READINESS_COMMAND_TIMEOUT,
+        )
+        require_redpanda_broker_count(output, nodes)
 
-        def ready() -> None:
-            output = run_tool(
-                REDPANDA_IMAGE,
-                network,
-                ["cluster", "info", "-X", f"brokers={','.join(f'{name}:9092' for name in names)}"],
-                cpus=cpus,
-                memory=memory,
-                timeout=READINESS_COMMAND_TIMEOUT,
-            )
-            require_redpanda_broker_count(output, nodes)
-
-        wait_for(ready, "Redpanda")
-    except BaseException:
-        for service in services:
-            service.close()
-        raise
-    return services
+    return start_services(services, ready, "Redpanda")
 
 
 def nats_server_command(name: str, names: list[str], cluster_name: str) -> list[str]:
@@ -805,27 +769,18 @@ def start_nats_services(
                 command=nats_server_command(name, names, cluster_name),
             )
         )
-    try:
+    def ready() -> None:
         for service in services:
-            service.start()
+            run_tool(
+                NATS_BOX_IMAGE,
+                network,
+                ["nats", "stream", "ls", "--server", f"nats://{service.name}:4222"],
+                cpus=cpus,
+                memory=memory,
+                timeout=READINESS_COMMAND_TIMEOUT,
+            )
 
-        def ready() -> None:
-            for service in services:
-                run_tool(
-                    NATS_BOX_IMAGE,
-                    network,
-                    ["nats", "stream", "ls", "--server", f"nats://{service.name}:4222"],
-                    cpus=cpus,
-                    memory=memory,
-                    timeout=READINESS_COMMAND_TIMEOUT,
-                )
-
-        wait_for(ready, "NATS JetStream")
-    except BaseException:
-        for service in services:
-            service.close()
-        raise
-    return services
+    return start_services(services, ready, "NATS JetStream")
 
 
 def run_kafka_family(
@@ -891,10 +846,16 @@ def run_kafka_family(
             cpus=client_cpus,
             memory=client_memory,
         )
-        publish_scenario = parse_kafka_publish(producer_output, size, messages)
-        publish_scenario["resource_samples"] = producer_resources
-        scenarios.append(publish_scenario)
-        raw[f"publish_{size}"] = producer_output[-12_000:]
+        record_tool_scenario(
+            scenarios,
+            raw,
+            f"publish_{size}",
+            producer_output,
+            producer_resources,
+            parse_kafka_publish,
+            size,
+            messages,
+        )
 
         if nodes == 1:
             consumer_output, consumer_resources = run_measured_tool(
@@ -916,10 +877,16 @@ def run_kafka_family(
                 cpus=client_cpus,
                 memory=client_memory,
             )
-            consume_scenario = parse_kafka_consume(consumer_output, size, messages)
-            consume_scenario["resource_samples"] = consumer_resources
-            scenarios.append(consume_scenario)
-            raw[f"consume_{size}"] = consumer_output[-12_000:]
+            record_tool_scenario(
+                scenarios,
+                raw,
+                f"consume_{size}",
+                consumer_output,
+                consumer_resources,
+                parse_kafka_consume,
+                size,
+                messages,
+            )
     return {"scenarios": scenarios, "raw_tool_output": raw}
 
 
@@ -987,10 +954,16 @@ def run_nats(
             cpus=client_cpus,
             memory=client_memory,
         )
-        publish_scenario = parse_nats_publish(producer_output, size, messages)
-        publish_scenario["resource_samples"] = producer_resources
-        scenarios.append(publish_scenario)
-        raw[f"publish_{size}"] = producer_output[-12_000:]
+        record_tool_scenario(
+            scenarios,
+            raw,
+            f"publish_{size}",
+            producer_output,
+            producer_resources,
+            parse_nats_publish,
+            size,
+            messages,
+        )
 
         if nodes == 1:
             consumer = f"bench-consumer-{size}"
@@ -1038,10 +1011,16 @@ def run_nats(
                 cpus=client_cpus,
                 memory=client_memory,
             )
-            consume_scenario = parse_nats_consume(consumer_output, size, messages)
-            consume_scenario["resource_samples"] = consumer_resources
-            scenarios.append(consume_scenario)
-            raw[f"consume_{size}"] = consumer_output[-12_000:]
+            record_tool_scenario(
+                scenarios,
+                raw,
+                f"consume_{size}",
+                consumer_output,
+                consumer_resources,
+                parse_nats_consume,
+                size,
+                messages,
+            )
     return {"scenarios": scenarios, "raw_tool_output": raw}
 
 
@@ -1135,41 +1114,6 @@ def close_services(services: list[Service]) -> dict[str, Any]:
         ),
         "nodes": summaries,
     }
-
-
-def remove_network(network: str) -> None:
-    """Remove a run network, disconnecting only containers attached to it if needed."""
-    for _ in range(3):
-        result = subprocess.run(
-            ["docker", "network", "rm", network],
-            check=False,
-            capture_output=True,
-        )
-        if result.returncode == 0:
-            return
-        time.sleep(0.2)
-
-    inspect = subprocess.run(
-        [
-            "docker",
-            "network",
-            "inspect",
-            network,
-            "--format",
-            "{{range $id, $container := .Containers}}{{$id}} {{end}}",
-        ],
-        check=False,
-        capture_output=True,
-        text=True,
-    )
-    for container in inspect.stdout.split():
-        subprocess.run(
-            ["docker", "network", "disconnect", "--force", network, container],
-            check=False,
-            capture_output=True,
-        )
-    subprocess.run(["docker", "network", "rm", network], check=False, capture_output=True)
-
 
 def backend_metadata(name: str, nodes: int) -> dict[str, Any]:
     if name == "runnel":
@@ -1293,10 +1237,9 @@ def main() -> int:
     run_id = timestamp.strftime("%Y%m%d%H%M%S%f")
     metadata = run_metadata(run_id)
     output = args.output or ROOT / "benchmark-results" / f"compare-{run_id}.json"
-    output.parent.mkdir(parents=True, exist_ok=True)
     resource_prefix = f"runnel-compare-{os.getpid()}-{time.time_ns()}"
     network = resource_prefix
-    subprocess.run(["docker", "network", "create", network], check=True, capture_output=True)
+    create_network(network)
     backends: dict[str, Any] = {}
     try:
         for backend in args.backends:
@@ -1389,9 +1332,7 @@ def main() -> int:
         "backends": backends,
     }
     validate_comparison_summary(summary)
-    output.write_text(json.dumps(summary, indent=2) + "\n", encoding="utf-8")
-    print(json.dumps(summary, indent=2))
-    print(f"results written to {output}")
+    write_json_result(output, summary)
     return 0
 
 

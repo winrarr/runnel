@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import platform
 import socket
 import subprocess
 import time
@@ -84,6 +85,45 @@ def publish(client: LineClient, stream: str, payload: str) -> tuple[int, int]:
     return int(response["offset"]), elapsed
 
 
+def publish_messages(
+    client_for: Callable[[int], LineClient],
+    stream: str,
+    payload: str,
+    messages: int,
+    *,
+    expected_offset: int | None = None,
+) -> list[int]:
+    """Publish a bounded batch, optionally checking its contiguous offsets."""
+    latencies: list[int] = []
+    for offset in range(messages):
+        published, elapsed = publish(client_for(offset), stream, payload)
+        if expected_offset is not None and published != expected_offset + offset:
+            raise BenchmarkError(
+                f"expected offset {expected_offset + offset}, got {published}"
+            )
+        latencies.append(elapsed)
+    return latencies
+
+
+def publish_stream(
+    client: LineClient,
+    stream: str,
+    payload: str,
+    messages: int,
+    *,
+    expected_offset: int = 0,
+) -> None:
+    """Create a stream and fill it with a bounded, offset-checked backlog."""
+    create_stream(client, stream)
+    publish_messages(
+        lambda _: client,
+        stream,
+        payload,
+        messages,
+        expected_offset=expected_offset,
+    )
+
+
 def poll(
     client: LineClient,
     stream: str,
@@ -107,6 +147,27 @@ def acknowledge(client: LineClient, stream: str, consumer: str, offset: int) -> 
         "acknowledged",
     )
     return elapsed
+
+
+def consume_ack_messages(
+    poll_client_for: Callable[[int], LineClient],
+    stream: str,
+    consumer: str,
+    messages: int,
+    *,
+    ack_client_for: Callable[[int], LineClient] | None = None,
+) -> list[int]:
+    """Poll and acknowledge a bounded sequence, returning request latencies."""
+    ack_client_for = ack_client_for or poll_client_for
+    latencies: list[int] = []
+    for offset in range(messages):
+        poll_client = poll_client_for(offset)
+        ack_client = ack_client_for(offset)
+        started = time.perf_counter_ns()
+        poll(poll_client, stream, consumer, offset)
+        acknowledge(ack_client, stream, consumer, offset)
+        latencies.append(time.perf_counter_ns() - started)
+    return latencies
 
 
 def percentile(values: list[int], percentage: float) -> float:
@@ -162,6 +223,29 @@ def measure_scenario(
     return result
 
 
+def measure_message_batch(
+    measurements: Any,
+    operation: str,
+    message_size: int,
+    action: Callable[[], list[int]],
+    *,
+    metadata: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Time one batch of request latencies and attach resource measurements."""
+    def measured() -> dict[str, Any]:
+        started = time.perf_counter_ns()
+        latencies = action()
+        return metric(
+            operation,
+            latencies,
+            time.perf_counter_ns() - started,
+            message_size=message_size,
+            metadata=metadata,
+        )
+
+    return measure_scenario(measurements, measured)
+
+
 def wait_for_ready(http_port: int, *, timeout_seconds: float = DEFAULT_TIMEOUT_SECONDS) -> None:
     deadline = time.monotonic() + timeout_seconds
     url = f"http://127.0.0.1:{http_port}/health/ready"
@@ -211,3 +295,22 @@ def git_revision(*, short: bool = True, cwd: Path = ROOT) -> str:
     command.append("HEAD")
     result = subprocess.run(command, cwd=cwd, capture_output=True, text=True, check=False)
     return result.stdout.strip() if result.returncode == 0 and result.stdout.strip() else "unknown"
+
+
+def host_metadata() -> dict[str, Any]:
+    """Return host fields shared by the single-node and cluster artifacts."""
+    return {
+        "platform": platform.platform(),
+        "processor": platform.processor(),
+        "python": platform.python_version(),
+        "cpus": os.cpu_count(),
+    }
+
+
+def write_json_result(output: Path, result: dict[str, Any]) -> None:
+    """Write and print one machine-readable benchmark artifact."""
+    serialized = json.dumps(result, indent=2)
+    output.parent.mkdir(parents=True, exist_ok=True)
+    output.write_text(serialized + "\n", encoding="utf-8")
+    print(serialized)
+    print(f"results written to {output}")

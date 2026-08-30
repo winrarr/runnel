@@ -9,11 +9,7 @@ future binary protocol or a different durability mode.
 from __future__ import annotations
 
 import argparse
-import json
 import os
-import platform
-import re
-import shutil
 import subprocess
 import tempfile
 import time
@@ -28,15 +24,22 @@ from common import (
     ROOT,
     acknowledge,
     create_stream,
+    consume_ack_messages,
     git_revision,
+    host_metadata,
     metric,
+    measure_message_batch,
     measure_scenario,
     parse_sizes,
     poll,
     publish,
+    publish_messages,
+    publish_stream,
     wait_for_ready,
+    write_json_result,
 )
-from resources import StatsSampler, summarize_stats
+from resources import summarize_stats
+from runtime import DockerContainer, MeasuredContainer, create_network, remove_network
 
 DEFAULT_IMAGE = "runnel:bench"
 DEFAULT_MESSAGES = 1_000
@@ -55,81 +58,46 @@ class DockerBroker:
     """Own a short-lived broker container and its temporary durable volume."""
 
     def __init__(self, image: str, cpus: str, memory: str) -> None:
-        self.image = image
-        self.cpus = cpus
-        self.memory = memory
         isolation_id = os.environ.get("RUNNEL_ISOLATION_ID")
         suffix = isolation_id or f"{os.getpid()}-{time.time_ns()}"
         self.name = f"runnel-bench-{suffix}"
         self.network = f"runnel-bench-net-{suffix}"
         self.network_created = False
-        self.data_dir = Path(tempfile.mkdtemp(prefix="runnel-bench-"))
-        self.data_dir.chmod(0o777)
-        self.image_id: str | None = None
+        self.container = MeasuredContainer(
+            DockerContainer(
+                name=self.name,
+                image=image,
+                network=self.network,
+                cpus=cpus,
+                memory=memory,
+                data_dir=Path(tempfile.mkdtemp(prefix="runnel-bench-")),
+                data_target="/var/lib/runnel",
+                published_ports=(4222, 8080),
+            )
+        )
         self.client_port: int | None = None
         self.http_port: int | None = None
         self.startup_ns: int | None = None
-        self.stats = StatsSampler(self.name)
+        self.stats = self.container.stats
+
+    @property
+    def image_id(self) -> str | None:
+        return self.container.image_id
 
     def start(self) -> None:
-        image = subprocess.run(
-            ["docker", "image", "inspect", "--format", "{{.Id}}", self.image],
-            check=True,
-            capture_output=True,
-            text=True,
-        )
-        self.image_id = image.stdout.strip()
-        command = [
-            "docker",
-            "run",
-            "--detach",
-            "--name",
-            self.name,
-            "--label",
-            "runnel.benchmark=true",
-            "--network",
-            self.network,
-            "--cpus",
-            self.cpus,
-            "--memory",
-            self.memory,
-            "--publish",
-            "127.0.0.1::4222",
-            "--publish",
-            "127.0.0.1::8080",
-            "--volume",
-            f"{self.data_dir}:/var/lib/runnel",
-            self.image,
-        ]
         started = time.perf_counter_ns()
         try:
-            subprocess.run(
-                [
-                    "docker",
-                    "network",
-                    "create",
-                    "--label",
-                    "runnel.benchmark=true",
-                    self.network,
-                ],
-                check=True,
-                capture_output=True,
-                text=True,
-            )
+            create_network(self.network)
             self.network_created = True
-            subprocess.run(command, check=True, capture_output=True, text=True)
-            self.client_port = self._published_port(4222)
-            self.http_port = self._published_port(8080)
+            self.container.start()
+            self.client_port = self.container.published_port(4222)
+            self.http_port = self.container.published_port(8080)
             wait_for_ready(self.http_port, timeout_seconds=DEFAULT_TIMEOUT_SECONDS)
         except (subprocess.CalledProcessError, BenchmarkError) as error:
-            logs = subprocess.run(
-                ["docker", "logs", self.name], capture_output=True, text=True, check=False
-            )
             raise BenchmarkError(
-                f"failed to start broker container: {error}\n{logs.stdout}{logs.stderr}"
+                f"failed to start broker container: {error}\n{self.container.logs()}"
             ) from error
         self.startup_ns = time.perf_counter_ns() - started
-        self.stats.start()
 
     def client(self) -> LineClient:
         if self.client_port is None:
@@ -138,9 +106,9 @@ class DockerBroker:
 
     def restart(self) -> int:
         started = time.perf_counter_ns()
-        subprocess.run(["docker", "restart", self.name], check=True, capture_output=True)
-        self.client_port = self._published_port(4222)
-        self.http_port = self._published_port(8080)
+        self.container.restart()
+        self.client_port = self.container.published_port(4222)
+        self.http_port = self.container.published_port(8080)
         try:
             wait_for_ready(self.http_port, timeout_seconds=DEFAULT_TIMEOUT_SECONDS)
         except BenchmarkError as error:
@@ -156,37 +124,16 @@ class DockerBroker:
                 text=True,
                 check=False,
             )
-            logs = subprocess.run(
-                ["docker", "logs", self.name], capture_output=True, text=True, check=False
-            )
             raise BenchmarkError(
                 f"broker was not ready after restart: {error}\n"
-                f"{state.stdout.strip()}\n{logs.stdout}{logs.stderr}"
+                f"{state.stdout.strip()}\n{self.container.logs()}"
             ) from error
         return time.perf_counter_ns() - started
 
-    def _published_port(self, container_port: int) -> int:
-        result = subprocess.run(
-            ["docker", "port", self.name, f"{container_port}/tcp"],
-            check=True,
-            capture_output=True,
-            text=True,
-        )
-        match = re.search(r":(\d+)\s*$", result.stdout.strip())
-        if match is None:
-            raise BenchmarkError(f"could not parse published port: {result.stdout!r}")
-        return int(match.group(1))
-
     def close(self) -> None:
-        self.stats.close()
-        subprocess.run(["docker", "rm", "--force", self.name], check=False, capture_output=True)
+        self.container.close()
         if self.network_created:
-            subprocess.run(
-                ["docker", "network", "rm", self.network],
-                check=False,
-                capture_output=True,
-            )
-        shutil.rmtree(self.data_dir, ignore_errors=True)
+            remove_network(self.network)
 
 
 def new_stream(run_id: str, name: str, size: int) -> str:
@@ -198,18 +145,13 @@ def run_durable_publish(
 ) -> dict[str, Any]:
     client = broker.client()
     try:
-        create_stream(client, stream)
-        for _ in range(warmup):
-            publish(client, stream, payload)
-        def measured() -> dict[str, Any]:
-            latencies: list[int] = []
-            started = time.perf_counter_ns()
-            for _ in range(messages):
-                latencies.append(publish(client, stream, payload)[1])
-            elapsed = time.perf_counter_ns() - started
-            return metric("durable_publish", latencies, elapsed, message_size=len(payload))
-
-        return measure_scenario(broker.stats, measured)
+        publish_stream(client, stream, payload, warmup)
+        return measure_message_batch(
+            broker.stats,
+            "durable_publish",
+            len(payload),
+            lambda: publish_messages(lambda _: client, stream, payload, messages),
+        )
     finally:
         client.close()
 
@@ -222,68 +164,59 @@ def run_concurrent_publish(
     concurrency: int,
 ) -> dict[str, Any]:
     setup = broker.client()
-    create_stream(setup, stream)
-    setup.close()
+    try:
+        publish_stream(setup, stream, payload, messages)
+    finally:
+        setup.close()
     per_worker = [(messages // concurrency) + (index < messages % concurrency) for index in range(concurrency)]
 
     def worker(worker_messages: int) -> list[int]:
         client = broker.client()
         try:
-            return [
-                publish(client, stream, payload)[1] for _ in range(worker_messages)
-            ]
+            return publish_messages(lambda _: client, stream, payload, worker_messages)
         finally:
             client.close()
 
-    def measured() -> dict[str, Any]:
-        started = time.perf_counter_ns()
+    def publish_concurrently() -> list[int]:
         with ThreadPoolExecutor(max_workers=concurrency) as executor:
             futures = [executor.submit(worker, count) for count in per_worker if count]
-            latencies = [latency for future in futures for latency in future.result()]
-        elapsed = time.perf_counter_ns() - started
-        return metric(
-            "concurrent_publish",
-            latencies,
-            elapsed,
-            message_size=len(payload),
-            metadata={"concurrency": concurrency},
-        )
+            return [latency for future in futures for latency in future.result()]
 
-    return measure_scenario(broker.stats, measured)
+    return measure_message_batch(
+        broker.stats,
+        "concurrent_publish",
+        len(payload),
+        publish_concurrently,
+        metadata={"concurrency": concurrency},
+    )
 
 
 def run_consume_ack(
     broker: DockerBroker, stream: str, payload: str, messages: int
 ) -> dict[str, Any]:
     producer = broker.client()
-    create_stream(producer, stream)
-    for _ in range(messages):
-        publish(producer, stream, payload)
-    producer.close()
+    try:
+        publish_stream(producer, stream, payload, messages)
+    finally:
+        producer.close()
 
     consumer = broker.client()
 
-    def measured() -> dict[str, Any]:
-        latencies: list[int] = []
-        started = time.perf_counter_ns()
+    def consume() -> list[int]:
         try:
-            for offset in range(messages):
-                poll_started = time.perf_counter_ns()
-                poll(consumer, stream, "benchmark-consumer", offset)
-                acknowledge(consumer, stream, "benchmark-consumer", offset)
-                latencies.append(time.perf_counter_ns() - poll_started)
+            return consume_ack_messages(
+                lambda _: consumer, stream, "benchmark-consumer", messages
+            )
         finally:
             consumer.close()
-        elapsed = time.perf_counter_ns() - started
-        return metric(
-            "consume_ack",
-            latencies,
-            elapsed,
-            message_size=len(payload),
-            metadata={"publish_setup_excluded": True},
-        )
 
-    return measure_scenario(broker.stats, measured)
+    return measure_message_batch(
+        broker.stats,
+        "consume_ack",
+        len(payload),
+        consume,
+        metadata={"publish_setup_excluded": True},
+    )
 
 
 def run_roundtrip(
@@ -391,7 +324,6 @@ def main() -> int:
     timestamp = datetime.now(UTC)
     run_id = timestamp.strftime("%Y%m%d%H%M%S%f")
     output = args.output or ROOT / "benchmark-results" / f"{run_id}.json"
-    output.parent.mkdir(parents=True, exist_ok=True)
     broker = DockerBroker(args.image, args.cpus, args.memory)
     scenarios: list[dict[str, Any]] = []
     selected_scenarios = set(args.scenarios)
@@ -458,12 +390,7 @@ def main() -> int:
         "backend": "runnel",
         "engine": "local",
         "git_revision": git_revision(short=True),
-        "host": {
-            "platform": platform.platform(),
-            "processor": platform.processor(),
-            "python": platform.python_version(),
-            "cpus": os.cpu_count(),
-        },
+        "host": host_metadata(),
         "container": {
             "image": args.image,
             "image_id": broker.image_id,
@@ -483,9 +410,7 @@ def main() -> int:
         },
         "scenarios": scenarios,
     }
-    output.write_text(json.dumps(summary, indent=2) + "\n", encoding="utf-8")
-    print(json.dumps(summary, indent=2))
-    print(f"results written to {output}")
+    write_json_result(output, summary)
     return 0
 
 

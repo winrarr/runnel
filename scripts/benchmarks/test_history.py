@@ -263,6 +263,14 @@ class HistoryTests(unittest.TestCase):
         self.assertEqual(summary["cpu_percent_avg"], 20.0)
         self.assertEqual(summary["memory_bytes_max"], 200.0)
         self.assertEqual(summary["cpu_seconds"], 0.25)
+        native_summary = summarize_stats(
+            [
+                {"cpu_seconds": 1.0, "memory_bytes": 100.0},
+                {"cpu_seconds": 2.0, "memory_bytes": 200.0},
+            ]
+        )
+        self.assertEqual(native_summary["memory_bytes_avg"], 150.0)
+        self.assertNotIn("cpu_percent_max", native_summary)
 
     def test_loader_accepts_raw_comparison_results(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

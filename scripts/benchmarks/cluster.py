@@ -11,15 +11,15 @@ backend with its normal durable storage.
 from __future__ import annotations
 
 import argparse
-import json
 import os
-import platform
 import shutil
 import socket
 import subprocess
 import tempfile
 import threading
 import time
+from collections.abc import Iterator
+from contextlib import contextmanager
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -31,20 +31,27 @@ from common import (
     LineClient,
     ROOT,
     acknowledge,
+    consume_ack_messages,
     create_stream,
     default_binary,
     git_revision,
+    host_metadata,
     metric,
+    measure_message_batch,
     measure_scenario,
     parse_nonnegative_int,
     parse_sizes,
     percentile,
     poll,
     publish,
+    publish_stream,
+    publish_messages,
     request_ok,
     wait_for_ready,
+    write_json_result,
 )
-from resources import read_cpu_seconds, read_stats
+from resources import PeriodicSampler, read_cpu_seconds, read_stats, summarize_stats
+from runtime import DockerContainer, create_network, inspect_image, remove_network
 
 DEFAULT_BINARY = default_binary()
 DEFAULT_MESSAGES = 1_000
@@ -65,8 +72,7 @@ class Node:
     peer_port: int
     data_dir: Path
     process: subprocess.Popen[bytes] | None = None
-    container_name: str | None = None
-    container_running: bool = False
+    container: DockerContainer | None = None
 
 
 def free_port() -> int:
@@ -92,23 +98,12 @@ def process_stats(pid: int) -> tuple[float, int] | None:
         return None
 
 
-class ProcessStats:
+class ProcessStats(PeriodicSampler):
     """Sample aggregate broker CPU time and resident memory for each scenario."""
 
     def __init__(self, cluster: "Cluster") -> None:
+        super().__init__("runnel-cluster-stats", interval_seconds=0.1)
         self.cluster = cluster
-        self.samples: list[dict[str, float]] = []
-        self.lock = threading.Lock()
-        self.stop_event = threading.Event()
-        self.thread = threading.Thread(target=self._run, name="runnel-cluster-stats", daemon=True)
-
-    def start(self) -> None:
-        self.thread.start()
-
-    def close(self) -> None:
-        self.stop_event.set()
-        if self.thread.ident is not None:
-            self.thread.join(timeout=2)
 
     def begin(self) -> tuple[int, float, int]:
         self._record()
@@ -124,34 +119,21 @@ class ProcessStats:
         with self.lock:
             samples = list(self.samples[sample_index:])
         cpu_end = samples[-1]["cpu_seconds"] if samples else cpu_start
-        result: dict[str, Any] = {
-            "samples": len(samples),
-            "cpu_seconds": max(0.0, cpu_end - cpu_start),
-            "elapsed_seconds": max(0.0, (ended_ns - started_ns) / 1_000_000_000),
-        }
-        if samples:
-            result["memory_bytes_max"] = max(sample["memory_bytes"] for sample in samples)
-            result["memory_bytes_avg"] = sum(sample["memory_bytes"] for sample in samples) / len(samples)
-        return result
-
-    def summary(self) -> dict[str, Any]:
-        with self.lock:
-            samples = list(self.samples)
-        result: dict[str, Any] = {"samples": len(samples)}
-        if samples:
-            result["memory_bytes_max"] = max(sample["memory_bytes"] for sample in samples)
-            result["memory_bytes_avg"] = sum(sample["memory_bytes"] for sample in samples) / len(samples)
-        return result
+        return summarize_stats(
+            samples,
+            cpu_seconds=cpu_end - cpu_start,
+            elapsed_seconds=(ended_ns - started_ns) / 1_000_000_000,
+        )
 
     def _record(self) -> None:
         cpu = 0.0
         memory = 0
         for node in self.cluster.nodes:
             if self.cluster.runtime == "container":
-                if node.container_name is None or not node.container_running:
+                if node.container is None or not node.container.created:
                     continue
-                cpu += read_cpu_seconds(node.container_name) or 0.0
-                sample = read_stats(node.container_name)
+                cpu += read_cpu_seconds(node.container.name) or 0.0
+                sample = read_stats(node.container.name)
                 if sample is not None:
                     memory += int(sample["memory_bytes"])
                 continue
@@ -163,11 +145,6 @@ class ProcessStats:
                 memory += sample[1]
         with self.lock:
             self.samples.append({"cpu_seconds": cpu, "memory_bytes": float(memory)})
-
-    def _run(self) -> None:
-        while not self.stop_event.is_set():
-            self._record()
-            self.stop_event.wait(0.1)
 
 
 class Cluster:
@@ -209,9 +186,6 @@ class Cluster:
                 http_port=free_port() if runtime == "process" else 0,
                 peer_port=free_port() if runtime == "process" else 7000,
                 data_dir=self.root / f"node-{index + 1}",
-                container_name=(
-                    f"{self.network}-node-{index + 1}" if runtime == "container" else None
-                ),
             )
             for index in range(node_count)
         ]
@@ -238,17 +212,22 @@ class Cluster:
             COMMAND_TIMEOUT_SECONDS,
         )
 
+    @contextmanager
+    def connected_clients(self) -> Iterator[list[LineClient]]:
+        clients = [self.client(index) for index in range(self.node_count)]
+        try:
+            yield clients
+        finally:
+            for client in clients:
+                client.close()
+
     def stop_node(self, index: int) -> None:
         node = self.nodes[index]
         if self.runtime == "container":
-            if not node.container_running or node.container_name is None:
+            if node.container is None:
                 return
-            subprocess.run(
-                ["docker", "rm", "--force", node.container_name],
-                check=False,
-                capture_output=True,
-            )
-            node.container_running = False
+            node.container.stop()
+            node.container = None
             node.broker_port = 0
             node.http_port = 0
             return
@@ -281,51 +260,41 @@ class Cluster:
         for index in range(self.node_count):
             self.stop_node(index)
         if self.network_created:
-            subprocess.run(
-                ["docker", "network", "rm", self.network],
-                check=False,
-                capture_output=True,
-            )
+            remove_network(self.network)
         shutil.rmtree(self.root, ignore_errors=True)
 
     def _prepare_container_runtime(self) -> None:
-        image = subprocess.run(
-            ["docker", "image", "inspect", "--format", "{{.Id}}", self.image],
-            check=False,
-            capture_output=True,
-            text=True,
-        )
-        self.image_id = image.stdout.strip() or None
+        self.image_id = inspect_image(self.image)
         if self.image_id is None:
             raise BenchmarkError(f"Docker image does not exist: {self.image}")
-        subprocess.run(
-            [
-                "docker",
-                "network",
-                "create",
-                "--label",
-                "runnel.benchmark=true",
-                self.network,
-            ],
-            check=True,
-            capture_output=True,
-            text=True,
-        )
+        create_network(self.network)
         self.network_created = True
 
     def _start_node(self, index: int, *, bootstrap: bool) -> None:
         node = self.nodes[index]
-        node.data_dir.mkdir(parents=True, exist_ok=True)
+        command = self._node_command(node, bootstrap=bootstrap)
         if self.runtime == "container":
-            node.data_dir.chmod(0o777)
+            self._start_container(node, command)
+            return
+
+        node.data_dir.mkdir(parents=True, exist_ok=True)
+        native_command = [str(self.binary), *command]
+        stdout: Any = subprocess.DEVNULL
+        stderr: Any = subprocess.DEVNULL
+        if self.log_dir is not None:
+            log = (self.log_dir / f"node-{node.node_id}.log").open("ab")
+            stdout = log
+            stderr = subprocess.STDOUT
+        node.process = subprocess.Popen(native_command, stdout=stdout, stderr=stderr)
+
+    def _node_command(self, node: Node, *, bootstrap: bool) -> list[str]:
         if self.runtime == "container":
             addresses = [
-                f"{other.node_id}={other.container_name}:7000" for other in self.nodes
+                f"{other.node_id}={self._container_name(other)}:7000" for other in self.nodes
             ]
             listen = "0.0.0.0"
             data_dir = "/var/lib/runnel"
             peer_port = 7000
-            command_binary = None
         else:
             addresses = [
                 f"{other.node_id}=127.0.0.1:{other.peer_port}" for other in self.nodes
@@ -333,7 +302,6 @@ class Cluster:
             listen = "127.0.0.1"
             data_dir = str(node.data_dir)
             peer_port = node.peer_port
-            command_binary = str(self.binary)
         command = [
             "--engine",
             "raft",
@@ -356,72 +324,32 @@ class Cluster:
             command.extend(["--cluster-node", address])
         if bootstrap:
             command.append("--bootstrap")
-        if command_binary is None:
-            docker_command = [
-                "docker",
-                "run",
-                "--detach",
-                "--name",
-                node.container_name or "",
-                "--label",
-                "runnel.benchmark=true",
-                "--network",
-                self.network,
-                "--cpus",
-                self.cpus,
-                "--memory",
-                self.memory,
-                "--publish",
-                "127.0.0.1::4222",
-                "--publish",
-                "127.0.0.1::8080",
-                "--volume",
-                f"{node.data_dir}:/var/lib/runnel",
-                self.image,
-                *command,
-            ]
-            try:
-                subprocess.run(docker_command, check=True, capture_output=True, text=True)
-                node.container_running = True
-                node.broker_port = self._published_port(node.container_name or "", 4222)
-                node.http_port = self._published_port(node.container_name or "", 8080)
-            except (subprocess.CalledProcessError, BenchmarkError) as error:
-                logs = subprocess.run(
-                    ["docker", "logs", node.container_name or ""],
-                    capture_output=True,
-                    text=True,
-                    check=False,
-                )
-                raise BenchmarkError(
-                    f"failed to start container {node.container_name}: {error}\n"
-                    f"{logs.stdout}{logs.stderr}"
-                ) from error
-            return
+        return command
 
-        native_command = [command_binary, *command]
-        stdout: Any = subprocess.DEVNULL
-        stderr: Any = subprocess.DEVNULL
-        if self.log_dir is not None:
-            log = (self.log_dir / f"node-{node.node_id}.log").open("ab")
-            stdout = log
-            stderr = subprocess.STDOUT
-        node.process = subprocess.Popen(native_command, stdout=stdout, stderr=stderr)
-
-    @staticmethod
-    def _published_port(container: str, container_port: int) -> int:
-        result = subprocess.run(
-            ["docker", "port", container, f"{container_port}/tcp"],
-            check=True,
-            capture_output=True,
-            text=True,
+    def _start_container(self, node: Node, command: list[str]) -> None:
+        container = DockerContainer(
+            name=self._container_name(node),
+            image=self.image,
+            network=self.network,
+            cpus=self.cpus,
+            memory=self.memory,
+            data_dir=node.data_dir,
+            data_target="/var/lib/runnel",
+            command=command,
+            published_ports=(4222, 8080),
         )
-        value = result.stdout.rsplit(":", 1)[-1].strip()
+        node.container = container
         try:
-            return int(value)
-        except ValueError as error:
+            container.start(image_id=self.image_id)
+            node.broker_port = container.published_port(4222)
+            node.http_port = container.published_port(8080)
+        except (subprocess.CalledProcessError, BenchmarkError) as error:
             raise BenchmarkError(
-                f"could not parse published port for {container_port}: {result.stdout!r}"
+                f"failed to start container {container.name}: {error}\n{container.logs()}"
             ) from error
+
+    def _container_name(self, node: Node) -> str:
+        return f"{self.network}-node-{node.node_id}"
 
 
 def poll_until_redelivered(
@@ -493,42 +421,30 @@ def run_durable_publish(
     cluster: Cluster, stream: str, payload: str, messages: int, warmup: int
 ) -> dict[str, Any]:
     setup = cluster.client(0)
-    create_stream(setup, stream)
-    for _ in range(warmup):
-        publish(setup, stream, payload)
-    setup.close()
-    clients = [cluster.client(index) for index in range(cluster.node_count)]
     try:
-        def operation() -> dict[str, Any]:
-            latencies: list[int] = []
-            started = time.perf_counter_ns()
-            for offset in range(messages):
-                published_offset, elapsed = publish(clients[offset % len(clients)], stream, payload)
-                if published_offset != warmup + offset:
-                    raise BenchmarkError(f"expected published offset {warmup + offset}, got {published_offset}")
-                latencies.append(elapsed)
-            return metric(
-                "cluster_durable_publish",
-                latencies,
-                time.perf_counter_ns() - started,
-                message_size=len(payload),
-                metadata={"nodes": cluster.node_count, "any_node_routing": True},
-            )
-
-        return measure_scenario(cluster.stats, operation)
+        publish_stream(setup, stream, payload, warmup)
     finally:
-        for client in clients:
-            client.close()
+        setup.close()
+    with cluster.connected_clients() as clients:
+        return measure_message_batch(
+            cluster.stats,
+            "cluster_durable_publish",
+            len(payload),
+            lambda: publish_messages(
+                lambda offset: clients[offset % len(clients)],
+                stream,
+                payload,
+                messages,
+                expected_offset=warmup,
+            ),
+            metadata={"nodes": cluster.node_count, "any_node_routing": True},
+        )
 
 
 def preload(cluster: Cluster, stream: str, payload: str, messages: int) -> None:
     client = cluster.client(0)
     try:
-        create_stream(client, stream)
-        for expected_offset in range(messages):
-            offset, _ = publish(client, stream, payload)
-            if offset != expected_offset:
-                raise BenchmarkError(f"expected preload offset {expected_offset}, got {offset}")
+        publish_stream(client, stream, payload, messages)
     finally:
         client.close()
 
@@ -537,30 +453,20 @@ def run_consume_ack(
     cluster: Cluster, stream: str, payload: str, messages: int
 ) -> dict[str, Any]:
     preload(cluster, stream, payload, messages)
-    clients = [cluster.client(index) for index in range(cluster.node_count)]
-    try:
-        def operation() -> dict[str, Any]:
-            latencies: list[int] = []
-            started = time.perf_counter_ns()
-            for offset in range(messages):
-                poll_client = clients[offset % len(clients)]
-                ack_client = clients[(offset + 1) % len(clients)]
-                roundtrip_started = time.perf_counter_ns()
-                poll(poll_client, stream, "cluster-consumer", offset)
-                acknowledge(ack_client, stream, "cluster-consumer", offset)
-                latencies.append(time.perf_counter_ns() - roundtrip_started)
-            return metric(
-                "cluster_consume_ack",
-                latencies,
-                time.perf_counter_ns() - started,
-                message_size=len(payload),
-                metadata={"nodes": cluster.node_count, "publish_setup_excluded": True},
-            )
-
-        return measure_scenario(cluster.stats, operation)
-    finally:
-        for client in clients:
-            client.close()
+    with cluster.connected_clients() as clients:
+        return measure_message_batch(
+            cluster.stats,
+            "cluster_consume_ack",
+            len(payload),
+            lambda: consume_ack_messages(
+                lambda offset: clients[offset % len(clients)],
+                stream,
+                "cluster-consumer",
+                messages,
+                ack_client_for=lambda offset: clients[(offset + 1) % len(clients)],
+            ),
+            metadata={"nodes": cluster.node_count, "publish_setup_excluded": True},
+        )
 
 
 def run_slow_consumer(
@@ -578,8 +484,7 @@ def run_slow_consumer(
     consumer condition explicit in the result metadata.
     """
     preload(cluster, stream, payload, messages)
-    clients = [cluster.client(index) for index in range(cluster.node_count)]
-    try:
+    with cluster.connected_clients() as clients:
         def operation() -> dict[str, Any]:
             request_latencies: list[int] = []
             started = time.perf_counter_ns()
@@ -609,17 +514,13 @@ def run_slow_consumer(
             return result
 
         return measure_scenario(cluster.stats, operation)
-    finally:
-        for client in clients:
-            client.close()
 
 
 def run_grouped_consume_ack(
     cluster: Cluster, stream: str, payload: str, messages: int
 ) -> dict[str, Any]:
     preload(cluster, stream, payload, messages)
-    clients = [cluster.client(index) for index in range(cluster.node_count)]
-    try:
+    with cluster.connected_clients() as clients:
         def operation() -> dict[str, Any]:
             latencies: list[int] = []
             started = time.perf_counter_ns()
@@ -649,9 +550,6 @@ def run_grouped_consume_ack(
             )
 
         return measure_scenario(cluster.stats, operation)
-    finally:
-        for client in clients:
-            client.close()
 
 
 def run_parallel_grouped(
@@ -844,7 +742,6 @@ def main() -> int:
     timestamp = datetime.now(UTC)
     run_id = timestamp.strftime("%Y%m%d%H%M%S%f")
     output = args.output or ROOT / "benchmark-results" / f"cluster-{run_id}.json"
-    output.parent.mkdir(parents=True, exist_ok=True)
     cluster = Cluster(
         args.binary,
         node_count=args.nodes,
@@ -907,12 +804,7 @@ def main() -> int:
         "comparison_mode": "cluster-baseline",
         "benchmark_suite": "cluster",
         "git_revision": git_revision(),
-        "host": {
-            "platform": platform.platform(),
-            "processor": platform.processor(),
-            "python": platform.python_version(),
-            "cpus": os.cpu_count(),
-        },
+        "host": host_metadata(),
         "resource_limits": resource_limits(
             runtime=args.runtime, cpus=args.cpus, memory=args.memory
         ),
@@ -942,9 +834,7 @@ def main() -> int:
             }
         },
     }
-    output.write_text(json.dumps(result, indent=2) + "\n", encoding="utf-8")
-    print(json.dumps(result, indent=2))
-    print(f"results written to {output}")
+    write_json_result(output, result)
     return 0
 
 

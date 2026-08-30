@@ -353,11 +353,23 @@ def parse_args() -> argparse.Namespace:
 
 
 def _range_percent(result: dict[str, object], metric: str) -> float | None:
-    maximum: float | None = None
+    field = "throughput_messages_per_second" if metric == "throughput" else "latency_p99"
+    ranges = (
+        summary[field].get("relative_range_percent")
+        for _, _, summary in _scenario_summaries(result)
+        if isinstance(summary.get(field), dict)
+    )
+    values = [float(value) for value in ranges if isinstance(value, (int, float))]
+    return max(values) if values else None
+
+
+def _scenario_summaries(
+    result: dict[str, object],
+) -> Iterator[tuple[str, dict[str, object], dict[str, object]]]:
     backends = result.get("backends")
     if not isinstance(backends, dict):
-        return None
-    for backend in backends.values():
+        return
+    for backend_name, backend in backends.items():
         if not isinstance(backend, dict):
             continue
         scenarios = backend.get("scenarios")
@@ -367,19 +379,8 @@ def _range_percent(result: dict[str, object], metric: str) -> float | None:
             if not isinstance(scenario, dict):
                 continue
             summary = scenario.get("repetition_summary")
-            if not isinstance(summary, dict):
-                continue
-            if metric == "throughput":
-                metric_summary = summary.get("throughput_messages_per_second")
-            else:
-                latency_summary = summary.get("latency_p99")
-                metric_summary = latency_summary if isinstance(latency_summary, dict) else None
-            if not isinstance(metric_summary, dict):
-                continue
-            value = metric_summary.get("relative_range_percent")
-            if isinstance(value, (int, float)):
-                maximum = max(maximum or 0.0, float(value))
-    return maximum
+            if isinstance(summary, dict):
+                yield str(backend_name), scenario, summary
 
 
 def _scenario_key(backend_name: object, scenario: dict[str, object]) -> tuple[str, str, str, str, str]:
@@ -395,38 +396,21 @@ def _scenario_key(backend_name: object, scenario: dict[str, object]) -> tuple[st
 
 def _metric_samples(result: dict[str, object], metric: str) -> dict[tuple[str, str, str, str, str], list[float]]:
     samples: dict[tuple[str, str, str, str, str], list[float]] = {}
-    backends = result.get("backends")
-    if not isinstance(backends, dict):
-        return samples
-    for backend_name, backend in backends.items():
-        if not isinstance(backend, dict):
+    field = "throughput_messages_per_second" if metric == "throughput" else "latency_p99"
+    for backend_name, scenario, repetition_summary in _scenario_summaries(result):
+        metric_summary = repetition_summary.get(field)
+        if not isinstance(metric_summary, dict):
             continue
-        scenarios = backend.get("scenarios")
-        if not isinstance(scenarios, list):
+        values = metric_summary.get("samples")
+        if not isinstance(values, list):
             continue
-        for scenario in scenarios:
-            if not isinstance(scenario, dict):
-                continue
-            repetition_summary = scenario.get("repetition_summary")
-            if not isinstance(repetition_summary, dict):
-                continue
-            metric_summary = (
-                repetition_summary.get("throughput_messages_per_second")
-                if metric == "throughput"
-                else repetition_summary.get("latency_p99")
-            )
-            if not isinstance(metric_summary, dict):
-                continue
-            values = metric_summary.get("samples")
-            if not isinstance(values, list):
-                continue
-            numeric = [
-                float(value)
-                for value in values
-                if isinstance(value, (int, float)) and not isinstance(value, bool)
-            ]
-            if numeric:
-                samples[_scenario_key(backend_name, scenario)] = numeric
+        numeric = [
+            float(value)
+            for value in values
+            if isinstance(value, (int, float)) and not isinstance(value, bool)
+        ]
+        if numeric:
+            samples[_scenario_key(backend_name, scenario)] = numeric
     return samples
 
 
