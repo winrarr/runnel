@@ -255,6 +255,50 @@ fn partial_request_times_out_and_unrelated_health_recovers() {
 }
 
 #[test]
+fn slow_reader_does_not_consume_in_flight_capacity() {
+    let directory = TempDir::new().unwrap();
+    let server = RunningServer::start(
+        directory.path(),
+        &[
+            "--request-timeout-ms",
+            "500",
+            "--max-in-flight-requests",
+            "1",
+        ],
+    );
+
+    let mut slow_reader = TcpStream::connect(server.broker_addr).unwrap();
+    slow_reader
+        .set_read_timeout(Some(Duration::from_secs(2)))
+        .unwrap();
+    slow_reader
+        .write_all(br#"{"op":"health"}"#)
+        .expect("partial request should be writable");
+
+    let started = Instant::now();
+    assert!(matches!(
+        request(server.broker_addr, Request::Health),
+        Response::Health { .. }
+    ));
+    assert!(
+        started.elapsed() < Duration::from_secs(1),
+        "a slow reader must not consume the only in-flight request permit"
+    );
+
+    let mut response = String::new();
+    BufReader::new(&mut slow_reader)
+        .read_line(&mut response)
+        .expect("slow reader timeout response should be readable");
+    assert!(
+        matches!(decode_response(&response), Response::Error { code, .. } if code == "request_timeout")
+    );
+
+    let metrics =
+        wait_for_metric_at_least(server.http_addr, "runnel_broker_request_timeouts_total", 1);
+    assert_eq!(metric_value(&metrics, "runnel_active_requests"), 0);
+}
+
+#[test]
 fn slow_writer_and_in_flight_admission_are_bounded() {
     let directory = TempDir::new().unwrap();
     let server = RunningServer::start(
