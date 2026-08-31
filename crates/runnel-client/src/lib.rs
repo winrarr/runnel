@@ -1,7 +1,10 @@
 use std::io;
 use std::time::Duration;
 
-use runnel_protocol::{BinaryPayload, Request, Response};
+use runnel_protocol::{
+    BinaryPayload, MAX_PUBLISH_BATCH_BYTES, MAX_PUBLISH_BATCH_RECORDS,
+    PublishBatchRecord as WirePublishBatchRecord, PublishBatchRecordResponse, Request, Response,
+};
 use thiserror::Error;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, ReadHalf, WriteHalf};
 use tokio::net::{TcpStream, ToSocketAddrs};
@@ -44,6 +47,9 @@ pub enum ClientError {
         #[source]
         source: serde_json::Error,
     },
+
+    #[error("invalid publish batch: {message}")]
+    InvalidBatch { message: String },
 
     #[error("writing request timed out after {timeout:?}")]
     WriteTimeout { timeout: Duration },
@@ -123,6 +129,64 @@ pub struct PublishReceipt {
     pub stream: String,
     /// The broker-assigned logical message offset.
     pub offset: u64,
+}
+
+/// One opaque record supplied to a publish batch.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PublishBatchRecord {
+    /// Optional ordering key attached to the message.
+    pub key: Option<String>,
+    /// Exact application payload bytes.
+    pub payload: Vec<u8>,
+    /// Optional stable identity for explicitly resolving an ambiguous record.
+    pub request_id: Option<String>,
+}
+
+impl PublishBatchRecord {
+    /// Construct a record with no key or retry identity.
+    pub fn new(payload: impl Into<Vec<u8>>) -> Self {
+        Self {
+            key: None,
+            payload: payload.into(),
+            request_id: None,
+        }
+    }
+
+    /// Construct a record with the same options used by single-record publishes.
+    pub fn with_options(payload: impl Into<Vec<u8>>, options: PublishOptions) -> Self {
+        Self {
+            key: options.key,
+            payload: payload.into(),
+            request_id: options.request_id,
+        }
+    }
+
+    /// Construct a UTF-8 record without changing its bytes.
+    pub fn text(payload: impl Into<String>) -> Self {
+        Self::new(payload.into().into_bytes())
+    }
+}
+
+/// Per-record outcome from a publish-batch attempt.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PublishBatchOutcome {
+    /// The broker durably accepted this record.
+    Confirmed(PublishReceipt),
+    /// The broker definitely rejected this record.
+    Rejected { code: String, message: String },
+    /// The broker did not accept this record because the request may be retried safely.
+    Retryable { code: String, message: String },
+    /// The record may have been accepted; retry only with its stable request identity.
+    Unknown { code: String, message: String },
+}
+
+/// Per-record results plus the whole-request failure, when no complete batch response arrived.
+#[derive(Debug)]
+pub struct PublishBatchAttempt {
+    /// One outcome for every supplied record, in input order.
+    pub outcomes: Vec<PublishBatchOutcome>,
+    /// The whole-request failure behind repeated retryable or unknown outcomes, if any.
+    pub attempt: Option<AttemptFailure>,
 }
 
 /// A message returned by a successful poll.
@@ -232,6 +296,7 @@ impl AttemptOutcome {
                 Self::Retryable(AttemptFailure::Client(error))
             }
             ClientError::EncodeRequest { .. } => Self::Rejected(AttemptFailure::Client(error)),
+            ClientError::InvalidBatch { .. } => Self::Rejected(AttemptFailure::Client(error)),
             _ => Self::Unknown(AttemptFailure::Client(error)),
         }
     }
@@ -509,6 +574,71 @@ impl Client {
             },
         )
         .await
+    }
+
+    /// Publish a bounded batch of opaque binary records.
+    ///
+    /// Records are sent and processed in input order. The broker does not
+    /// make the batch atomic: a completed response can contain both confirmed
+    /// and rejected records. A transport, timeout, or leader-change failure
+    /// returns one retry classification for every record because the broker
+    /// may have processed a prefix. Reuse each record's `request_id` when
+    /// resolving an unknown result.
+    pub async fn publish_batch(
+        &mut self,
+        stream: impl Into<String>,
+        records: impl IntoIterator<Item = PublishBatchRecord>,
+    ) -> PublishBatchAttempt {
+        let stream = stream.into();
+        let records = records.into_iter().collect::<Vec<_>>();
+        if records.is_empty() {
+            return publish_batch_invalid(
+                0,
+                "publish batch must contain at least one record".to_owned(),
+            );
+        }
+        if records.len() > MAX_PUBLISH_BATCH_RECORDS {
+            return publish_batch_invalid(
+                records.len(),
+                format!("publish batch contains more than {MAX_PUBLISH_BATCH_RECORDS} records"),
+            );
+        }
+
+        let record_count = records.len();
+        let request = Request::PublishBatch {
+            stream: stream.clone(),
+            records: records
+                .into_iter()
+                .map(|record| WirePublishBatchRecord {
+                    key: record.key,
+                    payload_base64: BinaryPayload::new(record.payload),
+                    request_id: record.request_id,
+                })
+                .collect(),
+        };
+        let encoded_size = match serde_json::to_vec(&request) {
+            Ok(encoded) => encoded.len(),
+            Err(source) => {
+                return publish_batch_failure(
+                    record_count,
+                    BatchFailureKind::Rejected,
+                    AttemptFailure::Client(ClientError::EncodeRequest { source }),
+                );
+            }
+        };
+        if encoded_size > MAX_PUBLISH_BATCH_BYTES {
+            return publish_batch_invalid(
+                record_count,
+                format!(
+                    "encoded publish batch exceeds the maximum of {MAX_PUBLISH_BATCH_BYTES} bytes"
+                ),
+            );
+        }
+        publish_batch_attempt(
+            stream,
+            record_count,
+            self.request_with_outcome(&request).await,
+        )
     }
 
     /// Poll a consumer, returning `None` when the broker reports an empty poll.
@@ -835,17 +965,133 @@ fn classify_response(response: Response) -> AttemptOutcome {
         return AttemptOutcome::Confirmed(response);
     };
 
-    match code.as_str() {
+    match classify_error_code(code) {
+        BatchFailureKind::Retryable => AttemptOutcome::Retryable(AttemptFailure::Broker(response)),
+        BatchFailureKind::Unknown => AttemptOutcome::Unknown(AttemptFailure::Broker(response)),
+        BatchFailureKind::Rejected => AttemptOutcome::Rejected(AttemptFailure::Broker(response)),
+    }
+}
+
+#[derive(Clone, Copy)]
+enum BatchFailureKind {
+    Rejected,
+    Retryable,
+    Unknown,
+}
+
+fn classify_error_code(code: &str) -> BatchFailureKind {
+    match code {
         "connection_limit" | "request_saturated" | "stream_not_ready" => {
-            AttemptOutcome::Retryable(AttemptFailure::Broker(response))
+            BatchFailureKind::Retryable
         }
         "request_timeout"
         | "storage_error"
         | "consumer_state_error"
         | "internal_error"
         | "cluster_error"
-        | "corrupt_record" => AttemptOutcome::Unknown(AttemptFailure::Broker(response)),
-        _ => AttemptOutcome::Rejected(AttemptFailure::Broker(response)),
+        | "corrupt_record" => BatchFailureKind::Unknown,
+        _ => BatchFailureKind::Rejected,
+    }
+}
+
+fn publish_batch_invalid(record_count: usize, message: String) -> PublishBatchAttempt {
+    let error = AttemptFailure::Client(ClientError::InvalidBatch { message });
+    publish_batch_failure(record_count, BatchFailureKind::Rejected, error)
+}
+
+fn publish_batch_attempt(
+    stream: String,
+    record_count: usize,
+    outcome: AttemptOutcome,
+) -> PublishBatchAttempt {
+    match outcome {
+        AttemptOutcome::Confirmed(response) => match response {
+            Response::PublishBatch {
+                stream: response_stream,
+                outcomes,
+            } if response_stream == stream && outcomes.len() == record_count => {
+                let outcomes = outcomes
+                    .into_iter()
+                    .map(|outcome| match outcome {
+                        PublishBatchRecordResponse::Published { offset } => {
+                            PublishBatchOutcome::Confirmed(PublishReceipt {
+                                stream: stream.clone(),
+                                offset,
+                            })
+                        }
+                        PublishBatchRecordResponse::Error { code, message } => {
+                            publish_batch_record_error(code, message)
+                        }
+                    })
+                    .collect();
+                PublishBatchAttempt {
+                    outcomes,
+                    attempt: None,
+                }
+            }
+            response => publish_batch_unexpected(record_count, response),
+        },
+        AttemptOutcome::Rejected(failure) => {
+            publish_batch_failure(record_count, BatchFailureKind::Rejected, failure)
+        }
+        AttemptOutcome::Retryable(failure) => {
+            publish_batch_failure(record_count, BatchFailureKind::Retryable, failure)
+        }
+        AttemptOutcome::Unknown(failure) => {
+            publish_batch_failure(record_count, BatchFailureKind::Unknown, failure)
+        }
+    }
+}
+
+fn publish_batch_unexpected(record_count: usize, response: Response) -> PublishBatchAttempt {
+    let failure = AttemptFailure::Client(ClientError::UnexpectedResponse {
+        operation: "publish_batch",
+        response: Box::new(response),
+    });
+    publish_batch_failure(record_count, BatchFailureKind::Unknown, failure)
+}
+
+fn publish_batch_failure(
+    record_count: usize,
+    kind: BatchFailureKind,
+    failure: AttemptFailure,
+) -> PublishBatchAttempt {
+    let (code, message) = attempt_failure_details(&failure);
+    let outcomes = (0..record_count)
+        .map(|_| publish_batch_record_failure(kind, code.clone(), message.clone()))
+        .collect();
+    PublishBatchAttempt {
+        outcomes,
+        attempt: Some(failure),
+    }
+}
+
+fn publish_batch_record_error(code: String, message: String) -> PublishBatchOutcome {
+    publish_batch_record_failure(classify_error_code(&code), code, message)
+}
+
+fn publish_batch_record_failure(
+    kind: BatchFailureKind,
+    code: String,
+    message: String,
+) -> PublishBatchOutcome {
+    match kind {
+        BatchFailureKind::Rejected => PublishBatchOutcome::Rejected { code, message },
+        BatchFailureKind::Retryable => PublishBatchOutcome::Retryable { code, message },
+        BatchFailureKind::Unknown => PublishBatchOutcome::Unknown { code, message },
+    }
+}
+
+fn attempt_failure_details(failure: &AttemptFailure) -> (String, String) {
+    match failure {
+        AttemptFailure::Broker(Response::Error { code, message }) => {
+            (code.clone(), message.clone())
+        }
+        AttemptFailure::Broker(response) => (
+            "unexpected_response".to_owned(),
+            format!("unexpected response: {response:?}"),
+        ),
+        AttemptFailure::Client(error) => ("client_error".to_owned(), error.to_string()),
     }
 }
 
@@ -959,6 +1205,147 @@ mod tests {
             created,
             Response::StreamCreated { stream, created } if stream == "events" && created
         ));
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn publish_batch_returns_ordered_per_record_outcomes() {
+        let (listener, address) = listener().await;
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut reader = BufReader::new(stream);
+            match read_request(&mut reader).await {
+                Request::PublishBatch { stream, records } => {
+                    assert_eq!(stream, "events");
+                    assert_eq!(records.len(), 2);
+                    assert_eq!(records[0].payload_base64.as_bytes(), [0, 255]);
+                    assert_eq!(records[0].request_id.as_deref(), Some("record-1"));
+                    assert_eq!(records[1].payload_base64.as_bytes(), b"second");
+                }
+                request => panic!("expected publish batch, got {request:?}"),
+            }
+            write_response(
+                &mut reader,
+                Response::PublishBatch {
+                    stream: "events".to_owned(),
+                    outcomes: vec![
+                        PublishBatchRecordResponse::Published { offset: 3 },
+                        PublishBatchRecordResponse::Error {
+                            code: "request_saturated".to_owned(),
+                            message: "busy".to_owned(),
+                        },
+                    ],
+                },
+            )
+            .await;
+        });
+
+        let mut client = Client::connect_with_config(address, test_config())
+            .await
+            .unwrap();
+        let attempt = client
+            .publish_batch(
+                "events",
+                [
+                    PublishBatchRecord::with_options(
+                        vec![0, 255],
+                        PublishOptions::default().with_request_id("record-1"),
+                    ),
+                    PublishBatchRecord::text("second"),
+                ],
+            )
+            .await;
+        assert!(attempt.attempt.is_none());
+        assert_eq!(
+            attempt.outcomes,
+            vec![
+                PublishBatchOutcome::Confirmed(PublishReceipt {
+                    stream: "events".to_owned(),
+                    offset: 3,
+                }),
+                PublishBatchOutcome::Retryable {
+                    code: "request_saturated".to_owned(),
+                    message: "busy".to_owned(),
+                },
+            ]
+        );
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn publish_batch_marks_every_record_unknown_after_disconnect() {
+        let (listener, address) = listener().await;
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut reader = BufReader::new(stream);
+            assert!(matches!(
+                read_request(&mut reader).await,
+                Request::PublishBatch { records, .. } if records.len() == 2
+            ));
+        });
+
+        let mut client = Client::connect_with_config(address, test_config())
+            .await
+            .unwrap();
+        let attempt = client
+            .publish_batch(
+                "events",
+                [
+                    PublishBatchRecord::with_options(
+                        "first",
+                        PublishOptions::default().with_request_id("first"),
+                    ),
+                    PublishBatchRecord::with_options(
+                        "second",
+                        PublishOptions::default().with_request_id("second"),
+                    ),
+                ],
+            )
+            .await;
+        assert!(matches!(
+            attempt.attempt,
+            Some(AttemptFailure::Client(ClientError::Eof))
+        ));
+        assert!(attempt.outcomes.iter().all(|outcome| matches!(
+            outcome,
+            PublishBatchOutcome::Unknown { code, .. } if code == "client_error"
+        )));
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn publish_batch_marks_every_record_unknown_after_response_timeout() {
+        let (listener, address) = listener().await;
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut reader = BufReader::new(stream);
+            assert!(matches!(
+                read_request(&mut reader).await,
+                Request::PublishBatch { records, .. } if records.len() == 2
+            ));
+            tokio::time::sleep(Duration::from_millis(250)).await;
+        });
+
+        let mut client = Client::connect_with_config(address, test_config())
+            .await
+            .unwrap();
+        let attempt = client
+            .publish_batch(
+                "events",
+                [
+                    PublishBatchRecord::new("first"),
+                    PublishBatchRecord::new("second"),
+                ],
+            )
+            .await;
+        assert!(matches!(
+            attempt.attempt,
+            Some(AttemptFailure::Client(ClientError::ResponseTimeout { .. }))
+        ));
+        assert!(attempt.outcomes.iter().all(|outcome| matches!(
+            outcome,
+            PublishBatchOutcome::Unknown { code, .. } if code == "client_error"
+        )));
         server.await.unwrap();
     }
 

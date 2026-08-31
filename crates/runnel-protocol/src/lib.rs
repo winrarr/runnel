@@ -2,6 +2,11 @@ use base64::{Engine as _, engine::general_purpose::STANDARD};
 use serde::de::Error as _;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
+/// Maximum number of records accepted in one publish-batch request.
+pub const MAX_PUBLISH_BATCH_RECORDS: usize = 1024;
+/// Maximum encoded request size supported by the protocol's publish-batch path.
+pub const MAX_PUBLISH_BATCH_BYTES: usize = 64 * 1024 * 1024;
+
 /// Opaque bytes represented as standard padded base64 on the provisional wire.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BinaryPayload(Vec<u8>);
@@ -47,6 +52,24 @@ impl<'de> Deserialize<'de> for BinaryPayload {
     }
 }
 
+/// One record in a binary-safe publish batch.
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PublishBatchRecord {
+    pub key: Option<String>,
+    pub payload_base64: BinaryPayload,
+    #[serde(default)]
+    pub request_id: Option<String>,
+}
+
+/// The broker's result for one publish-batch record.
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum PublishBatchRecordResponse {
+    Published { offset: u64 },
+    Error { code: String, message: String },
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 #[serde(tag = "op", rename_all = "snake_case")]
@@ -68,6 +91,10 @@ pub enum Request {
         payload_base64: BinaryPayload,
         #[serde(default)]
         request_id: Option<String>,
+    },
+    PublishBatch {
+        stream: String,
+        records: Vec<PublishBatchRecord>,
     },
     Poll {
         stream: String,
@@ -103,6 +130,10 @@ pub enum Response {
     Published {
         stream: String,
         offset: u64,
+    },
+    PublishBatch {
+        stream: String,
+        outcomes: Vec<PublishBatchRecordResponse>,
     },
     Message {
         stream: String,

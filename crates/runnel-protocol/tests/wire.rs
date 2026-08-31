@@ -160,3 +160,54 @@ fn binary_payload_rejects_malformed_or_contradictory_json() {
     )
     .is_err());
 }
+
+#[test]
+fn publish_batch_preserves_binary_records_and_per_record_outcomes() {
+    let request = Request::PublishBatch {
+        stream: "events".to_owned(),
+        records: vec![
+            runnel_protocol::PublishBatchRecord {
+                key: Some("order-1".to_owned()),
+                payload_base64: BinaryPayload::new(vec![0, 255]),
+                request_id: Some("record-1".to_owned()),
+            },
+            runnel_protocol::PublishBatchRecord {
+                key: None,
+                payload_base64: BinaryPayload::new(b"second".to_vec()),
+                request_id: None,
+            },
+        ],
+    };
+    let encoded = serde_json::to_string(&request).unwrap();
+    let decoded: Request = serde_json::from_str(&encoded).unwrap();
+    assert!(matches!(
+        decoded,
+        Request::PublishBatch { stream, records }
+            if stream == "events"
+                && records.len() == 2
+                && records[0].payload_base64.as_bytes() == [0, 255]
+                && records[0].request_id.as_deref() == Some("record-1")
+    ));
+
+    let response = Response::PublishBatch {
+        stream: "events".to_owned(),
+        outcomes: vec![
+            runnel_protocol::PublishBatchRecordResponse::Published { offset: 4 },
+            runnel_protocol::PublishBatchRecordResponse::Error {
+                code: "invalid_name".to_owned(),
+                message: "rejected".to_owned(),
+            },
+        ],
+    };
+    let encoded = serde_json::to_string(&response).unwrap();
+    let decoded: Response = serde_json::from_str(&encoded).unwrap();
+    assert!(matches!(
+        decoded,
+        Response::PublishBatch { stream, outcomes }
+            if stream == "events"
+                && matches!(outcomes.as_slice(), [
+                    runnel_protocol::PublishBatchRecordResponse::Published { offset: 4 },
+                    runnel_protocol::PublishBatchRecordResponse::Error { code, .. }
+                ] if code == "invalid_name")
+    ));
+}

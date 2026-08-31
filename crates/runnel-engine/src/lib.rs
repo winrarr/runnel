@@ -53,6 +53,20 @@ impl Drop for StageTimer {
 
 pub type Offset = u64;
 
+/// Maximum number of records accepted by one publish-batch engine operation.
+pub const MAX_PUBLISH_BATCH_RECORDS: usize = 1024;
+
+/// One opaque record in a publish batch.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PublishRecord {
+    pub key: Option<String>,
+    pub payload: Vec<u8>,
+    pub request_id: Option<String>,
+}
+
+/// The result for one record in a publish batch.
+pub type PublishRecordOutcome = Result<Offset, BrokerError>;
+
 pub type EngineFuture<'a, T> = Pin<Box<dyn Future<Output = Result<T, BrokerError>> + Send + 'a>>;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -132,6 +146,36 @@ pub trait Engine: Send + Sync {
         payload: Vec<u8>,
         request_id: Option<String>,
     ) -> EngineFuture<'a, Offset>;
+
+    /// Publish records independently in input order.
+    ///
+    /// The default implementation preserves the no-atomicity contract by
+    /// using the single-record operation for each record. Engines may
+    /// override it to amortize storage work while retaining the same
+    /// per-record outcomes.
+    fn publish_batch<'a>(
+        &'a self,
+        stream: &'a str,
+        records: Vec<PublishRecord>,
+    ) -> EngineFuture<'a, Vec<PublishRecordOutcome>> {
+        if records.len() > MAX_PUBLISH_BATCH_RECORDS {
+            return Box::pin(async {
+                Err(BrokerError::Configuration(format!(
+                    "publish batch contains more than {MAX_PUBLISH_BATCH_RECORDS} records"
+                )))
+            });
+        }
+        Box::pin(async move {
+            let mut outcomes = Vec::with_capacity(records.len());
+            for record in records {
+                outcomes.push(
+                    self.publish(stream, record.key, record.payload, record.request_id)
+                        .await,
+                );
+            }
+            Ok(outcomes)
+        })
+    }
 
     fn poll<'a>(&'a self, stream: &'a str, consumer: &'a str) -> EngineFuture<'a, PollResult>;
 

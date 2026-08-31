@@ -14,8 +14,11 @@ use clap::{Parser, ValueEnum};
 use runnel_core::{Broker, BrokerConfig};
 #[cfg(feature = "instrumentation")]
 use runnel_engine::StageTimer;
-use runnel_engine::{AckResult, BrokerError, Engine, PollResult};
-use runnel_protocol::{BinaryPayload, Request, Response};
+use runnel_engine::{AckResult, BrokerError, Engine, PollResult, PublishRecord};
+use runnel_protocol::{
+    BinaryPayload, MAX_PUBLISH_BATCH_BYTES, MAX_PUBLISH_BATCH_RECORDS, PublishBatchRecordResponse,
+    Request, Response,
+};
 use runnel_raft::{GroupManager, NodeId, PersistentEngine, SnapshotMetricsSnapshot};
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
@@ -29,7 +32,7 @@ const DEFAULT_MAX_CONNECTIONS: usize = 1_024;
 const DEFAULT_MAX_REQUEST_BYTES: usize = 1_048_576;
 const DEFAULT_MAX_IN_FLIGHT_REQUESTS: usize = 256;
 const DEFAULT_REQUEST_TIMEOUT_MS: u64 = 30_000;
-const MAX_CONFIGURED_REQUEST_BYTES: usize = 64 * 1024 * 1024;
+const MAX_CONFIGURED_REQUEST_BYTES: usize = MAX_PUBLISH_BATCH_BYTES;
 const CONNECTION_REJECTION_WRITE_TIMEOUT: Duration = Duration::from_millis(10);
 
 #[derive(Debug, Parser)]
@@ -192,6 +195,7 @@ impl RequestOperation {
             Request::CreateStream { .. } => Self::CreateStream,
             Request::Publish { .. } => Self::Publish,
             Request::PublishBytes { .. } => Self::Publish,
+            Request::PublishBatch { .. } => Self::Publish,
             Request::Poll { .. } => Self::Poll,
             Request::PollGroup { .. } => Self::PollGroup,
             Request::Ack { .. } => Self::Ack,
@@ -946,6 +950,16 @@ async fn handle_request(
 ) -> Response {
     #[cfg(feature = "instrumentation")]
     let _stage_timer = StageTimer::new("server.engine_request");
+    if let Request::PublishBatch { records, .. } = &request {
+        if records.is_empty() {
+            return invalid_request_response("publish batch must contain at least one record");
+        }
+        if records.len() > MAX_PUBLISH_BATCH_RECORDS {
+            return invalid_request_response(&format!(
+                "publish batch contains more than {MAX_PUBLISH_BATCH_RECORDS} records"
+            ));
+        }
+    }
     let result = match request {
         Request::CreateStream { stream } => engine.create_stream(&stream).await.map(|created| {
             if created {
@@ -987,6 +1001,52 @@ async fn handle_request(
                         .published_bytes
                         .fetch_add(payload_bytes, Ordering::Relaxed);
                     Response::Published { stream, offset }
+                })
+        }
+        Request::PublishBatch { stream, records } => {
+            let payload_sizes = records
+                .iter()
+                .map(|record| record.payload_base64.as_bytes().len() as u64)
+                .collect::<Vec<_>>();
+            let records = records
+                .into_iter()
+                .map(|record| PublishRecord {
+                    key: record.key,
+                    payload: record.payload_base64.into_bytes(),
+                    request_id: record.request_id,
+                })
+                .collect();
+            engine
+                .publish_batch(&stream, records)
+                .await
+                .and_then(|outcomes| {
+                    if outcomes.len() != payload_sizes.len() {
+                        return Err(BrokerError::Cluster(
+                            "publish batch returned the wrong number of outcomes".to_owned(),
+                        ));
+                    }
+                    let outcomes = outcomes
+                        .into_iter()
+                        .zip(payload_sizes)
+                        .map(|(outcome, payload_bytes)| match outcome {
+                            Ok(offset) => {
+                                metrics.publishes.fetch_add(1, Ordering::Relaxed);
+                                metrics
+                                    .published_bytes
+                                    .fetch_add(payload_bytes, Ordering::Relaxed);
+                                PublishBatchRecordResponse::Published { offset }
+                            }
+                            Err(error) => {
+                                let Response::Error { code, message } =
+                                    publish_batch_error_response(&error)
+                                else {
+                                    unreachable!("broker errors must map to error responses")
+                                };
+                                PublishBatchRecordResponse::Error { code, message }
+                            }
+                        })
+                        .collect();
+                    Ok(Response::PublishBatch { stream, outcomes })
                 })
         }
         Request::Poll { stream, consumer } => {
@@ -1149,6 +1209,18 @@ fn error_response(error: &BrokerError) -> Response {
         code: code.to_owned(),
         message: error.to_string(),
     }
+}
+
+fn publish_batch_error_response(error: &BrokerError) -> Response {
+    if let BrokerError::Io(io_error) = error
+        && io_error.kind() == std::io::ErrorKind::InvalidInput
+    {
+        return Response::Error {
+            code: "invalid_record".to_owned(),
+            message: error.to_string(),
+        };
+    }
+    error_response(error)
 }
 
 async fn wait_for_shutdown(mut shutdown: watch::Receiver<bool>) {
