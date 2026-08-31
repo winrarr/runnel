@@ -1,5 +1,5 @@
 use runnel_core::{Broker, BrokerConfig};
-use runnel_engine::{AckResult, Engine, PollResult};
+use runnel_engine::{AckResult, BrokerError, Engine, PollResult};
 use runnel_test_support::{
     assert_expired_delivery_is_fenced, assert_independent_consumers_contract,
     assert_key_ordering_contract, assert_shared_delivery_contract,
@@ -31,6 +31,67 @@ async fn local_broker_implements_the_engine_contract() {
         engine.ack("events", "worker", 0).await.unwrap(),
         AckResult::Acknowledged
     );
+    assert_eq!(
+        engine.poll("events", "worker").await.unwrap(),
+        PollResult::Empty
+    );
+}
+
+#[tokio::test]
+async fn local_engine_propagates_storage_errors() {
+    let directory = tempdir().unwrap();
+    let broker = Broker::open(directory.path(), BrokerConfig::default()).unwrap();
+    let engine: &dyn Engine = &broker;
+
+    assert!(matches!(
+        engine.poll("missing", "worker").await,
+        Err(BrokerError::StreamNotFound(stream)) if stream == "missing"
+    ));
+    assert!(matches!(
+        engine.create_stream("invalid/name").await,
+        Err(BrokerError::InvalidName { kind: "stream", name }) if name == "invalid/name"
+    ));
+}
+
+#[tokio::test]
+async fn local_engine_ack_recovery_remains_durable_across_restart() {
+    let directory = tempdir().unwrap();
+    {
+        let broker = Broker::open(directory.path(), BrokerConfig::default()).unwrap();
+        let engine: &dyn Engine = &broker;
+        assert_eq!(
+            engine
+                .publish("events", None, b"recover-me".to_vec(), None)
+                .await
+                .unwrap(),
+            0
+        );
+        assert!(matches!(
+            engine.poll("events", "worker").await.unwrap(),
+            PollResult::Message(message) if message.offset == 0 && message.delivery_attempt == Some(1)
+        ));
+    }
+
+    {
+        let broker = Broker::open(directory.path(), BrokerConfig::default()).unwrap();
+        let engine: &dyn Engine = &broker;
+        let message = match engine.poll("events", "worker").await.unwrap() {
+            PollResult::Message(message) => message,
+            PollResult::Empty => panic!("expected unacknowledged message after restart"),
+        };
+        assert_eq!(message.offset, 0);
+        assert_eq!(message.delivery_attempt, Some(2));
+        assert_eq!(
+            engine
+                .ack("events", "worker", message.offset)
+                .await
+                .unwrap(),
+            AckResult::Acknowledged
+        );
+    }
+
+    let broker = Broker::open(directory.path(), BrokerConfig::default()).unwrap();
+    let engine: &dyn Engine = &broker;
     assert_eq!(
         engine.poll("events", "worker").await.unwrap(),
         PollResult::Empty

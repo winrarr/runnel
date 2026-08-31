@@ -124,6 +124,49 @@ impl StorageExecutor {
             )),
         }
     }
+
+    fn dispatch<T, F>(self: Arc<Self>, operation: F) -> EngineFuture<'static, T>
+    where
+        T: Send + 'static,
+        F: FnOnce() -> Result<T, BrokerError> + Send + 'static,
+    {
+        Box::pin(async move {
+            #[cfg(feature = "instrumentation")]
+            let _stage_timer = StageTimer::new("core.storage_dispatch");
+
+            // Admission is reserved before waiting for an execution permit, so the number of
+            // active and queued blocking operations is bounded. Waiting for execution remains
+            // asynchronous; only the synchronous operation runs on Tokio's blocking pool.
+            let admission_permit = Arc::clone(&self.admission_permits)
+                .try_acquire_owned()
+                .map_err(|_| {
+                    BrokerError::Io(io::Error::new(
+                        io::ErrorKind::WouldBlock,
+                        "storage execution queue is full",
+                    ))
+                })?;
+            let execution_permit = Arc::clone(&self.execution_permits)
+                .acquire_owned()
+                .await
+                .map_err(|_| {
+                    BrokerError::Io(io::Error::other("storage execution capacity was closed"))
+                })?;
+            tokio::task::spawn_blocking(move || {
+                let _admission_permit = admission_permit;
+                let _execution_permit = execution_permit;
+                operation()
+            })
+            .await
+            .map_err(|error| {
+                let message = if error.is_panic() {
+                    "storage execution task panicked"
+                } else {
+                    "storage execution task was cancelled"
+                };
+                BrokerError::Io(io::Error::other(message))
+            })?
+        })
+    }
 }
 
 struct StreamState {
@@ -684,9 +727,7 @@ impl Engine for Broker {
     fn create_stream<'a>(&'a self, stream: &'a str) -> EngineFuture<'a, bool> {
         let broker = self.clone();
         let stream = stream.to_owned();
-        dispatch_storage(Arc::clone(&self.inner.storage_executor), move || {
-            broker.create_stream(&stream)
-        })
+        Arc::clone(&self.inner.storage_executor).dispatch(move || broker.create_stream(&stream))
     }
 
     fn publish<'a>(
@@ -698,18 +739,15 @@ impl Engine for Broker {
     ) -> EngineFuture<'a, Offset> {
         let broker = self.clone();
         let stream = stream.to_owned();
-        dispatch_storage(Arc::clone(&self.inner.storage_executor), move || {
-            broker.publish_with_request_id(&stream, key, payload, request_id)
-        })
+        Arc::clone(&self.inner.storage_executor)
+            .dispatch(move || broker.publish_with_request_id(&stream, key, payload, request_id))
     }
 
     fn poll<'a>(&'a self, stream: &'a str, consumer: &'a str) -> EngineFuture<'a, PollResult> {
         let broker = self.clone();
         let stream = stream.to_owned();
         let consumer = consumer.to_owned();
-        dispatch_storage(Arc::clone(&self.inner.storage_executor), move || {
-            broker.poll(&stream, &consumer)
-        })
+        Arc::clone(&self.inner.storage_executor).dispatch(move || broker.poll(&stream, &consumer))
     }
 
     fn poll_group<'a>(
@@ -722,9 +760,8 @@ impl Engine for Broker {
         let stream = stream.to_owned();
         let consumer = consumer.to_owned();
         let member = member.to_owned();
-        dispatch_storage(Arc::clone(&self.inner.storage_executor), move || {
-            broker.poll_group(&stream, &consumer, &member)
-        })
+        Arc::clone(&self.inner.storage_executor)
+            .dispatch(move || broker.poll_group(&stream, &consumer, &member))
     }
 
     fn ack<'a>(
@@ -736,9 +773,8 @@ impl Engine for Broker {
         let broker = self.clone();
         let stream = stream.to_owned();
         let consumer = consumer.to_owned();
-        dispatch_storage(Arc::clone(&self.inner.storage_executor), move || {
-            broker.ack(&stream, &consumer, offset)
-        })
+        Arc::clone(&self.inner.storage_executor)
+            .dispatch(move || broker.ack(&stream, &consumer, offset))
     }
 
     fn ack_group<'a>(
@@ -754,54 +790,15 @@ impl Engine for Broker {
         let consumer = consumer.to_owned();
         let member = member.to_owned();
         let delivery_token = delivery_token.to_owned();
-        dispatch_storage(Arc::clone(&self.inner.storage_executor), move || {
+        Arc::clone(&self.inner.storage_executor).dispatch(move || {
             broker.ack_group(&stream, &consumer, &member, offset, &delivery_token)
         })
     }
 
     fn health<'a>(&'a self) -> EngineFuture<'a, HealthSnapshot> {
         let broker = self.clone();
-        dispatch_storage(Arc::clone(&self.inner.storage_executor), move || {
-            broker.health()
-        })
+        Arc::clone(&self.inner.storage_executor).dispatch(move || broker.health())
     }
-}
-
-fn dispatch_storage<T, F>(executor: Arc<StorageExecutor>, operation: F) -> EngineFuture<'static, T>
-where
-    T: Send + 'static,
-    F: FnOnce() -> Result<T, BrokerError> + Send + 'static,
-{
-    Box::pin(async move {
-        let admission_permit = Arc::clone(&executor.admission_permits)
-            .try_acquire_owned()
-            .map_err(|_| {
-                BrokerError::Io(io::Error::new(
-                    io::ErrorKind::WouldBlock,
-                    "storage execution queue is full",
-                ))
-            })?;
-        let execution_permit = Arc::clone(&executor.execution_permits)
-            .acquire_owned()
-            .await
-            .map_err(|_| {
-                BrokerError::Io(io::Error::other("storage execution capacity was closed"))
-            })?;
-        tokio::task::spawn_blocking(move || {
-            let _admission_permit = admission_permit;
-            let _execution_permit = execution_permit;
-            operation()
-        })
-        .await
-        .map_err(|error| {
-            let message = if error.is_panic() {
-                "storage execution task panicked"
-            } else {
-                "storage execution task was cancelled"
-            };
-            BrokerError::Io(io::Error::other(message))
-        })?
-    })
 }
 
 impl StreamLog {
@@ -1685,6 +1682,7 @@ fn delivery_epoch() -> u128 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
     use std::sync::{Arc, Barrier};
     use std::thread;
     use tempfile::tempdir;
@@ -1765,7 +1763,8 @@ mod tests {
     async fn storage_dispatch_runs_off_the_async_runtime_thread() {
         let runtime_thread = thread::current().id();
         let executor = Arc::new(StorageExecutor::with_capacities(1, 1));
-        let storage_thread = dispatch_storage(executor, || Ok(thread::current().id()))
+        let storage_thread = executor
+            .dispatch(|| Ok(thread::current().id()))
             .await
             .unwrap();
 
@@ -1778,7 +1777,7 @@ mod tests {
         let started = Arc::new(tokio::sync::Notify::new());
         let (release_sender, release_receiver) = std::sync::mpsc::channel();
         let storage_started = Arc::clone(&started);
-        let storage = tokio::spawn(dispatch_storage(Arc::clone(&executor), move || {
+        let storage = tokio::spawn(Arc::clone(&executor).dispatch(move || {
             storage_started.notify_one();
             release_receiver
                 .recv()
@@ -1800,7 +1799,7 @@ mod tests {
         let started = Arc::new(tokio::sync::Notify::new());
         let (release_sender, release_receiver) = std::sync::mpsc::channel();
         let storage_started = Arc::clone(&started);
-        let first = tokio::spawn(dispatch_storage(Arc::clone(&executor), move || {
+        let first = tokio::spawn(Arc::clone(&executor).dispatch(move || {
             storage_started.notify_one();
             release_receiver
                 .recv()
@@ -1809,7 +1808,7 @@ mod tests {
         }));
 
         started.notified().await;
-        let second = tokio::spawn(dispatch_storage(executor, || Ok(())));
+        let second = tokio::spawn(executor.dispatch(|| Ok(())));
         tokio::task::yield_now().await;
         assert!(!second.is_finished());
 
@@ -1824,7 +1823,7 @@ mod tests {
         let started = Arc::new(tokio::sync::Notify::new());
         let (release_sender, release_receiver) = std::sync::mpsc::channel();
         let storage_started = Arc::clone(&started);
-        let first = tokio::spawn(dispatch_storage(Arc::clone(&executor), move || {
+        let first = tokio::spawn(Arc::clone(&executor).dispatch(move || {
             storage_started.notify_one();
             release_receiver
                 .recv()
@@ -1833,12 +1832,12 @@ mod tests {
         }));
 
         started.notified().await;
-        let second = tokio::spawn(dispatch_storage(Arc::clone(&executor), || Ok(())));
+        let second = tokio::spawn(Arc::clone(&executor).dispatch(|| Ok(())));
         while executor.admission_permits.available_permits() != 0 {
             tokio::task::yield_now().await;
         }
 
-        let rejected = dispatch_storage(executor, || Ok(())).await;
+        let rejected = executor.dispatch(|| Ok(())).await;
         assert!(matches!(
             rejected,
             Err(BrokerError::Io(error)) if error.kind() == io::ErrorKind::WouldBlock
@@ -1847,6 +1846,78 @@ mod tests {
         release_sender.send(()).unwrap();
         first.await.unwrap().unwrap();
         second.await.unwrap().unwrap();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn storage_dispatch_cancellation_drops_queued_work() {
+        let executor = Arc::new(StorageExecutor::with_capacities(1, 1));
+        let started = Arc::new(tokio::sync::Notify::new());
+        let (release_sender, release_receiver) = std::sync::mpsc::channel();
+        let storage_started = Arc::clone(&started);
+        let first = tokio::spawn(Arc::clone(&executor).dispatch(move || {
+            storage_started.notify_one();
+            release_receiver
+                .recv()
+                .expect("storage task should be released by the test");
+            Ok(())
+        }));
+
+        started.notified().await;
+        let executed = Arc::new(AtomicBool::new(false));
+        let queued_executed = Arc::clone(&executed);
+        let second = tokio::spawn(executor.clone().dispatch(move || {
+            queued_executed.store(true, AtomicOrdering::Release);
+            Ok(())
+        }));
+        while executor.admission_permits.available_permits() != 0 {
+            tokio::task::yield_now().await;
+        }
+
+        second.abort();
+        assert!(second.await.unwrap_err().is_cancelled());
+        release_sender.send(()).unwrap();
+        first.await.unwrap().unwrap();
+
+        assert!(!executed.load(AtomicOrdering::Acquire));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn async_engine_storage_stall_does_not_block_unrelated_work() {
+        let directory = tempdir().unwrap();
+        let broker = Broker::open(directory.path(), BrokerConfig::default()).unwrap();
+        broker.create_stream("events").unwrap();
+
+        // Holding the stream's synchronous storage lock creates the same blocking point that a
+        // slow filesystem operation would expose to the local engine. The Engine adapter must
+        // wait for it on a blocking worker, leaving this current-thread runtime responsive.
+        let stream = broker.get_stream("events").unwrap();
+        let storage_started = Arc::new(tokio::sync::Notify::new());
+        let (release_sender, release_receiver) = std::sync::mpsc::channel();
+        let blocked_stream = Arc::clone(&stream);
+        let storage_started_thread = Arc::clone(&storage_started);
+        let blocker = thread::spawn(move || {
+            let _stream_guard = blocked_stream.lock().unwrap();
+            storage_started_thread.notify_one();
+            release_receiver
+                .recv()
+                .expect("storage lock should be released by the test");
+        });
+        storage_started.notified().await;
+        let executor = Arc::clone(&broker.inner.storage_executor);
+        let publish = tokio::spawn({
+            let broker = broker.clone();
+            async move { Engine::publish(&broker, "events", None, b"payload".to_vec(), None).await }
+        });
+        while executor.execution_permits.available_permits() == DEFAULT_STORAGE_EXECUTOR_CAPACITY {
+            tokio::task::yield_now().await;
+        }
+
+        let unrelated = tokio::spawn(async { 42_u8 });
+        assert_eq!(unrelated.await.unwrap(), 42);
+        release_sender.send(()).unwrap();
+
+        assert_eq!(publish.await.unwrap().unwrap(), 0);
+        blocker.join().unwrap();
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
