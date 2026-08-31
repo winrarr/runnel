@@ -5,7 +5,10 @@ use std::process::{Child, Command, Stdio};
 use std::thread::sleep;
 use std::time::{Duration, Instant};
 
-use runnel_protocol::{Request, Response};
+use runnel_protocol::{
+    BinaryPayload, MAX_PUBLISH_BATCH_RECORDS, PublishBatchRecord, PublishBatchRecordResponse,
+    Request, Response,
+};
 use tempfile::TempDir;
 
 struct RunningServer {
@@ -708,6 +711,160 @@ fn network_protocol_reassigns_group_delivery_after_restart() {
             already_acknowledged: false,
             ..
         }
+    ));
+}
+
+#[test]
+fn network_protocol_recovers_binary_publish_batch_and_request_ids() {
+    let directory = TempDir::new().unwrap();
+    let server = RunningServer::start(directory.path());
+
+    assert!(matches!(
+        request(
+            server.broker_addr,
+            Request::PublishBatch {
+                stream: "events".to_owned(),
+                records: vec![
+                    PublishBatchRecord {
+                        key: Some("order-1".to_owned()),
+                        payload_base64: BinaryPayload::new(vec![0, 1, 255]),
+                        request_id: Some("batch-1".to_owned()),
+                    },
+                    PublishBatchRecord {
+                        key: None,
+                        payload_base64: BinaryPayload::new(b"second".to_vec()),
+                        request_id: Some("batch-2".to_owned()),
+                    },
+                ],
+            },
+        ),
+        Response::PublishBatch { outcomes, .. }
+            if matches!(outcomes.as_slice(), [
+                PublishBatchRecordResponse::Published { offset: 0 },
+                PublishBatchRecordResponse::Published { offset: 1 },
+            ])
+    ));
+    server.stop();
+
+    let server = RunningServer::start(directory.path());
+    assert!(matches!(
+        request(
+            server.broker_addr,
+            Request::PublishBatch {
+                stream: "events".to_owned(),
+                records: vec![
+                    PublishBatchRecord {
+                        key: Some("different-key".to_owned()),
+                        payload_base64: BinaryPayload::new(b"different".to_vec()),
+                        request_id: Some("batch-1".to_owned()),
+                    },
+                    PublishBatchRecord {
+                        key: None,
+                        payload_base64: BinaryPayload::new(b"different".to_vec()),
+                        request_id: Some("batch-2".to_owned()),
+                    },
+                ],
+            },
+        ),
+        Response::PublishBatch { outcomes, .. }
+            if matches!(outcomes.as_slice(), [
+                PublishBatchRecordResponse::Published { offset: 0 },
+                PublishBatchRecordResponse::Published { offset: 1 },
+            ])
+    ));
+    assert!(matches!(
+        request(
+            server.broker_addr,
+            Request::Poll {
+                stream: "events".to_owned(),
+                consumer: "worker".to_owned(),
+            },
+        ),
+        Response::MessageBytes {
+            offset: 0,
+            payload_base64,
+            ..
+        } if payload_base64.as_bytes() == [0, 1, 255]
+    ));
+    assert!(matches!(
+        request(
+            server.broker_addr,
+            Request::Ack {
+                stream: "events".to_owned(),
+                consumer: "worker".to_owned(),
+                offset: 0,
+            },
+        ),
+        Response::Acknowledged { .. }
+    ));
+    assert!(matches!(
+        request(
+            server.broker_addr,
+            Request::Poll {
+                stream: "events".to_owned(),
+                consumer: "worker".to_owned(),
+            },
+        ),
+        Response::Message {
+            offset: 1,
+            payload,
+            ..
+        } if payload == "second"
+    ));
+}
+
+#[test]
+fn network_protocol_rejects_publish_batches_over_record_bound() {
+    let directory = TempDir::new().unwrap();
+    let server = RunningServer::start(directory.path());
+    let records = (0..=MAX_PUBLISH_BATCH_RECORDS)
+        .map(|_| PublishBatchRecord {
+            key: None,
+            payload_base64: BinaryPayload::new(Vec::new()),
+            request_id: None,
+        })
+        .collect();
+    assert!(matches!(
+        request(
+            server.broker_addr,
+            Request::PublishBatch {
+                stream: "events".to_owned(),
+                records,
+            },
+        ),
+        Response::Error { code, message }
+            if code == "invalid_request" && message.contains("more than")
+    ));
+}
+
+#[test]
+fn network_protocol_returns_partial_publish_batch_outcomes() {
+    let directory = TempDir::new().unwrap();
+    let server = RunningServer::start(directory.path());
+    assert!(matches!(
+        request(
+            server.broker_addr,
+            Request::PublishBatch {
+                stream: "events".to_owned(),
+                records: vec![
+                    PublishBatchRecord {
+                        key: None,
+                        payload_base64: BinaryPayload::new(b"rejected".to_vec()),
+                        request_id: Some("x".repeat(1_025)),
+                    },
+                    PublishBatchRecord {
+                        key: None,
+                        payload_base64: BinaryPayload::new(b"accepted".to_vec()),
+                        request_id: Some("accepted".to_owned()),
+                    },
+                ],
+            },
+        ),
+        Response::PublishBatch { outcomes, .. }
+            if matches!(outcomes.as_slice(), [
+                PublishBatchRecordResponse::Error { code, .. },
+                PublishBatchRecordResponse::Published { offset: 0 },
+            ] if code == "invalid_record")
     ));
 }
 

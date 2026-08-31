@@ -8,7 +8,7 @@ use criterion::{
     BatchSize, BenchmarkGroup, BenchmarkId, Criterion, Throughput, criterion_group, criterion_main,
 };
 use runnel_core::{Broker, BrokerConfig, PollResult};
-use runnel_engine::Engine;
+use runnel_engine::{Engine, PublishRecord};
 use std::sync::{Arc, Barrier};
 use std::thread;
 use tempfile::TempDir;
@@ -22,6 +22,7 @@ const RECOVERY_RETAINED_MESSAGE_COUNTS: &[u64] = &[100, 1_000, 5_000, 20_000];
 const BOUNDED_INDEX_RETAINED_MESSAGE_COUNTS: &[u64] = &[65_537, 131_072];
 const BOUNDED_INDEX_COLD_OFFSET: u64 = 1_024;
 const SHARED_UNACKED_MEMBER_COUNT: u64 = 64;
+const PUBLISH_BATCH_RECORD_COUNT: u64 = 32;
 
 fn configured_group<'a, M: Measurement>(
     criterion: &'a mut Criterion<M>,
@@ -90,6 +91,27 @@ fn durable_publish(c: &mut Criterion) {
                 for _ in 0..MESSAGE_COUNT {
                     black_box(broker.publish("bench", None, PAYLOAD.to_vec()).unwrap());
                 }
+            },
+            BatchSize::SmallInput,
+        );
+    });
+    group.finish();
+}
+
+fn durable_publish_batch(c: &mut Criterion) {
+    let mut group = message_group(c, "durable_publish_batch", PUBLISH_BATCH_RECORD_COUNT, 20);
+    group.bench_function("100-byte_messages", |benchmark| {
+        benchmark.iter_batched(
+            open_broker,
+            |(_directory, broker)| {
+                let records = (0..PUBLISH_BATCH_RECORD_COUNT)
+                    .map(|_| PublishRecord {
+                        key: None,
+                        payload: PAYLOAD.to_vec(),
+                        request_id: None,
+                    })
+                    .collect();
+                black_box(broker.publish_batch("bench", records).unwrap());
             },
             BatchSize::SmallInput,
         );
@@ -508,6 +530,7 @@ fn grouped_delivery(result: PollResult) -> (u64, String) {
 criterion_group!(
     benches,
     durable_publish,
+    durable_publish_batch,
     async_engine_publish,
     publish_poll_ack,
     shared_consumer_poll_ack,

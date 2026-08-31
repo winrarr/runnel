@@ -1,6 +1,47 @@
 use std::time::Duration;
 
-use runnel_engine::{AckResult, BrokerError, Engine, PollResult};
+use runnel_engine::{AckResult, BrokerError, Engine, PollResult, PublishRecord};
+
+pub async fn assert_publish_batch_contract(engine: &dyn Engine) {
+    assert!(engine.create_stream("contract.batch").await.unwrap());
+    let records = vec![
+        PublishRecord {
+            key: Some("order-a".to_owned()),
+            payload: b"first".to_vec(),
+            request_id: Some("batch-first".to_owned()),
+        },
+        PublishRecord {
+            key: Some("order-a".to_owned()),
+            payload: vec![0, 1, 255],
+            request_id: Some("batch-second".to_owned()),
+        },
+        PublishRecord {
+            key: None,
+            payload: b"third".to_vec(),
+            request_id: None,
+        },
+    ];
+    assert_eq!(
+        engine
+            .publish_batch("contract.batch", records.clone())
+            .await
+            .unwrap()
+            .into_iter()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap(),
+        vec![0, 1, 2]
+    );
+    assert_eq!(
+        engine
+            .publish_batch("contract.batch", records[..2].to_vec())
+            .await
+            .unwrap()
+            .into_iter()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap(),
+        vec![0, 1]
+    );
+}
 
 pub async fn assert_shared_delivery_contract(engine: &dyn Engine) {
     assert!(engine.create_stream("contract.work").await.unwrap());

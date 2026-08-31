@@ -8,7 +8,9 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 #[cfg(feature = "instrumentation")]
 use runnel_engine::StageTimer;
-use runnel_engine::{Engine, EngineFuture};
+use runnel_engine::{
+    Engine, EngineFuture, MAX_PUBLISH_BATCH_RECORDS, PublishRecord, PublishRecordOutcome,
+};
 use serde::{Deserialize, Serialize};
 use tokio::sync::Semaphore;
 
@@ -448,6 +450,24 @@ impl Broker {
         }
     }
 
+    pub fn publish_batch(
+        &self,
+        stream: &str,
+        records: Vec<PublishRecord>,
+    ) -> Result<Vec<PublishRecordOutcome>, BrokerError> {
+        #[cfg(feature = "instrumentation")]
+        let _stage_timer = StageTimer::new("core.publish_batch");
+        if records.len() > MAX_PUBLISH_BATCH_RECORDS {
+            return Err(BrokerError::Configuration(format!(
+                "publish batch contains more than {MAX_PUBLISH_BATCH_RECORDS} records"
+            )));
+        }
+        validate_name("stream", stream)?;
+        let stream_state = self.get_or_create_stream(stream)?;
+        let mut stream_state = self.lock_stream(&stream_state)?;
+        stream_state.log.append_batch(records)
+    }
+
     pub fn poll(&self, stream: &str, consumer: &str) -> Result<PollResult, BrokerError> {
         self.poll_group(stream, consumer, consumer)
     }
@@ -743,6 +763,17 @@ impl Engine for Broker {
             .dispatch(move || broker.publish_with_request_id(&stream, key, payload, request_id))
     }
 
+    fn publish_batch<'a>(
+        &'a self,
+        stream: &'a str,
+        records: Vec<PublishRecord>,
+    ) -> EngineFuture<'a, Vec<PublishRecordOutcome>> {
+        let broker = self.clone();
+        let stream = stream.to_owned();
+        Arc::clone(&self.inner.storage_executor)
+            .dispatch(move || broker.publish_batch(&stream, records))
+    }
+
     fn poll<'a>(&'a self, stream: &'a str, consumer: &'a str) -> EngineFuture<'a, PollResult> {
         let broker = self.clone();
         let stream = stream.to_owned();
@@ -853,10 +884,19 @@ impl StreamLog {
     }
 
     fn append(&mut self, key: Option<String>, payload: Vec<u8>) -> Result<Offset, BrokerError> {
+        self.append_with_sync(key, payload, true)
+    }
+
+    fn append_with_sync(
+        &mut self,
+        key: Option<String>,
+        payload: Vec<u8>,
+        sync: bool,
+    ) -> Result<Offset, BrokerError> {
         #[cfg(feature = "instrumentation")]
         let _stage_timer = StageTimer::new("core.storage_append");
         if self.durable_format == DurableFormat::VersionedV1 {
-            return self.append_versioned(key, payload);
+            return self.append_versioned_with_sync(key, payload, sync);
         }
 
         let key_bytes = key.as_deref().unwrap_or_default().as_bytes();
@@ -885,7 +925,9 @@ impl StreamLog {
         self.file.write_all(&header)?;
         self.file.write_all(key_bytes)?;
         self.file.write_all(&payload)?;
-        self.file.sync_data()?;
+        if sync {
+            self.file.sync_data()?;
+        }
 
         let payload_offset = self.file.stream_position()? - payload.len() as u64;
         let record_cursor = payload_offset - key_bytes.len() as u64 - LEGACY_HEADER_LEN as u64;
@@ -905,10 +947,11 @@ impl StreamLog {
         Ok(offset)
     }
 
-    fn append_versioned(
+    fn append_versioned_with_sync(
         &mut self,
         key: Option<String>,
         payload: Vec<u8>,
+        sync: bool,
     ) -> Result<Offset, BrokerError> {
         let key_bytes = key.as_deref().unwrap_or_default().as_bytes();
         let key_len = u32::try_from(key_bytes.len()).map_err(|_| {
@@ -955,7 +998,9 @@ impl StreamLog {
         self.file.write_all(&header)?;
         self.file.write_all(key_bytes)?;
         self.file.write_all(&payload)?;
-        self.file.sync_data()?;
+        if sync {
+            self.file.sync_data()?;
+        }
 
         let payload_offset = self.file.stream_position()? - payload.len() as u64;
         let record_cursor = payload_offset - key_bytes.len() as u64 - VERSIONED_HEADER_LEN as u64;
@@ -980,6 +1025,16 @@ impl StreamLog {
         key: Option<String>,
         payload: Vec<u8>,
         request_id: String,
+    ) -> Result<Offset, BrokerError> {
+        self.append_with_request_id_sync(key, payload, request_id, true)
+    }
+
+    fn append_with_request_id_sync(
+        &mut self,
+        key: Option<String>,
+        payload: Vec<u8>,
+        request_id: String,
+        sync: bool,
     ) -> Result<Offset, BrokerError> {
         let limits = request_aware_limits(self.durable_format);
         let key_bytes = key.as_deref().unwrap_or_default().as_bytes();
@@ -1039,7 +1094,9 @@ impl StreamLog {
         self.file.write_all(key_bytes)?;
         self.file.write_all(request_id_bytes)?;
         self.file.write_all(&payload)?;
-        self.file.sync_data()?;
+        if sync {
+            self.file.sync_data()?;
+        }
 
         let payload_offset = self.file.stream_position()? - payload.len() as u64;
         let record_cursor = payload_offset
@@ -1061,6 +1118,48 @@ impl StreamLog {
         self.request_ids.insert(request_id, offset);
         self.next_offset = offset.saturating_add(1);
         Ok(offset)
+    }
+
+    fn append_batch(
+        &mut self,
+        records: Vec<PublishRecord>,
+    ) -> Result<Vec<PublishRecordOutcome>, BrokerError> {
+        let mut outcomes = Vec::with_capacity(records.len());
+        let mut appended = false;
+
+        for PublishRecord {
+            key,
+            payload,
+            request_id,
+        } in records
+        {
+            if let Some(request_id) = request_id.as_ref()
+                && let Some(offset) = self.request_ids.get(request_id)
+            {
+                outcomes.push(Ok(*offset));
+                continue;
+            }
+
+            let outcome = match request_id {
+                Some(request_id) => {
+                    self.append_with_request_id_sync(key, payload, request_id, false)
+                }
+                None => self.append_with_sync(key, payload, false),
+            };
+            match outcome {
+                Ok(offset) => {
+                    appended = true;
+                    outcomes.push(Ok(offset));
+                }
+                Err(error) if is_invalid_input(&error) => outcomes.push(Err(error)),
+                Err(error) => return Err(error),
+            }
+        }
+
+        if appended {
+            self.file.sync_data()?;
+        }
+        Ok(outcomes)
     }
 
     fn read_message(&mut self, stream: &str, offset: Offset) -> Result<Message, BrokerError> {
@@ -1663,6 +1762,13 @@ fn validate_name(kind: &'static str, name: &str) -> Result<(), BrokerError> {
         kind,
         name: name.to_owned(),
     })
+}
+
+fn is_invalid_input(error: &BrokerError) -> bool {
+    matches!(
+        error,
+        BrokerError::Io(io_error) if io_error.kind() == io::ErrorKind::InvalidInput
+    )
 }
 
 fn now_ms() -> u64 {
