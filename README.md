@@ -102,7 +102,7 @@ When multiple local processes, containers, or test suites need to run at the sam
 
 The test suite includes core persistence and recovery tests, wire-format round-trip tests, and a network-level test that starts the real broker process and verifies acknowledgement state across restart. `just smoke` is the canonical local end-to-end test: it starts the broker itself and uses `runnelctl` to publish, consume, acknowledge, restart, and verify recovery. See [docs/testing.md](docs/testing.md) for the interactive walkthrough and test layers.
 
-Benchmark workflows and interpretation are documented in [docs/benchmarking.md](docs/benchmarking.md). See [scripts/benchmarks/README.md](scripts/benchmarks/README.md) for harness semantics and comparison limitations.
+Benchmark workflows and interpretation are documented in [docs/benchmarking.md](docs/benchmarking.md). See [scripts/benchmarks2/README.md](scripts/benchmarks2/README.md) for harness semantics and comparison limitations.
 
 The current protocol accepts one JSON request per TCP line. For example:
 

@@ -88,7 +88,7 @@ class BenchmarkTarget:
 
     @property
     def script(self) -> Path:
-        return self.root / "scripts" / "benchmarks" / "cluster.py"
+        return self.root / "scripts" / "benchmarks2" / "cluster.py"
 
 
 def git(*arguments: str, cwd: Path = ROOT) -> subprocess.CompletedProcess[str]:
@@ -212,7 +212,7 @@ def run_benchmark(
 def normalize(raw: Path, normalized: Path, root: Path) -> None:
     command = [
         sys.executable,
-        str(root / "scripts" / "benchmarks" / "normalize.py"),
+        str(root / "scripts" / "benchmarks2" / "normalize.py"),
         "--input",
         str(raw),
         "--output",
@@ -224,7 +224,7 @@ def normalize(raw: Path, normalized: Path, root: Path) -> None:
 def aggregate(inputs: list[Path], output: Path) -> dict[str, object]:
     command = [
         sys.executable,
-        str(ROOT / "scripts" / "benchmarks" / "aggregate.py"),
+        str(ROOT / "scripts" / "benchmarks2" / "aggregate.py"),
         "--inputs",
         *(str(path) for path in inputs),
         "--output",

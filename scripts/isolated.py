@@ -24,7 +24,7 @@ import uuid
 from dataclasses import dataclass
 from pathlib import Path
 
-from benchmarks.lock import lock_command
+from benchmarks2.lock import lock_command
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -124,7 +124,7 @@ def cluster_command(
     """Build the native or container clustered benchmark command."""
     artifact = isolation.artifact_dir
     target_dir = Path(os.environ.get("CARGO_TARGET_DIR", str(isolation.target_dir)))
-    command = ["python3", "scripts/benchmarks/cluster.py"]
+    command = ["python3", "scripts/benchmarks2/cluster.py"]
     if runtime == "process":
         command.extend(
             [
@@ -196,7 +196,7 @@ def command_for(workflow: str, isolation: Isolation) -> list[str]:
     if workflow == "bench-container":
         return [
             "python3",
-            "scripts/benchmarks/run.py",
+            "scripts/benchmarks2/run.py",
             "--build",
             "--image",
             isolation.image,
@@ -206,7 +206,7 @@ def command_for(workflow: str, isolation: Isolation) -> list[str]:
     if workflow == "bench-container-smoke":
         return [
             "python3",
-            "scripts/benchmarks/run.py",
+            "scripts/benchmarks2/run.py",
             "--image",
             "runnel:dev",
             "--messages",
@@ -233,7 +233,7 @@ def command_for(workflow: str, isolation: Isolation) -> list[str]:
         binary = target_dir / "release" / "runnel"
         return [
             "python3",
-            "scripts/benchmarks/profile.py",
+            "scripts/benchmarks2/profile.py",
             "--build",
             "--binary",
             str(binary),
@@ -243,7 +243,7 @@ def command_for(workflow: str, isolation: Isolation) -> list[str]:
     if workflow == "bench-compare":
         return [
             "python3",
-            "scripts/benchmarks/compare.py",
+            "scripts/benchmarks2/compare.py",
             "--build-runnel",
             "--runnel-image",
             isolation.image,

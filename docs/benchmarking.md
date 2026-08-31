@@ -1,6 +1,6 @@
 # Benchmarking and performance evidence
 
-This document is the shared policy for deciding when to benchmark, interpreting benchmark results, and reporting performance evidence. The `justfile` and benchmark scripts define executable behavior; [scripts/benchmarks/README.md](../scripts/benchmarks/README.md) documents workload and harness details.
+This document is the shared policy for deciding when to benchmark, interpreting benchmark results, and reporting performance evidence. The `justfile` and benchmark scripts define executable behavior; [scripts/benchmarks2/README.md](../scripts/benchmarks2/README.md) documents workload and harness details.
 
 ## When to benchmark
 

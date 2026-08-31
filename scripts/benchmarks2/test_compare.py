@@ -76,7 +76,7 @@ class ComparisonBenchmarkTests(unittest.TestCase):
 
     def test_source_metadata_uses_ci_identity_when_available(self) -> None:
         with (
-            patch.object(compare, "git_revision", return_value="abc123"),
+            patch("common.git_revision", return_value="abc123"),
             patch.dict(
                 compare.os.environ,
                 {

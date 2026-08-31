@@ -297,14 +297,69 @@ def git_revision(*, short: bool = True, cwd: Path = ROOT) -> str:
     return result.stdout.strip() if result.returncode == 0 and result.stdout.strip() else "unknown"
 
 
-def host_metadata() -> dict[str, Any]:
-    """Return host fields shared by the single-node and cluster artifacts."""
+def source_metadata(*, full_revision: bool = False) -> dict[str, Any]:
+    """Capture source-control and CI identity shared by benchmark artifacts."""
+    repository = os.environ.get("GITHUB_REPOSITORY")
+    workflow_run_id = os.environ.get("GITHUB_RUN_ID")
+    server_url = os.environ.get("GITHUB_SERVER_URL", "https://github.com")
+    run_url = (
+        f"{server_url}/{repository}/actions/runs/{workflow_run_id}"
+        if repository and workflow_run_id
+        else None
+    )
+    revision = git_revision(short=not full_revision)
+    if full_revision:
+        revision = os.environ.get("GITHUB_SHA") or revision
     return {
+        "repository": repository or "local",
+        "revision": revision,
+        "ref": os.environ.get("GITHUB_REF_NAME")
+        or os.environ.get("GITHUB_REF", "local"),
+        "event": os.environ.get("GITHUB_EVENT_NAME", "local"),
+        "workflow": os.environ.get("GITHUB_WORKFLOW", "local"),
+        "run_id": workflow_run_id,
+        "run_url": run_url,
+        "profile": os.environ.get("BENCHMARK_PROFILE", "local"),
+    }
+
+
+def environment_metadata(*, cpu_key: str = "cpus", docker: bool = False) -> dict[str, Any]:
+    """Capture host details, preserving the key shape required by each artifact."""
+    metadata: dict[str, Any] = {
+        "host": platform.node() or "unknown",
         "platform": platform.platform(),
         "processor": platform.processor(),
         "python": platform.python_version(),
-        "cpus": os.cpu_count(),
+        cpu_key: os.cpu_count(),
     }
+    if docker:
+        version = docker_server_version()
+        if version:
+            metadata["docker_server"] = version
+    return metadata
+
+
+def docker_server_version() -> str | None:
+    result = subprocess.run(
+        ["docker", "version", "--format", "{{.Server.Version}}"],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    version = result.stdout.strip()
+    return version or None
+
+
+def build_image(image: str) -> None:
+    """Build the repository image used by container benchmark entrypoints."""
+    subprocess.run(["docker", "build", "--tag", image, str(ROOT)], check=True)
+
+
+def host_metadata() -> dict[str, Any]:
+    """Return host fields shared by the single-node and cluster artifacts."""
+    metadata = environment_metadata()
+    metadata.pop("host", None)
+    return metadata
 
 
 def write_json_result(output: Path, result: dict[str, Any]) -> None:

@@ -31,6 +31,7 @@ from common import (
     LineClient,
     ROOT,
     acknowledge,
+    build_image,
     consume_ack_messages,
     create_stream,
     default_binary,
@@ -669,10 +670,6 @@ def build_binary(binary: Path, *, features: str | None = None) -> None:
         raise BenchmarkError(f"release build did not produce {binary}")
 
 
-def build_image(image: str) -> None:
-    subprocess.run(["docker", "build", "--tag", image, str(ROOT)], check=True)
-
-
 def resource_limits(
     *, runtime: str, cpus: str, memory: str
 ) -> dict[str, str]:
@@ -827,7 +824,7 @@ def main() -> int:
                 "acknowledgement": "durable quorum commit",
                 "replication": f"{args.nodes}-node static Multi-Raft",
                 "measurement_boundary": "public line-delimited JSON protocol",
-                "measurement_client": "scripts/benchmarks/cluster.py",
+                "measurement_client": "scripts/benchmarks2/cluster.py",
                 "startup_seconds": startup_seconds,
                 "resource_samples": cluster.stats.summary(),
                 "scenarios": scenarios,

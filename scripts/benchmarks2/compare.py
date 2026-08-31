@@ -13,7 +13,6 @@ from __future__ import annotations
 import argparse
 import json
 import os
-import platform
 import re
 import subprocess
 import sys
@@ -23,7 +22,13 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Callable
 
-from common import ROOT, git_revision, parse_sizes, write_json_result
+from common import (
+    ROOT,
+    environment_metadata,
+    parse_sizes,
+    source_metadata,
+    write_json_result,
+)
 from runtime import DockerContainer, MeasuredContainer, create_network, inspect_image, remove_network
 
 
@@ -241,40 +246,6 @@ def benchmark_suite(nodes: int, backends: list[str]) -> str:
     if backends == ["runnel"]:
         return "runnel"
     return "native-comparison"
-
-
-def source_metadata() -> dict[str, Any]:
-    """Capture source-control and CI identity in the raw result."""
-    repository = os.environ.get("GITHUB_REPOSITORY")
-    workflow_run_id = os.environ.get("GITHUB_RUN_ID")
-    server_url = os.environ.get("GITHUB_SERVER_URL", "https://github.com")
-    run_url = (
-        f"{server_url}/{repository}/actions/runs/{workflow_run_id}"
-        if repository and workflow_run_id
-        else None
-    )
-    return {
-        "repository": repository or "local",
-        "revision": git_revision(),
-        "ref": os.environ.get("GITHUB_REF_NAME")
-        or os.environ.get("GITHUB_REF", "local"),
-        "event": os.environ.get("GITHUB_EVENT_NAME", "local"),
-        "workflow": os.environ.get("GITHUB_WORKFLOW", "local"),
-        "run_id": workflow_run_id,
-        "run_url": run_url,
-        "profile": os.environ.get("BENCHMARK_PROFILE", "local"),
-    }
-
-
-def environment_metadata() -> dict[str, Any]:
-    """Capture host details needed to interpret resource measurements."""
-    return {
-        "host": platform.node() or "unknown",
-        "platform": platform.platform(),
-        "processor": platform.processor(),
-        "python": platform.python_version(),
-        "cpus": os.cpu_count(),
-    }
 
 
 def run_metadata(run_id: str) -> dict[str, Any]:

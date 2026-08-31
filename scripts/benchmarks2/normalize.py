@@ -10,74 +10,15 @@ from __future__ import annotations
 
 import argparse
 import json
-import os
-import platform
-import subprocess
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
-
-ROOT = Path(__file__).resolve().parents[2]
+from common import environment_metadata, source_metadata
 
 
 class NormalizationError(RuntimeError):
     """The comparison result does not have the expected shape."""
-
-
-def git_revision() -> str:
-    revision = os.environ.get("GITHUB_SHA")
-    if revision:
-        return revision
-    result = subprocess.run(
-        ["git", "rev-parse", "HEAD"],
-        cwd=ROOT,
-        capture_output=True,
-        text=True,
-        check=False,
-    )
-    return result.stdout.strip() or "unknown"
-
-
-def docker_server_version() -> str | None:
-    result = subprocess.run(
-        ["docker", "version", "--format", "{{.Server.Version}}"],
-        capture_output=True,
-        text=True,
-        check=False,
-    )
-    version = result.stdout.strip()
-    return version or None
-
-
-def source_metadata() -> dict[str, Any]:
-    repository = os.environ.get("GITHUB_REPOSITORY")
-    run_id = os.environ.get("GITHUB_RUN_ID")
-    server_url = os.environ.get("GITHUB_SERVER_URL", "https://github.com")
-    run_url = f"{server_url}/{repository}/actions/runs/{run_id}" if repository and run_id else None
-    return {
-        "repository": repository or "local",
-        "revision": git_revision(),
-        "ref": os.environ.get("GITHUB_REF_NAME") or os.environ.get("GITHUB_REF", "local"),
-        "event": os.environ.get("GITHUB_EVENT_NAME", "local"),
-        "workflow": os.environ.get("GITHUB_WORKFLOW", "local"),
-        "run_id": run_id,
-        "run_url": run_url,
-        "profile": os.environ.get("BENCHMARK_PROFILE", "local"),
-    }
-
-
-def environment_metadata() -> dict[str, Any]:
-    metadata: dict[str, Any] = {
-        "host": platform.node() or "unknown",
-        "platform": platform.platform(),
-        "python": platform.python_version(),
-        "cpu_count": os.cpu_count(),
-    }
-    docker_version = docker_server_version()
-    if docker_version:
-        metadata["docker_server"] = docker_version
-    return metadata
 
 
 def benchmark_suite(result: dict[str, Any]) -> str:
@@ -161,8 +102,8 @@ def normalize_result(result: dict[str, Any], *, source_name: str = "comparison")
     return {
         "history_schema_version": 1,
         "generated_at": generated_at,
-        "source": source_metadata(),
-        "environment": environment_metadata(),
+        "source": source_metadata(full_revision=True),
+        "environment": environment_metadata(cpu_key="cpu_count", docker=True),
         "comparison_mode": result.get("comparison_mode"),
         "benchmark_suite": benchmark_suite(result),
         "resource_limits": result.get("resource_limits", {}),

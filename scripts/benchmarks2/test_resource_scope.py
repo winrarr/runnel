@@ -12,7 +12,7 @@ from resource_scope import ResourceScopeError, resource_limits, resource_scope_c
 class ResourceScopeTests(unittest.TestCase):
     def test_builds_explicit_cpu_and_memory_scope(self) -> None:
         command = resource_scope_command(
-            ["python3", "scripts/benchmarks/cluster.py"],
+            ["python3", "scripts/benchmarks2/cluster.py"],
             unit="runnel-benchmark-test-1",
             cpus="2",
             memory="2g",
@@ -21,7 +21,7 @@ class ResourceScopeTests(unittest.TestCase):
         self.assertEqual(command[:4], ["systemd-run", "--user", "--scope", "--collect"])
         self.assertIn("--property=CPUQuota=200%", command)
         self.assertIn("--property=MemoryMax=2G", command)
-        self.assertEqual(command[-2:], ["python3", "scripts/benchmarks/cluster.py"])
+        self.assertEqual(command[-2:], ["python3", "scripts/benchmarks2/cluster.py"])
 
     def test_records_scope_provenance(self) -> None:
         self.assertEqual(

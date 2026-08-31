@@ -48,7 +48,7 @@ jobs:
             if [ "$repetition" -eq 1 ]; then
               build_args+=(--build-runnel)
             fi
-            python3 scripts/benchmarks/compare.py \
+            python3 scripts/benchmarks2/compare.py \
               "${build_args[@]}" \
               --backends runnel \
               --runnel-image runnel:bench \
@@ -57,11 +57,11 @@ jobs:
               --cpus 2 \
               --memory 2g \
               --output "benchmark-results/raw/runnel-${repetition}.json"
-            python3 scripts/benchmarks/normalize.py \
+            python3 scripts/benchmarks2/normalize.py \
               --input "benchmark-results/raw/runnel-${repetition}.json" \
               --output "benchmark-results/normalized/runnel-repetition-${repetition}.json"
           done
-          python3 scripts/benchmarks/aggregate.py \
+          python3 scripts/benchmarks2/aggregate.py \
             --inputs benchmark-results/normalized/runnel-repetition-*.json \
             --output benchmark-results/normalized/runnel-aggregate.json
       - name: Run clustered Runnel repetitions
@@ -73,7 +73,7 @@ jobs:
             if [ "$repetition" -eq 1 ]; then
               build_args+=(--build)
             fi
-            python3 scripts/benchmarks/cluster.py \
+            python3 scripts/benchmarks2/cluster.py \
               "${build_args[@]}" \
               --binary target/release/runnel \
               --messages "$BENCHMARK_CLUSTER_MESSAGES" \
@@ -82,11 +82,11 @@ jobs:
               --payload-sizes 100,1024 \
               --output "benchmark-results/raw/cluster-${repetition}.json" \
               --log-dir "benchmark-results/logs/cluster-${repetition}"
-            python3 scripts/benchmarks/normalize.py \
+            python3 scripts/benchmarks2/normalize.py \
               --input "benchmark-results/raw/cluster-${repetition}.json" \
               --output "benchmark-results/normalized/cluster-repetition-${repetition}.json"
           done
-          python3 scripts/benchmarks/aggregate.py \
+          python3 scripts/benchmarks2/aggregate.py \
             --inputs benchmark-results/normalized/cluster-repetition-*.json \
             --output benchmark-results/normalized/cluster-aggregate.json
       - name: Upload raw and aggregated results
@@ -136,7 +136,7 @@ jobs:
             suite=$(basename "$result" -aggregate.json)
             cp "$result" "history/runs/${run_timestamp}-${short_sha}-${suite}.json"
           done
-          python3 scripts/benchmarks/build_history.py \
+          python3 scripts/benchmarks2/build_history.py \
             --runs history/runs \
             --output history/site
           git -C history add runs site
