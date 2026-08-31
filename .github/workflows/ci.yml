@@ -29,7 +29,7 @@ jobs:
       - run: just verify
 
   integration:
-    name: Integration and container benchmark smoke tests
+    name: Integration and container smoke tests
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     needs: verify
