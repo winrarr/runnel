@@ -255,7 +255,7 @@ fn partial_request_times_out_and_unrelated_health_recovers() {
 }
 
 #[test]
-fn slow_writer_is_bounded_and_independent_traffic_continues() {
+fn slow_writer_and_in_flight_admission_are_bounded() {
     let directory = TempDir::new().unwrap();
     let server = RunningServer::start(
         directory.path(),
@@ -265,7 +265,7 @@ fn slow_writer_is_bounded_and_independent_traffic_continues() {
             "--request-timeout-ms",
             "500",
             "--max-in-flight-requests",
-            "2",
+            "1",
         ],
     );
     let payload = "x".repeat(6 * 1024 * 1024);
@@ -295,6 +295,10 @@ fn slow_writer_is_bounded_and_independent_traffic_continues() {
     let metrics_before = http_metrics(server.http_addr);
     let request_timeouts_before =
         metric_value(&metrics_before, "runnel_broker_request_timeouts_total");
+    let requests_rejected_before =
+        metric_value(&metrics_before, "runnel_broker_requests_rejected_total");
+    let request_saturation_before =
+        metric_value(&metrics_before, "runnel_broker_request_saturation_total");
     let response_write_timeouts_before = metric_value(
         &metrics_before,
         "runnel_broker_response_write_timeouts_total",
@@ -318,6 +322,33 @@ fn slow_writer_is_bounded_and_independent_traffic_continues() {
     let started = Instant::now();
     assert!(matches!(
         request(server.broker_addr, Request::Health),
+        Response::Error { code, .. } if code == "request_saturated"
+    ));
+    assert!(
+        started.elapsed() < Duration::from_secs(1),
+        "a full in-flight budget must reject unrelated work promptly"
+    );
+    let metrics = wait_for_metric_at_least(
+        server.http_addr,
+        "runnel_broker_request_saturation_total",
+        request_saturation_before + 1,
+    );
+    assert_eq!(
+        metric_value(&metrics, "runnel_broker_requests_rejected_total"),
+        requests_rejected_before + 1
+    );
+    assert_eq!(metric_value(&metrics, "runnel_active_requests"), 1);
+
+    let metrics = wait_for_metric_at_least(
+        server.http_addr,
+        "runnel_broker_response_write_timeouts_total",
+        response_write_timeouts_before + 1,
+    );
+    assert_eq!(metric_value(&metrics, "runnel_active_requests"), 0);
+
+    let started = Instant::now();
+    assert!(matches!(
+        request(server.broker_addr, Request::Health),
         Response::Health { .. }
     ));
     assert!(matches!(
@@ -337,11 +368,7 @@ fn slow_writer_is_bounded_and_independent_traffic_continues() {
         "independent health and durable traffic must not wait for a slow response writer"
     );
 
-    let metrics = wait_for_metric_at_least(
-        server.http_addr,
-        "runnel_broker_response_write_timeouts_total",
-        response_write_timeouts_before + 1,
-    );
+    let metrics = http_metrics(server.http_addr);
     assert_eq!(
         metric_value(&metrics, "runnel_broker_request_timeouts_total"),
         request_timeouts_before,
