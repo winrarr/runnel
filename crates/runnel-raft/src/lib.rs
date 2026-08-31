@@ -356,15 +356,6 @@ struct PersistedStream {
 }
 
 impl PersistedStreamData {
-    fn current(state: &StreamState) -> Self {
-        Self::Current(PersistedStream {
-            stream_id: state.stream_id.clone(),
-            group_id: state.group_id.clone(),
-            lifecycle: Some(state.lifecycle.clone()),
-            messages: state.messages.clone(),
-        })
-    }
-
     fn into_state(self, stream: &str) -> StreamState {
         match self {
             Self::Legacy(messages) => {
@@ -382,6 +373,120 @@ impl PersistedStreamData {
                 lifecycle: stream_state.lifecycle.unwrap_or_default(),
                 messages: stream_state.messages,
             },
+        }
+    }
+}
+
+#[derive(Serialize)]
+struct PersistedStreamRef<'a> {
+    stream_id: &'a str,
+    group_id: &'a str,
+    lifecycle: Option<&'a StreamLifecycle>,
+    messages: &'a [StoredMessage],
+}
+
+impl<'a> PersistedStreamRef<'a> {
+    fn current(state: &'a StreamState) -> Self {
+        Self {
+            stream_id: &state.stream_id,
+            group_id: &state.group_id,
+            lifecycle: Some(&state.lifecycle),
+            messages: &state.messages,
+        }
+    }
+}
+
+#[derive(Serialize)]
+struct PersistedConsumerRef<'a> {
+    stream: &'a str,
+    consumer: &'a str,
+    offset: Offset,
+}
+
+#[derive(Serialize)]
+struct PersistedGroupConsumerRef<'a> {
+    stream: &'a str,
+    consumer: &'a str,
+    state: &'a GroupConsumerState,
+}
+
+#[derive(Serialize)]
+struct PersistedStateBodyRef<'a> {
+    streams: BTreeMap<&'a str, PersistedStreamRef<'a>>,
+    consumers: Vec<PersistedConsumerRef<'a>>,
+    group_consumers: Vec<PersistedGroupConsumerRef<'a>>,
+    lease_clock_ms: u64,
+    dedup: &'a BTreeMap<String, BTreeMap<String, Offset>>,
+    redeliveries: u64,
+    dead_letters: u64,
+}
+
+impl<'a> PersistedStateBodyRef<'a> {
+    fn new(state: &'a SnapshotState) -> Self {
+        Self {
+            streams: state
+                .streams
+                .iter()
+                .map(|(stream, state)| (stream.as_str(), PersistedStreamRef::current(state)))
+                .collect(),
+            consumers: state
+                .consumers
+                .iter()
+                .map(|((stream, consumer), offset)| PersistedConsumerRef {
+                    stream,
+                    consumer,
+                    offset: *offset,
+                })
+                .collect(),
+            group_consumers: state
+                .group_consumers
+                .iter()
+                .map(|((stream, consumer), state)| PersistedGroupConsumerRef {
+                    stream,
+                    consumer,
+                    state,
+                })
+                .collect(),
+            lease_clock_ms: state.lease_clock_ms,
+            dedup: &state.dedup,
+            redeliveries: state.redeliveries,
+            dead_letters: state.dead_letters,
+        }
+    }
+}
+
+#[derive(Serialize)]
+struct PersistedSnapshotStateRef<'a> {
+    version: u32,
+    #[serde(flatten)]
+    body: PersistedStateBodyRef<'a>,
+}
+
+impl<'a> PersistedSnapshotStateRef<'a> {
+    fn new(state: &'a SnapshotState) -> Self {
+        Self {
+            version: FORMAT_VERSION,
+            body: PersistedStateBodyRef::new(state),
+        }
+    }
+}
+
+#[derive(Serialize)]
+struct PersistedStateRef<'a> {
+    version: u32,
+    last_applied_log: Option<LogId<NodeId>>,
+    last_membership: &'a StoredMembership<NodeId, BasicNode>,
+    #[serde(flatten)]
+    body: PersistedStateBodyRef<'a>,
+}
+
+impl<'a> PersistedStateRef<'a> {
+    fn new(state: &'a StateMachineData) -> Self {
+        Self {
+            version: FORMAT_VERSION,
+            last_applied_log: state.last_applied_log,
+            last_membership: &state.last_membership,
+            body: PersistedStateBodyRef::new(&state.state),
         }
     }
 }
@@ -644,41 +749,10 @@ impl StateMachineStore {
         let Some(path) = &self.path else {
             return Ok(());
         };
-        let persisted = PersistedState {
-            version: FORMAT_VERSION,
-            last_applied_log: state.last_applied_log,
-            last_membership: state.last_membership.clone(),
-            streams: state
-                .state
-                .streams
-                .iter()
-                .map(|(stream, state)| (stream.clone(), PersistedStreamData::current(state)))
-                .collect(),
-            consumers: state
-                .state
-                .consumers
-                .iter()
-                .map(|((stream, consumer), offset)| PersistedConsumer {
-                    stream: stream.clone(),
-                    consumer: consumer.clone(),
-                    offset: *offset,
-                })
-                .collect(),
-            group_consumers: state
-                .state
-                .group_consumers
-                .iter()
-                .map(|((stream, consumer), state)| PersistedGroupConsumer {
-                    stream: stream.clone(),
-                    consumer: consumer.clone(),
-                    state: state.clone(),
-                })
-                .collect(),
-            lease_clock_ms: state.state.lease_clock_ms,
-            dedup: state.state.dedup.clone(),
-            redeliveries: state.state.redeliveries,
-            dead_letters: state.state.dead_letters,
-        };
+        // Encode borrowed views so checkpointing does not clone every retained message before
+        // serde_json performs the same traversal. The caller holds the state lock while this
+        // function runs, so the checkpoint remains a coherent image of the applied state.
+        let persisted = PersistedStateRef::new(state);
         let bytes = serde_json::to_vec(&persisted)
             .map_err(|error| StorageIOError::write_state_machine(&error))?;
         atomic_write(&path.join("state-machine.json"), &bytes)
@@ -1010,16 +1084,15 @@ impl RaftSnapshotBuilder<TypeConfig> for Arc<StateMachineStore> {
     async fn build_snapshot(&mut self) -> Result<Snapshot<TypeConfig>, StorageError<NodeId>> {
         self.metrics.builds_started.fetch_add(1, Ordering::Relaxed);
         let result = async {
-            let (snapshot_state, last_applied_log, last_membership) = {
+            let (data, last_applied_log, last_membership) = {
                 let state = self.state.read().await;
-                (
-                    persisted_snapshot_state(&state.state),
-                    state.last_applied_log,
-                    state.last_membership.clone(),
-                )
+                // Keep the read guard through encoding so the snapshot is coherent without
+                // materializing a second copy of every retained message.
+                let snapshot_state = PersistedSnapshotStateRef::new(&state.state);
+                let data = serde_json::to_vec(&snapshot_state)
+                    .map_err(|error| StorageIOError::read_state_machine(&error))?;
+                (data, state.last_applied_log, state.last_membership.clone())
             };
-            let data = serde_json::to_vec(&snapshot_state)
-                .map_err(|error| StorageIOError::read_state_machine(&error))?;
             let meta = SnapshotMeta {
                 last_log_id: last_applied_log,
                 last_membership,
@@ -1169,39 +1242,6 @@ impl RaftStateMachine<TypeConfig> for Arc<StateMachineStore> {
             meta: snapshot.meta,
             snapshot: Box::new(Cursor::new(snapshot.data)),
         }))
-    }
-}
-
-fn persisted_snapshot_state(state: &SnapshotState) -> PersistedSnapshotState {
-    PersistedSnapshotState {
-        version: FORMAT_VERSION,
-        streams: state
-            .streams
-            .iter()
-            .map(|(stream, state)| (stream.clone(), PersistedStreamData::current(state)))
-            .collect(),
-        consumers: state
-            .consumers
-            .iter()
-            .map(|((stream, consumer), offset)| PersistedConsumer {
-                stream: stream.clone(),
-                consumer: consumer.clone(),
-                offset: *offset,
-            })
-            .collect(),
-        group_consumers: state
-            .group_consumers
-            .iter()
-            .map(|((stream, consumer), state)| PersistedGroupConsumer {
-                stream: stream.clone(),
-                consumer: consumer.clone(),
-                state: state.clone(),
-            })
-            .collect(),
-        lease_clock_ms: state.lease_clock_ms,
-        dedup: state.dedup.clone(),
-        redeliveries: state.redeliveries,
-        dead_letters: state.dead_letters,
     }
 }
 
@@ -3692,9 +3732,8 @@ mod tests {
     }
 
     fn round_trip_snapshot_state_for_test(state: &SnapshotState) -> SnapshotState {
-        let persisted = persisted_snapshot_state(state);
         let recovered = serde_json::from_slice::<PersistedSnapshotState>(
-            &serde_json::to_vec(&persisted).unwrap(),
+            &serde_json::to_vec(&PersistedSnapshotStateRef::new(state)).unwrap(),
         )
         .unwrap();
         snapshot_state_from_persisted(recovered)
@@ -5001,6 +5040,75 @@ mod tests {
             PollResult::Message(Message { offset: 0, payload, .. })
                 if payload == b"message-0"
         ));
+    }
+
+    #[tokio::test]
+    async fn retained_history_survives_snapshot_install_and_reopen() {
+        const RETAINED_MESSAGES: u64 = 256;
+        let directory = tempfile::tempdir().unwrap();
+        let state_directory = directory.path().join("source-state-machine");
+        let kind = GroupKind::Data {
+            stream: "events".to_owned(),
+            stream_id: "stream/events".to_owned(),
+            group_id: "group/events/data".to_owned(),
+        };
+        let source = Arc::new(StateMachineStore::open(&state_directory, kind.clone()).unwrap());
+        let entries = (0..RETAINED_MESSAGES).map(|index| Entry {
+            log_id: LogId {
+                leader_id: openraft::CommittedLeaderId::new(1, 1),
+                index,
+            },
+            payload: EntryPayload::Normal(Command::Publish {
+                stream: "events".to_owned(),
+                key: None,
+                payload: format!("message-{index}").into_bytes(),
+                published_at_ms: index,
+                request_id: None,
+            }),
+        });
+        let mut source_machine = source.clone();
+        let responses = source_machine.apply(entries).await.unwrap();
+        assert_eq!(responses.len(), RETAINED_MESSAGES as usize);
+
+        let mut snapshot_builder = source.clone();
+        let snapshot = snapshot_builder.build_snapshot().await.unwrap();
+        let snapshot_state =
+            validate_snapshot_data(&snapshot.snapshot.clone().into_inner()).unwrap();
+        let snapshot_messages = match snapshot_state.streams.get("events").unwrap() {
+            PersistedStreamData::Current(stream) => &stream.messages,
+            PersistedStreamData::Legacy(_) => panic!("new snapshots must use current streams"),
+        };
+        assert_eq!(snapshot_messages.len(), RETAINED_MESSAGES as usize);
+        assert_eq!(
+            snapshot_messages.last().unwrap().payload,
+            format!("message-{}", RETAINED_MESSAGES - 1).into_bytes()
+        );
+
+        let installed_directory = directory.path().join("installed-state-machine");
+        let installed =
+            Arc::new(StateMachineStore::open(&installed_directory, kind.clone()).unwrap());
+        let snapshot_meta = snapshot.meta.clone();
+        let snapshot_data = snapshot.snapshot;
+        let mut installed_machine = installed.clone();
+        installed_machine
+            .install_snapshot(&snapshot_meta, snapshot_data)
+            .await
+            .unwrap();
+        drop(installed_machine);
+        drop(installed);
+
+        let reopened_source = StateMachineStore::open(&state_directory, kind.clone()).unwrap();
+        let reopened_installed = StateMachineStore::open(&installed_directory, kind).unwrap();
+        for store in [&reopened_source, &reopened_installed] {
+            let state = store.state.read().await;
+            let messages = &state.state.streams.get("events").unwrap().messages;
+            assert_eq!(messages.len(), RETAINED_MESSAGES as usize);
+            assert_eq!(messages.first().unwrap().payload, b"message-0");
+            assert_eq!(
+                messages.last().unwrap().payload,
+                format!("message-{}", RETAINED_MESSAGES - 1).into_bytes()
+            );
+        }
     }
 
     #[test]
