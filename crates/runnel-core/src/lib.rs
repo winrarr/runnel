@@ -3,7 +3,7 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{Arc, Mutex, RwLock, Weak};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 #[cfg(feature = "instrumentation")]
@@ -108,6 +108,9 @@ struct BrokerState {
 struct StorageExecutor {
     execution_permits: Arc<Semaphore>,
     admission_permits: Arc<Semaphore>,
+    // Weak entries keep transient lane state from growing with one-off requests for unknown
+    // streams. Active and queued operations hold the strong lane reference until they finish.
+    stream_lanes: Mutex<HashMap<String, Weak<Semaphore>>>,
 }
 
 impl StorageExecutor {
@@ -124,10 +127,42 @@ impl StorageExecutor {
             admission_permits: Arc::new(Semaphore::new(
                 execution_capacity.saturating_add(queue_capacity),
             )),
+            stream_lanes: Mutex::new(HashMap::new()),
         }
     }
 
     fn dispatch<T, F>(self: Arc<Self>, operation: F) -> EngineFuture<'static, T>
+    where
+        T: Send + 'static,
+        F: FnOnce() -> Result<T, BrokerError> + Send + 'static,
+    {
+        self.dispatch_with_lane(None, operation)
+    }
+
+    fn dispatch_stream<T, F>(
+        self: Arc<Self>,
+        stream: String,
+        operation: F,
+    ) -> EngineFuture<'static, T>
+    where
+        T: Send + 'static,
+        F: FnOnce(&str) -> Result<T, BrokerError> + Send + 'static,
+    {
+        if let Err(error) = validate_name("stream", &stream) {
+            return Box::pin(async move { Err(error) });
+        }
+        let lane = match self.stream_lane(&stream) {
+            Ok(lane) => lane,
+            Err(error) => return Box::pin(async move { Err(error) }),
+        };
+        self.dispatch_with_lane(Some(lane), move || operation(&stream))
+    }
+
+    fn dispatch_with_lane<T, F>(
+        self: Arc<Self>,
+        stream_lane: Option<Arc<Semaphore>>,
+        operation: F,
+    ) -> EngineFuture<'static, T>
     where
         T: Send + 'static,
         F: FnOnce() -> Result<T, BrokerError> + Send + 'static,
@@ -147,6 +182,12 @@ impl StorageExecutor {
                         "storage execution queue is full",
                     ))
                 })?;
+            let stream_permit = match stream_lane {
+                Some(stream_lane) => Some(stream_lane.acquire_owned().await.map_err(|_| {
+                    BrokerError::Io(io::Error::other("storage stream lane was closed"))
+                })?),
+                None => None,
+            };
             let execution_permit = Arc::clone(&self.execution_permits)
                 .acquire_owned()
                 .await
@@ -155,6 +196,7 @@ impl StorageExecutor {
                 })?;
             tokio::task::spawn_blocking(move || {
                 let _admission_permit = admission_permit;
+                let _stream_permit = stream_permit;
                 let _execution_permit = execution_permit;
                 operation()
             })
@@ -168,6 +210,21 @@ impl StorageExecutor {
                 BrokerError::Io(io::Error::other(message))
             })?
         })
+    }
+
+    fn stream_lane(&self, stream: &str) -> Result<Arc<Semaphore>, BrokerError> {
+        let mut stream_lanes = self
+            .stream_lanes
+            .lock()
+            .map_err(|_| BrokerError::LockPoisoned)?;
+        stream_lanes.retain(|_, lane| lane.upgrade().is_some());
+        if let Some(lane) = stream_lanes.get(stream).and_then(Weak::upgrade) {
+            return Ok(lane);
+        }
+
+        let lane = Arc::new(Semaphore::new(1));
+        stream_lanes.insert(stream.to_owned(), Arc::downgrade(&lane));
+        Ok(lane)
     }
 }
 
@@ -747,7 +804,8 @@ impl Engine for Broker {
     fn create_stream<'a>(&'a self, stream: &'a str) -> EngineFuture<'a, bool> {
         let broker = self.clone();
         let stream = stream.to_owned();
-        Arc::clone(&self.inner.storage_executor).dispatch(move || broker.create_stream(&stream))
+        Arc::clone(&self.inner.storage_executor)
+            .dispatch_stream(stream, move |stream| broker.create_stream(stream))
     }
 
     fn publish<'a>(
@@ -759,8 +817,9 @@ impl Engine for Broker {
     ) -> EngineFuture<'a, Offset> {
         let broker = self.clone();
         let stream = stream.to_owned();
-        Arc::clone(&self.inner.storage_executor)
-            .dispatch(move || broker.publish_with_request_id(&stream, key, payload, request_id))
+        Arc::clone(&self.inner.storage_executor).dispatch_stream(stream, move |stream| {
+            broker.publish_with_request_id(stream, key, payload, request_id)
+        })
     }
 
     fn publish_batch<'a>(
@@ -771,14 +830,15 @@ impl Engine for Broker {
         let broker = self.clone();
         let stream = stream.to_owned();
         Arc::clone(&self.inner.storage_executor)
-            .dispatch(move || broker.publish_batch(&stream, records))
+            .dispatch_stream(stream, move |stream| broker.publish_batch(stream, records))
     }
 
     fn poll<'a>(&'a self, stream: &'a str, consumer: &'a str) -> EngineFuture<'a, PollResult> {
         let broker = self.clone();
         let stream = stream.to_owned();
         let consumer = consumer.to_owned();
-        Arc::clone(&self.inner.storage_executor).dispatch(move || broker.poll(&stream, &consumer))
+        Arc::clone(&self.inner.storage_executor)
+            .dispatch_stream(stream, move |stream| broker.poll(stream, &consumer))
     }
 
     fn poll_group<'a>(
@@ -791,8 +851,9 @@ impl Engine for Broker {
         let stream = stream.to_owned();
         let consumer = consumer.to_owned();
         let member = member.to_owned();
-        Arc::clone(&self.inner.storage_executor)
-            .dispatch(move || broker.poll_group(&stream, &consumer, &member))
+        Arc::clone(&self.inner.storage_executor).dispatch_stream(stream, move |stream| {
+            broker.poll_group(stream, &consumer, &member)
+        })
     }
 
     fn ack<'a>(
@@ -805,7 +866,7 @@ impl Engine for Broker {
         let stream = stream.to_owned();
         let consumer = consumer.to_owned();
         Arc::clone(&self.inner.storage_executor)
-            .dispatch(move || broker.ack(&stream, &consumer, offset))
+            .dispatch_stream(stream, move |stream| broker.ack(stream, &consumer, offset))
     }
 
     fn ack_group<'a>(
@@ -821,8 +882,8 @@ impl Engine for Broker {
         let consumer = consumer.to_owned();
         let member = member.to_owned();
         let delivery_token = delivery_token.to_owned();
-        Arc::clone(&self.inner.storage_executor).dispatch(move || {
-            broker.ack_group(&stream, &consumer, &member, offset, &delivery_token)
+        Arc::clone(&self.inner.storage_executor).dispatch_stream(stream, move |stream| {
+            broker.ack_group(stream, &consumer, &member, offset, &delivery_token)
         })
     }
 
@@ -1985,6 +2046,56 @@ mod tests {
         first.await.unwrap().unwrap();
 
         assert!(!executed.load(AtomicOrdering::Acquire));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn storage_dispatch_lanes_preserve_stream_order_without_starving_other_streams() {
+        let executor = Arc::new(StorageExecutor::with_capacities(2, 2));
+        let started = Arc::new(tokio::sync::Notify::new());
+        let (release_sender, release_receiver) = std::sync::mpsc::channel();
+        let order = Arc::new(Mutex::new(Vec::new()));
+        let first_order = Arc::clone(&order);
+        let first_started = Arc::clone(&started);
+        let first = tokio::spawn(Arc::clone(&executor).dispatch_stream(
+            "events".to_owned(),
+            move |_| {
+                first_order.lock().unwrap().push(1_u8);
+                first_started.notify_one();
+                release_receiver
+                    .recv()
+                    .expect("storage task should be released by the test");
+                Ok(())
+            },
+        ));
+
+        started.notified().await;
+        let second_order = Arc::clone(&order);
+        let second = tokio::spawn(Arc::clone(&executor).dispatch_stream(
+            "events".to_owned(),
+            move |_| {
+                second_order.lock().unwrap().push(2_u8);
+                Ok(())
+            },
+        ));
+        while executor.admission_permits.available_permits() != 2 {
+            tokio::task::yield_now().await;
+        }
+
+        assert_eq!(executor.execution_permits.available_permits(), 1);
+        assert!(!second.is_finished());
+        assert_eq!(
+            executor
+                .clone()
+                .dispatch_stream("jobs".to_owned(), |_| Ok(42_u8))
+                .await
+                .unwrap(),
+            42
+        );
+
+        release_sender.send(()).unwrap();
+        first.await.unwrap().unwrap();
+        second.await.unwrap().unwrap();
+        assert_eq!(*order.lock().unwrap(), vec![1, 2]);
     }
 
     #[tokio::test(flavor = "current_thread")]
