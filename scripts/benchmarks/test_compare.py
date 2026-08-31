@@ -10,6 +10,7 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 sys.path.insert(0, str(SCRIPT_DIR))
 
 import compare  # noqa: E402
+import common  # noqa: E402
 
 
 class ComparisonBenchmarkTests(unittest.TestCase):
@@ -57,23 +58,6 @@ class ComparisonBenchmarkTests(unittest.TestCase):
 
         self.assertEqual(result["scenarios"][0]["operation"], "publish")
 
-    def test_run_metadata_records_identity_source_environment_and_command(self) -> None:
-        with (
-            patch.object(compare, "source_metadata", return_value={"revision": "abc123"}),
-            patch.object(
-                compare,
-                "environment_metadata",
-                return_value={"host": "benchmark-host", "cpus": 2},
-            ),
-            patch.object(compare.sys, "argv", ["compare.py", "--messages", "100"]),
-        ):
-            metadata = compare.run_metadata("20260827010203000000")
-
-        self.assertEqual(metadata["run_id"], "20260827010203000000")
-        self.assertEqual(metadata["command"], ["compare.py", "--messages", "100"])
-        self.assertEqual(metadata["source"], {"revision": "abc123"})
-        self.assertEqual(metadata["environment"], {"host": "benchmark-host", "cpus": 2})
-
     def test_source_metadata_uses_ci_identity_when_available(self) -> None:
         with (
             patch("common.git_revision", return_value="abc123"),
@@ -91,7 +75,7 @@ class ComparisonBenchmarkTests(unittest.TestCase):
                 clear=True,
             ),
         ):
-            metadata = compare.source_metadata()
+            metadata = common.source_metadata(full_revision=True)
 
         self.assertEqual(metadata["repository"], "example/runnel")
         self.assertEqual(metadata["revision"], "abc123")

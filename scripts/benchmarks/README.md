@@ -28,7 +28,7 @@ It builds `runnel:bench`, starts one broker container, applies explicit CPU and 
 The limits and workload can be changed without editing the runner:
 
 ```text
-python3 scripts/benchmarks2/run.py \
+python3 scripts/benchmarks/run.py \
   --image runnel:bench \
   --cpus 2 \
   --memory 1g \
@@ -37,7 +37,7 @@ python3 scripts/benchmarks2/run.py \
   --payload-sizes 100,1024
 ```
 
-The result records the image, source revision, host information, resource limits, startup time, scenario-scoped cgroup CPU time, CPU efficiency, sampled container memory, workload parameters, throughput, and p50/p99/p99.9/max latency where a scenario has per-message latency.
+Every raw runner emits the same version-2 result envelope. It records a unique run ID, exact command, full source and host provenance, explicit status and timestamps, workload and resource limits, target/runtime metadata, startup time, scenario-scoped cgroup CPU time, CPU efficiency, sampled resources, throughput, p50/p99/p99.9/max latency, logical payload throughput, and bounded deltas from the broker's `/metrics` endpoint where available. The single-node result stores its target under `backends.runnel`, just like clustered and comparison results.
 
 Use `--scenarios` to run only the named scenarios when a benchmark consumer needs a smaller, explicit workload. The accepted names are `durable_publish`, `concurrent_publish`, `consume_ack`, `publish_consume_ack_roundtrip`, and `restart_recovery`; the default runs all of them. The native comparison adapter selects only `durable_publish` and `consume_ack`, because those are the scenarios it retains from the Runnel result.
 
@@ -116,7 +116,7 @@ This is intentionally a first baseline built around native benchmark clients. Ru
 The bounded three-node slice measures only replicated durable publish for the three external competitors:
 
 ```text
-python3 scripts/benchmarks2/compare.py \
+python3 scripts/benchmarks/compare.py \
   --nodes 3 \
   --backends kafka,redpanda,nats \
   --messages 1000 \
@@ -142,8 +142,8 @@ The three-node mode rejects Runnel because this comparison runner has no distrib
 Examples:
 
 ```text
-python3 scripts/benchmarks2/compare.py --backends kafka,redpanda --messages 1000 --payload-sizes 100 --cpus 2 --memory 2g
-python3 scripts/benchmarks2/compare.py --backends nats --messages 10000 --payload-sizes 1024 --cpus 2 --memory 2g
+python3 scripts/benchmarks/compare.py --backends kafka,redpanda --messages 1000 --payload-sizes 100 --cpus 2 --memory 2g
+python3 scripts/benchmarks/compare.py --backends nats --messages 10000 --payload-sizes 1024 --cpus 2 --memory 2g
 ```
 
 ## History and dashboard
@@ -151,15 +151,15 @@ python3 scripts/benchmarks2/compare.py --backends nats --messages 10000 --payloa
 Normalize a comparison result and generate local history data:
 
 ```text
-python3 scripts/benchmarks2/normalize.py \
+python3 scripts/benchmarks/normalize.py \
   --input benchmark-results/compare-<timestamp>.json \
   --output benchmark-results/normalized.json
-python3 scripts/benchmarks2/build_history.py \
+python3 scripts/benchmarks/build_history.py \
   --runs benchmark-results \
   --output benchmark-results/site
 ```
 
-The normalized schema intentionally excludes native tool logs. It retains workload, limits, image identifiers, semantic boundaries, scenario resource samples, source revision, workflow provenance, and measured points. `build_history.py` aggregates these records into `site/data.json` on the generated `benchmark-history` branch. The hand-authored HTML, CSS, and JavaScript in `docs/benchmarks/` are served directly by GitHub Pages and read that public history data from the raw GitHub URL. The longer Runnel-only history is the primary optimization series; native and three-node competitor records are kept as separate suites. Invalid or unrelated JSON files are skipped.
+The normalized schema intentionally excludes native tool logs. It retains the version-2 run envelope, workload, limits, image identifiers, semantic boundaries, scenario resource and server-metric deltas, source revision, workflow provenance, and measured points. `build_history.py` aggregates these records into `site/data.json` on the generated `benchmark-history` branch. The hand-authored HTML, CSS, and JavaScript in `docs/benchmarks/` are served directly by GitHub Pages and read that public history data from the raw GitHub URL. The longer Runnel-only history is the primary optimization series; native and three-node competitor records are kept as separate suites. Invalid or unrelated JSON files are skipped.
 
 The dashboard uses the dedicated Runnel suite as the primary optimization history. Older Runnel points recorded by the native-comparison workflow remain available as a separate history, because their measurement boundary can differ. Charts keep benchmark suite, backend, operation, and payload size in separate visual series, so selecting all sizes or suites does not connect unrelated measurements or hide which point belongs to which workload. Raw run medians are shown as dots, while a five-run rolling median makes the direction of change easier to see; repetition ranges are shown as a band when available.
 

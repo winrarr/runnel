@@ -24,9 +24,8 @@ from typing import Any, Callable
 
 from common import (
     ROOT,
-    environment_metadata,
     parse_sizes,
-    source_metadata,
+    result_metadata,
     write_json_result,
 )
 from runtime import DockerContainer, MeasuredContainer, create_network, inspect_image, remove_network
@@ -246,16 +245,6 @@ def benchmark_suite(nodes: int, backends: list[str]) -> str:
     if backends == ["runnel"]:
         return "runnel"
     return "native-comparison"
-
-
-def run_metadata(run_id: str) -> dict[str, Any]:
-    """Return stable identity and provenance for one raw comparison artifact."""
-    return {
-        "run_id": run_id,
-        "command": list(sys.argv),
-        "source": source_metadata(),
-        "environment": environment_metadata(),
-    }
 
 
 def ensure_image(image: str) -> str:
@@ -1036,20 +1025,29 @@ def run_runnel(
         raise ComparisonError(f"Runnel benchmark failed: {error}") from error
     finally:
         output.unlink(missing_ok=True)
+    source_backend = result.get("backends", {}).get("runnel")
+    if not isinstance(source_backend, dict):
+        container = result.get("container")
+        scenarios = result.get("scenarios")
+        if not isinstance(container, dict) or not isinstance(scenarios, list):
+            raise ComparisonError("Runnel benchmark result has no canonical backend")
+        source_backend = {**container, "scenarios": scenarios}
     scenarios = [
         scenario
-        for scenario in result["scenarios"]
+        for scenario in source_backend["scenarios"]
         if scenario_operation(scenario) in {"durable_publish", "consume_ack"}
     ]
     return {
-        "image": result["container"]["image"],
-        "image_id": result["container"].get("image_id"),
+        "image": source_backend["image"],
+        "image_id": source_backend.get("image_id"),
+        "runtime": source_backend.get("runtime", "container"),
         "cpu_limit": cpus,
         "memory_limit": memory,
-        "startup_seconds": result["container"]["startup_seconds"],
-        "resource_samples": result["container"]["resource_samples"],
+        "startup_seconds": source_backend["startup_seconds"],
+        "resource_samples": source_backend["resource_samples"],
         "scenarios": [
             {
+                "scenario_id": f"{'publish' if scenario_operation(scenario) == 'durable_publish' else 'consume_ack'}:{scenario['message_size_bytes']}",
                 "operation": (
                     "publish"
                     if scenario_operation(scenario) == "durable_publish"
@@ -1060,12 +1058,21 @@ def run_runnel(
                 "throughput_messages_per_second": scenario[
                     "throughput_messages_per_second"
                 ],
+                "throughput_megabytes_per_second": scenario.get(
+                    "throughput_megabytes_per_second"
+                ),
+                "elapsed_seconds": scenario.get("elapsed_seconds"),
+                "elapsed_milliseconds": scenario.get("elapsed_milliseconds"),
+                "latency_sample_count": scenario.get("latency_sample_count"),
                 "latency_microseconds": scenario["latency_microseconds"],
                 "resource_samples": scenario.get("resource_samples", {}),
+                "server_metrics": scenario.get("server_metrics"),
+                "metadata": scenario.get("metadata", {}),
             }
             for scenario in scenarios
         ],
         "measurement_client": "host Python socket client",
+        "client_image": "host Python runtime",
     }
 
 
@@ -1147,6 +1154,7 @@ def backend_metadata(name: str, nodes: int) -> dict[str, Any]:
         scenario_classes = ["publish-only", "consume-with-ack"]
 
     return {
+        "runtime": "container",
         "acknowledgement": acknowledgement,
         "replication": replication,
         "measurement_boundary": measurement_boundary,
@@ -1206,7 +1214,18 @@ def main() -> int:
         subprocess.run(["docker", "build", "--tag", args.runnel_image, str(ROOT)], check=True)
     timestamp = datetime.now(UTC)
     run_id = timestamp.strftime("%Y%m%d%H%M%S%f")
-    metadata = run_metadata(run_id)
+    comparison_mode = (
+        "three-node replicated durable publish; native broker tools; publish-only first slice"
+        if args.nodes == THREE_NODE_COUNT
+        else "native broker tools; first-pass, not a final apples-to-apples claim"
+    )
+    metadata = result_metadata(
+        run_id,
+        timestamp,
+        benchmark_suite=benchmark_suite(args.nodes, args.backends),
+        comparison_mode=comparison_mode,
+        docker=True,
+    )
     output = args.output or ROOT / "benchmark-results" / f"compare-{run_id}.json"
     resource_prefix = f"runnel-compare-{os.getpid()}-{time.time_ns()}"
     network = resource_prefix
@@ -1275,14 +1294,10 @@ def main() -> int:
         remove_network(network)
 
     summary = {
-        "schema_version": 1,
+        "schema_version": 2,
         **metadata,
-        "generated_at": timestamp.isoformat(),
-        "comparison_mode": (
-            "three-node replicated durable publish; native broker tools; publish-only first slice"
-            if args.nodes == THREE_NODE_COUNT
-            else "native broker tools; first-pass, not a final apples-to-apples claim"
-        ),
+        "started_at": timestamp.isoformat(),
+        "comparison_mode": comparison_mode,
         "comparison_guardrail": comparison_guardrail_metadata(args.nodes),
         "benchmark_suite": benchmark_suite(args.nodes, args.backends),
         "resource_limits": {

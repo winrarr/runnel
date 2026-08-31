@@ -26,8 +26,6 @@ from common import (
     build_image,
     create_stream,
     consume_ack_messages,
-    git_revision,
-    host_metadata,
     metric,
     measure_message_batch,
     measure_scenario,
@@ -36,6 +34,8 @@ from common import (
     publish,
     publish_messages,
     publish_stream,
+    prometheus_metrics,
+    result_metadata,
     wait_for_ready,
     write_json_result,
 )
@@ -105,6 +105,11 @@ class DockerBroker:
             raise BenchmarkError("broker client port was not discovered")
         return LineClient("127.0.0.1", self.client_port, DEFAULT_TIMEOUT_SECONDS)
 
+    def metrics(self) -> dict[str, float] | None:
+        if self.http_port is None:
+            return None
+        return prometheus_metrics(self.http_port)
+
     def restart(self) -> int:
         started = time.perf_counter_ns()
         self.container.restart()
@@ -152,6 +157,7 @@ def run_durable_publish(
             "durable_publish",
             len(payload),
             lambda: publish_messages(lambda _: client, stream, payload, messages),
+            metrics=broker.metrics,
         )
     finally:
         client.close()
@@ -189,6 +195,7 @@ def run_concurrent_publish(
         len(payload),
         publish_concurrently,
         metadata={"concurrency": concurrency},
+        metrics=broker.metrics,
     )
 
 
@@ -217,6 +224,7 @@ def run_consume_ack(
         len(payload),
         consume,
         metadata={"publish_setup_excluded": True},
+        metrics=broker.metrics,
     )
 
 
@@ -243,7 +251,7 @@ def run_roundtrip(
         elapsed = time.perf_counter_ns() - started
         return metric("publish_consume_ack_roundtrip", latencies, elapsed, message_size=len(payload))
 
-    return measure_scenario(broker.stats, measured)
+    return measure_scenario(broker.stats, measured, metrics=broker.metrics)
 
 
 def run_restart_recovery(
@@ -255,6 +263,7 @@ def run_restart_recovery(
     poll(client, stream, "restart-consumer", 0)
     client.close()
     def measured() -> dict[str, Any]:
+        started = time.perf_counter_ns()
         restart_ns = broker.restart()
         recovered = broker.client()
         try:
@@ -262,15 +271,18 @@ def run_restart_recovery(
             acknowledge(recovered, stream, "restart-consumer", 0)
         finally:
             recovered.close()
-        return {
-            "operation": "restart_recovery",
-            "messages": 1,
-            "message_size_bytes": len(payload),
-            "restart_ready_seconds": restart_ns / 1_000_000_000,
-            "metadata": {"unacknowledged_message_redelivered": True},
-        }
+        elapsed_ns = time.perf_counter_ns() - started
+        result = metric(
+            "restart_recovery",
+            [elapsed_ns],
+            elapsed_ns,
+            message_size=len(payload),
+            metadata={"unacknowledged_message_redelivered": True},
+        )
+        result["restart_ready_seconds"] = restart_ns / 1_000_000_000
+        return result
 
-    return measure_scenario(broker.stats, measured)
+    return measure_scenario(broker.stats, measured, metrics=broker.metrics)
 
 
 def parse_scenarios(value: str) -> list[str]:
@@ -382,19 +394,16 @@ def main() -> int:
         broker.close()
 
     summary = {
-        "schema_version": 1,
-        "generated_at": timestamp.isoformat(),
-        "backend": "runnel",
-        "engine": "local",
-        "git_revision": git_revision(short=True),
-        "host": host_metadata(),
-        "container": {
-            "image": args.image,
-            "image_id": broker.image_id,
-            "cpu_limit": args.cpus,
-            "memory_limit": args.memory,
-            "startup_seconds": (broker.startup_ns or 0) / 1_000_000_000,
-            "resource_samples": summarize_stats(broker.stats.samples),
+        **result_metadata(
+            run_id,
+            timestamp,
+            benchmark_suite="runnel",
+            comparison_mode="single-node",
+            docker=True,
+        ),
+        "resource_limits": {
+            "broker_cpu": args.cpus,
+            "broker_memory": args.memory,
         },
         "workload": {
             "messages": args.messages,
@@ -403,9 +412,26 @@ def main() -> int:
             "payload_sizes_bytes": args.payload_sizes,
             "scenarios": args.scenarios,
             "protocol": "line-delimited JSON with UTF-8 string payloads",
+            "protocol_version": "provisional-line-json-v1",
+            "payload_encoding": "utf-8",
+            "compression": "none",
             "durability": "current broker default; see engine and implementation configuration",
         },
-        "scenarios": scenarios,
+        "backends": {
+            "runnel": {
+                "image": args.image,
+                "image_id": broker.image_id,
+                "runtime": "container",
+                "acknowledgement": "local durable append",
+                "replication": "single local broker engine",
+                "measurement_boundary": "public line-delimited JSON protocol",
+                "measurement_client": "host Python socket client",
+                "client_image": "host Python runtime",
+                "startup_seconds": (broker.startup_ns or 0) / 1_000_000_000,
+                "resource_samples": summarize_stats(broker.stats.samples),
+                "scenarios": scenarios,
+            }
+        },
     }
     write_json_result(output, summary)
     return 0

@@ -88,7 +88,7 @@ class BenchmarkTarget:
 
     @property
     def script(self) -> Path:
-        return self.root / "scripts" / "benchmarks2" / "cluster.py"
+        return self.root / "scripts" / "benchmarks" / "cluster.py"
 
 
 def git(*arguments: str, cwd: Path = ROOT) -> subprocess.CompletedProcess[str]:
@@ -212,7 +212,7 @@ def run_benchmark(
 def normalize(raw: Path, normalized: Path, root: Path) -> None:
     command = [
         sys.executable,
-        str(root / "scripts" / "benchmarks2" / "normalize.py"),
+        str(ROOT / "scripts" / "benchmarks" / "normalize.py"),
         "--input",
         str(raw),
         "--output",
@@ -224,7 +224,7 @@ def normalize(raw: Path, normalized: Path, root: Path) -> None:
 def aggregate(inputs: list[Path], output: Path) -> dict[str, object]:
     command = [
         sys.executable,
-        str(ROOT / "scripts" / "benchmarks2" / "aggregate.py"),
+        str(ROOT / "scripts" / "benchmarks" / "aggregate.py"),
         "--inputs",
         *(str(path) for path in inputs),
         "--output",
@@ -695,6 +695,13 @@ def main() -> int:
             if current_result is None or base_result is None or stability is None:
                 raise LocalBenchmarkError("benchmark produced no repetitions")
             current_result["benchmark_stability"] = stability
+            current_result["comparison"] = {
+                "baseline_ref": args.base_ref,
+                "baseline_revision": base_revision,
+                "current_revision": current_revision,
+                "paired_repetitions": True,
+                "isolation": "systemd user scope",
+            }
 
         report = render_report(
             reportable_result(current_result),

@@ -39,7 +39,9 @@ def load_runs(runs_dir: Path) -> list[dict[str, Any]]:
             raw = json.loads(path.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError):
             continue
-        if not isinstance(raw, dict) or "backends" not in raw:
+        if not isinstance(raw, dict) or (
+            "backends" not in raw and "scenarios" not in raw
+        ):
             continue
         if raw.get("history_schema_version") == 1:
             normalized = raw
@@ -289,6 +291,10 @@ def site_data(runs: list[dict[str, Any]]) -> dict[str, Any]:
                 "run_url": source.get("run_url"),
                 "event": source.get("event"),
                 "workflow": source.get("workflow"),
+                "run_id": run.get("run_id"),
+                "status": run.get("status", "complete"),
+                "started_at": run.get("started_at"),
+                "finished_at": run.get("finished_at"),
                 "run_file": run.get("_path"),
                 "comparison_mode": run.get("comparison_mode"),
                 "benchmark_suite": benchmark_suite(run),
@@ -323,10 +329,13 @@ def comparison_identity(run: dict[str, Any], backend_name: str | None = None) ->
                     key: backend.get(key)
                     for key in (
                         "image",
+                        "runtime",
                         "acknowledgement",
                         "replication",
                         "measurement_boundary",
                         "measurement_client",
+                        "client_image",
+                        "semantic_metadata",
                     )
                 }
                 for name, backend in run.get("backends", {}).items()

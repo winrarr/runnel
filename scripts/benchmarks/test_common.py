@@ -1,3 +1,4 @@
+import io
 import json
 import os
 import sys
@@ -41,6 +42,32 @@ class CommonBenchmarkTests(unittest.TestCase):
         self.assertNotIn("docker_server", comparison)
         self.assertEqual(normalized["cpu_count"], 4)
         self.assertEqual(normalized["docker_server"], "28.0")
+
+    def test_prometheus_metrics_keeps_labeled_samples(self) -> None:
+        body = b"# HELP metric example\nmetric 2\nmetric{operation=\"publish\"} 3\n"
+        with patch.object(common.urllib.request, "urlopen", return_value=io.BytesIO(body)):
+            metrics = common.prometheus_metrics(8080)
+
+        self.assertEqual(
+            metrics,
+            {"metric": 2.0, 'metric{operation="publish"}': 3.0},
+        )
+
+    def test_metric_delta_records_counter_and_reset_changes(self) -> None:
+        delta = common.metric_delta(
+            {"requests": 5.0, "restarted": 2.0},
+            {"requests": 8.0, "restarted": 1.0},
+        )
+
+        self.assertTrue(delta["available"])
+        self.assertEqual(delta["delta"], {"requests": 3.0, "restarted": -1.0})
+
+    def test_metric_records_payload_throughput_and_latency_sample_count(self) -> None:
+        result = common.metric("publish", [1_000, 2_000], 2_000_000, message_size=100)
+
+        self.assertEqual(result["latency_sample_count"], 2)
+        self.assertEqual(result["elapsed_milliseconds"], 2.0)
+        self.assertEqual(result["throughput_megabytes_per_second"], 0.1)
 
     def test_publish_messages_checks_contiguous_offsets(self) -> None:
         clients = [object(), object()]
@@ -117,9 +144,10 @@ class CommonBenchmarkTests(unittest.TestCase):
             with patch("builtins.print") as print_mock:
                 common.write_json_result(output, {"messages": 2})
 
-            self.assertEqual(
-                json.loads(output.read_text(encoding="utf-8")), {"messages": 2}
-            )
+            result = json.loads(output.read_text(encoding="utf-8"))
+            self.assertEqual(result["messages"], 2)
+            self.assertEqual(result["status"], "complete")
+            self.assertEqual(result["generated_at"], result["finished_at"])
             self.assertEqual(print_mock.call_count, 2)
             self.assertIn(str(output), print_mock.call_args_list[1].args[0])
 

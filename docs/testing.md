@@ -89,7 +89,7 @@ The Criterion suite includes durable publish, legacy publish/poll/ack, two-membe
 - `just bench-test` runs the benchmark normalization and dashboard tests.
 - `just ci` runs verification, the smoke test, the container build, and the container benchmark smoke check.
 
-Benchmark workflows, applicability, interpretation, and required handoff evidence are documented in [benchmarking.md](benchmarking.md). Workload semantics, comparison boundaries, and harness-specific options are documented in [scripts/benchmarks2/README.md](../scripts/benchmarks2/README.md).
+Benchmark workflows, applicability, interpretation, and required handoff evidence are documented in [benchmarking.md](benchmarking.md). Workload semantics, comparison boundaries, and harness-specific options are documented in [scripts/benchmarks/README.md](../scripts/benchmarks/README.md).
 
 ## Merge evidence classes
 

@@ -35,8 +35,6 @@ from common import (
     consume_ack_messages,
     create_stream,
     default_binary,
-    git_revision,
-    host_metadata,
     metric,
     measure_message_batch,
     measure_scenario,
@@ -47,7 +45,9 @@ from common import (
     publish,
     publish_stream,
     publish_messages,
+    prometheus_metrics,
     request_ok,
+    result_metadata,
     wait_for_ready,
     write_json_result,
 )
@@ -105,47 +105,97 @@ class ProcessStats(PeriodicSampler):
     def __init__(self, cluster: "Cluster") -> None:
         super().__init__("runnel-cluster-stats", interval_seconds=0.1)
         self.cluster = cluster
+        self.node_samples: list[dict[str, dict[str, float]]] = []
 
-    def begin(self) -> tuple[int, float, int]:
+    def begin(self) -> tuple[int, int, float, int]:
         self._record()
         with self.lock:
             sample_index = len(self.samples)
+            node_sample_index = max(0, len(self.node_samples) - 1)
             cpu_start = self.samples[-1]["cpu_seconds"] if self.samples else 0.0
-        return sample_index, cpu_start, time.perf_counter_ns()
+        return sample_index, node_sample_index, cpu_start, time.perf_counter_ns()
 
-    def end(self, token: tuple[int, float, int]) -> dict[str, Any]:
-        sample_index, cpu_start, started_ns = token
+    def end(self, token: tuple[int, int, float, int]) -> dict[str, Any]:
+        sample_index, node_sample_index, cpu_start, started_ns = token
         ended_ns = time.perf_counter_ns()
         self._record()
         with self.lock:
             samples = list(self.samples[sample_index:])
+            node_samples = list(self.node_samples[node_sample_index:])
         cpu_end = samples[-1]["cpu_seconds"] if samples else cpu_start
-        return summarize_stats(
+        result = summarize_stats(
             samples,
             cpu_seconds=cpu_end - cpu_start,
             elapsed_seconds=(ended_ns - started_ns) / 1_000_000_000,
         )
+        result["per_node"] = self._summarize_nodes(node_samples)
+        return result
+
+    def summary(self) -> dict[str, Any]:
+        with self.lock:
+            samples = list(self.samples)
+            node_samples = list(self.node_samples)
+        result = summarize_stats(samples)
+        result["per_node"] = self._summarize_nodes(node_samples)
+        return result
+
+    @staticmethod
+    def _summarize_nodes(
+        samples: list[dict[str, dict[str, float]]],
+    ) -> dict[str, dict[str, Any]]:
+        node_ids = sorted({node_id for sample in samples for node_id in sample})
+        summaries: dict[str, dict[str, Any]] = {}
+        for node_id in node_ids:
+            values = [sample[node_id] for sample in samples if node_id in sample]
+            if not values:
+                continue
+            memory_values = [value["memory_bytes"] for value in values]
+            summary: dict[str, Any] = {
+                "samples": len(values),
+                "memory_bytes_avg": sum(memory_values) / len(memory_values),
+                "memory_bytes_max": max(memory_values),
+            }
+            cpu_values = [
+                value["cpu_seconds"]
+                for value in values
+                if isinstance(value.get("cpu_seconds"), (int, float))
+            ]
+            if cpu_values:
+                summary["cpu_seconds"] = max(0.0, cpu_values[-1] - cpu_values[0])
+            summaries[node_id] = summary
+        return summaries
 
     def _record(self) -> None:
         cpu = 0.0
         memory = 0
+        node_sample: dict[str, dict[str, float]] = {}
         for node in self.cluster.nodes:
             if self.cluster.runtime == "container":
                 if node.container is None or not node.container.created:
                     continue
-                cpu += read_cpu_seconds(node.container.name) or 0.0
+                node_cpu = read_cpu_seconds(node.container.name)
                 sample = read_stats(node.container.name)
                 if sample is not None:
+                    node_value = {"memory_bytes": float(sample["memory_bytes"])}
+                    if node_cpu is not None:
+                        node_value["cpu_seconds"] = node_cpu
+                        cpu += node_cpu
+                    node_sample[str(node.node_id)] = node_value
                     memory += int(sample["memory_bytes"])
                 continue
             if node.process is None:
                 continue
             sample = process_stats(node.process.pid)
             if sample is not None:
+                node_sample[str(node.node_id)] = {
+                    "cpu_seconds": sample[0],
+                    "memory_bytes": float(sample[1]),
+                }
                 cpu += sample[0]
                 memory += sample[1]
         with self.lock:
             self.samples.append({"cpu_seconds": cpu, "memory_bytes": float(memory)})
+            self.node_samples.append(node_sample)
 
 
 class Cluster:
@@ -212,6 +262,18 @@ class Cluster:
             self.nodes[index % self.node_count].broker_port,
             COMMAND_TIMEOUT_SECONDS,
         )
+
+    def metrics(self) -> dict[str, float] | None:
+        """Return one flattened metrics snapshot for every live node."""
+        snapshot: dict[str, float] = {}
+        for node in self.nodes:
+            metrics = prometheus_metrics(node.http_port)
+            if metrics is None:
+                return None
+            snapshot.update(
+                {f"node_{node.node_id}.{name}": value for name, value in metrics.items()}
+            )
+        return snapshot or None
 
     @contextmanager
     def connected_clients(self) -> Iterator[list[LineClient]]:
@@ -439,6 +501,7 @@ def run_durable_publish(
                 expected_offset=warmup,
             ),
             metadata={"nodes": cluster.node_count, "any_node_routing": True},
+            metrics=cluster.metrics,
         )
 
 
@@ -467,6 +530,7 @@ def run_consume_ack(
                 ack_client_for=lambda offset: clients[(offset + 1) % len(clients)],
             ),
             metadata={"nodes": cluster.node_count, "publish_setup_excluded": True},
+            metrics=cluster.metrics,
         )
 
 
@@ -514,7 +578,7 @@ def run_slow_consumer(
             )
             return result
 
-        return measure_scenario(cluster.stats, operation)
+        return measure_scenario(cluster.stats, operation, metrics=cluster.metrics)
 
 
 def run_grouped_consume_ack(
@@ -550,7 +614,7 @@ def run_grouped_consume_ack(
                 metadata={"nodes": cluster.node_count, "members": 2, "parallel": False},
             )
 
-        return measure_scenario(cluster.stats, operation)
+        return measure_scenario(cluster.stats, operation, metrics=cluster.metrics)
 
 
 def run_parallel_grouped(
@@ -617,7 +681,7 @@ def run_parallel_grouped(
             metadata={"nodes": cluster.node_count, "members": concurrency, "parallel": True},
         )
 
-    return measure_scenario(cluster.stats, operation)
+    return measure_scenario(cluster.stats, operation, metrics=cluster.metrics)
 
 
 def run_restart_recovery(cluster: Cluster, stream: str, payload: str) -> dict[str, Any]:
@@ -658,7 +722,7 @@ def run_restart_recovery(cluster: Cluster, stream: str, payload: str) -> dict[st
         result["restart_ready_seconds"] = restart_ns / 1_000_000_000
         return result
 
-    return measure_scenario(cluster.stats, operation)
+    return measure_scenario(cluster.stats, operation, metrics=cluster.metrics)
 
 
 def build_binary(binary: Path, *, features: str | None = None) -> None:
@@ -796,12 +860,13 @@ def main() -> int:
 
     startup_seconds = cluster.startup_ns / 1_000_000_000
     result = {
-        "schema_version": 1,
-        "generated_at": timestamp.isoformat(),
-        "comparison_mode": "cluster-baseline",
-        "benchmark_suite": "cluster",
-        "git_revision": git_revision(),
-        "host": host_metadata(),
+        **result_metadata(
+            run_id,
+            timestamp,
+            benchmark_suite="cluster",
+            comparison_mode="cluster-baseline",
+            docker=args.runtime == "container",
+        ),
         "resource_limits": resource_limits(
             runtime=args.runtime, cpus=args.cpus, memory=args.memory
         ),
@@ -815,16 +880,21 @@ def main() -> int:
             "payload_sizes_bytes": args.payload_sizes,
             "runtime": args.runtime,
             "protocol": "line-delimited JSON with UTF-8 string payloads",
+            "protocol_version": "provisional-line-json-v1",
+            "payload_encoding": "utf-8",
+            "compression": "none",
             "durability": "committed by the current three-node Raft quorum and local durable state",
         },
         "backends": {
             "runnel-cluster": {
                 "image": args.image if args.runtime == "container" else str(args.binary),
                 "image_id": cluster.image_id,
+                "runtime": args.runtime,
                 "acknowledgement": "durable quorum commit",
                 "replication": f"{args.nodes}-node static Multi-Raft",
                 "measurement_boundary": "public line-delimited JSON protocol",
-                "measurement_client": "scripts/benchmarks2/cluster.py",
+                "measurement_client": "scripts/benchmarks/cluster.py",
+                "client_image": "host Python runtime",
                 "startup_seconds": startup_seconds,
                 "resource_samples": cluster.stats.summary(),
                 "scenarios": scenarios,

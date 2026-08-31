@@ -14,20 +14,20 @@ Runnel is a Rust message broker intended to offer durable streams, low operation
 - crates/runnel-cli: runnelctl, a small development client for the current protocol.
 - crates/runnel-core/benches: Criterion benchmarks for durable publish, legacy publish/poll/ack, and shared-consumer delivery paths.
 - crates/runnel-server/tests: network-level protocol and restart tests.
-- scripts/benchmarks2/run.py: resource-limited container benchmark runner with machine-readable results.
-- scripts/benchmarks2/runtime.py: shared Docker lifecycle and sampled-container primitives for benchmark runners.
-- scripts/benchmarks2/cluster.py: real three-node clustered benchmark runner with native-process or bounded-container runtimes and machine-readable results.
-- scripts/benchmarks2/pr_local.py: same-host current-vs-default-branch clustered benchmark and Markdown PR report generator.
-- scripts/benchmarks2/resource_scope.py: Linux systemd user-scope wrapper for explicit native benchmark CPU and memory limits.
-- scripts/benchmarks2/profile.py: optional Linux `perf` workflow for clustered CPU hotspot profiles.
-- scripts/benchmarks2/compare.py: first-pass single-node and three-node native-tool comparison runner for Runnel, Kafka, Redpanda, and JetStream.
-- scripts/benchmarks2/pr_report.py: renders clustered and single-node Runnel pull-request benchmark artifacts as Markdown reports.
-- scripts/benchmarks2/aggregate.py: median aggregation and observed-range summaries for repeated benchmark runs.
+- scripts/benchmarks/run.py: resource-limited container benchmark runner with machine-readable results.
+- scripts/benchmarks/runtime.py: shared Docker lifecycle and sampled-container primitives for benchmark runners.
+- scripts/benchmarks/cluster.py: real three-node clustered benchmark runner with native-process or bounded-container runtimes and machine-readable results.
+- scripts/benchmarks/pr_local.py: same-host current-vs-default-branch clustered benchmark and Markdown PR report generator.
+- scripts/benchmarks/resource_scope.py: Linux systemd user-scope wrapper for explicit native benchmark CPU and memory limits.
+- scripts/benchmarks/profile.py: optional Linux `perf` workflow for clustered CPU hotspot profiles.
+- scripts/benchmarks/compare.py: first-pass single-node and three-node native-tool comparison runner for Runnel, Kafka, Redpanda, and JetStream.
+- scripts/benchmarks/pr_report.py: renders clustered and single-node Runnel pull-request benchmark artifacts as Markdown reports.
+- scripts/benchmarks/aggregate.py: median aggregation and observed-range summaries for repeated benchmark runs.
 - scripts/isolated.py: canonical isolated workflow runner for concurrent local tests and benchmarks.
-- scripts/benchmarks2/normalize.py: strips raw tool output and adds provenance for durable benchmark history.
-- scripts/benchmarks2/build_history.py: aggregates normalized benchmark runs into generated history data.
+- scripts/benchmarks/normalize.py: strips raw tool output and adds provenance for durable benchmark history.
+- scripts/benchmarks/build_history.py: aggregates normalized benchmark runs into generated history data.
 - docs/benchmarks/: hand-authored static benchmark dashboard served by GitHub Pages.
-- scripts/benchmarks2/README.md: benchmark scope, semantics, and comparison guidance.
+- scripts/benchmarks/README.md: benchmark scope, semantics, and comparison guidance.
 - docs/architecture.md: current data flow and boundaries.
 - docs/benchmarking.md: canonical benchmark applicability, interpretation, and handoff evidence policy.
 - docs/product-fit.md: initial audience, representative workloads, product promise, non-goals, and validation needs.
@@ -127,7 +127,7 @@ Run these from the repository root:
 - just bench-compare-cluster runs the documented RF=3 durable-publish comparison against three-node Kafka, Redpanda, and JetStream clusters.
 - just bench-dashboard builds local history data from JSON files under benchmark-results/.
 - just bench-test runs the benchmark normalization and dashboard tests.
-- python3 scripts/benchmarks2/pr_report.py renders a pull-request benchmark JSON artifact as a Markdown report.
+- python3 scripts/benchmarks/pr_report.py renders a pull-request benchmark JSON artifact as a Markdown report.
 - just audit runs cargo-audit when it is installed.
 - ./scripts/verify.sh is a thin compatibility wrapper for just verify.
 

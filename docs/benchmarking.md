@@ -1,6 +1,6 @@
 # Benchmarking and performance evidence
 
-This document is the shared policy for deciding when to benchmark, interpreting benchmark results, and reporting performance evidence. The `justfile` and benchmark scripts define executable behavior; [scripts/benchmarks2/README.md](../scripts/benchmarks2/README.md) documents workload and harness details.
+This document is the shared policy for deciding when to benchmark, interpreting benchmark results, and reporting performance evidence. The `justfile` and benchmark scripts define executable behavior; [scripts/benchmarks/README.md](../scripts/benchmarks/README.md) documents workload and harness details.
 
 ## When to benchmark
 
@@ -55,3 +55,5 @@ Workers must report these fields even when a benchmark was not required or could
 ## History and comparisons
 
 Repeated benchmark history is aggregated by median while retaining raw samples and observed ranges. Compare a history point only with a compatible suite, workload, resource budget, broker image, measurement boundary, and comparison mode. Native competitor results are engineering baselines with explicitly different client and acknowledgement semantics; they are not a final product ranking.
+
+Raw benchmark artifacts use one version-2 envelope across single-node, clustered, comparison, and pull-request runs. The envelope carries run identity, full source and environment provenance, workload and resource limits, target semantics, scenario metrics, recovery metadata, and optional broker `/metrics` deltas. Normalized history is a deliberately smaller projection; retain the raw artifacts when diagnosing a result or making a performance claim.

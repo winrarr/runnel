@@ -8,9 +8,11 @@ import os
 import platform
 import socket
 import subprocess
+import sys
 import time
 import urllib.error
 import urllib.request
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Callable
 
@@ -70,6 +72,67 @@ def request_ok(
     if response.get("type") != response_type:
         raise BenchmarkError(f"unexpected response to {request.get('op')}: {response}")
     return response, elapsed
+
+
+def prometheus_metrics(http_port: int) -> dict[str, float] | None:
+    """Read a bounded Prometheus snapshot from one broker endpoint."""
+    try:
+        with urllib.request.urlopen(
+            f"http://127.0.0.1:{http_port}/metrics", timeout=1
+        ) as response:
+            body = response.read().decode("utf-8")
+    except (urllib.error.URLError, TimeoutError, OSError):
+        return None
+
+    metrics: dict[str, float] = {}
+    for line in body.splitlines():
+        if not line or line.startswith("#"):
+            continue
+        fields = line.split()
+        if len(fields) < 2:
+            continue
+        try:
+            metrics[fields[0]] = float(fields[1])
+        except ValueError:
+            continue
+    return metrics
+
+
+def metric_delta(
+    before: dict[str, float] | None, after: dict[str, float] | None
+) -> dict[str, Any]:
+    """Return a bounded scenario-scoped delta for a metrics endpoint."""
+    if before is None or after is None:
+        return {"available": False, "source": "GET /metrics"}
+    return {
+        "available": True,
+        "source": "GET /metrics",
+        "delta": {
+            name: after[name] - before[name]
+            for name in sorted(before.keys() & after.keys())
+        },
+    }
+
+
+def result_metadata(
+    run_id: str,
+    started_at: datetime,
+    *,
+    benchmark_suite: str,
+    comparison_mode: str,
+    docker: bool = False,
+) -> dict[str, Any]:
+    """Build the common envelope shared by every raw benchmark result."""
+    return {
+        "schema_version": 2,
+        "run_id": run_id,
+        "started_at": started_at.isoformat(),
+        "command": list(sys.argv),
+        "source": source_metadata(full_revision=True),
+        "environment": environment_metadata(docker=docker),
+        "benchmark_suite": benchmark_suite,
+        "comparison_mode": comparison_mode,
+    }
 
 
 def create_stream(client: LineClient, stream: str) -> None:
@@ -193,11 +256,17 @@ def metric(
         raise BenchmarkError(f"scenario {operation} produced no measured messages")
     elapsed_seconds = elapsed_ns / 1_000_000_000
     result: dict[str, Any] = {
+        "scenario_id": f"{operation}:{message_size}",
         "operation": operation,
         "messages": len(latencies_ns),
         "message_size_bytes": message_size,
         "elapsed_seconds": elapsed_seconds,
+        "elapsed_milliseconds": elapsed_seconds * 1_000,
         "throughput_messages_per_second": len(latencies_ns) / elapsed_seconds,
+        "throughput_megabytes_per_second": (
+            len(latencies_ns) * message_size / elapsed_seconds / 1_000_000
+        ),
+        "latency_sample_count": len(latencies_ns),
         "latency_microseconds": {
             "p50": percentile(latencies_ns, 50) / 1_000,
             "p99": percentile(latencies_ns, 99) / 1_000,
@@ -211,8 +280,12 @@ def metric(
 
 
 def measure_scenario(
-    measurements: Any, operation: Callable[[], dict[str, Any]]
+    measurements: Any,
+    operation: Callable[[], dict[str, Any]],
+    *,
+    metrics: Callable[[], dict[str, float] | None] | None = None,
 ) -> dict[str, Any]:
+    metrics_before = metrics() if metrics else None
     token = measurements.begin()
     try:
         result = operation()
@@ -220,6 +293,8 @@ def measure_scenario(
         measurements.end(token)
         raise
     result["resource_samples"] = measurements.end(token)
+    if metrics:
+        result["server_metrics"] = metric_delta(metrics_before, metrics())
     return result
 
 
@@ -230,6 +305,7 @@ def measure_message_batch(
     action: Callable[[], list[int]],
     *,
     metadata: dict[str, Any] | None = None,
+    metrics: Callable[[], dict[str, float] | None] | None = None,
 ) -> dict[str, Any]:
     """Time one batch of request latencies and attach resource measurements."""
     def measured() -> dict[str, Any]:
@@ -243,7 +319,7 @@ def measure_message_batch(
             metadata=metadata,
         )
 
-    return measure_scenario(measurements, measured)
+    return measure_scenario(measurements, measured, metrics=metrics)
 
 
 def wait_for_ready(http_port: int, *, timeout_seconds: float = DEFAULT_TIMEOUT_SECONDS) -> None:
@@ -355,15 +431,11 @@ def build_image(image: str) -> None:
     subprocess.run(["docker", "build", "--tag", image, str(ROOT)], check=True)
 
 
-def host_metadata() -> dict[str, Any]:
-    """Return host fields shared by the single-node and cluster artifacts."""
-    metadata = environment_metadata()
-    metadata.pop("host", None)
-    return metadata
-
-
 def write_json_result(output: Path, result: dict[str, Any]) -> None:
     """Write and print one machine-readable benchmark artifact."""
+    result.setdefault("status", "complete")
+    result.setdefault("generated_at", datetime.now(UTC).isoformat())
+    result.setdefault("finished_at", result["generated_at"])
     serialized = json.dumps(result, indent=2)
     output.parent.mkdir(parents=True, exist_ok=True)
     output.write_text(serialized + "\n", encoding="utf-8")

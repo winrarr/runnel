@@ -73,6 +73,39 @@ class HistoryTests(unittest.TestCase):
             0.25,
         )
 
+    def test_normalization_preserves_canonical_provenance_and_server_metrics(self) -> None:
+        raw = comparison_result()
+        raw.update(
+            {
+                "schema_version": 2,
+                "run_id": "run-1",
+                "started_at": "2026-08-20T08:57:55+00:00",
+                "finished_at": "2026-08-20T08:57:57+00:00",
+                "status": "complete",
+                "command": ["cluster.py", "--messages", "10"],
+                "source": {"revision": "full-sha", "run_id": "ci-1"},
+                "environment": {"host": "bench-host", "cpus": 4},
+                "comparison_guardrail": {"ranking_eligible": False},
+            }
+        )
+        raw["backends"]["runnel"]["scenarios"][0]["server_metrics"] = {
+            "available": True,
+            "source": "GET /metrics",
+            "delta": {"runnel_publishes_total": 10.0},
+        }
+
+        normalized = normalize_result(raw, source_name="raw.json")
+
+        self.assertEqual(normalized["schema_version"], 2)
+        self.assertEqual(normalized["run_id"], "run-1")
+        self.assertEqual(normalized["source"]["revision"], "full-sha")
+        self.assertEqual(normalized["environment"]["host"], "bench-host")
+        self.assertEqual(normalized["comparison_guardrail"]["ranking_eligible"], False)
+        self.assertEqual(
+            normalized["backends"]["runnel"]["scenarios"][0]["server_metrics"]["delta"],
+            {"runnel_publishes_total": 10.0},
+        )
+
     def test_site_points_include_latency_and_resources(self) -> None:
         normalized = normalize_result(comparison_result(), source_name="test.json")
         points = build_points([normalized])
@@ -129,12 +162,12 @@ class HistoryTests(unittest.TestCase):
             aggregated["repetition_runs"],
             [
                 {
-                    "run_id": first["source"]["run_id"],
+                    "run_id": first["run_id"],
                     "generated_at": "2026-08-20T08:57:56.024168+00:00",
                     "source_result": "first.json",
                 },
                 {
-                    "run_id": second["source"]["run_id"],
+                    "run_id": second["run_id"],
                     "generated_at": "2026-08-20T08:58:56.024168+00:00",
                     "source_result": "second.json",
                 },
