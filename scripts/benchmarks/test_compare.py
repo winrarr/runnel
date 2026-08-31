@@ -131,6 +131,43 @@ class ComparisonBenchmarkTests(unittest.TestCase):
         )
         self.assertFalse(semantic["comparison"]["apples_to_apples"])
         self.assertFalse(semantic["comparison"]["ranking_eligible"])
+        self.assertTrue(semantic["comparison"]["experimental"])
+        self.assertEqual(
+            semantic["comparison"]["mismatch_dimensions"],
+            list(compare.COMPARISON_MISMATCH_DIMENSIONS),
+        )
+
+    def test_backend_metadata_records_each_scenario_semantic_boundary(self) -> None:
+        for name, nodes in (
+            ("runnel", 1),
+            ("kafka", 1),
+            ("redpanda", 1),
+            ("nats", 1),
+            ("kafka", 3),
+            ("redpanda", 3),
+            ("nats", 3),
+        ):
+            with self.subTest(name=name, nodes=nodes):
+                semantic = compare.backend_metadata(name, nodes)["semantic_metadata"]
+                self.assertEqual(
+                    set(semantic["scenario_boundaries"]),
+                    set(semantic["scenario_classes"]),
+                )
+                for boundaries in semantic["scenario_boundaries"].values():
+                    self.assertEqual(set(boundaries), set(compare.SCENARIO_BOUNDARY_FIELDS))
+                    self.assertTrue(
+                        all(isinstance(value, str) and value for value in boundaries.values())
+                    )
+
+                record = self._complete_backend_record(name, nodes)
+                for scenario in record["scenarios"]:
+                    comparison_class = compare.scenario_comparison_class(
+                        scenario["operation"]
+                    )
+                    self.assertEqual(
+                        scenario["metadata"]["semantic_boundaries"],
+                        semantic["scenario_boundaries"][comparison_class],
+                    )
 
     def test_semantic_validation_accepts_complete_backend_records(self) -> None:
         cases = (
@@ -154,6 +191,24 @@ class ComparisonBenchmarkTests(unittest.TestCase):
         with self.assertRaisesRegex(compare.ComparisonError, "client_identity"):
             compare.validate_backend_record("runnel", record)
 
+    def test_semantic_validation_rejects_missing_scenario_boundary(self) -> None:
+        record = self._complete_backend_record("runnel")
+        del record["semantic_metadata"]["scenario_boundaries"]["publish-only"][
+            "latency_boundary"
+        ]
+
+        with self.assertRaisesRegex(compare.ComparisonError, "latency_boundary"):
+            compare.validate_backend_record("runnel", record)
+
+    def test_semantic_validation_rejects_scenario_replication_mismatch(self) -> None:
+        record = self._complete_backend_record("kafka", 3)
+        record["semantic_metadata"]["scenario_boundaries"]["publish-only"][
+            "replication_topology"
+        ] = "single broker"
+
+        with self.assertRaisesRegex(compare.ComparisonError, "replication topology"):
+            compare.validate_backend_record("kafka", record)
+
     def test_semantic_validation_rejects_mismatched_scenario_class(self) -> None:
         record = self._complete_backend_record("runnel")
         record["scenarios"][0]["metadata"]["comparison_class"] = "consume-with-ack"
@@ -171,6 +226,11 @@ class ComparisonBenchmarkTests(unittest.TestCase):
         compare.validate_comparison_summary(summary)
         self.assertFalse(summary["comparison_guardrail"]["apples_to_apples"])
         self.assertFalse(summary["comparison_guardrail"]["ranking_eligible"])
+        self.assertTrue(summary["comparison_guardrail"]["experimental"])
+        self.assertEqual(
+            summary["comparison_guardrail"]["mismatch_dimensions"],
+            list(compare.COMPARISON_MISMATCH_DIMENSIONS),
+        )
 
     def test_comparison_suite_distinguishes_single_and_three_node_runs(self) -> None:
         self.assertEqual(compare.benchmark_suite(1, ["runnel"]), "runnel")
