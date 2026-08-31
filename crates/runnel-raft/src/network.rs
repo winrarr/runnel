@@ -30,11 +30,12 @@ const MAX_REUSABLE_FRAME_BUFFER_SIZE: usize = 1024 * 1024;
 // Full registries evict idle pools by recency; busy pools use the bounded
 // fallback path instead of allowing an address burst to create unbounded work.
 const MAX_POOLED_PEERS: usize = 64;
-const MAX_CONNECTIONS_PER_POOLED_PEER: usize = 4;
+const MAX_CONNECTIONS_PER_POOLED_PEER: usize = 5;
 // Keep one connection available for Raft heartbeats and votes while forwarded
 // operations and data-group setup use the remaining bounded capacity. These
 // requests share a peer address, but control traffic must not wait behind a
-// slow data operation.
+// slow data operation. The extra shared slot keeps the control reservation
+// from reducing forwarding parallelism more than necessary.
 const RESERVED_CONTROL_CONNECTIONS_PER_POOLED_PEER: usize = 1;
 const MAX_SHARED_CONNECTIONS_PER_POOLED_PEER: usize =
     MAX_CONNECTIONS_PER_POOLED_PEER - RESERVED_CONTROL_CONNECTIONS_PER_POOLED_PEER;
@@ -1176,7 +1177,7 @@ mod tests {
     async fn concurrent_forwarding_uses_a_bounded_connection_pool() {
         const REQUESTS: usize = 32;
 
-        let peer = TestPeer::start_with_delay(None, Some(Duration::from_millis(5))).await;
+        let peer = TestPeer::start_with_delay(None, Some(Duration::from_millis(50))).await;
         let started = Instant::now();
         let mut tasks = Vec::with_capacity(REQUESTS);
         for _ in 0..REQUESTS {
@@ -1199,8 +1200,11 @@ mod tests {
             "concurrent topology-free forwarding: requests={REQUESTS}, connections={connections}, elapsed={:?}",
             started.elapsed()
         );
-        assert!(connections > 1);
-        assert!(connections <= MAX_SHARED_CONNECTIONS_PER_POOLED_PEER);
+        assert_eq!(connections, MAX_SHARED_CONNECTIONS_PER_POOLED_PEER);
+        assert_eq!(
+            peer.max_active_connections.load(Ordering::Relaxed),
+            MAX_SHARED_CONNECTIONS_PER_POOLED_PEER
+        );
     }
 
     async fn assert_reserved_control_connection(
@@ -1253,6 +1257,11 @@ mod tests {
         .await
         .expect("control traffic did not receive its reserved connection");
 
+        assert_eq!(
+            peer.max_active_connections.load(Ordering::Relaxed),
+            MAX_CONNECTIONS_PER_POOLED_PEER
+        );
+
         let error = control.await.unwrap().unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::TimedOut);
 
@@ -1279,7 +1288,7 @@ mod tests {
         const REQUESTS: usize = 16;
 
         let (mut registry, _held_pools) = busy_registry();
-        let peer = TestPeer::start_with_delay(None, Some(Duration::from_millis(5))).await;
+        let peer = TestPeer::start_with_delay(None, Some(Duration::from_millis(50))).await;
         let fallback_pool = registry.pool(&peer.address);
         assert!(fallback_pool.is_none());
         let frame_size = serde_json::to_vec(&request()).unwrap().len() + size_of::<u32>();
@@ -1306,9 +1315,9 @@ mod tests {
 
         assert_eq!(peer.connections.load(Ordering::Relaxed), REQUESTS);
         assert_eq!(peer.requests.load(Ordering::Relaxed), REQUESTS);
-        assert!(
-            peer.max_active_connections.load(Ordering::Relaxed)
-                <= MAX_SHARED_CONNECTIONS_PER_POOLED_PEER
+        assert_eq!(
+            peer.max_active_connections.load(Ordering::Relaxed),
+            MAX_SHARED_CONNECTIONS_PER_POOLED_PEER
         );
         assert_eq!(
             peer.framed_bytes.load(Ordering::Relaxed),
