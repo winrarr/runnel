@@ -427,13 +427,19 @@ def _format_observed_resources(sources: list[dict[str, Any]]) -> str | None:
 
 def _scenario_record(source: dict[str, Any], scenario: dict[str, Any]) -> dict[str, Any]:
     operation = scenario.get("operation") or scenario.get("name") or "unnamed"
-    return {
+    record = {
         "source": source["name"],
         "scenario": scenario,
         "operation": _bounded_text(operation),
         "messages": scenario.get("messages"),
         "message_size_bytes": scenario.get("message_size_bytes"),
     }
+    retained_messages = _number(
+        _mapping_or_empty(scenario.get("metadata")).get("retained_messages")
+    )
+    if retained_messages is not None:
+        record["retained_messages"] = retained_messages
+    return record
 
 
 def _metric_value(record: dict[str, Any], metric: str) -> float | int | None:
@@ -481,7 +487,9 @@ def _format_metric(metric: str, value: object) -> str | None:
     raise ValueError(f"unknown metric {metric}")
 
 
-def _scenario_identity(record: dict[str, Any], workload_key: str | None) -> tuple[str, str, str, str, str] | None:
+def _scenario_identity(
+    record: dict[str, Any], workload_key: str | None
+) -> tuple[str, str, str, str, str, str] | None:
     if workload_key is None:
         return None
     return (
@@ -490,6 +498,7 @@ def _scenario_identity(record: dict[str, Any], workload_key: str | None) -> tupl
         _bounded_text(record["operation"]),
         _canonical(record.get("messages")),
         _canonical(record.get("message_size_bytes")),
+        _canonical(record.get("retained_messages")),
     )
 
 
@@ -522,7 +531,7 @@ def _with_delta(formatted: str | None, current: object, baseline: object | None)
 def _render_table(
     title: str,
     records: list[dict[str, Any]],
-    baseline_records: dict[tuple[str, str, str, str, str], dict[str, Any]],
+    baseline_records: dict[tuple[str, str, str, str, str, str], dict[str, Any]],
     workload_key: str | None,
     metric_names: tuple[str, ...],
     multiple_sources: bool,
@@ -539,7 +548,13 @@ def _render_table(
         for metric in metric_names
         if any(_metric_value(record, metric) is not None for record in shown_records)
     ]
+    show_retained_messages = any(
+        record.get("retained_messages") is not None
+        for record in [*records, *baseline_records.values()]
+    )
     headers = (["Source"] if multiple_sources else []) + ["Operation", "Messages", "Size"]
+    if show_retained_messages:
+        headers.append("Retained")
     headers.extend(
         {
             "throughput": "Throughput",
@@ -576,6 +591,11 @@ def _render_table(
                 ),
             ]
         )
+        if show_retained_messages:
+            retained = record.get("retained_messages")
+            cells.append(
+                _cell(_format_scalar(retained) if retained is not None else "—")
+            )
         for metric in visible_metrics:
             current_value = _metric_value(record, metric)
             baseline_value = _metric_value(baseline_record, metric) if baseline_record else None
@@ -606,7 +626,7 @@ def render_report(
         if isinstance(scenario, dict)
     ]
 
-    baseline_records: dict[tuple[str, str, str, str, str], dict[str, Any]] = {}
+    baseline_records: dict[tuple[str, str, str, str, str, str], dict[str, Any]] = {}
     baseline_scenario_records: list[dict[str, Any]] = []
     baseline_sources: list[dict[str, Any]] = []
     baseline_workload_key: str | None = None
@@ -666,9 +686,9 @@ def render_report(
             _scenario_identity(record, current_workload_key) in baseline_records
             for record in current_records[:MAX_SCENARIOS]
         ):
-            lines.append("> Baseline deltas are shown only for matching operation, message count, and message size.")
+            lines.append("> Baseline deltas are shown only for matching operation, message count, and message size (and retained-history size when present).")
         else:
-            lines.append("> Baseline deltas compare matching workload, operation, message count, and message size.")
+            lines.append("> Baseline deltas compare matching workload, operation, message count, and message size (and retained-history size when present).")
 
     lines.append("")
     if baseline is not None:

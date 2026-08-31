@@ -1,7 +1,9 @@
+import argparse
 import sys
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 
@@ -9,13 +11,18 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 sys.path.insert(0, str(SCRIPT_DIR))
 
 from cluster import (  # noqa: E402
+    BenchmarkError,
     metric,
+    MIN_RETAINED_RECOVERY_MESSAGES,
+    DEFAULT_RETAINED_RECOVERY_MESSAGES,
     parse_args,
     parse_nonnegative_int,
+    parse_retained_messages,
     percentile,
     poll_until_redelivered,
     process_stats,
     resource_limits,
+    run_retained_recovery,
 )
 from profile import summarize_timing_logs  # noqa: E402
 
@@ -94,6 +101,101 @@ class ClusterBenchmarkTests(unittest.TestCase):
         ):
             with self.assertRaises(SystemExit):
                 parse_args()
+
+    def test_retained_recovery_messages_default_and_boundary_are_above_tail_index(self) -> None:
+        with patch.object(sys, "argv", ["cluster.py"]):
+            args = parse_args()
+
+        self.assertEqual(args.retained_messages, DEFAULT_RETAINED_RECOVERY_MESSAGES)
+        self.assertEqual(
+            parse_retained_messages(str(MIN_RETAINED_RECOVERY_MESSAGES)),
+            MIN_RETAINED_RECOVERY_MESSAGES,
+        )
+
+    def test_retained_recovery_messages_reject_invalid_bounds(self) -> None:
+        with self.assertRaises(argparse.ArgumentTypeError):
+            parse_retained_messages(str(MIN_RETAINED_RECOVERY_MESSAGES - 1))
+        with self.assertRaises(argparse.ArgumentTypeError):
+            parse_retained_messages("not-an-integer")
+
+        with patch.object(
+            sys,
+            "argv",
+            ["cluster.py", "--retained-messages", str(MIN_RETAINED_RECOVERY_MESSAGES - 1)],
+        ):
+            with self.assertRaises(SystemExit):
+                parse_args()
+
+    def test_retained_recovery_restarts_and_probes_earliest_record(self) -> None:
+        cluster = SimpleNamespace(
+            node_count=3,
+            nodes=[SimpleNamespace(node_id=1)],
+            stats=object(),
+            metrics=lambda: None,
+            restart_node=lambda _: 2_000_000,
+            client=lambda _: SimpleNamespace(close=lambda: None),
+        )
+        retained_messages = MIN_RETAINED_RECOVERY_MESSAGES
+        payload = "payload"
+
+        def run_measurement(_stats: object, operation: object, **_: object) -> dict:
+            return operation()
+
+        with (
+            patch("cluster.preload") as preload,
+            patch("cluster.measure_scenario", side_effect=run_measurement),
+            patch("cluster.poll", return_value=({"offset": 0, "payload": payload}, 100)),
+            patch("cluster.acknowledge", return_value=200) as acknowledge,
+        ):
+            result = run_retained_recovery(
+                cluster, "retained-events", payload, retained_messages
+            )
+
+        preload.assert_called_once_with(
+            cluster, "retained-events", payload, retained_messages
+        )
+        acknowledge.assert_called_once()
+        self.assertEqual(result["operation"], "cluster_retained_recovery")
+        self.assertEqual(result["metadata"]["retained_messages"], retained_messages)
+        self.assertEqual(
+            result["metadata"]["retained_logical_payload_bytes"],
+            retained_messages * len(payload),
+        )
+        self.assertEqual(result["restart_ready_seconds"], 0.002)
+
+    def test_retained_recovery_rejects_wrong_replayed_payload(self) -> None:
+        cluster = SimpleNamespace(
+            nodes=[SimpleNamespace(node_id=1)],
+            stats=object(),
+            metrics=lambda: None,
+            restart_node=lambda _: 0,
+            client=lambda _: SimpleNamespace(close=lambda: None),
+        )
+
+        def run_measurement(_stats: object, operation: object, **_: object) -> dict:
+            return operation()
+
+        with (
+            patch("cluster.preload"),
+            patch("cluster.measure_scenario", side_effect=run_measurement),
+            patch(
+                "cluster.poll",
+                return_value=({"offset": 0, "payload": "corrupt"}, 100),
+            ),
+            patch("cluster.acknowledge") as acknowledge,
+        ):
+            with self.assertRaisesRegex(
+                BenchmarkError,
+                "unexpected payload",
+            ):
+                run_retained_recovery(
+                    cluster,
+                    "retained-events",
+                    "payload",
+                    MIN_RETAINED_RECOVERY_MESSAGES,
+                )
+
+        acknowledge.assert_not_called()
 
     def test_container_runtime_records_per_broker_limits(self) -> None:
         with patch.object(

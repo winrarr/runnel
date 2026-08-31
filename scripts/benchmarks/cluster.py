@@ -62,6 +62,10 @@ DEFAULT_NODES = 3
 # but valid operations into redeliveries while measuring unrelated scenarios.
 DEFAULT_ACK_TIMEOUT_MS = 30_000
 DEFAULT_SLOW_CONSUMER_DELAY_MS = 10
+# Keep the retained-data probe beyond the local engine's bounded tail index so
+# recovery measurements exercise a non-trivial retained history.
+MIN_RETAINED_RECOVERY_MESSAGES = 1_025
+DEFAULT_RETAINED_RECOVERY_MESSAGES = 2_048
 COMMAND_TIMEOUT_SECONDS = 30.0
 
 
@@ -725,6 +729,53 @@ def run_restart_recovery(cluster: Cluster, stream: str, payload: str) -> dict[st
     return measure_scenario(cluster.stats, operation, metrics=cluster.metrics)
 
 
+def run_retained_recovery(
+    cluster: Cluster, stream: str, payload: str, retained_messages: int
+) -> dict[str, Any]:
+    """Measure restart recovery after preloading a bounded retained history.
+
+    The preload is deliberately excluded from the measured interval. The
+    measured probe restarts one node, waits for readiness, replays the earliest
+    record, and acknowledges it. This exercises recovery and cold replay with a
+    known retained-data size without inventing retention or batch semantics.
+    """
+    preload(cluster, stream, payload, retained_messages)
+
+    def operation() -> dict[str, Any]:
+        started = time.perf_counter_ns()
+        restart_ns = cluster.restart_node(0)
+        recovered = cluster.client(0)
+        try:
+            response, _ = poll(recovered, stream, "retained-recovery", 0)
+            if response.get("payload") != payload:
+                raise BenchmarkError(
+                    "retained recovery returned an unexpected payload at offset 0"
+                )
+            acknowledge(recovered, stream, "retained-recovery", 0)
+        finally:
+            recovered.close()
+        elapsed_ns = time.perf_counter_ns() - started
+        result = metric(
+            "cluster_retained_recovery",
+            [elapsed_ns],
+            elapsed_ns,
+            message_size=len(payload),
+            metadata={
+                "retained_messages": retained_messages,
+                "retained_logical_payload_bytes": retained_messages * len(payload),
+                "recovery_probe_offset": 0,
+                "publish_setup_excluded": True,
+                "latency_scope": "restart_ready_to_earliest_replay_acknowledgement",
+                "redelivery_expected": False,
+                "restarted_node": cluster.nodes[0].node_id,
+            },
+        )
+        result["restart_ready_seconds"] = restart_ns / 1_000_000_000
+        return result
+
+    return measure_scenario(cluster.stats, operation, metrics=cluster.metrics)
+
+
 def build_binary(binary: Path, *, features: str | None = None) -> None:
     command = ["cargo", "build", "--locked", "-p", "runnel-server", "--release"]
     if features:
@@ -755,6 +806,19 @@ def resource_limits(
     return {"processes": "host-scheduled; no cgroup limit"}
 
 
+def parse_retained_messages(value: str) -> int:
+    try:
+        messages = int(value)
+    except ValueError as error:
+        raise argparse.ArgumentTypeError("retained messages must be an integer") from error
+    if messages < MIN_RETAINED_RECOVERY_MESSAGES:
+        raise argparse.ArgumentTypeError(
+            "retained messages must exceed the current 1,024-record tail index "
+            f"(minimum: {MIN_RETAINED_RECOVERY_MESSAGES})"
+        )
+    return messages
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--binary", type=Path, default=DEFAULT_BINARY)
@@ -779,8 +843,21 @@ def parse_args() -> argparse.Namespace:
         default=DEFAULT_SLOW_CONSUMER_DELAY_MS,
         help="fixed processing delay before each slow-consumer acknowledgement",
     )
+    parser.add_argument(
+        "--retained-messages",
+        type=parse_retained_messages,
+        default=DEFAULT_RETAINED_RECOVERY_MESSAGES,
+        help=(
+            "retained records preloaded for the restart-recovery growth probe "
+            f"(minimum: {MIN_RETAINED_RECOVERY_MESSAGES})"
+        ),
+    )
     parser.add_argument("--payload-sizes", type=parse_sizes, default=[100, 1024])
-    parser.add_argument("--skip-recovery", action="store_true")
+    parser.add_argument(
+        "--skip-recovery",
+        action="store_true",
+        help="skip both restart-recovery scenarios",
+    )
     parser.add_argument("--output", type=Path)
     parser.add_argument("--log-dir", type=Path)
     args = parser.parse_args()
@@ -855,10 +932,36 @@ def main() -> int:
                 scenarios.append(
                     run_restart_recovery(cluster, f"cluster_{run_id}_recovery_{size}", payload)
                 )
+                scenarios.append(
+                    run_retained_recovery(
+                        cluster,
+                        f"cluster_{run_id}_retained_recovery_{size}",
+                        payload,
+                        args.retained_messages,
+                    )
+                )
     finally:
         cluster.close()
 
     startup_seconds = cluster.startup_ns / 1_000_000_000
+    workload = {
+        "messages": args.messages,
+        "warmup": args.warmup,
+        "concurrency": args.concurrency,
+        "nodes": args.nodes,
+        "ack_timeout_ms": args.ack_timeout_ms,
+        "slow_consumer_delay_ms": args.slow_consumer_delay_ms,
+        "payload_sizes_bytes": args.payload_sizes,
+        "runtime": args.runtime,
+        "protocol": "line-delimited JSON with UTF-8 string payloads",
+        "protocol_version": "provisional-line-json-v1",
+        "payload_encoding": "utf-8",
+        "compression": "none",
+        "durability": "committed by the current three-node Raft quorum and local durable state",
+    }
+    if not args.skip_recovery:
+        workload["retained_recovery_messages"] = args.retained_messages
+
     result = {
         **result_metadata(
             run_id,
@@ -870,21 +973,7 @@ def main() -> int:
         "resource_limits": resource_limits(
             runtime=args.runtime, cpus=args.cpus, memory=args.memory
         ),
-        "workload": {
-            "messages": args.messages,
-            "warmup": args.warmup,
-            "concurrency": args.concurrency,
-            "nodes": args.nodes,
-            "ack_timeout_ms": args.ack_timeout_ms,
-            "slow_consumer_delay_ms": args.slow_consumer_delay_ms,
-            "payload_sizes_bytes": args.payload_sizes,
-            "runtime": args.runtime,
-            "protocol": "line-delimited JSON with UTF-8 string payloads",
-            "protocol_version": "provisional-line-json-v1",
-            "payload_encoding": "utf-8",
-            "compression": "none",
-            "durability": "committed by the current three-node Raft quorum and local durable state",
-        },
+        "workload": workload,
         "backends": {
             "runnel-cluster": {
                 "image": args.image if args.runtime == "container" else str(args.binary),

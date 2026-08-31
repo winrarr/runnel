@@ -152,6 +152,31 @@ class PrReportTests(unittest.TestCase):
         self.assertIn("Default branch benchmark", report_with_baseline)
         self.assertIn("200 msg/s (Δ +100.0%)", report_with_baseline)
 
+    def test_reports_retained_history_dimension_for_recovery_scenarios(self) -> None:
+        result = container_result()
+        result["scenarios"][0].update(
+            {
+                "operation": "cluster_retained_recovery",
+                "metadata": {"retained_messages": 2048},
+            }
+        )
+
+        report = pr_report.render_report(result)
+
+        self.assertIn("| Operation | Messages | Size | Retained |", report)
+        self.assertIn("| cluster_retained_recovery | 100 | 100 B | 2,048 |", report)
+
+    def test_baseline_delta_requires_matching_retained_history_size(self) -> None:
+        current = container_result()
+        current["scenarios"][0]["metadata"] = {"retained_messages": 2048}
+        baseline = copy.deepcopy(current)
+        baseline["scenarios"][0]["metadata"] = {"retained_messages": 4096}
+
+        report = pr_report.render_report(current, baseline)
+
+        self.assertIn("Retained", report)
+        self.assertNotIn("Δ", report)
+
     def test_reports_aggregate_metadata(self) -> None:
         result = container_result()
         del result["git_revision"]

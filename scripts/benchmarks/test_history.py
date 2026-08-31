@@ -10,7 +10,7 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 sys.path.insert(0, str(SCRIPT_DIR))
 
 from build_history import build_points, load_runs, site_data  # noqa: E402
-from aggregate import aggregate_results  # noqa: E402
+from aggregate import AggregationError, aggregate_results  # noqa: E402
 from normalize import normalize_result  # noqa: E402
 from resources import parse_cpu_stat, summarize_stats  # noqa: E402
 
@@ -106,6 +106,29 @@ class HistoryTests(unittest.TestCase):
             {"runnel_publishes_total": 10.0},
         )
 
+    def test_normalization_preserves_retained_recovery_workload_metadata(self) -> None:
+        raw = comparison_result()
+        raw["schema_version"] = 2
+        raw["backends"]["runnel"]["scenarios"][0].update(
+            {
+                "operation": "cluster_retained_recovery",
+                "metadata": {
+                    "retained_messages": 2048,
+                    "retained_logical_payload_bytes": 204_800,
+                },
+            }
+        )
+
+        normalized = normalize_result(raw, source_name="retained.json")
+        scenario = normalized["backends"]["runnel"]["scenarios"][0]
+
+        self.assertEqual(scenario["operation"], "cluster_retained_recovery")
+        self.assertEqual(scenario["metadata"]["retained_messages"], 2048)
+        self.assertEqual(
+            scenario["metadata"]["retained_logical_payload_bytes"],
+            204_800,
+        )
+
     def test_site_points_include_latency_and_resources(self) -> None:
         normalized = normalize_result(comparison_result(), source_name="test.json")
         points = build_points([normalized])
@@ -189,6 +212,25 @@ class HistoryTests(unittest.TestCase):
         self.assertEqual(current["evidence"]["repetition_count"], 2)
         self.assertEqual(current["evidence"]["sample_coverage_percent"], 100.0)
         self.assertEqual(current["evidence"]["sample_values"], [1000.0, 2000.0])
+
+    def test_aggregation_rejects_mixed_retained_history_sizes(self) -> None:
+        first_raw = comparison_result()
+        first_raw["schema_version"] = 2
+        first_raw["workload"]["retained_recovery_messages"] = 2048
+        first_raw["backends"]["runnel"]["scenarios"][0]["metadata"] = {
+            "retained_messages": 2048
+        }
+        second_raw = copy.deepcopy(first_raw)
+        second_raw["workload"]["retained_recovery_messages"] = 4096
+        second_raw["backends"]["runnel"]["scenarios"][0]["metadata"] = {
+            "retained_messages": 4096
+        }
+
+        first = normalize_result(first_raw, source_name="first.json")
+        second = normalize_result(second_raw, source_name="second.json")
+
+        with self.assertRaisesRegex(AggregationError, "workload"):
+            aggregate_results([first, second])
 
     def test_legacy_aggregate_without_samples_remains_readable(self) -> None:
         first = normalize_result(comparison_result(), source_name="first.json")
