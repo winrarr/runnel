@@ -59,12 +59,12 @@ Parallel runs are suitable for exploratory correctness checks and rough optimiza
 
 For any worker task that can affect throughput, latency, CPU, memory, batching,
 I/O, or scheduling, follow [docs/benchmarking.md](../../../docs/benchmarking.md)
-and first map the changed runtime path to the standard benchmark coverage. Run
-the canonical local benchmark before claiming an improvement. If the standard
-benchmark does not exercise the changed path, determine whether a focused
-targeted benchmark can be added or run with reasonable effort and controlled
-resources; when it can, the worker must run it before claiming an improvement
-or recommending that an optimization PR merge. Use
+and first determine whether the standard benchmark meaningfully covers the PR's
+changes. Run the canonical local benchmark before claiming an improvement. If
+the standard benchmark does not meaningfully cover the PR, evaluate whether a
+focused targeted benchmark would be relevant and feasible with reasonable
+effort and controlled resources; when it is, the worker must run it before
+claiming an improvement or recommending that an optimization PR merge. Use
 `just bench-pr-local` after committing; if it is inconclusive, use
 `just bench-pr-local-until-stable` to retry complete authoritative comparisons.
 A one-pair command such as `just bench-pr-local-quick` is an explicit
@@ -87,7 +87,7 @@ Tell each worker to:
 - classify the work by one primary evidence class and optional secondary tags, follow the applicable gate in [docs/testing.md](../../../docs/testing.md), and do not use a classification to waive global safety, baseline, CI, pull-request, or cleanup requirements;
 - use the repository's canonical `just` commands and existing benchmark harnesses;
 - record the exact revision, workload, resource limits, isolation settings, and commands;
-- for performance-sensitive work, map the changed runtime path to the standard benchmark coverage, run the local benchmark sequentially with a fixed CPU/memory budget, and record the actual repetition count, stability thresholds, and stable status; if standard coverage misses the changed path, run a feasible focused targeted benchmark as well, or record why no such benchmark can be run; treat an inconclusive authoritative run as unfinished evidence;
+- for performance-sensitive work, determine whether the standard benchmark meaningfully covers the PR, run the local benchmark sequentially with a fixed CPU/memory budget, and record the actual repetition count, stability thresholds, and stable status; if standard coverage is insufficient, run a focused targeted benchmark when it is relevant and feasible, or record why no such benchmark can be run; treat an inconclusive authoritative run as unfinished evidence;
 - distinguish a confirmed improvement from noise, a blocked run, and an inconclusive result;
 - report changed files, correctness and crash-recovery considerations, test results, and remaining risks. Follow [docs/testing.md](../../../docs/testing.md) for the class-specific merge gate and [docs/benchmarking.md](../../../docs/benchmarking.md) for expected effects, non-performance improvements, benchmark applicability, exact findings, repetition and stability results, directional medians, outlier diagnostics, and the evidence-based recommendation to merge, revise, rerun, or defer. Include blocked or inconclusive results rather than omitting them;
 - report the recorded baseline revision and whether the branch was refreshed;
