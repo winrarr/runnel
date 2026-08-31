@@ -6,7 +6,7 @@ This document is the shared policy for deciding when to benchmark, interpreting 
 
 Benchmark a change when its goal is to improve throughput, latency, or tail latency, or when it changes a hot path with a plausible runtime effect. Performance-neutral documentation, tests, and configuration changes do not need the pull-request comparison unless they plausibly change runtime cost.
 
-Before running a benchmark, state the expected effects and non-effects: the behavior, runtime path, workload, and resource dimensions that should change or remain unchanged. Separate correctness, recovery, resource, operational, and test improvements from performance claims. A benchmark is useful only when it exercises the changed path; record any workload mismatch or coverage gap.
+Before running a benchmark, state the expected effects and non-effects: the behavior, runtime path, workload, and resource dimensions that should change or remain unchanged. Separate correctness, recovery, resource, operational, and test improvements from performance claims. A benchmark is useful only when it exercises the changed path; record any workload mismatch or coverage gap. For a performance-sensitive change, map the changed path to the standard suite first. If standard coverage misses it and a focused targeted benchmark is feasible with reasonable effort and controlled resources, run that targeted benchmark before claiming an improvement or recommending the change for merge. If no targeted benchmark is feasible, record the concrete blocker and do not make a performance claim.
 
 ## Authoritative local comparison
 
@@ -45,6 +45,7 @@ Every feature or bug-fix handoff that could affect performance must include:
 - expected effects and non-effects, including behavior, runtime paths, workloads, and resource dimensions;
 - correctness, recovery, resource, operational, and test improvements separately from performance claims;
 - whether each benchmark was required, whether it exercised the changed path, and its coverage gaps;
+- whether standard coverage exercised the changed path and, when it did not, whether a feasible targeted benchmark was run or why it could not be run;
 - the exact revision, `origin/main` baseline, workload, durability mode, resource limits, isolation, command, repetition count, stability thresholds, and result status;
 - directional scenario medians, raw range failures, and outlier diagnostics when available;
 - any blocked, noisy, inconclusive, or regressed result; and
