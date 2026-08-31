@@ -50,8 +50,27 @@ READINESS_COMMAND_TIMEOUT = 10
 RESOURCE_COMMAND_TIMEOUT = 2
 NATIVE_COMPARISON_CLASSIFICATION = "native-tool-baseline"
 NATIVE_COMPARISON_REASON = (
-    "native clients and operation-specific acknowledgement and measurement boundaries "
-    "are not an apples-to-apples end-to-end ranking"
+    "native clients and operation-specific acknowledgement, durability, replication, "
+    "delivery, batching, client, and latency boundaries are not an apples-to-apples "
+    "end-to-end ranking"
+)
+COMPARISON_MISMATCH_DIMENSIONS = (
+    "acknowledgement",
+    "durability",
+    "replication",
+    "delivery",
+    "batching",
+    "client",
+    "latency",
+)
+SCENARIO_BOUNDARY_FIELDS = (
+    "acknowledgement_boundary",
+    "durability_boundary",
+    "replication_topology",
+    "delivery_boundary",
+    "batching_boundary",
+    "client_boundary",
+    "latency_boundary",
 )
 SCENARIO_COMPARISON_CLASSES = {
     "publish": "publish-only",
@@ -87,10 +106,22 @@ def annotate_scenario_metadata(backend: dict[str, Any]) -> None:
     scenarios = backend.get("scenarios")
     if not isinstance(scenarios, list) or not scenarios:
         raise ComparisonError("backend result must contain at least one scenario")
+    semantic = backend.get("semantic_metadata")
+    if not isinstance(semantic, dict):
+        raise ComparisonError("backend result is missing semantic_metadata")
+    scenario_boundaries = semantic.get("scenario_boundaries")
+    if not isinstance(scenario_boundaries, dict):
+        raise ComparisonError("backend result is missing scenario_boundaries metadata")
     for index, scenario in enumerate(scenarios):
         if not isinstance(scenario, dict):
             raise ComparisonError(f"backend scenario {index} is not an object")
-        comparison_class = scenario_comparison_class(scenario.get("operation"))
+        comparison_class = scenario_comparison_class(scenario_operation(scenario))
+        boundaries = scenario_boundaries.get(comparison_class)
+        if not isinstance(boundaries, dict):
+            raise ComparisonError(
+                f"backend scenario {index} is missing semantic boundaries for "
+                f"{comparison_class!r}"
+            )
         existing_metadata = scenario.get("metadata", {})
         if not isinstance(existing_metadata, dict):
             raise ComparisonError(f"backend scenario {index} metadata is not an object")
@@ -100,9 +131,16 @@ def annotate_scenario_metadata(backend: dict[str, Any]) -> None:
                 f"backend scenario {index} declares comparison class {existing_class!r}, "
                 f"expected {comparison_class!r}"
             )
+        existing_boundaries = existing_metadata.get("semantic_boundaries")
+        if existing_boundaries is not None and existing_boundaries != boundaries:
+            raise ComparisonError(
+                f"backend scenario {index} declares semantic boundaries inconsistent "
+                f"with {comparison_class!r}"
+            )
         scenario["metadata"] = {
             **existing_metadata,
             "comparison_class": comparison_class,
+            "semantic_boundaries": dict(boundaries),
         }
 
 
@@ -145,6 +183,38 @@ def validate_backend_record(name: str, backend: dict[str, Any]) -> None:
                 f"backend {name!r} has inconsistent {field}: {actual!r} != {expected!r}"
             )
 
+    declared_classes = semantic.get("scenario_classes")
+    if (
+        not isinstance(declared_classes, list)
+        or not declared_classes
+        or any(not isinstance(value, str) or not value for value in declared_classes)
+        or len(set(declared_classes)) != len(declared_classes)
+    ):
+        raise ComparisonError(f"backend {name!r} has incomplete scenario_classes metadata")
+
+    scenario_boundaries = semantic.get("scenario_boundaries")
+    if not isinstance(scenario_boundaries, dict):
+        raise ComparisonError(f"backend {name!r} is missing scenario_boundaries metadata")
+    if set(scenario_boundaries) != set(declared_classes):
+        raise ComparisonError(
+            f"backend {name!r} scenario boundaries do not match declared scenario classes"
+        )
+    for comparison_class in declared_classes:
+        boundaries = scenario_boundaries.get(comparison_class)
+        if not isinstance(boundaries, dict):
+            raise ComparisonError(
+                f"backend {name!r} has no semantic boundaries for {comparison_class!r}"
+            )
+        for field in SCENARIO_BOUNDARY_FIELDS:
+            boundary = _require_nonempty_text(
+                boundaries.get(field),
+                f"{field} for {name!r} {comparison_class!r}",
+            )
+            if field == "replication_topology" and boundary != replication:
+                raise ComparisonError(
+                    f"backend {name!r} {comparison_class!r} has inconsistent replication topology"
+                )
+
     client_identity = semantic.get("client_identity")
     if not isinstance(client_identity, dict):
         raise ComparisonError(f"backend {name!r} is missing a client_identity object")
@@ -174,15 +244,13 @@ def validate_backend_record(name: str, backend: dict[str, Any]) -> None:
         raise ComparisonError(f"backend {name!r} must be marked non-equivalent")
     if comparison.get("ranking_eligible") is not False:
         raise ComparisonError(f"backend {name!r} must not be ranking eligible")
-
-    declared_classes = semantic.get("scenario_classes")
-    if (
-        not isinstance(declared_classes, list)
-        or not declared_classes
-        or any(not isinstance(value, str) or not value for value in declared_classes)
-        or len(set(declared_classes)) != len(declared_classes)
-    ):
-        raise ComparisonError(f"backend {name!r} has incomplete scenario_classes metadata")
+    if comparison.get("experimental") is not True:
+        raise ComparisonError(f"backend {name!r} must be marked experimental")
+    mismatch_dimensions = comparison.get("mismatch_dimensions")
+    if mismatch_dimensions != list(COMPARISON_MISMATCH_DIMENSIONS):
+        raise ComparisonError(
+            f"backend {name!r} has incomplete comparison mismatch dimensions"
+        )
 
     scenarios = backend.get("scenarios")
     if not isinstance(scenarios, list) or not scenarios:
@@ -191,11 +259,17 @@ def validate_backend_record(name: str, backend: dict[str, Any]) -> None:
     for index, scenario in enumerate(scenarios):
         if not isinstance(scenario, dict):
             raise ComparisonError(f"backend {name!r} scenario {index} is not an object")
-        expected_class = scenario_comparison_class(scenario.get("operation"))
+        expected_class = scenario_comparison_class(scenario_operation(scenario))
         metadata = scenario.get("metadata")
         if not isinstance(metadata, dict) or metadata.get("comparison_class") != expected_class:
             raise ComparisonError(
-                f"backend {name!r} scenario {index} is missing comparison class {expected_class!r}"
+                f"backend {name!r} scenario {index} is missing comparison class "
+                f"{expected_class!r}"
+            )
+        if metadata.get("semantic_boundaries") != scenario_boundaries[expected_class]:
+            raise ComparisonError(
+                f"backend {name!r} scenario {index} is missing semantic metadata for "
+                f"{expected_class!r}"
             )
         observed_classes.add(expected_class)
     if observed_classes != set(declared_classes):
@@ -211,6 +285,8 @@ def comparison_guardrail_metadata(nodes: int) -> dict[str, Any]:
         "classification": NATIVE_COMPARISON_CLASSIFICATION,
         "apples_to_apples": False,
         "ranking_eligible": False,
+        "experimental": True,
+        "mismatch_dimensions": list(COMPARISON_MISMATCH_DIMENSIONS),
         "scenario_scope": "publish-only" if nodes == THREE_NODE_COUNT else "publish and consume",
         "reason": NATIVE_COMPARISON_REASON,
     }
@@ -1104,15 +1180,50 @@ def backend_metadata(name: str, nodes: int) -> dict[str, Any]:
         client_image = "host Python runtime"
         client_name = "host Python socket client"
         scenario_classes = ["publish-only", "consume-with-ack"]
+        scenario_boundaries = {
+            "publish-only": {
+                "acknowledgement_boundary": "publish response after the local durable append",
+                "durability_boundary": (
+                    "current local broker durable-append default; no replica quorum"
+                ),
+                "replication_topology": replication,
+                "delivery_boundary": "not applicable to publish-only",
+                "batching_boundary": (
+                    "one in-flight publish request per message; concurrency=1; no client batching"
+                ),
+                "client_boundary": "host Python socket client using the host Python runtime",
+                "latency_boundary": (
+                    "per-message publish request send-to-response; p50/p99/p99.9/max are recorded"
+                ),
+            },
+            "consume-with-ack": {
+                "acknowledgement_boundary": (
+                    "ack response after the local consumer checkpoint is persisted"
+                ),
+                "durability_boundary": "consumer checkpoint persistence on the single local broker",
+                "replication_topology": replication,
+                "delivery_boundary": (
+                    "one poll followed by one acknowledgement per message; at-least-once delivery"
+                ),
+                "batching_boundary": (
+                    "one poll-and-ack sequence per message; concurrency=1; no client batching"
+                ),
+                "client_boundary": "host Python socket client using the host Python runtime",
+                "latency_boundary": (
+                    "per-message poll-and-ack sequence; p50/p99/p99.9/max are recorded"
+                ),
+            },
+        }
     elif name in {"kafka", "redpanda"}:
         client_image = KAFKA_IMAGE
         client_name = "Kafka producer/consumer performance clients"
         scenario_classes = ["publish-only", "consume-without-ack"]
         if nodes == THREE_NODE_COUNT:
-            acknowledgement = (
+            publish_acknowledgement = (
                 "Kafka producer performance client with acks=all and idempotence enabled; "
                 "topic min.insync.replicas=3"
             )
+            acknowledgement = publish_acknowledgement
             replication = (
                 "three broker nodes, one partition, replication factor three, "
                 "min.insync.replicas three"
@@ -1123,15 +1234,66 @@ def backend_metadata(name: str, nodes: int) -> dict[str, Any]:
             )
             client_name = "Kafka producer performance client"
             scenario_classes = ["publish-only"]
+            publish_durability = (
+                "one-partition broker log with replication factor three and min.insync.replicas=3; "
+                "filesystem flush behavior is not asserted"
+            )
         else:
+            publish_acknowledgement = "Kafka producer performance client with acks=all"
             acknowledgement = (
-                "Kafka producer performance client with acks=all; consumer perf client "
-                "measures fetch throughput without per-record application acknowledgement"
+                f"{publish_acknowledgement}; consumer perf client measures fetch throughput "
+                "without per-record application acknowledgement"
             )
             replication = "single broker, one partition, replication factor one"
             measurement_boundary = (
                 "Kafka producer/consumer performance clients over the Kafka protocol"
             )
+            publish_durability = (
+                "one-partition broker log with replication factor one and acks=all; "
+                "filesystem flush behavior is not asserted"
+            )
+        scenario_boundaries = {
+            "publish-only": {
+                "acknowledgement_boundary": publish_acknowledgement,
+                "durability_boundary": publish_durability,
+                "replication_topology": replication,
+                "delivery_boundary": "not applicable to publish-only",
+                "batching_boundary": (
+                    "Kafka producer perf client uses linger.ms=0 and the default batch.size; "
+                    "native client batching remains possible"
+                ),
+                "client_boundary": f"{client_name} from {client_image}",
+                "latency_boundary": (
+                    "native Kafka producer latency includes client-side batching and reports "
+                    "avg/p50/p95/p99/p99.9/max"
+                ),
+            },
+        }
+        if nodes == 1:
+            scenario_boundaries["consume-without-ack"] = {
+                "acknowledgement_boundary": (
+                    "native consumer perf fetch throughput; no per-record application "
+                    "acknowledgement"
+                ),
+                "durability_boundary": (
+                    "reads the single broker's log with replication factor one; consumer fetch is "
+                    "not a durability acknowledgement"
+                ),
+                "replication_topology": replication,
+                "delivery_boundary": (
+                    "native consumer performance client fetches records through a consumer group; "
+                    "no application-level delivery acknowledgement"
+                ),
+                "batching_boundary": (
+                    "native consumer fetch batching; application batch size and per-message "
+                    "processing are not measured"
+                ),
+                "client_boundary": f"Kafka consumer performance client from {client_image}",
+                "latency_boundary": (
+                    "per-record consumer latency is unavailable; output reports elapsed "
+                    "fetch throughput"
+                ),
+            }
     elif nodes == THREE_NODE_COUNT:
         acknowledgement = (
             "JetStream synchronous publish PubAck to a file-backed stream configured with "
@@ -1142,6 +1304,30 @@ def backend_metadata(name: str, nodes: int) -> dict[str, Any]:
         client_image = NATS_BOX_IMAGE
         client_name = "nats bench js native synchronous publisher"
         scenario_classes = ["publish-only"]
+        scenario_boundaries = {
+            "publish-only": {
+                "acknowledgement_boundary": (
+                    "synchronous JetStream PubAck after publishing to the three-replica stream"
+                ),
+                "durability_boundary": (
+                    "file-backed stream with three replicas; synchronous PubAck; exact filesystem "
+                    "flush behavior is not asserted"
+                ),
+                "replication_topology": replication,
+                "delivery_boundary": "not applicable to publish-only",
+                "batching_boundary": (
+                    "nats bench js pub sync publishes one message at a time; no explicit "
+                    "client batch"
+                ),
+                "client_boundary": (
+                    f"nats bench js native synchronous publisher from {client_image}"
+                ),
+                "latency_boundary": (
+                    "native synchronous publisher stats measure publish acknowledgement latency "
+                    "and report min/avg/p50/p90/p99/p99.9/max"
+                ),
+            },
+        }
     else:
         acknowledgement = (
             "JetStream synchronous publish PubAck; durable consumer explicit acknowledgement "
@@ -1152,6 +1338,54 @@ def backend_metadata(name: str, nodes: int) -> dict[str, Any]:
         client_image = NATS_BOX_IMAGE
         client_name = "nats bench js native benchmark client"
         scenario_classes = ["publish-only", "consume-with-ack"]
+        scenario_boundaries = {
+            "publish-only": {
+                "acknowledgement_boundary": (
+                    "synchronous JetStream PubAck after publishing to the file-backed stream"
+                ),
+                "durability_boundary": (
+                    "file-backed stream with one replica; synchronous PubAck; exact filesystem "
+                    "flush behavior is not asserted"
+                ),
+                "replication_topology": replication,
+                "delivery_boundary": "not applicable to publish-only",
+                "batching_boundary": (
+                    "nats bench js pub sync publishes one message at a time; no explicit "
+                    "client batch"
+                ),
+                "client_boundary": (
+                    f"nats bench js native synchronous publisher from {client_image}"
+                ),
+                "latency_boundary": (
+                    "native synchronous publisher stats measure publish acknowledgement latency "
+                    "and report min/avg/p50/p90/p99/p99.9/max"
+                ),
+            },
+            "consume-with-ack": {
+                "acknowledgement_boundary": (
+                    "explicit consumer acknowledgement with synchronous double acknowledgement"
+                ),
+                "durability_boundary": (
+                    "file-backed consumer on a one-replica stream; the double acknowledgement "
+                    "confirms the consumer acknowledgement"
+                ),
+                "replication_topology": replication,
+                "delivery_boundary": (
+                    "pull consumer with deliver=all and replay=instant; one explicit "
+                    "acknowledgement "
+                    "per message"
+                ),
+                "batching_boundary": (
+                    "nats bench js consume uses --batch=1 with explicit acknowledgement and "
+                    "double acknowledgement"
+                ),
+                "client_boundary": f"nats bench js native consumer from {client_image}",
+                "latency_boundary": (
+                    "per-message consumer latency is unavailable; output reports acknowledged "
+                    "consume throughput"
+                ),
+            },
+        }
 
     return {
         "runtime": "container",
@@ -1166,10 +1400,13 @@ def backend_metadata(name: str, nodes: int) -> dict[str, Any]:
             "measurement_boundary": measurement_boundary,
             "client_identity": {"name": client_name, "image": client_image},
             "scenario_classes": scenario_classes,
+            "scenario_boundaries": scenario_boundaries,
             "comparison": {
                 "classification": NATIVE_COMPARISON_CLASSIFICATION,
                 "apples_to_apples": False,
                 "ranking_eligible": False,
+                "experimental": True,
+                "mismatch_dimensions": list(COMPARISON_MISMATCH_DIMENSIONS),
             },
         },
     }
