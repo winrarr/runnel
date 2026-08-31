@@ -26,7 +26,7 @@ just bench-pr-local-until-stable
 
 This command holds the exclusive benchmark lock and stops at the first stable result, a hard failure, or its explicit maximum-attempt budget. It rejects diagnostic and fixed-repetition options. `just bench-pr-local-quick` and fixed-repetition runs with `--allow-inconclusive` are diagnostics only and cannot support an optimization claim.
 
-Other benchmark workflows provide complementary evidence: `just bench` covers local Criterion paths, `just bench-container` covers the resource-limited container path, `just bench-cluster` covers the real clustered workload, and `just bench-compare` and `just bench-compare-cluster` provide separate native-tool comparison series. Their workload, durability, resource, and measurement boundaries must remain attached to each result. Use the exclusive benchmark lock for authoritative measurements and `just isolated <workflow>` for concurrent process-heavy diagnostics.
+Other benchmark workflows provide complementary evidence: `just bench` covers local Criterion paths, `just bench-container` covers the resource-limited single-node container path, `just bench-cluster` covers the real clustered workload with native broker processes, `just bench-cluster-container` runs the same clustered workload with one bounded container per broker, and `just bench-compare` and `just bench-compare-cluster` provide separate native-tool comparison series. Their workload, durability, resource, and measurement boundaries must remain attached to each result. Use the exclusive benchmark lock for authoritative measurements and `just isolated <workflow>` for concurrent process-heavy diagnostics.
 
 ## Interpreting results
 
@@ -55,3 +55,5 @@ Workers must report these fields even when a benchmark was not required or could
 ## History and comparisons
 
 Repeated benchmark history is aggregated by median while retaining raw samples and observed ranges. Compare a history point only with a compatible suite, workload, resource budget, broker image, measurement boundary, and comparison mode. Native competitor results are engineering baselines with explicitly different client and acknowledgement semantics; they are not a final product ranking.
+
+Raw benchmark artifacts use one version-2 envelope across single-node, clustered, comparison, and pull-request runs. The envelope carries run identity, full source and environment provenance, workload and resource limits, target semantics, scenario metrics, recovery metadata, and optional broker `/metrics` deltas. Normalized history is a deliberately smaller projection; retain the raw artifacts when diagnosing a result or making a performance claim.

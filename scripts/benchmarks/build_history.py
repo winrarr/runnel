@@ -10,7 +10,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
-from normalize import normalize_result
+from normalize import benchmark_suite, normalize_result
 
 
 METRIC_DEFINITIONS = [
@@ -39,7 +39,9 @@ def load_runs(runs_dir: Path) -> list[dict[str, Any]]:
             raw = json.loads(path.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError):
             continue
-        if not isinstance(raw, dict) or "backends" not in raw:
+        if not isinstance(raw, dict) or (
+            "backends" not in raw and "scenarios" not in raw
+        ):
             continue
         if raw.get("history_schema_version") == 1:
             normalized = raw
@@ -123,15 +125,36 @@ def add_point(
     points.append(point)
 
 
-def benchmark_suite(run: dict[str, Any]) -> str:
-    explicit = run.get("benchmark_suite")
-    if isinstance(explicit, str) and explicit:
-        return explicit
-    if run.get("comparison_mode") == "cluster-baseline":
-        return "cluster"
-    if run.get("workload", {}).get("single_node") is True:
-        return "native-comparison"
-    return "other"
+def add_resource_points(
+    points: list[dict[str, Any]],
+    *,
+    run: dict[str, Any],
+    backend: str,
+    operation: str,
+    size: int | None,
+    resources: dict[str, Any],
+    repetitions: int | None,
+    repetition_summary: dict[str, Any],
+) -> None:
+    units = {name: unit for name, _, unit, _ in METRIC_DEFINITIONS}
+    for metric, key in (
+        ("cpu_percent_max", "cpu_percent_max"),
+        ("memory_bytes_max", "memory_bytes_max"),
+    ):
+        value = resources.get(key)
+        if isinstance(value, (int, float)):
+            add_point(
+                points,
+                run=run,
+                backend=backend,
+                operation=operation,
+                size=size,
+                metric=metric,
+                value=float(value),
+                unit=units[metric],
+                repetitions=repetitions,
+                repetition_summary=repetition_summary,
+            )
 
 
 def benchmark_series(run: dict[str, Any], backend: str) -> str:
@@ -196,24 +219,16 @@ def build_points(runs: list[dict[str, Any]]) -> list[dict[str, Any]]:
                 resources = scenario.get("resource_samples", {})
                 if not isinstance(resources, dict):
                     continue
-                for metric, key in (
-                    ("cpu_percent_max", "cpu_percent_max"),
-                    ("memory_bytes_max", "memory_bytes_max"),
-                ):
-                    value = resources.get(key)
-                    if isinstance(value, (int, float)):
-                        add_point(
-                            points,
-                            run=run,
-                            backend=backend_name,
-                            operation=operation,
-                            size=size,
-                            metric=metric,
-                            value=float(value),
-                            unit=units[metric],
-                            repetitions=repetitions,
-                            repetition_summary=repetition_summary,
-                        )
+                add_resource_points(
+                    points,
+                    run=run,
+                    backend=backend_name,
+                    operation=operation,
+                    size=size,
+                    resources=resources,
+                    repetitions=repetitions,
+                    repetition_summary=repetition_summary,
+                )
 
                 cpu_seconds = resources.get("cpu_seconds")
                 messages = scenario.get("messages")
@@ -249,24 +264,17 @@ def build_points(runs: list[dict[str, Any]]) -> list[dict[str, Any]]:
                 "repetitions", run.get("aggregate", {}).get("repetitions")
             )
             backend_summary = backend.get("repetition_summary", {})
-            for metric, key in (
-                ("cpu_percent_max", "cpu_percent_max"),
-                ("memory_bytes_max", "memory_bytes_max"),
-            ):
-                value = resources.get(key) if isinstance(resources, dict) else None
-                if isinstance(value, (int, float)):
-                    add_point(
-                        points,
-                        run=run,
-                        backend=backend_name,
-                        operation="broker",
-                        size=None,
-                        metric=metric,
-                        value=float(value),
-                        unit=units[metric],
-                        repetitions=backend_repetitions,
-                        repetition_summary=backend_summary,
-                    )
+            if isinstance(resources, dict) and isinstance(backend_summary, dict):
+                add_resource_points(
+                    points,
+                    run=run,
+                    backend=backend_name,
+                    operation="broker",
+                    size=None,
+                    resources=resources,
+                    repetitions=backend_repetitions,
+                    repetition_summary=backend_summary,
+                )
     return points
 
 
@@ -283,6 +291,10 @@ def site_data(runs: list[dict[str, Any]]) -> dict[str, Any]:
                 "run_url": source.get("run_url"),
                 "event": source.get("event"),
                 "workflow": source.get("workflow"),
+                "run_id": run.get("run_id"),
+                "status": run.get("status", "complete"),
+                "started_at": run.get("started_at"),
+                "finished_at": run.get("finished_at"),
                 "run_file": run.get("_path"),
                 "comparison_mode": run.get("comparison_mode"),
                 "benchmark_suite": benchmark_suite(run),
@@ -317,10 +329,13 @@ def comparison_identity(run: dict[str, Any], backend_name: str | None = None) ->
                     key: backend.get(key)
                     for key in (
                         "image",
+                        "runtime",
                         "acknowledgement",
                         "replication",
                         "measurement_boundary",
                         "measurement_client",
+                        "client_image",
+                        "semantic_metadata",
                     )
                 }
                 for name, backend in run.get("backends", {}).items()

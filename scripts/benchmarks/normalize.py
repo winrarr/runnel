@@ -9,75 +9,88 @@ removes raw logs before a result is appended to the generated history branch.
 from __future__ import annotations
 
 import argparse
+import copy
 import json
-import os
-import platform
-import subprocess
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
-
-ROOT = Path(__file__).resolve().parents[2]
+from common import environment_metadata, source_metadata
 
 
 class NormalizationError(RuntimeError):
     """The comparison result does not have the expected shape."""
 
 
-def git_revision() -> str:
-    revision = os.environ.get("GITHUB_SHA")
-    if revision:
-        return revision
-    result = subprocess.run(
-        ["git", "rev-parse", "HEAD"],
-        cwd=ROOT,
-        capture_output=True,
-        text=True,
-        check=False,
-    )
-    return result.stdout.strip() or "unknown"
+def raw_backends(result: dict[str, Any]) -> dict[str, Any]:
+    """Return canonical backends while accepting pre-envelope artifacts."""
+    backends = result.get("backends")
+    if isinstance(backends, dict):
+        return backends
 
-
-def docker_server_version() -> str | None:
-    result = subprocess.run(
-        ["docker", "version", "--format", "{{.Server.Version}}"],
-        capture_output=True,
-        text=True,
-        check=False,
-    )
-    version = result.stdout.strip()
-    return version or None
-
-
-def source_metadata() -> dict[str, Any]:
-    repository = os.environ.get("GITHUB_REPOSITORY")
-    run_id = os.environ.get("GITHUB_RUN_ID")
-    server_url = os.environ.get("GITHUB_SERVER_URL", "https://github.com")
-    run_url = f"{server_url}/{repository}/actions/runs/{run_id}" if repository and run_id else None
+    container = result.get("container")
+    scenarios = result.get("scenarios")
+    if not isinstance(container, dict) or not isinstance(scenarios, list):
+        raise NormalizationError("benchmark result is missing a backends object")
     return {
-        "repository": repository or "local",
-        "revision": git_revision(),
-        "ref": os.environ.get("GITHUB_REF_NAME") or os.environ.get("GITHUB_REF", "local"),
-        "event": os.environ.get("GITHUB_EVENT_NAME", "local"),
-        "workflow": os.environ.get("GITHUB_WORKFLOW", "local"),
-        "run_id": run_id,
-        "run_url": run_url,
-        "profile": os.environ.get("BENCHMARK_PROFILE", "local"),
+        "runnel": {
+            **container,
+            "runtime": "container",
+            "acknowledgement": "local durable append",
+            "replication": "single local broker engine",
+            "measurement_boundary": "public line-delimited JSON protocol",
+            "measurement_client": "host Python socket client",
+            "client_image": "host Python runtime",
+            "scenarios": scenarios,
+        }
     }
 
 
-def environment_metadata() -> dict[str, Any]:
-    metadata: dict[str, Any] = {
-        "host": platform.node() or "unknown",
-        "platform": platform.platform(),
-        "python": platform.python_version(),
-        "cpu_count": os.cpu_count(),
+def scenario_record(scenario: dict[str, Any]) -> dict[str, Any]:
+    """Keep stable measured fields without carrying native tool logs."""
+    fields = (
+        "scenario_id",
+        "operation",
+        "messages",
+        "message_size_bytes",
+        "elapsed_seconds",
+        "elapsed_milliseconds",
+        "throughput_messages_per_second",
+        "throughput_megabytes_per_second",
+        "latency_sample_count",
+        "latency_available",
+        "latency_microseconds",
+        "resource_samples",
+        "server_metrics",
+        "metadata",
+        "restart_ready_seconds",
+    )
+    return {
+        field: copy.deepcopy(scenario[field])
+        for field in fields
+        if field in scenario
     }
-    docker_version = docker_server_version()
-    if docker_version:
-        metadata["docker_server"] = docker_version
-    return metadata
+
+
+def source_record(result: dict[str, Any]) -> dict[str, Any]:
+    source = result.get("source")
+    if isinstance(source, dict):
+        return copy.deepcopy(source)
+    source = source_metadata(full_revision=True)
+    revision = result.get("git_revision")
+    if isinstance(revision, str) and revision:
+        source["revision"] = revision
+    return source
+
+
+def environment_record(result: dict[str, Any]) -> dict[str, Any]:
+    environment = result.get("environment")
+    if isinstance(environment, dict):
+        return copy.deepcopy(environment)
+    host = result.get("host")
+    if isinstance(host, dict):
+        return copy.deepcopy(host)
+    return environment_metadata(cpu_key="cpu_count", docker=True)
 
 
 def benchmark_suite(result: dict[str, Any]) -> str:
@@ -86,88 +99,85 @@ def benchmark_suite(result: dict[str, Any]) -> str:
         return explicit
     if result.get("comparison_mode") == "cluster-baseline":
         return "cluster"
+    if result.get("backend") == "runnel":
+        return "runnel"
     if result.get("workload", {}).get("single_node") is True:
         return "native-comparison"
     return "other"
 
 
-def _latency_values(scenario: dict[str, Any]) -> dict[str, float]:
-    latency = scenario.get("latency_microseconds")
-    if not isinstance(latency, dict):
-        return {}
-    return {
-        str(name): float(value)
-        for name, value in latency.items()
-        if isinstance(value, (int, float))
-    }
-
-
 def normalize_result(result: dict[str, Any], *, source_name: str = "comparison") -> dict[str, Any]:
-    if not isinstance(result.get("backends"), dict):
-        raise NormalizationError("comparison result is missing a backends object")
     if not isinstance(result.get("workload"), dict):
         raise NormalizationError("comparison result is missing a workload object")
 
+    raw_backend_records = raw_backends(result)
     backends: dict[str, Any] = {}
-    for backend_name, backend in result["backends"].items():
+    for backend_name, backend in raw_backend_records.items():
         if not isinstance(backend, dict):
             raise NormalizationError(f"backend {backend_name!r} is not an object")
-        scenarios: list[dict[str, Any]] = []
-        for scenario in backend.get("scenarios", []):
-            if not isinstance(scenario, dict):
-                continue
-            normalized_scenario: dict[str, Any] = {
-                "operation": scenario.get("operation", "unknown"),
-                "messages": scenario.get("messages"),
-                "message_size_bytes": scenario.get("message_size_bytes"),
-                "throughput_messages_per_second": scenario.get(
-                    "throughput_messages_per_second"
-                ),
-                "latency_available": scenario.get("latency_available", "latency_microseconds" in scenario),
-            }
-            latency = _latency_values(scenario)
-            if latency:
-                normalized_scenario["latency_microseconds"] = latency
-            resource_samples = scenario.get("resource_samples")
-            if isinstance(resource_samples, dict):
-                normalized_scenario["resource_samples"] = resource_samples
-            metadata = scenario.get("metadata")
-            if isinstance(metadata, dict):
-                normalized_scenario["metadata"] = metadata
-            for key in ("elapsed_milliseconds", "throughput_megabytes_per_second"):
-                if key in scenario:
-                    normalized_scenario[key] = scenario[key]
-            scenarios.append(normalized_scenario)
+        scenarios = [
+            scenario_record(scenario)
+            for scenario in backend.get("scenarios", [])
+            if isinstance(scenario, dict)
+        ]
 
         resource_samples = backend.get("resource_samples")
         if not isinstance(resource_samples, dict):
             resource_samples = {"samples": 0}
-        backends[str(backend_name)] = {
-            "image": backend.get("image"),
-            "image_id": backend.get("image_id"),
-            "acknowledgement": backend.get("acknowledgement"),
-            "replication": backend.get("replication"),
-            "measurement_boundary": backend.get("measurement_boundary"),
-            "measurement_client": backend.get("measurement_client"),
-            "startup_seconds": backend.get("startup_seconds"),
-            "resource_samples": resource_samples,
-            "scenarios": scenarios,
+        normalized_backend = {
+            field: copy.deepcopy(backend[field])
+            for field in (
+                "image",
+                "image_id",
+                "image_ids",
+                "runtime",
+                "cpu_limit",
+                "memory_limit",
+                "acknowledgement",
+                "replication",
+                "measurement_boundary",
+                "measurement_client",
+                "client_image",
+                "semantic_metadata",
+                "startup_seconds",
+                "nodes",
+            )
+            if field in backend
         }
+        normalized_backend.update(
+            {"resource_samples": resource_samples, "scenarios": scenarios}
+        )
+        backends[str(backend_name)] = normalized_backend
 
     generated_at = result.get("generated_at")
     if not isinstance(generated_at, str):
         generated_at = datetime.now(UTC).isoformat()
 
+    source = source_record(result)
     return {
         "history_schema_version": 1,
+        "schema_version": 2,
+        "run_id": result.get("run_id") or source.get("run_id") or source_name,
+        "started_at": result.get("started_at"),
         "generated_at": generated_at,
-        "source": source_metadata(),
-        "environment": environment_metadata(),
+        "finished_at": result.get("finished_at"),
+        "status": result.get("status", "complete"),
+        "command": copy.deepcopy(result.get("command")),
+        "source": source,
+        "environment": environment_record(result),
         "comparison_mode": result.get("comparison_mode"),
         "benchmark_suite": benchmark_suite(result),
-        "resource_limits": result.get("resource_limits", {}),
+        "resource_limits": result.get(
+            "resource_limits",
+            {
+                key: result["container"][key]
+                for key in ("cpu_limit", "memory_limit")
+                if isinstance(result.get("container"), dict) and key in result["container"]
+            },
+        ),
         "workload": result["workload"],
         "backends": backends,
+        "comparison_guardrail": copy.deepcopy(result.get("comparison_guardrail")),
         "source_result": source_name,
     }
 

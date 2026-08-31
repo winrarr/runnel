@@ -20,6 +20,6 @@ Native competitor clients and broker-specific tools do not share one acknowledge
 ## Consequences
 
 - Docker and Python are prerequisites for the container benchmark workflows.
-- The current runner measures Runnel's development protocol and local engine, not a future binary protocol or clustered engine.
+- The runners measure Runnel's development protocol and local or early clustered engine, not a future binary protocol or production distributed engine.
 - Resource samples are observational and must be interpreted with the host, storage, image, and workload recorded in each result.
 - At the time of this decision, full cross-broker comparison and historical reporting remained planned. Those workflows now exist as separate engineering evidence, while semantically equivalent cross-broker workloads and complete recovery coverage remain future work; neither is an implicit compatibility promise.

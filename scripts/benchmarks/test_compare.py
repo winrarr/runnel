@@ -1,6 +1,8 @@
+import json
 import sys
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 
@@ -8,29 +10,57 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 sys.path.insert(0, str(SCRIPT_DIR))
 
 import compare  # noqa: E402
+import common  # noqa: E402
 
 
 class ComparisonBenchmarkTests(unittest.TestCase):
-    def test_run_metadata_records_identity_source_environment_and_command(self) -> None:
-        with (
-            patch.object(compare, "source_metadata", return_value={"revision": "abc123"}),
-            patch.object(
-                compare,
-                "environment_metadata",
-                return_value={"host": "benchmark-host", "cpus": 2},
-            ),
-            patch.object(compare.sys, "argv", ["compare.py", "--messages", "100"]),
-        ):
-            metadata = compare.run_metadata("20260827010203000000")
+    def test_scenario_operation_reads_current_and_legacy_result_fields(self) -> None:
+        self.assertEqual(compare.scenario_operation({"operation": "publish"}), "publish")
+        self.assertEqual(compare.scenario_operation({"name": "durable_publish"}), "durable_publish")
+        with self.assertRaises(compare.ComparisonError):
+            compare.scenario_operation({"messages": 10})
 
-        self.assertEqual(metadata["run_id"], "20260827010203000000")
-        self.assertEqual(metadata["command"], ["compare.py", "--messages", "100"])
-        self.assertEqual(metadata["source"], {"revision": "abc123"})
-        self.assertEqual(metadata["environment"], {"host": "benchmark-host", "cpus": 2})
+    def test_runnel_adapter_accepts_current_scenario_results(self) -> None:
+        def run(command: list[str], **_: object) -> SimpleNamespace:
+            output = Path(command[command.index("--output") + 1])
+            output.write_text(
+                json.dumps(
+                    {
+                        "container": {
+                            "image": "runnel:test",
+                            "image_id": "sha256:test",
+                            "startup_seconds": 0.1,
+                            "resource_samples": {},
+                        },
+                        "scenarios": [
+                            {
+                                "operation": "durable_publish",
+                                "messages": 1,
+                                "message_size_bytes": 100,
+                                "throughput_messages_per_second": 1,
+                                "latency_microseconds": {},
+                            }
+                        ],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+        with patch.object(compare.subprocess, "run", side_effect=run):
+            result = compare.run_runnel(
+                image="runnel:test",
+                cpus="2",
+                memory="2g",
+                messages=1,
+                sizes=[100],
+            )
+
+        self.assertEqual(result["scenarios"][0]["operation"], "publish")
 
     def test_source_metadata_uses_ci_identity_when_available(self) -> None:
         with (
-            patch.object(compare, "git_revision", return_value="abc123"),
+            patch("common.git_revision", return_value="abc123"),
             patch.dict(
                 compare.os.environ,
                 {
@@ -45,7 +75,7 @@ class ComparisonBenchmarkTests(unittest.TestCase):
                 clear=True,
             ),
         ):
-            metadata = compare.source_metadata()
+            metadata = common.source_metadata(full_revision=True)
 
         self.assertEqual(metadata["repository"], "example/runnel")
         self.assertEqual(metadata["revision"], "abc123")

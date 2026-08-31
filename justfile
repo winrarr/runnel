@@ -61,6 +61,12 @@ bench-cluster:
 bench-cluster-smoke:
     python3 scripts/benchmarks/lock.py --path {{benchmark_lock}} --mode shared -- python3 scripts/benchmarks/cluster.py --build --messages 20 --warmup 2 --payload-sizes 100 --skip-recovery
 
+bench-cluster-container:
+    python3 scripts/benchmarks/lock.py --path {{benchmark_lock}} --mode exclusive -- python3 scripts/benchmarks/cluster.py --runtime container --build
+
+bench-cluster-container-smoke:
+    python3 scripts/benchmarks/lock.py --path {{benchmark_lock}} --mode shared -- python3 scripts/benchmarks/cluster.py --runtime container --image runnel:dev --messages 20 --warmup 2 --payload-sizes 100 --skip-recovery
+
 bench-pr-local *args:
     python3 scripts/benchmarks/lock.py --path {{benchmark_lock}} --mode exclusive -- python3 scripts/benchmarks/pr_local.py {{args}}
 
@@ -100,5 +106,6 @@ integration:
     RUNNEL_TEST_CAPTURE_LOGS=1 python3 scripts/isolated.py cluster-test
     if [ "${RUNNEL_INTEGRATION_IMAGE_READY:-0}" != "1" ]; then just docker-build; fi
     RUNNEL_TEST_CAPTURE_LOGS=1 python3 scripts/isolated.py bench-container-smoke
+    RUNNEL_TEST_CAPTURE_LOGS=1 python3 scripts/isolated.py bench-cluster-container-smoke
 
 ci: verify integration

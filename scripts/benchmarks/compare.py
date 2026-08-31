@@ -13,22 +13,24 @@ from __future__ import annotations
 import argparse
 import json
 import os
-import platform
 import re
-import shutil
 import subprocess
 import sys
 import tempfile
-import threading
 import time
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Callable
 
-from resources import parse_cpu_stat, parse_size, summarize_stats
+from common import (
+    ROOT,
+    parse_sizes,
+    result_metadata,
+    write_json_result,
+)
+from runtime import DockerContainer, MeasuredContainer, create_network, inspect_image, remove_network
 
 
-ROOT = Path(__file__).resolve().parents[2]
 KAFKA_IMAGE = "apache/kafka:4.3.1"
 REDPANDA_IMAGE = "docker.redpanda.com/redpandadata/redpanda:v26.2.1"
 NATS_IMAGE = "nats:2.14.5-alpine"
@@ -60,6 +62,14 @@ SCENARIO_COMPARISON_CLASSES = {
 
 class ComparisonError(RuntimeError):
     """A benchmark setup or native-tool failure."""
+
+
+def scenario_operation(scenario: dict[str, Any]) -> str:
+    """Read the current operation field while accepting older result artifacts."""
+    operation = scenario.get("operation", scenario.get("name"))
+    if not isinstance(operation, str):
+        raise ComparisonError(f"benchmark scenario has no operation: {scenario!r}")
+    return operation
 
 
 def scenario_comparison_class(operation: Any) -> str:
@@ -237,179 +247,10 @@ def benchmark_suite(nodes: int, backends: list[str]) -> str:
     return "native-comparison"
 
 
-def git_revision() -> str:
-    """Return the source revision used for the comparison, when available."""
-    try:
-        result = subprocess.run(
-            ["git", "rev-parse", "HEAD"],
-            cwd=ROOT,
-            capture_output=True,
-            text=True,
-            check=False,
-        )
-    except OSError:
-        return "unknown"
-    revision = result.stdout.strip()
-    return revision if result.returncode == 0 and revision else "unknown"
-
-
-def source_metadata() -> dict[str, Any]:
-    """Capture source-control and CI identity in the raw result."""
-    repository = os.environ.get("GITHUB_REPOSITORY")
-    workflow_run_id = os.environ.get("GITHUB_RUN_ID")
-    server_url = os.environ.get("GITHUB_SERVER_URL", "https://github.com")
-    run_url = (
-        f"{server_url}/{repository}/actions/runs/{workflow_run_id}"
-        if repository and workflow_run_id
-        else None
-    )
-    return {
-        "repository": repository or "local",
-        "revision": git_revision(),
-        "ref": os.environ.get("GITHUB_REF_NAME")
-        or os.environ.get("GITHUB_REF", "local"),
-        "event": os.environ.get("GITHUB_EVENT_NAME", "local"),
-        "workflow": os.environ.get("GITHUB_WORKFLOW", "local"),
-        "run_id": workflow_run_id,
-        "run_url": run_url,
-        "profile": os.environ.get("BENCHMARK_PROFILE", "local"),
-    }
-
-
-def environment_metadata() -> dict[str, Any]:
-    """Capture host details needed to interpret resource measurements."""
-    return {
-        "host": platform.node() or "unknown",
-        "platform": platform.platform(),
-        "processor": platform.processor(),
-        "python": platform.python_version(),
-        "cpus": os.cpu_count(),
-    }
-
-
-def run_metadata(run_id: str) -> dict[str, Any]:
-    """Return stable identity and provenance for one raw comparison artifact."""
-    return {
-        "run_id": run_id,
-        "command": list(sys.argv),
-        "source": source_metadata(),
-        "environment": environment_metadata(),
-    }
-
-
-def bounded_read_stats(container: str) -> dict[str, float] | None:
-    try:
-        result = subprocess.run(
-            ["docker", "stats", "--no-stream", "--format", "{{json .}}", container],
-            capture_output=True,
-            text=True,
-            check=False,
-            timeout=RESOURCE_COMMAND_TIMEOUT,
-        )
-    except (OSError, subprocess.TimeoutExpired):
-        return None
-    if result.returncode != 0 or not result.stdout.strip():
-        return None
-    try:
-        raw = json.loads(result.stdout)
-        return {
-            "cpu_percent": float(raw["CPUPerc"].rstrip("%")),
-            "memory_bytes": parse_size(raw["MemUsage"].split(" / ", 1)[0]),
-            "memory_percent": float(raw["MemPerc"].rstrip("%")),
-        }
-    except (KeyError, TypeError, ValueError, json.JSONDecodeError):
-        return None
-
-
-def bounded_read_cpu_seconds(container: str) -> float | None:
-    for path in ("/sys/fs/cgroup/cpu.stat", "/sys/fs/cgroup/cpuacct/cpuacct.usage"):
-        try:
-            result = subprocess.run(
-                ["docker", "exec", container, "cat", path],
-                capture_output=True,
-                text=True,
-                check=False,
-                timeout=RESOURCE_COMMAND_TIMEOUT,
-            )
-        except (OSError, subprocess.TimeoutExpired):
-            continue
-        if result.returncode == 0:
-            usage = parse_cpu_stat(result.stdout)
-            if usage is not None:
-                return usage
-    return None
-
-
-class BoundedStatsSampler:
-    """Collect comparison resources without allowing Docker probes to hang."""
-
-    def __init__(self, container: str) -> None:
-        self.container = container
-        self.samples: list[dict[str, float]] = []
-        self.lock = threading.Lock()
-        self.stop_event = threading.Event()
-        self.thread = threading.Thread(
-            target=self._run, name=f"docker-stats-{container}", daemon=True
-        )
-
-    def start(self) -> None:
-        self.thread.start()
-
-    def close(self) -> None:
-        self.stop_event.set()
-        if self.thread.ident is not None:
-            self.thread.join(timeout=2)
-
-    def begin(self) -> tuple[int, float | None, int]:
-        self._record()
-        with self.lock:
-            sample_index = len(self.samples)
-        return sample_index, bounded_read_cpu_seconds(self.container), time.perf_counter_ns()
-
-    def end(self, token: tuple[int, float | None, int]) -> dict[str, Any]:
-        sample_index, cpu_start, started_ns = token
-        ended_ns = time.perf_counter_ns()
-        cpu_end = bounded_read_cpu_seconds(self.container)
-        self._record()
-        with self.lock:
-            samples = list(self.samples[sample_index:])
-        cpu_seconds = None
-        if cpu_start is not None and cpu_end is not None:
-            cpu_seconds = cpu_end - cpu_start
-        return summarize_stats(
-            samples,
-            cpu_seconds=cpu_seconds,
-            elapsed_seconds=(ended_ns - started_ns) / 1_000_000_000,
-        )
-
-    def summary(self) -> dict[str, Any]:
-        with self.lock:
-            samples = list(self.samples)
-        return summarize_stats(samples)
-
-    def _record(self) -> None:
-        sample = bounded_read_stats(self.container)
-        if sample is None:
-            return
-        with self.lock:
-            self.samples.append(sample)
-
-    def _run(self) -> None:
-        while not self.stop_event.is_set():
-            self._record()
-            self.stop_event.wait(0.25)
-
-
 def ensure_image(image: str) -> str:
     """Return a local image ID, pulling the pinned image when necessary."""
-    inspect = subprocess.run(
-        ["docker", "image", "inspect", "--format", "{{.Id}}", image],
-        check=False,
-        capture_output=True,
-        text=True,
-    )
-    image_id = inspect.stdout.strip()
-    if inspect.returncode == 0 and image_id:
+    image_id = inspect_image(image)
+    if image_id is not None:
         return image_id
 
     try:
@@ -418,14 +259,8 @@ def ensure_image(image: str) -> str:
         detail = f"{error.stdout or ''}{error.stderr or ''}"
         raise ComparisonError(f"could not pull benchmark image {image}:\n{detail}") from error
 
-    inspect = subprocess.run(
-        ["docker", "image", "inspect", "--format", "{{.Id}}", image],
-        check=False,
-        capture_output=True,
-        text=True,
-    )
-    image_id = inspect.stdout.strip()
-    if inspect.returncode != 0 or not image_id:
+    image_id = inspect_image(image)
+    if image_id is None:
         raise ComparisonError(f"Docker pulled benchmark image {image} but it could not be inspected")
     return image_id
 
@@ -449,62 +284,43 @@ class Service:
         self.network = network
         self.cpus = cpus
         self.memory = memory
-        self.data_dir = Path(tempfile.mkdtemp(prefix=f"{name}-"))
-        self.data_dir.chmod(0o777)
-        self.data_target = data_target
-        self.command = command or []
-        self.environment = environment or {}
-        self.entrypoint = entrypoint
-        self.image_id: str | None = None
-        self.startup_ns: int | None = None
-        self.stats = BoundedStatsSampler(name)
+        self.container = MeasuredContainer(
+            DockerContainer(
+                name=name,
+                image=image,
+                network=network,
+                cpus=cpus,
+                memory=memory,
+                data_dir=Path(tempfile.mkdtemp(prefix=f"{name}-")),
+                data_target=data_target,
+                command=command or [],
+                environment=environment or {},
+                entrypoint=entrypoint,
+            ),
+            probe_timeout_seconds=RESOURCE_COMMAND_TIMEOUT,
+        )
+        self.stats = self.container.stats
+
+    @property
+    def image_id(self) -> str | None:
+        return self.container.image_id
+
+    @property
+    def startup_ns(self) -> int | None:
+        return self.container.startup_ns
 
     def start(self) -> None:
-        self.image_id = ensure_image(self.image)
-        command = [
-            "docker",
-            "run",
-            "--detach",
-            "--name",
-            self.name,
-            "--network",
-            self.network,
-            "--label",
-            "runnel.benchmark=true",
-            "--cpus",
-            self.cpus,
-            "--memory",
-            self.memory,
-            "--volume",
-            f"{self.data_dir}:{self.data_target}",
-        ]
-        if self.entrypoint:
-            command.extend(["--entrypoint", self.entrypoint])
-        for key, value in self.environment.items():
-            command.extend(["--env", f"{key}={value}"])
-        command.append(self.image)
-        command.extend(self.command)
-        started = time.perf_counter_ns()
+        image_id = ensure_image(self.image)
         try:
-            subprocess.run(command, check=True, capture_output=True, text=True)
-            self.startup_ns = time.perf_counter_ns() - started
-            self.stats.start()
+            self.container.start(image_id=image_id)
         except subprocess.CalledProcessError as error:
-            logs = subprocess.run(
-                ["docker", "logs", self.name], capture_output=True, text=True, check=False
-            )
             raise ComparisonError(
-                f"failed to start {self.name}: {error}\n{logs.stdout}{logs.stderr}"
+                f"failed to start {self.name}: {error}\n{self.container.logs()}"
             ) from error
 
     def close(self) -> dict[str, Any]:
-        self.stats.close()
+        logs = self.container.close()
         summary = self.stats.summary()
-        logs = subprocess.run(
-            ["docker", "logs", self.name], capture_output=True, text=True, check=False
-        )
-        subprocess.run(["docker", "rm", "--force", self.name], check=False, capture_output=True)
-        shutil.rmtree(self.data_dir, ignore_errors=True)
         return {
             "image": self.image,
             "image_id": self.image_id,
@@ -512,7 +328,7 @@ class Service:
             "memory_limit": self.memory,
             "startup_seconds": (self.startup_ns or 0) / 1_000_000_000,
             "resource_samples": summary,
-            "log_tail": (logs.stdout + logs.stderr)[-4000:],
+            "log_tail": logs[-4000:],
         }
 
 
@@ -535,6 +351,36 @@ def combine_resource_summaries(summaries: list[dict[str, Any]]) -> dict[str, Any
     return combined
 
 
+def start_services(
+    services: list[Service], ready: Callable[[], None], description: str
+) -> list[Service]:
+    try:
+        for service in services:
+            service.start()
+        wait_for(ready, description)
+    except BaseException:
+        for service in services:
+            service.close()
+        raise
+    return services
+
+
+def record_tool_scenario(
+    scenarios: list[dict[str, Any]],
+    raw: dict[str, str],
+    key: str,
+    output: str,
+    resources: dict[str, Any],
+    parser: Callable[[str, int, int], dict[str, Any]],
+    size: int,
+    messages: int,
+) -> None:
+    scenario = parser(output, size, messages)
+    scenario["resource_samples"] = resources
+    scenarios.append(scenario)
+    raw[key] = output[-12_000:]
+
+
 def run_tool(
     image: str,
     network: str,
@@ -544,7 +390,6 @@ def run_tool(
     memory: str,
     timeout: int = COMMAND_TIMEOUT,
 ) -> str:
-    ensure_image(image)
     command = [
         "docker",
         "run",
@@ -615,16 +460,6 @@ def wait_for(check: Callable[[], None], description: str) -> None:
             last_error = error
         time.sleep(0.5)
     raise ComparisonError(f"{description} did not become ready: {last_error}")
-
-
-def parse_sizes(value: str) -> list[int]:
-    try:
-        sizes = [int(part) for part in value.split(",") if part.strip()]
-    except ValueError as error:
-        raise argparse.ArgumentTypeError("payload sizes must be integers") from error
-    if not sizes or any(size <= 0 for size in sizes):
-        raise argparse.ArgumentTypeError("payload sizes must be positive")
-    return sizes
 
 
 def parse_number(value: str) -> float:
@@ -773,32 +608,23 @@ def start_kafka_services(
         )
         for index, name in enumerate(names)
     ]
-    try:
-        for service in services:
-            service.start()
+    def ready() -> None:
+        for name in names:
+            run_tool(
+                KAFKA_IMAGE,
+                network,
+                [
+                    "/opt/kafka/bin/kafka-topics.sh",
+                    "--bootstrap-server",
+                    f"{name}:9092",
+                    "--list",
+                ],
+                cpus=cpus,
+                memory=memory,
+                timeout=READINESS_COMMAND_TIMEOUT,
+            )
 
-        def ready() -> None:
-            for name in names:
-                run_tool(
-                    KAFKA_IMAGE,
-                    network,
-                    [
-                        "/opt/kafka/bin/kafka-topics.sh",
-                        "--bootstrap-server",
-                        f"{name}:9092",
-                        "--list",
-                    ],
-                    cpus=cpus,
-                    memory=memory,
-                    timeout=READINESS_COMMAND_TIMEOUT,
-                )
-
-        wait_for(ready, "Kafka")
-    except BaseException:
-        for service in services:
-            service.close()
-        raise
-    return services
+    return start_services(services, ready, "Kafka")
 
 
 def redpanda_command(name: str, node_id: int, seed_name: str | None) -> list[str]:
@@ -851,27 +677,18 @@ def start_redpanda_services(
                 environment={"REDPANDA_DATA_DIRECTORY": "/var/lib/redpanda/data"},
             )
         )
-    try:
-        for service in services:
-            service.start()
+    def ready() -> None:
+        output = run_tool(
+            REDPANDA_IMAGE,
+            network,
+            ["cluster", "info", "-X", f"brokers={','.join(f'{name}:9092' for name in names)}"],
+            cpus=cpus,
+            memory=memory,
+            timeout=READINESS_COMMAND_TIMEOUT,
+        )
+        require_redpanda_broker_count(output, nodes)
 
-        def ready() -> None:
-            output = run_tool(
-                REDPANDA_IMAGE,
-                network,
-                ["cluster", "info", "-X", f"brokers={','.join(f'{name}:9092' for name in names)}"],
-                cpus=cpus,
-                memory=memory,
-                timeout=READINESS_COMMAND_TIMEOUT,
-            )
-            require_redpanda_broker_count(output, nodes)
-
-        wait_for(ready, "Redpanda")
-    except BaseException:
-        for service in services:
-            service.close()
-        raise
-    return services
+    return start_services(services, ready, "Redpanda")
 
 
 def nats_server_command(name: str, names: list[str], cluster_name: str) -> list[str]:
@@ -896,6 +713,7 @@ def nats_server_command(name: str, names: list[str], cluster_name: str) -> list[
 def start_nats_services(
     network: str, cpus: str, memory: str, nodes: int, resource_prefix: str
 ) -> list[Service]:
+    ensure_image(NATS_BOX_IMAGE)
     names = [f"{resource_prefix}-nats-{index + 1}" for index in range(nodes)]
     cluster_name = f"{resource_prefix}-nats-cluster"
     services = []
@@ -911,39 +729,18 @@ def start_nats_services(
                 command=nats_server_command(name, names, cluster_name),
             )
         )
-    try:
+    def ready() -> None:
         for service in services:
-            service.start()
+            run_tool(
+                NATS_BOX_IMAGE,
+                network,
+                ["nats", "stream", "ls", "--server", f"nats://{service.name}:4222"],
+                cpus=cpus,
+                memory=memory,
+                timeout=READINESS_COMMAND_TIMEOUT,
+            )
 
-        def ready() -> None:
-            for service in services:
-                run_tool(
-                    NATS_BOX_IMAGE,
-                    network,
-                    ["nats", "stream", "ls", "--server", f"nats://{service.name}:4222"],
-                    cpus=cpus,
-                    memory=memory,
-                    timeout=READINESS_COMMAND_TIMEOUT,
-                )
-
-        wait_for(ready, "NATS JetStream")
-    except BaseException:
-        for service in services:
-            service.close()
-        raise
-    return services
-
-
-def start_kafka_service(network: str, cpus: str, memory: str) -> Service:
-    return start_kafka_services(network, cpus, memory, 1, "bench")[0]
-
-
-def start_redpanda_service(network: str, cpus: str, memory: str) -> Service:
-    return start_redpanda_services(network, cpus, memory, 1, "bench")[0]
-
-
-def start_nats_service(network: str, cpus: str, memory: str) -> Service:
-    return start_nats_services(network, cpus, memory, 1, "bench")[0]
+    return start_services(services, ready, "NATS JetStream")
 
 
 def run_kafka_family(
@@ -1009,10 +806,16 @@ def run_kafka_family(
             cpus=client_cpus,
             memory=client_memory,
         )
-        publish_scenario = parse_kafka_publish(producer_output, size, messages)
-        publish_scenario["resource_samples"] = producer_resources
-        scenarios.append(publish_scenario)
-        raw[f"publish_{size}"] = producer_output[-12_000:]
+        record_tool_scenario(
+            scenarios,
+            raw,
+            f"publish_{size}",
+            producer_output,
+            producer_resources,
+            parse_kafka_publish,
+            size,
+            messages,
+        )
 
         if nodes == 1:
             consumer_output, consumer_resources = run_measured_tool(
@@ -1034,10 +837,16 @@ def run_kafka_family(
                 cpus=client_cpus,
                 memory=client_memory,
             )
-            consume_scenario = parse_kafka_consume(consumer_output, size, messages)
-            consume_scenario["resource_samples"] = consumer_resources
-            scenarios.append(consume_scenario)
-            raw[f"consume_{size}"] = consumer_output[-12_000:]
+            record_tool_scenario(
+                scenarios,
+                raw,
+                f"consume_{size}",
+                consumer_output,
+                consumer_resources,
+                parse_kafka_consume,
+                size,
+                messages,
+            )
     return {"scenarios": scenarios, "raw_tool_output": raw}
 
 
@@ -1105,10 +914,16 @@ def run_nats(
             cpus=client_cpus,
             memory=client_memory,
         )
-        publish_scenario = parse_nats_publish(producer_output, size, messages)
-        publish_scenario["resource_samples"] = producer_resources
-        scenarios.append(publish_scenario)
-        raw[f"publish_{size}"] = producer_output[-12_000:]
+        record_tool_scenario(
+            scenarios,
+            raw,
+            f"publish_{size}",
+            producer_output,
+            producer_resources,
+            parse_nats_publish,
+            size,
+            messages,
+        )
 
         if nodes == 1:
             consumer = f"bench-consumer-{size}"
@@ -1156,10 +971,16 @@ def run_nats(
                 cpus=client_cpus,
                 memory=client_memory,
             )
-            consume_scenario = parse_nats_consume(consumer_output, size, messages)
-            consume_scenario["resource_samples"] = consumer_resources
-            scenarios.append(consume_scenario)
-            raw[f"consume_{size}"] = consumer_output[-12_000:]
+            record_tool_scenario(
+                scenarios,
+                raw,
+                f"consume_{size}",
+                consumer_output,
+                consumer_resources,
+                parse_nats_consume,
+                size,
+                messages,
+            )
     return {"scenarios": scenarios, "raw_tool_output": raw}
 
 
@@ -1204,32 +1025,54 @@ def run_runnel(
         raise ComparisonError(f"Runnel benchmark failed: {error}") from error
     finally:
         output.unlink(missing_ok=True)
+    source_backend = result.get("backends", {}).get("runnel")
+    if not isinstance(source_backend, dict):
+        container = result.get("container")
+        scenarios = result.get("scenarios")
+        if not isinstance(container, dict) or not isinstance(scenarios, list):
+            raise ComparisonError("Runnel benchmark result has no canonical backend")
+        source_backend = {**container, "scenarios": scenarios}
     scenarios = [
         scenario
-        for scenario in result["scenarios"]
-        if scenario["name"] in {"durable_publish", "consume_ack"}
+        for scenario in source_backend["scenarios"]
+        if scenario_operation(scenario) in {"durable_publish", "consume_ack"}
     ]
     return {
-        "image": result["container"]["image"],
-        "image_id": result["container"].get("image_id"),
+        "image": source_backend["image"],
+        "image_id": source_backend.get("image_id"),
+        "runtime": source_backend.get("runtime", "container"),
         "cpu_limit": cpus,
         "memory_limit": memory,
-        "startup_seconds": result["container"]["startup_seconds"],
-        "resource_samples": result["container"]["resource_samples"],
+        "startup_seconds": source_backend["startup_seconds"],
+        "resource_samples": source_backend["resource_samples"],
         "scenarios": [
             {
-                "operation": "publish" if scenario["name"] == "durable_publish" else "consume_ack",
+                "scenario_id": f"{'publish' if scenario_operation(scenario) == 'durable_publish' else 'consume_ack'}:{scenario['message_size_bytes']}",
+                "operation": (
+                    "publish"
+                    if scenario_operation(scenario) == "durable_publish"
+                    else "consume_ack"
+                ),
                 "messages": scenario["messages"],
                 "message_size_bytes": scenario["message_size_bytes"],
                 "throughput_messages_per_second": scenario[
                     "throughput_messages_per_second"
                 ],
+                "throughput_megabytes_per_second": scenario.get(
+                    "throughput_megabytes_per_second"
+                ),
+                "elapsed_seconds": scenario.get("elapsed_seconds"),
+                "elapsed_milliseconds": scenario.get("elapsed_milliseconds"),
+                "latency_sample_count": scenario.get("latency_sample_count"),
                 "latency_microseconds": scenario["latency_microseconds"],
                 "resource_samples": scenario.get("resource_samples", {}),
+                "server_metrics": scenario.get("server_metrics"),
+                "metadata": scenario.get("metadata", {}),
             }
             for scenario in scenarios
         ],
         "measurement_client": "host Python socket client",
+        "client_image": "host Python runtime",
     }
 
 
@@ -1249,41 +1092,6 @@ def close_services(services: list[Service]) -> dict[str, Any]:
         ),
         "nodes": summaries,
     }
-
-
-def remove_network(network: str) -> None:
-    """Remove a run network, disconnecting only containers attached to it if needed."""
-    for _ in range(3):
-        result = subprocess.run(
-            ["docker", "network", "rm", network],
-            check=False,
-            capture_output=True,
-        )
-        if result.returncode == 0:
-            return
-        time.sleep(0.2)
-
-    inspect = subprocess.run(
-        [
-            "docker",
-            "network",
-            "inspect",
-            network,
-            "--format",
-            "{{range $id, $container := .Containers}}{{$id}} {{end}}",
-        ],
-        check=False,
-        capture_output=True,
-        text=True,
-    )
-    for container in inspect.stdout.split():
-        subprocess.run(
-            ["docker", "network", "disconnect", "--force", network, container],
-            check=False,
-            capture_output=True,
-        )
-    subprocess.run(["docker", "network", "rm", network], check=False, capture_output=True)
-
 
 def backend_metadata(name: str, nodes: int) -> dict[str, Any]:
     if name == "runnel":
@@ -1346,6 +1154,7 @@ def backend_metadata(name: str, nodes: int) -> dict[str, Any]:
         scenario_classes = ["publish-only", "consume-with-ack"]
 
     return {
+        "runtime": "container",
         "acknowledgement": acknowledgement,
         "replication": replication,
         "measurement_boundary": measurement_boundary,
@@ -1405,12 +1214,22 @@ def main() -> int:
         subprocess.run(["docker", "build", "--tag", args.runnel_image, str(ROOT)], check=True)
     timestamp = datetime.now(UTC)
     run_id = timestamp.strftime("%Y%m%d%H%M%S%f")
-    metadata = run_metadata(run_id)
+    comparison_mode = (
+        "three-node replicated durable publish; native broker tools; publish-only first slice"
+        if args.nodes == THREE_NODE_COUNT
+        else "native broker tools; first-pass, not a final apples-to-apples claim"
+    )
+    metadata = result_metadata(
+        run_id,
+        timestamp,
+        benchmark_suite=benchmark_suite(args.nodes, args.backends),
+        comparison_mode=comparison_mode,
+        docker=True,
+    )
     output = args.output or ROOT / "benchmark-results" / f"compare-{run_id}.json"
-    output.parent.mkdir(parents=True, exist_ok=True)
     resource_prefix = f"runnel-compare-{os.getpid()}-{time.time_ns()}"
     network = resource_prefix
-    subprocess.run(["docker", "network", "create", network], check=True, capture_output=True)
+    create_network(network)
     backends: dict[str, Any] = {}
     try:
         for backend in args.backends:
@@ -1475,14 +1294,10 @@ def main() -> int:
         remove_network(network)
 
     summary = {
-        "schema_version": 1,
+        "schema_version": 2,
         **metadata,
-        "generated_at": timestamp.isoformat(),
-        "comparison_mode": (
-            "three-node replicated durable publish; native broker tools; publish-only first slice"
-            if args.nodes == THREE_NODE_COUNT
-            else "native broker tools; first-pass, not a final apples-to-apples claim"
-        ),
+        "started_at": timestamp.isoformat(),
+        "comparison_mode": comparison_mode,
         "comparison_guardrail": comparison_guardrail_metadata(args.nodes),
         "benchmark_suite": benchmark_suite(args.nodes, args.backends),
         "resource_limits": {
@@ -1503,9 +1318,7 @@ def main() -> int:
         "backends": backends,
     }
     validate_comparison_summary(summary)
-    output.write_text(json.dumps(summary, indent=2) + "\n", encoding="utf-8")
-    print(json.dumps(summary, indent=2))
-    print(f"results written to {output}")
+    write_json_result(output, summary)
     return 0
 
 

@@ -10,8 +10,6 @@ from __future__ import annotations
 
 import argparse
 from collections import defaultdict
-import json
-import os
 import re
 import shutil
 import signal
@@ -22,28 +20,19 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
-from cluster import (
-    BenchmarkError as ClusterBenchmarkError,
-    Cluster,
+from cluster import Cluster, build_binary
+from common import (
+    BenchmarkError,
+    ROOT,
     acknowledge,
-    build_binary,
     create_stream,
-    git_revision,
+    default_binary,
+    percentile,
     poll,
     publish,
-    percentile,
+    result_metadata,
+    write_json_result,
 )
-
-
-ROOT = Path(__file__).resolve().parents[2]
-
-
-def default_binary() -> Path:
-    target_dir = Path(os.environ.get("CARGO_TARGET_DIR", "target"))
-    if not target_dir.is_absolute():
-        target_dir = ROOT / target_dir
-    return target_dir / "release" / "runnel"
-
 
 DEFAULT_BINARY = default_binary()
 
@@ -258,12 +247,18 @@ def main() -> int:
     reports = make_reports(profile_dir, args.nodes) if not args.skip_perf else []
     internal_timing = summarize_timing_logs(profile_dir / "broker-logs")
     result = {
-        "schema_version": 1,
-        "generated_at": timestamp.isoformat(),
+        **result_metadata(
+            run_id,
+            timestamp,
+            benchmark_suite="profile",
+            comparison_mode="cluster-profile",
+        ),
         "profile": "internal-timing" if args.skip_perf else "linux-perf",
-        "git_revision": git_revision(),
         "binary": str(args.binary),
         "features": args.features,
+        "resource_limits": {
+            "processes": "host-scheduled; no explicit benchmark quota",
+        },
         "workload": {
             "duration_seconds": args.duration,
             "workers": args.workers,
@@ -283,8 +278,7 @@ def main() -> int:
         "reports": reports,
         "profiler_processes": profiler_logs,
     }
-    (profile_dir / "profile.json").write_text(json.dumps(result, indent=2) + "\n", encoding="utf-8")
-    print(json.dumps(result, indent=2))
+    write_json_result(profile_dir / "profile.json", result)
     print(f"profile artifacts written to {profile_dir}")
     return 0
 
@@ -292,5 +286,5 @@ def main() -> int:
 if __name__ == "__main__":
     try:
         raise SystemExit(main())
-    except (ClusterBenchmarkError, ProfilingError) as error:
+    except (BenchmarkError, ProfilingError) as error:
         raise SystemExit(f"profiling failed: {error}") from error

@@ -1,4 +1,4 @@
-# Container benchmarks
+# Benchmark framework
 
 ## Concurrent local workflows
 
@@ -8,6 +8,7 @@ isolation runner:
 ```text
 just isolated bench-container-smoke
 just isolated bench-cluster-smoke
+just isolated bench-cluster-container-smoke
 ```
 
 Each run receives a unique Cargo target directory, temporary directory, output
@@ -36,7 +37,7 @@ python3 scripts/benchmarks/run.py \
   --payload-sizes 100,1024
 ```
 
-The result records the image, source revision, host information, resource limits, startup time, scenario-scoped cgroup CPU time, CPU efficiency, sampled container memory, workload parameters, throughput, and p50/p99/p99.9/max latency where a scenario has per-message latency.
+Every raw runner emits the same version-2 result envelope. It records a unique run ID, exact command, full source and host provenance, explicit status and timestamps, workload and resource limits, target/runtime metadata, startup time, scenario-scoped cgroup CPU time, CPU efficiency, sampled resources, throughput, p50/p99/p99.9/max latency, logical payload throughput, and bounded deltas from the broker's `/metrics` endpoint where available. The single-node result stores its target under `backends.runnel`, just like clustered and comparison results.
 
 Use `--scenarios` to run only the named scenarios when a benchmark consumer needs a smaller, explicit workload. The accepted names are `durable_publish`, `concurrent_publish`, `consume_ack`, `publish_consume_ack_roundtrip`, and `restart_recovery`; the default runs all of them. The native comparison adapter selects only `durable_publish` and `consume_ack`, because those are the scenarios it retains from the Runnel result.
 
@@ -52,7 +53,15 @@ Run the real three-node clustered baseline with:
 just bench-cluster
 ```
 
-The runner builds the release broker, starts three processes with independent durable directories, and exercises the public protocol through multiple nodes. It measures durable publish, non-grouped consume/acknowledge, a bounded slow-consumer backlog drain, sequential shared-consumer delivery, parallel shared-consumer delivery, and restart recovery for the selected payload sizes. Each result records the node count, acknowledgement timeout, quorum durability boundary, protocol boundary, workload, throughput, p50/p99/p99.9 latency, aggregate process CPU time, and resident memory samples. Results use the same `backends` shape as the container and comparison runners, so they can be normalized into the existing history dashboard.
+The runner defaults to native broker processes with independent durable directories and exercises the public protocol through multiple nodes. It measures durable publish, non-grouped consume/acknowledge, a bounded slow-consumer backlog drain, sequential shared-consumer delivery, parallel shared-consumer delivery, and restart recovery for the selected payload sizes. Each result records the node count, acknowledgement timeout, quorum durability boundary, protocol boundary, workload, throughput, p50/p99/p99.9 latency, aggregate broker CPU time, and resident memory samples. Results use the same `backends` shape as the single-node container and comparison runners, so they can be normalized into the existing history dashboard.
+
+Run the same three-node workload with one bounded Docker container per broker:
+
+```text
+just bench-cluster-container
+```
+
+This selects `--runtime container`, applies the `--cpus` and `--memory` limits to each broker, keeps the benchmark client on the host, and connects the brokers over a private Docker network. The containerized and native modes share the workload and result schema, but their numbers are separate measurements because process scheduling, networking, filesystem mounts, and resource boundaries differ. Use `--runtime container` directly with `cluster.py` to select a custom image, workload, or resource budget. The three-node container run is a Runnel cluster baseline, not a cross-product ranking; the competitor adapter remains a separate suite.
 
 The clustered runner uses the broker's 30-second acknowledgement-timeout default. This keeps a constrained benchmark host from interpreting scheduling or quorum delay as a delivery failure during throughput measurements. Override it with `--ack-timeout-ms` when intentionally measuring redelivery behavior.
 
@@ -66,7 +75,7 @@ For a quick lifecycle check:
 just bench-cluster-smoke
 ```
 
-This is not a performance gate. Host scheduling, background processes, filesystem, and kernel state can materially affect the numbers. Keep the host and workload metadata with any result used for comparison.
+For a container lifecycle check, use `just bench-cluster-container-smoke`. Neither smoke workflow is a performance gate. Host scheduling, background processes, filesystem, kernel state, Docker networking, and container resource enforcement can materially affect the numbers. Keep the host and workload metadata with any result used for comparison.
 
 ## Profiling
 
@@ -150,7 +159,7 @@ python3 scripts/benchmarks/build_history.py \
   --output benchmark-results/site
 ```
 
-The normalized schema intentionally excludes native tool logs. It retains workload, limits, image identifiers, semantic boundaries, scenario resource samples, source revision, workflow provenance, and measured points. `build_history.py` aggregates these records into `site/data.json` on the generated `benchmark-history` branch. The hand-authored HTML, CSS, and JavaScript in `docs/benchmarks/` are served directly by GitHub Pages and read that public history data from the raw GitHub URL. The longer Runnel-only history is the primary optimization series; native and three-node competitor records are kept as separate suites. Invalid or unrelated JSON files are skipped.
+The normalized schema intentionally excludes native tool logs. It retains the version-2 run envelope, workload, limits, image identifiers, semantic boundaries, scenario resource and server-metric deltas, source revision, workflow provenance, and measured points. `build_history.py` aggregates these records into `site/data.json` on the generated `benchmark-history` branch. The hand-authored HTML, CSS, and JavaScript in `docs/benchmarks/` are served directly by GitHub Pages and read that public history data from the raw GitHub URL. The longer Runnel-only history is the primary optimization series; native and three-node competitor records are kept as separate suites. Invalid or unrelated JSON files are skipped.
 
 The dashboard uses the dedicated Runnel suite as the primary optimization history. Older Runnel points recorded by the native-comparison workflow remain available as a separate history, because their measurement boundary can differ. Charts keep benchmark suite, backend, operation, and payload size in separate visual series, so selecting all sizes or suites does not connect unrelated measurements or hide which point belongs to which workload. Raw run medians are shown as dots, while a five-run rolling median makes the direction of change easier to see; repetition ranges are shown as a band when available.
 

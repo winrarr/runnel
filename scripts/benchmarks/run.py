@@ -9,27 +9,39 @@ future binary protocol or a different durability mode.
 from __future__ import annotations
 
 import argparse
-import json
 import os
-import platform
-import re
-import shutil
-import socket
 import subprocess
 import tempfile
 import time
-import urllib.error
-import urllib.request
-from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
-from resources import StatsSampler, summarize_stats
+from common import (
+    BenchmarkError,
+    LineClient,
+    ROOT,
+    acknowledge,
+    build_image,
+    create_stream,
+    consume_ack_messages,
+    metric,
+    measure_message_batch,
+    measure_scenario,
+    parse_sizes,
+    poll,
+    publish,
+    publish_messages,
+    publish_stream,
+    prometheus_metrics,
+    result_metadata,
+    wait_for_ready,
+    write_json_result,
+)
+from resources import summarize_stats
+from runtime import DockerContainer, MeasuredContainer, create_network, remove_network
 
-
-ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_IMAGE = "runnel:bench"
 DEFAULT_MESSAGES = 1_000
 DEFAULT_WARMUP = 50
@@ -43,130 +55,68 @@ SCENARIO_NAMES = (
 )
 
 
-class BenchmarkError(RuntimeError):
-    """An expected benchmark setup or protocol failure."""
-
-
-class LineClient:
-    """A persistent client for the current line-delimited JSON protocol."""
-
-    def __init__(self, host: str, port: int) -> None:
-        self.socket = socket.create_connection((host, port), timeout=DEFAULT_TIMEOUT_SECONDS)
-        self.reader = self.socket.makefile("rb")
-
-    def request(self, request: dict[str, Any]) -> tuple[dict[str, Any], int]:
-        encoded = json.dumps(request, separators=(",", ":")).encode("utf-8") + b"\n"
-        started = time.perf_counter_ns()
-        self.socket.sendall(encoded)
-        line = self.reader.readline()
-        elapsed = time.perf_counter_ns() - started
-        if not line:
-            raise BenchmarkError("broker closed the protocol connection")
-        try:
-            response = json.loads(line)
-        except json.JSONDecodeError as error:
-            raise BenchmarkError(f"invalid broker response: {line!r}") from error
-        if response.get("type") == "error":
-            raise BenchmarkError(
-                f"broker rejected {request.get('op')}: {response.get('code')}: "
-                f"{response.get('message')}"
-            )
-        return response, elapsed
-
-    def close(self) -> None:
-        try:
-            self.reader.close()
-        finally:
-            self.socket.close()
-
-
 class DockerBroker:
     """Own a short-lived broker container and its temporary durable volume."""
 
     def __init__(self, image: str, cpus: str, memory: str) -> None:
-        self.image = image
-        self.cpus = cpus
-        self.memory = memory
         isolation_id = os.environ.get("RUNNEL_ISOLATION_ID")
         suffix = isolation_id or f"{os.getpid()}-{time.time_ns()}"
         self.name = f"runnel-bench-{suffix}"
         self.network = f"runnel-bench-net-{suffix}"
         self.network_created = False
-        self.data_dir = Path(tempfile.mkdtemp(prefix="runnel-bench-"))
-        self.data_dir.chmod(0o777)
-        self.image_id: str | None = None
+        self.container = MeasuredContainer(
+            DockerContainer(
+                name=self.name,
+                image=image,
+                network=self.network,
+                cpus=cpus,
+                memory=memory,
+                data_dir=Path(tempfile.mkdtemp(prefix="runnel-bench-")),
+                data_target="/var/lib/runnel",
+                published_ports=(4222, 8080),
+            )
+        )
         self.client_port: int | None = None
         self.http_port: int | None = None
         self.startup_ns: int | None = None
-        self.stats = StatsSampler(self.name)
+        self.stats = self.container.stats
+
+    @property
+    def image_id(self) -> str | None:
+        return self.container.image_id
 
     def start(self) -> None:
-        image = subprocess.run(
-            ["docker", "image", "inspect", "--format", "{{.Id}}", self.image],
-            check=True,
-            capture_output=True,
-            text=True,
-        )
-        self.image_id = image.stdout.strip()
-        command = [
-            "docker",
-            "run",
-            "--detach",
-            "--name",
-            self.name,
-            "--label",
-            "runnel.benchmark=true",
-            "--network",
-            self.network,
-            "--cpus",
-            self.cpus,
-            "--memory",
-            self.memory,
-            "--publish",
-            "127.0.0.1::4222",
-            "--publish",
-            "127.0.0.1::8080",
-            "--volume",
-            f"{self.data_dir}:/var/lib/runnel",
-            self.image,
-        ]
         started = time.perf_counter_ns()
         try:
-            subprocess.run(
-                [
-                    "docker",
-                    "network",
-                    "create",
-                    "--label",
-                    "runnel.benchmark=true",
-                    self.network,
-                ],
-                check=True,
-                capture_output=True,
-                text=True,
-            )
+            create_network(self.network)
             self.network_created = True
-            subprocess.run(command, check=True, capture_output=True, text=True)
-            self.client_port = self._published_port(4222)
-            self.http_port = self._published_port(8080)
-            wait_for_ready(self.http_port)
+            self.container.start()
+            self.client_port = self.container.published_port(4222)
+            self.http_port = self.container.published_port(8080)
+            wait_for_ready(self.http_port, timeout_seconds=DEFAULT_TIMEOUT_SECONDS)
         except (subprocess.CalledProcessError, BenchmarkError) as error:
-            logs = subprocess.run(
-                ["docker", "logs", self.name], capture_output=True, text=True, check=False
-            )
             raise BenchmarkError(
-                f"failed to start broker container: {error}\n{logs.stdout}{logs.stderr}"
+                f"failed to start broker container: {error}\n{self.container.logs()}"
             ) from error
         self.startup_ns = time.perf_counter_ns() - started
-        self.stats.start()
+
+    def client(self) -> LineClient:
+        if self.client_port is None:
+            raise BenchmarkError("broker client port was not discovered")
+        return LineClient("127.0.0.1", self.client_port, DEFAULT_TIMEOUT_SECONDS)
+
+    def metrics(self) -> dict[str, float] | None:
+        if self.http_port is None:
+            return None
+        return prometheus_metrics(self.http_port)
 
     def restart(self) -> int:
         started = time.perf_counter_ns()
-        subprocess.run(["docker", "restart", self.name], check=True, capture_output=True)
-        self.client_port = self._published_port(4222)
-        self.http_port = self._published_port(8080)
+        self.container.restart()
+        self.client_port = self.container.published_port(4222)
+        self.http_port = self.container.published_port(8080)
         try:
-            wait_for_ready(self.http_port)
+            wait_for_ready(self.http_port, timeout_seconds=DEFAULT_TIMEOUT_SECONDS)
         except BenchmarkError as error:
             state = subprocess.run(
                 [
@@ -180,159 +130,35 @@ class DockerBroker:
                 text=True,
                 check=False,
             )
-            logs = subprocess.run(
-                ["docker", "logs", self.name], capture_output=True, text=True, check=False
-            )
             raise BenchmarkError(
                 f"broker was not ready after restart: {error}\n"
-                f"{state.stdout.strip()}\n{logs.stdout}{logs.stderr}"
+                f"{state.stdout.strip()}\n{self.container.logs()}"
             ) from error
         return time.perf_counter_ns() - started
 
-    def _published_port(self, container_port: int) -> int:
-        result = subprocess.run(
-            ["docker", "port", self.name, f"{container_port}/tcp"],
-            check=True,
-            capture_output=True,
-            text=True,
-        )
-        match = re.search(r":(\d+)\s*$", result.stdout.strip())
-        if match is None:
-            raise BenchmarkError(f"could not parse published port: {result.stdout!r}")
-        return int(match.group(1))
-
     def close(self) -> None:
-        self.stats.close()
-        subprocess.run(["docker", "rm", "--force", self.name], check=False, capture_output=True)
+        self.container.close()
         if self.network_created:
-            subprocess.run(
-                ["docker", "network", "rm", self.network],
-                check=False,
-                capture_output=True,
-            )
-        shutil.rmtree(self.data_dir, ignore_errors=True)
-
-
-def wait_for_ready(http_port: int) -> None:
-    deadline = time.monotonic() + DEFAULT_TIMEOUT_SECONDS
-    url = f"http://127.0.0.1:{http_port}/health/ready"
-    last_error: Exception | None = None
-    while time.monotonic() < deadline:
-        try:
-            with urllib.request.urlopen(url, timeout=1) as response:
-                if response.status == 200:
-                    return
-        except (urllib.error.URLError, TimeoutError, OSError) as error:
-            last_error = error
-        time.sleep(0.05)
-    raise BenchmarkError(f"broker did not become ready: {last_error}")
-
-
-def create_stream(client: LineClient, stream: str) -> None:
-    response, _ = client.request({"op": "create_stream", "stream": stream})
-    if response.get("type") != "stream_created":
-        raise BenchmarkError(f"unexpected stream creation response: {response}")
-
-
-def publish(client: LineClient, stream: str, payload: str) -> int:
-    response, elapsed = client.request(
-        {"op": "publish", "stream": stream, "payload": payload}
-    )
-    if response.get("type") != "published":
-        raise BenchmarkError(f"unexpected publish response: {response}")
-    return elapsed
-
-
-def poll(client: LineClient, stream: str, consumer: str, expected_offset: int) -> int:
-    response, elapsed = client.request(
-        {"op": "poll", "stream": stream, "consumer": consumer}
-    )
-    if response.get("type") != "message" or response.get("offset") != expected_offset:
-        raise BenchmarkError(f"unexpected poll response: {response}")
-    return elapsed
-
-
-def acknowledge(client: LineClient, stream: str, consumer: str, offset: int) -> int:
-    response, elapsed = client.request(
-        {"op": "ack", "stream": stream, "consumer": consumer, "offset": offset}
-    )
-    if response.get("type") != "acknowledged":
-        raise BenchmarkError(f"unexpected acknowledgement response: {response}")
-    return elapsed
-
-
-def percentile(values: list[int], percentage: float) -> float:
-    if not values:
-        return 0.0
-    ordered = sorted(values)
-    position = (len(ordered) - 1) * percentage / 100
-    lower = int(position)
-    upper = min(lower + 1, len(ordered) - 1)
-    fraction = position - lower
-    return ordered[lower] + (ordered[upper] - ordered[lower]) * fraction
-
-
-def metric(
-    name: str,
-    latencies_ns: list[int],
-    elapsed_ns: int,
-    *,
-    message_size: int,
-    metadata: dict[str, Any] | None = None,
-) -> dict[str, Any]:
-    count = len(latencies_ns)
-    result: dict[str, Any] = {
-        "name": name,
-        "messages": count,
-        "message_size_bytes": message_size,
-        "elapsed_seconds": elapsed_ns / 1_000_000_000,
-        "throughput_messages_per_second": count / (elapsed_ns / 1_000_000_000),
-        "latency_microseconds": {
-            "p50": percentile(latencies_ns, 50) / 1_000,
-            "p99": percentile(latencies_ns, 99) / 1_000,
-            "p999": percentile(latencies_ns, 99.9) / 1_000,
-            "max": max(latencies_ns) / 1_000,
-        },
-    }
-    if metadata:
-        result["metadata"] = metadata
-    return result
+            remove_network(self.network)
 
 
 def new_stream(run_id: str, name: str, size: int) -> str:
     return f"bench_{run_id}_{name}_{size}"
 
 
-def measure_scenario(broker: DockerBroker, operation: Callable[[], dict[str, Any]]) -> dict[str, Any]:
-    token = broker.stats.begin()
-    try:
-        result = operation()
-    except BaseException:
-        broker.stats.end(token)
-        raise
-    result["resource_samples"] = broker.stats.end(token)
-    return result
-
-
 def run_durable_publish(
     broker: DockerBroker, stream: str, payload: str, messages: int, warmup: int
 ) -> dict[str, Any]:
-    if broker.client_port is None:
-        raise BenchmarkError("broker client port was not discovered")
-    client = LineClient("127.0.0.1", broker.client_port)
+    client = broker.client()
     try:
-        create_stream(client, stream)
-        for _ in range(warmup):
-            publish(client, stream, payload)
-        def measured() -> dict[str, Any]:
-            latencies: list[int] = []
-            started = time.perf_counter_ns()
-            for _ in range(messages):
-                latencies.append(publish(client, stream, payload))
-            elapsed = time.perf_counter_ns() - started
-            return metric("durable_publish", latencies, elapsed, message_size=len(payload))
-
-        return measure_scenario(broker, measured)
+        publish_stream(client, stream, payload, warmup)
+        return measure_message_batch(
+            broker.stats,
+            "durable_publish",
+            len(payload),
+            lambda: publish_messages(lambda _: client, stream, payload, messages),
+            metrics=broker.metrics,
+        )
     finally:
         client.close()
 
@@ -344,80 +170,69 @@ def run_concurrent_publish(
     messages: int,
     concurrency: int,
 ) -> dict[str, Any]:
-    if broker.client_port is None:
-        raise BenchmarkError("broker client port was not discovered")
-    setup = LineClient("127.0.0.1", broker.client_port)
-    create_stream(setup, stream)
-    setup.close()
+    setup = broker.client()
+    try:
+        publish_stream(setup, stream, payload, messages)
+    finally:
+        setup.close()
     per_worker = [(messages // concurrency) + (index < messages % concurrency) for index in range(concurrency)]
 
     def worker(worker_messages: int) -> list[int]:
-        client = LineClient("127.0.0.1", broker.client_port or 0)
+        client = broker.client()
         try:
-            return [publish(client, stream, payload) for _ in range(worker_messages)]
+            return publish_messages(lambda _: client, stream, payload, worker_messages)
         finally:
             client.close()
 
-    def measured() -> dict[str, Any]:
-        started = time.perf_counter_ns()
+    def publish_concurrently() -> list[int]:
         with ThreadPoolExecutor(max_workers=concurrency) as executor:
             futures = [executor.submit(worker, count) for count in per_worker if count]
-            latencies = [latency for future in futures for latency in future.result()]
-        elapsed = time.perf_counter_ns() - started
-        return metric(
-            "concurrent_publish",
-            latencies,
-            elapsed,
-            message_size=len(payload),
-            metadata={"concurrency": concurrency},
-        )
+            return [latency for future in futures for latency in future.result()]
 
-    return measure_scenario(broker, measured)
+    return measure_message_batch(
+        broker.stats,
+        "concurrent_publish",
+        len(payload),
+        publish_concurrently,
+        metadata={"concurrency": concurrency},
+        metrics=broker.metrics,
+    )
 
 
 def run_consume_ack(
     broker: DockerBroker, stream: str, payload: str, messages: int
 ) -> dict[str, Any]:
-    if broker.client_port is None:
-        raise BenchmarkError("broker client port was not discovered")
-    producer = LineClient("127.0.0.1", broker.client_port)
-    create_stream(producer, stream)
-    for _ in range(messages):
-        publish(producer, stream, payload)
-    producer.close()
+    producer = broker.client()
+    try:
+        publish_stream(producer, stream, payload, messages)
+    finally:
+        producer.close()
 
-    consumer = LineClient("127.0.0.1", broker.client_port)
+    consumer = broker.client()
 
-    def measured() -> dict[str, Any]:
-        latencies: list[int] = []
-        started = time.perf_counter_ns()
+    def consume() -> list[int]:
         try:
-            for offset in range(messages):
-                poll_started = time.perf_counter_ns()
-                poll(consumer, stream, "benchmark-consumer", offset)
-                acknowledge(consumer, stream, "benchmark-consumer", offset)
-                latencies.append(time.perf_counter_ns() - poll_started)
+            return consume_ack_messages(
+                lambda _: consumer, stream, "benchmark-consumer", messages
+            )
         finally:
             consumer.close()
-        elapsed = time.perf_counter_ns() - started
-        return metric(
-            "consume_ack",
-            latencies,
-            elapsed,
-            message_size=len(payload),
-            metadata={"publish_setup_excluded": True},
-        )
 
-    return measure_scenario(broker, measured)
+    return measure_message_batch(
+        broker.stats,
+        "consume_ack",
+        len(payload),
+        consume,
+        metadata={"publish_setup_excluded": True},
+        metrics=broker.metrics,
+    )
 
 
 def run_roundtrip(
     broker: DockerBroker, stream: str, payload: str, messages: int
 ) -> dict[str, Any]:
-    if broker.client_port is None:
-        raise BenchmarkError("broker client port was not discovered")
-    producer = LineClient("127.0.0.1", broker.client_port)
-    consumer = LineClient("127.0.0.1", broker.client_port)
+    producer = broker.client()
+    consumer = broker.client()
     create_stream(producer, stream)
 
     def measured() -> dict[str, Any]:
@@ -436,58 +251,38 @@ def run_roundtrip(
         elapsed = time.perf_counter_ns() - started
         return metric("publish_consume_ack_roundtrip", latencies, elapsed, message_size=len(payload))
 
-    return measure_scenario(broker, measured)
+    return measure_scenario(broker.stats, measured, metrics=broker.metrics)
 
 
 def run_restart_recovery(
     broker: DockerBroker, stream: str, payload: str
 ) -> dict[str, Any]:
-    if broker.client_port is None:
-        raise BenchmarkError("broker client port was not discovered")
-    client = LineClient("127.0.0.1", broker.client_port)
+    client = broker.client()
     create_stream(client, stream)
     publish(client, stream, payload)
     poll(client, stream, "restart-consumer", 0)
     client.close()
     def measured() -> dict[str, Any]:
+        started = time.perf_counter_ns()
         restart_ns = broker.restart()
-        recovered = LineClient("127.0.0.1", broker.client_port or 0)
+        recovered = broker.client()
         try:
             poll(recovered, stream, "restart-consumer", 0)
             acknowledge(recovered, stream, "restart-consumer", 0)
         finally:
             recovered.close()
-        return {
-            "name": "restart_recovery",
-            "messages": 1,
-            "message_size_bytes": len(payload),
-            "restart_ready_seconds": restart_ns / 1_000_000_000,
-            "metadata": {"unacknowledged_message_redelivered": True},
-        }
+        elapsed_ns = time.perf_counter_ns() - started
+        result = metric(
+            "restart_recovery",
+            [elapsed_ns],
+            elapsed_ns,
+            message_size=len(payload),
+            metadata={"unacknowledged_message_redelivered": True},
+        )
+        result["restart_ready_seconds"] = restart_ns / 1_000_000_000
+        return result
 
-    return measure_scenario(broker, measured)
-
-
-def build_image(image: str) -> None:
-    subprocess.run(["docker", "build", "--tag", image, str(ROOT)], check=True)
-
-
-def git_revision() -> str:
-    result = subprocess.run(
-        ["git", "rev-parse", "--short", "HEAD"],
-        cwd=ROOT,
-        check=False,
-        capture_output=True,
-        text=True,
-    )
-    return result.stdout.strip() if result.returncode == 0 else "uncommitted"
-
-
-def parse_sizes(value: str) -> list[int]:
-    sizes = [int(part) for part in value.split(",") if part.strip()]
-    if not sizes or any(size <= 0 for size in sizes):
-        raise argparse.ArgumentTypeError("payload sizes must be positive integers")
-    return sizes
+    return measure_scenario(broker.stats, measured, metrics=broker.metrics)
 
 
 def parse_scenarios(value: str) -> list[str]:
@@ -530,10 +325,6 @@ def parse_args() -> argparse.Namespace:
     return args
 
 
-def stats_summary(samples: list[dict[str, float]]) -> dict[str, Any]:
-    return summarize_stats(samples)
-
-
 def main() -> int:
     args = parse_args()
     if args.build:
@@ -542,7 +333,6 @@ def main() -> int:
     timestamp = datetime.now(UTC)
     run_id = timestamp.strftime("%Y%m%d%H%M%S%f")
     output = args.output or ROOT / "benchmark-results" / f"{run_id}.json"
-    output.parent.mkdir(parents=True, exist_ok=True)
     broker = DockerBroker(args.image, args.cpus, args.memory)
     scenarios: list[dict[str, Any]] = []
     selected_scenarios = set(args.scenarios)
@@ -604,24 +394,16 @@ def main() -> int:
         broker.close()
 
     summary = {
-        "schema_version": 1,
-        "generated_at": timestamp.isoformat(),
-        "backend": "runnel",
-        "engine": "local",
-        "git_revision": git_revision(),
-        "host": {
-            "platform": platform.platform(),
-            "processor": platform.processor(),
-            "python": platform.python_version(),
-            "cpus": os.cpu_count(),
-        },
-        "container": {
-            "image": args.image,
-            "image_id": broker.image_id,
-            "cpu_limit": args.cpus,
-            "memory_limit": args.memory,
-            "startup_seconds": (broker.startup_ns or 0) / 1_000_000_000,
-            "resource_samples": stats_summary(broker.stats.samples),
+        **result_metadata(
+            run_id,
+            timestamp,
+            benchmark_suite="runnel",
+            comparison_mode="single-node",
+            docker=True,
+        ),
+        "resource_limits": {
+            "broker_cpu": args.cpus,
+            "broker_memory": args.memory,
         },
         "workload": {
             "messages": args.messages,
@@ -630,13 +412,28 @@ def main() -> int:
             "payload_sizes_bytes": args.payload_sizes,
             "scenarios": args.scenarios,
             "protocol": "line-delimited JSON with UTF-8 string payloads",
+            "protocol_version": "provisional-line-json-v1",
+            "payload_encoding": "utf-8",
+            "compression": "none",
             "durability": "current broker default; see engine and implementation configuration",
         },
-        "scenarios": scenarios,
+        "backends": {
+            "runnel": {
+                "image": args.image,
+                "image_id": broker.image_id,
+                "runtime": "container",
+                "acknowledgement": "local durable append",
+                "replication": "single local broker engine",
+                "measurement_boundary": "public line-delimited JSON protocol",
+                "measurement_client": "host Python socket client",
+                "client_image": "host Python runtime",
+                "startup_seconds": (broker.startup_ns or 0) / 1_000_000_000,
+                "resource_samples": summarize_stats(broker.stats.samples),
+                "scenarios": scenarios,
+            }
+        },
     }
-    output.write_text(json.dumps(summary, indent=2) + "\n", encoding="utf-8")
-    print(json.dumps(summary, indent=2))
-    print(f"results written to {output}")
+    write_json_result(output, summary)
     return 0
 
 

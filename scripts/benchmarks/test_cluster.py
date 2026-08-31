@@ -15,6 +15,7 @@ from cluster import (  # noqa: E402
     percentile,
     poll_until_redelivered,
     process_stats,
+    resource_limits,
 )
 from profile import summarize_timing_logs  # noqa: E402
 
@@ -93,6 +94,24 @@ class ClusterBenchmarkTests(unittest.TestCase):
         ):
             with self.assertRaises(SystemExit):
                 parse_args()
+
+    def test_container_runtime_records_per_broker_limits(self) -> None:
+        with patch.object(
+            sys,
+            "argv",
+            ["cluster.py", "--runtime", "container", "--cpus", "1.5", "--memory", "1g"],
+        ):
+            args = parse_args()
+
+        self.assertEqual(args.runtime, "container")
+        self.assertEqual(
+            resource_limits(runtime=args.runtime, cpus=args.cpus, memory=args.memory),
+            {
+                "processes": "Docker containers; benchmark client remains host-side",
+                "cpu_per_broker": "1.5",
+                "memory_per_broker": "1g",
+            },
+        )
 
     def test_timing_summary_normalizes_tracing_stage_names(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

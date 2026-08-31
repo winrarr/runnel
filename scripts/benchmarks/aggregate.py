@@ -20,6 +20,9 @@ SCALAR_METRICS = (
     "throughput_messages_per_second",
     "elapsed_milliseconds",
     "throughput_megabytes_per_second",
+    "elapsed_seconds",
+    "latency_sample_count",
+    "restart_ready_seconds",
 )
 LATENCY_METRICS = ("p50", "p99", "p999", "max")
 
@@ -67,6 +70,17 @@ def aggregate_mapping(mappings: list[dict[str, Any]]) -> dict[str, Any]:
     return result
 
 
+def aggregate_per_node(mappings: list[dict[str, Any]]) -> dict[str, Any]:
+    """Aggregate node resource summaries without collapsing node identity."""
+    node_ids = sorted({node_id for mapping in mappings for node_id in mapping})
+    return {
+        node_id: aggregate_mapping(
+            [mapping[node_id] for mapping in mappings if node_id in mapping]
+        )
+        for node_id in node_ids
+    }
+
+
 def scenario_key(scenario: dict[str, Any]) -> tuple[Any, ...]:
     metadata = scenario.get("metadata", {})
     return (
@@ -103,6 +117,20 @@ def scenario_summary(scenarios: list[dict[str, Any]]) -> dict[str, Any]:
         metric_summary = summary(values)
         if metric_summary:
             result[metric] = metric_summary
+
+    server_metrics = [
+        scenario.get("server_metrics", {}).get("delta")
+        for scenario in scenarios
+        if isinstance(scenario.get("server_metrics"), dict)
+        and scenario["server_metrics"].get("available") is True
+        and isinstance(scenario["server_metrics"].get("delta"), dict)
+    ]
+    if server_metrics:
+        result["server_metrics"] = {
+            name: summary([metrics.get(name) for metrics in server_metrics])
+            for name in server_metrics[0]
+            if summary([metrics.get(name) for metrics in server_metrics])
+        }
 
     cpu_efficiency = []
     for scenario in scenarios:
@@ -144,6 +172,32 @@ def aggregate_scenarios(scenarios: list[dict[str, Any]]) -> list[dict[str, Any]]
                 if isinstance(scenario.get("resource_samples"), dict)
             ]
             result["resource_samples"] = aggregate_mapping(resources)
+            per_node = [
+                resource["per_node"]
+                for resource in resources
+                if isinstance(resource.get("per_node"), dict)
+            ]
+            if per_node:
+                result["resource_samples"]["per_node"] = aggregate_per_node(per_node)
+        server_metrics = [
+            scenario["server_metrics"]
+            for scenario in group
+            if isinstance(scenario.get("server_metrics"), dict)
+        ]
+        if server_metrics:
+            available = [
+                metrics
+                for metrics in server_metrics
+                if metrics.get("available") is True
+                and isinstance(metrics.get("delta"), dict)
+            ]
+            result["server_metrics"] = copy.deepcopy(server_metrics[0])
+            if available:
+                result["server_metrics"]["delta"] = aggregate_mapping(
+                    [metrics["delta"] for metrics in available]
+                )
+            else:
+                result["server_metrics"]["available"] = False
         result["repetitions"] = len(group)
         result["repetition_summary"] = scenario_summary(group)
         aggregated.append(result)
@@ -163,6 +217,24 @@ def aggregate_results(results: list[dict[str, Any]]) -> dict[str, Any]:
             raise AggregationError("repetitions disagree on source revision")
         if result.get("backends", {}).keys() != reference.get("backends", {}).keys():
             raise AggregationError("repetitions disagree on backend set")
+        for backend_name in reference.get("backends", {}):
+            for field in (
+                "image",
+                "image_id",
+                "runtime",
+                "acknowledgement",
+                "replication",
+                "measurement_boundary",
+                "measurement_client",
+                "client_image",
+                "semantic_metadata",
+            ):
+                if result["backends"][backend_name].get(field) != reference[
+                    "backends"
+                ][backend_name].get(field):
+                    raise AggregationError(
+                        f"repetitions disagree on {field} for backend {backend_name!r}"
+                    )
 
     backends: dict[str, Any] = {}
     for backend_name in reference.get("backends", {}):
@@ -187,6 +259,13 @@ def aggregate_results(results: list[dict[str, Any]]) -> dict[str, Any]:
         ]
         if resources:
             backend["resource_samples"] = aggregate_mapping(resources)
+            per_node = [
+                resource["per_node"]
+                for resource in resources
+                if isinstance(resource.get("per_node"), dict)
+            ]
+            if per_node:
+                backend["resource_samples"]["per_node"] = aggregate_per_node(per_node)
             backend["repetition_summary"] = {
                 key: summary([resource.get(key) for resource in resources])
                 for key in resources[0]
@@ -198,18 +277,27 @@ def aggregate_results(results: list[dict[str, Any]]) -> dict[str, Any]:
     source = copy.deepcopy(reference.get("source", {}))
     source["repetitions"] = len(results)
     source["repetition_run_ids"] = [
-        result.get("source", {}).get("run_id") for result in results
+        result.get("run_id") or result.get("source", {}).get("run_id") for result in results
     ]
     generated_at = max(result.get("generated_at", "") for result in results)
     return {
         "history_schema_version": reference.get("history_schema_version", 1),
+        "schema_version": reference.get("schema_version", 2),
+        "run_id": f"aggregate-{generated_at}",
+        "started_at": min(
+            result.get("started_at") or result.get("generated_at", "") for result in results
+        ),
         "generated_at": generated_at,
+        "finished_at": generated_at,
+        "status": "complete",
+        "command": copy.deepcopy(reference.get("command")),
         "source": source,
         "environment": copy.deepcopy(reference.get("environment", {})),
         "comparison_mode": reference.get("comparison_mode"),
         "benchmark_suite": reference.get("benchmark_suite", "unknown"),
         "resource_limits": copy.deepcopy(reference.get("resource_limits", {})),
         "workload": copy.deepcopy(reference.get("workload", {})),
+        "comparison_guardrail": copy.deepcopy(reference.get("comparison_guardrail")),
         "aggregate": {
             "repetitions": len(results),
             "first_generated_at": min(result.get("generated_at", "") for result in results),
@@ -217,7 +305,7 @@ def aggregate_results(results: list[dict[str, Any]]) -> dict[str, Any]:
         },
         "repetition_runs": [
             {
-                "run_id": result.get("source", {}).get("run_id"),
+                "run_id": result.get("run_id") or result.get("source", {}).get("run_id"),
                 "generated_at": result.get("generated_at"),
                 "source_result": result.get("source_result"),
             }
