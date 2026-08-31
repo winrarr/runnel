@@ -12,22 +12,161 @@ sys.path.insert(0, str(SCRIPT_DIR))
 
 from cluster import (  # noqa: E402
     BenchmarkError,
+    DEFAULT_SCENARIOS,
     metric,
     MIN_RETAINED_RECOVERY_MESSAGES,
     DEFAULT_RETAINED_RECOVERY_MESSAGES,
     parse_args,
     parse_nonnegative_int,
     parse_retained_messages,
+    parse_scenarios,
+    parse_positive_float,
     percentile,
+    PeerResponseDelayProxy,
     poll_until_redelivered,
     process_stats,
     resource_limits,
+    run_peer_forwarding,
     run_retained_recovery,
 )
 from profile import summarize_timing_logs  # noqa: E402
 
 
 class ClusterBenchmarkTests(unittest.TestCase):
+    def test_default_scenarios_preserve_the_existing_entrypoint_workload(self) -> None:
+        with patch.object(sys, "argv", ["cluster.py"]):
+            args = parse_args()
+
+        self.assertEqual(args.scenarios, list(DEFAULT_SCENARIOS))
+        self.assertNotIn("peer_forwarding", args.scenarios)
+
+    def test_peer_forwarding_options_are_explicit_and_parseable(self) -> None:
+        with patch.object(
+            sys,
+            "argv",
+            [
+                "cluster.py",
+                "--scenarios",
+                "peer_forwarding",
+                "--messages",
+                "3",
+                "--peer-forwarding-concurrency",
+                "8",
+                "--peer-response-delay-ms",
+                "5",
+                "--peer-forwarding-timeout-seconds",
+                "12.5",
+            ],
+        ):
+            args = parse_args()
+
+        self.assertEqual(args.scenarios, ["peer_forwarding"])
+        self.assertEqual(args.peer_forwarding_concurrency, 8)
+        self.assertEqual(args.peer_response_delay_ms, 5)
+        self.assertEqual(args.peer_forwarding_timeout_seconds, 12.5)
+        self.assertEqual(parse_positive_float("0.5"), 0.5)
+
+    def test_scenarios_reject_unknown_and_duplicate_names(self) -> None:
+        with self.assertRaises(argparse.ArgumentTypeError):
+            parse_scenarios("peer_forwarding,unknown")
+        with self.assertRaises(argparse.ArgumentTypeError):
+            parse_scenarios("peer_forwarding,peer_forwarding")
+        with self.assertRaises(argparse.ArgumentTypeError):
+            parse_scenarios("  ")
+        with self.assertRaises(argparse.ArgumentTypeError):
+            parse_positive_float("nan")
+        with self.assertRaises(argparse.ArgumentTypeError):
+            parse_positive_float("inf")
+
+    def test_peer_response_proxy_can_close_before_start(self) -> None:
+        proxy = PeerResponseDelayProxy(0, 1)
+        proxy.close()
+
+    def test_peer_response_delay_requires_native_runtime(self) -> None:
+        with patch.object(
+            sys,
+            "argv",
+            [
+                "cluster.py",
+                "--runtime",
+                "container",
+                "--peer-response-delay-ms",
+                "1",
+            ],
+        ):
+            with self.assertRaises(SystemExit):
+                parse_args()
+
+    def test_peer_forwarding_rejects_a_non_contiguous_response_batch(self) -> None:
+        cluster = SimpleNamespace(
+            node_count=3,
+            peer_response_delay_ms=0,
+            stats=object(),
+            metrics=lambda: None,
+            peer_proxy_summary=lambda: {"enabled": False},
+            client=lambda _index, **_: SimpleNamespace(close=lambda: None),
+        )
+
+        def run_measurement(_stats: object, operation: object, **_: object) -> dict:
+            return operation()
+
+        with (
+            patch("cluster.publish_stream"),
+            patch("cluster.measure_scenario", side_effect=run_measurement),
+            patch("cluster.publish", return_value=(0, 100)),
+        ):
+            with self.assertRaisesRegex(BenchmarkError, "non-contiguous offsets"):
+                run_peer_forwarding(
+                    cluster,
+                    "events",
+                    "payload",
+                    messages=2,
+                    warmup=0,
+                    concurrency=2,
+                    timeout_seconds=1,
+                )
+
+    def test_peer_forwarding_records_follower_roundtrip_metadata(self) -> None:
+        cluster = SimpleNamespace(
+            node_count=3,
+            peer_response_delay_ms=5,
+            stats=object(),
+            metrics=lambda: None,
+            peer_proxy_summary=lambda: {"enabled": True},
+            client=lambda _index, **_: SimpleNamespace(close=lambda: None),
+        )
+        next_offset = 2
+
+        def publish_message(*_: object) -> tuple[int, int]:
+            nonlocal next_offset
+            offset = next_offset
+            next_offset += 1
+            return offset, 100
+
+        def run_measurement(_stats: object, operation: object, **_: object) -> dict:
+            return operation()
+
+        with (
+            patch("cluster.publish_stream"),
+            patch("cluster.measure_scenario", side_effect=run_measurement),
+            patch("cluster.publish", side_effect=publish_message),
+        ):
+            result = run_peer_forwarding(
+                cluster,
+                "events",
+                "payload",
+                messages=4,
+                warmup=2,
+                concurrency=2,
+                timeout_seconds=1,
+            )
+
+        self.assertEqual(result["operation"], "cluster_peer_forwarding")
+        self.assertEqual(result["messages"], 4)
+        self.assertEqual(result["metadata"]["forwarding_ingress_node"], 2)
+        self.assertEqual(result["metadata"]["peer_response_delay_ms"], 5)
+        self.assertTrue(result["metadata"]["peer_response_proxy_enabled"])
+
     def test_recovery_poll_retries_empty_responses_until_second_attempt(self) -> None:
         class FakeClient:
             def __init__(self) -> None:

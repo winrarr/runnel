@@ -69,6 +69,29 @@ The slow-consumer scenario preloads a finite stream, polls one message at a time
 
 The retained-data recovery scenario is named `cluster_retained_recovery`. It preloads a separate stream with 2,048 records by default, which is above the current local 1,024-record tail-index boundary, then excludes that setup from the measured interval. The measured interval restarts one node, waits for readiness, polls the earliest retained record at offset 0, verifies its payload, and acknowledges it. Set the retained history size with `--retained-messages`; values must be at least 1,025. The scenario runs once for the first selected payload size and records `retained_messages` and `retained_logical_payload_bytes` in its existing v2 scenario metadata. Its request sample is the restart-ready-to-replay-acknowledgement interval, while the scenario resource sample covers that same interval. This measures recovery and cold replay with a known retained-data size; it does not measure retention cleanup, disk-pressure admission, batching, or prove that recovery cost is bounded. Compare runs only when retained count, payload size, topology, durability, runtime, and resource limits match.
 
+The opt-in `peer_forwarding` scenario targets the topology-free forwarding pool. Select it explicitly so the existing clustered entrypoint keeps its established workload:
+
+```text
+python3 scripts/benchmarks/cluster.py \
+  --build \
+  --scenarios peer_forwarding \
+  --messages 256 \
+  --warmup 16 \
+  --payload-sizes 100 \
+  --peer-forwarding-concurrency 8 \
+  --peer-response-delay-ms 5 \
+  --peer-forwarding-timeout-seconds 60 \
+  --output benchmark-results/peer-forwarding.json
+```
+
+The setup creates the stream and publishes warmup records through node 1; that work is excluded from measurement. Each measured publish uses one persistent public client per worker on node 2, the non-bootstrap ingress node, and therefore exercises the broker's internal `Forward` request to the data-group leader. The default eight workers exceed the current four shared forwarding permits (five pooled connections minus one reserved control connection), making pool wait visible when peer responses are delayed. The benchmark validates that all measured offsets are present and contiguous, but it does not expose offsets as a public product guarantee.
+
+`--peer-response-delay-ms` enables a run-scoped native TCP proxy on every peer address. The proxy forwards the real framed peer protocol and delays only `Forward` responses, leaving Raft control responses on the same transport but outside the injected delay; it is deliberately a bounded perturbation for response-delay and saturation experiments, not a production topology. A zero delay keeps direct peer connections. The proxy is native-process-only because container peers cannot reach the host loopback proxy. Keep the delay small enough for the cluster's acknowledgement and request timeouts. The focused scenario has a bounded wall-clock budget from `--peer-forwarding-timeout-seconds` (default 60 seconds, maximum 300); individual protocol requests retain the broker's 30-second timeout.
+
+The result uses the normal schema-v2 envelope and records the selected scenarios, message and warmup counts, payload sizes, forwarding concurrency, response delay, timeout, runtime, resource limits, full source revision, host provenance, and public-protocol durability boundary. Its `cluster_peer_forwarding` record reports throughput, logical payload throughput, p50/p99/p99.9/maximum follower round-trip latency, aggregate and per-node CPU/memory samples, and `/metrics` deltas. The scenario metadata identifies the forwarding ingress, operation, setup and latency boundaries, delay, concurrency, and saturation interpretation. When enabled, raw backend metadata at `backends.runnel-cluster.peer_response_proxy` additionally reports proxy connections, framed requests/responses, delayed responses, and per-node listen/target ports. These counters include cluster startup and setup traffic; use the scenario latency and metric deltas for measured comparisons.
+
+This probe establishes a repeatable forwarding and overload baseline; it is not evidence of a runtime performance improvement. Compare only runs with the same native runtime, topology, payload, warmup, message count, forwarding concurrency, response delay, timeout, resource budget, and source/build conditions. The delayed forwarding responses still include the target's normal quorum work, so a result does not isolate pool wait from consensus or target-processing cost. The public clustered benchmark remains unchanged unless `peer_forwarding` is selected in `--scenarios`.
+
 `--skip-recovery` skips both restart scenarios, including the retained-data probe. The cluster's temporary durable directories, generated stream names, native ports, and container network are run-scoped, so independent runs should use the normal isolation runner or distinct output paths when they overlap.
 
 The scheduled GitHub Actions history uses 200 messages per clustered scenario by default, independently of the native comparison workload. The retained-data probe remains at its separate 2,048-record default unless `--retained-messages` is overridden. This keeps repeated recovery and quorum measurements within the workflow time budget on the workflow runner's constrained CPU allocation while retaining enough traffic to compare the cluster scenarios. Increase the `cluster_messages` input for a larger manual run when investigating sustained-load behavior.
