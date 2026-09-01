@@ -2,7 +2,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::io;
 use std::mem::size_of;
 use std::sync::{Arc, OnceLock};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use openraft::BasicNode;
 use openraft::error::{RPCError, RaftError, Unreachable};
@@ -24,6 +24,11 @@ use runnel_engine::{AckResult, BrokerError, Offset, PollResult};
 
 const MAX_FRAME_SIZE: u32 = 64 * 1024 * 1024;
 const MAX_REUSABLE_FRAME_BUFFER_SIZE: usize = 1024 * 1024;
+// Stateless forwarding has no owner that can explicitly close an idle pool.
+// Reap old sockets lazily on the next checkout so an inactive peer does not
+// retain file descriptors indefinitely. A background reaper belongs with a
+// future long-lived transport owner rather than this compatibility bridge.
+const MAX_IDLE_CONNECTION_AGE: Duration = Duration::from_secs(30);
 // Topology-free forwarding and stateless control RPCs receive no long-lived
 // network object on which to scope their connections. Keep this compatibility
 // bridge process-wide but bounded until that ownership moves into the engine.
@@ -164,7 +169,12 @@ impl TcpConnection {
 struct PeerConnectionPool {
     control_permits: Arc<Semaphore>,
     shared_permits: Arc<Semaphore>,
-    idle: Mutex<Vec<TcpConnection>>,
+    idle: Mutex<Vec<IdleConnection>>,
+}
+
+struct IdleConnection {
+    connection: TcpConnection,
+    last_used: Instant,
 }
 
 #[derive(Clone, Copy)]
@@ -252,19 +262,53 @@ impl PeerConnectionPool {
             .await
             .map_err(|_| timed_out_error())?
             .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "peer RPC pool is closed"))?;
+        let mut connection = self.take_connection(address, ttl, started).await?;
         let remaining = ttl.saturating_sub(started.elapsed());
-        let mut connection = self
-            .idle
-            .lock()
-            .await
-            .pop()
-            .unwrap_or_else(|| TcpConnection::new(address));
         let result = connection.request(request, remaining).await;
         if result.is_ok() {
-            self.idle.lock().await.push(connection);
+            self.return_connection(connection, ttl, started).await;
         }
         drop(permit);
         result
+    }
+
+    async fn take_connection(
+        &self,
+        address: &str,
+        ttl: Duration,
+        started: tokio::time::Instant,
+    ) -> Result<TcpConnection, io::Error> {
+        let remaining = ttl.saturating_sub(started.elapsed());
+        let mut idle = tokio::time::timeout(remaining, self.idle.lock())
+            .await
+            .map_err(|_| timed_out_error())?;
+        let now = Instant::now();
+        let connection = loop {
+            let Some(idle_connection) = idle.pop() else {
+                break TcpConnection::new(address);
+            };
+            if now.duration_since(idle_connection.last_used) <= MAX_IDLE_CONNECTION_AGE {
+                break idle_connection.connection;
+            }
+        };
+        drop(idle);
+        Ok(connection)
+    }
+
+    async fn return_connection(
+        &self,
+        connection: TcpConnection,
+        ttl: Duration,
+        started: tokio::time::Instant,
+    ) {
+        let remaining = ttl.saturating_sub(started.elapsed());
+        let Ok(mut idle) = tokio::time::timeout(remaining, self.idle.lock()).await else {
+            return;
+        };
+        idle.push(IdleConnection {
+            connection,
+            last_used: Instant::now(),
+        });
     }
 
     fn permits(&self, lane: PeerRequestLane) -> Arc<Semaphore> {
@@ -1087,6 +1131,62 @@ mod tests {
             started.elapsed()
         );
         assert_eq!(connections, 1);
+    }
+
+    #[tokio::test]
+    async fn expired_idle_pool_connection_is_replaced_before_reuse() {
+        let peer = TestPeer::start(None).await;
+        let pool = PeerConnectionPool::new();
+
+        let response: PeerResponse = pool
+            .request(&peer.address, request(), Duration::from_secs(1))
+            .await
+            .unwrap();
+        assert!(matches!(
+            response,
+            PeerResponse::Forward(ForwardedResponse::CreateStream(Ok(true)))
+        ));
+
+        {
+            let mut idle = pool.idle.lock().await;
+            idle.last_mut().unwrap().last_used =
+                Instant::now() - (MAX_IDLE_CONNECTION_AGE + Duration::from_secs(1));
+        }
+
+        let response: PeerResponse = pool
+            .request(&peer.address, request(), Duration::from_secs(1))
+            .await
+            .unwrap();
+        assert!(matches!(
+            response,
+            PeerResponse::Forward(ForwardedResponse::CreateStream(Ok(true)))
+        ));
+        assert_eq!(peer.connections.load(Ordering::Relaxed), 2);
+    }
+
+    #[tokio::test]
+    async fn pool_idle_lock_wait_is_bounded_by_request_ttl() {
+        let peer = TestPeer::start(None).await;
+        let pool = PeerConnectionPool::new();
+        let idle = pool.idle.lock().await;
+
+        let error = pool
+            .request::<PeerResponse>(&peer.address, request(), Duration::from_millis(1))
+            .await
+            .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+        assert_eq!(peer.connections.load(Ordering::Relaxed), 0);
+
+        drop(idle);
+        let response: PeerResponse = pool
+            .request(&peer.address, request(), Duration::from_secs(1))
+            .await
+            .unwrap();
+        assert!(matches!(
+            response,
+            PeerResponse::Forward(ForwardedResponse::CreateStream(Ok(true)))
+        ));
+        assert_eq!(peer.connections.load(Ordering::Relaxed), 1);
     }
 
     #[tokio::test]
