@@ -37,6 +37,7 @@ const DEFAULT_STORAGE_EXECUTOR_CAPACITY: usize = 32;
 const DEFAULT_STORAGE_QUEUE_CAPACITY: usize = 32;
 const DEFAULT_ACK_TIMEOUT: Duration = Duration::from_secs(30);
 const DEAD_LETTER_SUFFIX: &str = ".dead-letter";
+const MAX_CONSUMER_STATE_JOURNAL_BYTES: u64 = 64 * 1024;
 
 pub use runnel_engine::{AckResult, BrokerError, HealthSnapshot, Message, Offset, PollResult};
 
@@ -381,8 +382,17 @@ struct ConsumerState {
     delivery_attempts: BTreeMap<Offset, u32>,
 }
 
+#[derive(Debug, Serialize, Deserialize)]
+enum ConsumerStateEvent {
+    DeliveryAttempt { offset: Offset, attempt: u32 },
+    Acknowledge { offset: Offset },
+}
+
 impl ConsumerState {
     fn acknowledge(&mut self, offset: Offset) {
+        if offset < self.committed_offset || self.acknowledged_offsets.contains(&offset) {
+            return;
+        }
         self.delivery_attempts.remove(&offset);
         if offset == self.committed_offset {
             self.committed_offset += 1;
@@ -393,6 +403,27 @@ impl ConsumerState {
         } else {
             self.acknowledged_offsets.insert(offset);
         }
+    }
+
+    fn apply_event(&mut self, event: ConsumerStateEvent) -> Result<(), BrokerError> {
+        match event {
+            ConsumerStateEvent::DeliveryAttempt { offset, attempt } => {
+                if attempt == 0 {
+                    return Err(BrokerError::Io(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "consumer delivery attempt must be greater than zero",
+                    )));
+                }
+                if offset >= self.committed_offset && !self.acknowledged_offsets.contains(&offset) {
+                    self.delivery_attempts
+                        .entry(offset)
+                        .and_modify(|current| *current = (*current).max(attempt))
+                        .or_insert(attempt);
+                }
+            }
+            ConsumerStateEvent::Acknowledge { offset } => self.acknowledge(offset),
+        }
+        Ok(())
     }
 }
 
@@ -589,8 +620,16 @@ impl Broker {
                 && !stream.ends_with(DEAD_LETTER_SUFFIX)
             {
                 self.dead_letter_record(&mut stream_state, stream, &candidate)?;
+                persist_consumer_event(
+                    &root,
+                    stream,
+                    consumer,
+                    &consumer_state,
+                    ConsumerStateEvent::Acknowledge {
+                        offset: candidate.offset,
+                    },
+                )?;
                 consumer_state.acknowledge(candidate.offset);
-                persist_consumer_state(&root, &consumer_state)?;
                 cache_consumer_state(
                     &mut stream_state,
                     consumer.to_owned(),
@@ -602,11 +641,19 @@ impl Broker {
 
             let delivery_attempt = attempts.saturating_add(1);
             let mut message = stream_state.log.read_message(stream, candidate.offset)?;
-            let mut next_state = consumer_state;
-            next_state
+            persist_consumer_event(
+                &root,
+                stream,
+                consumer,
+                &consumer_state,
+                ConsumerStateEvent::DeliveryAttempt {
+                    offset: candidate.offset,
+                    attempt: delivery_attempt,
+                },
+            )?;
+            consumer_state
                 .delivery_attempts
                 .insert(candidate.offset, delivery_attempt);
-            persist_consumer_state(&root, &next_state)?;
             let delivery_token = self.next_delivery_token();
             message.delivery_token = Some(delivery_token.clone());
             message.delivery_attempt = Some(delivery_attempt);
@@ -628,7 +675,7 @@ impl Broker {
                     deadline: Instant::now() + ack_timeout,
                 },
             );
-            cache_consumer_state(&mut stream_state, consumer.to_owned(), next_state);
+            cache_consumer_state(&mut stream_state, consumer.to_owned(), consumer_state);
             return Ok(PollResult::Message(message));
         }
     }
@@ -658,7 +705,7 @@ impl Broker {
         let stream_state = self.get_stream(stream)?;
         let mut stream_state = self.lock_stream(&stream_state)?;
         let root = self.inner.root.clone();
-        let consumer_state =
+        let mut consumer_state =
             load_consumer_state_for_request(&mut stream_state, &root, stream, consumer)?;
         if offset < consumer_state.committed_offset {
             return Ok(AckResult::AlreadyAcknowledged);
@@ -691,16 +738,18 @@ impl Broker {
             });
         }
 
-        let mut next_state = consumer_state;
-        next_state.acknowledge(offset);
-        let next_state = ConsumerState {
-            stream: stream.to_owned(),
-            consumer: consumer.to_owned(),
-            ..next_state
-        };
-        persist_consumer_state(&root, &next_state)?;
+        persist_consumer_event(
+            &root,
+            stream,
+            consumer,
+            &consumer_state,
+            ConsumerStateEvent::Acknowledge { offset },
+        )?;
+        consumer_state.acknowledge(offset);
+        consumer_state.stream = stream.to_owned();
+        consumer_state.consumer = consumer.to_owned();
         stream_state.remove_in_flight(&delivery_key);
-        cache_consumer_state(&mut stream_state, consumer.to_owned(), next_state);
+        cache_consumer_state(&mut stream_state, consumer.to_owned(), consumer_state);
         Ok(AckResult::Acknowledged)
     }
 
@@ -1732,23 +1781,33 @@ fn consumer_state_path(root: &Path, stream: &str, consumer: &str) -> PathBuf {
         .join(format!("{consumer}.json"))
 }
 
+fn consumer_state_journal_path(root: &Path, stream: &str, consumer: &str) -> PathBuf {
+    // Keep the historical temporary path as the event journal so existing storage-failure
+    // boundaries continue to exercise the same blocking point. Checkpoint compaction uses a
+    // separate temporary path below and never replaces this append-only file.
+    consumer_state_path(root, stream, consumer).with_extension("json.tmp")
+}
+
 fn load_consumer_state(
     root: &Path,
     stream: &str,
     consumer: &str,
 ) -> Result<ConsumerState, BrokerError> {
     let path = consumer_state_path(root, stream, consumer);
-    if !path.exists() {
-        return Ok(ConsumerState {
+    let mut state = if path.exists() {
+        let bytes = fs::read(path)?;
+        serde_json::from_slice(&bytes)?
+    } else {
+        ConsumerState {
             stream: stream.to_owned(),
             consumer: consumer.to_owned(),
             committed_offset: 0,
             acknowledged_offsets: BTreeSet::new(),
             delivery_attempts: BTreeMap::new(),
-        });
-    }
-    let bytes = fs::read(path)?;
-    Ok(serde_json::from_slice(&bytes)?)
+        }
+    };
+    replay_consumer_state_journal(root, stream, consumer, &mut state)?;
+    Ok(state)
 }
 
 fn load_consumer_state_for_request(
@@ -1787,6 +1846,102 @@ fn cache_consumer_state(stream_state: &mut StreamState, consumer: String, state:
     }
 }
 
+fn replay_consumer_state_journal(
+    root: &Path,
+    stream: &str,
+    consumer: &str,
+    state: &mut ConsumerState,
+) -> Result<(), BrokerError> {
+    let path = consumer_state_journal_path(root, stream, consumer);
+    if !path.exists() {
+        return Ok(());
+    }
+
+    let bytes = fs::read(&path)?;
+    if serde_json::from_slice::<ConsumerState>(&bytes).is_ok() {
+        // A pre-journal process may have left a fully written checkpoint temporary behind. It
+        // was never authoritative, so retain the old recovery behavior and ignore it.
+        return Ok(());
+    }
+    if bytes.len() as u64 > MAX_CONSUMER_STATE_JOURNAL_BYTES {
+        return Err(BrokerError::Io(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "consumer state journal exceeds its configured bound",
+        )));
+    }
+    let mut valid_length = 0;
+    for (line_index, line) in bytes.split_inclusive(|byte| *byte == b'\n').enumerate() {
+        if !line.ends_with(b"\n") {
+            break;
+        }
+        let line = &line[..line.len() - 1];
+        let event = match serde_json::from_slice::<ConsumerStateEvent>(line) {
+            Ok(event) => event,
+            Err(_) if line_index == 0 && serde_json::from_slice::<ConsumerState>(line).is_ok() => {
+                valid_length += line.len() + 1;
+                continue;
+            }
+            Err(error) => return Err(error.into()),
+        };
+        state.apply_event(event)?;
+        valid_length += line.len() + 1;
+    }
+
+    if valid_length != bytes.len() {
+        truncate_consumer_state_journal(&path, valid_length as u64)?;
+    }
+    Ok(())
+}
+
+fn truncate_consumer_state_journal(path: &Path, length: u64) -> Result<(), BrokerError> {
+    let file = OpenOptions::new().write(true).open(path)?;
+    file.set_len(length)?;
+    file.sync_all()?;
+    Ok(())
+}
+
+fn persist_consumer_event(
+    root: &Path,
+    stream: &str,
+    consumer: &str,
+    current_state: &ConsumerState,
+    event: ConsumerStateEvent,
+) -> Result<(), BrokerError> {
+    #[cfg(feature = "instrumentation")]
+    let _stage_timer = StageTimer::new("core.consumer_state_persist");
+    let path = consumer_state_journal_path(root, stream, consumer);
+    let parent = path.parent().ok_or_else(|| {
+        BrokerError::Io(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "consumer state journal has no parent",
+        ))
+    })?;
+    let mut encoded = serde_json::to_vec(&event)?;
+    encoded.push(b'\n');
+
+    let journal_len = match fs::metadata(&path) {
+        Ok(metadata) => metadata.len(),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => 0,
+        Err(error) => return Err(error.into()),
+    };
+    if journal_len.saturating_add(encoded.len() as u64) > MAX_CONSUMER_STATE_JOURNAL_BYTES {
+        // The checkpoint is published before the journal is truncated. If a process stops
+        // between those steps, replaying the old events is idempotent and cannot move progress
+        // backwards or revive an acknowledged delivery attempt.
+        let mut checkpoint = current_state.clone();
+        checkpoint.stream = stream.to_owned();
+        checkpoint.consumer = consumer.to_owned();
+        persist_consumer_state(root, &checkpoint)?;
+        truncate_consumer_state_journal(&path, 0)?;
+    }
+
+    fs::create_dir_all(parent)?;
+    let mut file = OpenOptions::new().create(true).append(true).open(path)?;
+    file.write_all(&encoded)?;
+    file.sync_all()?;
+    Ok(())
+}
+
 fn persist_consumer_state(root: &Path, state: &ConsumerState) -> Result<(), BrokerError> {
     #[cfg(feature = "instrumentation")]
     let _stage_timer = StageTimer::new("core.consumer_state_persist");
@@ -1798,7 +1953,7 @@ fn persist_consumer_state(root: &Path, state: &ConsumerState) -> Result<(), Brok
         ))
     })?;
     fs::create_dir_all(parent)?;
-    let temporary = path.with_extension("json.tmp");
+    let temporary = path.with_extension("checkpoint.tmp");
     let mut file = OpenOptions::new()
         .create(true)
         .write(true)
@@ -2750,6 +2905,118 @@ mod tests {
         assert!(matches!(
             result,
             PollResult::Message(Message { offset: 0, .. })
+        ));
+    }
+
+    #[test]
+    fn consumer_delivery_journal_recovers_committed_events_and_discards_partial_tail() {
+        let directory = tempdir().unwrap();
+        let journal_path = directory.path().join("consumers/events/worker.json.tmp");
+        let first_journal_len;
+        {
+            let broker = Broker::open(directory.path(), BrokerConfig::default()).unwrap();
+            broker
+                .publish("events", Some("order-1".to_owned()), b"payload".to_vec())
+                .unwrap();
+            assert!(matches!(
+                broker.poll("events", "worker").unwrap(),
+                PollResult::Message(Message {
+                    offset: 0,
+                    delivery_attempt: Some(1),
+                    ..
+                })
+            ));
+            first_journal_len = fs::metadata(&journal_path).unwrap().len();
+            assert!(first_journal_len > 0);
+
+            let mut journal = OpenOptions::new().append(true).open(&journal_path).unwrap();
+            journal.write_all(b"{\"delivery\"").unwrap();
+            journal.sync_all().unwrap();
+        }
+
+        {
+            let broker = Broker::open(directory.path(), BrokerConfig::default()).unwrap();
+            assert!(matches!(
+                broker.poll("events", "worker").unwrap(),
+                PollResult::Message(Message {
+                    offset: 0,
+                    delivery_attempt: Some(2),
+                    ..
+                })
+            ));
+            assert_eq!(
+                fs::metadata(&journal_path).unwrap().len(),
+                first_journal_len * 2
+            );
+            assert_eq!(
+                broker.ack("events", "worker", 0).unwrap(),
+                AckResult::Acknowledged
+            );
+        }
+
+        let broker = Broker::open(directory.path(), BrokerConfig::default()).unwrap();
+        assert_eq!(broker.poll("events", "worker").unwrap(), PollResult::Empty);
+    }
+
+    #[test]
+    fn consumer_delivery_journal_stays_within_its_checkpoint_bound() {
+        let directory = tempdir().unwrap();
+        let broker = Broker::open(
+            directory.path(),
+            BrokerConfig {
+                ack_timeout: Duration::ZERO,
+                max_delivery_attempts: None,
+            },
+        )
+        .unwrap();
+        broker.publish("events", None, b"payload".to_vec()).unwrap();
+
+        for expected_attempt in 1..=2_000 {
+            let message = match broker.poll("events", "worker").unwrap() {
+                PollResult::Message(message) => message,
+                PollResult::Empty => panic!("expected delivery attempt {expected_attempt}"),
+            };
+            assert_eq!(message.delivery_attempt, Some(expected_attempt));
+        }
+
+        let journal_path = directory.path().join("consumers/events/worker.json.tmp");
+        assert!(fs::metadata(journal_path).unwrap().len() <= MAX_CONSUMER_STATE_JOURNAL_BYTES);
+
+        drop(broker);
+        let broker = Broker::open(
+            directory.path(),
+            BrokerConfig {
+                ack_timeout: Duration::ZERO,
+                max_delivery_attempts: None,
+            },
+        )
+        .unwrap();
+        let message = match broker.poll("events", "worker").unwrap() {
+            PollResult::Message(message) => message,
+            PollResult::Empty => panic!("expected delivery after journal compaction recovery"),
+        };
+        assert_eq!(message.delivery_attempt, Some(2_001));
+    }
+
+    #[test]
+    fn oversized_consumer_delivery_journal_is_rejected_on_recovery() {
+        let directory = tempdir().unwrap();
+        let broker = Broker::open(directory.path(), BrokerConfig::default()).unwrap();
+        broker.publish("events", None, b"payload".to_vec()).unwrap();
+        drop(broker);
+
+        let journal_path = directory.path().join("consumers/events/worker.json.tmp");
+        fs::create_dir_all(journal_path.parent().unwrap()).unwrap();
+        fs::write(
+            &journal_path,
+            vec![b'x'; MAX_CONSUMER_STATE_JOURNAL_BYTES as usize + 1],
+        )
+        .unwrap();
+
+        let broker = Broker::open(directory.path(), BrokerConfig::default()).unwrap();
+        assert!(matches!(
+            broker.poll("events", "worker"),
+            Err(BrokerError::Io(error)) if error.kind() == io::ErrorKind::InvalidData
         ));
     }
 
