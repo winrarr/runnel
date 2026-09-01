@@ -13,6 +13,9 @@ sys.path.insert(0, str(SCRIPT_DIR))
 from cluster import (  # noqa: E402
     BenchmarkError,
     DEFAULT_SCENARIOS,
+    DEFAULT_PUBLISH_BATCH_SIZE,
+    MAX_PUBLISH_BATCH_SIZE,
+    batch_metric,
     metric,
     MIN_RETAINED_RECOVERY_MESSAGES,
     DEFAULT_RETAINED_RECOVERY_MESSAGES,
@@ -22,14 +25,27 @@ from cluster import (  # noqa: E402
     parse_scenarios,
     parse_positive_float,
     percentile,
+    publish_batch_request,
     PeerResponseDelayProxy,
     poll_until_redelivered,
     process_stats,
     resource_limits,
+    run_publish_batch,
     run_peer_forwarding,
     run_retained_recovery,
 )
 from profile import summarize_timing_logs  # noqa: E402
+
+
+class _ClientsContext:
+    def __init__(self, clients: list[object]) -> None:
+        self.clients = clients
+
+    def __enter__(self) -> list[object]:
+        return self.clients
+
+    def __exit__(self, *_: object) -> None:
+        return None
 
 
 class ClusterBenchmarkTests(unittest.TestCase):
@@ -39,6 +55,26 @@ class ClusterBenchmarkTests(unittest.TestCase):
 
         self.assertEqual(args.scenarios, list(DEFAULT_SCENARIOS))
         self.assertNotIn("peer_forwarding", args.scenarios)
+        self.assertNotIn("publish_batch", args.scenarios)
+
+    def test_publish_batch_options_are_explicit_and_bounded(self) -> None:
+        with patch.object(
+            sys,
+            "argv",
+            ["cluster.py", "--scenarios", "publish_batch", "--batch-size", "16"],
+        ):
+            args = parse_args()
+
+        self.assertEqual(args.scenarios, ["publish_batch"])
+        self.assertEqual(args.batch_size, 16)
+        self.assertEqual(DEFAULT_PUBLISH_BATCH_SIZE, 32)
+        with patch.object(
+            sys,
+            "argv",
+            ["cluster.py", "--batch-size", str(MAX_PUBLISH_BATCH_SIZE + 1)],
+        ):
+            with self.assertRaises(SystemExit):
+                parse_args()
 
     def test_peer_forwarding_options_are_explicit_and_parseable(self) -> None:
         with patch.object(
@@ -65,6 +101,114 @@ class ClusterBenchmarkTests(unittest.TestCase):
         self.assertEqual(args.peer_response_delay_ms, 5)
         self.assertEqual(args.peer_forwarding_timeout_seconds, 12.5)
         self.assertEqual(parse_positive_float("0.5"), 0.5)
+
+    def test_publish_batch_request_validates_each_published_outcome(self) -> None:
+        class FakeClient:
+            def __init__(self) -> None:
+                self.request_body: dict[str, object] | None = None
+
+            def request(self, request: dict[str, object]) -> tuple[dict[str, object], int]:
+                self.request_body = request
+                return {
+                    "type": "publish_batch",
+                    "outcomes": [
+                        {"type": "published", "offset": 4},
+                        {"type": "published", "offset": 5},
+                    ],
+                }, 2_500
+
+        client = FakeClient()
+        published, elapsed = publish_batch_request(
+            client, "events", "payload", batch_size=2, expected_offset=4
+        )
+
+        self.assertEqual(published, 2)
+        self.assertEqual(elapsed, 2_500)
+        self.assertEqual(client.request_body["op"], "publish_batch")
+        self.assertEqual(
+            client.request_body["records"],
+            [
+                {"key": None, "payload_base64": "cGF5bG9hZA=="},
+                {"key": None, "payload_base64": "cGF5bG9hZA=="},
+            ],
+        )
+
+    def test_publish_batch_request_rejects_a_per_record_error(self) -> None:
+        client = SimpleNamespace(
+            request=lambda _request: (
+                {
+                    "type": "publish_batch",
+                    "outcomes": [
+                        {"type": "error", "code": "invalid_record"},
+                    ],
+                },
+                1_000,
+            )
+        )
+
+        with self.assertRaisesRegex(BenchmarkError, "did not publish"):
+            publish_batch_request(client, "events", "payload", 1, 0)
+
+    def test_publish_batch_reports_record_count_and_batch_latency_samples(self) -> None:
+        result = batch_metric(
+            "cluster_publish_batch",
+            [1_000, 2_000, 3_000],
+            3_000_000,
+            messages=5,
+            message_size=100,
+            metadata={"batch_size": 2},
+        )
+
+        self.assertEqual(result["messages"], 5)
+        self.assertEqual(result["latency_sample_count"], 3)
+        self.assertEqual(result["throughput_messages_per_second"], 5 / 0.003)
+
+    def test_publish_batch_excludes_setup_and_checks_batch_offsets(self) -> None:
+        clients = [SimpleNamespace(close=lambda: None) for _ in range(3)]
+        setup = SimpleNamespace(close=lambda: None)
+        cluster = SimpleNamespace(
+            node_count=3,
+            stats=object(),
+            metrics=lambda: None,
+            client=lambda _index: setup,
+            connected_clients=lambda: _ClientsContext(clients),
+        )
+        next_offset = 2
+
+        def publish_batch_message(
+            _client: object,
+            _stream: str,
+            _payload: str,
+            batch_size: int,
+            expected_offset: int,
+        ) -> tuple[int, int]:
+            nonlocal next_offset
+            self.assertEqual(expected_offset, next_offset)
+            next_offset += batch_size
+            return batch_size, 1_000
+
+        def run_measurement(_stats: object, operation: object, **_: object) -> dict:
+            return operation()
+
+        with (
+            patch("cluster.publish_stream") as publish_stream,
+            patch("cluster.publish_batch_request", side_effect=publish_batch_message),
+            patch("cluster.measure_scenario", side_effect=run_measurement),
+        ):
+            result = run_publish_batch(
+                cluster,
+                "events",
+                "payload",
+                messages=5,
+                warmup=2,
+                batch_size=2,
+            )
+
+        publish_stream.assert_called_once_with(setup, "events", "payload", 2)
+        self.assertEqual(result["operation"], "cluster_publish_batch")
+        self.assertEqual(result["messages"], 5)
+        self.assertEqual(result["latency_sample_count"], 3)
+        self.assertEqual(result["metadata"]["batches"], 3)
 
     def test_scenarios_reject_unknown_and_duplicate_names(self) -> None:
         with self.assertRaises(argparse.ArgumentTypeError):
