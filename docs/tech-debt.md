@@ -104,8 +104,8 @@ This register records known implementation shortcuts in the current vertical sli
 
 - Status: open
 - Impact: a crash after a dead-letter append but before the source consumer checkpoint is persisted can produce a duplicate dead-letter record when the source message is retried. The ordering prevents acknowledged progress from being silently skipped, but dead-letter consumers must tolerate at-least-once duplicates.
-- Context: the first local policy uses the existing append-only stream logs and atomic consumer checkpoints without adding a cross-log transaction or reconciliation journal.
-- Retirement condition: a durable transaction or recovery reconciliation protocol provides duplicate-safe dead-letter movement while preserving bounded recovery and at-least-once guarantees.
+- Context: the first local policy uses the existing append-only stream logs and atomic consumer checkpoints without adding a cross-log transaction or reconciliation journal. The [dead-letter recovery design note](design/dead-letter-recovery.md) records the crash matrix and recommends a stable source-stream/source-consumer/source-offset move identity with idempotent target append and retry-based reconciliation. The clustered path currently keeps the derived record and source progress in one replicated data-group state transition, so this debt remains local to the split durable boundary.
+- Retirement condition: a durable transaction or recovery reconciliation protocol provides duplicate-safe dead-letter movement while preserving bounded recovery and at-least-once guarantees. The design evidence requires fault-injected proof that source progress never advances without a durable target record, that an append-before-checkpoint crash produces at most one target record per logical move after retry, that ambiguous I/O leaves source progress eligible, and that restart, corruption, retention, and real-process recovery boundaries are covered. The item remains open until those runtime gates are implemented and verified.
 
 ## TD-018: Retry policy and dead-letter provenance are coarse
 
