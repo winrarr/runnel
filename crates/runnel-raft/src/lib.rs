@@ -522,12 +522,19 @@ struct StateMachineJournalEntry {
     payload: EntryPayload<TypeConfig>,
 }
 
-impl StateMachineJournalEntry {
-    fn from_entry(entry: &Entry<TypeConfig>) -> Self {
+#[derive(Serialize)]
+struct StateMachineJournalEntryRef<'a> {
+    version: u32,
+    log_id: LogId<NodeId>,
+    payload: &'a EntryPayload<TypeConfig>,
+}
+
+impl<'a> StateMachineJournalEntryRef<'a> {
+    fn from_entry(entry: &'a Entry<TypeConfig>) -> Self {
         Self {
             version: STATE_MACHINE_JOURNAL_FORMAT_VERSION,
             log_id: entry.log_id,
-            payload: entry.payload.clone(),
+            payload: &entry.payload,
         }
     }
 }
@@ -701,7 +708,7 @@ impl StateMachineStore {
         }
         let journal_path = path.join(STATE_MACHINE_JOURNAL_FILE);
         let journal_entries = read_state_machine_journal(&journal_path)?;
-        replay_state_machine_journal(&mut state, &journal_entries, &kind)?;
+        replay_state_machine_journal(&mut state, journal_entries, &kind)?;
         fs::create_dir_all(&path)?;
         let journal = fs::OpenOptions::new()
             .create(true)
@@ -719,10 +726,7 @@ impl StateMachineStore {
         })
     }
 
-    fn persist_journal(
-        &self,
-        entries: &[StateMachineJournalEntry],
-    ) -> Result<(), StorageError<NodeId>> {
+    fn persist_journal(&self, entries: &[Entry<TypeConfig>]) -> Result<(), StorageError<NodeId>> {
         #[cfg(feature = "instrumentation")]
         let _stage_timer = StageTimer::new("raft.state_persist");
         let Some(journal) = &self.journal else {
@@ -734,7 +738,8 @@ impl StateMachineStore {
             ))
         })?;
         for entry in entries {
-            append_state_machine_journal_entry(&mut journal, entry)
+            let journal_entry = StateMachineJournalEntryRef::from_entry(entry);
+            append_state_machine_journal_entry(&mut journal, &journal_entry)
                 .map_err(|error| StorageIOError::write_state_machine(&error))?;
         }
         journal
@@ -1021,9 +1026,9 @@ fn validate_state_machine_storage(path: &Path) -> Result<(), BrokerError> {
     validate_state_machine_journal(&path.join(STATE_MACHINE_JOURNAL_FILE))
 }
 
-fn append_state_machine_journal_entry(
+fn append_state_machine_journal_entry<T: Serialize>(
     file: &mut fs::File,
-    entry: &StateMachineJournalEntry,
+    entry: &T,
 ) -> std::io::Result<()> {
     let bytes = serde_json::to_vec(entry).map_err(std::io::Error::other)?;
     if bytes.len() > MAX_STATE_MACHINE_JOURNAL_RECORD_SIZE as usize {
@@ -1044,7 +1049,7 @@ fn append_state_machine_journal_entry(
 
 fn replay_state_machine_journal(
     state: &mut StateMachineData,
-    entries: &[StateMachineJournalEntry],
+    entries: impl IntoIterator<Item = StateMachineJournalEntry>,
     kind: &GroupKind,
 ) -> Result<(), BrokerError> {
     for entry in entries {
@@ -1055,7 +1060,7 @@ fn replay_state_machine_journal(
             continue;
         }
         state.last_applied_log = Some(entry.log_id);
-        match entry.payload.clone() {
+        match entry.payload {
             EntryPayload::Blank => {}
             EntryPayload::Membership(membership) => {
                 state.last_membership = StoredMembership::new(Some(entry.log_id), membership);
@@ -1143,11 +1148,15 @@ impl RaftStateMachine<TypeConfig> for Arc<StateMachineStore> {
     {
         #[cfg(feature = "instrumentation")]
         let _stage_timer = StageTimer::new("raft.state_machine_apply");
+        let entries = entries.into_iter().collect::<Vec<_>>();
         let mut state = self.state.write().await;
-        let mut responses = Vec::new();
-        let mut journal_entries = Vec::new();
+        // The journal is the durable write-ahead record for the materialized state. Serializing
+        // borrowed entries avoids cloning each retained payload before it is moved into state.
+        if !entries.is_empty() {
+            self.persist_journal(&entries)?;
+        }
+        let mut responses = Vec::with_capacity(entries.len());
         for entry in entries {
-            journal_entries.push(StateMachineJournalEntry::from_entry(&entry));
             state.last_applied_log = Some(entry.log_id);
             match entry.payload {
                 EntryPayload::Blank => responses.push(CommandResponse::Noop),
@@ -1162,9 +1171,6 @@ impl RaftStateMachine<TypeConfig> for Arc<StateMachineStore> {
                     entry.log_id,
                 )),
             }
-        }
-        if !journal_entries.is_empty() {
-            self.persist_journal(&journal_entries)?;
         }
         Ok(responses)
     }
@@ -4685,6 +4691,41 @@ mod tests {
             fs::metadata(&journal_path).unwrap().len(),
             valid_journal_length
         );
+    }
+
+    #[tokio::test]
+    async fn state_machine_journal_replays_a_retained_batch_after_restart() {
+        const RETAINED_MESSAGES: u64 = 256;
+        let directory = tempfile::tempdir().unwrap();
+        let state_directory = directory.path().join("state-machine");
+        let kind = data_group_kind("events");
+        let store = Arc::new(StateMachineStore::open(&state_directory, kind.clone()).unwrap());
+        let entries = (0..RETAINED_MESSAGES).map(|index| Entry {
+            log_id: LogId {
+                leader_id: openraft::CommittedLeaderId::new(1, 1),
+                index,
+            },
+            payload: EntryPayload::Normal(Command::Publish {
+                stream: "events".to_owned(),
+                key: None,
+                payload: format!("message-{index}").into_bytes(),
+                published_at_ms: index,
+                request_id: None,
+            }),
+        });
+        let mut state_machine = store.clone();
+        let responses = state_machine.apply(entries).await.unwrap();
+        assert_eq!(responses.len(), RETAINED_MESSAGES as usize);
+        drop(state_machine);
+        drop(store);
+
+        let reopened = StateMachineStore::open(&state_directory, kind).unwrap();
+        let state = reopened.state.read().await;
+        let messages = &state.state.streams.get("events").unwrap().messages;
+        assert_eq!(messages.len(), RETAINED_MESSAGES as usize);
+        assert!(messages.iter().enumerate().all(|(index, message)| {
+            message.payload == format!("message-{index}").into_bytes()
+        }));
     }
 
     #[test]
