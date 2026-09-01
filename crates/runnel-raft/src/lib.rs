@@ -906,9 +906,16 @@ impl StateMachineStore {
                     + message.key.as_ref().map_or(0, |key| key.len() as u64)
             })
             .sum();
+        let in_flight_deliveries = state
+            .state
+            .group_consumers
+            .values()
+            .map(|consumer| consumer.in_flight.len() as u64)
+            .sum();
         runnel_engine::HealthSnapshot {
             streams,
             storage_bytes,
+            in_flight_deliveries,
             redeliveries: state.state.redeliveries,
             dead_letters: state.state.dead_letters,
         }
@@ -2883,17 +2890,20 @@ impl GroupManager {
             .cloned()
             .collect::<Vec<_>>();
         let mut storage_bytes = 0;
+        let mut in_flight_deliveries = 0;
         let mut redeliveries = metadata_health.redeliveries;
         let mut dead_letters = metadata_health.dead_letters;
         for group in groups {
             let health = group.health().await;
             storage_bytes += health.storage_bytes;
+            in_flight_deliveries += health.in_flight_deliveries;
             redeliveries += health.redeliveries;
             dead_letters += health.dead_letters;
         }
         runnel_engine::HealthSnapshot {
             streams: metadata_health.streams,
             storage_bytes,
+            in_flight_deliveries,
             redeliveries,
             dead_letters,
         }
@@ -4579,6 +4589,50 @@ mod tests {
                 tokio::time::sleep(Duration::from_millis(10)).await;
             }
         }
+    }
+
+    #[tokio::test]
+    async fn health_reports_in_flight_deliveries_until_group_acknowledged() {
+        let cluster = InMemoryCluster::new([1]).await.unwrap();
+        let leader = cluster.leader().await.unwrap();
+        assert!(leader.create_stream("events".to_owned()).await.unwrap());
+        leader
+            .publish(
+                "events".to_owned(),
+                None,
+                b"payload".to_vec(),
+                now_ms(),
+                None,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(leader.health().await.in_flight_deliveries, 0);
+        let message = match leader
+            .poll_group(
+                "events".to_owned(),
+                "workers".to_owned(),
+                "member-a".to_owned(),
+            )
+            .await
+            .unwrap()
+        {
+            PollResult::Message(message) => message,
+            PollResult::Empty => panic!("expected a message"),
+        };
+        assert_eq!(leader.health().await.in_flight_deliveries, 1);
+
+        leader
+            .ack_group(
+                "events".to_owned(),
+                "workers".to_owned(),
+                "member-a".to_owned(),
+                message.offset,
+                message.delivery_token.expect("group delivery token"),
+            )
+            .await
+            .unwrap();
+        assert_eq!(leader.health().await.in_flight_deliveries, 0);
     }
 
     #[tokio::test]

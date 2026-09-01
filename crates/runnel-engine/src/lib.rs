@@ -98,6 +98,7 @@ pub enum AckResult {
 pub struct HealthSnapshot {
     pub streams: usize,
     pub storage_bytes: u64,
+    pub in_flight_deliveries: u64,
     pub redeliveries: u64,
     pub dead_letters: u64,
 }

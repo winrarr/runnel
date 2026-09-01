@@ -1356,6 +1356,17 @@ fn format_metrics(
     .unwrap();
     writeln!(
         output,
+        "# HELP runnel_in_flight_deliveries Messages currently tracked as delivered but not yet acknowledged."
+    )
+    .unwrap();
+    writeln!(
+        output,
+        "# TYPE runnel_in_flight_deliveries gauge\nrunnel_in_flight_deliveries {}",
+        health.in_flight_deliveries
+    )
+    .unwrap();
+    writeln!(
+        output,
         "# HELP runnel_active_connections Broker protocol connections currently being served."
     )
     .unwrap();
