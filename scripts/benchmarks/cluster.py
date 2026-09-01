@@ -11,6 +11,7 @@ backend with its normal durable storage.
 from __future__ import annotations
 
 import argparse
+import base64
 import json
 import math
 import os
@@ -65,6 +66,8 @@ DEFAULT_NODES = 3
 # but valid operations into redeliveries while measuring unrelated scenarios.
 DEFAULT_ACK_TIMEOUT_MS = 30_000
 DEFAULT_SLOW_CONSUMER_DELAY_MS = 10
+DEFAULT_PUBLISH_BATCH_SIZE = 32
+MAX_PUBLISH_BATCH_SIZE = 1_024
 # The topology-free forwarding pool currently reserves one control lane from
 # five total connections, leaving four shared forwarding lanes. Keep the
 # focused workload above that boundary by default so queueing is observable.
@@ -84,7 +87,7 @@ DEFAULT_SCENARIOS = (
     "restart_recovery",
     "cluster_retained_recovery",
 )
-SCENARIO_NAMES = (*DEFAULT_SCENARIOS, "peer_forwarding")
+SCENARIO_NAMES = (*DEFAULT_SCENARIOS, "peer_forwarding", "publish_batch")
 # Keep the retained-data probe beyond the local engine's bounded tail index so
 # recovery measurements exercise a non-trivial retained history.
 MIN_RETAINED_RECOVERY_MESSAGES = 1_025
@@ -734,6 +737,127 @@ def run_consume_ack(
         )
 
 
+def publish_batch_request(
+    client: LineClient,
+    stream: str,
+    payload: str,
+    batch_size: int,
+    expected_offset: int,
+) -> tuple[int, int]:
+    """Publish one public batch and validate every per-record outcome."""
+    encoded_payload = base64.b64encode(payload.encode("utf-8")).decode("ascii")
+    response, elapsed = client.request(
+        {
+            "op": "publish_batch",
+            "stream": stream,
+            "records": [
+                {"key": None, "payload_base64": encoded_payload}
+                for _ in range(batch_size)
+            ],
+        }
+    )
+    if response.get("type") != "publish_batch":
+        raise BenchmarkError(f"unexpected publish batch response: {response}")
+    outcomes = response.get("outcomes")
+    if not isinstance(outcomes, list) or len(outcomes) != batch_size:
+        raise BenchmarkError(
+            f"publish batch returned {len(outcomes) if isinstance(outcomes, list) else 'no'} "
+            f"outcomes for {batch_size} records"
+        )
+    offsets: list[int] = []
+    for index, outcome in enumerate(outcomes):
+        if not isinstance(outcome, dict) or outcome.get("type") != "published":
+            raise BenchmarkError(
+                f"publish batch record {index} did not publish: {outcome}"
+            )
+        offset = outcome.get("offset")
+        if not isinstance(offset, int) or offset != expected_offset + index:
+            raise BenchmarkError(
+                f"publish batch returned unexpected offset at record {index}: {outcome}"
+            )
+        offsets.append(offset)
+    return len(offsets), elapsed
+
+
+def batch_metric(
+    operation: str,
+    batch_latencies_ns: list[int],
+    elapsed_ns: int,
+    *,
+    messages: int,
+    message_size: int,
+    metadata: dict[str, Any],
+) -> dict[str, Any]:
+    """Report record throughput while retaining one latency sample per batch."""
+    result = metric(
+        operation,
+        batch_latencies_ns,
+        elapsed_ns,
+        message_size=message_size,
+        metadata=metadata,
+    )
+    elapsed_seconds = elapsed_ns / 1_000_000_000
+    result["messages"] = messages
+    result["throughput_messages_per_second"] = messages / elapsed_seconds
+    result["throughput_megabytes_per_second"] = (
+        messages * message_size / elapsed_seconds / 1_000_000
+    )
+    return result
+
+
+def run_publish_batch(
+    cluster: Cluster,
+    stream: str,
+    payload: str,
+    messages: int,
+    warmup: int,
+    batch_size: int,
+) -> dict[str, Any]:
+    """Measure clustered public publish_batch round trips and outcomes."""
+    setup = cluster.client(0)
+    try:
+        publish_stream(setup, stream, payload, warmup)
+    finally:
+        setup.close()
+
+    with cluster.connected_clients() as clients:
+        def operation() -> dict[str, Any]:
+            batch_latencies: list[int] = []
+            published_messages = 0
+            started = time.perf_counter_ns()
+            while published_messages < messages:
+                current_batch_size = min(batch_size, messages - published_messages)
+                client = clients[len(batch_latencies) % len(clients)]
+                published, elapsed = publish_batch_request(
+                    client,
+                    stream,
+                    payload,
+                    current_batch_size,
+                    warmup + published_messages,
+                )
+                published_messages += published
+                batch_latencies.append(elapsed)
+            return batch_metric(
+                "cluster_publish_batch",
+                batch_latencies,
+                time.perf_counter_ns() - started,
+                messages=published_messages,
+                message_size=len(payload),
+                metadata={
+                    "nodes": cluster.node_count,
+                    "batch_size": batch_size,
+                    "batches": len(batch_latencies),
+                    "any_node_routing": True,
+                    "setup_excluded": True,
+                    "outcome_scope": "every input record returned a contiguous published outcome",
+                    "latency_scope": "one public publish_batch roundtrip per sample",
+                    "latency_sample_scope": "batch_requests",
+                },
+            )
+
+        return measure_scenario(cluster.stats, operation, metrics=cluster.metrics)
+
+
 def run_slow_consumer(
     cluster: Cluster,
     stream: str,
@@ -1153,7 +1277,7 @@ def parse_args() -> argparse.Namespace:
         default=list(DEFAULT_SCENARIOS),
         help=(
             "comma-separated scenarios to run (default: existing clustered workload; "
-            "add peer_forwarding explicitly for the focused forwarding probe)"
+            "add peer_forwarding or publish_batch explicitly for focused probes)"
         ),
     )
     parser.add_argument("--ack-timeout-ms", type=int, default=DEFAULT_ACK_TIMEOUT_MS)
@@ -1162,6 +1286,12 @@ def parse_args() -> argparse.Namespace:
         type=parse_nonnegative_int,
         default=DEFAULT_SLOW_CONSUMER_DELAY_MS,
         help="fixed processing delay before each slow-consumer acknowledgement",
+    )
+    parser.add_argument(
+        "--batch-size",
+        type=int,
+        default=DEFAULT_PUBLISH_BATCH_SIZE,
+        help="records per publish_batch request for the opt-in publish_batch scenario",
     )
     parser.add_argument(
         "--retained-messages",
@@ -1210,6 +1340,10 @@ def parse_args() -> argparse.Namespace:
         parser.error(
             "peer forwarding concurrency exceeds the bounded maximum "
             f"of {MAX_PEER_FORWARDING_CONCURRENCY}"
+        )
+    if args.batch_size <= 0 or args.batch_size > MAX_PUBLISH_BATCH_SIZE:
+        parser.error(
+            f"batch size must be between 1 and {MAX_PUBLISH_BATCH_SIZE} records"
         )
     if args.peer_response_delay_ms > MAX_PEER_RESPONSE_DELAY_MS:
         parser.error(
@@ -1265,6 +1399,17 @@ def main() -> int:
                         payload,
                         args.messages,
                         args.warmup,
+                    )
+                )
+            if "publish_batch" in selected_scenarios:
+                scenarios.append(
+                    run_publish_batch(
+                        cluster,
+                        f"cluster_{run_id}_publish_batch_{size}",
+                        payload,
+                        args.messages,
+                        args.warmup,
+                        args.batch_size,
                     )
                 )
             if "consume_ack" in selected_scenarios:
@@ -1348,6 +1493,7 @@ def main() -> int:
         "nodes": args.nodes,
         "ack_timeout_ms": args.ack_timeout_ms,
         "slow_consumer_delay_ms": args.slow_consumer_delay_ms,
+        "batch_size": args.batch_size,
         "peer_forwarding_concurrency": args.peer_forwarding_concurrency,
         "peer_response_delay_ms": args.peer_response_delay_ms,
         "peer_forwarding_timeout_seconds": args.peer_forwarding_timeout_seconds,
