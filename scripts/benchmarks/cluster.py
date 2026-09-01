@@ -11,9 +11,12 @@ backend with its normal durable storage.
 from __future__ import annotations
 
 import argparse
+import json
+import math
 import os
 import shutil
 import socket
+import socketserver
 import subprocess
 import tempfile
 import threading
@@ -62,11 +65,166 @@ DEFAULT_NODES = 3
 # but valid operations into redeliveries while measuring unrelated scenarios.
 DEFAULT_ACK_TIMEOUT_MS = 30_000
 DEFAULT_SLOW_CONSUMER_DELAY_MS = 10
+# The topology-free forwarding pool currently reserves one control lane from
+# five total connections, leaving four shared forwarding lanes. Keep the
+# focused workload above that boundary by default so queueing is observable.
+DEFAULT_PEER_FORWARDING_CONCURRENCY = 8
+DEFAULT_PEER_RESPONSE_DELAY_MS = 0
+DEFAULT_PEER_FORWARDING_TIMEOUT_SECONDS = 60.0
+MAX_PEER_FORWARDING_CONCURRENCY = 128
+MAX_PEER_RESPONSE_DELAY_MS = 2_000
+MAX_PEER_FORWARDING_TIMEOUT_SECONDS = 300.0
+PEER_FORWARDING_INGRESS_NODE_INDEX = 1
+DEFAULT_SCENARIOS = (
+    "durable_publish",
+    "consume_ack",
+    "slow_consumer",
+    "grouped_consume_ack",
+    "parallel_grouped_consume_ack",
+    "restart_recovery",
+    "cluster_retained_recovery",
+)
+SCENARIO_NAMES = (*DEFAULT_SCENARIOS, "peer_forwarding")
 # Keep the retained-data probe beyond the local engine's bounded tail index so
 # recovery measurements exercise a non-trivial retained history.
 MIN_RETAINED_RECOVERY_MESSAGES = 1_025
 DEFAULT_RETAINED_RECOVERY_MESSAGES = 2_048
 COMMAND_TIMEOUT_SECONDS = 30.0
+
+
+def _read_proxy_frame(sock: socket.socket) -> bytes | None:
+    header = _receive_exact(sock, 4)
+    if header is None:
+        return None
+    length = int.from_bytes(header, "big")
+    if length > 64 * 1024 * 1024:
+        raise BenchmarkError("peer proxy frame exceeds the 64 MiB limit")
+    payload = _receive_exact(sock, length)
+    if payload is None:
+        raise ConnectionError("peer proxy closed a partial frame")
+    return header + payload
+
+
+def _is_forward_response(frame: bytes) -> bool:
+    try:
+        response = json.loads(frame[4:])
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        return False
+    return isinstance(response, dict) and "Forward" in response
+
+
+def _receive_exact(sock: socket.socket, size: int) -> bytes | None:
+    chunks: list[bytes] = []
+    remaining = size
+    while remaining:
+        chunk = sock.recv(remaining)
+        if not chunk:
+            if chunks:
+                raise ConnectionError("peer proxy closed a partial frame")
+            return None
+        chunks.append(chunk)
+        remaining -= len(chunk)
+    return b"".join(chunks)
+
+
+class _PeerDelayProxyServer(socketserver.ThreadingTCPServer):
+    allow_reuse_address = True
+    daemon_threads = True
+
+    def __init__(self, target_port: int, response_delay_ms: int) -> None:
+        self.target_port = target_port
+        self.response_delay_ms = response_delay_ms
+        self.response_delay_seconds = response_delay_ms / 1_000
+        self.stats_lock = threading.Lock()
+        self.connection_count = 0
+        self.active_connections = 0
+        self.max_active_connections = 0
+        self.request_count = 0
+        self.response_count = 0
+        self.delayed_response_count = 0
+        super().__init__(("127.0.0.1", 0), _PeerDelayProxyHandler)
+
+
+class _PeerDelayProxyHandler(socketserver.BaseRequestHandler):
+    def handle(self) -> None:
+        server = self.server
+        assert isinstance(server, _PeerDelayProxyServer)
+        with server.stats_lock:
+            server.connection_count += 1
+            server.active_connections += 1
+            server.max_active_connections = max(
+                server.max_active_connections, server.active_connections
+            )
+        try:
+            with socket.create_connection(
+                ("127.0.0.1", server.target_port), timeout=COMMAND_TIMEOUT_SECONDS
+            ) as target:
+                self.request.settimeout(COMMAND_TIMEOUT_SECONDS)
+                while True:
+                    frame = _read_proxy_frame(self.request)
+                    if frame is None:
+                        return
+                    target.sendall(frame)
+                    with server.stats_lock:
+                        server.request_count += 1
+                    response = _read_proxy_frame(target)
+                    if response is None:
+                        return
+                    if server.response_delay_seconds and _is_forward_response(response):
+                        time.sleep(server.response_delay_seconds)
+                        with server.stats_lock:
+                            server.delayed_response_count += 1
+                    self.request.sendall(response)
+                    with server.stats_lock:
+                        server.response_count += 1
+        except (BenchmarkError, ConnectionError, OSError):
+            return
+        finally:
+            with server.stats_lock:
+                server.active_connections -= 1
+
+
+class PeerResponseDelayProxy:
+    """Delay framed peer responses while preserving the real TCP peer path."""
+
+    def __init__(self, target_port: int, response_delay_ms: int) -> None:
+        self.server = _PeerDelayProxyServer(target_port, response_delay_ms)
+        self.started = False
+        self.thread = threading.Thread(
+            target=self.server.serve_forever,
+            name=f"runnel-peer-delay-{self.server.server_address[1]}",
+            daemon=True,
+        )
+
+    @property
+    def port(self) -> int:
+        return int(self.server.server_address[1])
+
+    def start(self) -> None:
+        if self.started:
+            return
+        self.thread.start()
+        self.started = True
+
+    def close(self) -> None:
+        if self.started:
+            self.server.shutdown()
+        self.server.server_close()
+        if self.started:
+            self.thread.join(timeout=5)
+
+    def summary(self) -> dict[str, Any]:
+        with self.server.stats_lock:
+            return {
+                "target_port": self.server.target_port,
+                "listen_port": self.port,
+                "response_delay_ms": self.server.response_delay_ms,
+                "connections": self.server.connection_count,
+                "max_active_connections": self.server.max_active_connections,
+                "requests": self.server.request_count,
+                "responses": self.server.response_count,
+                "delayed_responses": self.server.delayed_response_count,
+            }
 
 
 @dataclass
@@ -75,9 +233,11 @@ class Node:
     broker_port: int
     http_port: int
     peer_port: int
+    peer_address_port: int
     data_dir: Path
     process: subprocess.Popen[bytes] | None = None
     container: DockerContainer | None = None
+    peer_proxy: PeerResponseDelayProxy | None = None
 
 
 def free_port() -> int:
@@ -216,9 +376,12 @@ class Cluster:
         image: str = "runnel:bench",
         cpus: str = "2",
         memory: str = "2g",
+        peer_response_delay_ms: int = DEFAULT_PEER_RESPONSE_DELAY_MS,
     ) -> None:
         if runtime not in {"process", "container"}:
             raise ValueError(f"unsupported cluster runtime: {runtime}")
+        if peer_response_delay_ms and runtime != "process":
+            raise ValueError("peer response delay requires the native process runtime")
         self.binary = binary
         self.node_count = node_count
         self.ack_timeout_ms = ack_timeout_ms
@@ -226,6 +389,7 @@ class Cluster:
         self.image = image
         self.cpus = cpus
         self.memory = memory
+        self.peer_response_delay_ms = peer_response_delay_ms
         self.root = Path(tempfile.mkdtemp(prefix="runnel-cluster-bench-"))
         self.root.chmod(0o777)
         self.network = f"runnel-cluster-net-{os.getpid()}-{time.time_ns()}"
@@ -240,10 +404,17 @@ class Cluster:
                 broker_port=free_port() if runtime == "process" else 0,
                 http_port=free_port() if runtime == "process" else 0,
                 peer_port=free_port() if runtime == "process" else 7000,
+                peer_address_port=0,
                 data_dir=self.root / f"node-{index + 1}",
             )
             for index in range(node_count)
         ]
+        for node in self.nodes:
+            node.peer_address_port = node.peer_port
+            if self.peer_response_delay_ms:
+                node.peer_proxy = PeerResponseDelayProxy(
+                    node.peer_port, self.peer_response_delay_ms
+                )
         self.stats = ProcessStats(self)
         self.startup_ns = 0
 
@@ -252,6 +423,10 @@ class Cluster:
             raise BenchmarkError(f"broker binary does not exist: {self.binary}")
         if self.runtime == "container":
             self._prepare_container_runtime()
+        for node in self.nodes:
+            if node.peer_proxy is not None:
+                node.peer_address_port = node.peer_proxy.port
+                node.peer_proxy.start()
         started = time.perf_counter_ns()
         for index in range(self.node_count):
             self._start_node(index, bootstrap=index == 0)
@@ -260,11 +435,13 @@ class Cluster:
         self.startup_ns = time.perf_counter_ns() - started
         self.stats.start()
 
-    def client(self, index: int) -> LineClient:
+    def client(
+        self, index: int, *, timeout_seconds: float = COMMAND_TIMEOUT_SECONDS
+    ) -> LineClient:
         return LineClient(
             "127.0.0.1",
             self.nodes[index % self.node_count].broker_port,
-            COMMAND_TIMEOUT_SECONDS,
+            timeout_seconds,
         )
 
     def metrics(self) -> dict[str, float] | None:
@@ -326,6 +503,9 @@ class Cluster:
         self.stats.close()
         for index in range(self.node_count):
             self.stop_node(index)
+        for node in self.nodes:
+            if node.peer_proxy is not None:
+                node.peer_proxy.close()
         if self.network_created:
             remove_network(self.network)
         shutil.rmtree(self.root, ignore_errors=True)
@@ -364,7 +544,7 @@ class Cluster:
             peer_port = 7000
         else:
             addresses = [
-                f"{other.node_id}=127.0.0.1:{other.peer_port}" for other in self.nodes
+                f"{other.node_id}=127.0.0.1:{other.peer_address_port}" for other in self.nodes
             ]
             listen = "127.0.0.1"
             data_dir = str(node.data_dir)
@@ -417,6 +597,22 @@ class Cluster:
 
     def _container_name(self, node: Node) -> str:
         return f"{self.network}-node-{node.node_id}"
+
+    def peer_proxy_summary(self) -> dict[str, Any]:
+        if not any(node.peer_proxy is not None for node in self.nodes):
+            return {
+                "enabled": False,
+                "response_delay_ms": self.peer_response_delay_ms,
+            }
+        return {
+            "enabled": True,
+            "response_delay_ms": self.peer_response_delay_ms,
+            "per_node": {
+                str(node.node_id): node.peer_proxy.summary()
+                for node in self.nodes
+                if node.peer_proxy is not None
+            },
+        }
 
 
 def poll_until_redelivered(
@@ -688,6 +884,97 @@ def run_parallel_grouped(
     return measure_scenario(cluster.stats, operation, metrics=cluster.metrics)
 
 
+def run_peer_forwarding(
+    cluster: Cluster,
+    stream: str,
+    payload: str,
+    messages: int,
+    warmup: int,
+    concurrency: int,
+    timeout_seconds: float,
+) -> dict[str, Any]:
+    """Publish through a follower to exercise the topology-free peer pool.
+
+    The setup is sent through the bootstrap node and excluded from the
+    measured interval. Measured publishes use persistent public clients on a
+    different node, so the Raft engine must forward each operation over its
+    shared topology-free peer lane. Concurrency above the current four shared
+    permits queues behind that lane; optional peer-response delay is applied by
+    the run-scoped native proxy configured on ``Cluster``.
+    """
+    setup = cluster.client(0)
+    try:
+        publish_stream(setup, stream, payload, warmup)
+    finally:
+        setup.close()
+
+    latencies: list[int] = []
+    offsets: list[int] = []
+    lock = threading.Lock()
+    deadline = time.monotonic() + timeout_seconds
+    ingress_index = PEER_FORWARDING_INGRESS_NODE_INDEX
+    client_timeout = min(COMMAND_TIMEOUT_SECONDS, timeout_seconds)
+
+    def worker(worker_index: int) -> None:
+        client = cluster.client(ingress_index, timeout_seconds=client_timeout)
+        try:
+            for message_index in range(worker_index, messages, concurrency):
+                if time.monotonic() >= deadline:
+                    raise BenchmarkError(
+                        "peer forwarding benchmark exceeded its bounded runtime"
+                    )
+                published, elapsed = publish(client, stream, payload)
+                with lock:
+                    offsets.append(published)
+                    latencies.append(elapsed)
+        finally:
+            client.close()
+
+    proxy_summary = cluster.peer_proxy_summary()
+
+    def operation() -> dict[str, Any]:
+        started = time.perf_counter_ns()
+        with ThreadPoolExecutor(max_workers=concurrency) as executor:
+            futures = [executor.submit(worker, index) for index in range(concurrency)]
+            for future in futures:
+                future.result()
+        ordered_offsets = sorted(offsets)
+        if len(ordered_offsets) != messages or any(
+            offset != warmup + index for index, offset in enumerate(ordered_offsets)
+        ):
+            raise BenchmarkError(
+                "peer forwarding returned non-contiguous offsets: "
+                f"received {len(ordered_offsets)} of {messages}"
+            )
+        result = metric(
+            "cluster_peer_forwarding",
+            latencies,
+            time.perf_counter_ns() - started,
+            message_size=len(payload),
+            metadata={
+                "nodes": cluster.node_count,
+                "forwarded_operation": "publish",
+                "forwarding_ingress_node": ingress_index + 1,
+                "forwarding_target": "data-group leader selected by the cluster",
+                "concurrency": concurrency,
+                "warmup": warmup,
+                "peer_response_delay_ms": cluster.peer_response_delay_ms,
+                "peer_response_proxy_enabled": proxy_summary["enabled"],
+                "latency_scope": (
+                    "follower_public_publish_roundtrip_includes_peer_forwarding_and_pool_wait"
+                ),
+                "setup_excluded": True,
+                "saturation_scope": (
+                    "shared_forwarding_lane_queues_when_concurrency_exceeds_current_four_per_peer"
+                ),
+                "bounded_runtime_seconds": timeout_seconds,
+            },
+        )
+        return result
+
+    return measure_scenario(cluster.stats, operation, metrics=cluster.metrics)
+
+
 def run_restart_recovery(cluster: Cluster, stream: str, payload: str) -> dict[str, Any]:
     client = cluster.client(0)
     create_stream(client, stream)
@@ -819,6 +1106,30 @@ def parse_retained_messages(value: str) -> int:
     return messages
 
 
+def parse_scenarios(value: str) -> list[str]:
+    scenarios = [part.strip() for part in value.split(",") if part.strip()]
+    unknown = sorted(set(scenarios) - set(SCENARIO_NAMES))
+    if not scenarios:
+        raise argparse.ArgumentTypeError("scenarios cannot be empty")
+    if unknown:
+        raise argparse.ArgumentTypeError(
+            f"unknown scenario(s): {', '.join(unknown)}; choose from {', '.join(SCENARIO_NAMES)}"
+        )
+    if len(scenarios) != len(set(scenarios)):
+        raise argparse.ArgumentTypeError("scenarios must not contain duplicates")
+    return scenarios
+
+
+def parse_positive_float(value: str) -> float:
+    try:
+        number = float(value)
+    except ValueError as error:
+        raise argparse.ArgumentTypeError("must be a number") from error
+    if not math.isfinite(number) or number <= 0:
+        raise argparse.ArgumentTypeError("must be a finite positive number")
+    return number
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--binary", type=Path, default=DEFAULT_BINARY)
@@ -836,6 +1147,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--warmup", type=int, default=DEFAULT_WARMUP)
     parser.add_argument("--nodes", type=int, default=DEFAULT_NODES)
     parser.add_argument("--concurrency", type=int, default=2)
+    parser.add_argument(
+        "--scenarios",
+        type=parse_scenarios,
+        default=list(DEFAULT_SCENARIOS),
+        help=(
+            "comma-separated scenarios to run (default: existing clustered workload; "
+            "add peer_forwarding explicitly for the focused forwarding probe)"
+        ),
+    )
     parser.add_argument("--ack-timeout-ms", type=int, default=DEFAULT_ACK_TIMEOUT_MS)
     parser.add_argument(
         "--slow-consumer-delay-ms",
@@ -852,6 +1172,27 @@ def parse_args() -> argparse.Namespace:
             f"(minimum: {MIN_RETAINED_RECOVERY_MESSAGES})"
         ),
     )
+    parser.add_argument(
+        "--peer-forwarding-concurrency",
+        type=int,
+        default=DEFAULT_PEER_FORWARDING_CONCURRENCY,
+        help="concurrent persistent follower clients for the peer-forwarding scenario",
+    )
+    parser.add_argument(
+        "--peer-response-delay-ms",
+        type=parse_nonnegative_int,
+        default=DEFAULT_PEER_RESPONSE_DELAY_MS,
+        help=(
+            "delay every framed peer response in the native-only focused probe; "
+            "zero keeps direct peer connections"
+        ),
+    )
+    parser.add_argument(
+        "--peer-forwarding-timeout-seconds",
+        type=parse_positive_float,
+        default=DEFAULT_PEER_FORWARDING_TIMEOUT_SECONDS,
+        help="bounded wall-clock budget for each peer-forwarding scenario",
+    )
     parser.add_argument("--payload-sizes", type=parse_sizes, default=[100, 1024])
     parser.add_argument(
         "--skip-recovery",
@@ -863,6 +1204,25 @@ def parse_args() -> argparse.Namespace:
     args = parser.parse_args()
     if args.messages <= 0 or args.warmup < 0 or args.nodes < 3 or args.concurrency <= 0:
         parser.error("messages, nodes, and concurrency must be positive; at least three nodes are required")
+    if args.peer_forwarding_concurrency <= 0:
+        parser.error("peer forwarding concurrency must be positive")
+    if args.peer_forwarding_concurrency > MAX_PEER_FORWARDING_CONCURRENCY:
+        parser.error(
+            "peer forwarding concurrency exceeds the bounded maximum "
+            f"of {MAX_PEER_FORWARDING_CONCURRENCY}"
+        )
+    if args.peer_response_delay_ms > MAX_PEER_RESPONSE_DELAY_MS:
+        parser.error(
+            "peer response delay exceeds the bounded maximum "
+            f"of {MAX_PEER_RESPONSE_DELAY_MS} ms"
+        )
+    if args.peer_forwarding_timeout_seconds > MAX_PEER_FORWARDING_TIMEOUT_SECONDS:
+        parser.error(
+            "peer forwarding timeout exceeds the bounded maximum "
+            f"of {MAX_PEER_FORWARDING_TIMEOUT_SECONDS:g} seconds"
+        )
+    if args.peer_response_delay_ms and args.runtime != "process":
+        parser.error("peer response delay requires the native process runtime")
     if args.ack_timeout_ms <= 0:
         parser.error("ack timeout must be positive")
     if args.slow_consumer_delay_ms >= args.ack_timeout_ms:
@@ -889,57 +1249,93 @@ def main() -> int:
         image=args.image,
         cpus=args.cpus,
         memory=args.memory,
+        peer_response_delay_ms=args.peer_response_delay_ms,
     )
     scenarios: list[dict[str, Any]] = []
+    selected_scenarios = set(args.scenarios)
     try:
         cluster.start()
         for size in args.payload_sizes:
             payload = "x" * size
-            scenarios.append(
-                run_durable_publish(
-                    cluster,
-                    f"cluster_{run_id}_publish_{size}",
-                    payload,
-                    args.messages,
-                    args.warmup,
-                )
-            )
-            scenarios.append(
-                run_consume_ack(cluster, f"cluster_{run_id}_consume_{size}", payload, args.messages)
-            )
-            scenarios.append(
-                run_slow_consumer(
-                    cluster,
-                    f"cluster_{run_id}_slow_consumer_{size}",
-                    payload,
-                    args.messages,
-                    args.slow_consumer_delay_ms,
-                )
-            )
-            scenarios.append(
-                run_grouped_consume_ack(cluster, f"cluster_{run_id}_grouped_{size}", payload, args.messages)
-            )
-            scenarios.append(
-                run_parallel_grouped(
-                    cluster,
-                    f"cluster_{run_id}_parallel_{size}",
-                    payload,
-                    args.messages,
-                    args.concurrency,
-                )
-            )
-            if not args.skip_recovery and size == args.payload_sizes[0]:
+            if "durable_publish" in selected_scenarios:
                 scenarios.append(
-                    run_restart_recovery(cluster, f"cluster_{run_id}_recovery_{size}", payload)
-                )
-                scenarios.append(
-                    run_retained_recovery(
+                    run_durable_publish(
                         cluster,
-                        f"cluster_{run_id}_retained_recovery_{size}",
+                        f"cluster_{run_id}_publish_{size}",
                         payload,
-                        args.retained_messages,
+                        args.messages,
+                        args.warmup,
                     )
                 )
+            if "consume_ack" in selected_scenarios:
+                scenarios.append(
+                    run_consume_ack(
+                        cluster,
+                        f"cluster_{run_id}_consume_{size}",
+                        payload,
+                        args.messages,
+                    )
+                )
+            if "slow_consumer" in selected_scenarios:
+                scenarios.append(
+                    run_slow_consumer(
+                        cluster,
+                        f"cluster_{run_id}_slow_consumer_{size}",
+                        payload,
+                        args.messages,
+                        args.slow_consumer_delay_ms,
+                    )
+                )
+            if "grouped_consume_ack" in selected_scenarios:
+                scenarios.append(
+                    run_grouped_consume_ack(
+                        cluster,
+                        f"cluster_{run_id}_grouped_{size}",
+                        payload,
+                        args.messages,
+                    )
+                )
+            if "parallel_grouped_consume_ack" in selected_scenarios:
+                scenarios.append(
+                    run_parallel_grouped(
+                        cluster,
+                        f"cluster_{run_id}_parallel_{size}",
+                        payload,
+                        args.messages,
+                        args.concurrency,
+                    )
+                )
+            if "peer_forwarding" in selected_scenarios:
+                scenarios.append(
+                    run_peer_forwarding(
+                        cluster,
+                        f"cluster_{run_id}_peer_forwarding_{size}",
+                        payload,
+                        args.messages,
+                        args.warmup,
+                        args.peer_forwarding_concurrency,
+                        args.peer_forwarding_timeout_seconds,
+                    )
+                )
+            if (
+                not args.skip_recovery
+                and size == args.payload_sizes[0]
+            ):
+                if "restart_recovery" in selected_scenarios:
+                    scenarios.append(
+                        run_restart_recovery(
+                            cluster, f"cluster_{run_id}_recovery_{size}", payload
+                        )
+                    )
+                if "cluster_retained_recovery" in selected_scenarios:
+                    scenarios.append(
+                        run_retained_recovery(
+                            cluster,
+                            f"cluster_{run_id}_retained_recovery_{size}",
+                            payload,
+                            args.retained_messages,
+                        )
+                    )
     finally:
         cluster.close()
 
@@ -948,9 +1344,13 @@ def main() -> int:
         "messages": args.messages,
         "warmup": args.warmup,
         "concurrency": args.concurrency,
+        "scenarios": args.scenarios,
         "nodes": args.nodes,
         "ack_timeout_ms": args.ack_timeout_ms,
         "slow_consumer_delay_ms": args.slow_consumer_delay_ms,
+        "peer_forwarding_concurrency": args.peer_forwarding_concurrency,
+        "peer_response_delay_ms": args.peer_response_delay_ms,
+        "peer_forwarding_timeout_seconds": args.peer_forwarding_timeout_seconds,
         "payload_sizes_bytes": args.payload_sizes,
         "runtime": args.runtime,
         "protocol": "line-delimited JSON with UTF-8 string payloads",
@@ -959,7 +1359,7 @@ def main() -> int:
         "compression": "none",
         "durability": "committed by the current three-node Raft quorum and local durable state",
     }
-    if not args.skip_recovery:
+    if not args.skip_recovery and "cluster_retained_recovery" in selected_scenarios:
         workload["retained_recovery_messages"] = args.retained_messages
 
     result = {
@@ -984,6 +1384,7 @@ def main() -> int:
                 "measurement_boundary": "public line-delimited JSON protocol",
                 "measurement_client": "scripts/benchmarks/cluster.py",
                 "client_image": "host Python runtime",
+                "peer_response_proxy": cluster.peer_proxy_summary(),
                 "startup_seconds": startup_seconds,
                 "resource_samples": cluster.stats.summary(),
                 "scenarios": scenarios,
