@@ -236,6 +236,9 @@ struct StreamState {
     // fast path; the durable checkpoint remains the source of truth across restart and eviction.
     consumer_states: HashMap<String, ConsumerState>,
     in_flight: HashMap<DeliveryKey, InFlight>,
+    // This index keeps expiry checks proportional to deliveries that are due instead of scanning
+    // every outstanding delivery on each poll. Entries are removed when a delivery is acked.
+    in_flight_deadlines: BTreeMap<Instant, Vec<DeliveryKey>>,
     // This index mirrors only active deliveries and is removed when a consumer has no deliveries.
     // It avoids rebuilding per-consumer offset/key sets and scanning members on every poll.
     in_flight_by_consumer: HashMap<String, ConsumerInFlightIndex>,
@@ -281,19 +284,29 @@ impl StreamState {
             log,
             consumer_states: HashMap::new(),
             in_flight: HashMap::new(),
+            in_flight_deadlines: BTreeMap::new(),
             in_flight_by_consumer: HashMap::new(),
         }
     }
 
     fn expire_in_flight(&mut self, now: Instant) {
-        let expired = self
-            .in_flight
-            .iter()
-            .filter(|(_, in_flight)| in_flight.deadline <= now)
-            .map(|(delivery_key, _)| delivery_key.clone())
-            .collect::<Vec<_>>();
-        for delivery_key in expired {
-            self.remove_in_flight(&delivery_key);
+        while let Some((&deadline, _)) = self.in_flight_deadlines.first_key_value() {
+            if deadline > now {
+                break;
+            }
+
+            let Some((_, delivery_keys)) = self.in_flight_deadlines.pop_first() else {
+                break;
+            };
+            for delivery_key in delivery_keys {
+                if self
+                    .in_flight
+                    .get(&delivery_key)
+                    .is_some_and(|in_flight| in_flight.deadline <= now)
+                {
+                    self.remove_in_flight(&delivery_key);
+                }
+            }
         }
     }
 
@@ -303,7 +316,12 @@ impl StreamState {
         let member = in_flight.member.clone();
         let key = in_flight.key.clone();
         debug_assert!(!self.in_flight.contains_key(&delivery_key));
-        self.in_flight.insert(delivery_key, in_flight);
+        let deadline = in_flight.deadline;
+        self.in_flight.insert(delivery_key.clone(), in_flight);
+        self.in_flight_deadlines
+            .entry(deadline)
+            .or_default()
+            .push(delivery_key);
 
         let index = self.in_flight_by_consumer.entry(consumer).or_default();
         index.offsets.insert(offset);
@@ -315,6 +333,16 @@ impl StreamState {
 
     fn remove_in_flight(&mut self, delivery_key: &DeliveryKey) -> Option<InFlight> {
         let in_flight = self.in_flight.remove(delivery_key)?;
+        let mut remove_deadline_index = false;
+        if let Some(deliveries) = self.in_flight_deadlines.get_mut(&in_flight.deadline) {
+            if let Some(index) = deliveries.iter().position(|key| key == delivery_key) {
+                deliveries.swap_remove(index);
+            }
+            remove_deadline_index = deliveries.is_empty();
+        }
+        if remove_deadline_index {
+            self.in_flight_deadlines.remove(&in_flight.deadline);
+        }
         let mut remove_consumer_index = false;
         if let Some(index) = self.in_flight_by_consumer.get_mut(&delivery_key.consumer) {
             index.offsets.remove(&delivery_key.offset);
@@ -2763,6 +2791,7 @@ mod tests {
         let stream_state = broker.get_stream("events").unwrap();
         let stream_state = broker.lock_stream(&stream_state).unwrap();
         assert!(stream_state.in_flight.is_empty());
+        assert!(stream_state.in_flight_deadlines.is_empty());
         assert!(stream_state.in_flight_by_consumer.is_empty());
     }
 
