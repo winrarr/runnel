@@ -3947,6 +3947,44 @@ mod tests {
     }
 
     #[test]
+    fn grouped_lease_preserves_early_expiry_for_deadline_behind_clock_floor() {
+        let mut state = grouped_test_state();
+        delivery_token_for_test(&mut state, "member-a", 100, 200, 0);
+
+        // A committed observation from another command advances the floor.
+        assert_eq!(
+            poll_group_for_test(&mut state, "clock", "workers", "member-a", 300, 400, 1),
+            PollResult::Empty
+        );
+        assert_eq!(state.lease_clock_ms, 300);
+
+        // A successor with a regressed clock can submit a deadline behind the
+        // floor. Keep that absolute deadline unchanged so it expires on the
+        // next command instead of silently extending the delivery.
+        let regressed_token = delivery_token_for_test(&mut state, "member-b", 150, 250, 2);
+        let delivery = state
+            .group_consumers
+            .get(&("events".to_owned(), "workers".to_owned()))
+            .and_then(|consumer| consumer.in_flight.get(&0))
+            .expect("redelivery must be in flight");
+        assert_eq!(delivery.deadline_ms, 250);
+        assert!(lease_expired(delivery.deadline_ms, state.lease_clock_ms));
+
+        let next_delivery =
+            poll_group_for_test(&mut state, "events", "workers", "member-c", 150, 350, 3);
+        match next_delivery {
+            PollResult::Message(message) => {
+                assert_eq!(message.delivery_attempt, Some(3));
+                assert_ne!(
+                    message.delivery_token.as_deref(),
+                    Some(regressed_token.as_str())
+                );
+            }
+            PollResult::Empty => panic!("expected the behind-floor deadline to expire"),
+        }
+    }
+
+    #[test]
     fn grouped_lease_has_no_lazy_expiry_without_a_committed_command() {
         let mut state = grouped_test_state();
         let token = delivery_token_for_test(&mut state, "member-a", 100, 200, 0);
