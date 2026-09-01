@@ -793,13 +793,16 @@ impl Broker {
             .cloned()
             .collect::<Vec<_>>();
         let mut storage_bytes = 0;
+        let mut in_flight_deliveries = 0;
         for stream in &streams {
             let stream = self.lock_stream(stream)?;
             storage_bytes += stream.log.file.metadata()?.len();
+            in_flight_deliveries += stream.in_flight.len() as u64;
         }
         Ok(HealthSnapshot {
             streams: streams.len(),
             storage_bytes,
+            in_flight_deliveries,
             redeliveries: self.inner.redeliveries.load(Ordering::Relaxed),
             dead_letters: self.inner.dead_letters.load(Ordering::Relaxed),
         })
@@ -2697,6 +2700,26 @@ mod tests {
     }
 
     #[test]
+    fn health_reports_in_flight_deliveries_until_acknowledged() {
+        let directory = tempdir().unwrap();
+        let broker = Broker::open(directory.path(), BrokerConfig::default()).unwrap();
+        broker.publish("events", None, b"payload".to_vec()).unwrap();
+
+        assert_eq!(broker.health().unwrap().in_flight_deliveries, 0);
+        let message = match broker.poll("events", "worker").unwrap() {
+            PollResult::Message(message) => message,
+            PollResult::Empty => panic!("expected a message"),
+        };
+        assert_eq!(broker.health().unwrap().in_flight_deliveries, 1);
+
+        assert_eq!(
+            broker.ack("events", "worker", message.offset).unwrap(),
+            AckResult::Acknowledged
+        );
+        assert_eq!(broker.health().unwrap().in_flight_deliveries, 0);
+    }
+
+    #[test]
     fn grouped_consumers_preserve_order_for_each_key() {
         let directory = tempdir().unwrap();
         let broker = Broker::open(directory.path(), BrokerConfig::default()).unwrap();
@@ -2858,6 +2881,7 @@ mod tests {
             HealthSnapshot {
                 streams: 2,
                 storage_bytes: broker.health().unwrap().storage_bytes,
+                in_flight_deliveries: 0,
                 redeliveries: 1,
                 dead_letters: 1,
             }

@@ -33,8 +33,8 @@ This register records known implementation shortcuts in the current vertical sli
 ## TD-006: Operational telemetry remains incomplete
 
 - Status: open
-- Impact: current metrics expose request rates and latency buckets, connections, traffic bytes, publish/delivery/acknowledgement totals, redelivery, dead letters, storage bytes, health failures, and snapshot and peer-transport activity. They still cannot explain consumer lag, retained and reclaimable storage, admission rejection, queue saturation, replication progress, or resource pressure under load.
-- Context: the metrics endpoint now covers the basic broker and transport path. An opt-in Rust timing feature and clustered profiling workflow provide deeper investigation data without adding timing calls to the default build, but these timings are not deployment-grade metrics.
+- Impact: current metrics expose request rates and latency buckets, connections, traffic bytes, publish/delivery/acknowledgement totals, in-flight deliveries, redelivery, dead letters, storage bytes, health failures, and snapshot and peer-transport activity. They still cannot explain consumer lag, retained and reclaimable storage, admission rejection, queue saturation, replication progress, or resource pressure under load.
+- Context: the metrics endpoint now covers the basic broker and transport path and reports the shared engine's currently tracked in-flight deliveries for both local and clustered delivery. An opt-in Rust timing feature and clustered profiling workflow provide deeper investigation data without adding timing calls to the default build, but these timings are not deployment-grade metrics.
 - Retirement condition: the deployment-grade operations backlog item is implemented and its metrics are exercised by integration or benchmark tests.
 
 ## TD-007: Storage format compatibility is not yet defined

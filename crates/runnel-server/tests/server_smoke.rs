@@ -293,6 +293,10 @@ fn metrics_report_messages_returned_by_polls() {
     let initial_metrics = http_metrics(server.http_addr);
     assert_eq!(metric_value(&initial_metrics, "runnel_deliveries_total"), 0);
     assert_eq!(
+        metric_value(&initial_metrics, "runnel_in_flight_deliveries"),
+        0
+    );
+    assert_eq!(
         metric_value(&initial_metrics, "runnel_active_connections"),
         0
     );
@@ -321,6 +325,7 @@ fn metrics_report_messages_returned_by_polls() {
         "# HELP runnel_deliveries_total Messages returned by successful poll operations."
     ));
     assert!(initial_metrics.contains("# TYPE runnel_deliveries_total counter"));
+    assert!(initial_metrics.contains("# TYPE runnel_in_flight_deliveries gauge"));
     assert!(initial_metrics.contains("# TYPE runnel_broker_request_duration_seconds histogram"));
 
     assert!(matches!(
@@ -345,6 +350,11 @@ fn metrics_report_messages_returned_by_polls() {
         ),
         Response::Message { offset: 0, .. }
     ));
+    let in_flight_metrics = http_metrics(server.http_addr);
+    assert_eq!(
+        metric_value(&in_flight_metrics, "runnel_in_flight_deliveries"),
+        1
+    );
     assert!(matches!(
         request(
             server.broker_addr,
@@ -361,6 +371,7 @@ fn metrics_report_messages_returned_by_polls() {
     ));
 
     let metrics = http_metrics(server.http_addr);
+    assert_eq!(metric_value(&metrics, "runnel_in_flight_deliveries"), 0);
     assert_eq!(metric_value(&metrics, "runnel_deliveries_total"), 1);
     assert_eq!(metric_value(&metrics, "runnel_delivered_bytes_total"), 5);
     assert_eq!(metric_value(&metrics, "runnel_publishes_total"), 1);
