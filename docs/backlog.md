@@ -401,6 +401,8 @@ Goal: determine whether stable internal work lanes, virtual shards, or key-affin
 
 Rationale: demand-driven delivery is the simplest first model, but larger deployments may benefit from moving a small, stable fraction of work when workers join or leave rather than recalculating all ownership.
 
+The current evidence and alternatives are recorded in [the stable work placement design](design/stable-work-placement.md). It favors retaining demand-driven delivery as the default while evaluating bounded virtual lanes with cooperative, epoch-fenced handoff; no runtime or performance conclusion has been established.
+
 Constraints:
 
 - the public stream and consumer model must not expose lanes, shards, ranges, or worker assignments;
