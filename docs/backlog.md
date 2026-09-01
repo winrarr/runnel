@@ -95,6 +95,8 @@ Goal: let multiple worker instances share one durable consumer while preserving 
 
 Rationale: small applications need a single durable worker without extra coordination, while growing applications should be able to add workers without learning about partitions or triggering application-managed rebalancing.
 
+Current progress: local and clustered grouped delivery now cover durable attempts, out-of-order acknowledgements, expiry, stale-delivery fencing, and bounded expiry lookup. The shared engine also reports currently tracked in-flight deliveries. Restart, failover, replay, retry-policy, dead-letter, and scalable ownership behavior remain incomplete.
+
 Constraints:
 
 - the public model must remain streams, consumers, records, acknowledgements, and ordering intent;
@@ -158,6 +160,8 @@ Goal: amortize protocol and durability overhead for publish and consume workload
 
 Rationale: batching is necessary for efficient small-message workloads, but an underspecified batch can hide partial success or force unsafe retries.
 
+Current progress: bounded binary-safe publish batches now return ordered per-record outcomes, preserve request-ID deduplication, and use explicit local and clustered durability boundaries. An opt-in clustered publish-batch baseline records per-record throughput and batch round-trip latency. Consume batches and the broader batch-size, failure, recovery, and resource tradeoff matrix remain open.
+
 Constraints:
 
 - clients must be able to determine or resolve each record’s confirmed, rejected, retryable, or unknown outcome;
@@ -220,6 +224,8 @@ Goal: let supported broker upgrades preserve or deliberately transform acknowled
 
 Rationale: the storage layout now has separate metadata and stream data groups, so future format and placement changes need an explicit recovery and migration contract.
 
+Current progress: unsupported clustered storage versions and layouts now fail closed during read-only preflight before recovery mutates state. A supported migration, downgrade policy, interrupted-transfer procedure, and end-to-end upgrade path remain undefined.
+
 Constraints:
 
 - incompatible layouts must fail clearly rather than appear empty or partially recovered;
@@ -238,6 +244,8 @@ Acceptance criteria:
 Goal: reduce storage, network, and CPU overhead with efficient message representations and optional compression while preserving the public stream and delivery model.
 
 Rationale: small messages and long-lived streams make framing, copying, encoding, and compression costs significant parts of Runnel's performance and storage profile.
+
+Current progress: the provisional protocol and reusable client support validated binary-safe payloads through padded base64 while retaining the legacy text path. Version negotiation, mixed-format recovery, compression, and representative resource measurements remain open.
 
 Constraints:
 
@@ -259,6 +267,8 @@ Goal: keep publish, consume, recovery, and resource behavior predictable as a st
 
 Rationale: a broker cannot meet its throughput, latency, and bounded-memory goals if each new message requires work proportional to all retained state.
 
+Current progress: retained-history benchmarks now cross the bounded local tail index, clustered recovery replays retained data after a real node restart, and clustered snapshot/journal paths avoid several redundant retained-payload copies. Segmented storage, bounded storage amplification, retention behavior, and a complete growth benchmark matrix remain open.
+
 Constraints:
 
 - retained history must remain durable and replayable under the documented guarantees;
@@ -277,6 +287,8 @@ Acceptance criteria:
 Goal: allow independent publishing, consuming, acknowledgement, health, and recovery work to make progress concurrently without violating delivery or durability guarantees.
 
 Rationale: a single serialized execution path can hide the performance characteristics needed for low tail latency and high throughput.
+
+Current progress: local storage work now has bounded asynchronous admission, a blocking-I/O executor, and per-stream lanes that preserve order while allowing unrelated streams to progress. Grouped expiry lookup also avoids scanning all active deliveries. The broker still has broader serialized state and scheduling boundaries, and predictable concurrent p50/p99/p99.9 evidence remains incomplete.
 
 Constraints:
 
@@ -318,6 +330,8 @@ Acceptance criteria:
 Goal: keep the broker responsive and explicit when clients create more connections, requests, payload bytes, or outstanding work than the configured deployment can safely serve.
 
 Rationale: predictable resource usage requires admission limits before authentication or ordinary application mistakes can turn unbounded network input into memory exhaustion, runtime starvation, or storage failure.
+
+Current progress: connection, request-size, in-flight-request, and request-timeout limits are configurable and exposed as metrics. Real-server tests cover connection floods, oversized requests, in-flight saturation, slow writers, and incomplete slow readers. Sustained storage pressure, full resource-pressure recovery, and the complete operational matrix remain open.
 
 Constraints:
 
@@ -381,6 +395,8 @@ Acceptance criteria:
 Goal: support many streams and uneven workloads without requiring one permanent distributed processing unit or replica layout per public stream.
 
 Rationale: a small static cluster is useful for correctness testing, but its initial placement shape must not become the scalability boundary for larger deployments.
+
+Current progress: the retained-storage and placement identities are separated in the accepted architecture, while the current implementation still uses a static data group per stream and static voters. Placement movement, splitting, balancing, and failure-safe recovery remain unimplemented.
 
 Constraints:
 
@@ -549,6 +565,8 @@ Goal: provide the health, security, observability, persistence, and upgrade beha
 
 Rationale: a cluster that is correct only during normal traffic is not a dependable deployment.
 
+Current progress: clustered snapshot lifecycle, peer transport, forwarding, storage, health, and in-flight delivery signals are now visible through existing diagnostics and metrics. Leadership, replication progress, resource pressure, security, upgrade, and deployment-level operational behavior remain incomplete.
+
 Constraints:
 
 - readiness must represent the ability to serve the documented durable workload;
@@ -566,6 +584,8 @@ Acceptance criteria:
 Goal: support efficient production data and peer communication without changing application intent or weakening outcome semantics.
 
 Rationale: framing, payload representation, connection management, copying, and batching can dominate small-message latency and throughput.
+
+Current progress: binary-safe payloads, bounded peer control/data capacity, lazy idle-socket expiry, payload-copy reductions, peer-forwarding saturation scenarios, and publish-batch workload coverage now exist. Protocol versioning, multiplexing or cluster-scoped transport ownership, equivalent end-to-end measurements, and broader failure semantics remain open.
 
 Constraints:
 
@@ -586,6 +606,8 @@ Goal: measure whether the selected clustered design meets Runnel's latency, thro
 
 Rationale: the first distributed implementation is a baseline for evaluating later copyset, sequencer, chain, and other engines.
 
+Current progress: repeatable clustered workloads now cover ordinary durable publish, retained-history restart/replay, peer-forwarding saturation, and opt-in publish batches, with bounded resources and machine-readable results. Slow consumers, complete fault coverage, stable tail-latency evidence, and broader recovery/resource matrices remain open.
+
 Constraints:
 
 - every result must state topology, durability, storage, batching, message size, and failure state;
@@ -604,6 +626,8 @@ Acceptance criteria:
 Goal: rerun representative Runnel and competing-broker workloads under controlled, documented conditions and compare their results over time.
 
 Rationale: performance leadership is meaningful only when message semantics, durability, resource limits, workload shape, and measurement boundaries are equivalent.
+
+Current progress: comparison results now declare operation-specific acknowledgement, durability, replication, delivery, batching, client, latency, topology, and resource boundaries, reject inconsistent metadata, and mark mismatched comparisons as experimental and non-ranking. A common equivalent client and fully comparable consume, recovery, and resource workloads remain open.
 
 Constraints:
 
