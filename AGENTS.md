@@ -99,6 +99,11 @@ loading.
   output, or integration behavior; coordinated architectural refactors may
   intentionally overlap when they follow domain responsibility and have an
   explicit integration plan.
+- When coordinating delegated work, retain each worker's identifier, wait for
+  every requested worker to reach a final status or be explicitly cancelled,
+  and provide a progress/output update as each worker finishes. Include its
+  result, branch or pull request, evidence, gaps, and recommendation; do not
+  silently treat pending, blocked, or inconclusive work as complete.
 
 When checking a remote baseline, compare the `headSha`, `status`, and
 `conclusion` from

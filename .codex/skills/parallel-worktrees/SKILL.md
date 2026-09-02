@@ -103,6 +103,18 @@ pull-request handoff. A worker's missing, blocked, or inconclusive benchmark
 report remains an explicit unresolved result; it must not be silently collapsed
 into the orchestrator's own summary.
 
+## Orchestrator lifecycle
+
+After spawning workers, retain their identifiers and keep the coordination run
+active until every requested worker reaches a final status or is explicitly
+cancelled. Wait for workers with grouped, non-busy-polling waits. When a worker
+finishes, promptly provide a concise progress/output update containing its
+result, changed branch or pull request, tests, benchmark evidence and gaps,
+and recommendation; then continue monitoring the remaining workers. Do not
+silently end the coordination run while requested workers are still pending.
+If a worker is blocked or inconclusive, report that state explicitly and keep
+it in the final handoff.
+
 ## Integration
 
 Review each branch independently before integration. Check the diff against the recorded baseline, rerun focused tests in a clean worktree, and run the repository verification path. Do not merge an optimization solely because a microbenchmark improved: preserve durability, ordering, timeout, ambiguous-outcome, bounded-resource, and recovery guarantees.
