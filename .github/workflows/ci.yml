@@ -43,7 +43,8 @@ jobs:
       - uses: Swatinem/rust-cache@v2.9.2
         id: rust-cache
       - name: Report Rust target cache result
-        run: echo "Rust target cache exact hit: ${{ steps.rust-cache.outputs.cache-hit }}"
+        run: |
+          echo "Rust target cache exact hit: ${{ steps.rust-cache.outputs.cache-hit }}"
       - uses: taiki-e/install-action@v2.86.7
         with:
           tool: just
