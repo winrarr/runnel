@@ -279,6 +279,11 @@ impl ServerMetrics {
             duration.buckets[bucket].fetch_add(1, Ordering::Relaxed);
         }
     }
+
+    fn record_rejected_request(&self, operation: RequestOperation, elapsed: Duration) {
+        self.requests_rejected.fetch_add(1, Ordering::Relaxed);
+        self.record_request(operation, elapsed, true);
+    }
 }
 
 struct ActiveConnection(Arc<ServerMetrics>);
@@ -633,7 +638,8 @@ async fn handle_connection(
             Ok(result) => result?,
             Err(_) => {
                 metrics.request_timeouts.fetch_add(1, Ordering::Relaxed);
-                metrics.record_request(RequestOperation::InvalidRequest, started.elapsed(), true);
+                metrics
+                    .record_rejected_request(RequestOperation::InvalidRequest, started.elapsed());
                 send_response(
                     &mut writer,
                     &timeout_response(),
@@ -651,11 +657,11 @@ async fn handle_connection(
                 metrics
                     .request_bytes
                     .fetch_add(bytes.len() as u64, Ordering::Relaxed);
-                metrics.requests_rejected.fetch_add(1, Ordering::Relaxed);
                 metrics
                     .request_size_rejections
                     .fetch_add(1, Ordering::Relaxed);
-                metrics.record_request(RequestOperation::InvalidRequest, started.elapsed(), true);
+                metrics
+                    .record_rejected_request(RequestOperation::InvalidRequest, started.elapsed());
                 let response = request_size_response(protocol_admission.max_request_bytes);
                 send_response(
                     &mut writer,
@@ -670,7 +676,8 @@ async fn handle_connection(
                 metrics
                     .request_bytes
                     .fetch_add(bytes.len() as u64, Ordering::Relaxed);
-                metrics.record_request(RequestOperation::InvalidRequest, started.elapsed(), true);
+                metrics
+                    .record_rejected_request(RequestOperation::InvalidRequest, started.elapsed());
                 let response = invalid_request_response("request frame must end with a newline");
                 send_response(
                     &mut writer,
@@ -692,12 +699,11 @@ async fn handle_connection(
                         let request_permit = match Arc::clone(&request_slots).try_acquire_owned() {
                             Ok(permit) => permit,
                             Err(_) => {
-                                metrics.requests_rejected.fetch_add(1, Ordering::Relaxed);
                                 metrics
                                     .request_saturation_rejections
                                     .fetch_add(1, Ordering::Relaxed);
                                 let response = saturated_response();
-                                metrics.record_request(operation, started.elapsed(), true);
+                                metrics.record_rejected_request(operation, started.elapsed());
                                 send_response(
                                     &mut writer,
                                     &response,
@@ -748,10 +754,9 @@ async fn handle_connection(
                     }
                     Err(error) => {
                         if std::str::from_utf8(line).is_err() {
-                            metrics.record_request(
+                            metrics.record_rejected_request(
                                 RequestOperation::InvalidRequest,
                                 started.elapsed(),
-                                true,
                             );
                             return Err(std::io::Error::new(
                                 std::io::ErrorKind::InvalidData,
@@ -760,10 +765,9 @@ async fn handle_connection(
                             .into());
                         }
                         let response = invalid_request_response(&error.to_string());
-                        metrics.record_request(
+                        metrics.record_rejected_request(
                             RequestOperation::InvalidRequest,
                             started.elapsed(),
-                            true,
                         );
                         send_response(
                             &mut writer,
