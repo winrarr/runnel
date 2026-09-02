@@ -53,7 +53,7 @@ Run the real three-node clustered baseline with:
 just bench-cluster
 ```
 
-The runner defaults to native broker processes with independent durable directories and exercises the public protocol through multiple nodes. It measures durable publish, non-grouped consume/acknowledge, a bounded slow-consumer backlog drain, sequential shared-consumer delivery, parallel shared-consumer delivery, restart recovery, and retained-data recovery for the selected payload sizes. Each result records the node count, acknowledgement timeout, quorum durability boundary, protocol boundary, workload, throughput, p50/p99/p99.9 latency, aggregate broker CPU time, and resident memory samples. Results use the same `backends` shape as the single-node container and comparison runners, so they can be normalized into the existing history dashboard.
+The runner defaults to native broker processes with independent durable directories and exercises the public protocol through multiple nodes. It measures durable publish, non-grouped consume/acknowledge, a bounded slow-consumer backlog drain, sequential shared-consumer delivery, parallel shared-consumer delivery, restart recovery, and retained-data recovery for the selected payload sizes. Each result records the node count, acknowledgement timeout, quorum durability boundary, protocol boundary, workload, throughput, p50/p99/p99.9 latency, aggregate and per-node broker CPU time, resident memory, and on-disk storage samples. Results use the same `backends` shape as the single-node container and comparison runners, so they can be normalized into the existing history dashboard.
 
 The opt-in `publish_batch` scenario measures the clustered public `publish_batch` protocol path, which is not part of the default workload. Setup creates the stream and publishes the warmup records outside the measured interval. Measured requests contain up to 32 records by default, rotate persistent clients across the cluster nodes, and validate one published outcome and contiguous offset for every input record. Set `--batch-size` from 1 through the protocol's 1,024-record limit. The result counts records for throughput and uses one latency sample per batch request, recording `batch_size`, batch count, outcome validation, setup exclusion, and the latency scope in scenario metadata. This is a clustered batching baseline, not evidence that the current engine commits a batch atomically or that it performs one consensus append per request; compare only runs with matching batch size, payload, message count, topology, runtime, and resource limits.
 
@@ -89,6 +89,25 @@ The setup creates a stream and commits one record through node 1, then excludes 
 
 The default fault budget is 60 seconds and the maximum is 300 seconds. The scenario runs once for the first selected payload size and records the failed and surviving node IDs, leader-selection basis, replacement-serving observation, verified offsets, request attempts, restart-ready time, scenario resource samples, and `/metrics` delta. Its fixed three-record sequence is deliberately separate from the general sustained `--messages` workload setting. Because one node is restarted during the measured interval, its metric counters can reset; the result marks that condition as expected. The single latency sample spans stop through survivor failover and restarted-node acknowledgement; this is a reliability/recovery measurement, not a throughput comparison or evidence of a runtime performance improvement. The bounded scope excludes network partitions, storage loss, membership changes, two-node failures, repeated stable tail-latency measurements, and cross-engine comparisons. Use `--skip-recovery` to omit this scenario along with the other restart/recovery probes.
 
+The opt-in `follower_failure_recovery` scenario uses the same bounded public-protocol sequence but stops node 2, a non-bootstrap follower, before survivor publish/consume/acknowledgement and same-node restart. It records `failure_state: follower_process_stop`, the selected failed node, and the fact that leader identity was not needed for this probe. Comparing the leader and follower cases separates leader-election behavior from ordinary replica restart behavior; neither is a complete partition, storage-loss, or multi-failure matrix.
+
+For a rerunnable workload and fault matrix, use:
+
+```text
+just bench-cluster-matrix
+```
+
+`matrix.py` expands scenarios, payload sizes, relevant concurrency and slow-consumer delay values, retained-history sizes, runtimes, and repetitions into independent sequential `cluster.py` invocations. Every case receives a unique result and broker-log directory under the selected artifacts directory. The default matrix covers durable publish, consume/acknowledge, slow-consumer drain, restart/replay, retained-history recovery, and both leader and follower process-stop probes. Use `--keep-going` to retain later cases after a failure; the command still exits nonzero and records failed or timed-out cases in the matrix envelope. `--case-timeout-seconds` is an outer bound, while each fault scenario keeps its own bounded recovery timeout.
+
+The matrix accepts `--runtimes process,container`, `--cpus`, and `--memory` for explicit resource dimensions. Container cases enforce per-broker Docker limits. Add `--native-resource-scope` on Linux to place native broker and client processes in the same bounded systemd user scope. Cluster resource samples include aggregate and per-node CPU, resident memory, and on-disk storage bytes; storage scans are throttled between scenario boundaries so they do not turn the sampler into a hot-path observer. Cases with different dimensions are intentionally not aggregated into a performance ranking; normalize and aggregate matching raw case results when repeated evidence is needed.
+
+For a small lifecycle check of the matrix orchestration:
+
+```text
+just bench-cluster-matrix-smoke
+just isolated bench-cluster-matrix-smoke
+```
+
 The opt-in `peer_forwarding` scenario targets the topology-free forwarding pool. Select it explicitly so the existing clustered entrypoint keeps its established workload:
 
 ```text
@@ -112,7 +131,7 @@ The result uses the normal schema-v2 envelope and records the selected scenarios
 
 This probe establishes a repeatable forwarding and overload baseline; it is not evidence of a runtime performance improvement. Compare only runs with the same native runtime, topology, payload, warmup, message count, forwarding concurrency, response delay, timeout, resource budget, and source/build conditions. The delayed forwarding responses still include the target's normal quorum work, so a result does not isolate pool wait from consensus or target-processing cost. The public clustered benchmark remains unchanged unless `peer_forwarding` is selected in `--scenarios`.
 
-`--skip-recovery` skips restart and failure-recovery scenarios, including the retained-data and leader-failure probes. The cluster's temporary durable directories, generated stream names, native ports, process/container resources, and container network are run-scoped. Supply distinct output and log paths when invoking the script directly; use the isolation runner when independent process-heavy workflows overlap.
+`--skip-recovery` skips restart and failure-recovery scenarios, including the retained-data, leader-failure, and follower-failure probes. The cluster's temporary durable directories, generated stream names, native ports, process/container resources, and container network are run-scoped. Supply distinct output and log paths when invoking the script directly; use the isolation runner when independent process-heavy workflows overlap.
 
 The scheduled GitHub Actions history uses 200 messages per clustered scenario by default, independently of the native comparison workload. The retained-data probe remains at its separate 2,048-record default unless `--retained-messages` is overridden. This keeps repeated recovery and quorum measurements within the workflow time budget on the workflow runner's constrained CPU allocation while retaining enough traffic to compare the cluster scenarios. Increase the `cluster_messages` input for a larger manual run when investigating sustained-load behavior.
 

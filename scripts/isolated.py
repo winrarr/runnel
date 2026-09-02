@@ -39,6 +39,7 @@ WORKFLOWS = (
     "bench-container-smoke",
     "bench-cluster",
     "bench-cluster-smoke",
+    "bench-cluster-matrix-smoke",
     "bench-cluster-container",
     "bench-cluster-container-smoke",
     "profile-cluster",
@@ -224,6 +225,29 @@ def command_for(workflow: str, isolation: Isolation) -> list[str]:
         return cluster_command(isolation, runtime="process")
     if workflow == "bench-cluster-smoke":
         return cluster_command(isolation, runtime="process", smoke=True)
+    if workflow == "bench-cluster-matrix-smoke":
+        target_dir = Path(os.environ.get("CARGO_TARGET_DIR", str(isolation.target_dir)))
+        return [
+            "python3",
+            "scripts/benchmarks/matrix.py",
+            "--build",
+            "--binary",
+            str(target_dir / "release" / "runnel"),
+            "--messages",
+            "10",
+            "--warmup",
+            "2",
+            "--payload-sizes",
+            "100",
+            "--scenarios",
+            "durable_publish,slow_consumer,leader_failure_recovery,follower_failure_recovery",
+            "--slow-consumer-delays-ms",
+            "1",
+            "--output",
+            str(isolation.artifact_dir / "cluster-matrix.json"),
+            "--artifacts-dir",
+            str(isolation.artifact_dir / "cluster-matrix-cases"),
+        ]
     if workflow == "bench-cluster-container":
         return cluster_command(isolation, runtime="container")
     if workflow == "bench-cluster-container-smoke":

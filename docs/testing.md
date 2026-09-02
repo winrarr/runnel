@@ -19,6 +19,7 @@ just isolated
 just isolated cluster-test
 just isolated cluster-replacement-test
 just isolated bench-container-smoke
+just isolated bench-cluster-matrix-smoke
 just isolated bench-cluster-container-smoke
 ```
 

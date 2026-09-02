@@ -55,7 +55,13 @@ from common import (
     wait_for_ready,
     write_json_result,
 )
-from resources import PeriodicSampler, read_cpu_seconds, read_stats, summarize_stats
+from resources import (
+    PeriodicSampler,
+    directory_size,
+    read_cpu_seconds,
+    read_stats,
+    summarize_stats,
+)
 from runtime import DockerContainer, create_network, inspect_image, remove_network
 
 DEFAULT_BINARY = default_binary()
@@ -94,6 +100,7 @@ SCENARIO_NAMES = (
     "peer_forwarding",
     "publish_batch",
     "leader_failure_recovery",
+    "follower_failure_recovery",
 )
 # Keep the retained-data probe beyond the local engine's bounded tail index so
 # recovery measurements exercise a non-trivial retained history.
@@ -280,9 +287,11 @@ class ProcessStats(PeriodicSampler):
         super().__init__("runnel-cluster-stats", interval_seconds=0.1)
         self.cluster = cluster
         self.node_samples: list[dict[str, dict[str, float]]] = []
+        self._last_storage_scan_ns = 0
+        self._storage_bytes: dict[int, int] = {}
 
     def begin(self) -> tuple[int, int, float, int]:
-        self._record()
+        self._record(force_storage=True)
         with self.lock:
             sample_index = len(self.samples)
             node_sample_index = max(0, len(self.node_samples) - 1)
@@ -292,7 +301,7 @@ class ProcessStats(PeriodicSampler):
     def end(self, token: tuple[int, int, float, int]) -> dict[str, Any]:
         sample_index, node_sample_index, cpu_start, started_ns = token
         ended_ns = time.perf_counter_ns()
-        self._record()
+        self._record(force_storage=True)
         with self.lock:
             samples = list(self.samples[sample_index:])
             node_samples = list(self.node_samples[node_sample_index:])
@@ -323,12 +332,23 @@ class ProcessStats(PeriodicSampler):
             values = [sample[node_id] for sample in samples if node_id in sample]
             if not values:
                 continue
-            memory_values = [value["memory_bytes"] for value in values]
-            summary: dict[str, Any] = {
-                "samples": len(values),
-                "memory_bytes_avg": sum(memory_values) / len(memory_values),
-                "memory_bytes_max": max(memory_values),
-            }
+            summary: dict[str, Any] = {"samples": len(values)}
+            memory_values = [
+                value["memory_bytes"]
+                for value in values
+                if isinstance(value.get("memory_bytes"), (int, float))
+            ]
+            if memory_values:
+                summary["memory_bytes_avg"] = sum(memory_values) / len(memory_values)
+                summary["memory_bytes_max"] = max(memory_values)
+            storage_values = [
+                value["storage_bytes"]
+                for value in values
+                if isinstance(value.get("storage_bytes"), (int, float))
+            ]
+            if storage_values:
+                summary["storage_bytes_avg"] = sum(storage_values) / len(storage_values)
+                summary["storage_bytes_max"] = max(storage_values)
             cpu_values = [
                 value["cpu_seconds"]
                 for value in values
@@ -339,36 +359,57 @@ class ProcessStats(PeriodicSampler):
             summaries[node_id] = summary
         return summaries
 
-    def _record(self) -> None:
+    def _record(self, *, force_storage: bool = False) -> None:
         cpu = 0.0
         memory = 0
         node_sample: dict[str, dict[str, float]] = {}
+        now_ns = time.monotonic_ns()
+        scan_storage = force_storage or now_ns - self._last_storage_scan_ns >= 1_000_000_000
+        if scan_storage:
+            self._last_storage_scan_ns = now_ns
         for node in self.cluster.nodes:
+            if scan_storage:
+                self._storage_bytes[node.node_id] = directory_size(node.data_dir)
+            storage_bytes = self._storage_bytes.get(node.node_id, 0)
             if self.cluster.runtime == "container":
-                if node.container is None or not node.container.created:
-                    continue
-                node_cpu = read_cpu_seconds(node.container.name)
-                sample = read_stats(node.container.name)
-                if sample is not None:
-                    node_value = {"memory_bytes": float(sample["memory_bytes"])}
+                node_value: dict[str, float] = {}
+                if node.container is not None and node.container.created:
+                    node_cpu = read_cpu_seconds(node.container.name)
+                    sample = read_stats(node.container.name)
+                    if sample is not None:
+                        node_value["memory_bytes"] = float(sample["memory_bytes"])
+                        memory += int(sample["memory_bytes"])
                     if node_cpu is not None:
                         node_value["cpu_seconds"] = node_cpu
                         cpu += node_cpu
+                if node.data_dir.exists():
+                    node_value["storage_bytes"] = float(storage_bytes)
+                if node_value:
                     node_sample[str(node.node_id)] = node_value
-                    memory += int(sample["memory_bytes"])
                 continue
-            if node.process is None:
-                continue
-            sample = process_stats(node.process.pid)
-            if sample is not None:
-                node_sample[str(node.node_id)] = {
-                    "cpu_seconds": sample[0],
-                    "memory_bytes": float(sample[1]),
-                }
-                cpu += sample[0]
-                memory += sample[1]
+            node_value = {}
+            if node.process is not None:
+                sample = process_stats(node.process.pid)
+                if sample is not None:
+                    node_value["cpu_seconds"] = sample[0]
+                    node_value["memory_bytes"] = float(sample[1])
+                    cpu += sample[0]
+                    memory += sample[1]
+            if node.data_dir.exists():
+                node_value["storage_bytes"] = float(storage_bytes)
+            if node_value:
+                node_sample[str(node.node_id)] = node_value
+        storage = sum(
+            int(value.get("storage_bytes", 0)) for value in node_sample.values()
+        )
         with self.lock:
-            self.samples.append({"cpu_seconds": cpu, "memory_bytes": float(memory)})
+            self.samples.append(
+                {
+                    "cpu_seconds": cpu,
+                    "memory_bytes": float(memory),
+                    "storage_bytes": float(storage),
+                }
+            )
             self.node_samples.append(node_sample)
 
 
@@ -1252,23 +1293,32 @@ def validate_leader_failure_message(
         raise BenchmarkError(f"{phase} returned an unexpected payload")
 
 
-def run_leader_failure_recovery(
-    cluster: Cluster, stream: str, payload: str, timeout_seconds: float
+def run_node_failure_recovery(
+    cluster: Cluster,
+    stream: str,
+    payload: str,
+    *,
+    failed_index: int,
+    failure_kind: str,
+    timeout_seconds: float,
 ) -> dict[str, Any]:
-    """Exercise one bounded bootstrap-leader failure through the public protocol.
+    """Exercise one bounded process-stop and same-node restart.
 
-    The provisional public protocol forwards requests from followers and does
-    not expose the current leader. The static runner therefore uses node 1 as
-    the initial-leader target: it is the only node started with ``--bootstrap``
-    and is launched before the non-bootstrap nodes. The result records this
-    assumption so a future topology or protocol can replace it with detection.
+    The public protocol does not expose leader identity, so the leader probe
+    keeps its bootstrap assumption. The follower probe uses the same public
+    sequence with a non-bootstrap node, separating process recovery from
+    leader-election observation without adding broker-specific controls.
     """
-    failed_index = 0
+    if failure_kind not in {"leader", "follower"}:
+        raise BenchmarkError(f"unsupported failure kind: {failure_kind}")
+    if not 0 <= failed_index < cluster.node_count:
+        raise BenchmarkError(f"failure node index is outside the cluster: {failed_index}")
     survivor_indices = [index for index in range(cluster.node_count) if index != failed_index]
     if len(survivor_indices) < 2:
-        raise BenchmarkError("leader failure recovery requires at least two surviving nodes")
+        raise BenchmarkError("node failure recovery requires at least two surviving nodes")
 
-    setup = cluster.client(failed_index)
+    setup_index = failed_index if failure_kind == "leader" else 0
+    setup = cluster.client(setup_index)
     try:
         create_stream(setup, stream)
         pre_failure_offset, _ = publish(setup, stream, payload)
@@ -1276,7 +1326,8 @@ def run_leader_failure_recovery(
         setup.close()
     if pre_failure_offset != 0:
         raise BenchmarkError(
-            f"leader failure recovery setup returned offset {pre_failure_offset}, expected 0"
+            f"{failure_kind} failure recovery setup returned offset {pre_failure_offset}, "
+            "expected 0"
         )
 
     def operation() -> dict[str, Any]:
@@ -1284,27 +1335,32 @@ def run_leader_failure_recovery(
         cluster.stop_node(failed_index)
 
         attempts: dict[str, int] = {}
-        response, _, attempts["publish_after_leader_failure"] = request_until_response(
+        consumer = f"{failure_kind}-failure-consumer"
+        request_prefix = (
+            stream if failure_kind == "leader" else f"follower-failure-{stream}"
+        )
+        failure_phase = f"{failure_kind}-failure"
+        response, _, attempts[f"publish_after_{failure_kind}_failure"] = request_until_response(
             cluster,
             survivor_indices[0],
             {
                 "op": "publish",
                 "stream": stream,
                 "payload": payload,
-                "request_id": f"{stream}-after-leader-failure",
+                "request_id": f"{request_prefix}-after-{failure_phase}",
             },
             "published",
             timeout_seconds=timeout_seconds,
         )
         if response.get("offset") != 1:
             raise BenchmarkError(
-                f"publish after leader failure returned {response}, expected offset 1"
+                f"publish after {failure_kind} failure returned {response}, expected offset 1"
             )
 
         response, _, attempts["poll_before_restart"] = request_until_response(
             cluster,
             survivor_indices[0],
-            {"op": "poll", "stream": stream, "consumer": "leader-failure-consumer"},
+            {"op": "poll", "stream": stream, "consumer": consumer},
             "message",
             timeout_seconds=timeout_seconds,
         )
@@ -1315,7 +1371,7 @@ def run_leader_failure_recovery(
             {
                 "op": "ack",
                 "stream": stream,
-                "consumer": "leader-failure-consumer",
+                "consumer": consumer,
                 "offset": 0,
             },
             "acknowledged",
@@ -1325,7 +1381,7 @@ def run_leader_failure_recovery(
         response, _, attempts["poll_second_survivor"] = request_until_response(
             cluster,
             survivor_indices[1],
-            {"op": "poll", "stream": stream, "consumer": "leader-failure-consumer"},
+            {"op": "poll", "stream": stream, "consumer": consumer},
             "message",
             timeout_seconds=timeout_seconds,
         )
@@ -1336,7 +1392,7 @@ def run_leader_failure_recovery(
             {
                 "op": "ack",
                 "stream": stream,
-                "consumer": "leader-failure-consumer",
+                "consumer": consumer,
                 "offset": 1,
             },
             "acknowledged",
@@ -1351,7 +1407,7 @@ def run_leader_failure_recovery(
                 "op": "publish",
                 "stream": stream,
                 "payload": payload,
-                "request_id": f"{stream}-after-node-restart",
+                "request_id": f"{request_prefix}-after-node-restart",
             },
             "published",
             timeout_seconds=timeout_seconds,
@@ -1363,7 +1419,7 @@ def run_leader_failure_recovery(
         response, _, attempts["poll_after_restart"] = request_until_response(
             cluster,
             failed_index,
-            {"op": "poll", "stream": stream, "consumer": "leader-failure-consumer"},
+            {"op": "poll", "stream": stream, "consumer": consumer},
             "message",
             timeout_seconds=timeout_seconds,
         )
@@ -1374,7 +1430,7 @@ def run_leader_failure_recovery(
             {
                 "op": "ack",
                 "stream": stream,
-                "consumer": "leader-failure-consumer",
+                "consumer": consumer,
                 "offset": 2,
             },
             "acknowledged",
@@ -1383,7 +1439,7 @@ def run_leader_failure_recovery(
 
         elapsed_ns = time.perf_counter_ns() - started
         result = metric(
-            "cluster_leader_failure_recovery",
+            f"cluster_{failure_kind}_failure_recovery",
             [elapsed_ns],
             elapsed_ns,
             message_size=len(payload),
@@ -1391,15 +1447,31 @@ def run_leader_failure_recovery(
                 "nodes": cluster.node_count,
                 "failed_node": cluster.nodes[failed_index].node_id,
                 "surviving_nodes": [cluster.nodes[index].node_id for index in survivor_indices],
-                "initial_leader_selection": "bootstrap_assumption",
-                "initial_leader_node": cluster.nodes[failed_index].node_id,
+                "failure_state": f"{failure_kind}_process_stop",
+                "failed_node_role": failure_kind,
+                "initial_leader_selection": (
+                    "bootstrap_assumption"
+                    if failure_kind == "leader"
+                    else "not_required_for_follower_probe"
+                ),
+                "initial_leader_node": (
+                    cluster.nodes[failed_index].node_id
+                    if failure_kind == "leader"
+                    else None
+                ),
                 "initial_leader_basis": (
                     "node 1 is the only process started with --bootstrap; the current "
                     "PersistentEngine uses that process to initialize the static metadata "
                     "group before data-stream creation"
+                    if failure_kind == "leader"
+                    else "follower probe does not require identifying the current leader"
                 ),
-                "replacement_leader_observed": True,
-                "replacement_leader_identity": "not exposed by the provisional public protocol",
+                "replacement_leader_observed": failure_kind == "leader",
+                "replacement_leader_identity": (
+                    "not exposed by the provisional public protocol"
+                    if failure_kind == "leader"
+                    else "not applicable"
+                ),
                 "replacement_observation": (
                     "both surviving public endpoints committed, consumed, and acknowledged "
                     "records after the failed node stopped"
@@ -1415,7 +1487,11 @@ def run_leader_failure_recovery(
                 "verified_message_count": 3,
                 "metrics_counter_reset_on_restart_expected": True,
                 "verified": {
-                    "surviving_nodes_elected_and_served": True,
+                    "surviving_nodes_elected_and_served": failure_kind == "leader",
+                    "surviving_nodes_served": True,
+                    "publish_after_failure": True,
+                    "consume_after_failure": True,
+                    "ack_after_failure": True,
                     "publish_after_leader_failure": True,
                     "consume_after_leader_failure": True,
                     "ack_after_leader_failure": True,
@@ -1427,9 +1503,11 @@ def run_leader_failure_recovery(
                 "bounded_timeout_seconds": timeout_seconds,
                 "latency_scope": (
                     "stopped-bootstrap-leader-through-survivor-failover-and-restarted-node-ack"
+                    if failure_kind == "leader"
+                    else "stopped-follower-through-survivor-service-and-restarted-node-ack"
                 ),
                 "failure_scope": (
-                    "one process stop in a static quorum followed by same-process restart; "
+                    f"one {failure_kind} process stop in a static quorum followed by same-process restart; "
                     "network partitions, storage loss, and membership changes are excluded"
                 ),
                 "request_attempts": attempts,
@@ -1439,6 +1517,34 @@ def run_leader_failure_recovery(
         return result
 
     return measure_scenario(cluster.stats, operation, metrics=cluster.metrics)
+
+
+def run_leader_failure_recovery(
+    cluster: Cluster, stream: str, payload: str, timeout_seconds: float
+) -> dict[str, Any]:
+    """Exercise one bounded bootstrap-leader failure through the public protocol."""
+    return run_node_failure_recovery(
+        cluster,
+        stream,
+        payload,
+        failed_index=0,
+        failure_kind="leader",
+        timeout_seconds=timeout_seconds,
+    )
+
+
+def run_follower_failure_recovery(
+    cluster: Cluster, stream: str, payload: str, timeout_seconds: float
+) -> dict[str, Any]:
+    """Exercise one bounded non-bootstrap follower failure through the public protocol."""
+    return run_node_failure_recovery(
+        cluster,
+        stream,
+        payload,
+        failed_index=1,
+        failure_kind="follower",
+        timeout_seconds=timeout_seconds,
+    )
 
 
 def build_binary(binary: Path, *, features: str | None = None) -> None:
@@ -1531,8 +1637,8 @@ def parse_args() -> argparse.Namespace:
         default=list(DEFAULT_SCENARIOS),
         help=(
             "comma-separated scenarios to run (default: existing clustered workload; "
-            "add peer_forwarding, publish_batch, or leader_failure_recovery explicitly "
-            "for focused probes)"
+            "add peer_forwarding, publish_batch, leader_failure_recovery, or "
+            "follower_failure_recovery explicitly for focused probes)"
         ),
     )
     parser.add_argument("--ack-timeout-ms", type=int, default=DEFAULT_ACK_TIMEOUT_MS)
@@ -1752,6 +1858,15 @@ def main() -> int:
                         run_leader_failure_recovery(
                             cluster,
                             f"cluster_{run_id}_leader_failure_{size}",
+                            payload,
+                            args.leader_failure_timeout_seconds,
+                        )
+                    )
+                if "follower_failure_recovery" in selected_scenarios:
+                    scenarios.append(
+                        run_follower_failure_recovery(
+                            cluster,
+                            f"cluster_{run_id}_follower_failure_{size}",
                             payload,
                             args.leader_failure_timeout_seconds,
                         )

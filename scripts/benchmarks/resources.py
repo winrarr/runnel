@@ -8,10 +8,32 @@ import re
 import subprocess
 import threading
 import time
+from pathlib import Path
 from typing import Any
 
 
 DEFAULT_PROBE_TIMEOUT_SECONDS = 2.0
+
+
+def directory_size(directory: Path) -> int:
+    """Return the bytes occupied by regular files below *directory*.
+
+    Benchmark data directories are run-scoped and contain no user-managed
+    files. Treat files that disappear during cleanup as an unavailable sample
+    rather than allowing resource collection to fail the workload.
+    """
+    total = 0
+    try:
+        paths = directory.rglob("*")
+        for path in paths:
+            try:
+                if path.is_file():
+                    total += path.stat().st_size
+            except OSError:
+                continue
+    except OSError:
+        return 0
+    return total
 
 
 def parse_size(value: str) -> float:
@@ -101,7 +123,12 @@ def summarize_stats(
     """Summarize resource samples and an optional exact cgroup CPU interval."""
     summary: dict[str, Any] = {"samples": len(samples)}
     if samples:
-        for field in ("cpu_percent", "memory_bytes", "memory_percent"):
+        for field in (
+            "cpu_percent",
+            "memory_bytes",
+            "memory_percent",
+            "storage_bytes",
+        ):
             values = [sample.get(field) for sample in samples]
             if not all(isinstance(value, (int, float)) for value in values):
                 continue

@@ -61,6 +61,12 @@ bench-cluster:
 bench-cluster-smoke:
     python3 scripts/benchmarks/lock.py --path {{benchmark_lock}} --mode shared -- python3 scripts/benchmarks/cluster.py --build --messages 20 --warmup 2 --payload-sizes 100 --skip-recovery
 
+bench-cluster-matrix:
+    python3 scripts/benchmarks/lock.py --path {{benchmark_lock}} --mode exclusive -- python3 scripts/benchmarks/matrix.py --build
+
+bench-cluster-matrix-smoke:
+    python3 scripts/benchmarks/lock.py --path {{benchmark_lock}} --mode shared -- python3 scripts/benchmarks/matrix.py --build --messages 10 --warmup 2 --payload-sizes 100 --scenarios durable_publish,slow_consumer,leader_failure_recovery,follower_failure_recovery --slow-consumer-delays-ms 1 --repetitions 1
+
 bench-cluster-container:
     python3 scripts/benchmarks/lock.py --path {{benchmark_lock}} --mode exclusive -- python3 scripts/benchmarks/cluster.py --runtime container --build
 

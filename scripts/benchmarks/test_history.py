@@ -12,7 +12,7 @@ sys.path.insert(0, str(SCRIPT_DIR))
 from build_history import build_points, load_runs, site_data  # noqa: E402
 from aggregate import AggregationError, aggregate_results  # noqa: E402
 from normalize import normalize_result  # noqa: E402
-from resources import parse_cpu_stat, summarize_stats  # noqa: E402
+from resources import directory_size, parse_cpu_stat, summarize_stats  # noqa: E402
 
 
 def comparison_result() -> dict:
@@ -52,6 +52,7 @@ def comparison_result() -> dict:
                             "cpu_seconds": 0.25,
                             "cpu_percent_max": 30.0,
                             "memory_bytes_max": 2048.0,
+                            "storage_bytes_max": 4096.0,
                         },
                     }
                 ],
@@ -144,6 +145,7 @@ class HistoryTests(unittest.TestCase):
                 "cpu_efficiency_messages_per_cpu_second",
                 "cpu_percent_max",
                 "memory_bytes_max",
+                "storage_bytes_max",
             },
         )
 
@@ -338,6 +340,14 @@ class HistoryTests(unittest.TestCase):
         self.assertEqual(summary["cpu_percent_avg"], 20.0)
         self.assertEqual(summary["memory_bytes_max"], 200.0)
         self.assertEqual(summary["cpu_seconds"], 0.25)
+        storage_summary = summarize_stats(
+            [
+                {"storage_bytes": 100.0},
+                {"storage_bytes": 200.0},
+            ]
+        )
+        self.assertEqual(storage_summary["storage_bytes_avg"], 150.0)
+        self.assertEqual(storage_summary["storage_bytes_max"], 200.0)
         native_summary = summarize_stats(
             [
                 {"cpu_seconds": 1.0, "memory_bytes": 100.0},
@@ -347,6 +357,15 @@ class HistoryTests(unittest.TestCase):
         self.assertEqual(native_summary["memory_bytes_avg"], 150.0)
         self.assertNotIn("cpu_percent_max", native_summary)
 
+    def test_directory_size_counts_regular_files(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "nested").mkdir()
+            (root / "one.bin").write_bytes(b"123")
+            (root / "nested" / "two.bin").write_bytes(b"12345")
+
+            self.assertEqual(directory_size(root), 8)
+
     def test_loader_accepts_raw_comparison_results(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             runs_dir = Path(directory)
@@ -355,12 +374,13 @@ class HistoryTests(unittest.TestCase):
             generated = site_data(runs)
 
         self.assertEqual(len(runs), 1)
-        self.assertEqual(len(generated["points"]), 9)
+        self.assertEqual(len(generated["points"]), 10)
 
         site_dir = SCRIPT_DIR.parents[1] / "docs" / "benchmarks"
         self.assertIn("Runnel benchmark history", (site_dir / "index.html").read_text(encoding="utf-8"))
         app = (site_dir / "app.js").read_text(encoding="utf-8")
         self.assertIn("CPU efficiency", app)
+        self.assertIn("Peak broker storage", app)
         self.assertIn("runnel-native-comparison", app)
         self.assertIn("rollingMedian", app)
         self.assertIn("logTickValues", app)

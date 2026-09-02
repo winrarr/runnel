@@ -21,6 +21,7 @@ METRIC_DEFINITIONS = [
     ("cpu_efficiency_messages_per_cpu_second", "CPU efficiency", "messages/CPU-second", True),
     ("cpu_percent_max", "Peak broker CPU", "%", False),
     ("memory_bytes_max", "Peak broker memory", "bytes", False),
+    ("storage_bytes_max", "Peak broker storage", "bytes", False),
 ]
 METRIC_CONFIG = {name: higher_better for name, _, _, higher_better in METRIC_DEFINITIONS}
 
@@ -140,6 +141,7 @@ def add_resource_points(
     for metric, key in (
         ("cpu_percent_max", "cpu_percent_max"),
         ("memory_bytes_max", "memory_bytes_max"),
+        ("storage_bytes_max", "storage_bytes_max"),
     ):
         value = resources.get(key)
         if isinstance(value, (int, float)):
