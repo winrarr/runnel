@@ -71,6 +71,24 @@ The slow-consumer scenario preloads a finite stream, polls one message at a time
 
 The retained-data recovery scenario is named `cluster_retained_recovery`. It preloads a separate stream with 2,048 records by default, which is above the current local 1,024-record tail-index boundary, then excludes that setup from the measured interval. The measured interval restarts one node, waits for readiness, polls the earliest retained record at offset 0, verifies its payload, and acknowledges it. Set the retained history size with `--retained-messages`; values must be at least 1,025. The scenario runs once for the first selected payload size and records `retained_messages` and `retained_logical_payload_bytes` in its existing v2 scenario metadata. Its request sample is the restart-ready-to-replay-acknowledgement interval, while the scenario resource sample covers that same interval. This measures recovery and cold replay with a known retained-data size; it does not measure retention cleanup, disk-pressure admission, batching, or prove that recovery cost is bounded. Compare runs only when retained count, payload size, topology, durability, runtime, and resource limits match.
 
+The opt-in `leader_failure_recovery` scenario is a bounded fault baseline for one three-node quorum. Select it explicitly with a run-scoped output and log directory:
+
+```text
+run_dir="$(mktemp -d -t runnel-leader-failure-XXXXXX)"
+python3 scripts/benchmarks/cluster.py \
+  --build \
+  --scenarios leader_failure_recovery \
+  --messages 1 \
+  --payload-sizes 100 \
+  --leader-failure-timeout-seconds 60 \
+  --output "$run_dir/result.json" \
+  --log-dir "$run_dir/logs"
+```
+
+The setup creates a stream and commits one record through node 1, then excludes that work from measurement. The current static clustered implementation starts node 1 with `--bootstrap` before the other nodes and uses it to initialize the metadata group; because the provisional public protocol forwards follower requests and exposes no leader identity, the scenario records this justified bootstrap assumption instead of claiming to detect a leader ID. It stops node 1, retries public publish/poll/ack requests through both surviving nodes until a replacement can serve, restarts node 1 on its run-scoped port and durable directory, and verifies publish/poll/ack through the restarted endpoint. Retried publishes use stable `request_id` values so an ambiguous response can be retried without intentionally creating a second record.
+
+The default fault budget is 60 seconds and the maximum is 300 seconds. The scenario runs once for the first selected payload size and records the failed and surviving node IDs, leader-selection basis, replacement-serving observation, verified offsets, request attempts, restart-ready time, scenario resource samples, and `/metrics` delta. Its fixed three-record sequence is deliberately separate from the general sustained `--messages` workload setting. Because one node is restarted during the measured interval, its metric counters can reset; the result marks that condition as expected. The single latency sample spans stop through survivor failover and restarted-node acknowledgement; this is a reliability/recovery measurement, not a throughput comparison or evidence of a runtime performance improvement. The bounded scope excludes network partitions, storage loss, membership changes, two-node failures, repeated stable tail-latency measurements, and cross-engine comparisons. Use `--skip-recovery` to omit this scenario along with the other restart/recovery probes.
+
 The opt-in `peer_forwarding` scenario targets the topology-free forwarding pool. Select it explicitly so the existing clustered entrypoint keeps its established workload:
 
 ```text
@@ -94,7 +112,7 @@ The result uses the normal schema-v2 envelope and records the selected scenarios
 
 This probe establishes a repeatable forwarding and overload baseline; it is not evidence of a runtime performance improvement. Compare only runs with the same native runtime, topology, payload, warmup, message count, forwarding concurrency, response delay, timeout, resource budget, and source/build conditions. The delayed forwarding responses still include the target's normal quorum work, so a result does not isolate pool wait from consensus or target-processing cost. The public clustered benchmark remains unchanged unless `peer_forwarding` is selected in `--scenarios`.
 
-`--skip-recovery` skips both restart scenarios, including the retained-data probe. The cluster's temporary durable directories, generated stream names, native ports, and container network are run-scoped, so independent runs should use the normal isolation runner or distinct output paths when they overlap.
+`--skip-recovery` skips restart and failure-recovery scenarios, including the retained-data and leader-failure probes. The cluster's temporary durable directories, generated stream names, native ports, process/container resources, and container network are run-scoped. Supply distinct output and log paths when invoking the script directly; use the isolation runner when independent process-heavy workflows overlap.
 
 The scheduled GitHub Actions history uses 200 messages per clustered scenario by default, independently of the native comparison workload. The retained-data probe remains at its separate 2,048-record default unless `--retained-messages` is overridden. This keeps repeated recovery and quorum measurements within the workflow time budget on the workflow runner's constrained CPU allocation while retaining enough traffic to compare the cluster scenarios. Increase the `cluster_messages` input for a larger manual run when investigating sustained-load behavior.
 

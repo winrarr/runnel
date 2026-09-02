@@ -78,6 +78,8 @@ MAX_PEER_FORWARDING_CONCURRENCY = 128
 MAX_PEER_RESPONSE_DELAY_MS = 2_000
 MAX_PEER_FORWARDING_TIMEOUT_SECONDS = 300.0
 PEER_FORWARDING_INGRESS_NODE_INDEX = 1
+DEFAULT_LEADER_FAILURE_TIMEOUT_SECONDS = 60.0
+MAX_LEADER_FAILURE_TIMEOUT_SECONDS = 300.0
 DEFAULT_SCENARIOS = (
     "durable_publish",
     "consume_ack",
@@ -87,7 +89,12 @@ DEFAULT_SCENARIOS = (
     "restart_recovery",
     "cluster_retained_recovery",
 )
-SCENARIO_NAMES = (*DEFAULT_SCENARIOS, "peer_forwarding", "publish_batch")
+SCENARIO_NAMES = (
+    *DEFAULT_SCENARIOS,
+    "peer_forwarding",
+    "publish_batch",
+    "leader_failure_recovery",
+)
 # Keep the retained-data probe beyond the local engine's bounded tail index so
 # recovery measurements exercise a non-trivial retained history.
 MIN_RETAINED_RECOVERY_MESSAGES = 1_025
@@ -1187,6 +1194,253 @@ def run_retained_recovery(
     return measure_scenario(cluster.stats, operation, metrics=cluster.metrics)
 
 
+def request_until_response(
+    cluster: Cluster,
+    node_index: int,
+    request: dict[str, Any],
+    response_type: str,
+    *,
+    timeout_seconds: float,
+) -> tuple[dict[str, Any], int, int]:
+    """Retry a public request while a bounded leader transition is in progress."""
+    deadline = time.monotonic() + timeout_seconds
+    attempts = 0
+    last_error: Exception | None = None
+    while time.monotonic() < deadline:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            break
+        attempts += 1
+        client: LineClient | None = None
+        try:
+            client = cluster.client(
+                node_index, timeout_seconds=min(COMMAND_TIMEOUT_SECONDS, remaining)
+            )
+            response, elapsed = client.request(request)
+            if response.get("type") == response_type:
+                return response, elapsed, attempts
+            last_error = BenchmarkError(
+                f"unexpected response to {request.get('op')}: {response}"
+            )
+        except (BenchmarkError, OSError, TimeoutError) as error:
+            last_error = error
+        finally:
+            if client is not None:
+                try:
+                    client.close()
+                except OSError:
+                    pass
+        remaining = deadline - time.monotonic()
+        if remaining > 0:
+            time.sleep(min(0.05, remaining))
+    node_id = cluster.nodes[node_index].node_id
+    raise BenchmarkError(
+        f"node {node_id} did not return {response_type} for {request.get('op')} "
+        f"before the {timeout_seconds:g}-second deadline after {attempts} attempts; "
+        f"last error: {last_error}"
+    )
+
+
+def validate_leader_failure_message(
+    response: dict[str, Any], expected_offset: int, payload: str, phase: str
+) -> None:
+    if response.get("offset") != expected_offset:
+        raise BenchmarkError(
+            f"{phase} returned offset {response.get('offset')}, expected {expected_offset}"
+        )
+    if response.get("payload") != payload:
+        raise BenchmarkError(f"{phase} returned an unexpected payload")
+
+
+def run_leader_failure_recovery(
+    cluster: Cluster, stream: str, payload: str, timeout_seconds: float
+) -> dict[str, Any]:
+    """Exercise one bounded bootstrap-leader failure through the public protocol.
+
+    The provisional public protocol forwards requests from followers and does
+    not expose the current leader. The static runner therefore uses node 1 as
+    the initial-leader target: it is the only node started with ``--bootstrap``
+    and is launched before the non-bootstrap nodes. The result records this
+    assumption so a future topology or protocol can replace it with detection.
+    """
+    failed_index = 0
+    survivor_indices = [index for index in range(cluster.node_count) if index != failed_index]
+    if len(survivor_indices) < 2:
+        raise BenchmarkError("leader failure recovery requires at least two surviving nodes")
+
+    setup = cluster.client(failed_index)
+    try:
+        create_stream(setup, stream)
+        pre_failure_offset, _ = publish(setup, stream, payload)
+    finally:
+        setup.close()
+    if pre_failure_offset != 0:
+        raise BenchmarkError(
+            f"leader failure recovery setup returned offset {pre_failure_offset}, expected 0"
+        )
+
+    def operation() -> dict[str, Any]:
+        started = time.perf_counter_ns()
+        cluster.stop_node(failed_index)
+
+        attempts: dict[str, int] = {}
+        response, _, attempts["publish_after_leader_failure"] = request_until_response(
+            cluster,
+            survivor_indices[0],
+            {
+                "op": "publish",
+                "stream": stream,
+                "payload": payload,
+                "request_id": f"{stream}-after-leader-failure",
+            },
+            "published",
+            timeout_seconds=timeout_seconds,
+        )
+        if response.get("offset") != 1:
+            raise BenchmarkError(
+                f"publish after leader failure returned {response}, expected offset 1"
+            )
+
+        response, _, attempts["poll_before_restart"] = request_until_response(
+            cluster,
+            survivor_indices[0],
+            {"op": "poll", "stream": stream, "consumer": "leader-failure-consumer"},
+            "message",
+            timeout_seconds=timeout_seconds,
+        )
+        validate_leader_failure_message(response, 0, payload, "survivor poll")
+        _, _, attempts["ack_before_restart"] = request_until_response(
+            cluster,
+            survivor_indices[1],
+            {
+                "op": "ack",
+                "stream": stream,
+                "consumer": "leader-failure-consumer",
+                "offset": 0,
+            },
+            "acknowledged",
+            timeout_seconds=timeout_seconds,
+        )
+
+        response, _, attempts["poll_second_survivor"] = request_until_response(
+            cluster,
+            survivor_indices[1],
+            {"op": "poll", "stream": stream, "consumer": "leader-failure-consumer"},
+            "message",
+            timeout_seconds=timeout_seconds,
+        )
+        validate_leader_failure_message(response, 1, payload, "second survivor poll")
+        _, _, attempts["ack_second_survivor"] = request_until_response(
+            cluster,
+            survivor_indices[0],
+            {
+                "op": "ack",
+                "stream": stream,
+                "consumer": "leader-failure-consumer",
+                "offset": 1,
+            },
+            "acknowledged",
+            timeout_seconds=timeout_seconds,
+        )
+
+        restart_ns = cluster.restart_node(failed_index)
+        response, _, attempts["publish_after_restart"] = request_until_response(
+            cluster,
+            failed_index,
+            {
+                "op": "publish",
+                "stream": stream,
+                "payload": payload,
+                "request_id": f"{stream}-after-node-restart",
+            },
+            "published",
+            timeout_seconds=timeout_seconds,
+        )
+        if response.get("offset") != 2:
+            raise BenchmarkError(
+                f"publish after node restart returned {response}, expected offset 2"
+            )
+        response, _, attempts["poll_after_restart"] = request_until_response(
+            cluster,
+            failed_index,
+            {"op": "poll", "stream": stream, "consumer": "leader-failure-consumer"},
+            "message",
+            timeout_seconds=timeout_seconds,
+        )
+        validate_leader_failure_message(response, 2, payload, "restarted node poll")
+        _, _, attempts["ack_after_restart"] = request_until_response(
+            cluster,
+            survivor_indices[0],
+            {
+                "op": "ack",
+                "stream": stream,
+                "consumer": "leader-failure-consumer",
+                "offset": 2,
+            },
+            "acknowledged",
+            timeout_seconds=timeout_seconds,
+        )
+
+        elapsed_ns = time.perf_counter_ns() - started
+        result = metric(
+            "cluster_leader_failure_recovery",
+            [elapsed_ns],
+            elapsed_ns,
+            message_size=len(payload),
+            metadata={
+                "nodes": cluster.node_count,
+                "failed_node": cluster.nodes[failed_index].node_id,
+                "surviving_nodes": [cluster.nodes[index].node_id for index in survivor_indices],
+                "initial_leader_selection": "bootstrap_assumption",
+                "initial_leader_node": cluster.nodes[failed_index].node_id,
+                "initial_leader_basis": (
+                    "node 1 is the only process started with --bootstrap; the current "
+                    "PersistentEngine uses that process to initialize the static metadata "
+                    "group before data-stream creation"
+                ),
+                "replacement_leader_observed": True,
+                "replacement_leader_identity": "not exposed by the provisional public protocol",
+                "replacement_observation": (
+                    "both surviving public endpoints committed, consumed, and acknowledged "
+                    "records after the failed node stopped"
+                ),
+                "public_protocol_survivor_nodes": [
+                    cluster.nodes[index].node_id for index in survivor_indices[:2]
+                ],
+                "post_failure_publish_offset": 1,
+                "post_failure_consumed_offsets": [0, 1],
+                "post_restart_publish_offset": 2,
+                "restart_recovered_message_offset": 2,
+                "fault_sequence_messages": 3,
+                "verified_message_count": 3,
+                "metrics_counter_reset_on_restart_expected": True,
+                "verified": {
+                    "surviving_nodes_elected_and_served": True,
+                    "publish_after_leader_failure": True,
+                    "consume_after_leader_failure": True,
+                    "ack_after_leader_failure": True,
+                    "stopped_node_restarted": True,
+                    "restarted_node_served_and_recovered": True,
+                },
+                "setup_excluded": True,
+                "request_identity_for_retried_publishes": "stable request_id",
+                "bounded_timeout_seconds": timeout_seconds,
+                "latency_scope": (
+                    "stopped-bootstrap-leader-through-survivor-failover-and-restarted-node-ack"
+                ),
+                "failure_scope": (
+                    "one process stop in a static quorum followed by same-process restart; "
+                    "network partitions, storage loss, and membership changes are excluded"
+                ),
+                "request_attempts": attempts,
+            },
+        )
+        result["restart_ready_seconds"] = restart_ns / 1_000_000_000
+        return result
+
+    return measure_scenario(cluster.stats, operation, metrics=cluster.metrics)
+
+
 def build_binary(binary: Path, *, features: str | None = None) -> None:
     command = ["cargo", "build", "--locked", "-p", "runnel-server", "--release"]
     if features:
@@ -1277,7 +1531,8 @@ def parse_args() -> argparse.Namespace:
         default=list(DEFAULT_SCENARIOS),
         help=(
             "comma-separated scenarios to run (default: existing clustered workload; "
-            "add peer_forwarding or publish_batch explicitly for focused probes)"
+            "add peer_forwarding, publish_batch, or leader_failure_recovery explicitly "
+            "for focused probes)"
         ),
     )
     parser.add_argument("--ack-timeout-ms", type=int, default=DEFAULT_ACK_TIMEOUT_MS)
@@ -1323,11 +1578,17 @@ def parse_args() -> argparse.Namespace:
         default=DEFAULT_PEER_FORWARDING_TIMEOUT_SECONDS,
         help="bounded wall-clock budget for each peer-forwarding scenario",
     )
+    parser.add_argument(
+        "--leader-failure-timeout-seconds",
+        type=parse_positive_float,
+        default=DEFAULT_LEADER_FAILURE_TIMEOUT_SECONDS,
+        help="bounded wall-clock budget for the opt-in leader-failure scenario",
+    )
     parser.add_argument("--payload-sizes", type=parse_sizes, default=[100, 1024])
     parser.add_argument(
         "--skip-recovery",
         action="store_true",
-        help="skip both restart-recovery scenarios",
+        help="skip restart and failure-recovery scenarios",
     )
     parser.add_argument("--output", type=Path)
     parser.add_argument("--log-dir", type=Path)
@@ -1354,6 +1615,11 @@ def parse_args() -> argparse.Namespace:
         parser.error(
             "peer forwarding timeout exceeds the bounded maximum "
             f"of {MAX_PEER_FORWARDING_TIMEOUT_SECONDS:g} seconds"
+        )
+    if args.leader_failure_timeout_seconds > MAX_LEADER_FAILURE_TIMEOUT_SECONDS:
+        parser.error(
+            "leader failure timeout exceeds the bounded maximum "
+            f"of {MAX_LEADER_FAILURE_TIMEOUT_SECONDS:g} seconds"
         )
     if args.peer_response_delay_ms and args.runtime != "process":
         parser.error("peer response delay requires the native process runtime")
@@ -1481,6 +1747,15 @@ def main() -> int:
                             args.retained_messages,
                         )
                     )
+                if "leader_failure_recovery" in selected_scenarios:
+                    scenarios.append(
+                        run_leader_failure_recovery(
+                            cluster,
+                            f"cluster_{run_id}_leader_failure_{size}",
+                            payload,
+                            args.leader_failure_timeout_seconds,
+                        )
+                    )
     finally:
         cluster.close()
 
@@ -1497,6 +1772,7 @@ def main() -> int:
         "peer_forwarding_concurrency": args.peer_forwarding_concurrency,
         "peer_response_delay_ms": args.peer_response_delay_ms,
         "peer_forwarding_timeout_seconds": args.peer_forwarding_timeout_seconds,
+        "leader_failure_timeout_seconds": args.leader_failure_timeout_seconds,
         "payload_sizes_bytes": args.payload_sizes,
         "runtime": args.runtime,
         "protocol": "line-delimited JSON with UTF-8 string payloads",

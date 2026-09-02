@@ -15,6 +15,7 @@ from cluster import (  # noqa: E402
     DEFAULT_SCENARIOS,
     DEFAULT_PUBLISH_BATCH_SIZE,
     MAX_PUBLISH_BATCH_SIZE,
+    MAX_LEADER_FAILURE_TIMEOUT_SECONDS,
     batch_metric,
     metric,
     MIN_RETAINED_RECOVERY_MESSAGES,
@@ -32,6 +33,7 @@ from cluster import (  # noqa: E402
     resource_limits,
     run_publish_batch,
     run_peer_forwarding,
+    run_leader_failure_recovery,
     run_retained_recovery,
 )
 from profile import summarize_timing_logs  # noqa: E402
@@ -56,6 +58,35 @@ class ClusterBenchmarkTests(unittest.TestCase):
         self.assertEqual(args.scenarios, list(DEFAULT_SCENARIOS))
         self.assertNotIn("peer_forwarding", args.scenarios)
         self.assertNotIn("publish_batch", args.scenarios)
+        self.assertNotIn("leader_failure_recovery", args.scenarios)
+
+    def test_leader_failure_scenario_is_opt_in_and_has_a_bounded_timeout(self) -> None:
+        with patch.object(
+            sys,
+            "argv",
+            [
+                "cluster.py",
+                "--scenarios",
+                "leader_failure_recovery",
+                "--leader-failure-timeout-seconds",
+                "12.5",
+            ],
+        ):
+            args = parse_args()
+
+        self.assertEqual(args.scenarios, ["leader_failure_recovery"])
+        self.assertEqual(args.leader_failure_timeout_seconds, 12.5)
+        with patch.object(
+            sys,
+            "argv",
+            [
+                "cluster.py",
+                "--leader-failure-timeout-seconds",
+                str(MAX_LEADER_FAILURE_TIMEOUT_SECONDS + 1),
+            ],
+        ):
+            with self.assertRaises(SystemExit):
+                parse_args()
 
     def test_publish_batch_options_are_explicit_and_bounded(self) -> None:
         with patch.object(
@@ -310,6 +341,86 @@ class ClusterBenchmarkTests(unittest.TestCase):
         self.assertEqual(result["metadata"]["forwarding_ingress_node"], 2)
         self.assertEqual(result["metadata"]["peer_response_delay_ms"], 5)
         self.assertTrue(result["metadata"]["peer_response_proxy_enabled"])
+
+    def test_leader_failure_recovery_checks_both_survivors_and_restarted_node(self) -> None:
+        requests: list[tuple[int, dict[str, object]]] = []
+        state = {"failed_publish": False, "polls": 0}
+
+        class FakeClient:
+            def __init__(self, node_index: int) -> None:
+                self.node_index = node_index
+
+            def request(self, request: dict[str, object]) -> tuple[dict[str, object], int]:
+                requests.append((self.node_index, request))
+                if request["op"] == "create_stream":
+                    return {"type": "stream_created"}, 100
+                if request["op"] == "publish":
+                    request_id = request.get("request_id")
+                    if request_id == "leader-failure-events-after-leader-failure":
+                        if not state["failed_publish"]:
+                            state["failed_publish"] = True
+                            raise BenchmarkError("leader transition")
+                        return {"type": "published", "offset": 1}, 100
+                    if request_id == "leader-failure-events-after-node-restart":
+                        return {"type": "published", "offset": 2}, 100
+                    return {"type": "published", "offset": 0}, 100
+                if request["op"] == "poll":
+                    offset = state["polls"]
+                    state["polls"] += 1
+                    return {"type": "message", "offset": offset, "payload": "payload"}, 100
+                if request["op"] == "ack":
+                    return {"type": "acknowledged"}, 100
+                raise AssertionError(f"unexpected request: {request}")
+
+            def close(self) -> None:
+                return None
+
+        events: list[tuple[str, int]] = []
+        cluster = SimpleNamespace(
+            node_count=3,
+            nodes=[SimpleNamespace(node_id=index) for index in (1, 2, 3)],
+            stats=object(),
+            metrics=lambda: None,
+            client=lambda index, **_: FakeClient(index),
+            stop_node=lambda index: events.append(("stop", index)),
+            restart_node=lambda index: events.append(("restart", index)) or 2_000_000,
+        )
+
+        def run_measurement(_stats: object, operation: object, **_: object) -> dict:
+            return operation()
+
+        with patch("cluster.measure_scenario", side_effect=run_measurement), patch(
+            "cluster.time.sleep"
+        ):
+            result = run_leader_failure_recovery(
+                cluster, "leader-failure-events", "payload", timeout_seconds=1
+            )
+
+        self.assertEqual(events, [("stop", 0), ("restart", 0)])
+        self.assertEqual(result["operation"], "cluster_leader_failure_recovery")
+        self.assertEqual(result["restart_ready_seconds"], 0.002)
+        self.assertEqual(result["metadata"]["failed_node"], 1)
+        self.assertEqual(result["metadata"]["surviving_nodes"], [2, 3])
+        self.assertEqual(result["metadata"]["initial_leader_selection"], "bootstrap_assumption")
+        self.assertTrue(result["metadata"]["replacement_leader_observed"])
+        self.assertEqual(result["metadata"]["request_attempts"]["publish_after_leader_failure"], 2)
+        publish_request_ids = [
+            request.get("request_id")
+            for _, request in requests
+            if request["op"] == "publish" and request.get("request_id")
+        ]
+        self.assertEqual(
+            publish_request_ids,
+            [
+                "leader-failure-events-after-leader-failure",
+                "leader-failure-events-after-leader-failure",
+                "leader-failure-events-after-node-restart",
+            ],
+        )
+        self.assertEqual(
+            {node_index for node_index, request in requests if request["op"] == "poll"},
+            {0, 1, 2},
+        )
 
     def test_recovery_poll_retries_empty_responses_until_second_attempt(self) -> None:
         class FakeClient:
