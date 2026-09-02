@@ -647,7 +647,7 @@ impl Broker {
                 .is_some_and(|max_attempts| attempts >= max_attempts)
                 && !stream.ends_with(DEAD_LETTER_SUFFIX)
             {
-                self.dead_letter_record(&mut stream_state, stream, &candidate)?;
+                self.dead_letter_record(&mut stream_state, stream, consumer, &candidate)?;
                 persist_consumer_event(
                     &root,
                     stream,
@@ -860,13 +860,17 @@ impl Broker {
         &self,
         source: &mut StreamState,
         stream: &str,
+        consumer: &str,
         record: &RecordIndex,
     ) -> Result<(), BrokerError> {
         let dead_letter_stream = dead_letter_stream_name(stream)?;
+        let move_id = dead_letter_move_id(stream, consumer, record.offset)?;
         let message = source.log.read_message(stream, record.offset)?;
         let target = self.get_or_create_stream(&dead_letter_stream)?;
         let mut target = self.lock_stream(&target)?;
-        target.log.append(message.key, message.payload)?;
+        target
+            .log
+            .append_with_move_id(message.key, message.payload, move_id)?;
         Ok(())
     }
 
@@ -1170,6 +1174,25 @@ impl StreamLog {
         self.append_with_request_id_sync(key, payload, request_id, true)
     }
 
+    fn append_with_move_id(
+        &mut self,
+        key: Option<String>,
+        payload: Vec<u8>,
+        move_id: String,
+    ) -> Result<Offset, BrokerError> {
+        if let Some(offset) = self.request_ids.get(&move_id).copied() {
+            let existing = self.find_record(offset)?;
+            if existing.key.as_ref() != key.as_ref() || self.read_payload(&existing)? != payload {
+                return Err(dead_letter_move_content_mismatch());
+            }
+            return Ok(offset);
+        }
+
+        // Move identities are internal request-aware records. Unlike public request IDs, their
+        // key and payload are part of the identity invariant and are checked on every retry.
+        self.append_with_request_id(key, payload, move_id)
+    }
+
     fn append_with_request_id_sync(
         &mut self,
         key: Option<String>,
@@ -1307,9 +1330,7 @@ impl StreamLog {
         #[cfg(feature = "instrumentation")]
         let _stage_timer = StageTimer::new("core.storage_read");
         let index = self.find_record(offset)?;
-        let mut payload = vec![0; index.payload_len as usize];
-        self.file.seek(SeekFrom::Start(index.payload_offset))?;
-        self.file.read_exact(&mut payload)?;
+        let payload = self.read_payload(&index)?;
         Ok(Message {
             stream: stream.to_owned(),
             offset: index.offset,
@@ -1319,6 +1340,13 @@ impl StreamLog {
             delivery_token: None,
             delivery_attempt: None,
         })
+    }
+
+    fn read_payload(&mut self, record: &RecordIndex) -> Result<Vec<u8>, BrokerError> {
+        let mut payload = vec![0; record.payload_len as usize];
+        self.file.seek(SeekFrom::Start(record.payload_offset))?;
+        self.file.read_exact(&mut payload)?;
+        Ok(payload)
     }
 
     fn find_candidate(
@@ -1804,6 +1832,31 @@ fn dead_letter_stream_name(stream: &str) -> Result<String, BrokerError> {
     let fallback = format!("runnel.dead-letter.{hash:016x}");
     validate_name("dead-letter stream", &fallback)?;
     Ok(fallback)
+}
+
+fn dead_letter_move_id(
+    source_stream: &str,
+    source_consumer: &str,
+    source_offset: Offset,
+) -> Result<String, BrokerError> {
+    // Length-prefix the validated names so the internal identity remains unambiguous without
+    // becoming a path or changing the public request-ID contract.
+    let move_id = format!(
+        "runnel-dlq/v1/{}:{source_stream}/{}:{source_consumer}/{source_offset}",
+        source_stream.len(),
+        source_consumer.len(),
+    );
+    if move_id.len() <= REQUEST_ID_MAX_LEN as usize {
+        return Ok(move_id);
+    }
+    Err(BrokerError::Io(io::Error::new(
+        io::ErrorKind::InvalidInput,
+        "dead-letter move identity exceeds storage limit",
+    )))
+}
+
+fn dead_letter_move_content_mismatch() -> BrokerError {
+    invalid_record_data("dead-letter move identity has different key or payload")
 }
 
 fn consumer_state_path(root: &Path, stream: &str, consumer: &str) -> PathBuf {
@@ -2925,6 +2978,137 @@ mod tests {
             reopened.poll("events.dead-letter", "inspector").unwrap(),
             PollResult::Empty
         );
+    }
+
+    #[test]
+    fn dead_letter_move_identity_is_stable_scoped_and_bounded() {
+        let first = dead_letter_move_id("events", "worker", 7).unwrap();
+        assert_eq!(first, dead_letter_move_id("events", "worker", 7).unwrap());
+        assert_ne!(first, dead_letter_move_id("events", "other", 7).unwrap());
+        assert_ne!(first, dead_letter_move_id("audit", "worker", 7).unwrap());
+        assert_ne!(first, dead_letter_move_id("events", "worker", 8).unwrap());
+        assert!(first.len() <= REQUEST_ID_MAX_LEN as usize);
+    }
+
+    #[test]
+    fn dead_letter_retry_reuses_move_identity_without_appending() {
+        let directory = tempdir().unwrap();
+        let broker = Broker::open(
+            directory.path(),
+            BrokerConfig {
+                ack_timeout: Duration::ZERO,
+                max_delivery_attempts: Some(1),
+            },
+        )
+        .unwrap();
+        broker
+            .publish("events", Some("order-1".to_owned()), b"poison".to_vec())
+            .unwrap();
+        assert!(matches!(
+            broker.poll("events", "worker").unwrap(),
+            PollResult::Message(Message { offset: 0, .. })
+        ));
+
+        let source = broker.get_stream("events").unwrap();
+        let mut source = broker.lock_stream(&source).unwrap();
+        let candidate = source.log.find_record(0).unwrap();
+        broker
+            .dead_letter_record(&mut source, "events", "worker", &candidate)
+            .unwrap();
+        broker
+            .dead_letter_record(&mut source, "events", "worker", &candidate)
+            .unwrap();
+        drop(source);
+
+        let target = broker.get_stream("events.dead-letter").unwrap();
+        let target = broker.lock_stream(&target).unwrap();
+        assert_eq!(target.log.next_offset, 1);
+        assert_eq!(target.log.request_ids.len(), 1);
+    }
+
+    #[test]
+    fn dead_letter_move_reconciles_target_after_restart() {
+        let directory = tempdir().unwrap();
+        let config = BrokerConfig {
+            ack_timeout: Duration::ZERO,
+            max_delivery_attempts: Some(1),
+        };
+        {
+            let broker = Broker::open(directory.path(), config.clone()).unwrap();
+            broker
+                .publish("events", Some("order-1".to_owned()), b"poison".to_vec())
+                .unwrap();
+            assert!(matches!(
+                broker.poll("events", "worker").unwrap(),
+                PollResult::Message(Message { offset: 0, .. })
+            ));
+
+            let source = broker.get_stream("events").unwrap();
+            let mut source = broker.lock_stream(&source).unwrap();
+            let candidate = source.log.find_record(0).unwrap();
+            broker
+                .dead_letter_record(&mut source, "events", "worker", &candidate)
+                .unwrap();
+        }
+
+        let broker = Broker::open(directory.path(), config).unwrap();
+        assert_eq!(broker.poll("events", "worker").unwrap(), PollResult::Empty);
+        let dead_letter = match broker.poll("events.dead-letter", "inspector").unwrap() {
+            PollResult::Message(message) => message,
+            PollResult::Empty => panic!("expected the reconciled dead-letter record"),
+        };
+        assert_eq!(dead_letter.offset, 0);
+        assert_eq!(dead_letter.key.as_deref(), Some("order-1"));
+        assert_eq!(dead_letter.payload, b"poison");
+        assert_eq!(
+            broker
+                .ack("events.dead-letter", "inspector", dead_letter.offset)
+                .unwrap(),
+            AckResult::Acknowledged
+        );
+        assert_eq!(
+            broker.poll("events.dead-letter", "inspector").unwrap(),
+            PollResult::Empty
+        );
+    }
+
+    #[test]
+    fn dead_letter_move_content_mismatch_is_storage_error_without_acknowledgement() {
+        for (key, payload) in [
+            (Some("wrong-key".to_owned()), b"poison".to_vec()),
+            (Some("order-1".to_owned()), b"wrong-payload".to_vec()),
+        ] {
+            let directory = tempdir().unwrap();
+            let config = BrokerConfig {
+                ack_timeout: Duration::ZERO,
+                max_delivery_attempts: Some(1),
+            };
+            let broker = Broker::open(directory.path(), config.clone()).unwrap();
+            broker
+                .publish("events", Some("order-1".to_owned()), b"poison".to_vec())
+                .unwrap();
+            assert!(matches!(
+                broker.poll("events", "worker").unwrap(),
+                PollResult::Message(Message { offset: 0, .. })
+            ));
+
+            let move_id = dead_letter_move_id("events", "worker", 0).unwrap();
+            broker
+                .publish_with_request_id("events.dead-letter", key, payload, Some(move_id))
+                .unwrap();
+            let error = broker.poll("events", "worker").unwrap_err();
+            assert!(matches!(
+                error,
+                BrokerError::Io(error) if error.kind() == io::ErrorKind::InvalidData
+            ));
+
+            drop(broker);
+            let broker = Broker::open(directory.path(), config).unwrap();
+            assert!(matches!(
+                broker.poll("events", "worker"),
+                Err(BrokerError::Io(error)) if error.kind() == io::ErrorKind::InvalidData
+            ));
+        }
     }
 
     fn delivery(result: Result<PollResult, BrokerError>) -> (Offset, String) {
