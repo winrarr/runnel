@@ -2443,6 +2443,7 @@ pub struct GroupManager {
     max_delivery_attempts: Option<u32>,
     groups: RwLock<BTreeMap<String, Arc<RaftGroup>>>,
     creation_lock: Mutex<()>,
+    peer_transport: Arc<network::PeerTransport>,
 }
 
 impl GroupManager {
@@ -2463,6 +2464,7 @@ impl GroupManager {
             max_delivery_attempts,
             groups: RwLock::new(BTreeMap::new()),
             creation_lock: Mutex::new(()),
+            peer_transport: network::PeerTransport::new(),
         });
         let metadata = manager
             .open_group(
@@ -2487,7 +2489,11 @@ impl GroupManager {
         directory: PathBuf,
     ) -> Result<Arc<RaftGroup>, BrokerError> {
         fs::create_dir_all(&directory)?;
-        let network = network::TcpNetwork::new(self.peers.clone(), group_id);
+        let network = network::TcpNetwork::with_transport(
+            self.peers.clone(),
+            group_id,
+            Arc::clone(&self.peer_transport),
+        );
         let log_store = log_store::LogStore::open(directory.join("raft-log.json"))
             .map_err(|error| BrokerError::Cluster(error.to_string()))?;
         let state_machine = Arc::new(StateMachineStore::open(
@@ -2707,6 +2713,7 @@ impl GroupManager {
                 continue;
             }
             network::ensure_data_group(
+                &self.peer_transport,
                 address,
                 stream.to_owned(),
                 metadata.stream_id.clone(),
@@ -2773,6 +2780,7 @@ impl GroupManager {
                     BrokerError::Cluster(format!("data leader node {target} has no address"))
                 })?;
                 let response = network::forward(
+                    &self.peer_transport,
                     address,
                     network::ForwardedOperation::InitializeDataStream {
                         stream: stream.to_owned(),
@@ -3295,14 +3303,20 @@ impl PersistentEngine {
                     last_error = Some(format!("leader node {target} has no configured address"));
                     continue;
                 };
-                let response =
-                    match network::forward(address, operation.clone(), FORWARD_TIMEOUT).await {
-                        Ok(response) => response,
-                        Err(error) => {
-                            last_error = Some(format!("leader forwarding failed: {error}"));
-                            continue;
-                        }
-                    };
+                let response = match network::forward(
+                    &self.manager.peer_transport,
+                    address,
+                    operation.clone(),
+                    FORWARD_TIMEOUT,
+                )
+                .await
+                {
+                    Ok(response) => response,
+                    Err(error) => {
+                        last_error = Some(format!("leader forwarding failed: {error}"));
+                        continue;
+                    }
+                };
                 if let Some(next_leader) = forwarded_leader(&response) {
                     if let Some(next_leader) = next_leader {
                         leader_id = Some(next_leader);

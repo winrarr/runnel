@@ -40,3 +40,6 @@ accepts it and the relevant implementation and verification work is complete.
 - [Raft follower recovery and replacement](raft-recovery-and-replacement.md)
   records the evidence and open design questions around crashed, stale, and
   empty replicas in the early clustered backend.
+- [TD-012 peer transport ownership](td-012-peer-transport-ownership.md)
+  records the OpenRaft network lifecycle constraints, scoped ownership choice,
+  alternatives, and unresolved pooling questions.
