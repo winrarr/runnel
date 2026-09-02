@@ -219,6 +219,9 @@ fn partial_request_times_out_and_unrelated_health_recovers() {
 
     let mut slow = TcpStream::connect(server.broker_addr).unwrap();
     slow.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+    let metrics_before = http_metrics(server.http_addr);
+    let requests_rejected_before =
+        metric_value(&metrics_before, "runnel_broker_requests_rejected_total");
     slow.write_all(br#"{"op":"health"}"#).unwrap();
     let mut response = String::new();
     BufReader::new(&mut slow)
@@ -231,6 +234,10 @@ fn partial_request_times_out_and_unrelated_health_recovers() {
     let metrics =
         wait_for_metric_at_least(server.http_addr, "runnel_broker_request_timeouts_total", 1);
     assert_eq!(metric_value(&metrics, "runnel_active_requests"), 0);
+    assert_eq!(
+        metric_value(&metrics, "runnel_broker_requests_rejected_total"),
+        requests_rejected_before + 1
+    );
 
     let mut recovered = TcpStream::connect(server.broker_addr).unwrap();
     recovered
@@ -420,6 +427,139 @@ fn slow_writer_and_in_flight_admission_are_bounded() {
     );
     assert_eq!(metric_value(&metrics, "runnel_active_requests"), 0);
     wait_for_metric_at_most(server.http_addr, "runnel_active_connections", 0);
+}
+
+#[test]
+fn sustained_in_flight_pressure_recovers_without_connection_churn() {
+    let directory = TempDir::new().unwrap();
+    let server = RunningServer::start(
+        directory.path(),
+        &[
+            "--max-connections",
+            "4",
+            "--max-request-bytes",
+            "8388608",
+            "--request-timeout-ms",
+            "1000",
+            "--max-in-flight-requests",
+            "1",
+        ],
+    );
+    let payload = "x".repeat(6 * 1024 * 1024);
+
+    assert!(matches!(
+        request(
+            server.broker_addr,
+            Request::CreateStream {
+                stream: "sustained-pressure".to_owned(),
+            },
+        ),
+        Response::StreamCreated { .. }
+    ));
+    assert!(matches!(
+        request(
+            server.broker_addr,
+            Request::Publish {
+                stream: "sustained-pressure".to_owned(),
+                key: None,
+                payload,
+                request_id: None,
+            },
+        ),
+        Response::Published { offset: 0, .. }
+    ));
+
+    let metrics_before = http_metrics(server.http_addr);
+    let saturation_before = metric_value(&metrics_before, "runnel_broker_request_saturation_total");
+    let requests_rejected_before =
+        metric_value(&metrics_before, "runnel_broker_requests_rejected_total");
+    let response_write_timeouts_before = metric_value(
+        &metrics_before,
+        "runnel_broker_response_write_timeouts_total",
+    );
+
+    let mut slow_writer = TcpStream::connect(server.broker_addr).unwrap();
+    slow_writer
+        .write_all(
+            &serde_json::to_vec(&Request::Poll {
+                stream: "sustained-pressure".to_owned(),
+                consumer: "unread".to_owned(),
+            })
+            .unwrap(),
+        )
+        .unwrap();
+    slow_writer.write_all(b"\n").unwrap();
+    wait_for_metric_at_least(server.http_addr, "runnel_active_requests", 1);
+
+    let mut pressure_connections = Vec::new();
+    for _ in 0..3 {
+        let connection = TcpStream::connect(server.broker_addr).unwrap();
+        connection
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        pressure_connections.push(connection);
+    }
+    let metrics = wait_for_metric_at_least(server.http_addr, "runnel_active_connections", 4);
+    assert_eq!(metric_value(&metrics, "runnel_active_requests"), 1);
+
+    let attempts = 8;
+    for _ in 0..attempts {
+        for connection in &mut pressure_connections {
+            assert!(matches!(
+                send_on_connection(connection, Request::Health),
+                Response::Error { code, .. } if code == "request_saturated"
+            ));
+        }
+        let metrics = http_metrics(server.http_addr);
+        assert_eq!(metric_value(&metrics, "runnel_active_requests"), 1);
+    }
+
+    let expected_rejections = (attempts * pressure_connections.len()) as u64;
+    let metrics = wait_for_metric_at_least(
+        server.http_addr,
+        "runnel_broker_request_saturation_total",
+        saturation_before + expected_rejections,
+    );
+    assert_eq!(
+        metric_value(&metrics, "runnel_broker_requests_rejected_total"),
+        requests_rejected_before + expected_rejections
+    );
+    assert_eq!(metric_value(&metrics, "runnel_active_requests"), 1);
+    assert_eq!(metric_value(&metrics, "runnel_active_connections"), 4);
+
+    let metrics = wait_for_metric_at_least(
+        server.http_addr,
+        "runnel_broker_response_write_timeouts_total",
+        response_write_timeouts_before + 1,
+    );
+    assert_eq!(metric_value(&metrics, "runnel_active_requests"), 0);
+
+    assert!(matches!(
+        send_on_connection(&mut pressure_connections[0], Request::Health),
+        Response::Health { .. }
+    ));
+    assert!(matches!(
+        send_on_connection(
+            &mut pressure_connections[0],
+            Request::Publish {
+                stream: "after-sustained-pressure".to_owned(),
+                key: None,
+                payload: "durable-recovery".to_owned(),
+                request_id: None,
+            },
+        ),
+        Response::Published { offset: 0, .. }
+    ));
+    assert!(matches!(
+        send_on_connection(
+            &mut pressure_connections[0],
+            Request::Poll {
+                stream: "after-sustained-pressure".to_owned(),
+                consumer: "recovery-reader".to_owned(),
+            },
+        ),
+        Response::Message { payload, .. } if payload == "durable-recovery"
+    ));
 }
 
 #[cfg(unix)]
