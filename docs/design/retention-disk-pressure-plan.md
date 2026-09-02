@@ -262,6 +262,17 @@ future public operation should support at least:
   that time; and
 - the earliest currently retained boundary.
 
+The first accepted slice resolves only the offset case as a bounded,
+read-only `replay` operation. It accepts a stream/consumer identity
+and one inclusive logical offset, returns one record with no delivery token or
+attempt, and never changes ordinary consumer progress. The local and clustered
+engines return the same `history_unavailable` outcome with the available
+half-open offset range when the offset is not present. Current storage retains
+all records from offset zero, so the earliest boundary is currently zero.
+This does not define a durable cursor, replay acknowledgement, time selector,
+range, retention pin, or session lifetime; those remain part of the full
+session decision below.
+
 Starting before the retained floor must return `history_unavailable` and the
 available offset/time boundary. A time or offset request that spans a deleted
 gap must fail as a whole; silently replaying only the suffix would make the
@@ -882,7 +893,8 @@ The following require explicit resolution before implementation is treated as
 an accepted product behavior:
 
 1. What exact versioned public operation configures retention and starts,
-   polls, acknowledges, resets, and ends a replay session?
+   polls, acknowledges, resets, and ends a replay session? The accepted v1
+   offset read is intentionally read-only and has no session lifecycle.
 2. Should a replay session pin history by default, and what durable lease,
    renewal, or operator-expiry semantics bound a crashed session?
 3. Is deleting an unacknowledged but no-longer-active message under `expire`

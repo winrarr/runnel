@@ -140,6 +140,14 @@ Goal: let an application deliberately reprocess a documented portion of retained
 
 Rationale: replay is part of the stated public model and a core reason to use durable streams, but the current poll contract only follows one forward checkpoint.
 
+Current progress: local and clustered engines now expose an additive,
+bounded, read-only replay operation for one inclusive logical offset. The
+protocol, typed client, CLI, and real-server tests preserve ordinary consumer
+progress and return explicit `history_unavailable` outcomes. Time selectors,
+durable replay sessions, retention floors and pins, replay acknowledgements,
+failover/replay-session behavior, and replay-specific observability remain
+open.
+
 Constraints:
 
 - replay eligibility must follow the selected retention policy;

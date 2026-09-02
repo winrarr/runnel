@@ -214,6 +214,18 @@ fn three_process_cluster_replicates_and_recovers_after_failures() {
         ),
         Response::Message { offset: 0, .. }
     ));
+    assert!(matches!(
+        wait_for_response_at(
+            nodes[(jobs_node + 2) % nodes.len()].broker_addr,
+            || Request::Replay {
+                stream: "jobs".to_owned(),
+                consumer: "worker".to_owned(),
+                offset: 0,
+            },
+            |response| matches!(response, Response::ReplayMessage { offset: 0, .. }),
+        ),
+        Response::ReplayMessage { offset: 0, .. }
+    ));
 
     let grouped_node = create_stream_on_any(&mut nodes, "grouped-jobs");
     for (index, payload) in ["first-grouped-job", "second-grouped-job"]

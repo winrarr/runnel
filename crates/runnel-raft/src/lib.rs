@@ -30,7 +30,9 @@ use openraft::{
 };
 #[cfg(feature = "instrumentation")]
 use runnel_engine::StageTimer;
-use runnel_engine::{AckResult, BrokerError, Engine, EngineFuture, Message, Offset, PollResult};
+use runnel_engine::{
+    AckResult, BrokerError, Engine, EngineFuture, Message, Offset, PollResult, ReplayMessage,
+};
 use serde::{Deserialize, Serialize};
 use tokio::sync::{Mutex, RwLock};
 
@@ -116,6 +118,11 @@ pub enum Command {
         consumer: String,
         offset: Offset,
     },
+    Replay {
+        stream: String,
+        consumer: String,
+        offset: Offset,
+    },
     PollGroup {
         stream: String,
         consumer: String,
@@ -137,18 +144,45 @@ pub enum Command {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum CommandResponse {
-    StreamCreated { created: bool },
-    DataStreamInitialized { initialized: bool },
-    StreamActivated { activated: bool },
-    Published { offset: Offset },
+    StreamCreated {
+        created: bool,
+    },
+    DataStreamInitialized {
+        initialized: bool,
+    },
+    StreamActivated {
+        activated: bool,
+    },
+    Published {
+        offset: Offset,
+    },
     Acknowledged,
     AlreadyAcknowledged,
-    OutOfOrderAck { expected: Offset, received: Offset },
-    GroupPoll { result: PollResult },
+    OutOfOrderAck {
+        expected: Offset,
+        received: Offset,
+    },
+    GroupPoll {
+        result: PollResult,
+    },
+    Replay {
+        result: ReplayMessage,
+    },
+    HistoryUnavailable {
+        requested_offset: Offset,
+        earliest_offset: Offset,
+        next_offset: Offset,
+    },
     GroupAcknowledged,
     GroupAlreadyAcknowledged,
-    GroupAckNotInFlight { consumer: String, offset: Offset },
-    GroupStaleDelivery { consumer: String, offset: Offset },
+    GroupAckNotInFlight {
+        consumer: String,
+        offset: Offset,
+    },
+    GroupStaleDelivery {
+        consumer: String,
+        offset: Offset,
+    },
     StreamNotFound,
     Noop,
 }
@@ -1445,6 +1479,11 @@ fn apply_command(
             state.consumers.insert(key, offset + 1);
             CommandResponse::Acknowledged
         }
+        Command::Replay {
+            stream,
+            consumer: _,
+            offset,
+        } => apply_replay(state, &stream, offset, kind),
         Command::PollGroup {
             stream,
             consumer,
@@ -1484,6 +1523,41 @@ fn apply_command(
             },
             kind,
         ),
+    }
+}
+
+fn apply_replay(
+    state: &SnapshotState,
+    stream: &str,
+    offset: Offset,
+    kind: &GroupKind,
+) -> CommandResponse {
+    if matches!(kind, GroupKind::Metadata) {
+        return CommandResponse::StreamNotFound;
+    }
+    let Some(stream_state) = state.streams.get(stream) else {
+        return CommandResponse::StreamNotFound;
+    };
+    if !stream_state.is_active() {
+        return CommandResponse::StreamNotFound;
+    }
+
+    let next_offset = stream_state.messages.len() as Offset;
+    let Some(message) = stream_state.messages.get(offset as usize) else {
+        return CommandResponse::HistoryUnavailable {
+            requested_offset: offset,
+            earliest_offset: 0,
+            next_offset,
+        };
+    };
+    CommandResponse::Replay {
+        result: ReplayMessage {
+            stream: stream.to_owned(),
+            offset,
+            key: message.key.clone(),
+            payload: message.payload.clone(),
+            published_at_ms: message.published_at_ms,
+        },
     }
 }
 
@@ -2228,6 +2302,45 @@ impl RaftGroup {
             .await
     }
 
+    pub async fn replay(
+        &self,
+        stream: String,
+        consumer: String,
+        offset: Offset,
+    ) -> Result<ReplayMessage, BrokerError> {
+        validate_name("stream", &stream)?;
+        validate_name("consumer", &consumer)?;
+        #[cfg(feature = "instrumentation")]
+        let _stage_timer = StageTimer::new("raft.replay_quorum");
+        let stream_name = stream.clone();
+        let response = self
+            .raft
+            .client_write(Command::Replay {
+                stream,
+                consumer,
+                offset,
+            })
+            .await
+            .map_err(map_client_write_error)?;
+        match response.data {
+            CommandResponse::Replay { result } => Ok(result),
+            CommandResponse::HistoryUnavailable {
+                requested_offset,
+                earliest_offset,
+                next_offset,
+            } => Err(BrokerError::HistoryUnavailable {
+                stream: stream_name,
+                requested_offset,
+                earliest_offset,
+                next_offset,
+            }),
+            CommandResponse::StreamNotFound => Err(BrokerError::StreamNotFound(stream_name)),
+            other => Err(BrokerError::Cluster(format!(
+                "unexpected replay response: {other:?}"
+            ))),
+        }
+    }
+
     pub async fn stream_metadata(&self, stream: &str) -> Result<StreamMetadata, BrokerError> {
         self.state_machine.metadata(stream).await
     }
@@ -2372,6 +2485,19 @@ impl Engine for SingleNodeEngine {
 
     fn poll<'a>(&'a self, stream: &'a str, consumer: &'a str) -> EngineFuture<'a, PollResult> {
         Box::pin(async move { self.group.poll(stream, consumer).await })
+    }
+
+    fn replay<'a>(
+        &'a self,
+        stream: &'a str,
+        consumer: &'a str,
+        offset: Offset,
+    ) -> EngineFuture<'a, ReplayMessage> {
+        Box::pin(async move {
+            self.group
+                .replay(stream.to_owned(), consumer.to_owned(), offset)
+                .await
+        })
     }
 
     fn poll_group<'a>(
@@ -2850,6 +2976,20 @@ impl GroupManager {
             .await
     }
 
+    pub(crate) async fn replay_local(
+        &self,
+        stream: &str,
+        consumer: &str,
+        offset: Offset,
+    ) -> Result<ReplayMessage, BrokerError> {
+        validate_name("stream", stream)?;
+        validate_name("consumer", consumer)?;
+        self.data_group_for_stream(stream)
+            .await?
+            .replay(stream.to_owned(), consumer.to_owned(), offset)
+            .await
+    }
+
     pub(crate) async fn ack_local(
         &self,
         stream: String,
@@ -2957,6 +3097,20 @@ fn path_component(value: &str) -> String {
         .iter()
         .map(|byte| format!("{byte:02x}"))
         .collect()
+}
+
+fn validate_name(kind: &'static str, name: &str) -> Result<(), BrokerError> {
+    let valid_length = (1..=128).contains(&name.len());
+    let valid_characters = name
+        .bytes()
+        .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'));
+    if valid_length && valid_characters {
+        return Ok(());
+    }
+    Err(BrokerError::InvalidName {
+        kind,
+        name: name.to_owned(),
+    })
 }
 
 fn validate_persisted_group_storage(directory: &Path) -> Result<(), BrokerError> {
@@ -3260,6 +3414,7 @@ impl PersistentEngine {
                 .await),
             network::ForwardedOperation::Publish { stream, .. }
             | network::ForwardedOperation::Poll { stream, .. }
+            | network::ForwardedOperation::Replay { stream, .. }
             | network::ForwardedOperation::Ack { stream, .. }
             | network::ForwardedOperation::PollGroup { stream, .. }
             | network::ForwardedOperation::AckGroup { stream, .. }
@@ -3387,6 +3542,19 @@ impl PersistentEngine {
         }
     }
 
+    async fn forward_replay(
+        &self,
+        operation: network::ForwardedOperation,
+        leader_id: Option<NodeId>,
+    ) -> Result<ReplayMessage, BrokerError> {
+        match self.forward_operation(operation, leader_id).await? {
+            network::ForwardedResponse::Replay(result) => result.map_err(forward_error_to_broker),
+            _ => Err(BrokerError::Cluster(
+                "leader returned the wrong replay response".to_owned(),
+            )),
+        }
+    }
+
     async fn forward_ack(
         &self,
         operation: network::ForwardedOperation,
@@ -3450,6 +3618,7 @@ fn forwarded_leader(response: &network::ForwardedResponse) -> Option<Option<Node
             leader_id,
         }))
         | network::ForwardedResponse::Poll(Err(network::ForwardError::NotLeader { leader_id }))
+        | network::ForwardedResponse::Replay(Err(network::ForwardError::NotLeader { leader_id }))
         | network::ForwardedResponse::Ack(Err(network::ForwardError::NotLeader { leader_id }))
         | network::ForwardedResponse::PollGroup(Err(network::ForwardError::NotLeader {
             leader_id,
@@ -3518,6 +3687,30 @@ impl Engine for PersistentEngine {
                     .await;
             }
             self.manager.poll_local(stream, consumer).await
+        })
+    }
+
+    fn replay<'a>(
+        &'a self,
+        stream: &'a str,
+        consumer: &'a str,
+        offset: Offset,
+    ) -> EngineFuture<'a, ReplayMessage> {
+        Box::pin(async move {
+            validate_name("stream", stream)?;
+            validate_name("consumer", consumer)?;
+            let operation = network::ForwardedOperation::Replay {
+                stream: stream.to_owned(),
+                consumer: consumer.to_owned(),
+                offset,
+            };
+            match self.manager.replay_local(stream, consumer, offset).await {
+                Ok(message) => Ok(message),
+                Err(BrokerError::NotLeader { leader_id }) => {
+                    self.forward_replay(operation, leader_id).await
+                }
+                Err(error) => Err(error),
+            }
         })
     }
 
@@ -3644,6 +3837,17 @@ fn forward_error_to_broker(error: network::ForwardError) -> BrokerError {
         network::ForwardError::StaleDelivery { consumer, offset } => {
             BrokerError::StaleDelivery { consumer, offset }
         }
+        network::ForwardError::HistoryUnavailable {
+            stream,
+            requested_offset,
+            earliest_offset,
+            next_offset,
+        } => BrokerError::HistoryUnavailable {
+            stream,
+            requested_offset,
+            earliest_offset,
+            next_offset,
+        },
         network::ForwardError::Message(message) => BrokerError::Cluster(message),
     }
 }
@@ -4254,6 +4458,12 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn single_node_raft_implements_replay_contract() {
+        let engine = SingleNodeEngine::new(1).await.unwrap();
+        runnel_test_support::assert_replay_contract(&engine).await;
+    }
+
+    #[tokio::test]
     async fn persistent_raft_implements_shared_delivery_contract() {
         let directory = tempfile::tempdir().unwrap();
         let peers = BTreeMap::from([(1, "127.0.0.1:0".to_owned())]);
@@ -4270,6 +4480,87 @@ mod tests {
         runnel_test_support::assert_shared_delivery_contract(&engine).await;
         runnel_test_support::assert_independent_consumers_contract(&engine).await;
         runnel_test_support::assert_key_ordering_contract(&engine).await;
+    }
+
+    #[tokio::test]
+    async fn persistent_raft_implements_replay_contract() {
+        let directory = tempfile::tempdir().unwrap();
+        let peers = BTreeMap::from([(1, "127.0.0.1:0".to_owned())]);
+        let engine = PersistentEngine::open(
+            1,
+            "runnel-persistent-replay-contract-test".to_owned(),
+            directory.path(),
+            peers,
+            true,
+        )
+        .await
+        .unwrap();
+
+        runnel_test_support::assert_replay_contract(&engine).await;
+    }
+
+    #[tokio::test]
+    async fn persistent_raft_replay_and_ordinary_progress_survive_restart_independently() {
+        let directory = tempfile::tempdir().unwrap();
+        let peers = BTreeMap::from([(1, "127.0.0.1:0".to_owned())]);
+        let engine = PersistentEngine::open(
+            1,
+            "runnel-persistent-replay-restart-test".to_owned(),
+            directory.path(),
+            peers.clone(),
+            true,
+        )
+        .await
+        .unwrap();
+        engine.create_stream("events").await.unwrap();
+        engine
+            .publish("events", None, b"first".to_vec(), None)
+            .await
+            .unwrap();
+        engine
+            .publish("events", None, b"second".to_vec(), None)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            engine.replay("events", "worker", 1).await.unwrap().payload,
+            b"second"
+        );
+        assert!(matches!(
+            engine.poll("events", "worker").await.unwrap(),
+            PollResult::Message(Message { offset: 0, .. })
+        ));
+        assert_eq!(
+            engine.ack("events", "worker", 0).await.unwrap(),
+            AckResult::Acknowledged
+        );
+        assert_eq!(
+            engine.replay("events", "worker", 0).await.unwrap().payload,
+            b"first"
+        );
+        drop(engine);
+
+        let reopened = PersistentEngine::open(
+            1,
+            "runnel-persistent-replay-restart-test".to_owned(),
+            directory.path(),
+            peers,
+            true,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            reopened
+                .replay("events", "worker", 1)
+                .await
+                .unwrap()
+                .payload,
+            b"second"
+        );
+        assert!(matches!(
+            reopened.poll("events", "worker").await.unwrap(),
+            PollResult::Message(Message { offset: 1, .. })
+        ));
     }
 
     #[tokio::test]

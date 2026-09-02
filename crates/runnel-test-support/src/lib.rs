@@ -2,6 +2,56 @@ use std::time::Duration;
 
 use runnel_engine::{AckResult, BrokerError, Engine, PollResult, PublishRecord};
 
+pub async fn assert_replay_contract(engine: &dyn Engine) {
+    assert!(engine.create_stream("contract.replay").await.unwrap());
+    for payload in [b"first".as_slice(), b"second".as_slice()] {
+        engine
+            .publish("contract.replay", None, payload.to_vec(), None)
+            .await
+            .unwrap();
+    }
+
+    let replayed = engine.replay("contract.replay", "worker", 0).await.unwrap();
+    assert_eq!(replayed.stream, "contract.replay");
+    assert_eq!(replayed.offset, 0);
+    assert_eq!(replayed.payload, b"first");
+    assert_eq!(replayed.key, None);
+
+    let ordinary = engine.poll("contract.replay", "worker").await.unwrap();
+    assert!(matches!(
+        ordinary,
+        PollResult::Message(message) if message.offset == 0 && message.payload == b"first"
+    ));
+    assert!(matches!(
+        engine.ack("contract.replay", "worker", 0).await,
+        Ok(AckResult::Acknowledged)
+    ));
+
+    let replayed_acknowledged = engine.replay("contract.replay", "worker", 0).await.unwrap();
+    assert_eq!(replayed_acknowledged.offset, 0);
+    assert_eq!(replayed_acknowledged.payload, b"first");
+    assert!(matches!(
+        engine.poll("contract.replay", "worker").await.unwrap(),
+        PollResult::Message(message) if message.offset == 1 && message.payload == b"second"
+    ));
+    assert!(matches!(
+        engine.replay("contract.replay", "worker", 2).await,
+        Err(BrokerError::HistoryUnavailable {
+            stream,
+            requested_offset: 2,
+            earliest_offset: 0,
+            next_offset: 2,
+        }) if stream == "contract.replay"
+    ));
+    assert!(matches!(
+        engine.replay("contract.replay", "invalid/consumer", 0).await,
+        Err(BrokerError::InvalidName {
+            kind: "consumer",
+            name,
+        }) if name == "invalid/consumer"
+    ));
+}
+
 pub async fn assert_publish_batch_contract(engine: &dyn Engine) {
     assert!(engine.create_stream("contract.batch").await.unwrap());
     let records = vec![
