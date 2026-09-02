@@ -26,6 +26,28 @@ Acceptance criteria:
 - onboarding and failure-recovery exercises with intended users identify where the public model or operational workflow is unclear;
 - documentation states when Runnel is a good fit, when it is not, and what product evidence supports those boundaries.
 
+## Improve the development feedback loop
+
+Goal: determine whether a newer hosted CI/CD platform can provide a materially better pull-request development experience than the current GitHub Actions workflow.
+
+Rationale: GitHub Actions is deeply integrated with the repository and is currently adequate, but its workflow model and operational experience have known rough edges. A bounded trial of a credible alternative could reveal a simpler or more effective way to validate changes without committing the project to a migration on intuition alone.
+
+Constraints:
+
+- do not assume dedicated workers, specialised hardware, or operator-managed caching and queues are required;
+- preserve the existing verification, integration, security, benchmark, artifact, status-check, and release coverage during the evaluation;
+- compare equivalent workloads and DAGs, including cold and warm runs, rather than comparing unrelated default configurations;
+- keep any trial isolated from required repository checks until the result and rollback path are understood;
+- retain GitHub as the source-control and pull-request system unless a broader change is explicitly justified.
+
+Acceptance criteria:
+
+- at least one credible hosted alternative is evaluated against the GitHub Actions baseline using the same representative pull-request DAG and workloads;
+- the comparison reports wall-clock time, variability, cache behavior, setup and maintenance effort, failure diagnostics, retry behavior, artifact and status-check integration, contributor ergonomics, and expected cost or usage limits;
+- the evaluation records which GitHub Actions shortcomings the candidate addresses, which it does not, and any new constraints it introduces;
+- a decision record recommends keeping GitHub Actions, piloting the alternative, or migrating, with an evidence-backed rollback plan and no loss of required coverage;
+- if the alternative is not materially better, the result is still recorded so the question does not need to be rediscovered.
+
 ## Make client interactions dependable and evolvable
 
 Goal: provide a stable client-facing contract that lets applications publish and consume messages while understanding the result of each operation.
