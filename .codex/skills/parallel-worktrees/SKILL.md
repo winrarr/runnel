@@ -14,7 +14,7 @@ the rule to parallel work.
 ## Before spawning
 
 - Identify the immediate local task and keep it on the critical path.
-- Split independent work by responsibility, file ownership, and an explicit domain boundary. Workers should record a useful refactor that crosses their boundary as tech debt instead of expanding into another worker's area. For an explicitly coordinated architectural refactor, overlapping paths are allowed when they reflect the domain; name an integration owner, explain the overlap, and define how shared changes will be reconciled.
+- Split independent work by responsibility, file ownership, and an explicit domain boundary. The refactoring and backlog/tech-debt policy is defined once in the repository root `AGENTS.md`; workers and coordinators must follow that policy. For an explicitly coordinated architectural refactor, overlapping paths are allowed when they reflect the domain; name an integration owner, explain the overlap, and define how shared changes will be reconciled.
 - Establish a committed baseline revision. Do not assume that uncommitted edits in the main worktree are visible in another worktree; if they matter, create a clearly identified local baseline or provide an explicit patch.
 - Before spawning, fetch `origin/main`, record its revision, and inspect the latest `ci.yml` run for that SHA when GitHub access is available. Give every worker the baseline revision, its owned paths, its expected result, and the instruction not to revert unrelated work.
 - Before spawning, give the user a short summary of each proposed worker's feature or outcome and primary evidence class, such as performance, correctness, reliability, or benchmark infrastructure. For performance-sensitive work, include a best-effort expectation of the likely direction and rough magnitude of change when possible, or explicitly say that no direct performance change is expected or that the magnitude is unclear. Label estimates as expectations rather than measured results; do not invent precision.
@@ -83,12 +83,12 @@ evidence.
 Tell each worker to:
 
 - stay inside its assigned worktree and write scope;
-- treat its assigned domain boundary as the default refactoring boundary: substantial or higher-risk refactors are allowed within that boundary when justified, while worthwhile cross-boundary refactors should be recorded as tech debt unless the coordinator explicitly coordinates the broader effort or the change is required for correctness;
+- follow the single-source refactoring and planning-record policy in the repository root `AGENTS.md`, including its requirements for within-domain refactors, cross-boundary tech debt, and handoff reporting;
 - read the repository root `AGENTS.md` before editing and follow its change-run baseline and handoff requirements;
 - for non-trivial architectural changes, follow `AGENTS.md`'s requirement to compare relevant competitor or reference designs and primary research, and include the sources, differences, alternatives, hypotheses, and unresolved risks in the handoff;
 - classify the work by one primary evidence class and optional secondary tags, follow the applicable gate in [docs/testing.md](../../../docs/testing.md), and do not use a classification to waive global safety, baseline, CI, pull-request, or cleanup requirements;
 - use the repository's canonical `just` commands and existing benchmark harnesses;
-- inspect the relevant entries in `docs/backlog.md` and `docs/tech-debt.md`; update them when the work materially changes an item's status, impact, context, acceptance or retirement evidence, or completion state. Agents may also add a focused tech-debt item when they identify a worthwhile refactor that should be deferred. Leave an item open when its retirement criteria remain unmet, and explicitly report when no update is warranted. Coordinate planning-file edits when several workers touch the same entry;
+- apply the backlog and tech-debt update requirements in `AGENTS.md`, and include the resulting update or explicit no-update rationale in the handoff;
 - record the exact revision, workload, resource limits, isolation settings, and commands;
 - for performance-sensitive work, determine whether the standard benchmark meaningfully covers the PR, run the local benchmark sequentially with a fixed CPU/memory budget, and record the actual repetition count, stability thresholds, and stable status; if standard coverage is insufficient, run a focused targeted benchmark when it is relevant and feasible, or record why no such benchmark can be run; treat an inconclusive authoritative run as unfinished evidence;
 - distinguish a confirmed improvement from noise, a blocked run, and an inconclusive result;
@@ -101,7 +101,11 @@ expected effects, non-performance improvements, benchmark applicability and
 findings, and recommendation and include them in the final status, review, or
 pull-request handoff. A worker's missing, blocked, or inconclusive benchmark
 report remains an explicit unresolved result; it must not be silently collapsed
-into the orchestrator's own summary.
+into the orchestrator's own summary. Before accepting each worker's final
+handoff, verify that the refactor and backlog/tech-debt assessment required by
+`AGENTS.md` is present and that any relevant planning-file updates are
+included. Do not turn an omitted update into an untracked coordinator
+follow-up.
 
 ## Orchestrator lifecycle
 
