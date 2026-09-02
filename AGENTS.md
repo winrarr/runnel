@@ -41,7 +41,7 @@ Runnel is a Rust message broker intended to offer durable streams, low operation
 - justfile: canonical Linux development command interface.
 - scripts/smoke.sh: repeatable broker/CLI/restart smoke test.
 - scripts/verify.sh: compatibility wrapper around just verify.
-- .codex/skills/parallel-worktrees/SKILL.md: repository workflow for disjoint delegated work, isolated tests, and benchmark resource separation.
+- .codex/skills/parallel-worktrees/SKILL.md: repository workflow for delegated work, coordinated refactors, isolated tests, and benchmark resource separation.
 
 ## Sources of truth and boundaries
 
@@ -63,6 +63,8 @@ The current implementation serializes broker operations behind one in-process lo
 - Every handoff must state expected effects and non-effects, evidence and coverage gaps, and an evidence-based recommendation to merge, revise, rerun, or defer. Coordinators must collect and relay these fields for every delegated worker, including blocked or inconclusive work.
 - Treat anything that could improve throughput or latency as worth considering. Evaluate allocation, copying, lock scope, batching, I/O, scheduling, transport, and encoding effects when making changes, while preserving correctness, bounded resource use, and predictable tail latency. Benchmark material assumptions instead of optimizing on intuition alone.
 - For any non-trivial design that could change broker semantics, storage, replication, ordering, recovery, or operational safety, compare relevant competitor or reference designs and primary research before implementation. Record direct sources, the differences that matter to Runnel, alternatives considered, hypotheses, and unresolved risks in `docs/research/` or `docs/design/`, and capture the accepted consequence in an ADR before treating the change as foundational.
+- Treat refactoring as part of normal engineering judgment. While working in a subsystem, proactively identify structural improvements that would better support current or likely requirements. Agents may propose or implement a substantial or higher-risk refactor when the architectural benefit warrants it; do not reject a sound evolution solely because it exceeds the immediate feature scope. If the refactor is not timely, record a focused tech-debt item with its goal, rationale, constraints, and verifiable retirement criteria.
+- Keep ADRs aligned with the accepted current state. Agents may revise existing ADRs when decisions or assumptions evolve; retain historical context only when it explains an important consequence, rejected alternative, migration, or compatibility constraint. Replace stale guidance instead of layering contradictory exceptions.
 - Treat `just` recipes, development scripts, and CLI flags as part of the developer-facing interface. When changing a test, benchmark, or operational workflow, expose useful workload, wait, timeout, retry, isolation, and output controls when they have a real use; keep defaults sensible, document them, and test them. If a task requires a repeatable script or workaround, consider whether that behavior is useful enough to promote into the normal user-facing interface as a recipe, script, or CLI option. Prefer explicit options over hard-coded values, without adding speculative configuration.
 - Keep network behavior covered by tests that start the real server process.
 - Keep the pinned development toolchain separate from compatibility policy; do not infer a supported compiler floor from the pinned version.
@@ -92,9 +94,11 @@ loading.
   Do not make independent branches chase unrelated merges solely to satisfy
   branch age.
 - Required pull-request checks still must pass before merging. Independently
-  reviewable disjoint pull requests may be merged in parallel; coordinate or
-  serialize changes that overlap in files, shared contracts, dependencies,
-  generated output, or integration behavior.
+  reviewable pull requests may be merged in parallel. Coordinate or serialize
+  changes that overlap in files, shared contracts, dependencies, generated
+  output, or integration behavior; coordinated architectural refactors may
+  intentionally overlap when they follow domain responsibility and have an
+  explicit integration plan.
 
 When checking a remote baseline, compare the `headSha`, `status`, and
 `conclusion` from
@@ -145,4 +149,4 @@ The required CI path is .github/workflows/ci.yml. It runs the pinned toolchain c
 
 Put implementation behavior in code and tests, the initial audience and product boundaries in docs/product-fit.md, current technical boundaries in docs/architecture.md, source-backed investigations in docs/research/, unsettled alternatives and implementation proposals in docs/design/, durable accepted rationale in a dated decision record, external or user-mandated guardrails in docs/constraints.md, intended unfinished outcomes in docs/backlog.md, known implementation shortcuts in docs/tech-debt.md, verification workflows in docs/testing.md, benchmark evidence policy in docs/benchmarking.md, and operational deployment guidance beside its deployment artifact. Put workflow changes in justfile and CI changes in .github/workflows. Remove stale guidance instead of appending exceptions.
 
-When parallel delegated work is authorized, follow .codex/skills/parallel-worktrees/SKILL.md. Keep task ownership disjoint, isolate process and container resources, and treat concurrent performance measurements as exploratory unless CPU, storage, and workload interference are controlled. Before removing a delegated worktree, explicitly stop or close its worker, including any nested workers, and verify that the worker and its owned processes and containers are gone. A clean Git status is not sufficient; preserve committed work and do not remove an active or dirty worktree.
+When parallel delegated work is authorized, follow .codex/skills/parallel-worktrees/SKILL.md. Divide independent work by domain responsibility, but allow coordinated refactors to overlap where that reflects the architecture rather than an artificial file boundary; identify an integration owner and reconcile shared changes before merging. Isolate process and container resources, and treat concurrent performance measurements as exploratory unless CPU, storage, and workload interference are controlled. Before removing a delegated worktree, explicitly stop or close its worker, including any nested workers, and verify that the worker and its owned processes and containers are gone. A clean Git status is not sufficient; preserve committed work and do not remove an active or dirty worktree.

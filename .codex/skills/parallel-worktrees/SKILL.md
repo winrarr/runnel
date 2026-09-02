@@ -1,11 +1,11 @@
 ---
 name: parallel-worktrees
-description: Coordinate independent coding and benchmark tasks in isolated Git worktrees with explicit file ownership and resource isolation. Use when parallel delegated work is authorized and tests or containers must not interfere.
+description: Coordinate independent coding, coordinated refactors, and benchmark tasks in isolated Git worktrees with explicit responsibility and resource isolation. Use when parallel delegated work is authorized and tests or containers must not interfere.
 ---
 
 # Parallel worktrees
 
-Use this workflow only when the user has authorized parallel delegation. Parallelism is valuable only when tasks have disjoint responsibilities and isolated execution resources.
+Use this workflow only when the user has authorized parallel delegation. Parallelism is valuable when tasks have clear responsibilities and isolated execution resources; coordinated architectural refactors may intentionally overlap when that better matches the domain.
 
 The root `AGENTS.md` change-run baseline is mandatory for every run. This skill
 adds the same start and handoff checks to delegated workers; it does not limit
@@ -14,12 +14,12 @@ the rule to parallel work.
 ## Before spawning
 
 - Identify the immediate local task and keep it on the critical path.
-- Split work by responsibility and file ownership. Do not assign two workers overlapping source, test, workflow, or generated-output paths.
+- Split independent work by responsibility and file ownership. For coordinated architectural refactors, overlapping paths are allowed when they reflect the domain; name an integration owner, explain the overlap, and define how shared changes will be reconciled.
 - Establish a committed baseline revision. Do not assume that uncommitted edits in the main worktree are visible in another worktree; if they matter, create a clearly identified local baseline or provide an explicit patch.
 - Before spawning, fetch `origin/main`, record its revision, and inspect the latest `ci.yml` run for that SHA when GitHub access is available. Give every worker the baseline revision, its owned paths, its expected result, and the instruction not to revert unrelated work.
 - Before spawning, give the user a short summary of each proposed worker's feature or outcome and primary evidence class, such as performance, correctness, reliability, or benchmark infrastructure. For performance-sensitive work, include a best-effort expectation of the likely direction and rough magnitude of change when possible, or explicitly say that no direct performance change is expected or that the magnitude is unclear. Label estimates as expectations rather than measured results; do not invent precision.
 - Tell every worker, including nested subagents, to read the repository root `AGENTS.md` before starting. Do not assume the delegated environment loads project instructions automatically.
-- Give workers the recorded starting baseline and its default-branch CI result; they do not need to repeat that check before handoff. A newer `main` commit requires an update only when it is known to overlap the worker's paths or shared contracts, dependencies, generated output, or integration behavior; disjoint work may remain based on the original baseline when it is cleanly mergeable.
+- Give workers the recorded starting baseline and its default-branch CI result; they do not need to repeat that check before handoff. A newer `main` commit requires an update when it is known to overlap the worker's paths or shared contracts, dependencies, generated output, or integration behavior; independent work may remain based on the original baseline when it is cleanly mergeable.
 
 ## Worktree and branch isolation
 
@@ -87,7 +87,7 @@ Tell each worker to:
 - for non-trivial architectural changes, follow `AGENTS.md`'s requirement to compare relevant competitor or reference designs and primary research, and include the sources, differences, alternatives, hypotheses, and unresolved risks in the handoff;
 - classify the work by one primary evidence class and optional secondary tags, follow the applicable gate in [docs/testing.md](../../../docs/testing.md), and do not use a classification to waive global safety, baseline, CI, pull-request, or cleanup requirements;
 - use the repository's canonical `just` commands and existing benchmark harnesses;
-- inspect the relevant entries in `docs/backlog.md` and `docs/tech-debt.md`; update them when the work materially changes an item's status, impact, context, acceptance or retirement evidence, or completion state. Leave an item open when its retirement criteria remain unmet, and explicitly report when no update is warranted. If a documentation update is needed, the coordinator must assign that entry to exactly one worker so planning files do not become an overlapping write scope;
+- inspect the relevant entries in `docs/backlog.md` and `docs/tech-debt.md`; update them when the work materially changes an item's status, impact, context, acceptance or retirement evidence, or completion state. Agents may also add a focused tech-debt item when they identify a worthwhile refactor that should be deferred. Leave an item open when its retirement criteria remain unmet, and explicitly report when no update is warranted. Coordinate planning-file edits when several workers touch the same entry;
 - record the exact revision, workload, resource limits, isolation settings, and commands;
 - for performance-sensitive work, determine whether the standard benchmark meaningfully covers the PR, run the local benchmark sequentially with a fixed CPU/memory budget, and record the actual repetition count, stability thresholds, and stable status; if standard coverage is insufficient, run a focused targeted benchmark when it is relevant and feasible, or record why no such benchmark can be run; treat an inconclusive authoritative run as unfinished evidence;
 - distinguish a confirmed improvement from noise, a blocked run, and an inconclusive result;
@@ -106,7 +106,7 @@ into the orchestrator's own summary.
 
 Review each branch independently before integration. Check the diff against the recorded baseline, rerun focused tests in a clean worktree, and run the repository verification path. Do not merge an optimization solely because a microbenchmark improved: preserve durability, ordering, timeout, ambiguous-outcome, bounded-resource, and recovery guarantees.
 
-Merge independently reviewable disjoint pull requests in parallel once their required pull-request checks pass. Coordinate or serialize changes that overlap in files, shared contracts, dependencies, generated output, or integration behavior. Never bypass required checks to compensate for a flaky test; diagnose whether the failure is in the implementation, test harness, environment, or resource isolation.
+Merge independently reviewable pull requests in parallel once their required pull-request checks pass. Coordinate or serialize changes that overlap in files, shared contracts, dependencies, generated output, or integration behavior; overlapping architectural refactors require integration review and must not be merged independently just because their pull requests are individually green. Never bypass required checks to compensate for a flaky test; diagnose whether the failure is in the implementation, test harness, environment, or resource isolation.
 
 ## Cleanup and handoff
 
