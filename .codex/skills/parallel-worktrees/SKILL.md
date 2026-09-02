@@ -102,10 +102,10 @@ findings, and recommendation and include them in the final status, review, or
 pull-request handoff. A worker's missing, blocked, or inconclusive benchmark
 report remains an explicit unresolved result; it must not be silently collapsed
 into the orchestrator's own summary. Before accepting each worker's final
-handoff, briefly remind the worker to complete the refactor and backlog/tech-
-debt assessment required by `AGENTS.md`, then verify that the assessment and
-any relevant planning-file updates are present. Do not turn an omitted update
-into an untracked coordinator follow-up.
+handoff, verify that the refactor and backlog/tech-debt assessment required by
+`AGENTS.md` is present and that any relevant planning-file updates are
+included. Do not turn an omitted update into an untracked coordinator
+follow-up.
 
 ## Orchestrator lifecycle
 
