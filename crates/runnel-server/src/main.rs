@@ -14,7 +14,7 @@ use clap::{Parser, ValueEnum};
 use runnel_core::{Broker, BrokerConfig};
 #[cfg(feature = "instrumentation")]
 use runnel_engine::StageTimer;
-use runnel_engine::{AckResult, BrokerError, Engine, PollResult, PublishRecord};
+use runnel_engine::{AckResult, BrokerError, Engine, PollResult, PublishRecord, ReplayMessage};
 use runnel_protocol::{
     BinaryPayload, MAX_PUBLISH_BATCH_BYTES, MAX_PUBLISH_BATCH_RECORDS, PublishBatchRecordResponse,
     Request, Response,
@@ -135,7 +135,7 @@ struct ProtocolAdmission {
     request_timeout: Duration,
 }
 
-const REQUEST_OPERATION_COUNT: usize = 8;
+const REQUEST_OPERATION_COUNT: usize = 9;
 const LATENCY_BUCKET_MICROS: [u64; 6] = [100, 1_000, 10_000, 100_000, 1_000_000, 10_000_000];
 const LATENCY_BUCKET_LABELS: [&str; LATENCY_BUCKET_MICROS.len()] =
     ["0.0001", "0.001", "0.01", "0.1", "1", "10"];
@@ -145,6 +145,7 @@ enum RequestOperation {
     CreateStream,
     Publish,
     Poll,
+    Replay,
     PollGroup,
     Ack,
     AckGroup,
@@ -157,6 +158,7 @@ impl RequestOperation {
         Self::CreateStream,
         Self::Publish,
         Self::Poll,
+        Self::Replay,
         Self::PollGroup,
         Self::Ack,
         Self::AckGroup,
@@ -169,11 +171,12 @@ impl RequestOperation {
             Self::CreateStream => 0,
             Self::Publish => 1,
             Self::Poll => 2,
-            Self::PollGroup => 3,
-            Self::Ack => 4,
-            Self::AckGroup => 5,
-            Self::Health => 6,
-            Self::InvalidRequest => 7,
+            Self::Replay => 3,
+            Self::PollGroup => 4,
+            Self::Ack => 5,
+            Self::AckGroup => 6,
+            Self::Health => 7,
+            Self::InvalidRequest => 8,
         }
     }
 
@@ -182,6 +185,7 @@ impl RequestOperation {
             Self::CreateStream => "create_stream",
             Self::Publish => "publish",
             Self::Poll => "poll",
+            Self::Replay => "replay",
             Self::PollGroup => "poll_group",
             Self::Ack => "ack",
             Self::AckGroup => "ack_group",
@@ -197,6 +201,7 @@ impl RequestOperation {
             Request::PublishBytes { .. } => Self::Publish,
             Request::PublishBatch { .. } => Self::Publish,
             Request::Poll { .. } => Self::Poll,
+            Request::Replay { .. } => Self::Replay,
             Request::PollGroup { .. } => Self::PollGroup,
             Request::Ack { .. } => Self::Ack,
             Request::AckGroup { .. } => Self::AckGroup,
@@ -1067,6 +1072,14 @@ async fn handle_request(
                 PollResult::Empty => Response::Empty { stream, consumer },
             })
         }
+        Request::Replay {
+            stream,
+            consumer,
+            offset,
+        } => engine
+            .replay(&stream, &consumer, offset)
+            .await
+            .map(|message| replay_message_response(message, consumer)),
         Request::PollGroup {
             stream,
             consumer,
@@ -1139,6 +1152,34 @@ fn record_delivery(metrics: &ServerMetrics, result: &Result<PollResult, BrokerEr
     }
 }
 
+fn replay_message_response(message: ReplayMessage, consumer: String) -> Response {
+    let ReplayMessage {
+        stream,
+        offset,
+        key,
+        payload,
+        published_at_ms,
+    } = message;
+    match String::from_utf8(payload) {
+        Ok(payload) => Response::ReplayMessage {
+            stream,
+            consumer,
+            offset,
+            key,
+            payload,
+            published_at_ms,
+        },
+        Err(error) => Response::ReplayMessageBytes {
+            stream,
+            consumer,
+            offset,
+            key,
+            payload_base64: BinaryPayload::new(error.into_bytes()),
+            published_at_ms,
+        },
+    }
+}
+
 struct MessageResponse {
     stream: String,
     consumer: String,
@@ -1197,6 +1238,7 @@ fn error_response(error: &BrokerError) -> Response {
         BrokerError::AckNotInFlight { .. } => "ack_not_in_flight",
         BrokerError::StaleDelivery { .. } => "stale_delivery",
         BrokerError::OutOfOrderAck { .. } => "out_of_order_ack",
+        BrokerError::HistoryUnavailable { .. } => "history_unavailable",
         BrokerError::CorruptRecord(_) => "corrupt_record",
         BrokerError::Io(_) => "storage_error",
         BrokerError::State(_) => "consumer_state_error",

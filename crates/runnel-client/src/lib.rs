@@ -235,6 +235,44 @@ pub struct BinaryMessage {
     pub delivery_attempt: Option<u32>,
 }
 
+/// A message returned by an explicit replay read.
+///
+/// Replay messages are read-only and have no delivery token or attempt. They
+/// must not be acknowledged through the ordinary consumer acknowledgement
+/// methods.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReplayMessage {
+    /// The stream containing the retained message.
+    pub stream: String,
+    /// The consumer identity used to scope this replay request.
+    pub consumer: String,
+    /// The broker-assigned logical message offset.
+    pub offset: u64,
+    /// The optional ordering key attached to the message.
+    pub key: Option<String>,
+    /// The UTF-8 payload returned by the text replay method.
+    pub payload: String,
+    /// The broker timestamp associated with the publish.
+    pub published_at_ms: u64,
+}
+
+/// A replay message with the exact application payload bytes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BinaryReplayMessage {
+    /// The stream containing the retained message.
+    pub stream: String,
+    /// The consumer identity used to scope this replay request.
+    pub consumer: String,
+    /// The broker-assigned logical message offset.
+    pub offset: u64,
+    /// The optional ordering key attached to the message.
+    pub key: Option<String>,
+    /// The exact application payload bytes.
+    pub payload: Vec<u8>,
+    /// The broker timestamp associated with the publish.
+    pub published_at_ms: u64,
+}
+
 /// The result of an acknowledgement request.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Acknowledgement {
@@ -668,6 +706,118 @@ impl Client {
             stream.into(),
             consumer.into(),
             Some(member.into()),
+        )
+        .await
+    }
+
+    /// Read one retained message at an inclusive logical offset without
+    /// changing ordinary consumer progress.
+    ///
+    /// This first replay operation is intentionally one-record and
+    /// offset-based. An unavailable offset is returned as a rejected broker
+    /// outcome; it is never silently converted into an empty result.
+    pub async fn replay(
+        &mut self,
+        stream: impl Into<String>,
+        consumer: impl Into<String>,
+        offset: u64,
+    ) -> Result<ReplayMessage, AttemptOutcome> {
+        let stream = stream.into();
+        let consumer = consumer.into();
+        self.request_typed(
+            "replay",
+            Request::Replay {
+                stream: stream.clone(),
+                consumer: consumer.clone(),
+                offset,
+            },
+            move |response| match response {
+                Response::ReplayMessage {
+                    stream: response_stream,
+                    consumer: response_consumer,
+                    offset: response_offset,
+                    key,
+                    payload,
+                    published_at_ms,
+                } if response_stream == stream
+                    && response_consumer == consumer
+                    && response_offset == offset =>
+                {
+                    Ok(ReplayMessage {
+                        stream: response_stream,
+                        consumer: response_consumer,
+                        offset: response_offset,
+                        key,
+                        payload,
+                        published_at_ms,
+                    })
+                }
+                response => Err(Box::new(response)),
+            },
+        )
+        .await
+    }
+
+    /// Read one retained message at an inclusive logical offset with exact
+    /// application payload bytes.
+    pub async fn replay_bytes(
+        &mut self,
+        stream: impl Into<String>,
+        consumer: impl Into<String>,
+        offset: u64,
+    ) -> Result<BinaryReplayMessage, AttemptOutcome> {
+        let stream = stream.into();
+        let consumer = consumer.into();
+        self.request_typed(
+            "replay_bytes",
+            Request::Replay {
+                stream: stream.clone(),
+                consumer: consumer.clone(),
+                offset,
+            },
+            move |response| match response {
+                Response::ReplayMessage {
+                    stream: response_stream,
+                    consumer: response_consumer,
+                    offset: response_offset,
+                    key,
+                    payload,
+                    published_at_ms,
+                } if response_stream == stream
+                    && response_consumer == consumer
+                    && response_offset == offset =>
+                {
+                    Ok(BinaryReplayMessage {
+                        stream: response_stream,
+                        consumer: response_consumer,
+                        offset: response_offset,
+                        key,
+                        payload: payload.into_bytes(),
+                        published_at_ms,
+                    })
+                }
+                Response::ReplayMessageBytes {
+                    stream: response_stream,
+                    consumer: response_consumer,
+                    offset: response_offset,
+                    key,
+                    payload_base64,
+                    published_at_ms,
+                } if response_stream == stream
+                    && response_consumer == consumer
+                    && response_offset == offset =>
+                {
+                    Ok(BinaryReplayMessage {
+                        stream: response_stream,
+                        consumer: response_consumer,
+                        offset: response_offset,
+                        key,
+                        payload: payload_base64.into_bytes(),
+                        published_at_ms,
+                    })
+                }
+                response => Err(Box::new(response)),
+            },
         )
         .await
     }
@@ -1686,6 +1836,75 @@ mod tests {
                 delivery_attempt: Some(1),
             })
         );
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn replay_is_read_only_and_reports_unavailable_history() {
+        let (listener, address) = listener().await;
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut reader = BufReader::new(stream);
+
+            assert!(matches!(
+                read_request(&mut reader).await,
+                Request::Replay {
+                    stream,
+                    consumer,
+                    offset: 4,
+                } if stream == "events" && consumer == "worker"
+            ));
+            write_response(
+                &mut reader,
+                Response::ReplayMessage {
+                    stream: "events".to_owned(),
+                    consumer: "worker".to_owned(),
+                    offset: 4,
+                    key: Some("order-1".to_owned()),
+                    payload: "replayed".to_owned(),
+                    published_at_ms: 12,
+                },
+            )
+            .await;
+
+            assert!(matches!(
+                read_request(&mut reader).await,
+                Request::Replay {
+                    stream,
+                    consumer,
+                    offset: 99,
+                } if stream == "events" && consumer == "worker"
+            ));
+            write_response(
+                &mut reader,
+                Response::Error {
+                    code: "history_unavailable".to_owned(),
+                    message: "requested offset is unavailable".to_owned(),
+                },
+            )
+            .await;
+        });
+
+        let mut client = Client::connect_with_config(address, test_config())
+            .await
+            .unwrap();
+        assert_eq!(
+            client.replay("events", "worker", 4).await.unwrap(),
+            ReplayMessage {
+                stream: "events".to_owned(),
+                consumer: "worker".to_owned(),
+                offset: 4,
+                key: Some("order-1".to_owned()),
+                payload: "replayed".to_owned(),
+                published_at_ms: 12,
+            }
+        );
+        assert!(matches!(
+            client.replay("events", "worker", 99).await,
+            Err(AttemptOutcome::Rejected(AttemptFailure::Broker(
+                Response::Error { code, .. }
+            ))) if code == "history_unavailable"
+        ));
         server.await.unwrap();
     }
 

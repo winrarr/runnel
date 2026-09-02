@@ -11,6 +11,7 @@ This repository currently provides the first vertical slice:
 - multiple independent durable consumers;
 - shared consumers that distribute work between named members;
 - at-least-once polling and acknowledgements;
+- explicit one-record logical-offset replay that leaves ordinary progress unchanged;
 - per-key ordering and stale-delivery rejection for local and clustered shared consumers;
 - retry attempt tracking and optional dead-letter streams in local and clustered grouped delivery;
 - redelivery after acknowledgement timeout or broker restart;
@@ -38,6 +39,7 @@ Use the CLI in another terminal:
     cargo run -p runnel-cli -- publish events "hello from runnel"
     cargo run -p runnel-cli -- consume events worker
     cargo run -p runnel-cli -- ack events worker 0
+    cargo run -p runnel-cli -- replay events worker 0
 
 To share work between local worker processes, use one consumer name and a distinct member name for each worker. The grouped consume response includes a delivery token that must be supplied when acknowledging:
 
@@ -112,8 +114,15 @@ The current protocol accepts one JSON request per TCP line. For example:
     {"op":"publish","stream":"events","payload":"hello","request_id":"optional-stable-id"}
     {"op":"poll","stream":"events","consumer":"worker"}
     {"op":"ack","stream":"events","consumer":"worker","offset":0}
+    {"op":"replay","stream":"events","consumer":"worker","offset":0}
 
 Grouped delivery uses `poll_group` and `ack_group` requests with a consumer name, member name, and delivery token. These are provisional development-protocol operations.
+
+Replay reads exactly one inclusive logical offset and does not create an
+ordinary delivery or advance the consumer checkpoint. Its response has no
+delivery token; an unavailable offset returns `history_unavailable` with the
+available offset range. Replay sessions, time selectors, retention floors,
+and replay acknowledgements are not implemented yet.
 
 Message responses include a delivery attempt while retry state is being tracked. Dead-letter records are available on the source stream's .dead-letter stream and preserve the original key and payload.
 

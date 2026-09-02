@@ -25,3 +25,4 @@ Current decisions:
 - 0019-clustered-storage-identity.md: fail closed when persisted clustered state does not match its configured identity or format.
 - 0020-stable-optimization-evidence.md: benchmark requirements are evaluated by expected runtime impact, and optimization claims require stable authoritative evidence.
 - 0021-scheduled-benchmark-history.md: run the longer Runnel history suite on a schedule or manually instead of on every `main` push.
+- 0024-explicit-offset-replay-read.md: first replay slice is a bounded, read-only logical-offset operation with explicit unavailable-history outcomes.

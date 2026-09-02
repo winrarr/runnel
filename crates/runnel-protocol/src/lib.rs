@@ -100,6 +100,13 @@ pub enum Request {
         stream: String,
         consumer: String,
     },
+    /// Read one retained record at an inclusive logical offset without
+    /// changing the consumer's ordinary progress.
+    Replay {
+        stream: String,
+        consumer: String,
+        offset: u64,
+    },
     PollGroup {
         stream: String,
         consumer: String,
@@ -163,6 +170,23 @@ pub enum Response {
         delivery_token: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         delivery_attempt: Option<u32>,
+    },
+    ReplayMessage {
+        stream: String,
+        consumer: String,
+        offset: u64,
+        key: Option<String>,
+        payload: String,
+        published_at_ms: u64,
+    },
+    /// A replay record whose bytes are not representable by the legacy UTF-8 payload field.
+    ReplayMessageBytes {
+        stream: String,
+        consumer: String,
+        offset: u64,
+        key: Option<String>,
+        payload_base64: BinaryPayload,
+        published_at_ms: u64,
     },
     Empty {
         stream: String,

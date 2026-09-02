@@ -2,7 +2,8 @@ use runnel_core::{Broker, BrokerConfig};
 use runnel_engine::{AckResult, BrokerError, Engine, PollResult};
 use runnel_test_support::{
     assert_expired_delivery_is_fenced, assert_independent_consumers_contract,
-    assert_key_ordering_contract, assert_publish_batch_contract, assert_shared_delivery_contract,
+    assert_key_ordering_contract, assert_publish_batch_contract, assert_replay_contract,
+    assert_shared_delivery_contract,
 };
 use tempfile::tempdir;
 
@@ -105,6 +106,14 @@ async fn local_broker_implements_shared_delivery_contract() {
     let engine: &dyn Engine = &broker;
 
     assert_shared_delivery_contract(engine).await;
+}
+
+#[tokio::test]
+async fn local_broker_implements_replay_contract() {
+    let directory = tempdir().unwrap();
+    let broker = Broker::open(directory.path(), BrokerConfig::default()).unwrap();
+
+    assert_replay_contract(&broker).await;
 }
 
 #[tokio::test]

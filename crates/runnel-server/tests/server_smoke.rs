@@ -148,6 +148,21 @@ fn network_protocol_persists_acknowledgements_across_restart() {
     assert!(matches!(
         request(
             server.broker_addr,
+            Request::Replay {
+                stream: "events".to_owned(),
+                consumer: "worker".to_owned(),
+                offset: 0,
+            },
+        ),
+        Response::ReplayMessage {
+            offset: 0,
+            payload,
+            ..
+        } if payload == "hello"
+    ));
+    assert!(matches!(
+        request(
+            server.broker_addr,
             Request::Poll {
                 stream: "events".to_owned(),
                 consumer: "worker".to_owned(),
@@ -168,9 +183,36 @@ fn network_protocol_persists_acknowledgements_across_restart() {
         ),
         Response::Published { offset: 1, .. }
     ));
+    assert!(matches!(
+        request(
+            server.broker_addr,
+            Request::Replay {
+                stream: "events".to_owned(),
+                consumer: "worker".to_owned(),
+                offset: 2,
+            },
+        ),
+        Response::Error { code, message }
+            if code == "history_unavailable" && message.contains("[0, 2)")
+    ));
     server.stop();
 
     let server = RunningServer::start(directory.path());
+    assert!(matches!(
+        request(
+            server.broker_addr,
+            Request::Replay {
+                stream: "events".to_owned(),
+                consumer: "worker".to_owned(),
+                offset: 0,
+            },
+        ),
+        Response::ReplayMessage {
+            offset: 0,
+            payload,
+            ..
+        } if payload == "hello"
+    ));
     assert!(matches!(
         request(
             server.broker_addr,
@@ -221,6 +263,21 @@ fn network_protocol_round_trips_binary_payload_across_restart() {
 
     server.stop();
     let server = RunningServer::start(directory.path());
+    assert!(matches!(
+        request(
+            server.broker_addr,
+            Request::Replay {
+                stream: "binary".to_owned(),
+                consumer: "worker".to_owned(),
+                offset: 0,
+            },
+        ),
+        Response::ReplayMessageBytes {
+            offset: 0,
+            payload_base64,
+            ..
+        } if payload_base64.as_bytes() == [0, 1, 255, b'\n', b'_']
+    ));
     assert!(matches!(
         request_line(
             server.broker_addr,

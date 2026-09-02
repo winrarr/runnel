@@ -20,7 +20,7 @@ use tokio::sync::{Mutex, Semaphore, watch};
 use crate::{GroupManager, METADATA_GROUP_ID, StreamMetadata, TypeConfig};
 #[cfg(feature = "instrumentation")]
 use runnel_engine::StageTimer;
-use runnel_engine::{AckResult, BrokerError, Offset, PollResult};
+use runnel_engine::{AckResult, BrokerError, Offset, PollResult, ReplayMessage};
 
 const MAX_FRAME_SIZE: u32 = 64 * 1024 * 1024;
 const MAX_REUSABLE_FRAME_BUFFER_SIZE: usize = 1024 * 1024;
@@ -597,6 +597,11 @@ pub(crate) enum ForwardedOperation {
         stream: String,
         consumer: String,
     },
+    Replay {
+        stream: String,
+        consumer: String,
+        offset: Offset,
+    },
     Ack {
         stream: String,
         consumer: String,
@@ -626,6 +631,7 @@ pub(crate) enum ForwardedResponse {
     CreateStream(Result<bool, ForwardError>),
     Publish(Result<Offset, ForwardError>),
     Poll(Result<PollResult, ForwardError>),
+    Replay(Result<ReplayMessage, ForwardError>),
     Ack(Result<AckResult, ForwardError>),
     PollGroup(Result<PollResult, ForwardError>),
     AckGroup(Result<AckResult, ForwardError>),
@@ -634,9 +640,23 @@ pub(crate) enum ForwardedResponse {
 
 #[derive(Debug, Serialize, Deserialize)]
 pub(crate) enum ForwardError {
-    NotLeader { leader_id: Option<u64> },
-    AckNotInFlight { consumer: String, offset: Offset },
-    StaleDelivery { consumer: String, offset: Offset },
+    NotLeader {
+        leader_id: Option<u64>,
+    },
+    AckNotInFlight {
+        consumer: String,
+        offset: Offset,
+    },
+    StaleDelivery {
+        consumer: String,
+        offset: Offset,
+    },
+    HistoryUnavailable {
+        stream: String,
+        requested_offset: Offset,
+        earliest_offset: Offset,
+        next_offset: Offset,
+    },
     Message(String),
 }
 
@@ -779,6 +799,16 @@ async fn handle_forwarded(
             }
             ForwardedResponse::Poll(group.poll(&stream, &consumer).await.map_err(forward_error))
         }
+        ForwardedOperation::Replay {
+            stream,
+            consumer,
+            offset,
+        } => ForwardedResponse::Replay(
+            manager
+                .replay_local(&stream, &consumer, offset)
+                .await
+                .map_err(forward_error),
+        ),
         ForwardedOperation::Ack {
             stream,
             consumer,
@@ -862,6 +892,17 @@ fn forward_error(error: BrokerError) -> ForwardError {
         BrokerError::StaleDelivery { consumer, offset } => {
             ForwardError::StaleDelivery { consumer, offset }
         }
+        BrokerError::HistoryUnavailable {
+            stream,
+            requested_offset,
+            earliest_offset,
+            next_offset,
+        } => ForwardError::HistoryUnavailable {
+            stream,
+            requested_offset,
+            earliest_offset,
+            next_offset,
+        },
         error => ForwardError::Message(error.to_string()),
     }
 }

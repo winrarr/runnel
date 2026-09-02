@@ -94,6 +94,56 @@ fn grouped_delivery_round_trips_member_and_token() {
 }
 
 #[test]
+fn replay_round_trips_without_delivery_state() {
+    let request = Request::Replay {
+        stream: "events".to_owned(),
+        consumer: "worker".to_owned(),
+        offset: 7,
+    };
+    let encoded = serde_json::to_string(&request).unwrap();
+    assert_eq!(
+        encoded,
+        r#"{"op":"replay","stream":"events","consumer":"worker","offset":7}"#
+    );
+    assert!(matches!(
+        serde_json::from_str::<Request>(&encoded).unwrap(),
+        Request::Replay {
+            stream,
+            consumer,
+            offset: 7,
+        } if stream == "events" && consumer == "worker"
+    ));
+
+    let response = Response::ReplayMessage {
+        stream: "events".to_owned(),
+        consumer: "worker".to_owned(),
+        offset: 7,
+        key: Some("order-1".to_owned()),
+        payload: "hello".to_owned(),
+        published_at_ms: 10,
+    };
+    let encoded = serde_json::to_string(&response).unwrap();
+    assert_eq!(
+        encoded,
+        r#"{"type":"replay_message","stream":"events","consumer":"worker","offset":7,"key":"order-1","payload":"hello","published_at_ms":10}"#
+    );
+    assert!(matches!(
+        serde_json::from_str::<Response>(&encoded).unwrap(),
+        Response::ReplayMessage {
+            stream,
+            consumer,
+            offset: 7,
+            key: Some(key),
+            payload,
+            published_at_ms: 10,
+        } if stream == "events"
+            && consumer == "worker"
+            && key == "order-1"
+            && payload == "hello"
+    ));
+}
+
+#[test]
 fn binary_payloads_round_trip_without_utf8_conversion() {
     let empty: Request = serde_json::from_str(
         r#"{"op":"publish_bytes","stream":"events","key":null,"payload_base64":"","request_id":null}"#,

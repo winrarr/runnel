@@ -82,6 +82,21 @@ pub struct Message {
     pub delivery_attempt: Option<u32>,
 }
 
+/// A message returned by an explicit replay read.
+///
+/// Replay is read-only in the first protocol slice: it does not create an
+/// in-flight delivery, increment delivery attempts, or change consumer
+/// progress. A replay result therefore cannot be acknowledged as an ordinary
+/// delivery through the typed engine model.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReplayMessage {
+    pub stream: String,
+    pub offset: Offset,
+    pub key: Option<String>,
+    pub payload: Vec<u8>,
+    pub published_at_ms: u64,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum PollResult {
     Message(Message),
@@ -120,6 +135,15 @@ pub enum BrokerError {
         consumer: String,
         expected: Offset,
         received: Offset,
+    },
+    #[error(
+        "replay offset {requested_offset} is unavailable for stream '{stream}'; available offsets are [{earliest_offset}, {next_offset})"
+    )]
+    HistoryUnavailable {
+        stream: String,
+        requested_offset: Offset,
+        earliest_offset: Offset,
+        next_offset: Offset,
     },
     #[error("record log is malformed at offset {0}")]
     CorruptRecord(Offset),
@@ -179,6 +203,15 @@ pub trait Engine: Send + Sync {
     }
 
     fn poll<'a>(&'a self, stream: &'a str, consumer: &'a str) -> EngineFuture<'a, PollResult>;
+
+    /// Read one retained record at an inclusive logical offset without
+    /// changing the consumer checkpoint or delivery state.
+    fn replay<'a>(
+        &'a self,
+        stream: &'a str,
+        consumer: &'a str,
+        offset: Offset,
+    ) -> EngineFuture<'a, ReplayMessage>;
 
     fn poll_group<'a>(
         &'a self,

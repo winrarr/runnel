@@ -34,6 +34,11 @@ enum Command {
         #[arg(long)]
         member: Option<String>,
     },
+    Replay {
+        stream: String,
+        consumer: String,
+        offset: u64,
+    },
     Ack {
         stream: String,
         consumer: String,
@@ -90,6 +95,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 member,
             },
             None => Request::Poll { stream, consumer },
+        },
+        Command::Replay {
+            stream,
+            consumer,
+            offset,
+        } => Request::Replay {
+            stream,
+            consumer,
+            offset,
         },
         Command::Ack {
             stream,

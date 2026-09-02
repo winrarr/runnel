@@ -39,7 +39,9 @@ const DEFAULT_ACK_TIMEOUT: Duration = Duration::from_secs(30);
 const DEAD_LETTER_SUFFIX: &str = ".dead-letter";
 const MAX_CONSUMER_STATE_JOURNAL_BYTES: u64 = 64 * 1024;
 
-pub use runnel_engine::{AckResult, BrokerError, HealthSnapshot, Message, Offset, PollResult};
+pub use runnel_engine::{
+    AckResult, BrokerError, HealthSnapshot, Message, Offset, PollResult, ReplayMessage,
+};
 
 /// Selects the durable record format used for new appends.
 ///
@@ -588,6 +590,23 @@ impl Broker {
         self.poll_group(stream, consumer, consumer)
     }
 
+    /// Read one retained record without creating delivery state or changing
+    /// the ordinary consumer checkpoint.
+    pub fn replay(
+        &self,
+        stream: &str,
+        consumer: &str,
+        offset: Offset,
+    ) -> Result<ReplayMessage, BrokerError> {
+        #[cfg(feature = "instrumentation")]
+        let _stage_timer = StageTimer::new("core.replay");
+        validate_name("stream", stream)?;
+        validate_name("consumer", consumer)?;
+        let stream_state = self.get_stream(stream)?;
+        let mut stream_state = self.lock_stream(&stream_state)?;
+        stream_state.log.read_replay_message(stream, offset)
+    }
+
     pub fn poll_group(
         &self,
         stream: &str,
@@ -923,6 +942,20 @@ impl Engine for Broker {
         let consumer = consumer.to_owned();
         Arc::clone(&self.inner.storage_executor)
             .dispatch_stream(stream, move |stream| broker.poll(stream, &consumer))
+    }
+
+    fn replay<'a>(
+        &'a self,
+        stream: &'a str,
+        consumer: &'a str,
+        offset: Offset,
+    ) -> EngineFuture<'a, ReplayMessage> {
+        let broker = self.clone();
+        let stream = stream.to_owned();
+        let consumer = consumer.to_owned();
+        Arc::clone(&self.inner.storage_executor).dispatch_stream(stream, move |stream| {
+            broker.replay(stream, &consumer, offset)
+        })
     }
 
     fn poll_group<'a>(
@@ -1339,6 +1372,31 @@ impl StreamLog {
             published_at_ms: index.published_at_ms,
             delivery_token: None,
             delivery_attempt: None,
+        })
+    }
+
+    fn read_replay_message(
+        &mut self,
+        stream: &str,
+        offset: Offset,
+    ) -> Result<ReplayMessage, BrokerError> {
+        if offset >= self.next_offset {
+            return Err(BrokerError::HistoryUnavailable {
+                stream: stream.to_owned(),
+                requested_offset: offset,
+                earliest_offset: 0,
+                next_offset: self.next_offset,
+            });
+        }
+
+        let index = self.find_record(offset)?;
+        let payload = self.read_payload(&index)?;
+        Ok(ReplayMessage {
+            stream: stream.to_owned(),
+            offset: index.offset,
+            key: index.key,
+            payload,
+            published_at_ms: index.published_at_ms,
         })
     }
 
