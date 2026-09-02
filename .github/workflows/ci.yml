@@ -32,13 +32,18 @@ jobs:
     name: Integration and container smoke tests
     runs-on: ubuntu-24.04
     timeout-minutes: 15
-    needs: verify
+    env:
+      # Keep the integration target in the repository's conventional location
+      # so rust-cache can restore dependency artifacts before the run starts.
+      CARGO_TARGET_DIR: target
+      RUNNEL_INTEGRATION_IMAGE_READY: "1"
     steps:
       - uses: actions/checkout@v7.0.1
       - uses: dtolnay/rust-toolchain@1.97.1
-        with:
-          components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2.9.2
+        id: rust-cache
+      - name: Report Rust target cache result
+        run: echo "Rust target cache exact hit: ${{ steps.rust-cache.outputs.cache-hit }}"
       - uses: taiki-e/install-action@v2.86.7
         with:
           tool: just
@@ -51,7 +56,7 @@ jobs:
           tags: runnel:dev
           cache-from: type=gha,scope=runnel-ci
           cache-to: type=gha,mode=max,scope=runnel-ci,ignore-error=true
-      - run: CARGO_TARGET_DIR="$RUNNER_TEMP/runnel-target" RUNNEL_INTEGRATION_IMAGE_READY=1 just integration
+      - run: just integration
       - name: Capture integration diagnostics
         if: failure()
         run: |

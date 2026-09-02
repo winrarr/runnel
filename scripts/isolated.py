@@ -29,6 +29,7 @@ from benchmarks.lock import lock_command
 
 ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_WORKFLOW = "test"
+INTEGRATION_IMAGE = "runnel:dev"
 WORKFLOWS = (
     "test",
     "smoke",
@@ -139,13 +140,21 @@ def cluster_command(
             ]
         )
     elif runtime == "container":
+        integration_image_ready = (
+            os.environ.get("RUNNEL_INTEGRATION_IMAGE_READY") == "1"
+        )
         command.extend(
             [
                 "--runtime",
                 "container",
                 "--image",
-                isolation.image,
-                "--build",
+                INTEGRATION_IMAGE if integration_image_ready else isolation.image,
+            ]
+        )
+        if not integration_image_ready:
+            command.append("--build")
+        command.extend(
+            [
                 "--output",
                 str(artifact / "cluster-container.json"),
             ]
