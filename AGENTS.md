@@ -117,7 +117,7 @@ Run these from the repository root:
 
 - just verify runs formatting, Clippy, all-target tests, documentation tests, ShellCheck, benchmark-script tests, and a workspace build.
 - just ci runs verification and the full local integration sequence.
-- just integration runs the same separate isolated smoke, clustered, Docker, single-node container-smoke, and three-node container-smoke sequence used by the CI integration job; callers may provide `CARGO_TARGET_DIR` to reuse compilation across the sequential smoke and cluster checks, and CI prebuilds the image with reusable Docker layers.
+- just integration runs the separate isolated process smoke, Docker image setup, single-node container-smoke, and three-node container-smoke sequence used by the CI integration job; the `cluster_smoke` process recovery test is owned by `just verify` and is not duplicated here. Callers may provide `CARGO_TARGET_DIR` for the process smoke build, and CI prebuilds one `runnel:dev` image with reusable Docker layers for both container workflows.
 - just run starts a local broker with data in ./data.
 - just smoke starts a real broker and uses runnelctl to exercise publish, consume, acknowledgement, restart recovery, readiness, and metrics with temporary state.
 - just isolated runs the default workspace test with a unique Cargo target, temporary directory, and benchmark artifact directory; pass a supported workflow such as `just isolated cluster-test`, `just isolated cluster-replacement-test`, `just isolated bench-container-smoke`, or `just isolated bench-cluster-container-smoke` for concurrent work. An explicitly supplied `CARGO_TARGET_DIR` is for sequential workflows only.

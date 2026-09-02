@@ -109,9 +109,8 @@ docker-build:
 
 integration:
     RUNNEL_TEST_CAPTURE_LOGS=1 python3 scripts/isolated.py smoke
-    RUNNEL_TEST_CAPTURE_LOGS=1 python3 scripts/isolated.py cluster-test
     if [ "${RUNNEL_INTEGRATION_IMAGE_READY:-0}" != "1" ]; then just docker-build; fi
-    RUNNEL_TEST_CAPTURE_LOGS=1 python3 scripts/isolated.py bench-container-smoke
-    RUNNEL_TEST_CAPTURE_LOGS=1 python3 scripts/isolated.py bench-cluster-container-smoke
+    RUNNEL_TEST_CAPTURE_LOGS=1 RUNNEL_INTEGRATION_IMAGE_READY=1 python3 scripts/isolated.py bench-container-smoke
+    RUNNEL_TEST_CAPTURE_LOGS=1 RUNNEL_INTEGRATION_IMAGE_READY=1 python3 scripts/isolated.py bench-cluster-container-smoke
 
 ci: verify integration

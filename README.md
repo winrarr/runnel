@@ -98,6 +98,11 @@ Useful workflows:
 
 The existing scripts/verify.sh command remains as a thin compatibility wrapper around just verify.
 
+The required pull-request CI gate is a two-branch DAG: `Verify` and `Integration`
+run in parallel and both must pass. `Verify` owns the real three-node
+`cluster_smoke` test; `Integration` owns the process smoke and container smoke
+workflows and reuses one prebuilt image for both container checks.
+
 Contributions use Conventional Commits because pull-request titles become the
 release-facing subjects after squash merges. See [CONTRIBUTING.md](CONTRIBUTING.md)
 for the format; GitHub Actions enforces it on pull requests and new commits to

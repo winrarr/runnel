@@ -64,6 +64,23 @@ class IsolationRunnerTests(unittest.TestCase):
             " ".join(command),
         )
 
+    def test_integration_cluster_container_smoke_reuses_prebuilt_image(self) -> None:
+        run = self.new_run()
+        with patch.dict(os.environ, {"RUNNEL_INTEGRATION_IMAGE_READY": "1"}):
+            command = isolated.command_for("bench-cluster-container-smoke", run)
+
+        command_text = " ".join(command)
+        self.assertIn("--image runnel:dev", command_text)
+        self.assertNotIn("--build", command)
+
+    def test_standalone_cluster_container_smoke_builds_isolated_image(self) -> None:
+        run = self.new_run()
+        with patch.dict(os.environ, {"RUNNEL_INTEGRATION_IMAGE_READY": "0"}):
+            command = isolated.command_for("bench-cluster-container-smoke", run)
+
+        self.assertIn(run.image, " ".join(command))
+        self.assertIn("--build", command)
+
     def test_workflows_use_isolated_outputs_when_they_produce_them(self) -> None:
         run = self.new_run()
 
