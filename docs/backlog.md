@@ -606,7 +606,7 @@ Goal: measure whether the selected clustered design meets Runnel's latency, thro
 
 Rationale: the first distributed implementation is a baseline for evaluating later copyset, sequencer, chain, and other engines.
 
-Current progress: repeatable clustered workloads now cover ordinary durable publish, retained-history restart/replay, peer-forwarding saturation, and opt-in publish batches, with bounded resources and machine-readable results. Slow consumers, complete fault coverage, stable tail-latency evidence, and broader recovery/resource matrices remain open.
+Current progress: repeatable clustered workloads now cover ordinary durable publish, retained-history restart/replay, peer-forwarding saturation, opt-in publish batches, and an opt-in bootstrap-leader stop/survivor-failover/restart probe, with bounded resources and machine-readable results. Slow consumers, complete fault coverage, stable tail-latency evidence, repeated recovery/resource matrices, and leader identity detection beyond the current bootstrap assumption remain open.
 
 Constraints:
 
@@ -618,6 +618,7 @@ Acceptance criteria:
 
 - benchmarks cover durable publish, publish-to-consume latency, sustained throughput, batching, slow consumers, restart, and recovery;
 - results include p50, p99, and p99.9 latency, memory, CPU, and storage usage where applicable;
+- an opt-in leader-failure probe exercises real process stop, survivor publish/consume/ack, and same-node restart through the public protocol while recording its leader-selection assumption and recovery evidence;
 - a repeatable profiling workflow can produce actionable per-process hot-path evidence for clustered workloads;
 - the baseline can be rerun to compare future distributed engines without changing the public workload model.
 
