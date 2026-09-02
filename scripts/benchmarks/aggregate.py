@@ -108,7 +108,12 @@ def scenario_summary(scenarios: list[dict[str, Any]]) -> dict[str, Any]:
         if metric_summary:
             result[f"latency_{percentile}"] = metric_summary
 
-    for metric in ("cpu_seconds", "cpu_percent_max", "memory_bytes_max"):
+    for metric in (
+        "cpu_seconds",
+        "cpu_percent_max",
+        "memory_bytes_max",
+        "storage_bytes_max",
+    ):
         values = [
             scenario.get("resource_samples", {}).get(metric)
             for scenario in scenarios

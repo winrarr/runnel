@@ -28,11 +28,13 @@ from cluster import (  # noqa: E402
     percentile,
     publish_batch_request,
     PeerResponseDelayProxy,
+    ProcessStats,
     poll_until_redelivered,
     process_stats,
     resource_limits,
     run_publish_batch,
     run_peer_forwarding,
+    run_follower_failure_recovery,
     run_leader_failure_recovery,
     run_retained_recovery,
 )
@@ -87,6 +89,16 @@ class ClusterBenchmarkTests(unittest.TestCase):
         ):
             with self.assertRaises(SystemExit):
                 parse_args()
+
+    def test_follower_failure_scenario_is_opt_in(self) -> None:
+        with patch.object(
+            sys,
+            "argv",
+            ["cluster.py", "--scenarios", "follower_failure_recovery"],
+        ):
+            args = parse_args()
+
+        self.assertEqual(args.scenarios, ["follower_failure_recovery"])
 
     def test_publish_batch_options_are_explicit_and_bounded(self) -> None:
         with patch.object(
@@ -422,6 +434,65 @@ class ClusterBenchmarkTests(unittest.TestCase):
             {0, 1, 2},
         )
 
+    def test_follower_failure_recovery_records_process_failure_state(self) -> None:
+        events: list[tuple[str, int]] = []
+        polls = 0
+
+        class FakeClient:
+            def __init__(self, _node_index: int) -> None:
+                pass
+
+            def request(self, request: dict[str, object]) -> tuple[dict[str, object], int]:
+                nonlocal polls
+                if request["op"] == "create_stream":
+                    return {"type": "stream_created"}, 100
+                if request["op"] == "publish":
+                    request_id = request.get("request_id", "")
+                    if "after-node-restart" in request_id:
+                        return {"type": "published", "offset": 2}, 100
+                    if "after-follower-failure" in request_id:
+                        return {"type": "published", "offset": 1}, 100
+                    return {"type": "published", "offset": 0}, 100
+                if request["op"] == "poll":
+                    response = {"type": "message", "offset": polls, "payload": "payload"}
+                    polls += 1
+                    return response, 100
+                if request["op"] == "ack":
+                    return {"type": "acknowledged"}, 100
+                raise AssertionError(f"unexpected request: {request}")
+
+            def close(self) -> None:
+                return None
+
+        cluster = SimpleNamespace(
+            node_count=3,
+            nodes=[SimpleNamespace(node_id=index) for index in (1, 2, 3)],
+            stats=object(),
+            metrics=lambda: None,
+            client=lambda index, **_: FakeClient(index),
+            stop_node=lambda index: events.append(("stop", index)),
+            restart_node=lambda index: events.append(("restart", index)) or 2_000_000,
+        )
+
+        def run_measurement(_stats: object, operation: object, **_: object) -> dict:
+            return operation()
+
+        with patch("cluster.measure_scenario", side_effect=run_measurement), patch(
+            "cluster.time.sleep"
+        ):
+            result = run_follower_failure_recovery(
+                cluster, "follower-failure-events", "payload", timeout_seconds=1
+            )
+
+        self.assertEqual(events, [("stop", 1), ("restart", 1)])
+        self.assertEqual(result["operation"], "cluster_follower_failure_recovery")
+        self.assertEqual(result["metadata"]["failed_node"], 2)
+        self.assertEqual(result["metadata"]["failed_node_role"], "follower")
+        self.assertEqual(
+            result["metadata"]["initial_leader_selection"],
+            "not_required_for_follower_probe",
+        )
+
     def test_recovery_poll_retries_empty_responses_until_second_attempt(self) -> None:
         class FakeClient:
             def __init__(self) -> None:
@@ -467,6 +538,19 @@ class ClusterBenchmarkTests(unittest.TestCase):
         self.assertIsNotNone(sample)
         self.assertGreaterEqual(sample[0], 0)
         self.assertGreaterEqual(sample[1], 0)
+
+    def test_process_stats_preserves_per_node_storage_samples(self) -> None:
+        summary = ProcessStats._summarize_nodes(
+            [
+                {"1": {"storage_bytes": 8.0}},
+                {"1": {"memory_bytes": 200.0, "storage_bytes": 12.0}},
+            ]
+        )
+
+        self.assertEqual(summary["1"]["samples"], 2)
+        self.assertEqual(summary["1"]["memory_bytes_avg"], 200.0)
+        self.assertEqual(summary["1"]["storage_bytes_avg"], 10.0)
+        self.assertEqual(summary["1"]["storage_bytes_max"], 12.0)
 
     def test_slow_consumer_delay_is_configurable_and_recorded(self) -> None:
         with patch.object(

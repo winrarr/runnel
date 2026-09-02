@@ -8,6 +8,7 @@ const definitions = [
   { metric: 'cpu_efficiency_messages_per_cpu_second', title: 'CPU efficiency', unit: 'messages/CPU-second', higherBetter: true },
   { metric: 'cpu_percent_max', title: 'Peak broker CPU', unit: '%', higherBetter: false },
   { metric: 'memory_bytes_max', title: 'Peak broker memory', unit: 'bytes', higherBetter: false },
+  { metric: 'storage_bytes_max', title: 'Peak broker storage', unit: 'bytes', higherBetter: false },
 ];
 const colors = ['#75c7ff', '#ff9f68', '#9be28f', '#d7a5ff', '#ffd166', '#ff7aa2', '#76e4d1'];
 
@@ -86,6 +87,7 @@ function filteredPoints(metric, operation, size, profile, suite) {
     'cpu_efficiency_messages_per_cpu_second',
     'cpu_percent_max',
     'memory_bytes_max',
+    'storage_bytes_max',
   ].includes(metric);
 
   return data.points.filter((point) => {

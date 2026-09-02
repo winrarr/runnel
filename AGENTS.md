@@ -17,6 +17,7 @@ Runnel is a Rust message broker intended to offer durable streams, low operation
 - scripts/benchmarks/run.py: resource-limited container benchmark runner with machine-readable results.
 - scripts/benchmarks/runtime.py: shared Docker lifecycle and sampled-container primitives for benchmark runners.
 - scripts/benchmarks/cluster.py: real three-node clustered benchmark runner with native-process or bounded-container runtimes and machine-readable results.
+- scripts/benchmarks/matrix.py: sequential clustered workload/fault matrix runner with per-case artifacts and machine-readable results.
 - scripts/benchmarks/pr_local.py: same-host current-vs-default-branch clustered benchmark and Markdown PR report generator.
 - scripts/benchmarks/resource_scope.py: Linux systemd user-scope wrapper for explicit native benchmark CPU and memory limits.
 - scripts/benchmarks/profile.py: optional Linux `perf` workflow for clustered CPU hotspot profiles.
@@ -122,8 +123,8 @@ Run these from the repository root:
 - just isolated runs the default workspace test with a unique Cargo target, temporary directory, and benchmark artifact directory; pass a supported workflow such as `just isolated cluster-test`, `just isolated cluster-replacement-test`, `just isolated bench-container-smoke`, or `just isolated bench-cluster-container-smoke` for concurrent work. An explicitly supplied `CARGO_TARGET_DIR` is for sequential workflows only.
 - just cluster-test starts three real broker processes, exercises quorum replication, follower restart, leader failure, and recovery through the public protocol.
 - just cluster-replacement-test runs the opt-in snapshot replacement experiment that depends on the test-only permissive recovery feature.
-- just bench, just bench-container, just bench-cluster, and just bench-cluster-container run the documented local, single-node container, native clustered, and containerized clustered benchmark suites.
-- just bench-container-smoke, just bench-cluster-smoke, and just bench-cluster-container-smoke exercise small benchmark lifecycles for CI and diagnostics.
+- just bench, just bench-container, just bench-cluster, just bench-cluster-container, and just bench-cluster-matrix run the documented local, single-node container, native clustered, containerized clustered, and clustered matrix benchmark suites.
+- just bench-container-smoke, just bench-cluster-smoke, just bench-cluster-matrix-smoke, and just bench-cluster-container-smoke exercise small benchmark lifecycles for CI and diagnostics.
 - just bench-pr-local runs the authoritative current-versus-`origin/main` comparison; just bench-pr-local-until-stable retries complete inconclusive comparisons; just bench-pr-local-quick is diagnostic only. See [docs/benchmarking.md](docs/benchmarking.md).
 - just profile-cluster captures optional Linux `perf` samples and reports for all clustered broker processes.
 - just profile-cluster-instrumented builds the opt-in Rust timing instrumentation and records internal stage timings without requiring `perf` permissions; it uses the exclusive host benchmark lock.
