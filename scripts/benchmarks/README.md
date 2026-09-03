@@ -71,6 +71,19 @@ The slow-consumer scenario preloads a finite stream, polls one message at a time
 
 The retained-data recovery scenario is named `cluster_retained_recovery`. It preloads a separate stream with 2,048 records by default, which is above the current local 1,024-record tail-index boundary, then excludes that setup from the measured interval. The measured interval restarts one node, waits for readiness, polls the earliest retained record at offset 0, verifies its payload, and acknowledges it. Set the retained history size with `--retained-messages`; values must be at least 1,025. The scenario runs once for the first selected payload size and records `retained_messages` and `retained_logical_payload_bytes` in its existing v2 scenario metadata. Its request sample is the restart-ready-to-replay-acknowledgement interval, while the scenario resource sample covers that same interval. This measures recovery and cold replay with a known retained-data size; it does not measure retention cleanup, disk-pressure admission, batching, or prove that recovery cost is bounded. Compare runs only when retained count, payload size, topology, durability, runtime, and resource limits match.
 
+The opt-in `retained_hot_path` scenario measures the append path after retained state already exists. It preloads exactly `--retained-messages` records into a fresh stream, excludes that setup, and then publishes the selected `--messages` through persistent public clients on the same stream while checking contiguous post-preload offsets. Select it explicitly, for example:
+
+```text
+python3 scripts/benchmarks/cluster.py \
+  --scenarios retained_hot_path \
+  --messages 1000 \
+  --retained-messages 2048 \
+  --payload-sizes 100 \
+  --output benchmark-results/retained-hot-path.json
+```
+
+The result is a normal schema-v2 scenario record named `cluster_retained_hot_path`; its latency and throughput cover only measured durable publish round trips after the preload, while metadata records the retained count and logical payload bytes. This is a diagnostic hot-path baseline, not an optimization claim. It does not measure consume/replay, restart recovery, retention cleanup, disk-pressure admission, storage amplification, or behavior beyond the selected retained-history sizes. Compare only matching retained count, payload, measured message count, topology, durability, runtime, resource limits, and source/build conditions.
+
 The opt-in `leader_failure_recovery` scenario is a bounded fault baseline for one three-node quorum. Select it explicitly with a run-scoped output and log directory:
 
 ```text
@@ -97,7 +110,7 @@ For a rerunnable workload and fault matrix, use:
 just bench-cluster-matrix
 ```
 
-`matrix.py` expands scenarios, payload sizes, relevant concurrency and slow-consumer delay values, retained-history sizes, runtimes, and repetitions into independent sequential `cluster.py` invocations. Every case receives a unique result and broker-log directory under the selected artifacts directory. The default matrix covers durable publish, consume/acknowledge, slow-consumer drain, restart/replay, retained-history recovery, and both leader and follower process-stop probes. Use `--keep-going` to retain later cases after a failure; the command still exits nonzero and records failed or timed-out cases in the matrix envelope. `--case-timeout-seconds` is an outer bound, while each fault scenario keeps its own bounded recovery timeout.
+`matrix.py` expands scenarios, payload sizes, relevant concurrency and slow-consumer delay values, retained-history sizes, runtimes, and repetitions into independent sequential `cluster.py` invocations. Every case receives a unique result and broker-log directory under the selected artifacts directory. The default matrix covers durable publish, consume/acknowledge, slow-consumer drain, restart/replay, retained-history recovery, and both leader and follower process-stop probes. Select `retained_hot_path` explicitly to expand each `--retained-message-values` entry into a separate post-preload publish case; this keeps retained-state hot-path coverage visible without changing the existing default matrix. Use `--keep-going` to retain later cases after a failure; the command still exits nonzero and records failed or timed-out cases in the matrix envelope. `--case-timeout-seconds` is an outer bound, while each fault scenario keeps its own bounded recovery timeout. Matrix cases are diagnostic coverage and are not combined into an authoritative performance claim.
 
 The matrix accepts `--runtimes process,container`, `--cpus`, and `--memory` for explicit resource dimensions. Container cases enforce per-broker Docker limits. Add `--native-resource-scope` on Linux to place native broker and client processes in the same bounded systemd user scope. Cluster resource samples include aggregate and per-node CPU, resident memory, and on-disk storage bytes; storage scans are throttled between scenario boundaries so they do not turn the sampler into a hot-path observer. Cases with different dimensions are intentionally not aggregated into a performance ranking; normalize and aggregate matching raw case results when repeated evidence is needed.
 
@@ -131,7 +144,7 @@ The result uses the normal schema-v2 envelope and records the selected scenarios
 
 This probe establishes a repeatable forwarding and overload baseline; it is not evidence of a runtime performance improvement. Compare only runs with the same native runtime, topology, payload, warmup, message count, forwarding concurrency, response delay, timeout, resource budget, and source/build conditions. The delayed forwarding responses still include the target's normal quorum work, so a result does not isolate pool wait from consensus or target-processing cost. The public clustered benchmark remains unchanged unless `peer_forwarding` is selected in `--scenarios`.
 
-`--skip-recovery` skips restart and failure-recovery scenarios, including the retained-data, leader-failure, and follower-failure probes. The cluster's temporary durable directories, generated stream names, native ports, process/container resources, and container network are run-scoped. Supply distinct output and log paths when invoking the script directly; use the isolation runner when independent process-heavy workflows overlap.
+`--skip-recovery` skips restart and failure-recovery scenarios, including the retained-data recovery, leader-failure, and follower-failure probes; it does not skip the independent `retained_hot_path` publish probe. The cluster's temporary durable directories, generated stream names, native ports, process/container resources, and container network are run-scoped. Supply distinct output and log paths when invoking the script directly; use the isolation runner when independent process-heavy workflows overlap.
 
 The scheduled GitHub Actions history uses 200 messages per clustered scenario by default, independently of the native comparison workload. The retained-data probe remains at its separate 2,048-record default unless `--retained-messages` is overridden. This keeps repeated recovery and quorum measurements within the workflow time budget on the workflow runner's constrained CPU allocation while retaining enough traffic to compare the cluster scenarios. Increase the `cluster_messages` input for a larger manual run when investigating sustained-load behavior.
 

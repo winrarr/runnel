@@ -49,6 +49,7 @@ from cluster import (  # noqa: E402
     run_peer_forwarding,
     run_follower_failure_recovery,
     run_leader_failure_recovery,
+    run_retained_hot_path,
     run_retained_recovery,
 )
 from cluster_faults import PeerResponseDelayProxy  # noqa: E402
@@ -77,6 +78,24 @@ class ClusterBenchmarkTests(unittest.TestCase):
         self.assertNotIn("publish_batch", args.scenarios)
         self.assertNotIn("leader_failure_recovery", args.scenarios)
         self.assertNotIn("hot_ordering", args.scenarios)
+        self.assertNotIn("retained_hot_path", args.scenarios)
+
+    def test_retained_hot_path_is_opt_in_and_accepts_retained_history(self) -> None:
+        with patch.object(
+            sys,
+            "argv",
+            [
+                "cluster.py",
+                "--scenarios",
+                "retained_hot_path",
+                "--retained-messages",
+                "2048",
+            ],
+        ):
+            args = parse_args()
+
+        self.assertEqual(args.scenarios, ["retained_hot_path"])
+        self.assertEqual(args.retained_messages, 2048)
 
     def test_hot_ordering_options_are_opt_in_and_bounded(self) -> None:
         with patch.object(
@@ -923,8 +942,61 @@ class ClusterBenchmarkTests(unittest.TestCase):
                     "payload",
                     MIN_RETAINED_RECOVERY_MESSAGES,
                 )
+            acknowledge.assert_not_called()
 
-        acknowledge.assert_not_called()
+    def test_retained_hot_path_excludes_preload_and_checks_following_offsets(self) -> None:
+        clients = [SimpleNamespace(close=lambda: None) for _ in range(3)]
+        cluster = SimpleNamespace(
+            node_count=3,
+            stats=object(),
+            metrics=lambda: None,
+            connected_clients=lambda: _ClientsContext(clients),
+        )
+        retained_messages = MIN_RETAINED_RECOVERY_MESSAGES
+
+        def run_measurement(
+            _stats: object,
+            operation: str,
+            message_size: int,
+            action: object,
+            *,
+            metadata: dict[str, object],
+            metrics: object,
+        ) -> dict[str, object]:
+            self.assertEqual(operation, "cluster_retained_hot_path")
+            self.assertEqual(message_size, len("payload"))
+            self.assertIs(metrics, cluster.metrics)
+            return metric(
+                operation,
+                action(),  # type: ignore[operator]
+                2_000_000,
+                message_size=message_size,
+                metadata=metadata,
+            )
+
+        with (
+            patch("cluster.preload") as preload,
+            patch("cluster.publish_messages", return_value=[100, 200]) as publish_messages,
+            patch("cluster.measure_message_batch", side_effect=run_measurement),
+        ):
+            result = run_retained_hot_path(
+                cluster,
+                "retained-events",
+                "payload",
+                messages=2,
+                retained_messages=retained_messages,
+            )
+
+        preload.assert_called_once_with(
+            cluster, "retained-events", "payload", retained_messages
+        )
+        publish_args, publish_kwargs = publish_messages.call_args
+        self.assertEqual(publish_args[1:4], ("retained-events", "payload", 2))
+        self.assertEqual(publish_kwargs["expected_offset"], retained_messages)
+        self.assertEqual(result["operation"], "cluster_retained_hot_path")
+        self.assertEqual(result["messages"], 2)
+        self.assertEqual(result["metadata"]["retained_messages"], retained_messages)
+        self.assertTrue(result["metadata"]["publish_setup_excluded"])
 
     def test_container_runtime_records_per_broker_limits(self) -> None:
         with patch.object(
