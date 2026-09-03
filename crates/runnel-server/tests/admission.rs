@@ -627,18 +627,10 @@ fn served_persistent_connection_drains_promptly_on_shutdown() {
     wait_for_metric_at_least(server.http_addr, "runnel_active_connections", 1);
 
     send_sigterm(&server.child);
-    let deadline = Instant::now() + Duration::from_secs(2);
-    let status = loop {
-        if let Some(status) = server.child.try_wait().unwrap() {
-            break status;
-        }
-        assert!(
-            Instant::now() < deadline,
-            "server did not drain a served persistent connection promptly"
-        );
-        sleep(Duration::from_millis(25));
-    };
-    assert!(status.success(), "server exited unsuccessfully: {status}");
+    wait_for_server_exit(
+        &mut server,
+        "server did not drain a served persistent connection promptly",
+    );
 }
 
 #[cfg(unix)]
@@ -779,19 +771,7 @@ fn storage_stall_is_bounded_and_durable_traffic_continues() {
         "durable traffic must not wait for one stalled storage operation"
     );
 
-    let fifo_writer = fs::OpenOptions::new()
-        .write(true)
-        .open(&fifo)
-        .expect("opening the FIFO writer should release the stalled storage reader");
-    drop(fifo_writer);
-    let mut fifo_reader = fs::OpenOptions::new()
-        .read(true)
-        .open(&fifo)
-        .expect("opening the FIFO reader should release the stalled storage writer");
-    let mut discarded = Vec::new();
-    fifo_reader
-        .read_to_end(&mut discarded)
-        .expect("the stalled storage writer should close after recovery");
+    release_fifo_stall(&fifo);
 
     let metrics = wait_for_metric_at_least(server.http_addr, "runnel_streams", 1);
     assert_eq!(metric_value(&metrics, "runnel_engine_health_available"), 1);
@@ -800,6 +780,129 @@ fn storage_stall_is_bounded_and_durable_traffic_continues() {
     assert!(has_metric(&metrics, "runnel_in_flight_deliveries"));
     assert!(has_metric(&metrics, "runnel_redeliveries_total"));
     assert!(has_metric(&metrics, "runnel_dead_letters_total"));
+}
+
+#[cfg(unix)]
+#[test]
+fn storage_stall_shutdown_is_bounded_and_restart_recovers() {
+    let directory = TempDir::new().unwrap();
+    let mut server = RunningServer::start(
+        directory.path(),
+        &[
+            "--request-timeout-ms",
+            "500",
+            "--max-in-flight-requests",
+            "2",
+        ],
+    );
+
+    assert!(matches!(
+        request(
+            server.broker_addr,
+            Request::CreateStream {
+                stream: "stalled".to_owned(),
+            },
+        ),
+        Response::StreamCreated { .. }
+    ));
+    assert!(matches!(
+        request(
+            server.broker_addr,
+            Request::Publish {
+                stream: "stalled".to_owned(),
+                key: None,
+                payload: "survives-stall".to_owned(),
+                request_id: None,
+            },
+        ),
+        Response::Published { offset: 0, .. }
+    ));
+
+    let consumer_directory = directory.path().join("consumers/stalled");
+    fs::create_dir_all(&consumer_directory).unwrap();
+    let fifo = consumer_directory.join("blocked.json.tmp");
+    create_fifo(&fifo);
+
+    let started = Instant::now();
+    assert!(matches!(
+        request(
+            server.broker_addr,
+            Request::Poll {
+                stream: "stalled".to_owned(),
+                consumer: "blocked".to_owned(),
+            },
+        ),
+        Response::Error { code, .. } if code == "request_timeout"
+    ));
+    assert!(
+        started.elapsed() < Duration::from_secs(1),
+        "storage stall should remain bounded before shutdown"
+    );
+
+    assert!(http_ready(server.http_addr).starts_with("HTTP/1.1 503"));
+    let stalled_metrics = http_metrics_response(server.http_addr);
+    assert!(stalled_metrics.starts_with("HTTP/1.1 200"));
+    let stalled_metrics = response_body(&stalled_metrics);
+    assert_eq!(
+        metric_value(stalled_metrics, "runnel_engine_health_available"),
+        0
+    );
+    assert!(has_metric(stalled_metrics, "runnel_active_connections"));
+    assert!(has_metric(
+        stalled_metrics,
+        "runnel_metrics_scrape_failures_total"
+    ));
+    assert!(!has_metric(stalled_metrics, "runnel_streams"));
+
+    let shutdown_started = Instant::now();
+    send_sigterm(&server.child);
+    release_fifo_stall(&fifo);
+    fs::remove_file(&fifo).unwrap();
+    let shutdown_elapsed = wait_for_server_exit(
+        &mut server,
+        "server did not exit successfully after releasing the stalled storage operation",
+    );
+    assert!(
+        shutdown_started.elapsed() < Duration::from_secs(2),
+        "graceful shutdown after a released storage stall took too long: {shutdown_elapsed:?}"
+    );
+
+    let mut recovered = RunningServer::start(
+        directory.path(),
+        &[
+            "--request-timeout-ms",
+            "500",
+            "--max-in-flight-requests",
+            "2",
+        ],
+    );
+    let ready = http_ready(recovered.http_addr);
+    assert!(ready.starts_with("HTTP/1.1 200"));
+    assert!(ready.contains("\"status\":\"ready\""));
+    let metrics = http_metrics_response(recovered.http_addr);
+    assert!(metrics.starts_with("HTTP/1.1 200"));
+    let metrics = response_body(&metrics);
+    assert_eq!(metric_value(metrics, "runnel_engine_health_available"), 1);
+    assert!(has_metric(metrics, "runnel_streams"));
+    assert!(has_metric(metrics, "runnel_storage_bytes"));
+
+    assert!(matches!(
+        request(
+            recovered.broker_addr,
+            Request::Poll {
+                stream: "stalled".to_owned(),
+                consumer: "recovered".to_owned(),
+            },
+        ),
+        Response::Message { payload, .. } if payload == "survives-stall"
+    ));
+    assert!(matches!(
+        request(recovered.broker_addr, Request::Health),
+        Response::Health { streams: 1, .. }
+    ));
+
+    send_sigterm(&recovered.child);
+    wait_for_server_exit(&mut recovered, "recovered server did not shut down cleanly");
 }
 
 fn server_binary() -> PathBuf {
@@ -835,6 +938,23 @@ fn create_fifo(path: &Path) {
 }
 
 #[cfg(unix)]
+fn release_fifo_stall(path: &Path) {
+    let fifo_writer = fs::OpenOptions::new()
+        .write(true)
+        .open(path)
+        .expect("opening the FIFO writer should release the stalled storage reader");
+    drop(fifo_writer);
+    let mut fifo_reader = fs::OpenOptions::new()
+        .read(true)
+        .open(path)
+        .expect("opening the FIFO reader should release the stalled storage writer");
+    let mut discarded = Vec::new();
+    fifo_reader
+        .read_to_end(&mut discarded)
+        .expect("the stalled storage writer should close after recovery");
+}
+
+#[cfg(unix)]
 fn send_sigterm(child: &Child) {
     let pid = child.id().to_string();
     let status = Command::new("kill")
@@ -842,6 +962,20 @@ fn send_sigterm(child: &Child) {
         .status()
         .expect("kill should be available on Unix");
     assert!(status.success(), "SIGTERM should be delivered: {status}");
+}
+
+#[cfg(unix)]
+fn wait_for_server_exit(server: &mut RunningServer, description: &str) -> Duration {
+    let started = Instant::now();
+    let deadline = started + Duration::from_secs(2);
+    loop {
+        if let Some(status) = server.child.try_wait().unwrap() {
+            assert!(status.success(), "server exited unsuccessfully: {status}");
+            return started.elapsed();
+        }
+        assert!(Instant::now() < deadline, "{description}");
+        sleep(Duration::from_millis(25));
+    }
 }
 
 fn decode_response(encoded: &str) -> Response {
