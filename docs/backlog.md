@@ -254,7 +254,7 @@ Goal: let supported broker upgrades preserve or deliberately transform acknowled
 
 Rationale: the storage layout now has separate metadata and stream data groups, so future format and placement changes need an explicit recovery and migration contract.
 
-Current progress: unsupported clustered storage versions and layouts now fail closed during read-only preflight before recovery mutates state. A supported migration, downgrade policy, interrupted-transfer procedure, and end-to-end upgrade path remain undefined.
+Current progress: unsupported clustered storage versions and layouts now fail closed during read-only preflight before recovery mutates state. The [durable storage upgrade policy proposal](design/storage-upgrade-policy.md) now defines the observed format boundary, candidate compatibility and rollback vocabulary, interruption/observability requirements, and a smallest implementation slice; a supported migration, downgrade policy, interrupted-transfer procedure, and end-to-end upgrade path remain unimplemented and open.
 
 Constraints:
 
