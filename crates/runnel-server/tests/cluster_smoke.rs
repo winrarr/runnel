@@ -597,6 +597,317 @@ fn three_process_cluster_replicates_and_recovers_after_failures() {
 }
 
 #[test]
+fn three_process_cluster_preserves_group_delivery_through_replica_restart() {
+    let directory = TempDir::new().unwrap();
+    let addresses = (0..9).map(|_| free_addr()).collect::<Vec<_>>();
+    let cluster_nodes = vec![(1, addresses[6]), (2, addresses[7]), (3, addresses[8])];
+    let mut nodes = vec![
+        RunningNode::start_with_ack_timeout(
+            1,
+            addresses[0],
+            addresses[3],
+            addresses[6],
+            directory.path().join("node-1"),
+            cluster_nodes.clone(),
+            true,
+            REASSIGN_ACK_TIMEOUT_MS,
+        ),
+        RunningNode::start_with_ack_timeout(
+            2,
+            addresses[1],
+            addresses[4],
+            addresses[7],
+            directory.path().join("node-2"),
+            cluster_nodes.clone(),
+            false,
+            REASSIGN_ACK_TIMEOUT_MS,
+        ),
+        RunningNode::start_with_ack_timeout(
+            3,
+            addresses[2],
+            addresses[5],
+            addresses[8],
+            directory.path().join("node-3"),
+            cluster_nodes,
+            false,
+            REASSIGN_ACK_TIMEOUT_MS,
+        ),
+    ];
+    for node in &nodes {
+        wait_for_http(node.http_addr);
+    }
+
+    let leader = create_stream_on_any(&mut nodes, "restart-jobs");
+    for (index, payload) in ["first", "second"].into_iter().enumerate() {
+        assert!(matches!(
+            wait_for_response_at(
+                nodes[leader].broker_addr,
+                || Request::Publish {
+                    stream: "restart-jobs".to_owned(),
+                    key: None,
+                    payload: payload.to_owned(),
+                    request_id: Some(format!("restart-job-{index}")),
+                },
+                |response| matches!(response, Response::Published { offset, .. } if *offset == index as u64),
+            ),
+            Response::Published { offset, .. } if offset == index as u64
+        ));
+    }
+
+    // A separate consumer must receive and durably acknowledge both records;
+    // the shared consumer below should still receive its own copy.
+    let fanout_node = (leader + 2) % nodes.len();
+    for (offset, payload) in [(0, "first"), (1, "second")] {
+        assert!(matches!(
+            wait_for_response_at(
+                nodes[fanout_node].broker_addr,
+                || Request::Poll {
+                    stream: "restart-jobs".to_owned(),
+                    consumer: "fanout".to_owned(),
+                },
+                |response| matches!(
+                    response,
+                    Response::Message {
+                        offset: received_offset,
+                        payload: received_payload,
+                        ..
+                    } if *received_offset == offset && received_payload == payload
+                ),
+            ),
+            Response::Message { offset: received_offset, .. } if received_offset == offset
+        ));
+        assert!(matches!(
+            wait_for_response_at(
+                nodes[fanout_node].broker_addr,
+                || Request::Ack {
+                    stream: "restart-jobs".to_owned(),
+                    consumer: "fanout".to_owned(),
+                    offset,
+                },
+                |response| matches!(response, Response::Acknowledged { .. }),
+            ),
+            Response::Acknowledged { .. }
+        ));
+    }
+
+    let replica = (leader + 1) % nodes.len();
+    let first = wait_for_response_at(
+        nodes[replica].broker_addr,
+        || Request::PollGroup {
+            stream: "restart-jobs".to_owned(),
+            consumer: "workers".to_owned(),
+            member: "member-a".to_owned(),
+        },
+        |response| {
+            matches!(
+                response,
+                Response::Message {
+                    offset: 0,
+                    payload,
+                    delivery_attempt: Some(1),
+                    delivery_token: Some(_),
+                    ..
+                } if payload == "first"
+            )
+        },
+    );
+    let first_token = match first {
+        Response::Message {
+            delivery_token: Some(token),
+            ..
+        } => token,
+        response => panic!("expected first grouped delivery, got {response:?}"),
+    };
+    let second = wait_for_response_at(
+        nodes[leader].broker_addr,
+        || Request::PollGroup {
+            stream: "restart-jobs".to_owned(),
+            consumer: "workers".to_owned(),
+            member: "member-b".to_owned(),
+        },
+        |response| {
+            matches!(
+                response,
+                Response::Message {
+                    offset: 1,
+                    payload,
+                    delivery_attempt: Some(1),
+                    delivery_token: Some(_),
+                    ..
+                } if payload == "second"
+            )
+        },
+    );
+    let second_token = match second {
+        Response::Message {
+            delivery_token: Some(token),
+            ..
+        } => token,
+        response => panic!("expected second grouped delivery, got {response:?}"),
+    };
+
+    // The grouped leases and tokens are replicated state. A follower restart
+    // must return each still-live member's existing delivery, not reassign it.
+    nodes[replica].restart();
+    assert!(matches!(
+        wait_for_response_at(
+            nodes[replica].broker_addr,
+            || Request::PollGroup {
+                stream: "restart-jobs".to_owned(),
+                consumer: "workers".to_owned(),
+                member: "member-a".to_owned(),
+            },
+            |response| matches!(
+                response,
+                Response::Message {
+                    offset: 0,
+                    delivery_attempt: Some(1),
+                    delivery_token: Some(token),
+                    ..
+                } if token == &first_token
+            ),
+        ),
+        Response::Message { offset: 0, .. }
+    ));
+    assert!(matches!(
+        wait_for_response_at(
+            nodes[replica].broker_addr,
+            || Request::PollGroup {
+                stream: "restart-jobs".to_owned(),
+                consumer: "workers".to_owned(),
+                member: "member-b".to_owned(),
+            },
+            |response| matches!(
+                response,
+                Response::Message {
+                    offset: 1,
+                    delivery_attempt: Some(1),
+                    delivery_token: Some(token),
+                    ..
+                } if token == &second_token
+            ),
+        ),
+        Response::Message { offset: 1, .. }
+    ));
+
+    // Acknowledging the higher offset first exercises durable out-of-order
+    // progress while the lower offset remains eligible for redelivery.
+    assert!(matches!(
+        wait_for_response_at(
+            nodes[replica].broker_addr,
+            || Request::AckGroup {
+                stream: "restart-jobs".to_owned(),
+                consumer: "workers".to_owned(),
+                member: "member-b".to_owned(),
+                offset: 1,
+                delivery_token: second_token.clone(),
+            },
+            |response| matches!(response, Response::Acknowledged { .. }),
+        ),
+        Response::Acknowledged { .. }
+    ));
+    sleep(Duration::from_millis(REASSIGN_ACK_TIMEOUT_MS + 100));
+
+    let redelivered = wait_for_response_at(
+        nodes[replica].broker_addr,
+        || Request::PollGroup {
+            stream: "restart-jobs".to_owned(),
+            consumer: "workers".to_owned(),
+            member: "member-c".to_owned(),
+        },
+        |response| {
+            matches!(
+                response,
+                Response::Message {
+                    offset: 0,
+                    payload,
+                    delivery_attempt: Some(2),
+                    delivery_token: Some(_),
+                    ..
+                } if payload == "first"
+            )
+        },
+    );
+    let redelivered_token = match redelivered {
+        Response::Message {
+            delivery_token: Some(token),
+            ..
+        } => token,
+        response => panic!("expected redelivered grouped message, got {response:?}"),
+    };
+    assert_ne!(first_token, redelivered_token);
+    assert!(matches!(
+        wait_for_response_at(
+            nodes[replica].broker_addr,
+            || Request::AckGroup {
+                stream: "restart-jobs".to_owned(),
+                consumer: "workers".to_owned(),
+                member: "member-a".to_owned(),
+                offset: 0,
+                delivery_token: first_token.clone(),
+            },
+            |response| matches!(response, Response::Error { code, .. } if code == "stale_delivery"),
+        ),
+        Response::Error { .. }
+    ));
+    assert!(matches!(
+        wait_for_response_at(
+            nodes[replica].broker_addr,
+            || Request::AckGroup {
+                stream: "restart-jobs".to_owned(),
+                consumer: "workers".to_owned(),
+                member: "member-c".to_owned(),
+                offset: 0,
+                delivery_token: redelivered_token.clone(),
+            },
+            |response| matches!(response, Response::Acknowledged { .. }),
+        ),
+        Response::Acknowledged { .. }
+    ));
+
+    assert!(matches!(
+        wait_for_response_at(
+            nodes[replica].broker_addr,
+            || Request::PollGroup {
+                stream: "restart-jobs".to_owned(),
+                consumer: "workers".to_owned(),
+                member: "member-d".to_owned(),
+            },
+            |response| matches!(response, Response::Empty { .. }),
+        ),
+        Response::Empty { .. }
+    ));
+
+    // Both independent and grouped acknowledgements must remain durable after
+    // the replica rejoins again; neither consumer should see a duplicate.
+    nodes[replica].restart();
+    assert!(matches!(
+        wait_for_response_at(
+            nodes[replica].broker_addr,
+            || Request::Poll {
+                stream: "restart-jobs".to_owned(),
+                consumer: "fanout".to_owned(),
+            },
+            |response| matches!(response, Response::Empty { .. }),
+        ),
+        Response::Empty { .. }
+    ));
+    assert!(matches!(
+        wait_for_response_at(
+            nodes[replica].broker_addr,
+            || Request::PollGroup {
+                stream: "restart-jobs".to_owned(),
+                consumer: "workers".to_owned(),
+                member: "member-e".to_owned(),
+            },
+            |response| matches!(response, Response::Empty { .. }),
+        ),
+        Response::Empty { .. }
+    ));
+    assert_live_nodes(&mut nodes);
+}
+
+#[test]
 fn three_process_cluster_reassigns_group_delivery_after_node_failure() {
     let directory = TempDir::new().unwrap();
     let addresses = (0..9).map(|_| free_addr()).collect::<Vec<_>>();
