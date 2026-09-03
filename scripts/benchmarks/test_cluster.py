@@ -1,6 +1,9 @@
 import argparse
+import socket
+import socketserver
 import sys
 import tempfile
+import threading
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
@@ -40,7 +43,6 @@ from cluster import (  # noqa: E402
     parse_positive_float,
     percentile,
     publish_batch_request,
-    PeerResponseDelayProxy,
     poll_until_redelivered,
     resource_limits,
     run_publish_batch,
@@ -49,6 +51,7 @@ from cluster import (  # noqa: E402
     run_leader_failure_recovery,
     run_retained_recovery,
 )
+from cluster_faults import PeerResponseDelayProxy  # noqa: E402
 from cluster_resources import ProcessStats, process_stats  # noqa: E402
 from profile import summarize_timing_logs  # noqa: E402
 
@@ -453,6 +456,69 @@ class ClusterBenchmarkTests(unittest.TestCase):
     def test_peer_response_proxy_can_close_before_start(self) -> None:
         proxy = PeerResponseDelayProxy(0, 1)
         proxy.close()
+
+    def test_peer_response_proxy_forwards_and_summarizes_delayed_response(self) -> None:
+        def receive_exact(sock: socket.socket, size: int) -> bytes:
+            received = bytearray()
+            while len(received) < size:
+                chunk = sock.recv(size - len(received))
+                if not chunk:
+                    raise AssertionError("target closed a partial test frame")
+                received.extend(chunk)
+            return bytes(received)
+
+        class TargetHandler(socketserver.BaseRequestHandler):
+            def handle(self) -> None:
+                header = receive_exact(self.request, 4)
+                payload = receive_exact(self.request, int.from_bytes(header, "big"))
+                self.request.sendall(header + payload)
+
+        target = socketserver.ThreadingTCPServer(("127.0.0.1", 0), TargetHandler)
+        target.daemon_threads = True
+        target_thread = threading.Thread(target=target.serve_forever, daemon=True)
+        target_thread.start()
+        proxy = PeerResponseDelayProxy(target.server_address[1], 1)
+        try:
+            proxy.start()
+            payload = b'{"Forward":true}'
+            frame = len(payload).to_bytes(4, "big") + payload
+            with socket.create_connection(("127.0.0.1", proxy.port), timeout=2) as client:
+                client.sendall(frame)
+                self.assertEqual(receive_exact(client, len(frame)), frame)
+        finally:
+            proxy.close()
+            target.shutdown()
+            target.server_close()
+            target_thread.join(timeout=5)
+
+        self.assertEqual(
+            proxy.summary(),
+            {
+                "target_port": target.server_address[1],
+                "listen_port": proxy.port,
+                "response_delay_ms": 1,
+                "connections": 1,
+                "max_active_connections": 1,
+                "requests": 1,
+                "responses": 1,
+                "delayed_responses": 1,
+            },
+        )
+
+    def test_peer_response_proxy_closes_client_after_oversized_frame(self) -> None:
+        proxy = PeerResponseDelayProxy(0, 0)
+        proxy.start()
+        try:
+            with socket.create_connection(("127.0.0.1", proxy.port), timeout=2) as client:
+                client.sendall((64 * 1024 * 1024 + 1).to_bytes(4, "big"))
+                self.assertEqual(client.recv(1), b"")
+        finally:
+            proxy.close()
+
+        self.assertFalse(proxy.thread.is_alive())
+        self.assertEqual(proxy.server.active_connections, 0)
+        self.assertEqual(proxy.summary()["connections"], 1)
+        self.assertEqual(proxy.summary()["requests"], 0)
 
     def test_peer_response_delay_requires_native_runtime(self) -> None:
         with patch.object(
