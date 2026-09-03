@@ -3139,7 +3139,14 @@ fn validate_persisted_cluster_storage(data_dir: &Path) -> Result<(), BrokerError
             groups_directory.display()
         )));
     }
-    validate_persisted_group_storage(&groups_directory.join(METADATA_GROUP_ID))?;
+    let metadata_directory = groups_directory.join(METADATA_GROUP_ID);
+    if !metadata_directory.exists() {
+        return Err(BrokerError::Cluster(format!(
+            "missing metadata group storage '{}'; refusing to open a partial clustered layout",
+            metadata_directory.display()
+        )));
+    }
+    validate_persisted_group_storage(&metadata_directory)?;
 
     let data_groups_directory = groups_directory.join("data");
     if !data_groups_directory.exists() {
@@ -5252,6 +5259,8 @@ mod tests {
             .unwrap(),
         )
         .unwrap();
+        let metadata_group_directory = directory.path().join("groups/metadata");
+        fs::create_dir_all(&metadata_group_directory).unwrap();
         let data_group_directory = directory
             .path()
             .join("groups/data")
@@ -5291,6 +5300,61 @@ mod tests {
         };
         assert!(error.contains("unsupported log format version"));
         assert!(error.contains(log_path.to_str().unwrap()));
+        assert_eq!(fs::read(&manifest_path).unwrap(), manifest_before);
+        assert_eq!(fs::read(&log_path).unwrap(), log_before);
+        assert!(metadata_group_directory.exists());
+        assert!(!metadata_group_directory.join("raft-log.json").exists());
+        assert!(!metadata_group_directory.join("state-machine").exists());
+    }
+
+    #[tokio::test]
+    async fn partial_cluster_layout_is_rejected_without_opening_as_empty() {
+        let directory = tempfile::tempdir().unwrap();
+        let cluster_name = "runnel-partial-layout-test";
+        let metadata_path = directory.path().join(STORAGE_METADATA_FILE);
+        let metadata_before = serde_json::to_vec(&PersistedStorageMetadata {
+            version: STORAGE_METADATA_FORMAT_VERSION,
+            cluster_name: cluster_name.to_owned(),
+            node_id: 1,
+        })
+        .unwrap();
+        fs::write(&metadata_path, &metadata_before).unwrap();
+
+        let data_group_directory = directory
+            .path()
+            .join("groups/data")
+            .join(path_component("events"));
+        fs::create_dir_all(&data_group_directory).unwrap();
+        let manifest_path = data_group_directory.join("group.json");
+        let manifest_before = serde_json::to_vec(&DataGroupManifest {
+            stream: "events".to_owned(),
+            stream_id: "stream/events".to_owned(),
+            group_id: "group/events/data".to_owned(),
+        })
+        .unwrap();
+        fs::write(&manifest_path, &manifest_before).unwrap();
+        let log_path = data_group_directory.join("raft-log.json");
+        let log_before = serde_json::to_vec(&serde_json::json!({
+            "version": 1,
+            "last_purged_log_id": null,
+            "log": {},
+            "committed": null,
+            "vote": null,
+        }))
+        .unwrap();
+        fs::write(&log_path, &log_before).unwrap();
+        let peers = BTreeMap::from([(1, "127.0.0.1:0".to_owned())]);
+
+        let error =
+            match PersistentEngine::open(1, cluster_name.to_owned(), directory.path(), peers, true)
+                .await
+            {
+                Ok(_) => panic!("partial clustered storage must be rejected"),
+                Err(error) => error.to_string(),
+            };
+        assert!(error.contains("missing metadata group storage"));
+        assert!(error.contains("partial clustered layout"));
+        assert_eq!(fs::read(&metadata_path).unwrap(), metadata_before);
         assert_eq!(fs::read(&manifest_path).unwrap(), manifest_before);
         assert_eq!(fs::read(&log_path).unwrap(), log_before);
         assert!(!directory.path().join("groups/metadata").exists());

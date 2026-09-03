@@ -1,9 +1,9 @@
 # Safe durable storage upgrades
 
 - Status: exploratory design proposal; not an accepted compatibility decision
-- Last reviewed: 2026-08-27
+- Last reviewed: 2026-09-03
 - Scope: backlog outcome “Make durable storage upgrades safe” and TD-007
-- Baseline: `b26a8e19b59189462946094ab98f19a3df694134`
+- Baseline: `3b22e2398dc54d55c5a8ad7887d2b9954eda7eda`
 
 ## Purpose and boundary
 
@@ -34,6 +34,79 @@ artifacts:
 The current refusal of the earlier single-group clustered layout is the safe
 default. It is an explicit unsupported migration, not evidence that a future
 in-place conversion is safe.
+
+## Implemented compatibility contract
+
+The current implementation supports opening a fresh directory and reopening a
+directory in the current split metadata/data-group layout. It also supports a
+narrow read-forward case for legacy version-1 state-machine checkpoints and
+snapshot payloads. Opening those legacy payloads does not rewrite them during
+preflight; a later normal checkpoint or snapshot write may emit the current
+version-2 payload. This is artifact compatibility, not a general migration
+promise.
+
+The following matrix is the compatibility boundary implemented and tested in
+`runnel-raft`:
+
+| Artifact or layout | Current representation | Supported legacy representation | Unsupported or refused representation | Evidence |
+| --- | --- | --- | --- | --- |
+| Cluster directory | `storage.json` plus `groups/metadata` and optional `groups/data/<stream>/` directories | None | Earlier root-level single-group paths, unmarked grouped state, and a partial grouped layout without metadata storage | `persistent_engine_recovers_committed_state_after_reopen`, `legacy_cluster_layout_is_rejected_without_creating_new_layout`, `unmarked_clustered_layout_is_rejected_without_guessing_identity`, `partial_cluster_layout_is_rejected_without_opening_as_empty` |
+| Root identity marker | Metadata version `1` with matching cluster and node identities | None | Unknown/malformed version or identity mismatch; existing grouped state without a marker | `unsupported_storage_metadata_version_is_rejected_before_opening_groups`, `persisted_storage_rejects_cluster_identity_mismatch_without_rewriting_data`, `unmarked_clustered_layout_is_rejected_without_guessing_identity` |
+| Raft log | Log format version `1` | None | Unknown versions and malformed records | `supported_raft_log_format_recovers_without_rewriting`, `unsupported_raft_log_format_is_rejected_without_rewriting` |
+| State-machine checkpoint | Payload version `2` | Payload version `1` | Unknown versions, malformed JSON, and unknown required fields | `legacy_state_machine_format_recovers_metadata_messages_and_progress`, `unsupported_state_machine_checkpoint_is_rejected_without_creating_journal` |
+| Snapshot payload | Payload version `2` | Payload version `1` (including the legacy omitted-version default) | Unknown versions, malformed JSON, and unknown required fields | `legacy_snapshot_format_recovers_metadata_messages_and_progress`, `unsupported_snapshot_version_is_rejected_without_creating_journal` |
+| State-machine journal | Framed record version `1` | None | Unknown versions, malformed complete records, and oversized records. An incomplete final frame is the one supported crash-recovery exception and is truncated to the last complete frame. | `state_machine_journal_replays_and_discards_a_partial_tail`, `unsupported_state_machine_journal_is_rejected_without_truncating` |
+| Data-group manifest | Current stream, stream identity, group identity, and path agreement | None | Missing/malformed manifest, path mismatch, identity mismatch, or unknown fields | `unsupported_data_group_log_is_rejected_before_opening_new_groups` and the persisted data-group validation paths |
+
+Preflight validates existing state before opening Raft groups. Refusal leaves
+the inspected files unchanged and must not create an empty replacement group.
+The fresh-directory case is the only case that initializes `storage.json`.
+In particular, a current binary must not interpret an unsupported, unmarked, or
+partial directory as a new empty store.
+
+### Supported upgrade and unsupported downgrade
+
+The supported upgrade contract is intentionally small: install a binary that
+can validate the current split layout and every artifact in the matrix, then
+allow it to read the supported version-1 checkpoint/snapshot payloads. The
+current writer may advance those individual payloads to version 2 during
+ordinary checkpointing or snapshotting. No root-layout rewrite, Raft-log
+conversion, dual-write period, or online migration is implied.
+
+There is no supported downgrade in the current implementation. In particular,
+the old single-group layout cannot be opened as the split layout, and an older
+binary is not promised to read a version-2 payload or any target-only state
+written by a newer binary. The code has no reverse converter, migration
+manifest, activation marker, or backup-restore command. Operators must retain
+and restore a verified compatible recovery artifact or perform a separately
+designed migration; changing a version number, deleting the marker, or
+pointing an older binary at the directory is not a downgrade procedure.
+
+### Interrupted-operation boundary and diagnostics
+
+The implementation has recovery behavior for individual persistence writes,
+but no interrupted-migration protocol. Atomic file writes sync a temporary file
+and its parent before rename; an abandoned temporary file is never selected as
+active state. A journal with an incomplete final frame is truncated during
+normal recovery after read-only validation, while a complete malformed or
+unsupported frame fails closed without truncation. Snapshot payloads are
+validated before they replace in-memory state. These are file and replay
+boundaries, not evidence that a directory rewrite can resume safely.
+
+If a process stops while a layout conversion is being performed outside the
+current implementation, the only supported action is to preserve the original
+directory and recover with a compatible binary or recovery copy. There is no
+current activation marker from which startup can choose between source and
+target generations, so a staged directory must never be guessed as active or
+served as an empty store. The new partial-layout test covers the corresponding
+in-repository refusal boundary for a missing metadata group.
+
+Current diagnostics are startup errors, not an operational migration API.
+They include the artifact kind, path, observed version, supported version(s),
+identity mismatch, or the legacy paths that caused refusal. There are no
+active-generation, migration-phase, rollback-window, progress, or orphan-byte
+diagnostics yet; those remain requirements for a future migration design and
+must not be represented by invented metrics in this slice.
 
 ## Evidence from reference systems and research
 
