@@ -1353,7 +1353,12 @@ async fn metrics(State(state): State<HttpState>) -> (StatusCode, String) {
             };
             (
                 StatusCode::OK,
-                format_metrics(health, snapshot_metrics, &state.metrics, state.admission),
+                format_metrics(
+                    Some(health),
+                    Some(snapshot_metrics),
+                    &state.metrics,
+                    state.admission,
+                ),
             )
         }
         Err(error) => {
@@ -1366,49 +1371,67 @@ async fn metrics(State(state): State<HttpState>) -> (StatusCode, String) {
                 .health_check_failures
                 .fetch_add(1, Ordering::Relaxed);
             error!(%error, "metrics check failed");
-            (StatusCode::SERVICE_UNAVAILABLE, String::new())
+            // Keep process and admission telemetry scrapeable without turning unavailable
+            // engine-derived samples into fresh-looking zeroes or stale values.
+            (
+                StatusCode::OK,
+                format_metrics(None, None, &state.metrics, state.admission),
+            )
         }
     }
 }
 
 fn format_metrics(
-    health: runnel_engine::HealthSnapshot,
-    snapshot_metrics: SnapshotMetricsSnapshot,
+    health: Option<runnel_engine::HealthSnapshot>,
+    snapshot_metrics: Option<SnapshotMetricsSnapshot>,
     metrics: &ServerMetrics,
     admission: ProtocolAdmission,
 ) -> String {
     let mut output = String::with_capacity(5_000);
+    if let Some(health) = health {
+        writeln!(
+            output,
+            "# HELP runnel_streams Number of streams currently known to the broker."
+        )
+        .unwrap();
+        writeln!(
+            output,
+            "# TYPE runnel_streams gauge\nrunnel_streams {}",
+            health.streams
+        )
+        .unwrap();
+        writeln!(
+            output,
+            "# HELP runnel_storage_bytes Bytes currently occupied by broker storage."
+        )
+        .unwrap();
+        writeln!(
+            output,
+            "# TYPE runnel_storage_bytes gauge\nrunnel_storage_bytes {}",
+            health.storage_bytes
+        )
+        .unwrap();
+        writeln!(
+            output,
+            "# HELP runnel_in_flight_deliveries Messages currently tracked as delivered but not yet acknowledged."
+        )
+        .unwrap();
+        writeln!(
+            output,
+            "# TYPE runnel_in_flight_deliveries gauge\nrunnel_in_flight_deliveries {}",
+            health.in_flight_deliveries
+        )
+        .unwrap();
+    }
     writeln!(
         output,
-        "# HELP runnel_streams Number of streams currently known to the broker."
+        "# HELP runnel_engine_health_available Whether this scrape includes a fresh bounded engine health snapshot."
     )
     .unwrap();
     writeln!(
         output,
-        "# TYPE runnel_streams gauge\nrunnel_streams {}",
-        health.streams
-    )
-    .unwrap();
-    writeln!(
-        output,
-        "# HELP runnel_storage_bytes Bytes currently occupied by broker storage."
-    )
-    .unwrap();
-    writeln!(
-        output,
-        "# TYPE runnel_storage_bytes gauge\nrunnel_storage_bytes {}",
-        health.storage_bytes
-    )
-    .unwrap();
-    writeln!(
-        output,
-        "# HELP runnel_in_flight_deliveries Messages currently tracked as delivered but not yet acknowledged."
-    )
-    .unwrap();
-    writeln!(
-        output,
-        "# TYPE runnel_in_flight_deliveries gauge\nrunnel_in_flight_deliveries {}",
-        health.in_flight_deliveries
+        "# TYPE runnel_engine_health_available gauge\nrunnel_engine_health_available {}",
+        u8::from(health.is_some())
     )
     .unwrap();
     writeln!(
@@ -1600,28 +1623,30 @@ fn format_metrics(
         metrics.response_bytes.load(Ordering::Relaxed)
     )
     .unwrap();
-    writeln!(
-        output,
-        "# HELP runnel_redeliveries_total Messages delivered again after an acknowledgement timeout."
-    )
-    .unwrap();
-    writeln!(
-        output,
-        "# TYPE runnel_redeliveries_total counter\nrunnel_redeliveries_total {}",
-        health.redeliveries
-    )
-    .unwrap();
-    writeln!(
-        output,
-        "# HELP runnel_dead_letters_total Messages moved to a dead-letter stream after reaching the delivery limit."
-    )
-    .unwrap();
-    writeln!(
-        output,
-        "# TYPE runnel_dead_letters_total counter\nrunnel_dead_letters_total {}",
-        health.dead_letters
-    )
-    .unwrap();
+    if let Some(health) = health {
+        writeln!(
+            output,
+            "# HELP runnel_redeliveries_total Messages delivered again after an acknowledgement timeout."
+        )
+        .unwrap();
+        writeln!(
+            output,
+            "# TYPE runnel_redeliveries_total counter\nrunnel_redeliveries_total {}",
+            health.redeliveries
+        )
+        .unwrap();
+        writeln!(
+            output,
+            "# HELP runnel_dead_letters_total Messages moved to a dead-letter stream after reaching the delivery limit."
+        )
+        .unwrap();
+        writeln!(
+            output,
+            "# TYPE runnel_dead_letters_total counter\nrunnel_dead_letters_total {}",
+            health.dead_letters
+        )
+        .unwrap();
+    }
     writeln!(
         output,
         "# HELP runnel_deliveries_total Messages returned by successful poll operations."
@@ -1803,16 +1828,18 @@ fn format_metrics(
         )
         .unwrap();
     }
-    writeln!(output, "# TYPE runnel_snapshot_builds_started_total counter\nrunnel_snapshot_builds_started_total {}", snapshot_metrics.builds_started).unwrap();
-    writeln!(output, "# TYPE runnel_snapshot_builds_completed_total counter\nrunnel_snapshot_builds_completed_total {}", snapshot_metrics.builds_completed).unwrap();
-    writeln!(output, "# TYPE runnel_snapshot_build_failures_total counter\nrunnel_snapshot_build_failures_total {}", snapshot_metrics.build_failures).unwrap();
-    writeln!(output, "# TYPE runnel_snapshot_installs_started_total counter\nrunnel_snapshot_installs_started_total {}", snapshot_metrics.installs_started).unwrap();
-    writeln!(output, "# TYPE runnel_snapshot_installs_completed_total counter\nrunnel_snapshot_installs_completed_total {}", snapshot_metrics.installs_completed).unwrap();
-    writeln!(output, "# TYPE runnel_snapshot_install_failures_total counter\nrunnel_snapshot_install_failures_total {}", snapshot_metrics.install_failures).unwrap();
-    writeln!(output, "# TYPE runnel_snapshot_install_bytes_total counter\nrunnel_snapshot_install_bytes_total {}", snapshot_metrics.install_bytes).unwrap();
-    writeln!(output, "# TYPE runnel_snapshot_installs_in_progress gauge\nrunnel_snapshot_installs_in_progress {}", snapshot_metrics.installs_in_progress).unwrap();
-    writeln!(output, "# TYPE runnel_snapshot_transfer_chunks_received_total counter\nrunnel_snapshot_transfer_chunks_received_total {}", snapshot_metrics.transfer_chunks).unwrap();
-    writeln!(output, "# TYPE runnel_snapshot_transfer_final_chunks_received_total counter\nrunnel_snapshot_transfer_final_chunks_received_total {}", snapshot_metrics.transfer_final_chunks).unwrap();
-    writeln!(output, "# TYPE runnel_snapshot_transfer_bytes_received_total counter\nrunnel_snapshot_transfer_bytes_received_total {}", snapshot_metrics.transfer_bytes).unwrap();
+    if let Some(snapshot_metrics) = snapshot_metrics {
+        writeln!(output, "# TYPE runnel_snapshot_builds_started_total counter\nrunnel_snapshot_builds_started_total {}", snapshot_metrics.builds_started).unwrap();
+        writeln!(output, "# TYPE runnel_snapshot_builds_completed_total counter\nrunnel_snapshot_builds_completed_total {}", snapshot_metrics.builds_completed).unwrap();
+        writeln!(output, "# TYPE runnel_snapshot_build_failures_total counter\nrunnel_snapshot_build_failures_total {}", snapshot_metrics.build_failures).unwrap();
+        writeln!(output, "# TYPE runnel_snapshot_installs_started_total counter\nrunnel_snapshot_installs_started_total {}", snapshot_metrics.installs_started).unwrap();
+        writeln!(output, "# TYPE runnel_snapshot_installs_completed_total counter\nrunnel_snapshot_installs_completed_total {}", snapshot_metrics.installs_completed).unwrap();
+        writeln!(output, "# TYPE runnel_snapshot_install_failures_total counter\nrunnel_snapshot_install_failures_total {}", snapshot_metrics.install_failures).unwrap();
+        writeln!(output, "# TYPE runnel_snapshot_install_bytes_total counter\nrunnel_snapshot_install_bytes_total {}", snapshot_metrics.install_bytes).unwrap();
+        writeln!(output, "# TYPE runnel_snapshot_installs_in_progress gauge\nrunnel_snapshot_installs_in_progress {}", snapshot_metrics.installs_in_progress).unwrap();
+        writeln!(output, "# TYPE runnel_snapshot_transfer_chunks_received_total counter\nrunnel_snapshot_transfer_chunks_received_total {}", snapshot_metrics.transfer_chunks).unwrap();
+        writeln!(output, "# TYPE runnel_snapshot_transfer_final_chunks_received_total counter\nrunnel_snapshot_transfer_final_chunks_received_total {}", snapshot_metrics.transfer_final_chunks).unwrap();
+        writeln!(output, "# TYPE runnel_snapshot_transfer_bytes_received_total counter\nrunnel_snapshot_transfer_bytes_received_total {}", snapshot_metrics.transfer_bytes).unwrap();
+    }
     output
 }

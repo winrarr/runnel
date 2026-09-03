@@ -705,6 +705,43 @@ fn storage_stall_is_bounded_and_durable_traffic_continues() {
     );
 
     let started = Instant::now();
+    let stalled_metrics_response = http_metrics_response(server.http_addr);
+    assert!(
+        stalled_metrics_response.starts_with("HTTP/1.1 200"),
+        "metrics should remain scrapeable while engine health is unavailable: {stalled_metrics_response}"
+    );
+    assert!(
+        started.elapsed() < Duration::from_secs(2),
+        "metrics should report a stalled storage dependency within its health deadline"
+    );
+    let stalled_metrics = response_body(&stalled_metrics_response);
+    assert_eq!(
+        metric_value(stalled_metrics, "runnel_engine_health_available"),
+        0
+    );
+    assert!(has_metric(stalled_metrics, "runnel_active_connections"));
+    assert!(has_metric(
+        stalled_metrics,
+        "runnel_broker_max_in_flight_requests"
+    ));
+    assert!(has_metric(
+        stalled_metrics,
+        "runnel_metrics_scrape_failures_total"
+    ));
+    for name in [
+        "runnel_streams",
+        "runnel_storage_bytes",
+        "runnel_in_flight_deliveries",
+        "runnel_redeliveries_total",
+        "runnel_dead_letters_total",
+    ] {
+        assert!(
+            !has_metric(stalled_metrics, name),
+            "unavailable engine metric {name} must not be presented as fresh"
+        );
+    }
+
+    let started = Instant::now();
     assert!(matches!(
         request(server.broker_addr, Request::Health),
         Response::Error { code, .. } if code == "request_timeout"
@@ -741,6 +778,28 @@ fn storage_stall_is_bounded_and_durable_traffic_continues() {
         started.elapsed() < Duration::from_secs(1),
         "durable traffic must not wait for one stalled storage operation"
     );
+
+    let fifo_writer = fs::OpenOptions::new()
+        .write(true)
+        .open(&fifo)
+        .expect("opening the FIFO writer should release the stalled storage reader");
+    drop(fifo_writer);
+    let mut fifo_reader = fs::OpenOptions::new()
+        .read(true)
+        .open(&fifo)
+        .expect("opening the FIFO reader should release the stalled storage writer");
+    let mut discarded = Vec::new();
+    fifo_reader
+        .read_to_end(&mut discarded)
+        .expect("the stalled storage writer should close after recovery");
+
+    let metrics = wait_for_metric_at_least(server.http_addr, "runnel_streams", 1);
+    assert_eq!(metric_value(&metrics, "runnel_engine_health_available"), 1);
+    assert!(has_metric(&metrics, "runnel_streams"));
+    assert!(has_metric(&metrics, "runnel_storage_bytes"));
+    assert!(has_metric(&metrics, "runnel_in_flight_deliveries"));
+    assert!(has_metric(&metrics, "runnel_redeliveries_total"));
+    assert!(has_metric(&metrics, "runnel_dead_letters_total"));
 }
 
 fn server_binary() -> PathBuf {
@@ -816,6 +875,11 @@ fn free_addr() -> SocketAddr {
 }
 
 fn http_metrics(address: SocketAddr) -> String {
+    let response = http_metrics_response(address);
+    response_body(&response).to_owned()
+}
+
+fn http_metrics_response(address: SocketAddr) -> String {
     let mut stream =
         TcpStream::connect(address).expect("metrics endpoint should accept connections");
     stream
@@ -829,8 +893,12 @@ fn http_metrics(address: SocketAddr) -> String {
         .read_to_string(&mut response)
         .expect("metrics response should be readable");
     response
+}
+
+fn response_body(response: &str) -> &str {
+    response
         .split_once("\r\n\r\n")
-        .map_or(response.clone(), |(_, body)| body.to_owned())
+        .map_or(response, |(_, body)| body)
 }
 
 #[cfg(unix)]
@@ -864,6 +932,12 @@ fn metric_float_value(metrics: &str, name: &str) -> f64 {
         .find_map(|line| line.strip_prefix(&format!("{name} ")))
         .and_then(|value| value.parse().ok())
         .unwrap_or_default()
+}
+
+fn has_metric(metrics: &str, name: &str) -> bool {
+    metrics
+        .lines()
+        .any(|line| line.starts_with(&format!("{name} ")))
 }
 
 fn assert_metric_type(metrics: &str, name: &str, metric_type: &str) {
