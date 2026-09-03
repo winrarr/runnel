@@ -117,7 +117,7 @@ Goal: let multiple worker instances share one durable consumer while preserving 
 
 Rationale: small applications need a single durable worker without extra coordination, while growing applications should be able to add workers without learning about partitions or triggering application-managed rebalancing.
 
-Current progress: local and clustered grouped delivery now cover durable attempts, out-of-order acknowledgements, expiry, stale-delivery fencing, and bounded expiry lookup. The shared engine also reports currently tracked in-flight deliveries. Restart, failover, replay, retry-policy, dead-letter, and scalable ownership behavior remain incomplete.
+Current progress: local and clustered grouped delivery now cover durable attempts, out-of-order acknowledgements, expiry, stale-delivery fencing, bounded expiry lookup, and an initial real-process failure/rejoin path that preserves an acknowledged delivery and keeps its old token from committing again. The shared engine also reports currently tracked in-flight deliveries. Broader restart, failover, replay, retry-policy, dead-letter, and scalable ownership behavior remain incomplete.
 
 Constraints:
 
