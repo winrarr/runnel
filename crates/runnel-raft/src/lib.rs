@@ -9,8 +9,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
-use std::io::{Cursor, Write};
-use std::mem::size_of;
+use std::io::Cursor;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::Mutex as StdMutex;
@@ -38,6 +37,18 @@ use tokio::sync::{Mutex, RwLock};
 
 mod log_store;
 mod network;
+mod state_machine_journal;
+
+use state_machine_journal::{
+    FILE as STATE_MACHINE_JOURNAL_FILE, JournalEntryRef as StateMachineJournalEntryRef,
+    append as append_state_machine_journal_entry, is_log_after, read as read_state_machine_journal,
+    replay as replay_state_machine_journal, validate as validate_state_machine_journal,
+};
+#[cfg(test)]
+use state_machine_journal::{
+    FORMAT_VERSION as STATE_MACHINE_JOURNAL_FORMAT_VERSION,
+    JournalEntry as StateMachineJournalEntry,
+};
 
 pub type NodeId = u64;
 pub const METADATA_GROUP_ID: &str = "metadata";
@@ -82,9 +93,6 @@ const LEGACY_SINGLE_GROUP_PATHS: &[&str] = &[
     "snapshot.json",
     "state-machine.log",
 ];
-const STATE_MACHINE_JOURNAL_FORMAT_VERSION: u32 = 1;
-const STATE_MACHINE_JOURNAL_FILE: &str = "state-machine.log";
-const MAX_STATE_MACHINE_JOURNAL_RECORD_SIZE: u32 = 64 * 1024 * 1024;
 const DEAD_LETTER_SUFFIX: &str = ".dead-letter";
 const DEAD_LETTER_HASH_PREFIX: &str = "runnel.dead-letter.";
 
@@ -548,31 +556,6 @@ struct StoredSnapshot {
     data: Vec<u8>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct StateMachineJournalEntry {
-    version: u32,
-    log_id: LogId<NodeId>,
-    payload: EntryPayload<TypeConfig>,
-}
-
-#[derive(Serialize)]
-struct StateMachineJournalEntryRef<'a> {
-    version: u32,
-    log_id: LogId<NodeId>,
-    payload: &'a EntryPayload<TypeConfig>,
-}
-
-impl<'a> StateMachineJournalEntryRef<'a> {
-    fn from_entry(entry: &'a Entry<TypeConfig>) -> Self {
-        Self {
-            version: STATE_MACHINE_JOURNAL_FORMAT_VERSION,
-            log_id: entry.log_id,
-            payload: &entry.payload,
-        }
-    }
-}
-
 #[derive(Debug, Default)]
 struct SnapshotMetrics {
     builds_started: AtomicU64,
@@ -972,79 +955,6 @@ impl StateMachineStore {
     }
 }
 
-fn read_state_machine_journal(path: &Path) -> Result<Vec<StateMachineJournalEntry>, BrokerError> {
-    let (entries, truncated_at) = parse_state_machine_journal(path)?;
-    let Some(truncated_at) = truncated_at else {
-        return Ok(entries);
-    };
-    let file = fs::OpenOptions::new().read(true).write(true).open(path)?;
-    file.set_len(truncated_at as u64)?;
-    file.sync_data()?;
-    Ok(entries)
-}
-
-fn validate_state_machine_journal(path: &Path) -> Result<(), BrokerError> {
-    parse_state_machine_journal(path).map(|_| ())
-}
-
-fn parse_state_machine_journal(
-    path: &Path,
-) -> Result<(Vec<StateMachineJournalEntry>, Option<usize>), BrokerError> {
-    if !path.exists() {
-        return Ok((Vec::new(), None));
-    }
-    let bytes = fs::read(path).map_err(|error| {
-        BrokerError::Cluster(format!(
-            "could not read state-machine journal '{}': {error}",
-            path.display()
-        ))
-    })?;
-    let mut cursor = 0usize;
-    let mut truncated_at = None;
-    let mut entries = Vec::new();
-    while cursor < bytes.len() {
-        let record_start = cursor;
-        if bytes.len() - cursor < size_of::<u32>() {
-            truncated_at = Some(record_start);
-            break;
-        }
-        let record_len = u32::from_le_bytes(
-            bytes[cursor..cursor + size_of::<u32>()]
-                .try_into()
-                .expect("journal length has a fixed size"),
-        );
-        cursor += size_of::<u32>();
-        if record_len > MAX_STATE_MACHINE_JOURNAL_RECORD_SIZE {
-            return Err(BrokerError::Cluster(format!(
-                "state-machine journal record is too large: {record_len} bytes"
-            )));
-        }
-        let record_len = record_len as usize;
-        if bytes.len() - cursor < record_len {
-            truncated_at = Some(record_start);
-            break;
-        }
-        let entry: StateMachineJournalEntry =
-            serde_json::from_slice(&bytes[cursor..cursor + record_len]).map_err(|error| {
-                BrokerError::Cluster(format!(
-                    "invalid state-machine journal record in '{}': {error}",
-                    path.display()
-                ))
-            })?;
-        if entry.version != STATE_MACHINE_JOURNAL_FORMAT_VERSION {
-            return Err(BrokerError::Cluster(format!(
-                "unsupported state-machine journal format version {} in '{}' (supported version {})",
-                entry.version,
-                path.display(),
-                STATE_MACHINE_JOURNAL_FORMAT_VERSION
-            )));
-        }
-        entries.push(entry);
-        cursor += record_len;
-    }
-    Ok((entries, truncated_at))
-}
-
 fn validate_state_machine_storage(path: &Path) -> Result<(), BrokerError> {
     if !path.exists() {
         return Ok(());
@@ -1065,57 +975,6 @@ fn validate_state_machine_storage(path: &Path) -> Result<(), BrokerError> {
         })?;
     }
     validate_state_machine_journal(&path.join(STATE_MACHINE_JOURNAL_FILE))
-}
-
-fn append_state_machine_journal_entry<T: Serialize>(
-    file: &mut fs::File,
-    entry: &T,
-) -> std::io::Result<()> {
-    let bytes = serde_json::to_vec(entry).map_err(std::io::Error::other)?;
-    if bytes.len() > MAX_STATE_MACHINE_JOURNAL_RECORD_SIZE as usize {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            "state-machine journal record exceeds configured size",
-        ));
-    }
-    let length = u32::try_from(bytes.len()).map_err(|_| {
-        std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            "state-machine journal record exceeds u32 length",
-        )
-    })?;
-    file.write_all(&length.to_le_bytes())?;
-    file.write_all(&bytes)
-}
-
-fn replay_state_machine_journal(
-    state: &mut StateMachineData,
-    entries: impl IntoIterator<Item = StateMachineJournalEntry>,
-    kind: &GroupKind,
-) -> Result<(), BrokerError> {
-    for entry in entries {
-        if state
-            .last_applied_log
-            .is_some_and(|last| !is_log_after(entry.log_id, last))
-        {
-            continue;
-        }
-        state.last_applied_log = Some(entry.log_id);
-        match entry.payload {
-            EntryPayload::Blank => {}
-            EntryPayload::Membership(membership) => {
-                state.last_membership = StoredMembership::new(Some(entry.log_id), membership);
-            }
-            EntryPayload::Normal(command) => {
-                apply_command(&mut state.state, command, kind, entry.log_id);
-            }
-        }
-    }
-    Ok(())
-}
-
-fn is_log_after(candidate: LogId<NodeId>, current: LogId<NodeId>) -> bool {
-    (candidate.leader_id.term, candidate.index) > (current.leader_id.term, current.index)
 }
 
 fn is_optional_log_after(candidate: Option<LogId<NodeId>>, current: Option<LogId<NodeId>>) -> bool {
@@ -3890,6 +3749,7 @@ fn atomic_write(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Write;
 
     fn grouped_test_state() -> SnapshotState {
         let mut state = SnapshotState::default();
