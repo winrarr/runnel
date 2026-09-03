@@ -6,6 +6,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock, Weak};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+#[cfg(test)]
+use std::sync::atomic::AtomicBool;
+
 #[cfg(feature = "instrumentation")]
 use runnel_engine::StageTimer;
 use runnel_engine::{
@@ -106,6 +109,8 @@ struct BrokerState {
     delivery_epoch: u128,
     next_delivery_id: AtomicU64,
     storage_executor: Arc<StorageExecutor>,
+    #[cfg(test)]
+    fail_next_dead_letter_ack_persist: AtomicBool,
 }
 
 struct StorageExecutor {
@@ -687,6 +692,8 @@ impl Broker {
                 delivery_epoch: delivery_epoch(),
                 next_delivery_id: AtomicU64::new(0),
                 storage_executor: Arc::new(StorageExecutor::new()),
+                #[cfg(test)]
+                fail_next_dead_letter_ack_persist: AtomicBool::new(false),
             }),
         })
     }
@@ -848,14 +855,12 @@ impl Broker {
                 && !stream.ends_with(DEAD_LETTER_SUFFIX)
             {
                 self.dead_letter_record(&mut stream_state, stream, consumer, &candidate)?;
-                persist_consumer_event(
+                self.persist_dead_letter_ack(
                     &root,
                     stream,
                     consumer,
                     &consumer_state,
-                    ConsumerStateEvent::Acknowledge {
-                        offset: candidate.offset,
-                    },
+                    candidate.offset,
                 )?;
                 consumer_state.acknowledge(candidate.offset);
                 cache_consumer_state(
@@ -1072,6 +1077,42 @@ impl Broker {
             .log
             .append_with_move_id(message.key, message.payload, move_id)?;
         Ok(())
+    }
+
+    fn persist_dead_letter_ack(
+        &self,
+        root: &Path,
+        stream: &str,
+        consumer: &str,
+        current_state: &ConsumerState,
+        offset: Offset,
+    ) -> Result<(), BrokerError> {
+        #[cfg(test)]
+        if self
+            .inner
+            .fail_next_dead_letter_ack_persist
+            .swap(false, Ordering::AcqRel)
+        {
+            return Err(BrokerError::Io(io::Error::new(
+                io::ErrorKind::Interrupted,
+                "injected dead-letter acknowledgement persistence failure",
+            )));
+        }
+
+        persist_consumer_event(
+            root,
+            stream,
+            consumer,
+            current_state,
+            ConsumerStateEvent::Acknowledge { offset },
+        )
+    }
+
+    #[cfg(test)]
+    fn fail_next_dead_letter_ack_persist(&self) {
+        self.inner
+            .fail_next_dead_letter_ack_persist
+            .store(true, Ordering::Release);
     }
 
     fn next_delivery_token(&self) -> String {
@@ -3385,6 +3426,68 @@ mod tests {
             broker.poll("events.dead-letter", "inspector").unwrap(),
             PollResult::Empty
         );
+    }
+
+    #[test]
+    fn dead_letter_move_reconciles_after_source_ack_persistence_failure_and_restart() {
+        let directory = tempdir().unwrap();
+        let config = BrokerConfig {
+            ack_timeout: Duration::ZERO,
+            max_delivery_attempts: Some(1),
+        };
+        let move_id = dead_letter_move_id("events", "worker", 0).unwrap();
+
+        {
+            let broker = Broker::open(directory.path(), config.clone()).unwrap();
+            broker
+                .publish("events", Some("order-1".to_owned()), b"poison".to_vec())
+                .unwrap();
+            assert!(matches!(
+                broker.poll("events", "worker").unwrap(),
+                PollResult::Message(Message {
+                    offset: 0,
+                    delivery_attempt: Some(1),
+                    ..
+                })
+            ));
+
+            broker.fail_next_dead_letter_ack_persist();
+            let error = broker.poll("events", "worker").unwrap_err();
+            assert!(matches!(
+                error,
+                BrokerError::Io(error) if error.kind() == io::ErrorKind::Interrupted
+            ));
+
+            let source_state = load_consumer_state(directory.path(), "events", "worker").unwrap();
+            assert_eq!(source_state.committed_offset, 0);
+            assert_eq!(source_state.delivery_attempts.get(&0), Some(&1));
+
+            let target = broker.get_stream("events.dead-letter").unwrap();
+            let target = broker.lock_stream(&target).unwrap();
+            assert_eq!(target.log.next_offset, 1);
+            assert_eq!(target.log.request_ids.get(&move_id), Some(&0));
+        }
+
+        {
+            let broker = Broker::open(directory.path(), config.clone()).unwrap();
+            assert_eq!(broker.poll("events", "worker").unwrap(), PollResult::Empty);
+
+            let source_state = load_consumer_state(directory.path(), "events", "worker").unwrap();
+            assert_eq!(source_state.committed_offset, 1);
+            assert!(source_state.delivery_attempts.is_empty());
+
+            let target = broker.get_stream("events.dead-letter").unwrap();
+            let target = broker.lock_stream(&target).unwrap();
+            assert_eq!(target.log.next_offset, 1);
+            assert_eq!(target.log.request_ids.get(&move_id), Some(&0));
+        }
+
+        let broker = Broker::open(directory.path(), config).unwrap();
+        assert_eq!(broker.poll("events", "worker").unwrap(), PollResult::Empty);
+        let target = broker.get_stream("events.dead-letter").unwrap();
+        let target = broker.lock_stream(&target).unwrap();
+        assert_eq!(target.log.next_offset, 1);
+        assert_eq!(target.log.request_ids.get(&move_id), Some(&0));
     }
 
     #[test]
