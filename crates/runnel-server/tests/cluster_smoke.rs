@@ -743,6 +743,46 @@ fn three_process_cluster_reassigns_group_delivery_after_node_failure() {
         Response::Acknowledged { .. }
     ));
 
+    nodes[0].restart();
+    assert!(matches!(
+        wait_for_response_at(
+            nodes[0].broker_addr,
+            || Request::PollGroup {
+                stream: "failover-jobs".to_owned(),
+                consumer: "workers".to_owned(),
+                member: "member-f".to_owned(),
+            },
+            |response| matches!(response, Response::Empty { .. }),
+        ),
+        Response::Empty { .. }
+    ));
+    // The survivor's acknowledgement must remain terminal after the failed
+    // node rejoins; retrying the old token can only report already-acknowledged
+    // progress and must not commit a new delivery.
+    assert!(matches!(
+        wait_for_response_at(
+            nodes[0].broker_addr,
+            || Request::AckGroup {
+                stream: "failover-jobs".to_owned(),
+                consumer: "workers".to_owned(),
+                member: "member-a".to_owned(),
+                offset: 0,
+                delivery_token: first_token.clone(),
+            },
+            |response| matches!(
+                response,
+                Response::Acknowledged {
+                    already_acknowledged: true,
+                    ..
+                }
+            ),
+        ),
+        Response::Acknowledged {
+            already_acknowledged: true,
+            ..
+        }
+    ));
+
     assert!(matches!(
         wait_for_response_at(
             nodes[survivor].broker_addr,
