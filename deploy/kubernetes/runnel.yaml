@@ -1,8 +1,15 @@
+# Development-only static-cluster manifest. This file intentionally does not
+# provide a PodDisruptionBudget, topology spread, backup policy, ServiceMonitor,
+# TLS/authentication, storage-capacity policy, or supported rolling upgrade.
+# See README.md for the readiness, liveness, persistence, disruption,
+# control-plane, resource, metrics, and compatibility assumptions.
 apiVersion: v1
 kind: Service
 metadata:
   name: runnel
 spec:
+  # Client and HTTP traffic use readiness-filtered endpoints. This Service
+  # does not provide TLS, authentication, or a metrics scrape policy.
   selector:
     app.kubernetes.io/name: runnel
   ports:
@@ -18,6 +25,8 @@ kind: Service
 metadata:
   name: runnel-headless
 spec:
+  # The broker uses these stable DNS names for its static peer list; Raft does
+  # not call the Kubernetes API for membership, elections, or recovery.
   clusterIP: None
   selector:
     app.kubernetes.io/name: runnel
@@ -40,6 +49,10 @@ spec:
   serviceName: runnel-headless
   podManagementPolicy: Parallel
   replicas: 3
+  # Keep image changes explicit while clustered storage and peer compatibility
+  # remain undefined. Delete/restart one pod at a time for experiments.
+  updateStrategy:
+    type: OnDelete
   selector:
     matchLabels:
       app.kubernetes.io/name: runnel
@@ -48,6 +61,8 @@ spec:
       labels:
         app.kubernetes.io/name: runnel
     spec:
+      # There is no disruption budget, anti-affinity, or topology spread in
+      # this development manifest; keep voluntary disruption to one member.
       terminationGracePeriodSeconds: 30
       securityContext:
         runAsNonRoot: true
@@ -84,6 +99,9 @@ spec:
             - name: peer
               containerPort: 7000
           startupProbe:
+            # /health/live checks only that the HTTP handler responds. The
+            # process opens the engine before binding this listener, so the
+            # startup window covers slow persistent-state recovery.
             httpGet:
               path: /health/live
               port: http
@@ -91,6 +109,9 @@ spec:
             timeoutSeconds: 2
             failureThreshold: 60
           readinessProbe:
+            # /health/ready checks initialized Raft metadata and an elected
+            # leader through the engine health path; it is not local-leader,
+            # replication-lag, quorum-margin, or disk-capacity validation.
             httpGet:
               path: /health/ready
               port: http
@@ -98,6 +119,8 @@ spec:
             timeoutSeconds: 5
             failureThreshold: 3
           livenessProbe:
+            # Liveness intentionally does not restart a node merely because
+            # the engine is not ready or the cluster has no leader.
             httpGet:
               path: /health/live
               port: http
@@ -110,6 +133,8 @@ spec:
             capabilities:
               drop: [ALL]
           resources:
+            # Illustrative per-pod values; they are not measured capacity
+            # guidance and do not reserve or limit persistent storage.
             requests:
               cpu: 100m
               memory: 128Mi
@@ -123,6 +148,8 @@ spec:
     - metadata:
         name: data
       spec:
+        # Each ordinal receives an independent claim. The default StorageClass
+        # is used because no storageClassName is selected here.
         accessModes: [ReadWriteOnce]
         resources:
           requests:
