@@ -1523,7 +1523,7 @@ fn format_metrics(
     .unwrap();
     writeln!(
         output,
-        "# HELP runnel_broker_requests_rejected_total Broker protocol requests rejected before engine execution."
+        "# HELP runnel_broker_requests_rejected_total Broker protocol requests rejected before completion, including admission, framing, and timeout failures."
     )
     .unwrap();
     writeln!(

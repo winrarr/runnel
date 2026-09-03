@@ -430,7 +430,7 @@ fn slow_writer_and_in_flight_admission_are_bounded() {
 }
 
 #[test]
-fn sustained_in_flight_pressure_recovers_without_connection_churn() {
+fn sustained_in_flight_pressure_reports_metrics_and_recovers() {
     let directory = TempDir::new().unwrap();
     let server = RunningServer::start(
         directory.path(),
@@ -473,9 +473,27 @@ fn sustained_in_flight_pressure_recovers_without_connection_churn() {
     let saturation_before = metric_value(&metrics_before, "runnel_broker_request_saturation_total");
     let requests_rejected_before =
         metric_value(&metrics_before, "runnel_broker_requests_rejected_total");
+    let request_timeouts_before =
+        metric_value(&metrics_before, "runnel_broker_request_timeouts_total");
     let response_write_timeouts_before = metric_value(
         &metrics_before,
         "runnel_broker_response_write_timeouts_total",
+    );
+    assert_metric_type(&metrics_before, "runnel_active_requests", "gauge");
+    assert_metric_type(
+        &metrics_before,
+        "runnel_broker_requests_rejected_total",
+        "counter",
+    );
+    assert_metric_type(
+        &metrics_before,
+        "runnel_broker_request_timeouts_total",
+        "counter",
+    );
+    assert_metric_type(
+        &metrics_before,
+        "runnel_broker_request_saturation_total",
+        "counter",
     );
 
     let mut slow_writer = TcpStream::connect(server.broker_addr).unwrap();
@@ -524,6 +542,11 @@ fn sustained_in_flight_pressure_recovers_without_connection_churn() {
         metric_value(&metrics, "runnel_broker_requests_rejected_total"),
         requests_rejected_before + expected_rejections
     );
+    assert_eq!(
+        metric_value(&metrics, "runnel_broker_request_timeouts_total"),
+        request_timeouts_before,
+        "saturation rejections must not be counted as request timeouts"
+    );
     assert_eq!(metric_value(&metrics, "runnel_active_requests"), 1);
     assert_eq!(metric_value(&metrics, "runnel_active_connections"), 4);
 
@@ -533,6 +556,16 @@ fn sustained_in_flight_pressure_recovers_without_connection_churn() {
         response_write_timeouts_before + 1,
     );
     assert_eq!(metric_value(&metrics, "runnel_active_requests"), 0);
+    assert_eq!(
+        metric_value(&metrics, "runnel_active_connections"),
+        3,
+        "only the timed-out slow-writer connection should be closed"
+    );
+    assert_eq!(
+        metric_value(&metrics, "runnel_broker_request_timeouts_total"),
+        request_timeouts_before,
+        "a response-write timeout must remain distinct from request execution timeout"
+    );
 
     assert!(matches!(
         send_on_connection(&mut pressure_connections[0], Request::Health),
@@ -560,6 +593,21 @@ fn sustained_in_flight_pressure_recovers_without_connection_churn() {
         ),
         Response::Message { payload, .. } if payload == "durable-recovery"
     ));
+    let metrics = http_metrics(server.http_addr);
+    assert_eq!(metric_value(&metrics, "runnel_active_requests"), 0);
+    assert_eq!(metric_value(&metrics, "runnel_active_connections"), 3);
+    assert_eq!(
+        metric_value(&metrics, "runnel_broker_requests_rejected_total"),
+        requests_rejected_before + expected_rejections
+    );
+    assert_eq!(
+        metric_value(&metrics, "runnel_broker_request_saturation_total"),
+        saturation_before + expected_rejections
+    );
+    assert_eq!(
+        metric_value(&metrics, "runnel_broker_request_timeouts_total"),
+        request_timeouts_before
+    );
 }
 
 #[cfg(unix)]
@@ -816,6 +864,14 @@ fn metric_float_value(metrics: &str, name: &str) -> f64 {
         .find_map(|line| line.strip_prefix(&format!("{name} ")))
         .and_then(|value| value.parse().ok())
         .unwrap_or_default()
+}
+
+fn assert_metric_type(metrics: &str, name: &str, metric_type: &str) {
+    let expected = format!("# TYPE {name} {metric_type}");
+    assert!(
+        metrics.lines().any(|line| line == expected),
+        "metrics should expose {name} as a {metric_type}"
+    );
 }
 
 fn wait_for_metric_at_least(address: SocketAddr, name: &str, expected: u64) -> String {
