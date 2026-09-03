@@ -41,9 +41,7 @@ from cluster import (  # noqa: E402
     percentile,
     publish_batch_request,
     PeerResponseDelayProxy,
-    ProcessStats,
     poll_until_redelivered,
-    process_stats,
     resource_limits,
     run_publish_batch,
     run_peer_forwarding,
@@ -51,6 +49,7 @@ from cluster import (  # noqa: E402
     run_leader_failure_recovery,
     run_retained_recovery,
 )
+from cluster_resources import ProcessStats, process_stats  # noqa: E402
 from profile import summarize_timing_logs  # noqa: E402
 
 
