@@ -10,6 +10,7 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 sys.path.insert(0, str(SCRIPT_DIR))
 
 import compare  # noqa: E402
+import compare_adapters  # noqa: E402
 import common  # noqa: E402
 
 
@@ -209,6 +210,28 @@ class ComparisonBenchmarkTests(unittest.TestCase):
         with self.assertRaisesRegex(compare.ComparisonError, "replication topology"):
             compare.validate_backend_record("kafka", record)
 
+    def test_semantic_validation_rejects_mismatched_acknowledgement_or_durability(self) -> None:
+        cases = (
+            (
+                "acknowledgement",
+                "acknowledgement_boundary",
+                "inconsistent acknowledgement_boundary",
+            ),
+            ("durability", "durability_boundary", "semantic metadata"),
+        )
+        for name, field, message in cases:
+            with self.subTest(name=name):
+                record = self._complete_backend_record("runnel")
+                if name == "acknowledgement":
+                    record["semantic_metadata"][field] = "mismatched acknowledgement"
+                else:
+                    record["semantic_metadata"]["scenario_boundaries"]["publish-only"][
+                        field
+                    ] = "mismatched durability"
+
+                with self.assertRaisesRegex(compare.ComparisonError, message):
+                    compare.validate_backend_record("runnel", record)
+
     def test_semantic_validation_rejects_mismatched_scenario_class(self) -> None:
         record = self._complete_backend_record("runnel")
         record["scenarios"][0]["metadata"]["comparison_class"] = "consume-with-ack"
@@ -231,6 +254,23 @@ class ComparisonBenchmarkTests(unittest.TestCase):
             summary["comparison_guardrail"]["mismatch_dimensions"],
             list(compare.COMPARISON_MISMATCH_DIMENSIONS),
         )
+
+    def test_summary_guardrail_rejects_equivalence_or_ranking_claims(self) -> None:
+        for field, value in (
+            ("apples_to_apples", True),
+            ("ranking_eligible", True),
+            ("experimental", False),
+        ):
+            with self.subTest(field=field):
+                summary = {
+                    "workload": {"nodes": 1},
+                    "comparison_guardrail": compare.comparison_guardrail_metadata(1),
+                    "backends": {"runnel": self._complete_backend_record("runnel")},
+                }
+                summary["comparison_guardrail"][field] = value
+
+                with self.assertRaises(compare.ComparisonError):
+                    compare.validate_comparison_summary(summary)
 
     def test_comparison_suite_distinguishes_single_and_three_node_runs(self) -> None:
         self.assertEqual(compare.benchmark_suite(1, ["runnel"]), "runnel")
@@ -255,7 +295,7 @@ class ComparisonBenchmarkTests(unittest.TestCase):
 
     def test_kafka_three_node_environment_has_shared_controller_quorum_and_rf(self) -> None:
         names = ["run-kafka-1", "run-kafka-2", "run-kafka-3"]
-        environment = compare.kafka_environment(names[1], 2, names)
+        environment = compare_adapters.kafka_environment(names[1], 2, names)
 
         self.assertEqual(environment["KAFKA_NODE_ID"], "2")
         self.assertEqual(
@@ -266,8 +306,8 @@ class ComparisonBenchmarkTests(unittest.TestCase):
         self.assertEqual(environment["KAFKA_DEFAULT_REPLICATION_FACTOR"], "3")
 
     def test_redpanda_and_nats_commands_advertise_unique_cluster_members(self) -> None:
-        redpanda = compare.redpanda_command("run-redpanda-2", 2, "run-redpanda-1")
-        nats = compare.nats_server_command(
+        redpanda = compare_adapters.redpanda_command("run-redpanda-2", 2, "run-redpanda-1")
+        nats = compare_adapters.nats_server_command(
             "run-nats-2",
             ["run-nats-1", "run-nats-2", "run-nats-3"],
             "run-nats-cluster",
@@ -278,7 +318,7 @@ class ComparisonBenchmarkTests(unittest.TestCase):
         self.assertIn("nats://run-nats-1:6222,nats://run-nats-3:6222", nats)
         self.assertEqual(nats[nats.index("--cluster_name") + 1], "run-nats-cluster")
         self.assertEqual(
-            compare.nats_server_command("run-nats-1", ["run-nats-1"], "unused"),
+            compare_adapters.nats_server_command("run-nats-1", ["run-nats-1"], "unused"),
             ["-js", "-sd", "/data"],
         )
 
@@ -292,9 +332,30 @@ class ComparisonBenchmarkTests(unittest.TestCase):
             "2     redpanda-2    9092\n"
         )
 
-        compare.require_redpanda_broker_count(output, 3)
+        compare_adapters.require_redpanda_broker_count(output, 3)
         with self.assertRaises(compare.ComparisonError):
-            compare.require_redpanda_broker_count(output.replace("2     redpanda-2", ""), 3)
+            compare_adapters.require_redpanda_broker_count(
+                output.replace("2     redpanda-2", ""), 3
+            )
+
+    def test_native_output_adapters_preserve_backend_measurements(self) -> None:
+        kafka = compare_adapters.parse_kafka_publish(
+            "100 records sent, 2000 records/sec 1 ms avg latency, 2 ms max latency, "
+            "1 ms 50th, 2 ms 95th, 3 ms 99th, 4 ms 99.9th",
+            100,
+            100,
+        )
+        nats = compare_adapters.parse_nats_publish(
+            "stats: 2,000 msgs/sec min: 1us avg: 2us max: 4us "
+            "P50: 2us P90: 3us P99: 4us P99.9: 5us",
+            100,
+            100,
+        )
+
+        self.assertEqual(kafka["messages"], 100)
+        self.assertEqual(kafka["latency_microseconds"]["p99"], 3000)
+        self.assertEqual(nats["throughput_messages_per_second"], 2000)
+        self.assertEqual(nats["latency_microseconds"]["p999"], 5)
 
     def test_cluster_resource_summary_keeps_nodes_and_sums_cpu_and_memory(self) -> None:
         result = compare.combine_resource_summaries(
