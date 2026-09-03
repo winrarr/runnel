@@ -700,6 +700,98 @@ fn network_protocol_reports_attempts_and_dead_letters_after_limit() {
 }
 
 #[test]
+fn network_protocol_recovers_dead_letter_without_source_redelivery_after_restart() {
+    let directory = TempDir::new().unwrap();
+    let server = RunningServer::start_with_args(
+        directory.path(),
+        &["--ack-timeout-ms", "10", "--max-delivery-attempts", "1"],
+    );
+
+    assert!(matches!(
+        request(
+            server.broker_addr,
+            Request::Publish {
+                stream: "events".to_owned(),
+                key: Some("order-1".to_owned()),
+                payload: "poison".to_owned(),
+                request_id: None,
+            },
+        ),
+        Response::Published { offset: 0, .. }
+    ));
+    assert!(matches!(
+        request(
+            server.broker_addr,
+            Request::Poll {
+                stream: "events".to_owned(),
+                consumer: "worker".to_owned(),
+            },
+        ),
+        Response::Message {
+            offset: 0,
+            delivery_attempt: Some(1),
+            ..
+        }
+    ));
+    wait_for_empty_poll(server.broker_addr, "events", "worker");
+    server.stop();
+
+    let server = RunningServer::start_with_args(
+        directory.path(),
+        &["--ack-timeout-ms", "10", "--max-delivery-attempts", "1"],
+    );
+    assert!(matches!(
+        request(
+            server.broker_addr,
+            Request::Poll {
+                stream: "events".to_owned(),
+                consumer: "worker".to_owned(),
+            },
+        ),
+        Response::Empty { .. }
+    ));
+    assert!(matches!(
+        request(
+            server.broker_addr,
+            Request::Poll {
+                stream: "events.dead-letter".to_owned(),
+                consumer: "inspector".to_owned(),
+            },
+        ),
+        Response::Message {
+            offset: 0,
+            key: Some(key),
+            payload,
+            ..
+        } if key == "order-1" && payload == "poison"
+    ));
+    assert!(matches!(
+        request(
+            server.broker_addr,
+            Request::Ack {
+                stream: "events.dead-letter".to_owned(),
+                consumer: "inspector".to_owned(),
+                offset: 0,
+            },
+        ),
+        Response::Acknowledged {
+            already_acknowledged: false,
+            ..
+        }
+    ));
+    assert!(matches!(
+        request(
+            server.broker_addr,
+            Request::Poll {
+                stream: "events.dead-letter".to_owned(),
+                consumer: "inspector".to_owned(),
+            },
+        ),
+        Response::Empty { .. }
+    ));
+}
+
+#[test]
 fn network_protocol_reassigns_group_delivery_after_restart() {
     let directory = TempDir::new().unwrap();
     let server = RunningServer::start(directory.path());
@@ -1013,6 +1105,28 @@ fn wait_for_http(address: SocketAddr) {
         sleep(Duration::from_millis(25));
     }
     panic!("runnel HTTP endpoint did not become ready");
+}
+
+fn wait_for_empty_poll(address: SocketAddr, stream: &str, consumer: &str) {
+    let deadline = Instant::now() + Duration::from_secs(2);
+    let mut last_response = None;
+    while Instant::now() < deadline {
+        let response = request(
+            address,
+            Request::Poll {
+                stream: stream.to_owned(),
+                consumer: consumer.to_owned(),
+            },
+        );
+        if matches!(response, Response::Empty { .. }) {
+            return;
+        }
+        last_response = Some(response);
+        sleep(Duration::from_millis(25));
+    }
+    panic!(
+        "{stream}/{consumer} did not become empty before the deadline; last response: {last_response:?}"
+    );
 }
 
 fn wait_for_metric_at_least(address: SocketAddr, name: &str, expected: u64) -> String {
