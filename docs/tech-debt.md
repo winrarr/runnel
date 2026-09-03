@@ -141,3 +141,51 @@ This register records known implementation shortcuts in the current vertical sli
 - Impact: the server now bounds connection count, request frame size, in-flight request work, and request duration, with explicit rejection responses and metrics. Real-process coverage now exercises connection floods, oversized requests, in-flight saturation, slow writers, incomplete slow readers, sustained in-flight recovery, and scrapeable metrics during a stalled storage health dependency. Stalled-stream recovery and the full sustained resource-pressure matrix remain incomplete.
 - Context: the development protocol favors a minimal persistent-connection loop. The admission layer now exposes configured limits and resource-specific rejection counters, uses bounded frame reads, connection/request permits, and request deadlines, and retains graceful drain behavior for already-used connections. Focused tests demonstrate that slow or malformed clients do not consume unrelated request capacity, and sustained pressure verifies active-work, rejection, saturation, timeout, and response-write-timeout metrics across recovery. The FIFO storage probe now confirms that a bounded `200` metrics fallback retains process and admission samples, signals unavailable engine health, and restores the full metric set after recovery; broader storage-pressure and operational-resource evidence remains open.
 - Retirement condition: the overload backlog outcome establishes configurable safe defaults and tests for connection count, request size, request duration, in-flight work, slow readers and writers, and rejection metrics without weakening graceful shutdown or normal client ergonomics.
+
+## TD-024: Local engine responsibilities are concentrated in one module
+
+- Status: open
+- Goal: separate local broker orchestration, storage execution, stream-log encoding, delivery state, and consumer-state persistence into private modules with explicit ownership boundaries.
+- Rationale: `crates/runnel-core/src/lib.rs` is a 4,222-line module containing several independently evolving domains. Changes to record formats, storage admission, delivery semantics, and consumer recovery must navigate the same file, increasing review coupling and making focused test seams harder to maintain. This is a code-organization debt distinct from TD-002's one-file stream representation and TD-022's storage-execution behavior.
+- Constraints: preserve the `runnel-engine::Engine` contract and all durability, acknowledgement, redelivery, and recovery behavior; keep local file I/O and consumer-state persistence inside `runnel-core`; do not expose storage layout or introduce abstractions without a second concrete use.
+- Retirement condition: private modules have clear dependency direction for broker state, storage execution, stream-log codecs, delivery state, and consumer persistence; focused tests remain attached to each boundary; `just verify` and the real-process recovery tests pass without semantic or public-API changes.
+
+## TD-025: Clustered adapter responsibilities are concentrated in one module
+
+- Status: open
+- Goal: establish private module boundaries for clustered command/state models, durable state-machine persistence, delivery transitions, group lifecycle, client forwarding, and engine construction.
+- Rationale: `crates/runnel-raft/src/lib.rs` is a 5,937-line module that combines persisted representations and snapshot/journal recovery with grouped delivery, Raft group management, forwarding, and the public engine adapter. These concerns evolve at different rates and make recovery or consensus changes unnecessarily coupled to delivery and lifecycle code. This is a structural debt distinct from TD-008's early static-cluster architecture and TD-009/TD-010's retained-state representation.
+- Constraints: keep consensus-specific behavior behind the distributed-engine adapter; preserve persisted formats, Raft trait behavior, public engine semantics, fencing, and recovery guarantees; do not use extraction to hide or weaken topology, durability, or failure-policy decisions.
+- Retirement condition: state-machine persistence, delivery transitions, group management, forwarding, and engine adaptation have explicit private module ownership; focused unit and cluster recovery tests cover the boundaries; `just verify` and `just cluster-test` pass with unchanged public behavior and storage compatibility.
+
+## TD-026: Peer transport mixes outbound networking and inbound peer serving
+
+- Status: open
+- Goal: separate the OpenRaft outbound network implementation and connection pools from the inbound framed peer RPC server and forwarded-operation handling.
+- Rationale: `crates/runnel-raft/src/network.rs` is a 1,750-line module containing Raft client connections, pooled transport admission, peer request/response framing, inbound connection handling, forwarding, and error conversion. Pooling or protocol changes therefore share implementation seams with server-side request handling, which increases the risk and cost of transport evolution. This is a code-organization debt distinct from TD-012's incomplete connection strategy.
+- Constraints: preserve bounded control/data capacity, timeouts, cleanup, framed request boundaries, forwarding outcomes, and stale-delivery or leader errors; keep peer transport private to the clustered adapter; retain real-process and transport-lifecycle coverage.
+- Retirement condition: outbound Raft transport, connection-pool policy, inbound peer serving, and forwarding/error mapping have separate private modules with focused tests; cluster smoke and transport tests pass without changing wire semantics or resource bounds.
+
+## TD-027: Server entrypoint combines lifecycle, protocol, admission, and observability
+
+- Status: open
+- Goal: separate server bootstrap and shutdown orchestration, TCP framing and admission, request dispatch and response mapping, and HTTP health/metrics handling into private modules.
+- Rationale: `crates/runnel-server/src/main.rs` is a 1,845-line entrypoint that owns CLI configuration, engine startup, listener lifecycle, persistent-connection framing, admission limits, request execution, response serialization, health, metrics, and shutdown. These responsibilities have different failure and test boundaries, so continued feature work will make the entrypoint harder to review and change safely. This is a structural debt distinct from TD-023's admission behavior.
+- Constraints: keep transport concerns in `runnel-server`; preserve the provisional protocol, explicit outcome mapping, bounded-resource behavior, graceful shutdown, and real-process network tests; do not broaden the public protocol while extracting modules.
+- Retirement condition: bootstrap/lifecycle, TCP protocol/admission, request mapping, and HTTP observability have clear private module ownership; network, health, metrics, and shutdown tests remain green under `just verify` and `just integration`.
+
+## TD-028: Cluster benchmark scenarios and runtime are concentrated in one script
+
+- Status: open
+- Goal: separate clustered process/container lifecycle, resource observation, workload scenarios, fault/recovery operations, result metadata, and CLI dispatch into focused benchmark modules.
+- Rationale: `scripts/benchmarks/cluster.py` is a 2,622-line script containing peer proxies, node lifecycle, process sampling, publish/consume/batch workloads, hot-ordering observations, failure probes, result shaping, argument parsing, and command dispatch. Adding a scenario currently expands an already coupled harness and makes cleanup, resource isolation, and semantic evidence harder to audit. The same boundary should guide the adjacent `test_cluster.py` tests without forcing a speculative framework rewrite.
+- Constraints: preserve command names and defaults, machine-readable result fields, resource limits, unique-resource cleanup, scenario semantics, and the distinction between diagnostic and authoritative benchmark evidence; update benchmark documentation if an interface changes.
+- Retirement condition: lifecycle/resource primitives, scenario implementations, observations, and CLI dispatch have focused ownership and tests; existing benchmark smoke workflows and `just bench-test` pass with equivalent outputs and cleanup guarantees.
+
+## TD-029: Competitor comparison harness mixes adapters, orchestration, and policy validation
+
+- Status: open
+- Goal: isolate backend-specific service and output adapters from comparison lifecycle, semantic guardrails, result validation, and CLI orchestration.
+- Rationale: `scripts/benchmarks/compare.py` is a 1,563-line script combining Docker service lifecycle, Kafka/Redpanda/JetStream command construction and parsing, Runnel execution, equivalence metadata validation, result aggregation, and CLI dispatch. Backend-specific changes can therefore affect common comparison policy, while the harness remains difficult to extend with a new adapter or failure mode. This is a structural debt distinct from TD-013's unresolved semantic equivalence.
+- Constraints: preserve operation-specific durability and acknowledgement declarations, experimental/non-ranking guardrails, result schemas, bounded cleanup, and documented comparison commands; do not make comparisons appear equivalent through extraction alone.
+- Retirement condition: backend adapters, service lifecycle, policy validation, result handling, and CLI dispatch have separate focused modules and tests; comparison smoke tests pass and continue to reject mismatched semantics.
