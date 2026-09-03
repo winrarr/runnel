@@ -20,11 +20,15 @@ the rule to parallel work.
 - Before spawning, give the user a short summary of each proposed worker's feature or outcome and primary evidence class, such as performance, correctness, reliability, or benchmark infrastructure. For performance-sensitive work, include a best-effort expectation of the likely direction and rough magnitude of change when possible, or explicitly say that no direct performance change is expected or that the magnitude is unclear. Label estimates as expectations rather than measured results; do not invent precision.
 - Tell every worker, including nested subagents, to read the repository root `AGENTS.md` before starting. Do not assume the delegated environment loads project instructions automatically.
 - Give workers the recorded starting baseline and its default-branch CI result; they do not need to repeat that check before handoff. A newer `main` commit requires an update when it is known to overlap the worker's paths or shared contracts, dependencies, generated output, or integration behavior; independent work may remain based on the original baseline when it is cleanly mergeable.
+- Treat implicit worktree allocation as a serialized critical section. Do not issue concurrent spawn or resume calls until each prior worker's worktree identity has been validated, unless all worktrees were explicitly provisioned beforehand.
+- After each worker is provisioned and before it edits, verify `git worktree list --porcelain` and record a task-to-path-to-branch mapping. The coordinator worktree must remain on the default branch; every worker path must be distinct, outside the repository root, on its assigned branch, and at the recorded baseline. If any check fails, interrupt the worker before editing, preserve any patch, and provision a replacement worktree; do not switch branches inside a shared or ambiguous worktree.
 
 ## Worktree and branch isolation
 
 - Create one worktree outside the repository directory per task, with one branch per task.
 - Keep the main worktree for integration and verification; workers must not edit it directly.
+- The first worker instruction must require a pre-edit identity report containing `pwd`, `git rev-parse --show-toplevel`, `git branch --show-current`, and `git rev-parse HEAD`. A worker must stop and notify the coordinator if the reported top-level is the coordinator repository, the branch is not its assigned branch, or the revision is not the supplied baseline.
+- A resumed or restarted worker must receive a newly validated dedicated worktree unless its previous worktree is known to be isolated and is explicitly revalidated before editing.
 - Workers must inspect status and diff before committing and stage only their owned paths.
 - Prefer one focused commit and one pull request per independently reviewable improvement.
 - Do not rebase or update a pending branch solely because another disjoint pull request changed the base. Recheck the newest `origin/main` revision after merges and update the branch when the changed commits overlap or affect shared behavior; rerun relevant checks after any update.
@@ -124,6 +128,7 @@ it in the final handoff.
 Review each branch independently before integration. Check the diff against the recorded baseline, rerun focused tests in a clean worktree, and run the repository verification path. Do not merge an optimization solely because a microbenchmark improved: preserve durability, ordering, timeout, ambiguous-outcome, bounded-resource, and recovery guarantees.
 
 Merge independently reviewable pull requests in parallel once their required pull-request checks pass. Coordinate or serialize changes that overlap in files, shared contracts, dependencies, generated output, or integration behavior; overlapping architectural refactors require integration review and must not be merged independently just because their pull requests are individually green. Never bypass required checks to compensate for a flaky test; diagnose whether the failure is in the implementation, test harness, environment, or resource isolation.
+- If delegation dirties the coordinator worktree or mixes task files, stop the affected workers before changing branches. Preserve the mixed state in a recoverable stash or explicit patch, restore the coordinator worktree to the default branch, and re-home only verified task files into dedicated worktrees. Never reset or discard the mixed state to repair allocation.
 
 ## Cleanup and handoff
 
