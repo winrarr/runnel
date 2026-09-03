@@ -14,9 +14,22 @@ from cluster import (  # noqa: E402
     BenchmarkError,
     DEFAULT_SCENARIOS,
     DEFAULT_PUBLISH_BATCH_SIZE,
+    DEFAULT_HOT_KEY_MESSAGES,
+    DEFAULT_COLD_KEY_COUNT,
+    DEFAULT_COLD_MESSAGES_PER_KEY,
+    DEFAULT_HOT_ORDERING_CONCURRENCY,
+    DEFAULT_HOT_KEY_PROCESSING_DELAY_MS,
+    DEFAULT_HOT_ORDERING_TIMEOUT_SECONDS,
+    MAX_HOT_ORDERING_CONCURRENCY,
+    MAX_HOT_KEY_PROCESSING_DELAY_MS,
+    MAX_HOT_ORDERING_TIMEOUT_SECONDS,
+    MAX_HOT_ORDERING_MESSAGES,
     MAX_PUBLISH_BATCH_SIZE,
     MAX_LEADER_FAILURE_TIMEOUT_SECONDS,
     batch_metric,
+    hot_ordering_records,
+    HotOrderingObservation,
+    _hot_ordering_metadata,
     metric,
     MIN_RETAINED_RECOVERY_MESSAGES,
     DEFAULT_RETAINED_RECOVERY_MESSAGES,
@@ -61,6 +74,179 @@ class ClusterBenchmarkTests(unittest.TestCase):
         self.assertNotIn("peer_forwarding", args.scenarios)
         self.assertNotIn("publish_batch", args.scenarios)
         self.assertNotIn("leader_failure_recovery", args.scenarios)
+        self.assertNotIn("hot_ordering", args.scenarios)
+
+    def test_hot_ordering_options_are_opt_in_and_bounded(self) -> None:
+        with patch.object(
+            sys,
+            "argv",
+            [
+                "cluster.py",
+                "--scenarios",
+                "hot_ordering",
+                "--hot-key-messages",
+                "12",
+                "--cold-key-count",
+                "3",
+                "--cold-messages-per-key",
+                "4",
+                "--hot-ordering-concurrency",
+                "6",
+                "--hot-key-processing-delay-ms",
+                "7",
+                "--hot-ordering-timeout-seconds",
+                "12.5",
+            ],
+        ):
+            args = parse_args()
+
+        self.assertEqual(args.scenarios, ["hot_ordering"])
+        self.assertEqual(args.hot_key_messages, 12)
+        self.assertEqual(args.cold_key_count, 3)
+        self.assertEqual(args.cold_messages_per_key, 4)
+        self.assertEqual(args.hot_ordering_concurrency, 6)
+        self.assertEqual(args.hot_key_processing_delay_ms, 7)
+        self.assertEqual(args.hot_ordering_timeout_seconds, 12.5)
+        self.assertEqual(DEFAULT_HOT_KEY_MESSAGES, 64)
+        self.assertEqual(DEFAULT_COLD_KEY_COUNT, 4)
+        self.assertEqual(DEFAULT_COLD_MESSAGES_PER_KEY, 8)
+        self.assertEqual(DEFAULT_HOT_ORDERING_CONCURRENCY, 4)
+        self.assertEqual(DEFAULT_HOT_KEY_PROCESSING_DELAY_MS, 5)
+        self.assertEqual(DEFAULT_HOT_ORDERING_TIMEOUT_SECONDS, 60.0)
+
+        invalid_options = (
+            ("--hot-ordering-concurrency", str(MAX_HOT_ORDERING_CONCURRENCY + 1)),
+            ("--hot-key-processing-delay-ms", str(MAX_HOT_KEY_PROCESSING_DELAY_MS + 1)),
+            (
+                "--hot-ordering-timeout-seconds",
+                str(MAX_HOT_ORDERING_TIMEOUT_SECONDS + 1),
+            ),
+            ("--hot-key-messages", str(MAX_HOT_ORDERING_MESSAGES)),
+        )
+        for option, value in invalid_options:
+            with self.subTest(option=option):
+                with patch.object(
+                    sys,
+                    "argv",
+                    ["cluster.py", "--scenarios", "hot_ordering", option, value],
+                ):
+                    with self.assertRaises(SystemExit):
+                        parse_args()
+
+        with patch.object(
+            sys,
+            "argv",
+            ["cluster.py", "--scenarios", "hot_ordering", "--hot-ordering-concurrency", "1"],
+        ):
+            with self.assertRaises(SystemExit):
+                parse_args()
+        with patch.object(
+            sys,
+            "argv",
+            [
+                "cluster.py",
+                "--scenarios",
+                "hot_ordering",
+                "--ack-timeout-ms",
+                "5",
+                "--hot-key-processing-delay-ms",
+                "5",
+            ],
+        ):
+            with self.assertRaises(SystemExit):
+                parse_args()
+
+    def test_hot_ordering_schedule_is_deterministic_and_mixed(self) -> None:
+        self.assertEqual(
+            hot_ordering_records(3, 2, 2),
+            [
+                (0, "hot-key"),
+                (1, "cold-key-0"),
+                (2, "cold-key-1"),
+                (3, "hot-key"),
+                (4, "cold-key-0"),
+                (5, "cold-key-1"),
+                (6, "hot-key"),
+            ],
+        )
+        with self.assertRaises(BenchmarkError):
+            hot_ordering_records(0, 2, 2)
+
+    def test_hot_ordering_metadata_reports_backlog_order_and_cold_fairness(self) -> None:
+        records = hot_ordering_records(2, 1, 2)
+        observation = HotOrderingObservation.for_records(records, "hot-key")
+        observation.record_delivery(
+            offset=0, key="hot-key", delivery_attempt=1, delivery_wait_ns=1_000_000
+        )
+        observation.record_delivery(
+            offset=1, key="cold-key-0", delivery_attempt=1, delivery_wait_ns=2_000_000
+        )
+        observation.record_ack_start(offset=1, key="cold-key-0")
+        observation.record_completion(
+            offset=1,
+            key="cold-key-0",
+            request_latency_ns=100,
+            completion_elapsed_ns=3_000_000,
+        )
+        observation.record_ack_start(offset=0, key="hot-key")
+        observation.record_completion(
+            offset=0,
+            key="hot-key",
+            request_latency_ns=100,
+            completion_elapsed_ns=4_000_000,
+        )
+        observation.record_delivery(
+            offset=2, key="hot-key", delivery_attempt=1, delivery_wait_ns=5_000_000
+        )
+        observation.record_delivery(
+            offset=3, key="cold-key-0", delivery_attempt=1, delivery_wait_ns=6_000_000
+        )
+        observation.record_ack_start(offset=3, key="cold-key-0")
+        observation.record_completion(
+            offset=3,
+            key="cold-key-0",
+            request_latency_ns=100,
+            completion_elapsed_ns=7_000_000,
+        )
+        observation.record_ack_start(offset=2, key="hot-key")
+        observation.record_completion(
+            offset=2,
+            key="hot-key",
+            request_latency_ns=100,
+            completion_elapsed_ns=8_000_000,
+        )
+
+        metadata = _hot_ordering_metadata(
+            observation,
+            records=records,
+            cluster=SimpleNamespace(node_count=3),
+            concurrency=2,
+            processing_delay_ms=5,
+            timeout_seconds=60.0,
+            operation_elapsed_ns=8_000_000,
+        )
+
+        self.assertTrue(metadata["per_key_ordering"]["verified"])
+        self.assertEqual(metadata["hot_key_backlog"]["at_first_cold_completion"], 2)
+        self.assertEqual(
+            metadata["unrelated_key_progress"]["cold_messages_completed_before_hot_drained"],
+            2,
+        )
+        self.assertEqual(
+            metadata["unrelated_key_progress"]["cold_keys_completed_before_hot_drained_names"],
+            ["cold-key-0"],
+        )
+        self.assertEqual(
+            metadata["unrelated_key_progress"][
+                "cold_keys_with_progress_before_hot_drained_names"
+            ],
+            ["cold-key-0"],
+        )
+        self.assertIn("fairness", metadata["unrelated_key_progress"])
+        self.assertEqual(
+            metadata["delivery_concurrency"]["max_processing_in_flight_by_key"]["hot-key"],
+            1,
+        )
 
     def test_leader_failure_scenario_is_opt_in_and_has_a_bounded_timeout(self) -> None:
         with patch.object(
