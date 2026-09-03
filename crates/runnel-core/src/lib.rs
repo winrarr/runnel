@@ -1758,7 +1758,7 @@ fn read_legacy_record(
         None
     } else {
         let Ok(key) = std::str::from_utf8(&key_bytes) else {
-            return Ok(None);
+            return Err(invalid_record_data("legacy record key is not UTF-8"));
         };
         Some(key.to_owned())
     };
@@ -3857,6 +3857,44 @@ mod tests {
                 ..
             }) if payload == b"complete"
         ));
+    }
+
+    #[test]
+    fn complete_legacy_record_with_malformed_key_fails_closed_on_recovery() {
+        let directory = tempdir().unwrap();
+        {
+            let broker = Broker::open(directory.path(), BrokerConfig::default()).unwrap();
+            broker
+                .publish("events", Some("complete".to_owned()), b"payload".to_vec())
+                .unwrap();
+        }
+
+        let path = directory.path().join("streams/events.log");
+        let valid_len = fs::metadata(&path).unwrap().len();
+        let key = [0xff];
+        let payload = b"malformed-key-record";
+        let mut header = [0; LEGACY_HEADER_LEN];
+        header[..4].copy_from_slice(LEGACY_MAGIC);
+        header[4..12].copy_from_slice(&1_u64.to_le_bytes());
+        header[20..24].copy_from_slice(&(key.len() as u32).to_le_bytes());
+        header[24..28].copy_from_slice(&(payload.len() as u32).to_le_bytes());
+
+        let mut file = OpenOptions::new().append(true).open(&path).unwrap();
+        file.write_all(&header).unwrap();
+        file.write_all(&key).unwrap();
+        file.write_all(payload).unwrap();
+        file.sync_all().unwrap();
+        let complete_len =
+            valid_len + LEGACY_HEADER_LEN as u64 + key.len() as u64 + payload.len() as u64;
+
+        let error = match Broker::open(directory.path(), BrokerConfig::default()) {
+            Err(BrokerError::Io(error)) => error,
+            Err(error) => panic!("expected malformed legacy key to fail recovery, got {error}"),
+            Ok(_) => panic!("expected malformed legacy key to fail recovery"),
+        };
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert_eq!(error.to_string(), "legacy record key is not UTF-8");
+        assert_eq!(fs::metadata(&path).unwrap().len(), complete_len);
     }
 
     #[tokio::test]
