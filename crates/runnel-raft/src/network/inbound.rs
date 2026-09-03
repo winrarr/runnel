@@ -5,8 +5,8 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::watch;
 
 use super::{
-    ForwardError, ForwardedOperation, ForwardedResponse, PeerRequest, PeerResponse, read_frame,
-    write_frame,
+    ForwardError, ForwardedOperation, ForwardedResponse, PeerRequest, PeerResponse,
+    framing::{read_frame, write_frame},
 };
 use crate::{GroupManager, StreamMetadata};
 

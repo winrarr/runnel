@@ -19,9 +19,8 @@ use crate::{METADATA_GROUP_ID, TypeConfig};
 #[cfg(feature = "instrumentation")]
 use runnel_engine::StageTimer;
 
-use super::{
-    ForwardedOperation, ForwardedResponse, PeerRequest, PeerResponse, read_frame, write_frame,
-};
+use super::framing::{read_frame, write_frame};
+use super::{ForwardedOperation, ForwardedResponse, PeerRequest, PeerResponse};
 
 // Reap old sockets lazily on the next checkout so an inactive peer does not
 // retain file descriptors indefinitely. The transport owner closes all
@@ -588,7 +587,7 @@ fn unreachable_snapshot_error(
 
 #[cfg(test)]
 mod tests {
-    use crate::network::MAX_REUSABLE_FRAME_BUFFER_SIZE;
+    use super::super::framing::MAX_REUSABLE_FRAME_BUFFER_SIZE;
 
     use std::mem::size_of;
     use std::sync::Arc;
