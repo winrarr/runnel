@@ -74,6 +74,17 @@ DEFAULT_ACK_TIMEOUT_MS = 30_000
 DEFAULT_SLOW_CONSUMER_DELAY_MS = 10
 DEFAULT_PUBLISH_BATCH_SIZE = 32
 MAX_PUBLISH_BATCH_SIZE = 1_024
+HOT_ORDERING_HOT_KEY = "hot-key"
+DEFAULT_HOT_KEY_MESSAGES = 64
+DEFAULT_COLD_KEY_COUNT = 4
+DEFAULT_COLD_MESSAGES_PER_KEY = 8
+DEFAULT_HOT_ORDERING_CONCURRENCY = 4
+DEFAULT_HOT_KEY_PROCESSING_DELAY_MS = 5
+DEFAULT_HOT_ORDERING_TIMEOUT_SECONDS = 60.0
+MAX_HOT_ORDERING_CONCURRENCY = 128
+MAX_HOT_KEY_PROCESSING_DELAY_MS = 5_000
+MAX_HOT_ORDERING_TIMEOUT_SECONDS = 300.0
+MAX_HOT_ORDERING_MESSAGES = 4_096
 # The topology-free forwarding pool currently reserves one control lane from
 # five total connections, leaving four shared forwarding lanes. Keep the
 # focused workload above that boundary by default so queueing is observable.
@@ -99,6 +110,7 @@ SCENARIO_NAMES = (
     *DEFAULT_SCENARIOS,
     "peer_forwarding",
     "publish_batch",
+    "hot_ordering",
     "leader_failure_recovery",
     "follower_failure_recovery",
 )
@@ -255,6 +267,152 @@ class Node:
     process: subprocess.Popen[bytes] | None = None
     container: DockerContainer | None = None
     peer_proxy: PeerResponseDelayProxy | None = None
+
+
+@dataclass
+class HotOrderingObservation:
+    """Collect bounded delivery observations for the hot-ordering probe."""
+
+    expected_offsets_by_key: dict[str, list[int]]
+    hot_key: str
+    hot_key_messages: int
+    delivered_offsets_by_key: dict[str, list[int]]
+    completed_offsets_by_key: dict[str, list[int]]
+    delivery_wait_ns_by_key: dict[str, list[int]]
+    request_latency_ns_by_key: dict[str, list[int]]
+    completion_elapsed_ns_by_key: dict[str, list[int]]
+    delivered_attempts: dict[int, int]
+    completed_offsets: set[int]
+    active_offsets: set[int]
+    processing_offsets: set[int]
+    ack_started_offsets: set[int]
+    active_by_key: dict[str, int]
+    max_in_flight_by_key: dict[str, int]
+    request_latencies_ns: list[int]
+    hot_backlog_at_delivery: list[int]
+    hot_backlog_at_cold_completion: list[int]
+    cold_keys_with_progress_while_hot_backlog: set[str]
+    cold_keys_completed_while_hot_backlog: set[str]
+    hot_completed_messages: int = 0
+    hot_drained_elapsed_ns: int | None = None
+    max_in_flight_messages: int = 0
+
+    @classmethod
+    def for_records(
+        cls, records: list[tuple[int, str]], hot_key: str
+    ) -> "HotOrderingObservation":
+        expected: dict[str, list[int]] = {}
+        for offset, key in records:
+            expected.setdefault(key, []).append(offset)
+        return cls(
+            expected_offsets_by_key=expected,
+            hot_key=hot_key,
+            hot_key_messages=len(expected.get(hot_key, [])),
+            delivered_offsets_by_key={key: [] for key in expected},
+            completed_offsets_by_key={key: [] for key in expected},
+            delivery_wait_ns_by_key={key: [] for key in expected},
+            request_latency_ns_by_key={key: [] for key in expected},
+            completion_elapsed_ns_by_key={key: [] for key in expected},
+            delivered_attempts={},
+            completed_offsets=set(),
+            active_offsets=set(),
+            processing_offsets=set(),
+            ack_started_offsets=set(),
+            active_by_key={key: 0 for key in expected},
+            max_in_flight_by_key={key: 0 for key in expected},
+            request_latencies_ns=[],
+            hot_backlog_at_delivery=[],
+            hot_backlog_at_cold_completion=[],
+            cold_keys_with_progress_while_hot_backlog=set(),
+            cold_keys_completed_while_hot_backlog=set(),
+        )
+
+    def record_delivery(
+        self,
+        *,
+        offset: int,
+        key: str,
+        delivery_attempt: int,
+        delivery_wait_ns: int,
+    ) -> None:
+        expected_offsets = self.expected_offsets_by_key.get(key)
+        if expected_offsets is None or offset not in expected_offsets:
+            raise BenchmarkError(
+                f"hot-ordering delivery returned unexpected key/offset: {key!r}/{offset}"
+            )
+        if delivery_attempt != 1:
+            raise BenchmarkError(
+                "hot-ordering workload observed an unexpected redelivery at "
+                f"offset {offset} (attempt {delivery_attempt})"
+            )
+        if offset in self.delivered_attempts:
+            raise BenchmarkError(
+                f"hot-ordering workload delivered offset {offset} more than once"
+            )
+        observed_offsets = self.delivered_offsets_by_key[key]
+        if observed_offsets and offset <= observed_offsets[-1]:
+            raise BenchmarkError(
+                f"hot-ordering key {key!r} was delivered out of order: "
+                f"{observed_offsets[-1]} then {offset}"
+            )
+        observed_offsets.append(offset)
+        self.delivered_attempts[offset] = delivery_attempt
+        self.delivery_wait_ns_by_key[key].append(delivery_wait_ns)
+        self.active_offsets.add(offset)
+        self.processing_offsets.add(offset)
+        self.active_by_key[key] += 1
+        self.max_in_flight_by_key[key] = max(
+            self.max_in_flight_by_key[key], self.active_by_key[key]
+        )
+        self.max_in_flight_messages = max(
+            self.max_in_flight_messages, len(self.processing_offsets)
+        )
+        if key == self.hot_key:
+            self.hot_backlog_at_delivery.append(
+                self.hot_key_messages - self.hot_completed_messages
+            )
+
+    def record_ack_start(self, *, offset: int, key: str) -> None:
+        if offset not in self.processing_offsets:
+            raise BenchmarkError(
+                f"hot-ordering workload acknowledged offset {offset} without processing it"
+            )
+        self.processing_offsets.remove(offset)
+        self.active_by_key[key] -= 1
+        self.ack_started_offsets.add(offset)
+
+    def record_completion(
+        self,
+        *,
+        offset: int,
+        key: str,
+        request_latency_ns: int,
+        completion_elapsed_ns: int,
+    ) -> None:
+        if offset not in self.active_offsets or offset not in self.ack_started_offsets:
+            raise BenchmarkError(
+                f"hot-ordering workload completed offset {offset} without an acknowledgement"
+            )
+        self.active_offsets.remove(offset)
+        self.ack_started_offsets.remove(offset)
+        self.completed_offsets.add(offset)
+        self.completed_offsets_by_key[key].append(offset)
+        self.request_latencies_ns.append(request_latency_ns)
+        self.request_latency_ns_by_key[key].append(request_latency_ns)
+        self.completion_elapsed_ns_by_key[key].append(completion_elapsed_ns)
+        if key == self.hot_key:
+            self.hot_completed_messages += 1
+            if self.hot_completed_messages == self.hot_key_messages:
+                self.hot_drained_elapsed_ns = completion_elapsed_ns
+            return
+        hot_backlog = self.hot_key_messages - self.hot_completed_messages
+        if hot_backlog > 0:
+            self.hot_backlog_at_cold_completion.append(hot_backlog)
+            self.cold_keys_with_progress_while_hot_backlog.add(key)
+            if len(self.completed_offsets_by_key[key]) == len(
+                self.expected_offsets_by_key[key]
+            ):
+                self.cold_keys_completed_while_hot_backlog.add(key)
 
 
 def free_port() -> int:
@@ -1056,6 +1214,435 @@ def run_parallel_grouped(
     return measure_scenario(cluster.stats, operation, metrics=cluster.metrics)
 
 
+def hot_ordering_records(
+    hot_key_messages: int,
+    cold_key_count: int,
+    cold_messages_per_key: int,
+    *,
+    hot_key: str = HOT_ORDERING_HOT_KEY,
+) -> list[tuple[int, str]]:
+    """Build the deterministic interleaved record schedule for the probe."""
+    if hot_key_messages <= 0 or cold_key_count <= 0 or cold_messages_per_key <= 0:
+        raise BenchmarkError("hot-ordering workload dimensions must be positive")
+    total_messages = hot_key_messages + cold_key_count * cold_messages_per_key
+    if total_messages > MAX_HOT_ORDERING_MESSAGES:
+        raise BenchmarkError(
+            "hot-ordering workload exceeds the bounded maximum of "
+            f"{MAX_HOT_ORDERING_MESSAGES} records"
+        )
+    records: list[tuple[int, str]] = []
+    offset = 0
+    rounds = max(hot_key_messages, cold_messages_per_key)
+    for round_index in range(rounds):
+        if round_index < hot_key_messages:
+            records.append((offset, hot_key))
+            offset += 1
+        if round_index < cold_messages_per_key:
+            for cold_key_index in range(cold_key_count):
+                records.append((offset, f"cold-key-{cold_key_index}"))
+                offset += 1
+    return records
+
+
+def publish_keyed(
+    client: LineClient,
+    stream: str,
+    key: str,
+    payload: str,
+    expected_offset: int,
+) -> tuple[int, int]:
+    """Publish one keyed record through the public protocol and check its offset."""
+    response, elapsed = request_ok(
+        client,
+        {"op": "publish", "stream": stream, "key": key, "payload": payload},
+        "published",
+    )
+    offset = response.get("offset")
+    if offset != expected_offset:
+        raise BenchmarkError(
+            f"hot-ordering setup returned offset {offset}, expected {expected_offset}"
+        )
+    return int(offset), elapsed
+
+
+def _duration_summary_milliseconds(values_ns: list[int]) -> dict[str, Any]:
+    if not values_ns:
+        return {"samples": 0}
+    return {
+        "samples": len(values_ns),
+        "p50_milliseconds": percentile(values_ns, 50) / 1_000_000,
+        "p99_milliseconds": percentile(values_ns, 99) / 1_000_000,
+        "max_milliseconds": max(values_ns) / 1_000_000,
+    }
+
+
+def _hot_ordering_metadata(
+    observation: HotOrderingObservation,
+    *,
+    records: list[tuple[int, str]],
+    cluster: Cluster,
+    concurrency: int,
+    processing_delay_ms: int,
+    timeout_seconds: float,
+    operation_elapsed_ns: int,
+) -> dict[str, Any]:
+    expected_offsets = observation.expected_offsets_by_key
+    key_metrics: dict[str, Any] = {}
+    strict_delivery_order_verified = True
+    strict_completion_order_verified = True
+    same_key_exclusion_verified = True
+    for key, expected in expected_offsets.items():
+        observed = observation.delivered_offsets_by_key[key]
+        completed = observation.completed_offsets_by_key[key]
+        ordering_verified = observed == expected
+        strict_delivery_order_verified &= ordering_verified
+        completion_order_verified = completed == expected
+        strict_completion_order_verified &= completion_order_verified
+        same_key_exclusion_verified &= observation.max_in_flight_by_key[key] <= 1
+        completions = observation.completion_elapsed_ns_by_key[key]
+        key_metrics[key] = {
+            "role": "hot" if key == observation.hot_key else "cold",
+            "messages": len(expected),
+            "delivered_messages": len(observed),
+            "completed_messages": len(completions),
+            "expected_offsets": expected,
+            "observed_delivery_offsets": observed,
+            "delivery_order_verified": ordering_verified,
+            "observed_completion_offsets": completed,
+            "completion_order_verified": completion_order_verified,
+            "same_key_processing_overlap_verified": (
+                observation.max_in_flight_by_key[key] <= 1
+            ),
+            "delivery_wait": _duration_summary_milliseconds(
+                observation.delivery_wait_ns_by_key[key]
+            ),
+            "request_latency": _duration_summary_milliseconds(
+                observation.request_latency_ns_by_key[key]
+            ),
+            "completion_elapsed": _duration_summary_milliseconds(completions),
+            "first_completion_elapsed_milliseconds": (
+                min(completions) / 1_000_000 if completions else None
+            ),
+            "last_completion_elapsed_milliseconds": (
+                max(completions) / 1_000_000 if completions else None
+            ),
+            "max_in_flight": observation.max_in_flight_by_key[key],
+        }
+
+    cold_keys = [key for key in expected_offsets if key != observation.hot_key]
+    cold_first_completions = [
+        min(observation.completion_elapsed_ns_by_key[key])
+        for key in cold_keys
+        if observation.completion_elapsed_ns_by_key[key]
+    ]
+    cold_last_completions = [
+        max(observation.completion_elapsed_ns_by_key[key])
+        for key in cold_keys
+        if observation.completion_elapsed_ns_by_key[key]
+    ]
+    cold_first_completion_spread_ms = (
+        (max(cold_first_completions) - min(cold_first_completions)) / 1_000_000
+        if cold_first_completions
+        else None
+    )
+    cold_last_completion_spread_ms = (
+        (max(cold_last_completions) - min(cold_last_completions)) / 1_000_000
+        if cold_last_completions
+        else None
+    )
+    hot_backlog_at_cold_completion = observation.hot_backlog_at_cold_completion
+    return {
+        "nodes": cluster.node_count,
+        "records": len(records),
+        "hot_key": observation.hot_key,
+        "hot_key_messages": observation.hot_key_messages,
+        "cold_key_count": len(cold_keys),
+        "cold_messages": sum(len(expected_offsets[key]) for key in cold_keys),
+        "configured_workers": concurrency,
+        "hot_key_processing_delay_ms": processing_delay_ms,
+        "bounded_runtime_seconds": timeout_seconds,
+        "mixed_workload_schedule": (
+            "each round publishes one hot-key record followed by one record for "
+            "each cold key; all records are preloaded before measurement"
+        ),
+        "setup_excluded": True,
+        "redelivery_expected": False,
+        "latency_scope": (
+            "poll_and_ack_request_time_excludes_the_configured_processing_delay"
+        ),
+        "throughput_scope": (
+            "concurrent_preloaded_grouped_backlog_drain_includes_processing_delay"
+        ),
+        "per_key_ordering": {
+            "verified": (
+                strict_delivery_order_verified
+                and strict_completion_order_verified
+                and same_key_exclusion_verified
+            ),
+            "verification": (
+                "observed delivery and acknowledgement-completion offsets exactly "
+                "match published offsets per key"
+            ),
+            "expected_offsets_by_key": expected_offsets,
+            "observed_delivery_offsets_by_key": observation.delivered_offsets_by_key,
+            "observed_completion_offsets_by_key": observation.completed_offsets_by_key,
+            "delivery_order_verified": strict_delivery_order_verified,
+            "completion_order_verified": strict_completion_order_verified,
+            "same_key_processing_overlap_verified": same_key_exclusion_verified,
+        },
+        "key_metrics": key_metrics,
+        "hot_key_backlog": {
+            "definition": "preloaded hot-key records not yet durably acknowledged",
+            "initial_messages": observation.hot_key_messages,
+            "peak_messages": max(
+                observation.hot_backlog_at_delivery,
+                default=observation.hot_key_messages,
+            ),
+            "samples_at_hot_delivery": observation.hot_backlog_at_delivery,
+            "at_first_cold_completion": (
+                hot_backlog_at_cold_completion[0]
+                if hot_backlog_at_cold_completion
+                else None
+            ),
+            "at_last_cold_completion": (
+                hot_backlog_at_cold_completion[-1]
+                if hot_backlog_at_cold_completion
+                else None
+            ),
+            "samples_at_cold_completion": hot_backlog_at_cold_completion,
+            "drained": observation.hot_completed_messages
+            == observation.hot_key_messages,
+            "drained_elapsed_milliseconds": (
+                observation.hot_drained_elapsed_ns / 1_000_000
+                if observation.hot_drained_elapsed_ns is not None
+                else None
+            ),
+        },
+        "unrelated_key_progress": {
+            "definition": "cold-key acknowledgements completed while any hot-key record remained unacknowledged",
+            "cold_messages_completed_before_hot_drained": len(
+                hot_backlog_at_cold_completion
+            ),
+            "cold_keys_with_progress_before_hot_drained": len(
+                observation.cold_keys_with_progress_while_hot_backlog
+            ),
+            "cold_keys_with_progress_before_hot_drained_names": sorted(
+                observation.cold_keys_with_progress_while_hot_backlog
+            ),
+            "cold_keys_completed_before_hot_drained": len(
+                observation.cold_keys_completed_while_hot_backlog
+            ),
+            "cold_keys_completed_before_hot_drained_names": sorted(
+                observation.cold_keys_completed_while_hot_backlog
+            ),
+            "cold_key_first_completion_spread_milliseconds": cold_first_completion_spread_ms,
+            "cold_key_last_completion_spread_milliseconds": cold_last_completion_spread_ms,
+            "fairness": {
+                "definition": (
+                    "descriptive spread of first and last completion times across "
+                    "cold keys; lower spread indicates closer timing"
+                ),
+                "first_completion_spread_milliseconds": cold_first_completion_spread_ms,
+                "last_completion_spread_milliseconds": cold_last_completion_spread_ms,
+            },
+        },
+        "delivery_concurrency": {
+            "max_processing_in_flight_messages": observation.max_in_flight_messages,
+            "max_processing_in_flight_by_key": observation.max_in_flight_by_key,
+            "interpretation": (
+                "observed client-side processing slots from delivery through the "
+                "start of the acknowledgement request; it does not claim a broker "
+                "scheduling policy"
+            ),
+        },
+        "resource_measurement": {
+            "scope": (
+                "scenario resource_samples cover the grouped poll/ack drain, "
+                "including configured hot-key processing delay"
+            ),
+            "dimensions": [
+                "resource_samples.cpu_seconds",
+                "resource_samples.memory_bytes_avg",
+                "resource_samples.memory_bytes_max",
+                "resource_samples.storage_bytes_avg",
+                "resource_samples.storage_bytes_max",
+                "resource_samples.per_node.*",
+            ],
+            "server_metrics": "scenario-scoped GET /metrics delta when all node endpoints are available",
+        },
+        "scheduling_observation": (
+            "worker scheduling and timing are runtime-dependent; this result does "
+            "not imply adaptive scheduling or prove a performance improvement"
+        ),
+        "operation_elapsed_milliseconds": operation_elapsed_ns / 1_000_000,
+    }
+
+
+def run_hot_ordering(
+    cluster: Cluster,
+    stream: str,
+    payload: str,
+    *,
+    hot_key_messages: int,
+    cold_key_count: int,
+    cold_messages_per_key: int,
+    concurrency: int,
+    processing_delay_ms: int,
+    timeout_seconds: float,
+) -> dict[str, Any]:
+    """Measure a bounded mixed-key grouped-consumer drain through the public protocol."""
+    records = hot_ordering_records(
+        hot_key_messages,
+        cold_key_count,
+        cold_messages_per_key,
+    )
+    setup = cluster.client(0)
+    try:
+        create_stream(setup, stream)
+        for offset, key in records:
+            publish_keyed(setup, stream, key, payload, offset)
+    finally:
+        setup.close()
+
+    total_messages = len(records)
+    client_timeout = min(COMMAND_TIMEOUT_SECONDS, timeout_seconds)
+    stop_event = threading.Event()
+    observation_lock = threading.Lock()
+
+    def operation() -> dict[str, Any]:
+        observation = HotOrderingObservation.for_records(
+            records, HOT_ORDERING_HOT_KEY
+        )
+        operation_started_ns = time.perf_counter_ns()
+        deadline = time.monotonic() + timeout_seconds
+
+        def worker(worker_index: int) -> None:
+            client = cluster.client(
+                worker_index % cluster.node_count,
+                timeout_seconds=client_timeout,
+            )
+            member = f"hot-ordering-member-{worker_index}"
+            try:
+                while not stop_event.is_set():
+                    with observation_lock:
+                        if len(observation.completed_offsets) >= total_messages:
+                            return
+                    if time.monotonic() >= deadline:
+                        raise BenchmarkError(
+                            "hot-ordering benchmark exceeded its bounded runtime"
+                        )
+                    response, poll_elapsed = client.request(
+                        {
+                            "op": "poll_group",
+                            "stream": stream,
+                            "consumer": "hot-ordering-workers",
+                            "member": member,
+                        }
+                    )
+                    if response.get("type") == "empty":
+                        remaining = deadline - time.monotonic()
+                        if remaining > 0:
+                            time.sleep(min(0.001, remaining))
+                        continue
+                    if response.get("type") != "message":
+                        raise BenchmarkError(
+                            f"unexpected hot-ordering poll response: {response}"
+                        )
+                    offset = response.get("offset")
+                    key = response.get("key")
+                    token = response.get("delivery_token")
+                    delivery_attempt = response.get("delivery_attempt")
+                    if not isinstance(offset, int) or not isinstance(key, str):
+                        raise BenchmarkError(
+                            f"hot-ordering poll omitted offset or key: {response}"
+                        )
+                    if not isinstance(token, str) or not isinstance(delivery_attempt, int):
+                        raise BenchmarkError(
+                            f"hot-ordering poll omitted delivery fencing fields: {response}"
+                        )
+                    if response.get("payload") != payload:
+                        raise BenchmarkError(
+                            f"hot-ordering poll returned an unexpected payload at offset {offset}"
+                        )
+                    delivered_ns = time.perf_counter_ns()
+                    with observation_lock:
+                        observation.record_delivery(
+                            offset=offset,
+                            key=key,
+                            delivery_attempt=delivery_attempt,
+                            delivery_wait_ns=delivered_ns - operation_started_ns,
+                        )
+                    if key == HOT_ORDERING_HOT_KEY and processing_delay_ms:
+                        time.sleep(processing_delay_ms / 1_000)
+                    with observation_lock:
+                        observation.record_ack_start(offset=offset, key=key)
+                    ack_elapsed = acknowledge_group(
+                        client,
+                        stream,
+                        "hot-ordering-workers",
+                        member,
+                        offset,
+                        token,
+                    )
+                    completed_ns = time.perf_counter_ns()
+                    with observation_lock:
+                        observation.record_completion(
+                            offset=offset,
+                            key=key,
+                            request_latency_ns=poll_elapsed + ack_elapsed,
+                            completion_elapsed_ns=completed_ns - operation_started_ns,
+                        )
+            except BaseException:
+                stop_event.set()
+                raise
+            finally:
+                client.close()
+
+        try:
+            with ThreadPoolExecutor(max_workers=concurrency) as executor:
+                futures = [
+                    executor.submit(worker, worker_index)
+                    for worker_index in range(concurrency)
+                ]
+                for future in futures:
+                    future.result()
+        finally:
+            stop_event.set()
+
+        if len(observation.completed_offsets) != total_messages:
+            raise BenchmarkError(
+                "hot-ordering benchmark processed "
+                f"{len(observation.completed_offsets)} of {total_messages} messages"
+            )
+        if observation.active_offsets:
+            raise BenchmarkError(
+                "hot-ordering benchmark ended with active offsets: "
+                f"{sorted(observation.active_offsets)}"
+            )
+        if observation.processing_offsets or observation.ack_started_offsets:
+            raise BenchmarkError(
+                "hot-ordering benchmark ended with incomplete client acknowledgement state"
+            )
+        metadata = _hot_ordering_metadata(
+            observation,
+            records=records,
+            cluster=cluster,
+            concurrency=concurrency,
+            processing_delay_ms=processing_delay_ms,
+            timeout_seconds=timeout_seconds,
+            operation_elapsed_ns=time.perf_counter_ns() - operation_started_ns,
+        )
+        return metric(
+            "cluster_hot_ordering",
+            observation.request_latencies_ns,
+            time.perf_counter_ns() - operation_started_ns,
+            message_size=len(payload),
+            metadata=metadata,
+        )
+
+    return measure_scenario(cluster.stats, operation, metrics=cluster.metrics)
+
+
 def run_peer_forwarding(
     cluster: Cluster,
     stream: str,
@@ -1637,8 +2224,8 @@ def parse_args() -> argparse.Namespace:
         default=list(DEFAULT_SCENARIOS),
         help=(
             "comma-separated scenarios to run (default: existing clustered workload; "
-            "add peer_forwarding, publish_batch, leader_failure_recovery, or "
-            "follower_failure_recovery explicitly for focused probes)"
+            "add peer_forwarding, publish_batch, hot_ordering, leader_failure_recovery, "
+            "or follower_failure_recovery explicitly for focused probes)"
         ),
     )
     parser.add_argument("--ack-timeout-ms", type=int, default=DEFAULT_ACK_TIMEOUT_MS)
@@ -1653,6 +2240,42 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=DEFAULT_PUBLISH_BATCH_SIZE,
         help="records per publish_batch request for the opt-in publish_batch scenario",
+    )
+    parser.add_argument(
+        "--hot-key-messages",
+        type=int,
+        default=DEFAULT_HOT_KEY_MESSAGES,
+        help="preloaded records for the hot key in the opt-in hot_ordering scenario",
+    )
+    parser.add_argument(
+        "--cold-key-count",
+        type=int,
+        default=DEFAULT_COLD_KEY_COUNT,
+        help="number of independent cold keys in the opt-in hot_ordering scenario",
+    )
+    parser.add_argument(
+        "--cold-messages-per-key",
+        type=int,
+        default=DEFAULT_COLD_MESSAGES_PER_KEY,
+        help="preloaded records per cold key in the opt-in hot_ordering scenario",
+    )
+    parser.add_argument(
+        "--hot-ordering-concurrency",
+        type=int,
+        default=DEFAULT_HOT_ORDERING_CONCURRENCY,
+        help="grouped workers for the opt-in hot_ordering scenario",
+    )
+    parser.add_argument(
+        "--hot-key-processing-delay-ms",
+        type=parse_nonnegative_int,
+        default=DEFAULT_HOT_KEY_PROCESSING_DELAY_MS,
+        help="processing delay before acknowledging hot-key records",
+    )
+    parser.add_argument(
+        "--hot-ordering-timeout-seconds",
+        type=parse_positive_float,
+        default=DEFAULT_HOT_ORDERING_TIMEOUT_SECONDS,
+        help="bounded wall-clock budget for each hot_ordering scenario",
     )
     parser.add_argument(
         "--retained-messages",
@@ -1711,6 +2334,46 @@ def parse_args() -> argparse.Namespace:
     if args.batch_size <= 0 or args.batch_size > MAX_PUBLISH_BATCH_SIZE:
         parser.error(
             f"batch size must be between 1 and {MAX_PUBLISH_BATCH_SIZE} records"
+        )
+    if args.hot_key_messages <= 0:
+        parser.error("hot-key messages must be positive")
+    if args.cold_key_count <= 0:
+        parser.error("cold-key count must be positive")
+    if args.cold_messages_per_key <= 0:
+        parser.error("cold messages per key must be positive")
+    if args.hot_ordering_concurrency <= 0:
+        parser.error("hot-ordering concurrency must be positive")
+    if args.hot_ordering_concurrency > MAX_HOT_ORDERING_CONCURRENCY:
+        parser.error(
+            "hot-ordering concurrency exceeds the bounded maximum "
+            f"of {MAX_HOT_ORDERING_CONCURRENCY}"
+        )
+    hot_ordering_messages = args.hot_key_messages + (
+        args.cold_key_count * args.cold_messages_per_key
+    )
+    if hot_ordering_messages > MAX_HOT_ORDERING_MESSAGES:
+        parser.error(
+            "hot-ordering workload exceeds the bounded maximum of "
+            f"{MAX_HOT_ORDERING_MESSAGES} records"
+        )
+    if args.hot_key_processing_delay_ms > MAX_HOT_KEY_PROCESSING_DELAY_MS:
+        parser.error(
+            "hot-key processing delay exceeds the bounded maximum "
+            f"of {MAX_HOT_KEY_PROCESSING_DELAY_MS} ms"
+        )
+    if args.hot_ordering_timeout_seconds > MAX_HOT_ORDERING_TIMEOUT_SECONDS:
+        parser.error(
+            "hot-ordering timeout exceeds the bounded maximum "
+            f"of {MAX_HOT_ORDERING_TIMEOUT_SECONDS:g} seconds"
+        )
+    if "hot_ordering" in args.scenarios and args.hot_ordering_concurrency < 2:
+        parser.error("hot-ordering scenario requires at least two grouped workers")
+    if (
+        "hot_ordering" in args.scenarios
+        and args.hot_key_processing_delay_ms >= args.ack_timeout_ms
+    ):
+        parser.error(
+            "hot-key processing delay must be shorter than the acknowledgement timeout"
         )
     if args.peer_response_delay_ms > MAX_PEER_RESPONSE_DELAY_MS:
         parser.error(
@@ -1822,6 +2485,20 @@ def main() -> int:
                         args.concurrency,
                     )
                 )
+            if "hot_ordering" in selected_scenarios:
+                scenarios.append(
+                    run_hot_ordering(
+                        cluster,
+                        f"cluster_{run_id}_hot_ordering_{size}",
+                        payload,
+                        hot_key_messages=args.hot_key_messages,
+                        cold_key_count=args.cold_key_count,
+                        cold_messages_per_key=args.cold_messages_per_key,
+                        concurrency=args.hot_ordering_concurrency,
+                        processing_delay_ms=args.hot_key_processing_delay_ms,
+                        timeout_seconds=args.hot_ordering_timeout_seconds,
+                    )
+                )
             if "peer_forwarding" in selected_scenarios:
                 scenarios.append(
                     run_peer_forwarding(
@@ -1884,6 +2561,15 @@ def main() -> int:
         "ack_timeout_ms": args.ack_timeout_ms,
         "slow_consumer_delay_ms": args.slow_consumer_delay_ms,
         "batch_size": args.batch_size,
+        "hot_ordering": {
+            "hot_key_messages": args.hot_key_messages,
+            "cold_key_count": args.cold_key_count,
+            "cold_messages_per_key": args.cold_messages_per_key,
+            "concurrency": args.hot_ordering_concurrency,
+            "hot_key_processing_delay_ms": args.hot_key_processing_delay_ms,
+            "timeout_seconds": args.hot_ordering_timeout_seconds,
+            "max_records": MAX_HOT_ORDERING_MESSAGES,
+        },
         "peer_forwarding_concurrency": args.peer_forwarding_concurrency,
         "peer_response_delay_ms": args.peer_response_delay_ms,
         "peer_forwarding_timeout_seconds": args.peer_forwarding_timeout_seconds,
