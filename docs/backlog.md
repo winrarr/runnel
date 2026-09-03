@@ -48,6 +48,13 @@ Acceptance criteria:
 - a decision record recommends keeping GitHub Actions, piloting the alternative, or migrating, with an evidence-backed rollback plan and no loss of required coverage;
 - if the alternative is not materially better, the result is still recorded so the question does not need to be rediscovered.
 
+Current status: the desk evaluation is recorded in
+[ci-feedback-loop-evaluation.md](research/ci-feedback-loop-evaluation.md) and
+[ADR 0025](decisions/0025-retain-github-actions-pending-hosted-ci-trial.md).
+The outcome remains open: no hosted CircleCI trial was run in this environment,
+so wall-clock, variability, cache, contributor, diagnostics, status-check, and
+cost evidence remain to be collected before acceptance.
+
 ## Make client interactions dependable and evolvable
 
 Goal: provide a stable client-facing contract that lets applications publish and consume messages while understanding the result of each operation.
