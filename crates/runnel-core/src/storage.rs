@@ -5,7 +5,7 @@ use std::sync::{Arc, Mutex, Weak};
 #[cfg(feature = "instrumentation")]
 use runnel_engine::StageTimer;
 use runnel_engine::{BrokerError, EngineFuture};
-use tokio::sync::{Notify, Semaphore};
+use tokio::sync::{Notify, OwnedSemaphorePermit, Semaphore};
 
 use crate::validate_name;
 
@@ -15,6 +15,8 @@ const DEFAULT_STORAGE_QUEUE_CAPACITY: usize = 32;
 pub(super) struct StorageExecutor {
     execution_permits: Arc<Semaphore>,
     admission_permits: Arc<Semaphore>,
+    // This bounds async tasks waiting for a busy stream across all per-stream lanes.
+    stream_waiter_permits: Arc<Semaphore>,
     // Weak entries keep transient lane state from growing with one-off requests for unknown
     // streams. Active and queued operations hold the strong lane reference until they finish.
     stream_lanes: Mutex<HashMap<String, Weak<StorageLane>>>,
@@ -48,6 +50,7 @@ struct StorageLaneWaiter {
 struct QueuedStorageLaneWaiter {
     lane: Arc<StorageLane>,
     waiter: Arc<StorageLaneWaiter>,
+    waiter_permit: Option<OwnedSemaphorePermit>,
     claimed: bool,
 }
 
@@ -69,6 +72,7 @@ impl StorageExecutor {
             admission_permits: Arc::new(Semaphore::new(
                 execution_capacity.saturating_add(queue_capacity),
             )),
+            stream_waiter_permits: Arc::new(Semaphore::new(queue_capacity)),
             stream_lanes: Mutex::new(HashMap::new()),
             stream_queue_capacity: queue_capacity,
         }
@@ -117,14 +121,18 @@ impl StorageExecutor {
             // Admission is reserved before waiting for an execution permit, so the number of
             // active and queued blocking operations is bounded. Waiting for execution remains
             // asynchronous; only the synchronous operation runs on Tokio's blocking pool. A
-            // stream waiter is kept outside global admission while it waits for its explicit
-            // FIFO lane. Each lane has its configured bounded queue, so one stalled stream cannot
-            // consume global queue slots with operations that are unable to make progress in
-            // stream order.
+            // A stream waiter is kept outside execution admission while it waits for its explicit
+            // FIFO lane, but a separate bounded pool caps the total number of such waiters. Each
+            // lane has its configured bounded queue, so one stalled stream cannot consume global
+            // execution slots with operations that are unable to make progress in stream order.
             let stream_permit = match stream_lane.as_ref() {
-                Some(stream_lane) => {
-                    Some(Self::acquire_stream_permit(Arc::clone(stream_lane)).await?)
-                }
+                Some(stream_lane) => Some(
+                    Self::acquire_stream_permit(
+                        Arc::clone(stream_lane),
+                        Arc::clone(&self.stream_waiter_permits),
+                    )
+                    .await?,
+                ),
                 None => None,
             };
             let admission_permit = Arc::clone(&self.admission_permits)
@@ -162,8 +170,9 @@ impl StorageExecutor {
 
     async fn acquire_stream_permit(
         stream_lane: Arc<StorageLane>,
+        stream_waiter_permits: Arc<Semaphore>,
     ) -> Result<StorageLanePermit, BrokerError> {
-        let reservation = stream_lane.reserve()?;
+        let reservation = stream_lane.reserve(stream_waiter_permits)?;
         match reservation {
             LaneReservation::Active(permit) => Ok(permit),
             LaneReservation::Queued(waiter) => waiter.wait().await,
@@ -203,7 +212,10 @@ enum LaneReservation {
 }
 
 impl StorageLane {
-    fn reserve(self: &Arc<Self>) -> Result<LaneReservation, BrokerError> {
+    fn reserve(
+        self: &Arc<Self>,
+        stream_waiter_permits: Arc<Semaphore>,
+    ) -> Result<LaneReservation, BrokerError> {
         let mut state = self.state.lock().map_err(|_| BrokerError::LockPoisoned)?;
         if matches!(state.ownership, LaneOwnership::Idle) && state.waiters.is_empty() {
             state.ownership = LaneOwnership::Held;
@@ -217,6 +229,12 @@ impl StorageLane {
                 "storage stream queue is full",
             )));
         }
+        let waiter_permit = stream_waiter_permits.try_acquire_owned().map_err(|_| {
+            BrokerError::Io(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "storage stream queue is full",
+            ))
+        })?;
 
         let waiter = Arc::new(StorageLaneWaiter {
             notify: Notify::new(),
@@ -225,6 +243,7 @@ impl StorageLane {
         Ok(LaneReservation::Queued(QueuedStorageLaneWaiter {
             lane: Arc::clone(self),
             waiter,
+            waiter_permit: Some(waiter_permit),
             claimed: false,
         }))
     }
@@ -298,6 +317,7 @@ impl QueuedStorageLaneWaiter {
             let notified = self.waiter.notify.notified();
             if self.lane.claim(&self.waiter)? {
                 self.claimed = true;
+                self.waiter_permit.take();
                 return Ok(StorageLanePermit {
                     lane: Arc::clone(&self.lane),
                 });
@@ -324,7 +344,7 @@ impl Drop for StorageLanePermit {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering as AtomicOrdering};
     use std::thread;
 
     #[tokio::test(flavor = "current_thread")]
@@ -520,6 +540,65 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    async fn storage_dispatch_bounds_stream_waiters_across_lanes() {
+        let executor = Arc::new(StorageExecutor::with_capacities(3, 2));
+        let started = Arc::new(AtomicUsize::new(0));
+        let release = Arc::new(AtomicBool::new(false));
+        let mut active = Vec::new();
+
+        for stream in ["events", "jobs", "metrics"] {
+            let started = Arc::clone(&started);
+            let release = Arc::clone(&release);
+            active.push(tokio::spawn(Arc::clone(&executor).dispatch_stream(
+                stream.to_owned(),
+                move |_| {
+                    started.fetch_add(1, AtomicOrdering::Release);
+                    while !release.load(AtomicOrdering::Acquire) {
+                        thread::yield_now();
+                    }
+                    Ok(())
+                },
+            )));
+        }
+
+        while started.load(AtomicOrdering::Acquire) != 3 {
+            tokio::task::yield_now().await;
+        }
+
+        let first_waiter = tokio::spawn(
+            executor
+                .clone()
+                .dispatch_stream("events".to_owned(), |_| Ok(())),
+        );
+        let second_waiter = tokio::spawn(
+            executor
+                .clone()
+                .dispatch_stream("jobs".to_owned(), |_| Ok(())),
+        );
+        while executor.stream_waiter_permits.available_permits() != 0 {
+            tokio::task::yield_now().await;
+        }
+
+        assert_eq!(executor.admission_permits.available_permits(), 2);
+        let rejected = executor
+            .clone()
+            .dispatch_stream("metrics".to_owned(), |_| Ok(()))
+            .await;
+        assert!(matches!(
+            rejected,
+            Err(BrokerError::Io(error)) if error.kind() == io::ErrorKind::WouldBlock
+        ));
+
+        release.store(true, AtomicOrdering::Release);
+        for operation in active {
+            operation.await.unwrap().unwrap();
+        }
+        first_waiter.await.unwrap().unwrap();
+        second_waiter.await.unwrap().unwrap();
+        assert_eq!(executor.stream_waiter_permits.available_permits(), 2);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn storage_dispatch_lane_cancellation_releases_the_stream_queue_slot() {
         let executor = Arc::new(StorageExecutor::with_capacities(1, 1));
         let started = Arc::new(tokio::sync::Notify::new());
@@ -554,6 +633,7 @@ mod tests {
         second.abort();
         assert!(second.await.unwrap_err().is_cancelled());
         assert_eq!(events_lane.queue_len().unwrap(), 0);
+        assert_eq!(executor.stream_waiter_permits.available_permits(), 1);
 
         let third_executed = Arc::new(AtomicBool::new(false));
         let third_executed_flag = Arc::clone(&third_executed);
