@@ -1,8 +1,8 @@
 # Single-node to clustered migration boundary
 
 - Status: exploratory design note; not an accepted compatibility decision
-- Last reviewed: 2026-09-03
-- Baseline: `origin/main` `dfcdfc74a2819bef3992f0b6b5be9b8095eff907`
+- Last reviewed: 2026-09-05
+- Baseline: `origin/main` `f6b1fb97bf097bfacff445fd2810f75bbc286a44`
 - Scope: backlog outcome [Make growth from one node to a cluster non-disruptive](../backlog.md#make-growth-from-one-node-to-a-cluster-non-disruptive) and [TD-004](../tech-debt.md#td-004-local-and-clustered-durable-state-have-no-supported-migration-path)
 
 ## Summary
@@ -28,11 +28,44 @@ cluster data-group state. Copying a local file into a clustered directory,
 republishing through the public API, or installing local files as an OpenRaft
 snapshot is not a supported migration.
 
+## Boundary at the recorded baseline
+
+The following distinction is important: this note defines a candidate future
+boundary; it does not turn the current engine into a migration service.
+
+| Classification | Evidence in the current repository | Consequence for this note |
+| --- | --- | --- |
+| Observed local behavior | The local broker selects one durable writer format at startup, scans known `RNL1`, `RNL2`, and `RNL3` frame magics, truncates an incomplete trailing frame during normal recovery, and persists consumer checkpoints/journal events. Active delivery members, tokens, and `Instant` deadlines are process memory. See [`BrokerState::open`](../../crates/runnel-core/src/broker.rs), [`StreamLog::open`](../../crates/runnel-core/src/stream_log.rs), and the recovery tests in [`runnel-core`](../../crates/runnel-core/src/lib.rs). | A converter can preserve logical records and durable consumer state only after a normal source recovery boundary. It cannot copy volatile delivery ownership. |
+| Observed clustered behavior | The clustered engine selects the Raft backend at process startup. Startup validates clustered storage identity and persisted artifacts before opening groups; stream creation reconciles metadata `Creating`/`Active` state with one data group per stream and the configured peer set. See [`PersistentEngine::open_with_config`](../../crates/runnel-raft/src/engine.rs), [`GroupManager`](../../crates/runnel-raft/src/group_manager.rs), and [`SnapshotState`](../../crates/runnel-raft/src/state_machine.rs). | A fresh target can be populated only through a future logical import path. The existing public `Publish`, `CreateStream`, and snapshot-recovery paths are not a local-to-cluster interchange format. |
+| Observed absence | There is no migration command, import/export schema, durable migration phase, writer-fence epoch, endpoint-generation owner, or migration-specific status/metric in the current code. Existing clustered identity checks intentionally reject ambiguous state; they do not convert it. The current tests cover local recovery and clustered restart/failure, not cross-engine migration. | Any phase, fence, activation, rollback, or migration-status behavior below is proposed work and must not be described as current support. |
+| Proposed first supported slice | Side-by-side logical export/import into an empty, current three-node target, with a source fence for the final boundary, validation before serving, external endpoint cutover, and source retention until the recovery window ends. | This is the narrow retirement shape for TD-004. It preserves the application messaging model, not zero downtime or automatic downgrade. |
+
+The current evidence is useful but deliberately weaker than migration evidence.
+Local tests cover request-ID recovery, mixed legacy/versioned frame replay,
+consumer journal recovery, durable attempts, dead-letter retry identity, and
+incomplete/corrupt input. Cluster tests cover Raft state-machine recovery,
+stream lifecycle, request-ID deduplication, grouped delivery fencing, durable
+restart, leader failure, and the test-only interrupted snapshot replacement
+experiment. The real-process coverage is in
+[`cluster_smoke.rs`](../../crates/runnel-server/tests/cluster_smoke.rs). None
+of these tests proves a local export, cross-engine state conversion, writer
+fence, endpoint switch, or rollback boundary; those remain explicit gaps in
+the verification plan below.
+
+The test-to-claim mapping is:
+
+| Current claim | Existing evidence | Not established by that evidence |
+| --- | --- | --- |
+| Local logical history can be recovered and scanned safely | `versioned_reader_replays_mixed_legacy_and_versioned_frames`, `incomplete_trailing_frame_is_discarded_on_recovery`, `complete_legacy_record_with_malformed_key_fails_closed_on_recovery`, and `versioned_checksum_corruption_fails_recovery` in [`runnel-core/src/lib.rs`](../../crates/runnel-core/src/lib.rs). | A stable export schema, source-generation marker, or cross-engine digest. |
+| Local durable consumer and retry state survives failures | `consumer_delivery_journal_recovers_committed_events_and_discards_partial_tail`, `acknowledged_group_progress_and_retry_state_survive_restart`, and `request_id_deduplication_survives_restart` in [`runnel-core/src/lib.rs`](../../crates/runnel-core/src/lib.rs). | Conversion into clustered state or behavior for a fence racing with an acknowledgement. |
+| Cluster state recovers and rejects ambiguous storage | `persistent_engine_recovers_committed_state_after_reopen`, `persisted_storage_rejects_cluster_identity_mismatch_without_rewriting_data`, `partial_cluster_layout_is_rejected_without_opening_as_empty`, and `rejected_snapshot_install_preserves_existing_state` in [`runnel-raft/src/lib.rs`](../../crates/runnel-raft/src/lib.rs). | Local-to-cluster import, migration authority, endpoint ownership, or production replica replacement. |
+| Cluster delivery and process failures have a correctness baseline | `three_process_cluster_preserves_group_delivery_through_replica_restart`, `three_process_cluster_reassigns_group_delivery_after_node_failure`, and `three_process_cluster_replicates_and_recovers_after_failures` in [`cluster_smoke.rs`](../../crates/runnel-server/tests/cluster_smoke.rs). | Any cross-engine cutover, stale local writer rejection, or rollback after target writes. |
+
 ## Current evidence and the boundary it creates
 
-The current implementation provides two compatible messaging contracts, but
-not two compatible durable representations. The public boundary is deliberately
-topology-free: [`Engine`](../../crates/runnel-engine/src/lib.rs) exposes streams,
+The current implementation provides two implementations of the same intended
+messaging contract, but not two compatible durable representations. The public
+boundary is deliberately topology-free: [`Engine`](../../crates/runnel-engine/src/lib.rs) exposes streams,
 publishes, polls, replay, acknowledgements, and health, while engine selection
 is made when the process starts. [ADR 0004](../decisions/0004-multi-raft-first-distributed-engine.md)
 explicitly defers mixed engines and live engine migration.
@@ -268,9 +301,15 @@ work is:
 
 The current local engine has per-stream operation lanes but no persisted
 migration epoch, so this is a prerequisite for calling the procedure supported.
-Stopping the process is a useful first implementation mechanism only when the
-durable migration marker makes a later unfenced restart refuse service or
-explicitly aborts the migration after validation.
+The current server lifecycle can stop a process, but process shutdown alone is
+not a writer fence: a stale process or an operator restart could otherwise
+serve the same local directory without knowing that another generation is
+authoritative. Stopping the process is therefore only a possible first
+mechanism when a durable migration marker makes a later unfenced restart refuse
+service or explicitly abort the migration after validation. The existing
+`NotLeader` and generic `Cluster` outcomes are not migration-fence outcomes;
+the implementation must add and test a migration-specific classification
+before this design can claim stale-writer rejection.
 
 Local in-flight deliveries need a deliberate barrier. The simplest first
 contract is to stop new polls, allow acknowledgements that entered before the
@@ -451,6 +490,27 @@ Each phase must have a deterministic restart rule:
 | During endpoint switch or status reporting | Readiness is conservative until endpoint owner and durable target activation agree. Unknown route state is an operational incident, not permission for two writers. |
 | After target activation and new traffic | Target recovery or a new migration is required. Source pointer rollback is forbidden. |
 
+### Observable failure outcomes (proposed)
+
+The current protocol can report ordinary validation, cluster, not-leader,
+stream-not-ready, stale-delivery, and transport/unknown outcomes, but it has no
+migration outcome vocabulary. A future migration surface should make the
+authority decision explicit without asking an operator to infer it from those
+generic errors:
+
+| Failure point | Durable migration outcome and readiness | Required operator/client interpretation |
+| --- | --- | --- |
+| Preflight or source validation | No migration mutation; source remains ready and authoritative. | Fix the input or configuration and retry the plan. No client reconciliation is needed. |
+| Fence acquisition or drain cannot complete | `failed` or `aborted` before target activation; source remains fenced until the record is reconciled. | Do not start a second source. Resolve the recorded owner, then explicitly abort and revalidate before reopening source traffic. |
+| Chunk, consumer-state, or digest mismatch | Target staging is not ready; source remains the authority if activation has not committed. | Quarantine or discard only unreferenced staging and investigate the named migration/ordinal/digest. Do not skip the record or continue from an unverified prefix. |
+| Target replica or activation readiness failure | Target remains not ready; source stays fenced once cutover has begun. | Resume target recovery or declare a pre-activation abort. Never route clients to a partial or empty target. |
+| Activation committed, route switch unknown | Target is the durable authority; readiness is conservative until the endpoint owner agrees. | Reconcile the endpoint to the target or keep service down. Do not restart the old source as a fallback. |
+| Stale source write or acknowledgement after activation | Source rejects the operation under the migration epoch; target accepts only a retried operation with its current delivery/request identity. | A publish with a stable request ID may be resolved explicitly; an ID-less publish remains unknown; a stale acknowledgement must not move target progress. |
+
+These are proposed states and operator-visible consequences, not existing
+response codes. The implementation must define their serialization and add
+real-process tests before the procedure can be advertised as supported.
+
 The retry identity rules are equally important:
 
 - a stable request ID present in a source record is imported before target
@@ -545,6 +605,13 @@ ambiguous, while any required stream is not validated, or while a target
 generation is only staging. A process that starts successfully but cannot
 prove which generation it may serve is not ready.
 
+This is a proposed migration status surface, not a description of the current
+HTTP or public protocol. Today, health and metrics expose broker, request,
+delivery, storage, peer, and snapshot observations, but no migration phase,
+source-fence epoch, target generation, or endpoint owner. Until that surface
+exists, an operator cannot infer migration authority from a successful process
+start, a reachable socket, or an ordinary health response.
+
 ## Resource bounds and operational budget
 
 Migration is inherently proportional to the retained state being moved, so
@@ -584,8 +651,9 @@ These sources inform the boundary; none establishes Runnel compatibility.
 | Reference | Relevant mechanism | Difference that matters to Runnel |
 | --- | --- | --- |
 | [PostgreSQL `pg_upgrade`](https://www.postgresql.org/docs/current/pgupgrade.html) | Runs compatibility checks before mutation, initializes a separate destination, keeps the old cluster usable for ordinary copy/clone paths, and documents that link/swap choices can remove the old-cluster rollback property. | This is the closest operational model for a side-by-side generation. Runnel should retain the source and validate before activation, but must logically translate records and consumer state because local files are not clustered state. It should not adopt link-mode semantics that let two engines share mutable files. |
-| [Apache Kafka partition reassignment](https://kafka.apache.org/36/operations/basic-kafka-operations/) | Moves partitions to new brokers through the same replicated log protocol, offers execute/verify phases, preserves the current assignment for rollback, and supports a replication-bandwidth throttle. | Kafka expands one cluster whose source and target replicas already speak one log protocol. Runnel’s local engine has no Raft membership, committed log identity, or clustered consumer/dedup schema, so a Kafka-like live replica reassignment cannot be applied to local files. Its explicit plan, verify, rollback artifact, and throttle remain useful. |
-| [etcd learner design](https://etcd.io/docs/v3.6/learning/design-learner/) and [runtime reconfiguration](https://etcd.io/docs/v3.6/op-guide/runtime-configuration/) | A new member receives state as a non-voting learner, cannot serve normal client traffic, and is promoted only after it catches up and passes safety checks. Learner count and replication load are bounded. | Runnel should apply the readiness-before-authority principle to each target replica. A local source is not an etcd/Raft member, so it cannot simply be added as a learner; logical import must first create target data-group state, after which normal controlled replica recovery can apply. |
+| [Apache Kafka cross-cluster mirroring](https://kafka.apache.org/35/operations/geo-replication-cross-cluster-data-mirroring/) and [MirrorMaker offset configuration](https://kafka.apache.org/38/configuration/mirrormaker-configs/) | MirrorMaker 2 is explicitly used for cloud migration and replicates topics plus consumer groups/offsets; checkpoint and offset-sync settings translate source offsets before target consumers move. | This supports separating data transfer from endpoint cutover and treating consumer progress as migration data. Runnel cannot copy a source consumer offset by numeric translation alone because its local and clustered state models differ; the bundle must validate logical offsets and durable attempt state. The asynchronous mirror remains outside the first slice. |
+| [Apache Kafka partition reassignment](https://kafka.apache.org/36/operations/basic-kafka-operations/) and [leader-epoch fencing in the protocol](https://kafka.apache.org/37/design/protocol/) | Reassignment uses an explicit plan/verify workflow and a replication throttle. Kafka’s protocol carries leader epochs so stale clients/replicas can be rejected rather than allowed to write against an old authority. | Kafka moves replicas that already share one log protocol. Runnel’s local engine has no Raft membership, committed log identity, or migration epoch, so Kafka-like live reassignment cannot be applied to local files. Its explicit verification, throttling, and stale-authority rejection are useful requirements, but need a Runnel-owned fence. |
+| [etcd learner design](https://etcd.io/docs/v3.6/learning/design-learner/) and [runtime reconfiguration](https://etcd.io/docs/v3.7/op-guide/runtime-configuration/) | A new member receives state as a non-voting learner, cannot serve normal client traffic, and is promoted only after it catches up and passes safety checks. Learner count and replication load are bounded. | Runnel should apply the readiness-before-authority principle to each target replica. A local source is not an etcd/Raft member, so it cannot simply be added as a learner; logical import must first create target data-group state, after which normal controlled replica recovery can apply. |
 | [The Raft paper](https://raft.github.io/raft.pdf) and [OpenRaft snapshot replication](https://docs.rs/openraft/latest/openraft/docs/protocol/replication/snapshot_replication/) | Consensus applies an ordered command stream and snapshots carry a committed state boundary and membership information for replica recovery. | A local log has no Raft log index, membership, or committed term to install. The target may use its normal Raft snapshot/recovery path after import, but local-to-cluster conversion needs a Runnel-owned bundle and schema validation before target activation. |
 | [RocksDB MANIFEST/CURRENT](https://github.com/facebook/rocksdb/wiki/MANIFEST) | A transactional version-edit log plus a `CURRENT` pointer identifies the latest consistent generation; recovery does not infer state from arbitrary files and does not apply partial atomic groups. | Runnel needs the same explicit-generation and no-partial-activation discipline. Its marker must additionally bind stream, consumer, request-ID, engine, and writer-epoch semantics; a generic file pointer is insufficient. |
 | [Online, Asynchronous Schema Change in F1](https://research.google/pubs/online-asynchronous-schema-change-in-f1/) | Online readers and writers can corrupt shared data when schema transitions are not mutually compatible; F1 constrains transitions to a formally safe bounded version window. | This is evidence against casually adding a live local writer plus clustered importer. An online Runnel design would need a compatibility proof for every old/new publish, acknowledgement, retry, and ordering interaction; the first slice therefore uses a fence. |
@@ -850,8 +918,11 @@ shortcuts.
 
 - [PostgreSQL `pg_upgrade`](https://www.postgresql.org/docs/current/pgupgrade.html)
 - [Apache Kafka basic operations and partition reassignment](https://kafka.apache.org/36/operations/basic-kafka-operations/)
+- [Apache Kafka cross-cluster data mirroring](https://kafka.apache.org/35/operations/geo-replication-cross-cluster-data-mirroring/)
+- [Apache Kafka MirrorMaker checkpoint configuration](https://kafka.apache.org/38/configuration/mirrormaker-configs/)
+- [Apache Kafka protocol leader epochs](https://kafka.apache.org/37/design/protocol/)
 - [etcd learner design](https://etcd.io/docs/v3.6/learning/design-learner/)
-- [etcd runtime reconfiguration](https://etcd.io/docs/v3.6/op-guide/runtime-configuration/)
+- [etcd runtime reconfiguration](https://etcd.io/docs/v3.7/op-guide/runtime-configuration/)
 - [Raft: In Search of an Understandable Consensus Algorithm](https://raft.github.io/raft.pdf)
 - [OpenRaft snapshot replication](https://docs.rs/openraft/latest/openraft/docs/protocol/replication/snapshot_replication/)
 - [RocksDB MANIFEST](https://github.com/facebook/rocksdb/wiki/MANIFEST)
