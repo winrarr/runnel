@@ -31,6 +31,7 @@ from cluster import (  # noqa: E402
     DEFAULT_BINARY,
     DEFAULT_LEADER_FAILURE_TIMEOUT_SECONDS,
     DEFAULT_MESSAGES,
+    DEFAULT_PUBLISH_BATCH_SIZE,
     DEFAULT_RETAINED_RECOVERY_MESSAGES,
     DEFAULT_SLOW_CONSUMER_DELAY_MS,
     DEFAULT_WARMUP,
@@ -149,7 +150,21 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--cpus", default="2", help="per-broker container or scope CPU limit")
     parser.add_argument("--memory", default="2g", help="per-broker container or scope memory limit")
     parser.add_argument(
-        "--batch-size", type=int, default=32, help="records per publish_batch request"
+        "--batch-size",
+        type=int,
+        default=DEFAULT_PUBLISH_BATCH_SIZE,
+        help="records per publish_batch request",
+    )
+    parser.add_argument(
+        "--batch-size-values",
+        type=lambda value: parse_integer_values(
+            value, minimum=1, label="batch size values"
+        ),
+        default=None,
+        help=(
+            "comma-separated publish_batch sizes to expand independently; "
+            "defaults to the legacy --batch-size value"
+        ),
     )
     parser.add_argument("--peer-response-delay-ms", type=parse_nonnegative_int, default=0)
     parser.add_argument(
@@ -204,6 +219,20 @@ def parse_args() -> argparse.Namespace:
         parser.error(
             f"batch size must be between 1 and {MAX_PUBLISH_BATCH_SIZE} records"
         )
+    if (
+        args.batch_size_values is not None
+        and args.batch_size != DEFAULT_PUBLISH_BATCH_SIZE
+    ):
+        parser.error(
+            "--batch-size-values cannot be combined with a non-default --batch-size"
+        )
+    if args.batch_size_values is None:
+        args.batch_size_values = [args.batch_size]
+    if any(value > MAX_PUBLISH_BATCH_SIZE for value in args.batch_size_values):
+        parser.error(
+            "batch size values must be between 1 and "
+            f"{MAX_PUBLISH_BATCH_SIZE} records"
+        )
     if any(value > MAX_PEER_FORWARDING_CONCURRENCY for value in args.concurrency_values):
         parser.error(
             "concurrency values exceed the bounded maximum "
@@ -257,23 +286,30 @@ def matrix_cases(args: argparse.Namespace) -> list[dict[str, Any]]:
             if scenario in {"cluster_retained_recovery", "retained_hot_path"}
             else args.retained_message_values[:1]
         )
+        batch_size_values = (
+            args.batch_size_values
+            if scenario == "publish_batch"
+            else args.batch_size_values[:1]
+        )
         for runtime in args.runtimes:
             for payload_size in args.payload_sizes:
                 for concurrency in concurrency_values:
                     for delay_ms in delay_values:
                         for retained_messages in retained_values:
-                            for repetition in range(1, args.repetitions + 1):
-                                cases.append(
-                                    {
-                                        "scenario": scenario,
-                                        "runtime": runtime,
-                                        "payload_size": payload_size,
-                                        "concurrency": concurrency,
-                                        "slow_consumer_delay_ms": delay_ms,
-                                        "retained_messages": retained_messages,
-                                        "repetition": repetition,
-                                    }
-                                )
+                            for batch_size in batch_size_values:
+                                for repetition in range(1, args.repetitions + 1):
+                                    cases.append(
+                                        {
+                                            "scenario": scenario,
+                                            "runtime": runtime,
+                                            "payload_size": payload_size,
+                                            "concurrency": concurrency,
+                                            "slow_consumer_delay_ms": delay_ms,
+                                            "retained_messages": retained_messages,
+                                            "batch_size": batch_size,
+                                            "repetition": repetition,
+                                        }
+                                    )
     if len(cases) > args.max_cases:
         raise BenchmarkError(
             f"matrix expands to {len(cases)} cases, exceeding --max-cases {args.max_cases}"
@@ -319,7 +355,7 @@ def case_command(
             "--slow-consumer-delay-ms",
             str(case["slow_consumer_delay_ms"]),
             "--batch-size",
-            str(args.batch_size),
+            str(case["batch_size"]),
             "--retained-messages",
             str(case["retained_messages"]),
             "--peer-forwarding-concurrency",
@@ -343,11 +379,14 @@ def case_command(
 
 def case_id(index: int, case: dict[str, Any]) -> str:
     scenario = case["scenario"].replace("_", "-")
+    batch_size = (
+        f"batch-{case['batch_size']}-" if case["scenario"] == "publish_batch" else ""
+    )
     return (
         f"case-{index:03d}-{scenario}-{case['runtime']}-"
         f"payload-{case['payload_size']}-c{case['concurrency']}-"
         f"delay-{case['slow_consumer_delay_ms']}-retained-{case['retained_messages']}-"
-        f"r{case['repetition']}"
+        f"{batch_size}r{case['repetition']}"
     )
 
 
@@ -504,6 +543,7 @@ def run_matrix(
         "concurrency_values": args.concurrency_values,
         "slow_consumer_delay_values_ms": args.slow_consumer_delays_ms,
         "retained_message_values": args.retained_message_values,
+        "batch_size_values": args.batch_size_values,
         "runtimes": args.runtimes,
         "repetitions": args.repetitions,
         "ack_timeout_ms": args.ack_timeout_ms,
