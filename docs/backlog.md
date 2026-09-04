@@ -261,7 +261,7 @@ Goal: let supported broker upgrades preserve or deliberately transform acknowled
 
 Rationale: the storage layout now has separate metadata and stream data groups, so future format and placement changes need an explicit recovery and migration contract.
 
-Current progress: unsupported clustered storage versions and layouts now fail closed during read-only preflight before recovery mutates state. The [durable storage upgrade policy proposal](design/storage-upgrade-policy.md) now defines the observed format boundary, candidate compatibility and rollback vocabulary, interruption/observability requirements, and a smallest implementation slice; a supported migration, downgrade policy, interrupted-transfer procedure, and end-to-end upgrade path remain unimplemented and open.
+Current progress: unsupported clustered storage versions and layouts now fail closed during preflight before recovery opens groups or mutates authoritative state. The [durable storage upgrade policy proposal](design/storage-upgrade-policy.md) records the observed compatibility boundary, while the [storage-upgrade safety plan](design/storage-upgrade-safety-plan.md) now provides the proposed per-artifact compatibility matrix, validation rules, bounded side-by-side transfer, activation and writer-fencing invariants, rollback boundary, observability requirements, and end-to-end acceptance matrix. This is a design milestone only: no migration command, generation selector, writer fence, supported downgrade, interrupted-transfer recovery, or rolling-upgrade path is implemented.
 
 Constraints:
 
@@ -271,10 +271,22 @@ Constraints:
 
 Acceptance criteria:
 
-- supported upgrade paths and unsupported downgrade paths are documented;
-- representative old and new layouts have automated recovery or migration tests;
-- interrupted migration resumes safely or leaves the original data usable;
-- storage version, format, and migration outcomes are visible in diagnostics.
+- the current reopen/read-forward behavior and the proposed supported
+  side-by-side migration and unsupported downgrade boundary are documented per
+  artifact;
+- representative old and new layouts have automated recovery or migration
+  tests that preserve logical records, consumer progress, attempts, and
+  producer request identity;
+- interrupted transfer, activation, restart, and cleanup tests either resume
+  from verified bounded progress or leave the source generation usable;
+- writer/activation fencing prevents stale publish and acknowledgement
+  mutations across cutover;
+- storage version, format, identity, migration phase/outcome, progress,
+  rollback eligibility, validation failure, and cleanup/orphan state are
+  visible through bounded diagnostics and metrics; and
+- real-process local and three-node clustered upgrade tests cover mixed
+  compatibility, leader/follower recovery, snapshot/replacement boundaries,
+  and old-binary refusal after target-only state becomes active.
 
 ### Make message encoding and compression evolvable
 
