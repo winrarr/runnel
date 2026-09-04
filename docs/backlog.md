@@ -12,6 +12,13 @@ Goal: validate that the audience and workloads in [product-fit.md](product-fit.m
 
 Rationale: the initial product thesis is specific enough to guide development, but its workload budgets, usability, and operating envelope are not yet supported by intended-user evidence. Without that validation, infrastructure work can expand faster than evidence of user value.
 
+Progress: on 2026-09-04, bounded real-process checks passed for single-node
+background work, single-node event replay, and the static three-node failover
+slice. These checks establish repository-backed semantic evidence only; the
+numeric budgets, intended-user exercises, resource limits, and one-node-to-
+cluster migration evidence required by this outcome remain unknown. See the
+[validation record](research/initial-product-fit-validation.md).
+
 Constraints:
 
 - validate real application workflows rather than optimizing only synthetic broker operations;

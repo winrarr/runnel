@@ -1,14 +1,15 @@
 # Initial product-fit validation
 
-- Status: proposed validation plan; not a product-fit claim
-- Last reviewed: 2026-09-03
+- Status: repository validation recorded; product-fit claim remains unknown
+- Last reviewed: 2026-09-04
 - Scope: validate the audience, workloads, and product promise in
   [product-fit.md](../product-fit.md) against the current single-node and early
   three-node slices.
 
 This note turns the open outcome in [backlog.md](../backlog.md) into a
-repeatable validation plan. It does not change the backlog, accept a product
-decision, or claim that the current implementation is production-ready.
+repeatable validation plan and records the bounded repository checks completed
+against the current slices. It does not accept a product decision or claim
+that the current implementation is production-ready.
 
 ## Evidence vocabulary and budget registration
 
@@ -41,6 +42,84 @@ inventing measurements or choosing thresholds after seeing results:
 The numeric values are part of the signed-off workload manifest and must come
 from the intended application or an explicitly documented representative
 workload. This note deliberately contains no measured performance numbers.
+
+## Repository validation at the baseline
+
+On 2026-09-04, three bounded checks were run from revision
+`3e114d68cb5dab989f33fb5bb5453b0f072fcbf1`. The worktree was clean before the
+run, and `origin/main` resolved to the same revision. The latest `ci.yml` run
+for that revision was still in progress at the time of the run, so it is not
+counted as completed evidence here.
+
+The host was Linux 7.0.0-30-generic on x86_64 with 20 logical CPUs, 31 GiB of
+RAM, and 589 GiB free on the 934 GiB filesystem. The process checks used the
+repository isolation runner's unique temporary directories, ports, and Cargo
+targets, but they did not impose a CPU or memory cgroup. These host details are
+provenance, not a resource budget.
+
+No tracked `benchmark-results/` artifacts were present at the baseline. The
+repository's benchmark harnesses document how to produce machine-readable
+measurements, but no retained run was available to supply product-fit budgets
+for this validation.
+
+| Workload slice | Manifest shape and recovery boundary | Exact command and result |
+| --- | --- | --- |
+| Single-node durable background work | Real broker and CLI; five small UTF-8 source records across `events`, `jobs`, and `poison`, two members of one shared consumer, 50 ms acknowledgement timeout, two delivery attempts, one generated dead-letter record, broker restart, readiness and metrics checks. Messages were unkeyed, so this run did not exercise keyed ordering. | `just isolated smoke` — pass; `Runnel smoke test passed`. |
+| Single-node events and offset replay | Real server process with default test configuration; two small UTF-8 records, one acknowledged ordinary consumer, replay of offset 0, unavailable offset 2, broker restart, replay and ordinary poll after restart. | `CARGO_TARGET_DIR=/tmp/runnel-fit-replay.6r2AzN cargo test --locked -p runnel-server --test server_smoke network_protocol_persists_acknowledgements_across_restart -- --exact --nocapture --test-threads=1` — pass; 1 passed, 12 filtered out, test body 0.07 s. |
+| Three-node failover and rejoin | Three real static Raft-backed broker processes per scenario, low-volume UTF-8 records, default 50 ms lease for the replication scenario and 5 s lease for reassignment fencing, follower restart, leader/process failure, reassignment, stale-token rejection, quorum continuation, retry and dead-letter recovery. No migration or sustained-load exercise. | `just isolated cluster-test` — pass; all 3 cluster tests passed, 0 failed, test body 22.86 s. |
+
+The replay command used a unique temporary Cargo target for concurrent-run
+safety; the isolation runner removed successful temporary state after the
+other checks. The commands above are validation workflows, not application
+benchmarks: they do not report latency distributions, sustained throughput,
+resident-memory samples, storage growth, or participant task times.
+
+### Claim and budget disposition
+
+| Criterion | Disposition from this run |
+| --- | --- |
+| `B_safety` and semantic delivery behavior | **Pass for exercised assertions:** confirmed messages remained available, acknowledged progress survived restart, shared members received distinct records, retry/dead-letter transitions completed, and stale delivery state was rejected or reported as already acknowledged where the scenario required it. Keyed ordering was not part of the smoke manifest; existing contract and engine tests cover that separate predicate. |
+| `B_p95`, `B_p99`, and `B_rate` | **Unknown:** no numeric application budget was registered and these checks do not collect end-to-end distributions or sustained-rate measurements. |
+| `B_rss`, in-flight, and `B_disk` | **Unknown:** the host was not resource-limited and these checks did not sample peak resident memory, in-flight work, logical/physical storage growth, or recovery headroom. |
+| `B_rto` and replay/recovery window | **Semantic recovery passed within the test harness bounds**, including restart and one-node failover/rejoin. A numeric workload recovery budget was not registered; the cluster harness allows up to 120 s for recovery requests, which is a test timeout rather than a product SLO. |
+| `B_onboard` and `B_recover` | **Unknown:** maintainers ran the commands; no intended-user onboarding or recovery exercise was performed, and no operator-effort times or help requests were recorded. |
+
+The three slices therefore provide current repository evidence for the
+acceptance surface, but none meets the full product-fit acceptance criterion
+that requires numeric operating budgets and intended-user evidence. A green
+test is not evidence that an engineer understands consumer groups, replay,
+redelivery, stale acknowledgements, or cluster recovery.
+
+### Evidence-supported operating point and explicit boundaries
+
+The following is the current evidence boundary, not a production support
+promise:
+
+- A single local broker process can be exercised through the development CLI
+  and provisional protocol for small durable background-work and event/replay
+  flows. The tested semantics include at-least-once acknowledgement progress,
+  independent consumers, shared-member delivery, expiry-based redelivery,
+  dead-letter handling, restart recovery, and one-record offset replay with an
+  explicit unavailable-history outcome.
+- A static three-node development cluster can preserve the tested public model
+  across one broker process failure, follower restart, leader election, group
+  reassignment, stale-token fencing, and quorum-backed continuation. The
+  tests do not establish a supported deployment scale or availability SLO.
+- The documented recovery entry points are `just smoke` for the local
+  broker/CLI path and `just cluster-test` for the three-process development
+  cluster. The current operator must still understand the test/development
+  topology and inspect readiness, logs, and metrics; operator effort has not
+  been validated with an intended user.
+
+The current evidence does not establish support for a stable production client
+compatibility promise, numeric message/connection/in-flight/lag limits,
+retention or disk-pressure behavior, sustained resource bounds, time-based or
+durable replay sessions, one-node-to-three-node migration, dynamic membership,
+network partitions, storage loss, simultaneous failures, multi-region
+operation, exactly-once application processing, or large-cluster operation.
+Teams requiring those properties should defer adoption or use an established
+system until Runnel has the corresponding design, implementation, and
+evidence.
 
 ## Representative end-to-end workloads
 
@@ -281,13 +360,13 @@ These sources are used as reference points, not compatibility targets:
 
 This is a design/research change with no runtime path change. No benchmark is
 required for this note, and no latency, throughput, memory, storage, or product
-fit claim is made. When the plan is executed, use representative end-to-end
-workloads and follow [benchmarking.md](../benchmarking.md); synthetic broker
-results alone cannot satisfy the product-fit outcome.
+fit claim is made. Future representative end-to-end performance runs should
+follow [benchmarking.md](../benchmarking.md); synthetic broker results alone
+cannot satisfy the product-fit outcome.
 
-Current conclusion: the repository has credible automated starting evidence for
-the three slices, but initial product fit remains `unknown` until intended-user
-exercises, pre-registered operating budgets, resource/fault coverage, and a
-documented single-node-to-cluster migration result are available. The evidence
-package and claim matrix should then drive a backlog update or an explicit
-decision to defer adoption claims; this note itself does not warrant either.
+Current conclusion: the three repository checks provide credible automated
+semantic evidence for the selected slices, but initial product fit remains
+`unknown` until intended-user exercises, pre-registered operating budgets,
+resource/fault coverage, and a documented single-node-to-cluster migration
+result are available. The backlog progress note records this partial result;
+the evidence does not warrant adoption claims or closure of the outcome.
