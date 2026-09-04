@@ -111,8 +111,8 @@ This register records known implementation shortcuts in the current vertical sli
 
 - Status: open
 - Impact: retry configuration is broker-wide, backoff is limited to the acknowledgement timeout, and dead-letter records preserve only the original key and payload. Applications cannot yet select policy per consumer or reliably identify the source offset and attempt history from the dead-letter record alone.
-- Context: the initial policy establishes durable attempt counting and usable local and clustered grouped-delivery dead-letter streams before the public consumer configuration model is finalized.
-- Retirement condition: consumer-scoped policy, documented backoff and redrive behavior, and durable dead-letter provenance are available and covered by restart, retry, and clustered ownership tests.
+- Context: the initial policy establishes durable attempt counting and usable local and clustered grouped-delivery dead-letter streams before the public consumer configuration model is finalized. The local recursion guard recognizes only the `.dead-letter` suffix, while clustered handling also recognizes the hashed fallback used for maximum-length source names; the mismatch is not covered by a boundary test.
+- Retirement condition: consumer-scoped policy, documented backoff and redrive behavior, and durable dead-letter provenance are available and covered by restart, retry, clustered ownership, and maximum-length derived-target tests. Derived dead-letter targets are identified consistently in both engines and do not recurse.
 
 ## TD-019: Delivery bookkeeping synchronizes durable state per delivery
 
