@@ -1,5 +1,6 @@
 use std::collections::{BTreeMap, HashMap};
 use std::io;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::{Duration, Instant};
 
@@ -182,6 +183,7 @@ impl TcpConnection {
 /// manager's lifecycle and prevents unrelated engines in one process from
 /// sharing sockets or pool capacity.
 pub(crate) struct PeerTransport {
+    closed: AtomicBool,
     pools: StdMutex<PeerPoolRegistry>,
     fallback_permits: PeerPoolPermits,
 }
@@ -189,6 +191,7 @@ pub(crate) struct PeerTransport {
 impl PeerTransport {
     pub(crate) fn new() -> Arc<Self> {
         Arc::new(Self {
+            closed: AtomicBool::new(false),
             pools: StdMutex::new(PeerPoolRegistry::default()),
             fallback_permits: PeerPoolPermits::default(),
         })
@@ -199,7 +202,38 @@ impl PeerTransport {
             .pools
             .lock()
             .expect("peer RPC transport registry is not poisoned");
+        if self.is_closed() {
+            return None;
+        }
         pools.pool(address)
+    }
+
+    /// Stop new requests and close all idle compatibility sockets. Requests
+    /// already in flight finish under their existing TTL, then discard their
+    /// sockets instead of returning them to a closed pool.
+    pub(crate) fn shutdown(&self) {
+        if self.closed.swap(true, Ordering::AcqRel) {
+            return;
+        }
+
+        let pools = {
+            let mut registry = self
+                .pools
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            registry
+                .pools
+                .drain()
+                .map(|(_, entry)| entry.pool)
+                .collect::<Vec<_>>()
+        };
+        for pool in pools {
+            pool.shutdown();
+        }
+    }
+
+    fn is_closed(&self) -> bool {
+        self.closed.load(Ordering::Acquire)
     }
 
     async fn request<Res>(
@@ -211,6 +245,9 @@ impl PeerTransport {
     where
         Res: DeserializeOwned,
     {
+        if self.is_closed() {
+            return Err(transport_closed_error());
+        }
         self.request_with_pool(self.pool(address), address, request, ttl)
             .await
     }
@@ -225,6 +262,9 @@ impl PeerTransport {
     where
         Res: DeserializeOwned,
     {
+        if self.is_closed() {
+            return Err(transport_closed_error());
+        }
         if let Some(pool) = pool {
             return pool.request(address, request, ttl).await;
         }
@@ -239,6 +279,10 @@ impl PeerTransport {
         .await
         .map_err(|_| timed_out_error())?
         .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "peer RPC fallback is closed"))?;
+        if self.is_closed() {
+            drop(permit);
+            return Err(transport_closed_error());
+        }
         let remaining = ttl.saturating_sub(started.elapsed());
         let mut connection = TcpConnection::new(address);
         let result = connection.request(request, remaining).await;
@@ -248,6 +292,7 @@ impl PeerTransport {
 }
 
 struct PeerConnectionPool {
+    closed: AtomicBool,
     control_permits: Arc<Semaphore>,
     shared_permits: Arc<Semaphore>,
     idle: Mutex<Vec<IdleConnection>>,
@@ -322,10 +367,22 @@ impl PeerPoolRegistry {
 impl PeerConnectionPool {
     fn new() -> Self {
         Self {
+            closed: AtomicBool::new(false),
             control_permits: Arc::new(Semaphore::new(RESERVED_CONTROL_CONNECTIONS_PER_POOLED_PEER)),
             shared_permits: Arc::new(Semaphore::new(MAX_SHARED_CONNECTIONS_PER_POOLED_PEER)),
             idle: Mutex::new(Vec::with_capacity(MAX_CONNECTIONS_PER_POOLED_PEER)),
         }
+    }
+
+    fn shutdown(&self) {
+        self.closed.store(true, Ordering::Release);
+        if let Ok(mut idle) = self.idle.try_lock() {
+            idle.clear();
+        }
+    }
+
+    fn is_closed(&self) -> bool {
+        self.closed.load(Ordering::Acquire)
     }
 
     async fn request<Res>(
@@ -337,16 +394,27 @@ impl PeerConnectionPool {
     where
         Res: DeserializeOwned,
     {
+        if self.is_closed() {
+            return Err(pool_closed_error());
+        }
         let started = tokio::time::Instant::now();
         let lane = request.lane();
         let permit = tokio::time::timeout(ttl, self.permits(lane).acquire_owned())
             .await
             .map_err(|_| timed_out_error())?
             .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "peer RPC pool is closed"))?;
+        if self.is_closed() {
+            drop(permit);
+            return Err(pool_closed_error());
+        }
         let mut connection = self.take_connection(address, ttl, started).await?;
+        if self.is_closed() {
+            drop(permit);
+            return Err(pool_closed_error());
+        }
         let remaining = ttl.saturating_sub(started.elapsed());
         let result = connection.request(request, remaining).await;
-        if result.is_ok() {
+        if result.is_ok() && !self.is_closed() {
             self.return_connection(connection, ttl, started).await;
         }
         drop(permit);
@@ -363,6 +431,9 @@ impl PeerConnectionPool {
         let mut idle = tokio::time::timeout(remaining, self.idle.lock())
             .await
             .map_err(|_| timed_out_error())?;
+        if self.is_closed() {
+            return Err(pool_closed_error());
+        }
         let now = Instant::now();
         let connection = loop {
             let Some(idle_connection) = idle.pop() else {
@@ -386,6 +457,9 @@ impl PeerConnectionPool {
         let Ok(mut idle) = tokio::time::timeout(remaining, self.idle.lock()).await else {
             return;
         };
+        if self.is_closed() {
+            return;
+        }
         idle.push(IdleConnection {
             connection,
             last_used: Instant::now(),
@@ -425,6 +499,14 @@ impl PeerPoolPermits {
 
 fn timed_out_error() -> io::Error {
     io::Error::new(io::ErrorKind::TimedOut, "peer RPC timed out")
+}
+
+fn transport_closed_error() -> io::Error {
+    io::Error::new(io::ErrorKind::BrokenPipe, "peer RPC transport is closed")
+}
+
+fn pool_closed_error() -> io::Error {
+    io::Error::new(io::ErrorKind::BrokenPipe, "peer RPC pool is closed")
 }
 
 pub(crate) async fn forward(
@@ -601,6 +683,7 @@ mod tests {
     struct TestPeer {
         address: String,
         connections: Arc<AtomicUsize>,
+        active_connections: Arc<AtomicUsize>,
         max_active_connections: Arc<AtomicUsize>,
         requests: Arc<AtomicUsize>,
         framed_bytes: Arc<AtomicUsize>,
@@ -698,6 +781,7 @@ mod tests {
             Self {
                 address,
                 connections,
+                active_connections,
                 max_active_connections,
                 requests,
                 framed_bytes,
@@ -895,6 +979,86 @@ mod tests {
         .unwrap();
 
         assert_eq!(peer.connections.load(Ordering::Relaxed), 2);
+    }
+
+    #[tokio::test]
+    async fn transport_shutdown_closes_idle_connections_and_rejects_new_requests() {
+        let peer = TestPeer::start(None).await;
+        let transport = PeerTransport::new();
+
+        forward(
+            &transport,
+            &peer.address,
+            forwarded_operation(),
+            Duration::from_secs(1),
+        )
+        .await
+        .unwrap();
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while peer.active_connections.load(Ordering::Relaxed) != 1 {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .expect("pooled connection did not become active");
+
+        let retained_transport = Arc::clone(&transport);
+        transport.shutdown();
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while peer.active_connections.load(Ordering::Relaxed) != 0 {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .expect("transport shutdown did not close the idle connection");
+
+        let error = forward(
+            &retained_transport,
+            &peer.address,
+            forwarded_operation(),
+            Duration::from_secs(1),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::BrokenPipe);
+        assert_eq!(peer.connections.load(Ordering::Relaxed), 1);
+    }
+
+    #[tokio::test]
+    async fn transport_shutdown_does_not_retain_a_completed_pooled_connection() {
+        let peer = TestPeer::start_with_delay(None, Some(Duration::from_millis(25))).await;
+        let transport = PeerTransport::new();
+        let pool = transport.pool(&peer.address).unwrap();
+        let address = peer.address.clone();
+        let request_task = tokio::spawn({
+            let transport = Arc::clone(&transport);
+            async move {
+                transport
+                    .request::<PeerResponse>(&address, request(), Duration::from_secs(1))
+                    .await
+            }
+        });
+
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while peer.requests.load(Ordering::Relaxed) != 1 {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .expect("pooled request did not reach the peer");
+        transport.shutdown();
+
+        let response = request_task.await.unwrap().unwrap();
+        assert!(matches!(
+            response,
+            PeerResponse::Forward(ForwardedResponse::CreateStream(Ok(true)))
+        ));
+        assert!(pool.idle.lock().await.is_empty());
+        let error = pool
+            .request::<PeerResponse>(&peer.address, request(), Duration::from_secs(1))
+            .await
+            .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::BrokenPipe);
     }
 
     #[tokio::test]
