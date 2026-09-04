@@ -459,10 +459,12 @@ impl Client {
     /// Send one request and read exactly one response from this connection.
     ///
     /// After a write, response timeout, read, EOF, or response-decoding error,
-    /// the connection is discarded automatically. Reconnect before issuing
-    /// another request. If this future is cancelled after polling begins, its
-    /// connection is also discarded; the request outcome is unknown and must
-    /// be resolved explicitly before retrying.
+    /// the connection is discarded automatically. The broker's
+    /// `request_too_large` response also closes the protocol connection, so it
+    /// is discarded even though the response itself was received. Reconnect
+    /// before issuing another request. If this future is cancelled after
+    /// polling begins, its connection is also discarded; the request outcome
+    /// is unknown and must be resolved explicitly before retrying.
     ///
     /// A local request-encoding error occurs before the connection is taken and
     /// leaves an otherwise healthy connection available for reuse.
@@ -507,7 +509,9 @@ impl Client {
         }
         .await;
 
-        if result.is_ok() {
+        if let Ok(response) = &result
+            && !response_closes_connection(response)
+        {
             self.connection = Some(connection);
         }
         result
@@ -1147,6 +1151,13 @@ fn unexpected_response(outcome: &AttemptOutcome) -> bool {
         AttemptOutcome::Unknown(AttemptFailure::Client(
             ClientError::UnexpectedResponse { .. }
         ))
+    )
+}
+
+fn response_closes_connection(response: &Response) -> bool {
+    matches!(
+        response,
+        Response::Error { code, .. } if code == "request_too_large"
     )
 }
 
@@ -2397,6 +2408,37 @@ mod tests {
             .unwrap();
         let result = client.request(&Request::Health).await;
         assert!(matches!(result, Err(ClientError::InvalidResponse { .. })));
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn request_too_large_response_invalidates_persistent_connection() {
+        let (listener, address) = listener().await;
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut reader = BufReader::new(stream);
+            assert!(matches!(read_request(&mut reader).await, Request::Health));
+            write_response(
+                &mut reader,
+                Response::Error {
+                    code: "request_too_large".to_owned(),
+                    message: "request exceeds the configured maximum".to_owned(),
+                },
+            )
+            .await;
+        });
+
+        let mut client = Client::connect_with_config(address, test_config())
+            .await
+            .unwrap();
+        assert!(matches!(
+            client.request(&Request::Health).await,
+            Ok(Response::Error { code, .. }) if code == "request_too_large"
+        ));
+        assert!(matches!(
+            client.request(&Request::Health).await,
+            Err(ClientError::ConnectionUnavailable)
+        ));
         server.await.unwrap();
     }
 
