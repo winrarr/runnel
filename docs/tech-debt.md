@@ -86,13 +86,6 @@ This register records known implementation shortcuts in the current vertical sli
 - Context: native tools provide an immediately reproducible single-node and RF=3 publish baseline while Runnel's public protocol and common benchmark client are still provisional. Results now record operation-specific acknowledgement, durability, replication, delivery, batching, client, latency, topology, and resource boundaries, reject inconsistent declarations, and mark mismatched comparisons as experimental and non-ranking. A common equivalent workload client and fully comparable consume/recovery measurements remain absent.
 - Retirement condition: a common workload client or rigorously equivalent adapters measure durable publish, consume with application acknowledgement, batching, recovery, resource usage, and tail latency across all supported brokers while preserving each broker's explicitly stated guarantee.
 
-## TD-014: Security audit has a documented optional-dependency exception
-
-- Status: open; blocked on the transitive dependency graph
-- Impact: the required dependency audit ignores `RUSTSEC-2026-0235`, which is reported for `rkyv 0.7.46`. The advisory is not in Runnel's active feature graph, but `cargo audit` scans the lockfile and reports optional package entries that are not compiled. The exception must remain until the affected lockfile entry can be removed or upgraded without weakening the OpenRaft dependency.
-- Context: OpenRaft 0.9.25 depends on `byte-unit` with its default `byte` feature, which activates `rust_decimal 1.42.1`. `rust_decimal` declares `rkyv 0.7.46` as an optional feature dependency, but neither the default workspace features nor `--all-features --all-targets` activate that feature; `cargo tree --all-features --all-targets --invert rkyv@0.7.46` produces no dependency path. The advisory states that the fixed release is `rkyv >=0.8.17`, which is outside the `rust_decimal` 1.42.1 dependency requirement of `^0.7.46`. Downgrading or locally patching this indirect dependency would be speculative and could weaken compatibility or reintroduce unrelated defects.
-- Retirement condition: remove the ignore only after a compatible upstream release or dependency path change removes `rkyv 0.7.46` from `Cargo.lock`, or after a reviewed upgrade of the affected serialization path makes the fixed `rkyv >=0.8.17` release available. Before retiring the exception, verify both `cargo tree --all-features --all-targets --invert rkyv@0.7.46` has no result and `cargo audit` passes without `--ignore`; until then, the security workflow must fail if the advisory appears in the active feature graph.
-
 ## TD-016: Initial shared dispatcher uses a simple scan and one delivery per member
 
 - Status: open
