@@ -21,8 +21,8 @@ use super::delivery_state::{DeliveryState, DeliveryTokenGenerator, InFlight};
 use super::storage::StorageExecutor;
 use super::stream_log::{RecordIndex, StreamLog};
 use super::{
-    AckResult, BrokerConfig, DEAD_LETTER_SUFFIX, DurableFormat, HealthSnapshot,
-    dead_letter_move_id, dead_letter_stream_name, stream_path, validate_name,
+    AckResult, BrokerConfig, DurableFormat, HealthSnapshot, dead_letter_move_id,
+    dead_letter_stream_name, is_dead_letter_stream, stream_path, validate_name,
 };
 
 #[derive(Clone)]
@@ -276,7 +276,7 @@ impl Broker {
                 .inner
                 .max_delivery_attempts
                 .is_some_and(|max_attempts| attempts >= max_attempts)
-                && !stream.ends_with(DEAD_LETTER_SUFFIX)
+                && !is_dead_letter_stream(stream)
             {
                 self.dead_letter_record(&mut stream_state, stream, consumer, &candidate)?;
                 self.persist_dead_letter_ack(

@@ -35,6 +35,7 @@ use stream_log::{
 };
 const DEFAULT_ACK_TIMEOUT: Duration = Duration::from_secs(30);
 const DEAD_LETTER_SUFFIX: &str = ".dead-letter";
+const DEAD_LETTER_HASH_PREFIX: &str = "runnel.dead-letter.";
 
 pub use runnel_engine::{
     AckResult, BrokerError, HealthSnapshot, Message, Offset, PollResult, ReplayMessage,
@@ -189,9 +190,13 @@ fn dead_letter_stream_name(stream: &str) -> Result<String, BrokerError> {
     let hash = stream.bytes().fold(0xcbf29ce484222325_u64, |hash, byte| {
         (hash ^ u64::from(byte)).wrapping_mul(0x100000001b3)
     });
-    let fallback = format!("runnel.dead-letter.{hash:016x}");
+    let fallback = format!("{DEAD_LETTER_HASH_PREFIX}{hash:016x}");
     validate_name("dead-letter stream", &fallback)?;
     Ok(fallback)
+}
+
+fn is_dead_letter_stream(stream: &str) -> bool {
+    stream.ends_with(DEAD_LETTER_SUFFIX) || stream.starts_with(DEAD_LETTER_HASH_PREFIX)
 }
 
 fn dead_letter_move_id(
@@ -947,6 +952,56 @@ mod tests {
             reopened.poll("events.dead-letter", "inspector").unwrap(),
             PollResult::Empty
         );
+    }
+
+    #[test]
+    fn maximum_length_dead_letter_target_does_not_recurse() {
+        let directory = tempdir().unwrap();
+        let config = BrokerConfig {
+            ack_timeout: Duration::ZERO,
+            max_delivery_attempts: Some(1),
+        };
+        let broker = Broker::open(directory.path(), config.clone()).unwrap();
+        let source = "s".repeat(128);
+        broker
+            .publish(&source, Some("order-1".to_owned()), b"poison".to_vec())
+            .unwrap();
+
+        assert!(matches!(
+            broker.poll(&source, "worker").unwrap(),
+            PollResult::Message(Message {
+                delivery_attempt: Some(1),
+                ..
+            })
+        ));
+        assert_eq!(broker.poll(&source, "worker").unwrap(), PollResult::Empty);
+
+        let dead_letter = dead_letter_stream_name(&source).unwrap();
+        assert!(dead_letter.starts_with(DEAD_LETTER_HASH_PREFIX));
+        assert!(matches!(
+            broker.poll(&dead_letter, "inspector").unwrap(),
+            PollResult::Message(Message {
+                delivery_attempt: Some(1),
+                ..
+            })
+        ));
+
+        drop(broker);
+        let broker = Broker::open(directory.path(), config).unwrap();
+        assert!(matches!(
+            broker.poll(&dead_letter, "inspector").unwrap(),
+            PollResult::Message(Message {
+                delivery_attempt: Some(2),
+                ..
+            })
+        ));
+        assert_eq!(broker.health().unwrap().streams, 2);
+
+        let nested_dead_letter = format!("{dead_letter}{DEAD_LETTER_SUFFIX}");
+        assert!(matches!(
+            broker.poll(&nested_dead_letter, "inspector"),
+            Err(BrokerError::StreamNotFound(stream)) if stream == nested_dead_letter
+        ));
     }
 
     #[test]
