@@ -11,10 +11,20 @@ sys.path.insert(0, str(SCRIPT_DIR))
 
 import compare  # noqa: E402
 import compare_adapters  # noqa: E402
+import compare_backends  # noqa: E402
+import compare_cli  # noqa: E402
+import compare_lifecycle  # noqa: E402
+import compare_results  # noqa: E402
 import common  # noqa: E402
 
 
 class ComparisonBenchmarkTests(unittest.TestCase):
+    def test_entrypoint_facade_keeps_focused_module_ownership(self) -> None:
+        self.assertIs(compare.combine_resource_summaries, compare_lifecycle.combine_resource_summaries)
+        self.assertIs(compare.backend_metadata, compare_results.backend_metadata)
+        self.assertIs(compare.run_kafka_family, compare_backends.run_kafka_family)
+        self.assertIs(compare.parse_args, compare_cli.parse_args)
+
     def test_scenario_operation_reads_current_and_legacy_result_fields(self) -> None:
         self.assertEqual(compare.scenario_operation({"operation": "publish"}), "publish")
         self.assertEqual(compare.scenario_operation({"name": "durable_publish"}), "durable_publish")
