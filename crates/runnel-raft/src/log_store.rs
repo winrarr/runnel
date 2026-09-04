@@ -134,6 +134,74 @@ where
                 ),
             ));
         }
+
+        let mut expected_index = persisted
+            .last_purged_log_id
+            .map(|log_id| log_id.index.checked_add(1))
+            .unwrap_or(Some(0));
+        for (index, entry) in &persisted.log {
+            let Some(next_index) = expected_index else {
+                return Err(invalid_log(
+                    path,
+                    format!("log entry at index {index} follows the maximum possible log index"),
+                ));
+            };
+            if *index != next_index {
+                return Err(invalid_log(
+                    path,
+                    format!("expected contiguous log entry at index {next_index}, found {index}"),
+                ));
+            }
+            let entry_index = entry.get_log_id().index;
+            if entry_index != *index {
+                return Err(invalid_log(
+                    path,
+                    format!(
+                        "log entry map index {index} does not match entry log index {entry_index}"
+                    ),
+                ));
+            }
+            expected_index = index.checked_add(1);
+        }
+
+        let last_log_index = persisted
+            .log
+            .keys()
+            .next_back()
+            .copied()
+            .or_else(|| persisted.last_purged_log_id.map(|log_id| log_id.index));
+        if let Some(committed) = persisted.committed {
+            let Some(last_log_index) = last_log_index else {
+                return Err(invalid_log(
+                    path,
+                    format!(
+                        "committed log index {} is present but the persisted log is empty",
+                        committed.index
+                    ),
+                ));
+            };
+            if committed.index > last_log_index {
+                return Err(invalid_log(
+                    path,
+                    format!(
+                        "committed log index {} is beyond the last persisted log index {last_log_index}",
+                        committed.index
+                    ),
+                ));
+            }
+            if let Some(entry) = persisted.log.get(&committed.index)
+                && *entry.get_log_id() != committed
+            {
+                return Err(invalid_log(
+                    path,
+                    format!(
+                        "committed log id {committed:?} does not match the retained entry at index {} ({:?})",
+                        committed.index,
+                        entry.get_log_id()
+                    ),
+                ));
+            }
+        }
         Ok(Some(persisted))
     }
 
@@ -164,6 +232,17 @@ where
             )
         })
     }
+}
+
+fn invalid_log(path: &Path, reason: String) -> StorageError<NodeId> {
+    StorageError::from_io_error(
+        openraft::ErrorSubject::Logs,
+        openraft::ErrorVerb::Read,
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("invalid Raft log '{}': {reason}", path.display()),
+        ),
+    )
 }
 
 impl<C: RaftTypeConfig<NodeId = NodeId>> RaftLogReader<C> for LogStore<C>
@@ -299,6 +378,35 @@ fn atomic_write(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use openraft::{CommittedLeaderId, Entry, EntryPayload};
+
+    fn blank_entry(index: u64, term: u64) -> Entry<crate::TypeConfig> {
+        Entry {
+            log_id: LogId {
+                leader_id: CommittedLeaderId::new(term, 1),
+                index,
+            },
+            payload: EntryPayload::Blank,
+        }
+    }
+
+    fn write_persisted_log(
+        path: &Path,
+        last_purged_log_id: Option<LogId<NodeId>>,
+        log: BTreeMap<u64, Entry<crate::TypeConfig>>,
+        committed: Option<LogId<NodeId>>,
+    ) -> Vec<u8> {
+        let bytes = serde_json::to_vec(&PersistedLog {
+            version: FORMAT_VERSION,
+            last_purged_log_id,
+            log,
+            committed,
+            vote: None,
+        })
+        .unwrap();
+        fs::write(path, &bytes).unwrap();
+        bytes
+    }
 
     #[tokio::test]
     async fn supported_raft_log_format_recovers_without_rewriting() {
@@ -338,6 +446,104 @@ mod tests {
             .to_string();
         assert!(error.contains("unsupported log format version"));
         assert!(error.contains(path.to_str().unwrap()));
+        assert_eq!(fs::read(&path).unwrap(), bytes);
+    }
+
+    #[test]
+    fn mismatched_raft_log_entry_index_is_rejected_without_rewriting() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("raft-log.json");
+        let bytes =
+            write_persisted_log(&path, None, BTreeMap::from([(0, blank_entry(1, 1))]), None);
+
+        let error = LogStore::<crate::TypeConfig>::open(&path)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("log entry map index 0 does not match entry log index 1"));
+        assert_eq!(fs::read(&path).unwrap(), bytes);
+    }
+
+    #[test]
+    fn non_contiguous_raft_log_is_rejected_without_rewriting() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("raft-log.json");
+        let bytes = write_persisted_log(
+            &path,
+            None,
+            BTreeMap::from([(0, blank_entry(0, 1)), (2, blank_entry(2, 1))]),
+            None,
+        );
+
+        let error = LogStore::<crate::TypeConfig>::open(&path)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("expected contiguous log entry at index 1, found 2"));
+        assert_eq!(fs::read(&path).unwrap(), bytes);
+    }
+
+    #[test]
+    fn committed_raft_log_beyond_retained_entries_is_rejected_without_rewriting() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("raft-log.json");
+        let bytes = write_persisted_log(
+            &path,
+            None,
+            BTreeMap::from([(0, blank_entry(0, 1))]),
+            Some(LogId {
+                leader_id: CommittedLeaderId::new(1, 1),
+                index: 1,
+            }),
+        );
+
+        let error = LogStore::<crate::TypeConfig>::open(&path)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("committed log index 1 is beyond the last persisted log index 0"));
+        assert_eq!(fs::read(&path).unwrap(), bytes);
+    }
+
+    #[test]
+    fn committed_raft_log_id_mismatch_is_rejected_without_rewriting() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("raft-log.json");
+        let bytes = write_persisted_log(
+            &path,
+            None,
+            BTreeMap::from([(0, blank_entry(0, 1))]),
+            Some(LogId {
+                leader_id: CommittedLeaderId::new(2, 1),
+                index: 0,
+            }),
+        );
+
+        let error = LogStore::<crate::TypeConfig>::open(&path)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("does not match the retained entry at index 0"));
+        assert_eq!(fs::read(&path).unwrap(), bytes);
+    }
+
+    #[tokio::test]
+    async fn valid_purged_raft_log_recovers_without_rewriting() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("raft-log.json");
+        let last_purged_log_id = Some(LogId {
+            leader_id: CommittedLeaderId::new(1, 1),
+            index: 4,
+        });
+        let committed = Some(LogId {
+            leader_id: CommittedLeaderId::new(2, 1),
+            index: 6,
+        });
+        let bytes = write_persisted_log(
+            &path,
+            last_purged_log_id,
+            BTreeMap::from([(5, blank_entry(5, 2)), (6, blank_entry(6, 2))]),
+            committed,
+        );
+
+        let mut store = LogStore::<crate::TypeConfig>::open(&path).unwrap();
+        assert_eq!(store.get_log_state().await.unwrap().last_log_id, committed);
         assert_eq!(fs::read(&path).unwrap(), bytes);
     }
 }
