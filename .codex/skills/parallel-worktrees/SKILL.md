@@ -14,6 +14,10 @@ the rule to parallel work.
 ## Before spawning
 
 - Identify the immediate local task and keep it on the critical path.
+- For a backlog or tech-debt run, select independent, still-unfinished items from
+  `docs/backlog.md` and `docs/tech-debt.md`. Confirm the current code and tests
+  still support each item before assigning it; planning text is not an accepted
+  implementation contract by itself.
 - Split independent work by responsibility, file ownership, and an explicit domain boundary. The refactoring and backlog/tech-debt policy is defined once in the repository root `AGENTS.md`; workers and coordinators must follow that policy. For an explicitly coordinated architectural refactor, overlapping paths are allowed when they reflect the domain; name an integration owner, explain the overlap, and define how shared changes will be reconciled.
 - Establish a committed baseline before spawning. Fetch `origin/main`, record its revision, and inspect the latest `ci.yml` run for that SHA when GitHub access is available. If uncommitted edits matter, create a clearly identified local baseline or explicit patch.
 - Give every worker the baseline revision, owned paths, expected result, and instruction not to revert unrelated work.
@@ -96,7 +100,8 @@ Tell each worker to:
 - distinguish a confirmed improvement from noise, a blocked run, and an inconclusive result;
 - report changed files, expected effects and non-effects, correctness and crash-recovery considerations, evidence, coverage gaps, and an evidence-based recommendation to merge, revise, rerun, or defer. Include blocked or inconclusive results rather than omitting them;
 - report the recorded baseline revision and whether the branch was refreshed;
-- commit the result on its task branch when code is ready, or leave a clearly documented uncommitted patch when it is not.
+- commit the result on its task branch, push it, and open exactly one pull request for the task. Use a draft PR for incomplete or blocked work, and include the documented handoff in the PR body;
+- do not merge the PR or enable auto-merge. The worker may provide a provisional disposition, but the orchestrator owns the independent review, final merge recommendation, merge, and rolling-pool lifecycle.
 
 When coordinating delegated work, the orchestrator must collect each worker's
 expected effects and non-effects, evidence and coverage gaps, recommendation,
@@ -109,32 +114,53 @@ untracked coordinator follow-up.
 Interpret these concise requests as predefined coordination modes:
 
 - “run parallel-worktrees with N subagents”: start a fixed pool of exactly N
-  workers and do not start replacements.
-- “run parallel-worktrees with N subagents and rolling pool”: start up to N
-  workers and replace a worker only after its recommended PR actually merges.
-  Worker completion, PR creation, or green checks do not trigger replacement.
+  workers and do not start replacements. If fewer eligible tasks exist, start
+  one worker per available task and report the shortage.
+- “run parallel-worktrees with N subagents and rolling pool”: fill N initial
+  worker slots (or all available eligible tasks when fewer exist), maintain at
+  most N assigned workers, and replace a slot only after the orchestrator
+  recommends that worker's PR for merge and the PR actually merges. Every
+  replacement is another eligible item from the backlog or tech-debt records.
+  Worker completion, PR creation, a worker's recommendation, or green checks do
+  not trigger replacement.
 
 For both modes, N is the requested initial and maximum worker count unless the
 user gives a different concurrency limit. Record the count, mode, baseline,
-task-to-worktree mapping, and stop condition. In rolling mode, a slot may remain
-unfilled while a recommended PR awaits checks or merge, or while work is deferred.
+task-to-worktree mapping, and stop condition. In rolling mode, a slot remains
+unfilled while its worker's PR awaits checks or merge, or after the orchestrator
+does not recommend merging that item.
 
-After spawning, retain worker identifiers and keep the run active until every
-requested worker reaches a final status or is explicitly cancelled. Use grouped,
-non-busy-polling waits, check open PRs periodically, and report each completion
-with its branch or PR, result, evidence, gaps, and recommendation. Report blocked
-or inconclusive work explicitly.
+After spawning, retain worker identifiers. Use grouped, non-busy-polling waits,
+check open PRs periodically while workers or PRs are pending, and report each
+completion with its branch and PR, result, evidence, gaps, and recommendation.
+Report blocked or inconclusive work explicitly.
 
-When a worker recommends merge, review its branch and merge only after required
-checks pass. In rolling mode, refresh the default-branch baseline and start one
-replacement from a newly validated worktree after the actual merge, unless the
-user has asked to stop. When a worker does not recommend merge, report the branch,
-evidence, gaps, and recommendation immediately; do not replace it automatically.
+The worker must create and own its PR; the orchestrator must review the PR and
+make the final recommendation. Review the diff against the recorded baseline,
+the worker's evidence and planning assessment, required checks, mergeability,
+and relevant repository gates. If the orchestrator recommends merge, merge only
+after required checks pass. In rolling mode, refresh the default-branch baseline
+and start exactly one replacement from a newly validated worktree after the
+actual merge, unless a stop condition has been reached.
 
-A stop request prevents all replacements. Let already-started workers reach a
-final status when practical and process their recommendations. Auto-merge remains
-opt-in; if explicitly requested but unsupported by the repository, leave the PR
-open and report that limitation.
+If the orchestrator does not recommend merging a work item—including when it
+recommends revise, rerun, defer, or records blocked/inconclusive evidence—leave
+its PR and worktree in place, increment the distinct non-merge work-item count,
+and immediately update the user with the PR, branch/worktree, evidence, gaps,
+and recommendation so the user can direct follow-up. Do not replace that slot.
+
+In rolling mode, continue until the user tells the orchestrator to stop starting
+workers or five distinct work items have received a final non-merge
+recommendation. Once either condition is reached, start no replacements. Let
+already-started workers reach final status when practical and continue
+processing their PRs, including merging PRs the orchestrator recommends when
+their required checks pass.
+
+If the user asks to call it a day after the remaining workers finish and requests
+auto-merge, enable it for open PRs the orchestrator recommends merging. If the
+repository does not support auto-merge, leave those PRs open, report the
+limitation, and finish without starting replacements. Auto-merge never replaces
+the orchestrator's review or merge recommendation.
 
 ## Integration
 
@@ -146,6 +172,13 @@ Merge independently reviewable pull requests in parallel once their required pul
 
 ## Cleanup and handoff
 
-After a worker is complete or cancelled, explicitly stop or close the worker and any nested workers before cleanup. Then confirm that the workers and their owned processes and containers are gone, preserve committed work and benchmark artifacts needed for review, and remove only clean temporary worktrees. A clean Git status is not sufficient. Do not delete a worktree containing uncommitted user changes or belonging to a worker that is still active; do not terminate unrelated processes.
+After a worker is complete or cancelled, explicitly stop or close the worker and
+any nested workers before cleanup. For a non-merge recommendation, retain the
+PR and worktree for user-directed follow-up; otherwise confirm that the workers
+and their owned processes and containers are gone, preserve committed work and
+benchmark artifacts needed for review, and remove only clean temporary
+worktrees. A clean Git status is not sufficient. Do not delete a worktree
+containing uncommitted user changes or belonging to a worker that is still
+active; do not terminate unrelated processes.
 
 The final handoff should state which branches or pull requests were integrated, which remain open or blocked, the exact verification status, and any unresolved resource or benchmark reliability issue.
