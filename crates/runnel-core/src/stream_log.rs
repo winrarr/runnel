@@ -56,7 +56,7 @@ pub(super) struct StreamLog {
     // The durable log retains the complete history; this tail cache keeps normal delivery
     // bounded while older replay requests use the bounded sparse index as a scan starting point.
     records: VecDeque<RecordIndex>,
-    sparse_index: VecDeque<LogCheckpoint>,
+    sparse_index: SparseIndex,
     request_ids: HashMap<String, Offset>,
     next_offset: Offset,
 }
@@ -72,7 +72,7 @@ impl StreamLog {
             file,
             durable_format,
             records: VecDeque::with_capacity(MAX_IN_MEMORY_RECORDS),
-            sparse_index: VecDeque::with_capacity(MAX_SPARSE_INDEX_ENTRIES),
+            sparse_index: SparseIndex::new(),
             request_ids: HashMap::new(),
             next_offset: 0,
         })
@@ -82,14 +82,20 @@ impl StreamLog {
         let mut file = OpenOptions::new().read(true).append(true).open(path)?;
         let file_len = file.metadata()?.len();
         let mut records = VecDeque::with_capacity(MAX_IN_MEMORY_RECORDS);
-        let mut sparse_index = VecDeque::with_capacity(MAX_SPARSE_INDEX_ENTRIES);
+        let mut sparse_index = SparseIndex::new();
         let mut request_ids = HashMap::new();
         let mut cursor = 0;
         let mut next_offset = 0;
-        while let Some(parsed) = read_record(&mut file, cursor, file_len, durable_format)? {
-            remember_checkpoint(&mut sparse_index, parsed.index.offset, cursor);
+        file.seek(SeekFrom::Start(cursor))?;
+        while let Some(parsed) = read_next_record(&mut file, cursor, file_len, durable_format)? {
+            if parsed.index.offset != next_offset {
+                return Err(invalid_record_data("record offsets are not contiguous"));
+            }
+            sparse_index.remember(parsed.index.offset, cursor);
             cursor = parsed.next_cursor;
-            next_offset = parsed.index.offset.saturating_add(1);
+            next_offset = next_offset
+                .checked_add(1)
+                .ok_or_else(|| invalid_record_data("record offset exceeds u64 range"))?;
             if let Some(request_id) = parsed.index.request_id.as_ref() {
                 request_ids
                     .entry(request_id.clone())
@@ -147,14 +153,12 @@ impl StreamLog {
 
     #[cfg(test)]
     pub(super) fn first_sparse_offset(&self) -> Option<Offset> {
-        self.sparse_index
-            .front()
-            .map(|checkpoint| checkpoint.offset)
+        self.sparse_index.first_offset()
     }
 
     #[cfg(test)]
     pub(super) fn last_sparse_offset(&self) -> Option<Offset> {
-        self.sparse_index.back().map(|checkpoint| checkpoint.offset)
+        self.sparse_index.last_offset()
     }
 
     pub(super) fn append(
@@ -209,7 +213,7 @@ impl StreamLog {
 
         let payload_offset = self.file.stream_position()? - payload.len() as u64;
         let record_cursor = payload_offset - key_bytes.len() as u64 - LEGACY_HEADER_LEN as u64;
-        remember_checkpoint(&mut self.sparse_index, offset, record_cursor);
+        self.sparse_index.remember(offset, record_cursor);
         remember_record(
             &mut self.records,
             RecordIndex {
@@ -282,7 +286,7 @@ impl StreamLog {
 
         let payload_offset = self.file.stream_position()? - payload.len() as u64;
         let record_cursor = payload_offset - key_bytes.len() as u64 - VERSIONED_HEADER_LEN as u64;
-        remember_checkpoint(&mut self.sparse_index, offset, record_cursor);
+        self.sparse_index.remember(offset, record_cursor);
         remember_record(
             &mut self.records,
             RecordIndex {
@@ -402,7 +406,7 @@ impl StreamLog {
             - request_id_bytes.len() as u64
             - key_bytes.len() as u64
             - REQUEST_ID_HEADER_LEN as u64;
-        remember_checkpoint(&mut self.sparse_index, offset, record_cursor);
+        self.sparse_index.remember(offset, record_cursor);
         remember_record(
             &mut self.records,
             RecordIndex {
@@ -536,7 +540,9 @@ impl StreamLog {
         // from byte zero.
         let file_len = self.file.metadata()?.len();
         let mut cursor = self.scan_start(committed_offset);
-        while let Some(parsed) = read_record(&mut self.file, cursor, file_len, self.durable_format)?
+        self.file.seek(SeekFrom::Start(cursor))?;
+        while let Some(parsed) =
+            read_next_record(&mut self.file, cursor, file_len, self.durable_format)?
         {
             cursor = parsed.next_cursor;
             if parsed.index.offset < committed_offset {
@@ -556,7 +562,9 @@ impl StreamLog {
 
         let file_len = self.file.metadata()?.len();
         let mut cursor = self.scan_start(offset);
-        while let Some(parsed) = read_record(&mut self.file, cursor, file_len, self.durable_format)?
+        self.file.seek(SeekFrom::Start(cursor))?;
+        while let Some(parsed) =
+            read_next_record(&mut self.file, cursor, file_len, self.durable_format)?
         {
             cursor = parsed.next_cursor;
             if parsed.index.offset == offset {
@@ -567,11 +575,7 @@ impl StreamLog {
     }
 
     pub(super) fn scan_start(&self, offset: Offset) -> u64 {
-        self.sparse_index
-            .iter()
-            .rev()
-            .find(|checkpoint| checkpoint.offset <= offset)
-            .map_or(0, |checkpoint| checkpoint.cursor)
+        self.sparse_index.start_for(offset)
     }
 }
 
@@ -597,12 +601,70 @@ struct LogCheckpoint {
     cursor: u64,
 }
 
+#[derive(Debug, Default)]
+struct SparseIndex {
+    // Checkpoints stay in offset order and retain only a bounded recent window. An old replay can
+    // still scan from byte zero after its checkpoint is evicted, while normal delivery never
+    // retains one location per durable record.
+    checkpoints: VecDeque<LogCheckpoint>,
+}
+
+impl SparseIndex {
+    fn new() -> Self {
+        Self {
+            checkpoints: VecDeque::with_capacity(MAX_SPARSE_INDEX_ENTRIES),
+        }
+    }
+
+    fn remember(&mut self, offset: Offset, cursor: u64) {
+        if !offset.is_multiple_of(SPARSE_INDEX_STRIDE) {
+            return;
+        }
+
+        debug_assert!(
+            self.checkpoints
+                .back()
+                .is_none_or(|previous| { previous.offset < offset && previous.cursor < cursor })
+        );
+        if self.checkpoints.len() == MAX_SPARSE_INDEX_ENTRIES {
+            self.checkpoints.pop_front();
+        }
+        self.checkpoints.push_back(LogCheckpoint { offset, cursor });
+    }
+
+    fn start_for(&self, offset: Offset) -> u64 {
+        self.checkpoints
+            .iter()
+            .rev()
+            .find(|checkpoint| checkpoint.offset <= offset)
+            .map_or(0, |checkpoint| checkpoint.cursor)
+    }
+
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.checkpoints.len()
+    }
+
+    #[cfg(test)]
+    fn first_offset(&self) -> Option<Offset> {
+        self.checkpoints.front().map(|checkpoint| checkpoint.offset)
+    }
+
+    #[cfg(test)]
+    fn last_offset(&self) -> Option<Offset> {
+        self.checkpoints.back().map(|checkpoint| checkpoint.offset)
+    }
+}
+
 struct ParsedRecord {
     index: RecordIndex,
     next_cursor: u64,
 }
 
-fn read_record(
+// The caller seeks to `cursor` once before starting a scan. Each parser consumes exactly one
+// complete record and leaves the file positioned at `next_cursor`; no parser seeks back to the
+// record start. Legacy records still use one forward seek to skip their unchecked payload.
+fn read_next_record(
     file: &mut File,
     cursor: u64,
     file_len: u64,
@@ -612,14 +674,13 @@ fn read_record(
         return Ok(None);
     }
 
-    file.seek(SeekFrom::Start(cursor))?;
     let mut magic = [0; 4];
     file.read_exact(&mut magic)?;
     if &magic == VERSIONED_MAGIC {
-        return read_versioned_record(file, cursor, file_len);
+        return read_versioned_record(file, cursor, file_len, magic);
     }
     if &magic == REQUEST_ID_MAGIC {
-        return read_request_id_record(file, cursor, file_len, durable_format);
+        return read_request_id_record(file, cursor, file_len, durable_format, magic);
     }
     if &magic != LEGACY_MAGIC {
         return Err(invalid_record_data("unsupported record magic"));
@@ -687,14 +748,15 @@ fn read_versioned_record(
     file: &mut File,
     cursor: u64,
     file_len: u64,
+    magic: [u8; 4],
 ) -> Result<Option<ParsedRecord>, BrokerError> {
     if file_len.saturating_sub(cursor) < VERSIONED_HEADER_LEN as u64 {
         return Ok(None);
     }
 
-    file.seek(SeekFrom::Start(cursor))?;
     let mut header = [0; VERSIONED_HEADER_LEN];
-    file.read_exact(&mut header)?;
+    header[..4].copy_from_slice(&magic);
+    file.read_exact(&mut header[4..])?;
     if header[4] != VERSIONED_FORMAT_VERSION {
         return Err(invalid_record_data("unsupported versioned record version"));
     }
@@ -793,14 +855,15 @@ fn read_request_id_record(
     cursor: u64,
     file_len: u64,
     durable_format: DurableFormat,
+    magic: [u8; 4],
 ) -> Result<Option<ParsedRecord>, BrokerError> {
     if file_len.saturating_sub(cursor) < REQUEST_ID_HEADER_LEN as u64 {
         return Ok(None);
     }
 
-    file.seek(SeekFrom::Start(cursor))?;
     let mut header = [0; REQUEST_ID_HEADER_LEN];
-    file.read_exact(&mut header)?;
+    header[..4].copy_from_slice(&magic);
+    file.read_exact(&mut header[4..])?;
     if header[4] != REQUEST_ID_FORMAT_VERSION {
         return Err(invalid_record_data(
             "unsupported request-aware record version",
@@ -975,16 +1038,6 @@ fn remember_record(records: &mut VecDeque<RecordIndex>, record: RecordIndex) {
     records.push_back(record);
 }
 
-fn remember_checkpoint(checkpoints: &mut VecDeque<LogCheckpoint>, offset: Offset, cursor: u64) {
-    if !offset.is_multiple_of(SPARSE_INDEX_STRIDE) {
-        return;
-    }
-    if checkpoints.len() == MAX_SPARSE_INDEX_ENTRIES {
-        checkpoints.pop_front();
-    }
-    checkpoints.push_back(LogCheckpoint { offset, cursor });
-}
-
 fn record_is_candidate(
     record: &RecordIndex,
     acknowledged_offsets: &BTreeSet<Offset>,
@@ -1019,22 +1072,56 @@ fn now_ms() -> u64 {
 mod tests {
     use super::*;
 
+    fn legacy_record(offset: Offset, payload: &[u8]) -> Vec<u8> {
+        let mut header = [0; LEGACY_HEADER_LEN];
+        header[..4].copy_from_slice(LEGACY_MAGIC);
+        header[4..12].copy_from_slice(&offset.to_le_bytes());
+        header[24..28].copy_from_slice(&(payload.len() as u32).to_le_bytes());
+        let mut record = header.to_vec();
+        record.extend_from_slice(payload);
+        record
+    }
+
+    #[test]
+    fn recovery_rejects_noncontiguous_offsets() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("events.log");
+        let mut bytes = legacy_record(0, b"first");
+        bytes.extend_from_slice(&legacy_record(2, b"second"));
+        std::fs::write(&path, &bytes).unwrap();
+
+        let error = match StreamLog::open(&path, DurableFormat::Rnl1) {
+            Ok(_) => panic!("expected recovery to reject a skipped offset"),
+            Err(error) => error,
+        };
+        assert!(matches!(
+            error,
+            BrokerError::Io(error) if error.kind() == io::ErrorKind::InvalidData
+        ));
+        assert_eq!(std::fs::metadata(path).unwrap().len(), bytes.len() as u64);
+    }
+
     #[test]
     fn sparse_lookup_index_keeps_only_a_bounded_recent_window() {
-        let mut checkpoints = VecDeque::new();
-        for index in 0..=MAX_SPARSE_INDEX_ENTRIES {
-            let offset = index as Offset * SPARSE_INDEX_STRIDE;
-            remember_checkpoint(&mut checkpoints, offset, offset * 10);
+        let mut index = SparseIndex::new();
+        for checkpoint in 0..=MAX_SPARSE_INDEX_ENTRIES {
+            let offset = checkpoint as Offset * SPARSE_INDEX_STRIDE;
+            index.remember(offset, offset * 10);
         }
 
-        assert_eq!(checkpoints.len(), MAX_SPARSE_INDEX_ENTRIES);
-        assert_eq!(checkpoints.front().unwrap().offset, SPARSE_INDEX_STRIDE);
+        assert_eq!(index.len(), MAX_SPARSE_INDEX_ENTRIES);
+        assert_eq!(index.first_offset().unwrap(), SPARSE_INDEX_STRIDE);
+        assert_eq!(index.start_for(SPARSE_INDEX_STRIDE - 1), 0);
         assert_eq!(
-            checkpoints.back().unwrap().offset,
+            index.start_for(SPARSE_INDEX_STRIDE),
+            SPARSE_INDEX_STRIDE * 10
+        );
+        assert_eq!(
+            index.last_offset().unwrap(),
             MAX_SPARSE_INDEX_ENTRIES as Offset * SPARSE_INDEX_STRIDE
         );
         assert_eq!(
-            checkpoints.back().unwrap().cursor,
+            index.start_for(Offset::MAX),
             MAX_SPARSE_INDEX_ENTRIES as Offset * SPARSE_INDEX_STRIDE * 10
         );
     }
