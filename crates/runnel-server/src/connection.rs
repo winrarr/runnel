@@ -129,13 +129,12 @@ async fn handle_connection(
     let _active_connection = ActiveConnection::new(Arc::clone(&metrics));
     let (reader, mut writer) = stream.into_split();
     let mut reader = BufReader::new(reader);
-    let mut served_request = false;
     loop {
         // Waiting for the first byte is intentionally not timed. An idle
         // persistent connection is valid; once a request starts, its frame
-        // must complete within the request deadline. Every idle read still
-        // observes shutdown so an already-served persistent connection does
-        // not extend the graceful-drain window.
+        // must complete within the request deadline. Both idle reads and
+        // partial frame reads observe shutdown so a persistent connection
+        // cannot extend the graceful-drain window.
         let has_data = match wait_for_request_data(&mut reader, &mut shutdown).await? {
             Some(has_data) => has_data,
             None => return Ok(()),
@@ -145,26 +144,16 @@ async fn handle_connection(
         }
 
         let started = Instant::now();
-        let frame_result = if served_request {
-            Some(
-                tokio::time::timeout(
-                    protocol_admission.request_timeout,
-                    read_frame(&mut reader, protocol_admission.max_request_bytes),
-                )
-                .await,
-            )
-        } else {
-            tokio::select! {
-                result = tokio::time::timeout(
-                    protocol_admission.request_timeout,
-                    read_frame(&mut reader, protocol_admission.max_request_bytes),
-                ) => Some(result),
-                changed = shutdown.changed() => {
-                    if changed.is_err() || *shutdown.borrow() {
-                        return Ok(());
-                    }
-                    None
+        let frame_result = tokio::select! {
+            result = tokio::time::timeout(
+                protocol_admission.request_timeout,
+                read_frame(&mut reader, protocol_admission.max_request_bytes),
+            ) => Some(result),
+            changed = shutdown.changed() => {
+                if changed.is_err() || *shutdown.borrow() {
+                    return Ok(());
                 }
+                None
             }
         };
         let Some(frame_result) = frame_result else {
@@ -286,7 +275,6 @@ async fn handle_connection(
                             &metrics,
                         )
                         .await?;
-                        served_request = true;
                     }
                     Err(error) => {
                         if std::str::from_utf8(line).is_err() {
@@ -316,7 +304,6 @@ async fn handle_connection(
                             &metrics,
                         )
                         .await?;
-                        served_request = true;
                     }
                 }
             }

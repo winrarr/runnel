@@ -614,7 +614,10 @@ fn sustained_in_flight_pressure_reports_metrics_and_recovers() {
 #[test]
 fn served_persistent_connection_drains_promptly_on_shutdown() {
     let directory = TempDir::new().unwrap();
-    let mut server = RunningServer::start(directory.path(), &[]);
+    let mut server = RunningServer::start(
+        directory.path(),
+        &["--max-connections", "1", "--request-timeout-ms", "5000"],
+    );
     let mut connection = TcpStream::connect(server.broker_addr).unwrap();
     connection
         .set_read_timeout(Some(Duration::from_secs(2)))
@@ -626,10 +629,42 @@ fn served_persistent_connection_drains_promptly_on_shutdown() {
     ));
     wait_for_metric_at_least(server.http_addr, "runnel_active_connections", 1);
 
+    // A served persistent connection can begin another frame before shutdown.
+    // The partial frame must not keep its connection task alive until the
+    // request timeout expires.
+    connection
+        .write_all(br#"{"op":"health"}"#)
+        .expect("partial follow-up request should be writable");
+    sleep(Duration::from_millis(100));
+
+    let mut rejected = TcpStream::connect(server.broker_addr).unwrap();
+    rejected
+        .set_read_timeout(Some(Duration::from_secs(1)))
+        .unwrap();
+    let mut response = String::new();
+    BufReader::new(&mut rejected)
+        .read_line(&mut response)
+        .expect("connection rejection response should be readable");
+    assert!(
+        matches!(decode_response(&response), Response::Error { code, .. } if code == "connection_limit")
+    );
+    let metrics = wait_for_metric_at_least(
+        server.http_addr,
+        "runnel_broker_connections_rejected_total",
+        1,
+    );
+    assert_eq!(metric_value(&metrics, "runnel_active_connections"), 1);
+
     send_sigterm(&server.child);
     wait_for_server_exit(
         &mut server,
         "server did not drain a served persistent connection promptly",
+    );
+    let mut byte = [0; 1];
+    assert_eq!(
+        connection.read(&mut byte).unwrap(),
+        0,
+        "the client should observe the persistent connection closing during shutdown"
     );
 }
 
