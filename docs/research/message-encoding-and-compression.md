@@ -1,528 +1,489 @@
 # Message encoding and compression study
 
-- Status: research-backed exploratory study
-- Last reviewed: 2026-08-24
-- Scope: public request/response payloads, peer frames, and retained broker records
+- Status: research-backed exploratory study; not an accepted compatibility decision
+- Last reviewed: 2026-09-04
+- Baseline inspected: `6c666cd1a2d3e41c35d230a3156e57180a0f94fd`
+- Evidence class: research/design
+- Scope: public request/response payloads, retained message records, and the
+  clustered peer transport
 
-This document explores a path from Runnel's development-only JSON protocol and
-unchecksummed retained-record frames to versioned binary encodings with optional
-compression. It is not an accepted ADR and does not change the current wire or
-storage format. An ADR should record the compatibility policy and exact format
-before implementation starts.
+This document records the evidence and hypotheses behind the backlog outcome
+[Make message encoding and compression evolvable](../backlog.md#make-message-encoding-and-compression-evolvable).
+It does not change the current wire or storage format. The exact compatibility
+policy, format bytes, and default codec require a future ADR after the focused
+tests and measurements described here.
 
-## Current boundary and constraints
+## Decision summary
 
-The [public request and response types](../../crates/runnel-protocol/src/lib.rs)
-are Serde models carried as one JSON object per TCP line. The current public
-`payload` is a Rust `String`; the server converts it to UTF-8 bytes before
-calling the engine. The engine already models a message payload as `Vec<u8>`,
-so the semantic boundary can become binary without changing delivery meaning.
+The current system already has a useful binary-safety slice, but not an
+evolvable encoding/compression contract:
 
-The local [stream log](../../crates/runnel-core/src/lib.rs) uses a 28-byte
-little-endian `RNL1` header followed by UTF-8 key bytes and raw payload bytes.
-It records offset, timestamp, key length, and payload length, calls
-`sync_data`, and truncates an incomplete suffix during recovery. It has no
-checksum, format-version field, compression flag, or explicit uncompressed
-length. The [peer transport](../../crates/runnel-raft/src/network.rs) uses a
-u32 length prefix around JSON, while the [state-machine journal](../../crates/runnel-raft/src/lib.rs)
-uses a u32 length prefix around versioned JSON. These formats have different
-lifecycle and compatibility requirements and should not be replaced by one
-universal serialization type.
+- The public path is one UTF-8 JSON object per TCP line. Text payloads use the
+  legacy `payload` string; arbitrary payload bytes use the explicit padded
+  base64 `PublishBytes`, `PublishBatch`, `MessageBytes`, and replay variants.
+- Local stream files are one `.log` file per stream. The reader dispatches
+  between legacy `RNL1`, checksummed uncompressed `RNL2`, and request-aware
+  checksummed `RNL3` frames. `RNL2` has encoding and compression fields, but
+  only `bytes` plus `none` are currently accepted. `RNL3` carries request
+  identity but has no compression metadata.
+- Cluster peer RPCs remain a custom big-endian `u32` length prefix around JSON,
+  capped at 64 MiB, with no protocol preface or codec negotiation. A peer frame
+  can carry Raft control RPCs, forwarded operations, or a snapshot chunk, so
+  one universal message-record format would couple unrelated compatibility
+  lifecycles.
+- Compression is not implemented on the public, retained-record, or peer
+  paths. The current state-machine journal, checkpoint, and snapshot formats
+  are separate JSON persistence boundaries and must not silently inherit a
+  retained-message codec decision.
 
-The current [benchmark guidance](../testing.md) already treats 100-byte and
-1-KiB messages, durability mode, ordering distribution, p50/p99/p99.9 latency,
-CPU, and memory as relevant dimensions. Encoding work should extend that
-evidence rather than infer a win from encoded size alone.
+The bounded next step is an opt-in, uncompressed, Runnel-owned durable-frame
+contract with golden fixtures and real restart/corruption tests. It should
+preserve all current readers and public behavior, establish length/checksum
+and recovery semantics, and measure the uncompressed framing cost. Only then
+should bounded LZ4 and Zstandard experiments be added, followed by a separate
+peer-transport negotiation design. No source supports claiming that one codec
+or schema will win across Runnel's workloads.
 
-## Research-backed comparison
+## How to read this document
 
-This section separates documented behavior from interpretation. The external
-systems are evidence about useful design boundaries, not specifications for
-Runnel.
+The labels below keep observed behavior separate from design intent:
+
+- **Observed:** behavior inspected in the current Rust code and tests.
+- **Sourced fact:** behavior documented by an external standard, project, or
+  primary research source linked directly.
+- **Inference:** a deduction about Runnel from observed behavior and sourced
+  facts; it is not a claim made by the cited source.
+- **Hypothesis/proposal:** a candidate for future implementation, not a
+  compatibility promise.
+- **Acceptance evidence:** tests or measurements that would be required before
+  an ADR or default change.
+
+## Current observed boundary
+
+The source of truth for current behavior is Rust code and tests, not this
+proposal. The relevant boundaries are the [provisional protocol types](../../crates/runnel-protocol/src/lib.rs),
+[server framing and response serialization](../../crates/runnel-server/src/protocol.rs),
+[request dispatch](../../crates/runnel-server/src/main.rs),
+[local stream log](../../crates/runnel-core/src/lib.rs),
+[peer frame codec](../../crates/runnel-raft/src/network/framing.rs), and
+[state-machine journal](../../crates/runnel-raft/src/state_machine_journal.rs).
+
+| Boundary | Observed current behavior | What is still not established |
+|---|---|---|
+| Public client protocol | Serde-tagged JSON requests and responses are exchanged as one line per request. Incoming request bytes must be UTF-8. The configured request-frame limit is bounded above by 64 MiB and includes the JSON/base64 representation, not just decoded payload bytes. | No public binary protocol, version negotiation, compatibility range, or stable wire schema exists. A base64 request can consume substantially more wire space than its logical payload. |
+| Public payloads | `Publish` accepts a UTF-8 `String`. `PublishBytes` and `PublishBatch` carry `BinaryPayload`, which is standard padded base64 in JSON and decodes to `Vec<u8>`. Responses choose the readable UTF-8 variant or an explicit base64 variant without changing logical bytes. | The current JSON path is a development representation, not a compact binary contract. The optional ordering key remains an application-visible UTF-8 string; changing key semantics to arbitrary bytes would be a separate decision. |
+| Legacy local records | `RNL1` is a 28-byte little-endian header containing magic, offset, timestamp, key length, and payload length, followed by UTF-8 key bytes and raw payload bytes. It has no checksum, compression identifier, or format-version field. | A complete `RNL1` record does not provide corruption detection. Its lengths are bounded by file availability and integer arithmetic, but not by the versioned storage limits. |
+| Versioned local records | `RNL2` version 1 is a 44-byte little-endian frame with flags, header length, stored/logical body lengths, offset, timestamp, key length, encoding `bytes`, compression `none`, reserved fields, and CRC-32C. Its reader rejects compressed records and requires the exact 44-byte header. | The versioned fields are an experimental boundary, not an evolvable contract: there is no accepted field-width/reserved-bit policy, segment generation, migration selector, or rolling-writer gate. |
+| Request-aware local records | `RNL3` version 1 is a 48-byte little-endian frame with request-ID length and CRC-32C. It is used for public request identities and local dead-letter move identities. | `RNL3` has no encoding or compression identifiers. A future compressed request-aware record needs an explicit compatible version/family; reusing reserved bytes without a decision would make request deduplication and recovery ambiguous. |
+| Local recovery | `StreamLog::open` scans complete frames, dispatches by magic, and truncates an incomplete suffix. A complete unsupported magic, invalid key encoding, impossible versioned field, or checksum mismatch fails recovery. Normal server startup uses `RNL1`; `VersionedV1` is an explicit core configuration/test path. | The one-file layout can contain different recognized frame families, but there is no cross-release mixed-writer guarantee, generation manifest, writer fence, or conversion/rollback procedure. Current read-forward behavior is useful evidence, not a release compatibility promise. |
+| Peer transport | Peer requests and responses use a persistent or pooled TCP connection with a big-endian `u32` body length and JSON body. The frame cap is 64 MiB. `PeerRequest` covers Raft RPCs, forwarding, and data-group setup; snapshot chunks travel through the same outer framing. | There is no connection preface, version/capability handshake, codec negotiation, application checksum, or rule preventing a new writer from sending a body an older peer cannot interpret. JSON serialization of byte vectors also adds representation overhead. |
+| Clustered persistence | The Raft log, state-machine journal, checkpoints, and snapshots have separate JSON formats and version/recovery rules. The journal uses a little-endian `u32` length plus JSON and truncates a partial final record; checkpoints and snapshots use atomic JSON writes. | A retained-message encoding decision does not establish consensus, journal, or snapshot compatibility. Those artifacts need independent migration gates and failure tests. |
+
+The local engine preserves the important semantic boundary: payloads are
+`Vec<u8>` internally, offsets are logical record positions, and consumer
+acknowledgement state is persisted independently of the physical payload
+bytes. A compressed block therefore cannot become an acknowledgement unit or
+change the ordering and redelivery model.
+
+## Constraints for an evolvable design
+
+These constraints apply to future proposals; they do not imply that the
+current implementation already satisfies them.
+
+1. **Byte preservation:** an opaque payload must round-trip byte-for-byte. The
+   broker must not parse, transcode, normalize, or infer an application
+   schema. UTF-8 validation applies to fields that are defined as text, not to
+   payload bytes.
+2. **Semantic preservation:** offsets, published timestamps, optional UTF-8
+   ordering keys, at-least-once delivery, acknowledgement ordering, retry
+   attempts, request identities, and dead-letter identity must retain their
+   current logical meaning.
+3. **Independent boundaries:** logical payload, schema-encoded envelope, wire
+   frame, and durable frame are separate concepts. A transport codec must not
+   silently become an at-rest codec, and a storage block must not become a
+   delivery or acknowledgement batch.
+4. **Bounded work before allocation:** a reader must validate magic/version,
+   header length, flags, stored length, decoded length, record count, key and
+   request-ID lengths, compression window, dictionary identity, and configured
+   maxima before allocating or decompressing. Integer overflow and expansion
+   beyond the local limit must fail closed.
+5. **Observable corruption:** an incomplete final write may be recoverable as a
+   torn suffix when the format can prove that it is incomplete. A complete
+   frame with a bad checksum, impossible length, unknown required feature, or
+   invalid text field must not be silently skipped.
+6. **Upgrade safety:** old data must remain readable for the documented
+   compatibility window. New writers need an explicit capability/fencing gate;
+   parsing one new frame successfully is not proof that old writers can append
+   beside it or that rollback is safe.
+7. **Client reach:** a future binary schema must have maintained
+   implementations for the languages Runnel intends to support. A generated
+   schema dependency is acceptable only if its toolchain, field policy, and
+   debugging path are explicit.
+8. **Resource evidence:** compression ratio alone is insufficient. Encoding
+   and codec CPU, allocations, memory, batch wait, storage bytes, network
+   bytes, recovery time, and p50/p99/p99.9 latency must be measured under the
+   target resource budget.
+
+## Encoding alternatives
+
+The candidates below are evidence about possible schema encodings, not choices
+made by Runnel. Every candidate still needs a Runnel-owned outer frame for
+message boundaries, limits, checksum coverage, and storage recovery.
+
+| Candidate and primary source | Relevant sourced behavior | Runnel-specific difference and fit |
+|---|---|---|
+| [Protocol Buffers encoding guide](https://protobuf.dev/programming-guides/encoding/) and [proto3 language guide](https://protobuf.dev/programming-guides/proto3/) | The binary wire uses numbered fields and length-delimited `bytes`; the decoder needs the schema to interpret field numbers. Proto3 binary parsing preserves unknown fields, while JSON conversion can lose them. Field order is not guaranteed to be stable. | Strong leading candidate for typed public requests/responses and peer commands because opaque payloads map directly to `bytes` and additive fields have explicit schema rules. It requires `.proto` ownership, code generation, reserved field numbers, and a policy for old peers that do not understand a new semantic field. It is not a canonical byte-string or a self-describing durable record by itself. |
+| [CBOR, RFC 8949](https://www.rfc-editor.org/rfc/rfc8949.html) | CBOR adds byte strings to a JSON-like data model and explicitly targets extensibility without requiring version negotiation. Multiple valid encodings can represent the same data; maps have no semantic key order unless a deterministic profile says otherwise. | Good compatibility and tooling bridge for dynamic clients and binary-safe development traffic. Runnel would need a schema/profile, deterministic-encoding rule if bytes are hashed or signed, map/array limits, and strict duplicate/unknown-field handling. Its flexibility shifts more validation into Runnel and does not replace an outer durable frame. |
+| [MessagePack specification](https://github.com/msgpack/msgpack/blob/master/spec.md) | The format has distinct `str` and `bin` families, arrays, maps, and application-defined extension types. The specification describes a type system and formats, while profiles and schema/determinism rules are left to applications. | Easy to prototype beside Serde and useful as a JSON-like comparator. Binary payloads are direct, but struct-as-map versus struct-as-array and extension semantics would become a Runnel profile. The specification alone does not supply the compatibility policy needed for long-lived retained records or peer commands. |
+| [FlatBuffers evolution](https://flatbuffers.dev/evolution/) and [FlatBuffers internals](https://flatbuffers.dev/internals/) | Tables use offsets/vtables; old code can ignore newly added fields when schema-evolution rules are followed. The format is designed for access without first unpacking a full object, with alignment and verifier considerations. | Worth testing only if peer hot paths or large replay reads show decode/copy cost as material. Generated code, verifier limits, alignment, and builder order increase the first-slice surface. A FlatBuffer still needs Runnel framing, offset/index rules, and corruption handling for a durable log. |
+| [Cap'n Proto schema language](https://capnproto.org/language.html) and [encoding specification](https://capnproto.org/encoding.html) | Cap'n Proto is strongly typed and not self-describing. Field ordinals support compatible additions; the native representation uses pointers/segments, and optional packing can reduce transmission size. It also defines a canonicalization path separately from ordinary encoding. | Attractive for a zero-copy peer experiment, but the schema/compiler and traversal limits are a larger client and storage commitment. Its pointer/segment representation does not define Runnel's record offsets, block checksums, or migration selector. The peer protocol would still need a Runnel-owned handshake and outer bounds. |
+
+### Encoding inference and preliminary direction
+
+The strongest preliminary direction is Protocol Buffers for a future typed
+public/peer envelope, with CBOR retained as the dynamic-tooling fallback. This
+is an inference from the direct `bytes` field, explicit field-number evolution,
+and expected language-client needs; it is not an accepted Runnel choice. The
+first implementation should not add a generated schema dependency merely to
+test framing and compression. MessagePack is a reasonable prototype
+comparator. FlatBuffers and Cap'n Proto should be deferred until a measured
+zero-copy requirement exists.
+
+Whichever schema is selected, do not persist or transmit an unbounded generic
+object. Define a small Runnel message envelope with explicit metadata and one
+opaque payload field. Keep schema versions, frame versions, and compression
+identifiers independently visible so a reader never has to infer one from the
+other.
+
+## Compression alternatives and scope
 
 ### Sourced facts
 
-#### Kafka and Redpanda: producer-side full-batch compression
+- Apache Kafka documents producer compression over full batches, with
+  `none`, `gzip`, `snappy`, `lz4`, and `zstd` choices. Its record-batch format
+  carries compression attributes and a CRC-32C over the batch body: [producer
+  configuration](https://kafka.apache.org/41/configuration/producer-configs/),
+  [record-batch format](https://kafka.apache.org/41/implementation/message-format/).
+- Redpanda documents the same producer-side full-batch shape and says producer
+  compression is retained/served as-is, while noting that compression costs
+  CPU: [producer guidance](https://docs.redpanda.com/streaming/current/develop/produce-data/configure-producers/)
+  and [topic properties](https://docs.redpanda.com/streaming/current/reference/properties/topic-properties/).
+- The official [LZ4 frame specification](https://github.com/lz4/lz4/blob/dev/doc/lz4_Frame_format.md)
+  supports bounded block sizes, optional block/content checksums, dictionary
+  IDs, and linked or independent blocks. Linked blocks can improve ratio but
+  require sequential history, which limits random access and parallel decode.
+- [RFC 8878](https://www.rfc-editor.org/rfc/rfc8878.html) defines Zstandard
+  frames with optional content size, checksum, dictionary ID, and a window
+  that bounds the decoder's history requirement. Dictionaries are identified
+  but supplied out of band. [RFC 9659](https://www.rfc-editor.org/rfc/rfc9659.html)
+  gives a resource-bounded window-sizing profile.
+- NATS separates its byte-counted client payload from application data
+  formats: [client protocol](https://docs.nats.io/reference/protocols/client)
+  and [message structure](https://docs.nats.io/using-nats/developer/sending/structure).
+  JetStream's `Compression` setting is an at-rest file-store setting (`s2` or
+  none), not evidence of a compressed client payload contract: [stream
+  configuration](https://github.com/nats-io/nats.docs/blob/master/nats-concepts/jetstream/streams.md).
 
-Apache Kafka's [producer configuration](https://kafka.apache.org/41/configuration/producer-configs/)
-defines `compression.type` for the producer and explicitly says compression is
-applied to full batches. Its choices are `none`, `gzip`, `snappy`, `lz4`, and
-`zstd`; `batch.size` groups records per partition, `linger.ms` bounds the wait
-for more records, and the producer documentation calls out extra memory for
-compression. The same page exposes codec levels for gzip, LZ4, and Zstandard.
-Kafka's [broker configuration](https://kafka.apache.org/41/configuration/broker-configs/)
-also has a final topic compression policy: `producer` retains the codec chosen
-by the producer, while a named codec selects the final representation. Kafka's
-[record-batch format](https://kafka.apache.org/41/implementation/message-format/)
-stores codec attributes and a CRC-32C over the batch body.
+These systems demonstrate why compression scope matters, but their policies
+are not Runnel specifications. In particular, Kafka's record batches and
+NATS's file-store compression do not establish equivalent acknowledgement,
+replay, or peer-recovery semantics for Runnel.
 
-Redpanda's [producer guidance](https://docs.redpanda.com/streaming/current/develop/produce-data/configure-producers/)
-likewise says the producer compresses full batches, with `zstd`, `lz4`,
-`gzip`, and `snappy`, and exposes `batch.size` and `linger.ms`. Its
-[topic properties](https://docs.redpanda.com/streaming/current/reference/properties/topic-properties/)
-state that `compression.type` is retained for Kafka compatibility while
-Redpanda uses producer semantics: compressed data is stored and served as-is,
-uncompressed data remains uncompressed, and compression consumes more CPU.
-The documented `max.message.bytes` limit applies to the compressed message or
-batch when compression is enabled.
+### Candidate comparison
 
-#### NATS JetStream: file-store compression is not transport compression
-
-The [NATS client protocol](https://docs.nats.io/reference/protocols/client)
-defines text commands such as `PUB` and `MSG` with an explicit byte count for
-the payload. The protocol page documents headers and protocol capability flags,
-but does not document a negotiated payload-compression codec. NATS's
-[message structure guidance](https://docs.nats.io/using-nats/developer/sending/structure)
-leaves the choice of bytes, JSON, Protobuf, or another application format to
-the client.
-
-JetStream's [stream configuration](https://github.com/nats-io/nats.docs/blob/master/nats-concepts/jetstream/streams.md)
-has a different `Compression` setting: for file-based storage, an empty value
-means no compression and `s2` means Snappy compression on disk. The same
-configuration documents `AllowBatchPublish` and `AllowAtomicPublish` as
-separate publish features. Thus JetStream file-store compression describes an
-at-rest transformation; it does not imply compression of the client transport
-or of the logical payload delivered to consumers.
-
-#### Primary research and standards
-
-- A 2025 MASCOTS study of Kafka batching models the full-batch-versus-timeout
-  policy and derives a throughput/latency trade-off from truncated Erlang and
-  Poisson batch arrivals. It is an analytical and simulation result, not a
-  compression benchmark: [Horváth et al.,
-  *Analytical characterization and efficient simulation of batched arrivals in
-  the Kafka broker*](https://qed.usc.edu/paolieri/papers/2025_mascots_arrivals_batching_simulation.html).
-- The Zstandard project documents that small independent samples are harder to
-  compress, and that a trained, data-family-specific dictionary can improve
-  small-data ratio and speed. It also documents a broad speed/ratio level
-  range and a fast decoder: [Zstandard small-data guidance and
-  benchmarks](https://facebook.github.io/zstd/). This is an implementation
-  reference and benchmark, not an independent messaging study.
-- A 2026 PETRA III study evaluated more than 212 TiB of heterogeneous science
-  data, found compression ratios varying by more than two orders of magnitude,
-  and reported that heterogeneous codec strategies outperformed a uniform
-  policy; Zstandard and LZ4 occupied the high-throughput part of its Pareto
-  front: [Buschmann et al., *Lossless Compression Performance for PETRA III
-  Datasets*](https://arxiv.org/abs/2608.00168). The corpus is archival data, so
-  its result motivates but does not establish a Runnel policy.
-- [RFC 8878](https://www.rfc-editor.org/rfc/rfc8878.html) standardizes Zstandard
-  frames, including optional content size, checksum, and dictionary identifiers;
-  the frame window is a bounded memory concern. [RFC
-  9659](https://www.rfc-editor.org/rfc/rfc9659.html) gives a concrete example of
-  constraining Zstandard window size for resource-bounded protocols.
-
-### Inferences for Runnel
-
-These are deductions from the facts above, not claims made by the cited
-projects. Full-batch compression favors a producer or transport layer that can
-hold a bounded batch; compressing each small record independently pays framing
-and dictionary overhead repeatedly. Broker-side recompression can normalize
-storage but spends CPU after the producer has already paid to compress and can
-break a producer's intended wire/at-rest separation. A mixed workload therefore
-needs an explicit policy boundary: logical bytes should remain stable while
-wire and durable representations may choose different codecs.
-
-The likely tail-latency cost is not just codec time. Waiting to fill a batch,
-allocating an uncompressed and compressed copy, decompression during replay,
-and a cache miss on an old dictionary can all lengthen p99/p99.9. Conversely,
-smaller batches, per-record frames, and no dictionary make recovery and random
-access simpler but may increase bytes, syscalls, and network overhead. The
-MASCOTS model supports measuring batch wait as a first-class variable; the
-heterogeneous-data study supports testing workload-aware selection rather than
-assuming one codec wins everywhere.
-
-### Hypotheses for Runnel
-
-- Keep application payload bytes, encoded envelope bytes, wire bytes, and
-  durable bytes as separate measurements and compatibility concepts.
-- Treat producer-side batch compression as the primary comparison point for
-  peer transport, while allowing storage to select a separate representation.
-- For small, correlated records, test a versioned dictionary identifier only
-  when its distribution and retirement protocol are explicit; never make
-  recovery depend on an unbounded or ambient dictionary.
-- Compare `none`, LZ4-fast, and low-level Zstandard on the same bounded batches,
-  plus an adaptive policy that may decline compression. The adaptive policy is
-  a performance experiment, not a default.
-
-## Design goals
-
-- Preserve the logical model: opaque payload bytes, optional UTF-8 ordering key,
-  offsets, at-least-once delivery, explicit acknowledgement, and current
-  durability semantics.
-- Let a reader identify the format and safely bound every allocation before
-  decoding or decompressing.
-- Keep JSON available as a debuggable development representation during a
-  migration, without making JSON the durable compatibility contract.
-- Permit old and new records to coexist during recovery and rolling upgrades.
-- Make compression an independently measurable policy, not an assumption in
-  the message model.
-- Keep the format implementable by future non-Rust clients and alternative
-  engines.
-
-Non-goals are schema-registry design, encryption/authentication, a universal
-cross-product benchmark claim, and changing ordering or delivery guarantees.
-
-## Public payload representation
-
-The logical public message should be defined as:
-
-```text
-Message {
-    stream: validated UTF-8 name,
-    key: optional UTF-8 bytes used by broker ordering,
-    payload: opaque bytes,
-    published_at_ms: broker timestamp,
-    offset: broker position,
-    optional application metadata added by a later schema
-}
-```
-
-The broker should not parse or transcode the payload. A binary protocol should
-carry the payload as a length-delimited byte field. The legacy JSON adapter
-continues to interpret the existing `payload` string as UTF-8 bytes and renders
-only UTF-8 payloads. A future JSON representation for arbitrary bytes must use
-an explicit representation such as a base64 field and a versioned response;
-silently replacing the current string with base64 would break development
-clients and make text less readable.
-
-The envelope should distinguish the logical payload representation from a
-transport or storage content coding. For example, `payload_encoding = bytes`
-describes the application-visible value, while `compression = zstd` describes
-an optional transformation of the encoded bytes. A content type is useful
-metadata but should be opaque to the broker and deferred until a real client
-use case requires it.
-
-### Encoding alternatives
-
-| Candidate | Strengths | Costs and fit for Runnel |
+| Candidate | Useful property | Runnel cost/risk to measure |
 |---|---|---|
-| Protocol Buffers | Compact typed wire format; numbered fields and length-delimited bytes support additive evolution and unknown-field skipping. The [encoding guide](https://protobuf.dev/programming-guides/encoding/) documents the TLV wire model, while the [evolution guide](https://protobuf.dev/programming-guides/editions/) documents field and unknown-field rules. | Requires schemas/code generation and a deliberate field-number policy. It is not self-describing, and the wire bytes are not a stable hash/canonical form by default. Strong candidate for public requests, responses, and peer commands. |
-| CBOR | Standardized compact data model; supports bytes and maps, and [RFC 8949](https://www.rfc-editor.org/rfc/rfc8949.html) explicitly targets extensibility without requiring version negotiation. | Dynamic maps and generic values leave more validation and allocation to Runnel; canonicalization and schema discipline would still be application policy. Good compatibility bridge or tooling format, less compelling as the long-lived typed peer contract. |
-| MessagePack | Small binary analogue of JSON with broad implementations and easy Serde integration; [rmp-serde](https://docs.rs/rmp-serde/latest/rmp_serde/) documents binary bytes handling and the need to opt into efficient byte slices. | Struct/array versus map choices and Serde representation details can become an accidental schema. It is a reasonable prototype comparator, but its evolution rules are less explicit than Protocol Buffers for a public contract. |
-| FlatBuffers / Cap'n Proto | Schema-driven access with little or no unpacking; [FlatBuffers evolution](https://flatbuffers.dev/evolution/) and [Cap'n Proto's schema rules](https://capnproto.org/language.html) provide compatibility mechanisms. | Verifiers, alignment/offset rules, generated code, and larger conceptual surface are valuable for zero-copy hot paths but unnecessary for the first request/response and append/replay slice. Their native messages also do not remove the need for Runnel-owned outer framing and limits. |
+| None | No codec CPU, no expansion risk, simplest recovery. It is an explicit baseline, not absence of policy. | More storage and wire bytes; JSON/base64 overhead remains on the provisional public path. |
+| LZ4, independent blocks | Low-CPU candidate with bounded blocks and a natural option for random block access. Block/content checksums can supplement Runnel's outer checksum. | Ratio may be insufficient for small or already-compressed payloads. Independent blocks may lose cross-record redundancy; linked blocks complicate random replay and parallel decode. |
+| Zstandard, low level and bounded window | Higher ratio candidate with a standardized frame, explicit window/content-size metadata, and fast decompression. | Encoder CPU, window memory, decode expansion, and level-dependent tail latency. Dictionary IDs require distribution, versioning, and retirement; an absent dictionary must be a deterministic failure, not an ambient fallback. |
+| gzip or Snappy | Kafka/Redpanda/NATS references make them relevant interop comparators; Snappy is the JetStream at-rest reference. | No current Runnel requirement calls for them. Adding more codecs expands capability negotiation, test matrices, security review, and maintenance. Include only for a measured workload or external interoperability need. |
 
-The recommendation for the public and peer schema is Protocol Buffers, subject
-to a representative benchmark and an ADR. CBOR should remain the fallback if
-schema generation or dynamic tooling becomes the dominant constraint. The
-recommendation is about the envelope and command metadata; the application
-payload remains an opaque bytes field in every candidate.
+### Compression scope inference
 
-## Versioned framing
+Per-record compression keeps random access and corruption boundaries simple,
+but repeats frame/window overhead and gives 100-byte messages little shared
+history. A bounded batch/block amortizes codec calls and headers and can use
+the correlation between adjacent records, but replay may decompress unrelated
+records and consume more memory. Linked blocks improve history reuse at the
+cost of sequential recovery and parallelism.
 
-Use two layers:
+The likely Runnel shape is therefore a bounded physical block containing
+multiple independently indexed logical records, with an explicit first/last
+offset or offset index. A block is only a storage/transport unit: each record
+keeps its own offset, delivery, and acknowledgement identity. This is an
+inference from the Kafka and LZ4 boundaries, not a performance claim.
 
-1. a connection or segment frame that identifies the format, bounds the body,
-   and carries checksum/compression metadata; and
-2. a schema-encoded body containing a request, response, peer command, or
-   logical record metadata.
+Start with independent blocks and no shared dictionary. If measurements later
+justify linked blocks or dictionaries, the block format must carry the needed
+history/ID metadata and prove bounded replay, portability, rolling-upgrade,
+and cleanup behavior first.
 
-The exact bytes require an ADR, but a durable record v2 should contain fields
-equivalent to the following before key and payload bytes:
+## Hypothetical format and negotiation boundary
 
-| Field | Purpose |
+The following is a proposal to test, not an accepted byte layout.
+
+### Four layers
+
+1. **Logical message:** stream identity, optional UTF-8 ordering key, broker
+   timestamp/offset, and opaque payload bytes.
+2. **Schema-encoded envelope:** a small typed representation of metadata and
+   payload. The schema codec is identified independently from compression.
+3. **Runnel-owned frame:** magic, format version, flags, lengths, record/block
+   metadata, encoding/compression/dictionary IDs, and corruption checksum.
+4. **Transport or storage carrier:** connection frame, durable segment, or
+   snapshot chunk with its own lifecycle and compatibility policy.
+
+Do not use the schema library's serialization defaults as the storage contract.
+The outer frame must make these values unambiguous:
+
+- frame/header version and bounded header length;
+- stored body length and the precise pre-compression encoded-body length;
+- logical record count and offset range or an index sufficient for offset lookup;
+- key/request-ID lengths where those fields are outside the body;
+- encoding, compression, and dictionary identifiers;
+- checksum algorithm, coverage, and the checksum field's canonical zeroing
+  rule; and
+- reserved bits/fields, maximums, and failure behavior for unknown values.
+
+Do not overload `logical_len` to mean both decoded envelope bytes and total
+payload bytes. If both are needed, carry both or define one as derived with an
+explicit overflow-safe rule. The frame checksum should cover the decoding
+metadata, key/request identity, and stored bytes after the checksum field is
+zeroed. This detects accidental corruption of compressed bytes and routing
+metadata; it is not authentication. A separate digest would be a later
+security decision.
+
+### Public and peer wire evolution
+
+The current JSON-lines protocol should remain the debuggable v1 path while a
+binary path is experimental. A future binary connection needs an unambiguous
+preface followed by a `Hello` exchange that advertises and selects:
+
+- protocol major/minor versions;
+- schema encodings and compression algorithms;
+- maximum stored frame, decoded envelope, decompressed block, and batch sizes;
+- supported dictionary IDs, if dictionaries ever exist; and
+- optional operations such as publish batches or binary payload responses.
+
+The selected combination is connection-scoped. A reconnect repeats the
+handshake. A malformed preface must not be guessed as JSON, and a connection
+must not silently downgrade after application data has been exchanged. A
+legacy JSON client remains explicit and does not become a base64-only contract
+by silently changing the meaning of its `payload` field.
+
+Peer control RPCs, forwarded message operations, and snapshot chunks should
+have separate schema/version gates even if they share a bounded outer frame.
+Control traffic may reasonably stay uncompressed until evidence says
+otherwise. A peer may send compressed data only after the receiver has
+advertised the codec and limits; a wire choice must not force a replica to
+persist bytes it cannot recover. The Raft/state-machine journal and snapshot
+formats remain independently versioned.
+
+### Durable records and mixed-format recovery
+
+The current reader's `RNL1`/`RNL2`/`RNL3` dispatch is a useful compatibility
+fixture. It is not enough to promise rolling upgrades because the current
+one-file writer has no generation selector or old-writer fence. The safer
+future migration shape is format-tagged immutable segments with a small
+validated generation/manifest selector:
+
+- retain old segments and keep their readers;
+- write the new format only to a new segment family after an explicit writer
+  capability gate;
+- validate complete frames before exposing records;
+- convert/compact only through a temporary validated output and an atomic
+  selector update; and
+- define what an old binary does when the active generation contains a frame
+  it cannot read: fail closed or use a tested fallback, never appear empty.
+
+If a single file eventually mixes frames, every supported writer and recovery
+path must recognize every permitted magic/version and prove that an old
+writer cannot truncate an unknown suffix. Segment boundaries make that proof
+and rollback boundary easier. The storage-upgrade proposals provide the
+broader generation, fence, and rollback context: [policy](../design/storage-upgrade-policy.md)
+and [safety plan](../design/storage-upgrade-safety-plan.md).
+
+### Recovery and corruption rules
+
+Before allocating key, body, batch, or decompression buffers, validate all
+lengths and limits. For a durable block:
+
+- a short final header/body that can only be a torn append may be truncated to
+  the last complete frame and synchronized;
+- a complete frame with a bad checksum, impossible length, unknown required
+  version/codec/dictionary, invalid text field, or decompression expansion
+  beyond policy must fail recovery and surface corruption/unsupported format;
+- a frame must not be silently skipped merely because its payload is
+  unreadable; and
+- a bad snapshot or journal record must follow its consensus recovery boundary,
+  not be treated as a retained-message record.
+
+The acceptance tests need bit flips in header, key, request ID, and stored
+body; truncated compressed blocks; oversized stored/logical/window lengths;
+unknown IDs and flags; a crash at the write/sync boundary; and restart with
+both old and new records. CRC-32C is suitable for accidental-corruption
+coverage if retained, but it does not provide authenticity or malicious-input
+protection by itself.
+
+## Research hypotheses for Runnel
+
+These hypotheses should be tested, not encoded as defaults:
+
+- A typed schema with an opaque bytes field will reduce envelope overhead and
+  make additive evolution clearer than extending the current Serde/JSON shape,
+  but the generated-schema/tooling cost may outweigh the benefit for the first
+  public client set.
+- Bounded independent compression blocks will give a better total cost than
+  per-record compression for correlated small messages, while large blocks
+  will worsen replay memory or p99 latency.
+- LZ4 will be the low-CPU/tail-latency comparator; low-level Zstandard will be
+  the ratio/storage comparator. Neither should be assumed to win for random or
+  already-compressed bytes.
+- Storage and peer transport should be allowed to choose independently. A
+  compressed producer/peer frame need not be the durable representation, and
+  broker-side recompression may duplicate CPU work.
+- A dictionary may help a single small-message family but will create more
+  compatibility and operational risk for mixed tenants, rolling upgrades, and
+  cold recovery than its ratio gain justifies unless evidence is strong.
+- Batch wait, allocation/copy count, decode/replay work, and resource
+  contention will matter to p99/p99.9 at least as much as encoded size.
+
+## Acceptance evidence required later
+
+No runtime benchmark is expected for this documentation-only change. Before a
+future ADR accepts a format or default codec, collect evidence with the exact
+source revision, codec/level, frame/block limits, durability point, topology,
+resource limits, and measurement boundary attached to every result.
+
+| Dimension | Initial values to measure |
 |---|---|
-| magic and format version | Reject unrelated files and dispatch v1/v2 readers. |
-| header length and flags | Permit additive header fields and distinguish record kinds. |
-| encoded body length and logical body length | Bound reads, decompression, and allocation. |
-| offset and published timestamp | Preserve broker semantics independently of physical position. |
-| key length | Locate the key without interpreting payload bytes. |
-| encoding and compression identifiers | Select the decoder explicitly; `none` is a valid value. |
-| checksum type and checksum | Detect corruption over the header, key, and stored body. |
+| Logical payload | 100 B, 1 KiB, 16 KiB, 1 MiB; random bytes, repeated text, JSON-like text, and already-compressed bytes |
+| Public representation | legacy text JSON, explicit base64 JSON bytes, candidate binary envelope; record decoded payload bytes and wire bytes separately |
+| Compression | none, LZ4 fast/independent, Zstandard low level/bounded window; per-record versus bounded 64 KiB and 256 KiB blocks |
+| Workload | durable publish, publish batch, replay after restart, consume/ack, slow consumer, keyed grouped delivery, follower forwarding, and snapshot transfer as a separate case |
+| Topology | local engine and three-node cluster with quorum durability |
+| Failure | torn final frame, header/key/body bit flip, bad dictionary/codec ID, oversized logical/window length, follower restart, leader failure, interrupted snapshot transfer, and near/full storage |
+| Measures | logical, encoded, stored, and wire bytes; compression decision/ratio; encode/decode CPU; allocations/copies; peak/RSS memory; throughput; batch wait; p50/p99/p99.9/max latency; recovery time; bytes replayed; and failure classification |
 
-All integer widths, endianness, maximums, and reserved bits must be specified;
-they must not be inferred from Rust layout. Unknown flags and versions should
-fail closed. A header length allows future fields to be skipped only when the
-reader can still validate the whole frame safely.
+The existing [benchmarking policy](../benchmarking.md) requires controlled
+resources, matching workload semantics, and explicit treatment of inconclusive
+results. The existing [testing workflows](../testing.md) provide the real
+process, restart, cluster, and benchmark entry points. A codec microbenchmark
+can explain a result, but cannot replace durable publish/replay and peer
+transport evidence.
 
-The outer frame should be Runnel-owned even if the body is Protocol Buffers or
-another standard encoding. This gives Runnel a stable place for limits,
-offsets, compression identifiers, and checksums, and prevents a library's
-schema evolution rules from becoming the storage recovery policy.
+An ADR should not be proposed as accepted until evidence also covers:
 
-## Version negotiation and mixed-format recovery
+- golden cross-version fixtures and interoperability in at least the intended
+  client languages;
+- bounded decoding/decompression and fuzz/fault-injection behavior;
+- old/new readers, writer fencing, mixed-format restart, retention, and
+  rollback boundaries;
+- per-record offsets, acknowledgements, redelivery, request identity, and
+  dead-letter behavior through compressed blocks;
+- peer handshake, unsupported capability, reconnect, snapshot, and leader/
+  follower failure behavior; and
+- metrics that expose codec choice, logical/stored/wire bytes, rejected
+  frames, decompression failures, and resource pressure.
 
-The existing JSON-lines connection remains protocol v1. A binary connection
-should begin with an unambiguous fixed preface and a `Hello` exchange carrying:
+## Bounded next-step recommendation
 
-- protocol major/minor versions supported;
-- body encodings supported;
-- compression algorithms and maximum decompressed frame size;
-- maximum frame and batch sizes;
-- optional capabilities such as batch publish or server-side payload bytes.
+1. **Freeze the existing boundary with fixtures.** Capture representative
+   `RNL1`, `RNL2`, and `RNL3` bytes, public text/base64 requests and responses,
+   peer JSON frames, and journal tails. Add malformed, truncated, and checksum
+   failure vectors to the focused test plan without changing defaults.
+2. **Choose one candidate durable-frame family in a future ADR.** Reuse the
+   current `RNL2`/`RNL3` work only if their exact-header and request-identity
+   limitations are intentionally addressed; otherwise define a new
+   format-tagged segment family. Specify integer widths, endian convention,
+   lengths, limits, checksum coverage, record/block index, reserved values,
+   and writer/reader activation before implementation.
+3. **Implement and test only the uncompressed durable candidate first.** Keep
+   the JSON/base64 public path, default `RNL1` writes, current recognized
+   readers, peer JSON framing, Raft journal, and snapshots unchanged. Make the
+   candidate opt-in and test opaque bytes, offset/replay/ack semantics, torn
+   suffixes, complete corruption, restart, and bounded allocation.
+4. **Measure that baseline, then add codec experiments.** Compare none, LZ4
+   independent blocks, and low-level bounded-window Zstandard on the same
+   local and clustered workloads. Retain compressed bytes only when framing,
+   CPU, memory, recovery, and tail-latency costs are acceptable; do not add
+   dictionaries, high levels, broker recompression, or adaptive defaults yet.
+5. **Design peer negotiation separately.** After the storage boundary is
+   trustworthy, specify a preface/Hello and capability gate for peer control,
+   forwarding, and snapshot traffic. Keep an old-peer refusal and reconnect
+   path explicit; do not infer peer compatibility from durable-record parsing.
 
-The server selects one mutually supported combination and returns a typed
-failure when none exists. Negotiation is connection-scoped; a record's durable
-format is still self-identifying. Do not silently reinterpret a malformed
-binary preface as JSON or downgrade after application data has been exchanged.
-The legacy JSON path may be selected by its existing line-oriented behavior
-until a future protocol version is explicitly retired.
-
-Recovery should recognize `RNL1` and v2 frames one frame at a time, but a new
-writer must not append an unreadable frame to a file that an old binary can
-still open. The safer migration shape is immutable format-tagged segments:
-
-- v1 segments remain readable and are never rewritten in place during startup;
-- a v2-capable reader can replay v1 and v2 segments in offset order;
-- once all writers/readers for a stream or replica set advertise v2 support,
-  new appends go to a v2 segment;
-- compaction or export may later rewrite old segments, but only through a
-  validated temporary file and atomic manifest update.
-
-If a single-file mixed stream is eventually desired, every supported reader
-must recognize both magic values and the writer must prove that no old process
-can truncate an unknown suffix. Segment boundaries make that proof simpler and
-make rollback possible: an old binary can continue to use old segments after a
-v2 segment is drained, but it cannot consume new v2 data. A rolling upgrade must
-therefore use capability discovery, drain or fence old writers before the first
-v2 append, and retain a downgrade plan before enabling v2 by default.
-
-For the JSON-based Raft log, state-machine journal, and snapshots, use the same
-principles but separate migration gates. Consensus entries and snapshots are
-not retained message records; a node must not interpret a successful data-log
-upgrade as permission to decode a new consensus format. A replacement replica
-must reject an unsupported snapshot or request a compatible snapshot rather
-than partially applying it.
-
-## Compression policy
-
-Compression should normally operate on bounded batches or storage blocks, not
-on each small message independently. A batch can expose first offset, record
-count, encoded length, logical length, compression identifier, and checksum;
-the broker can decompress one bounded block for replay while retaining an index
-from offsets to blocks. This follows the useful property illustrated by
-[Kafka's record-batch format](https://kafka.apache.org/41/implementation/message-format/):
-records are batched and the batch carries compression attributes. It also keeps
-compression scope separate from acknowledgement scope: a batch is a physical
-unit, not a single delivery or acknowledgement unit.
-
-Candidate policy:
-
-- `none` for already small, incompressible, or latency-critical bodies;
-- LZ4 for the low-CPU/tail-latency candidate; its [frame format](https://github.com/lz4/lz4/blob/dev/doc/lz4_Frame_format.md)
-  defines bounded blocks and optional block/content checksums;
-- Zstandard at a low level for the ratio/storage/network candidate; [RFC 8878](https://www.rfc-editor.org/rfc/rfc8878.html)
-  defines the interoperable format, frame content size, window bounds, and
-  optional checksum, while the [format specification](https://github.com/facebook/zstd/blob/dev/doc/zstd_compression_format.md)
-  explains the memory cost of larger windows;
-- gzip only if an external interoperability requirement justifies its older
-  throughput and ratio tradeoff. It is not the preferred broker default.
-
-The encoder should sample or compress a bounded batch, retain compressed bytes
-only when they beat the raw representation including framing overhead, and
-record the selected algorithm in every frame. Initial implementations should
-avoid shared dictionaries: they complicate segment portability, rolling
-upgrades, memory accounting, and corruption recovery. If dictionaries later
-win a measured workload, the frame must carry a dictionary identifier and the
-reader must reject missing or incompatible dictionaries before allocation.
-
-Compression selection is a policy input, not a client-visible semantic change.
-Storage and peer transport may select different policies, and public payload
-bytes must remain identical after decoding. A negotiated peer compression
-choice must not cause a replica to persist a format it cannot recover.
-
-### Trade-offs
-
-| Choice | Likely benefit | Risk to measure |
-|---|---|---|
-| Per-record compression | Simple random access and isolated corruption | Repeats headers/windows, poor ratio for 100-byte messages, more allocations and codec calls. |
-| Bounded batch compression | Better ratio and fewer calls; amortizes headers and checksums | Reads may decompress unrelated records; larger blocks increase memory and tail latency. |
-| LZ4 | Low encode/decode CPU and predictable bounded work | Usually larger output than Zstandard; storage and network savings may be insufficient. |
-| Zstandard low level | Better ratio at modest CPU; fast decompression | Encoder CPU, window memory, and queueing can raise p99 under contention. |
-| High compression level or dictionary | Potential storage/network reduction | Higher CPU, memory, warm-up, portability, and tail-latency cost; not a first default. |
-
-The first measured default should be no compression for the smallest messages
-and a low Zstandard level for batches only if it improves end-to-end cost under
-the configured CPU, memory, and storage limits. LZ4 must be measured as the
-alternative when p99 or CPU efficiency dominates. This is a hypothesis, not an
-accepted production default.
-
-## Corruption detection and failure behavior
-
-The outer frame should calculate a fast CRC-32C over a canonical byte sequence:
-format fields that affect decoding, key bytes, and the stored (possibly
-compressed) body. [RFC 3309](https://www.rfc-editor.org/rfc/rfc3309.html)
-specifies CRC-32C's Castagnoli polynomial and validation procedure. The checksum
-is for accidental corruption, not authenticity; authentication belongs to a
-future security design. Codec-native checksums may remain enabled as a second
-decoded-content check, but Runnel must not rely on a codec-specific checksum
-for all encodings.
-
-Before allocating or decompressing, validate magic, supported version, header
-length, flags, stored length, logical length, key length, batch count, and all
-configured limits. Reject integer overflow and decompression expansion beyond
-the negotiated or local maximum. Validate the outer checksum before passing
-bytes to the codec where possible.
-
-Recovery behavior should distinguish:
-
-- a short final header/body caused by an interrupted append: truncate only the
-  incomplete suffix to the last complete frame, then sync the file;
-- a complete frame with a bad checksum, impossible length, unsupported required
-  feature, or invalid key encoding: fail recovery for that segment and surface
-  corruption; do not silently skip a complete record;
-- a bad replicated snapshot or journal frame: reject it and retry from a known
-  good snapshot/log boundary, with an observable error and metric.
-
-This is stricter than the current scanner's generic suffix truncation, but it
-prevents a torn write and genuine media corruption from having the same silent
-meaning. Tests must cover bit flips in header/key/stored body, truncated
-compressed data, oversized logical lengths, unknown versions, and a crash after
-the frame write but before the durability point.
-
-## Batching and durability
-
-Batching should be explicit at both the public and storage boundaries. A public
-batch request can reduce framing, codec, syscall, and network overhead, while
-the response must preserve one outcome or an unambiguous range/outcome per
-request identity. A storage batch can assign consecutive offsets and write one
-bounded frame/block, then call the selected durability primitive once. The
-broker must not report an individual publish as durable until the batch's
-durability point covers it.
-
-Batch limits should be expressed in records, encoded bytes, logical bytes, and
-wall-clock wait. Flush on whichever limit arrives first. Keep enough indexing
-metadata to find a record without scanning or decompressing the entire stream.
-Benchmark one-message batches, full batches, and mixed small/large records;
-large batches that win throughput but inflate p99 are not an unconditional
-improvement.
-
-## Benchmark matrix
-
-Every result should record source revision, codec/level, compression decision,
-batch limits, durability point, storage medium, CPU/memory limits, topology,
-and whether latency is measured at the public request or inside the engine.
-Repeat each cell enough to report median and observed min/max, plus p50, p99,
-and p99.9 where per-operation timing is available.
-
-| Dimension | Values to start with |
-|---|---|
-| Logical payload | 100 B, 1 KiB, 16 KiB, 1 MiB; random, repeated text, JSON-like text, and already-compressed bytes |
-| Encoding | Current JSON, Protocol Buffers candidate, CBOR comparator; raw bytes and UTF-8 text payloads |
-| Compression | None, LZ4 fast, Zstandard low level; per-record versus 64/256-KiB bounded batches |
-| Workload | Durable publish, publish/poll/ack, replay after restart, mixed batch sizes, slow consumer, and grouped keyed delivery |
-| Topology | Local engine; three-node cluster with peer forwarding and quorum durability |
-| Failure | Torn final frame, checksum bit flip, interrupted recovery, follower restart, snapshot transfer, and disk-full/near-limit behavior |
-| Measures | Encoded/logical bytes, compression ratio, encode/decode CPU, allocations, peak/RSS memory, throughput, p50/p99/p99.9/max latency, recovery time, and bytes replayed |
-
-The first implementation benchmark should compare the existing JSON peer frame
-and `RNL1` record path against a binary frame with compression disabled. Only
-after that baseline should compression be enabled in the same harness. The
-existing [container and clustered benchmark workflows](../testing.md) are the
-right end-to-end evidence; add focused codec/block microbenchmarks only to
-explain a result, not as a substitute for durable and network measurements.
-
-## Recommendation hypotheses for the next implementation slice
-
-The following is a research-informed hypothesis, not an accepted ADR. The
-useful boundary is a deliberately small Day 1 design followed by Day 2
-experiments that earn their complexity through measurements.
-
-### Day 1: small, robust, measurable
-
-1. Keep the JSON-lines development protocol and its compatibility behavior.
-   Define the logical message as opaque bytes in a Runnel-owned envelope, but
-   defer committing public clients to Protobuf, CBOR, or another binary schema.
-2. Define one versioned durable frame for a new format-tagged segment family:
-   bounded header and payload lengths, explicit encoding and compression IDs,
-   uncompressed length, batch byte/record limits, and CRC-32C. Start with
-   `compression = none` so framing, allocation bounds, and corruption behavior
-   are independently testable.
-3. Make recovery recognize both `RNL1` and the new frame, skip no unknown
-   format silently, and recover a mixed stream by validating each frame before
-   exposing it. Keep old segments readable and make the new writer opt-in
-   until crash, torn-suffix, checksum, length-limit, and replay fixtures pass.
-4. Measure the baseline and the new frame with the existing JSON and raw-record
-   paths: logical/encoded/durable bytes, encode/decode CPU, allocations, peak
-   memory, throughput, recovery time, and p50/p99/p99.9 request latency. Report
-   the workload, durability point, and batch wait with every result.
-5. Add capability/version metadata only where it is needed to select a reader;
-   keep JSON as a fallback for at least one rolling-upgrade window. A binary
-   connection preface and peer negotiation can follow the stable frame tests.
-
-Day 1 is successful only if the format is bounded, corruption is observable,
-mixed-format restart recovery is deterministic, and the benchmark makes the
-cost of the framing change visible. It intentionally does not add dictionaries,
-adaptive selection, broker recompression, or a new public schema dependency.
-
-### Day 2: designs to explore for performance and robustness
-
-These options should remain experiments until workload evidence justifies them:
-
-- Producer-side full-batch compression for peer and client transport, with
-  bounded `batch.size` and `linger` limits, negotiated codec capabilities, and
-  storage allowed to retain a different representation. Compare no compression,
-  LZ4-fast, and low-level Zstandard; include an adaptive policy that can decline
-  compression when the batch is small or already compressed.
-- Data-family-specific Zstandard dictionaries for small messages, with an
-  immutable dictionary ID, distribution/retirement protocol, bounded memory,
-  and a recovery fallback. Measure whether the dictionary benefit survives
-  mixed tenants and rolling upgrades rather than assuming it does.
-- Independent versus linked compression blocks, block indexes, background or
-  parallel compression, and parallel replay/decompression. These may improve
-  throughput or ratio but affect random access, memory, recovery time, and
-  tail latency.
-- Broker-side final compression or lazy at-rest rewrite for storage-heavy
-  workloads. Treat this as a separate policy from producer compression and
-  verify that it does not duplicate CPU work or make a partially rewritten
-  segment unrecoverable.
-- Stronger corruption diagnosis, such as a cryptographic digest in addition to
-  a fast frame checksum, plus fuzzing and fault-injection of every codec and
-  mixed-format transition.
-
-Day 2 should be judged by the benchmark matrix, with separate acceptance
-criteria for CPU, bytes, memory, recovery, and tail latency. None of these
-experiments is a compatibility decision until a future ADR records the chosen
-format and upgrade policy.
+This sequence is intentionally narrow: it retires uncertainty about framing,
+limits, corruption, and logical-byte preservation before multiplying it with
+schema generation, compression policy, or rolling cluster upgrades.
 
 ## Unresolved decisions
 
-- Is Protocol Buffers acceptable as a generated-schema dependency for every
-  future client, or should CBOR be the public compatibility format?
-- Does the JSON development protocol need an explicit base64 payload variant,
-  or is arbitrary binary payload support restricted to the negotiated binary
-  protocol at first?
-- What exact v2 header fields, widths, endian convention, reserved bits, frame
-  maximum, and segment naming/manifest rules should be accepted?
-- Should the public wire, peer transport, retained records, journals, and
-  snapshots share a schema codec while retaining separate frame formats, or
-  should their codecs be versioned independently?
-- Is a 64/256-KiB batch/block bound appropriate for the target memory and replay
-  tail, and what index is needed for offset-to-block lookup?
-- Should the initial checksum be CRC-32C only, or should a stronger digest be
-  required for corruption diagnosis or future untrusted storage?
-- Which compression threshold and level minimize total cost for the supported
-  workloads, and should storage and peer transport choose independently?
-- Can the cluster's capability gate guarantee that no old writer can append
-  after v2 activation, and what rollback/downgrade procedure is required?
-- Should format migration be lazy through mixed segments, an offline rewrite,
-  or both; when is it safe to retire the v1 decoder?
-- Which codec and compression metrics are required before enabling a new format
-  by default, and which failures should make a node unhealthy versus retryable?
+- Is Protocol Buffers acceptable as a generated dependency for every intended
+  client, or should CBOR be the public compatibility bridge?
+- Which fields belong in the schema body versus the Runnel-owned outer frame,
+  and does a durable block index provide sufficient offset-to-record lookup?
+- Should `RNL2`/`RNL3` be extended under a formally versioned contract or
+  retired behind a new segment family? How are current one-file logs selected,
+  migrated, and rolled back?
+- What are the maximum stored body, encoded envelope, logical payload,
+  decompressed block, record count, and batch wait values at each boundary?
+- Does the public binary path need one negotiated schema for requests,
+  responses, and peer commands, or independent schema versions with a shared
+  outer frame?
+- Should durable blocks use independent or linked codec blocks, and can replay
+  avoid decompressing unrelated records without an unbounded index?
+- Which checksum is required for accidental corruption, and is a separate
+  cryptographic digest needed for untrusted storage or diagnostics?
+- Which codecs and levels are available in every supported client/server
+  deployment, and how should unsupported required capabilities fail?
+- What writer fence and rollback procedure prevents an old process from
+  appending or acknowledging after a new generation activates?
+- Which codec metrics and failure classes must make a node unhealthy,
+  retryable, or permanently incompatible?
+
+## Refactor and planning-record assessment
+
+The touched subsystem was inspected for safe adjacent refactoring. Existing
+planning records already cover the concrete adjacent issues: provisional JSON
+and limited payload compatibility (TD-003), one-file local stream storage
+(TD-002), storage-format compatibility (TD-007), incomplete end-to-end
+benchmark coverage (TD-011), peer transport strategy (TD-012), and the
+remaining module-ownership debts (TD-024/TD-025). No new concrete shortcut or
+retirement condition was found that is better represented by another
+`docs/tech-debt.md` entry, so that file is intentionally unchanged.
 
 ## Verification commands
 
-This document-only change should be checked with the following commands from
-the repository root:
+This is a document-only research/design change. From the repository root,
+check the owned files and their external links with:
 
 ```text
-git diff --check -- docs/research/message-encoding-and-compression.md
+git diff --check -- docs/research/message-encoding-and-compression.md docs/design/encoding-compression-day1-plan.md
 python3 - <<'PY'
 import re
 import urllib.request
 from pathlib import Path
 
-path = Path("docs/research/message-encoding-and-compression.md")
-text = path.read_text(encoding="utf-8")
-urls = sorted(set(re.findall(r"\]\((https?://[^)]+)\)", text)))
+paths = [
+    Path("docs/research/message-encoding-and-compression.md"),
+    Path("docs/design/encoding-compression-day1-plan.md"),
+]
+urls = sorted({
+    url
+    for path in paths
+    for url in re.findall(r"\]\((https?://[^)]+)\)", path.read_text(encoding="utf-8"))
+})
 for url in urls:
     with urllib.request.urlopen(url, timeout=20) as response:
         if response.status >= 400:
             raise SystemExit(f"{response.status}: {url}")
 print(f"checked {len(urls)} external links")
 PY
-git status --short -- docs/research/message-encoding-and-compression.md
+git status --short -- docs/research/message-encoding-and-compression.md docs/design/encoding-compression-day1-plan.md docs/tech-debt.md
 ```
 
-No Rust or benchmark command is required for a document-only change; the
-implementation slice must run the focused recovery tests and the existing
-`just bench`/`just bench-cluster` workflows before an ADR accepts a format.
+No Rust, integration, or benchmark command is required for this documentation
+change. A future implementation is a design/research follow-up with storage,
+public-contract, and peer-transport tests and with the benchmark evidence
+listed above.
