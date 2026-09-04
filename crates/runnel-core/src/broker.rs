@@ -21,8 +21,8 @@ use super::delivery_state::{DeliveryState, DeliveryTokenGenerator, InFlight};
 use super::storage::StorageExecutor;
 use super::stream_log::{RecordIndex, StreamLog};
 use super::{
-    AckResult, BrokerConfig, DEAD_LETTER_SUFFIX, DurableFormat, HealthSnapshot,
-    dead_letter_move_id, dead_letter_stream_name, stream_path, validate_name,
+    AckResult, BrokerConfig, DEAD_LETTER_HASH_PREFIX, DEAD_LETTER_SUFFIX, DurableFormat,
+    HealthSnapshot, dead_letter_move_id, dead_letter_stream_name, stream_path, validate_name,
 };
 
 #[derive(Clone)]
@@ -276,7 +276,7 @@ impl Broker {
                 .inner
                 .max_delivery_attempts
                 .is_some_and(|max_attempts| attempts >= max_attempts)
-                && !stream.ends_with(DEAD_LETTER_SUFFIX)
+                && !self.is_dead_letter_stream(stream)?
             {
                 self.dead_letter_record(&mut stream_state, stream, consumer, &candidate)?;
                 self.persist_dead_letter_ack(
@@ -480,6 +480,26 @@ impl Broker {
         #[cfg(feature = "instrumentation")]
         let _stage_timer = StageTimer::new("core.stream_lock_wait");
         stream.lock().map_err(|_| BrokerError::LockPoisoned)
+    }
+
+    fn is_dead_letter_stream(&self, stream: &str) -> Result<bool, BrokerError> {
+        if stream.ends_with(DEAD_LETTER_SUFFIX) {
+            return Ok(true);
+        }
+        if !stream.starts_with(DEAD_LETTER_HASH_PREFIX) {
+            return Ok(false);
+        }
+
+        let streams = self
+            .inner
+            .streams
+            .read()
+            .map_err(|_| BrokerError::LockPoisoned)?;
+        Ok(streams.keys().any(|source| {
+            dead_letter_stream_name(source)
+                .map(|target| target == stream)
+                .unwrap_or(false)
+        }))
     }
 
     pub(super) fn dead_letter_record(
