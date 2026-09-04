@@ -365,6 +365,15 @@ Goal: provide the security, resource, health, and observability behavior needed 
 
 Rationale: low operational complexity is a core product promise, so safe defaults and useful signals matter as much as message throughput.
 
+Current progress: the HTTP metrics endpoint exposes bounded broker and
+transport telemetry, including request rates and latency buckets, traffic,
+admission, health failures, logical storage, delivery outcomes, and a
+label-free per-process uptime gauge. Real-server tests verify that uptime
+progresses and that this process-level signal remains scrapeable while the
+engine health dependency is stalled. Consumer lag, reclaimable storage,
+resource pressure, and the remaining security and capacity controls are still
+open.
+
 Constraints:
 
 - the broker remains correct without Kubernetes;

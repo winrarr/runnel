@@ -77,6 +77,7 @@ enum EngineKind {
 
 pub(crate) async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let args = Args::parse();
+    let server_metrics = Arc::new(ServerMetrics::default());
     protocol::validate_admission_config(
         args.max_connections,
         args.max_request_bytes,
@@ -136,7 +137,6 @@ pub(crate) async fn run() -> Result<(), Box<dyn std::error::Error>> {
         "runnel started"
     );
 
-    let server_metrics = Arc::new(ServerMetrics::default());
     let protocol_admission = ProtocolAdmission {
         max_connections: args.max_connections,
         max_request_bytes: args.max_request_bytes,
