@@ -119,8 +119,30 @@ class ComparisonBenchmarkTests(unittest.TestCase):
             {"operation": operations[comparison_class]}
             for comparison_class in record["semantic_metadata"]["scenario_classes"]
         ]
+        record["cpu_limit"] = "2"
+        record["memory_limit"] = "2g"
+        if nodes == compare.THREE_NODE_COUNT:
+            record["nodes"] = [
+                {"cpu_limit": "2", "memory_limit": "2g"} for _ in range(nodes)
+            ]
         compare.annotate_scenario_metadata(record)
         return record
+
+    def _complete_summary(self, nodes: int = 1) -> dict:
+        backend_names = ("runnel",) if nodes == 1 else ("kafka",)
+        return {
+            "workload": {"nodes": nodes},
+            "resource_limits": {
+                "broker_cpu": "2",
+                "broker_memory": "2g",
+                "client_cpu": "1",
+                "client_memory": "512m",
+            },
+            "comparison_guardrail": compare.comparison_guardrail_metadata(nodes),
+            "backends": {
+                name: self._complete_backend_record(name, nodes) for name in backend_names
+            },
+        }
 
     def test_backend_metadata_declares_semantic_boundaries_and_native_baseline(self) -> None:
         metadata = compare.backend_metadata("kafka", 1)
@@ -202,6 +224,13 @@ class ComparisonBenchmarkTests(unittest.TestCase):
         with self.assertRaisesRegex(compare.ComparisonError, "client_identity"):
             compare.validate_backend_record("runnel", record)
 
+    def test_semantic_validation_rejects_missing_backend_resource_limit(self) -> None:
+        record = self._complete_backend_record("runnel")
+        del record["cpu_limit"]
+
+        with self.assertRaisesRegex(compare.ComparisonError, "cpu_limit"):
+            compare.validate_backend_record("runnel", record)
+
     def test_semantic_validation_rejects_missing_scenario_boundary(self) -> None:
         record = self._complete_backend_record("runnel")
         del record["semantic_metadata"]["scenario_boundaries"]["publish-only"][
@@ -250,11 +279,7 @@ class ComparisonBenchmarkTests(unittest.TestCase):
             compare.validate_backend_record("runnel", record)
 
     def test_summary_guardrail_explicitly_disallows_native_ranking(self) -> None:
-        summary = {
-            "workload": {"nodes": 1},
-            "comparison_guardrail": compare.comparison_guardrail_metadata(1),
-            "backends": {"runnel": self._complete_backend_record("runnel")},
-        }
+        summary = self._complete_summary()
 
         compare.validate_comparison_summary(summary)
         self.assertFalse(summary["comparison_guardrail"]["apples_to_apples"])
@@ -272,15 +297,39 @@ class ComparisonBenchmarkTests(unittest.TestCase):
             ("experimental", False),
         ):
             with self.subTest(field=field):
-                summary = {
-                    "workload": {"nodes": 1},
-                    "comparison_guardrail": compare.comparison_guardrail_metadata(1),
-                    "backends": {"runnel": self._complete_backend_record("runnel")},
-                }
+                summary = self._complete_summary()
                 summary["comparison_guardrail"][field] = value
 
                 with self.assertRaises(compare.ComparisonError):
                     compare.validate_comparison_summary(summary)
+
+    def test_summary_validation_rejects_backend_resource_mismatch(self) -> None:
+        summary = self._complete_summary()
+        summary["backends"]["runnel"]["memory_limit"] = "4g"
+
+        with self.assertRaisesRegex(compare.ComparisonError, "memory_limit"):
+            compare.validate_comparison_summary(summary)
+
+    def test_summary_validation_rejects_missing_client_resource_limit(self) -> None:
+        summary = self._complete_summary()
+        del summary["resource_limits"]["client_memory"]
+
+        with self.assertRaisesRegex(compare.ComparisonError, "client_memory"):
+            compare.validate_comparison_summary(summary)
+
+    def test_summary_validation_rejects_incomplete_cluster_topology(self) -> None:
+        summary = self._complete_summary(compare.THREE_NODE_COUNT)
+        del summary["backends"]["kafka"]["nodes"]
+
+        with self.assertRaisesRegex(compare.ComparisonError, "measured node records"):
+            compare.validate_comparison_summary(summary)
+
+    def test_summary_validation_rejects_inconsistent_cluster_node_resources(self) -> None:
+        summary = self._complete_summary(compare.THREE_NODE_COUNT)
+        summary["backends"]["kafka"]["nodes"][1]["cpu_limit"] = "4"
+
+        with self.assertRaisesRegex(compare.ComparisonError, "resource limits"):
+            compare.validate_comparison_summary(summary)
 
     def test_comparison_suite_distinguishes_single_and_three_node_runs(self) -> None:
         self.assertEqual(compare.benchmark_suite(1, ["runnel"]), "runnel")
