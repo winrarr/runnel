@@ -1,4 +1,132 @@
-use runnel_protocol::{BinaryPayload, Request, Response};
+use runnel_protocol::{
+    BinaryPayload, PROTOCOL_NAME, PROTOCOL_SUPPORT, PROTOCOL_VERSION, PayloadEncoding,
+    ProtocolVersionRange, Request, Response,
+};
+
+#[test]
+fn provisional_protocol_support_is_explicit_and_bounded() {
+    assert_eq!(PROTOCOL_NAME, "runnel-json-lines");
+    assert_eq!(PROTOCOL_VERSION, 1);
+    assert_eq!(
+        PROTOCOL_SUPPORT.versions,
+        ProtocolVersionRange { min: 1, max: 1 }
+    );
+    assert!(PROTOCOL_SUPPORT.supports_version(1));
+    assert!(!PROTOCOL_SUPPORT.supports_version(0));
+    assert!(!PROTOCOL_SUPPORT.supports_version(2));
+    assert_eq!(
+        PROTOCOL_SUPPORT.payload_encodings,
+        &[PayloadEncoding::Utf8Text, PayloadEncoding::Base64]
+    );
+    assert!(PROTOCOL_SUPPORT.supports_payload_encoding(PayloadEncoding::Utf8Text));
+    assert!(PROTOCOL_SUPPORT.supports_payload_encoding(PayloadEncoding::Base64));
+}
+
+#[test]
+fn payload_encoding_is_explicit_for_every_payload_wire_shape() {
+    assert_eq!(
+        Request::Publish {
+            stream: "events".to_owned(),
+            key: None,
+            payload: "hello".to_owned(),
+            request_id: None,
+        }
+        .payload_encoding(),
+        Some(PayloadEncoding::Utf8Text)
+    );
+    assert_eq!(
+        Request::PublishBytes {
+            stream: "events".to_owned(),
+            key: None,
+            payload_base64: BinaryPayload::new([]),
+            request_id: None,
+        }
+        .payload_encoding(),
+        Some(PayloadEncoding::Base64)
+    );
+    assert_eq!(
+        Request::PublishBatch {
+            stream: "events".to_owned(),
+            records: vec![],
+        }
+        .payload_encoding(),
+        Some(PayloadEncoding::Base64)
+    );
+    assert_eq!(
+        runnel_protocol::PublishBatchRecord {
+            key: None,
+            payload_base64: BinaryPayload::new([]),
+            request_id: None,
+        }
+        .payload_encoding(),
+        PayloadEncoding::Base64
+    );
+    assert_eq!(BinaryPayload::new([]).encoding(), PayloadEncoding::Base64);
+    assert_eq!(
+        Response::Message {
+            stream: "events".to_owned(),
+            consumer: "worker".to_owned(),
+            member: None,
+            offset: 0,
+            key: None,
+            payload: "hello".to_owned(),
+            published_at_ms: 0,
+            delivery_token: None,
+            delivery_attempt: None,
+        }
+        .payload_encoding(),
+        Some(PayloadEncoding::Utf8Text)
+    );
+    assert_eq!(
+        Response::MessageBytes {
+            stream: "events".to_owned(),
+            consumer: "worker".to_owned(),
+            member: None,
+            offset: 0,
+            key: None,
+            payload_base64: BinaryPayload::new([]),
+            published_at_ms: 0,
+            delivery_token: None,
+            delivery_attempt: None,
+        }
+        .payload_encoding(),
+        Some(PayloadEncoding::Base64)
+    );
+    assert_eq!(
+        Response::ReplayMessage {
+            stream: "events".to_owned(),
+            consumer: "worker".to_owned(),
+            offset: 0,
+            key: None,
+            payload: "hello".to_owned(),
+            published_at_ms: 0,
+        }
+        .payload_encoding(),
+        Some(PayloadEncoding::Utf8Text)
+    );
+    assert_eq!(
+        Response::ReplayMessageBytes {
+            stream: "events".to_owned(),
+            consumer: "worker".to_owned(),
+            offset: 0,
+            key: None,
+            payload_base64: BinaryPayload::new([]),
+            published_at_ms: 0,
+        }
+        .payload_encoding(),
+        Some(PayloadEncoding::Base64)
+    );
+    assert_eq!(Request::Health.payload_encoding(), None);
+    assert_eq!(
+        Response::Health {
+            status: "ok".to_owned(),
+            streams: 0,
+            storage_bytes: 0,
+        }
+        .payload_encoding(),
+        None
+    );
+}
 
 #[test]
 fn requests_and_responses_round_trip_as_json() {
