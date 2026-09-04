@@ -161,6 +161,15 @@ mod tests {
         }
     }
 
+    struct PollGroupTestRequest<'a> {
+        stream: &'a str,
+        consumer: &'a str,
+        member: &'a str,
+        now_ms: u64,
+        lease_deadline_ms: u64,
+        max_delivery_attempts: Option<u32>,
+    }
+
     fn poll_group_for_test(
         state: &mut SnapshotState,
         stream: &str,
@@ -170,18 +179,52 @@ mod tests {
         lease_deadline_ms: u64,
         log_index: u64,
     ) -> PollResult {
-        poll_group_with_log_id_for_test(
+        poll_group_with_max_attempts_for_test(
             state,
-            stream,
-            consumer,
-            member,
-            now_ms,
-            lease_deadline_ms,
+            PollGroupTestRequest {
+                stream,
+                consumer,
+                member,
+                now_ms,
+                lease_deadline_ms,
+                max_delivery_attempts: None,
+            },
             LogId {
                 leader_id: openraft::CommittedLeaderId::new(1, 1),
                 index: log_index,
             },
         )
+    }
+
+    fn poll_group_with_max_attempts_for_test(
+        state: &mut SnapshotState,
+        request: PollGroupTestRequest<'_>,
+        log_id: LogId<NodeId>,
+    ) -> PollResult {
+        let PollGroupTestRequest {
+            stream,
+            consumer,
+            member,
+            now_ms,
+            lease_deadline_ms,
+            max_delivery_attempts,
+        } = request;
+        match apply_command(
+            state,
+            Command::PollGroup {
+                stream: stream.to_owned(),
+                consumer: consumer.to_owned(),
+                member: member.to_owned(),
+                now_ms,
+                lease_deadline_ms,
+                max_delivery_attempts,
+            },
+            &data_group_kind(stream),
+            log_id,
+        ) {
+            CommandResponse::GroupPoll { result } => result,
+            response => panic!("unexpected grouped poll response: {response:?}"),
+        }
     }
 
     fn poll_group_with_log_id_for_test(
@@ -193,22 +236,193 @@ mod tests {
         lease_deadline_ms: u64,
         log_id: LogId<NodeId>,
     ) -> PollResult {
-        match apply_command(
+        poll_group_with_max_attempts_for_test(
             state,
-            Command::PollGroup {
-                stream: stream.to_owned(),
-                consumer: consumer.to_owned(),
-                member: member.to_owned(),
+            PollGroupTestRequest {
+                stream,
+                consumer,
+                member,
                 now_ms,
                 lease_deadline_ms,
                 max_delivery_attempts: None,
             },
-            &data_group_kind(stream),
             log_id,
-        ) {
-            CommandResponse::GroupPoll { result } => result,
-            response => panic!("unexpected grouped poll response: {response:?}"),
-        }
+        )
+    }
+
+    #[test]
+    fn user_stream_with_dead_letter_hash_prefix_still_dead_letters() {
+        let source = "runnel.dead-letter.user";
+        let mut state = SnapshotState::default();
+        state.streams.insert(
+            source.to_owned(),
+            StreamState::active("stream/user".to_owned(), "group/user/data".to_owned()),
+        );
+        state
+            .streams
+            .get_mut(source)
+            .unwrap()
+            .messages
+            .push(StoredMessage {
+                key: Some("order-1".to_owned()),
+                payload: b"poison".to_vec(),
+                published_at_ms: 1,
+            });
+
+        assert!(matches!(
+            poll_group_with_max_attempts_for_test(
+                &mut state,
+                PollGroupTestRequest {
+                    stream: source,
+                    consumer: "worker",
+                    member: "member-a",
+                    now_ms: 0,
+                    lease_deadline_ms: 1,
+                    max_delivery_attempts: Some(1),
+                },
+                LogId {
+                    leader_id: openraft::CommittedLeaderId::new(1, 1),
+                    index: 1,
+                },
+            ),
+            PollResult::Message(Message {
+                delivery_attempt: Some(1),
+                ..
+            })
+        ));
+        assert_eq!(
+            poll_group_with_max_attempts_for_test(
+                &mut state,
+                PollGroupTestRequest {
+                    stream: source,
+                    consumer: "worker",
+                    member: "member-b",
+                    now_ms: 1,
+                    lease_deadline_ms: 2,
+                    max_delivery_attempts: Some(1),
+                },
+                LogId {
+                    leader_id: openraft::CommittedLeaderId::new(1, 1),
+                    index: 2,
+                },
+            ),
+            PollResult::Empty
+        );
+
+        let dead_letter = delivery::dead_letter_stream_name(source);
+        assert_eq!(dead_letter, format!("{source}.dead-letter"));
+        assert_eq!(state.dead_letters, 1);
+        assert_eq!(state.streams[&dead_letter].messages.len(), 1);
+    }
+
+    #[test]
+    fn maximum_length_dead_letter_target_does_not_recurse() {
+        let source = "s".repeat(128);
+        let mut state = SnapshotState::default();
+        state.streams.insert(
+            source.to_owned(),
+            StreamState::active("stream/long".to_owned(), "group/long/data".to_owned()),
+        );
+        state
+            .streams
+            .get_mut(&source)
+            .unwrap()
+            .messages
+            .push(StoredMessage {
+                key: None,
+                payload: b"poison".to_vec(),
+                published_at_ms: 1,
+            });
+
+        assert!(matches!(
+            poll_group_with_max_attempts_for_test(
+                &mut state,
+                PollGroupTestRequest {
+                    stream: &source,
+                    consumer: "worker",
+                    member: "member-a",
+                    now_ms: 0,
+                    lease_deadline_ms: 1,
+                    max_delivery_attempts: Some(1),
+                },
+                LogId {
+                    leader_id: openraft::CommittedLeaderId::new(1, 1),
+                    index: 1,
+                },
+            ),
+            PollResult::Message(Message {
+                delivery_attempt: Some(1),
+                ..
+            })
+        ));
+        assert_eq!(
+            poll_group_with_max_attempts_for_test(
+                &mut state,
+                PollGroupTestRequest {
+                    stream: &source,
+                    consumer: "worker",
+                    member: "member-b",
+                    now_ms: 1,
+                    lease_deadline_ms: 2,
+                    max_delivery_attempts: Some(1),
+                },
+                LogId {
+                    leader_id: openraft::CommittedLeaderId::new(1, 1),
+                    index: 2,
+                },
+            ),
+            PollResult::Empty
+        );
+
+        let dead_letter = delivery::dead_letter_stream_name(&source);
+        assert!(dead_letter.starts_with("runnel.dead-letter."));
+        assert!(matches!(
+            poll_group_with_max_attempts_for_test(
+                &mut state,
+                PollGroupTestRequest {
+                    stream: &dead_letter,
+                    consumer: "inspector",
+                    member: "member-a",
+                    now_ms: 2,
+                    lease_deadline_ms: 3,
+                    max_delivery_attempts: Some(1),
+                },
+                LogId {
+                    leader_id: openraft::CommittedLeaderId::new(1, 1),
+                    index: 3,
+                },
+            ),
+            PollResult::Message(Message {
+                delivery_attempt: Some(1),
+                ..
+            })
+        ));
+        assert!(matches!(
+            poll_group_with_max_attempts_for_test(
+                &mut state,
+                PollGroupTestRequest {
+                    stream: &dead_letter,
+                    consumer: "inspector",
+                    member: "member-b",
+                    now_ms: 3,
+                    lease_deadline_ms: 4,
+                    max_delivery_attempts: Some(1),
+                },
+                LogId {
+                    leader_id: openraft::CommittedLeaderId::new(1, 1),
+                    index: 4,
+                },
+            ),
+            PollResult::Message(Message {
+                delivery_attempt: Some(2),
+                ..
+            })
+        ));
+        assert!(
+            !state
+                .streams
+                .contains_key(&format!("{dead_letter}.dead-letter"))
+        );
     }
 
     fn round_trip_snapshot_state_for_test(state: &SnapshotState) -> SnapshotState {

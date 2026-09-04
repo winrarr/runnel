@@ -164,7 +164,7 @@ pub(super) fn apply_group_poll(
             .copied()
             .unwrap_or_default();
         if max_delivery_attempts.is_some_and(|max| attempts >= max)
-            && !is_dead_letter_stream(&stream)
+            && !is_dead_letter_stream(state, &stream)
         {
             let original = state
                 .streams
@@ -347,6 +347,16 @@ pub(super) fn dead_letter_stream_name(stream: &str) -> String {
     format!("{DEAD_LETTER_HASH_PREFIX}{hash:016x}")
 }
 
-pub(super) fn is_dead_letter_stream(stream: &str) -> bool {
-    stream.ends_with(DEAD_LETTER_SUFFIX) || stream.starts_with(DEAD_LETTER_HASH_PREFIX)
+fn is_dead_letter_stream(state: &SnapshotState, stream: &str) -> bool {
+    if stream.ends_with(DEAD_LETTER_SUFFIX) {
+        return true;
+    }
+    if !stream.starts_with(DEAD_LETTER_HASH_PREFIX) {
+        return false;
+    }
+
+    state
+        .streams
+        .keys()
+        .any(|source| dead_letter_stream_name(source) == stream)
 }

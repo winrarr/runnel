@@ -195,10 +195,6 @@ fn dead_letter_stream_name(stream: &str) -> Result<String, BrokerError> {
     Ok(fallback)
 }
 
-fn is_dead_letter_stream(stream: &str) -> bool {
-    stream.ends_with(DEAD_LETTER_SUFFIX) || stream.starts_with(DEAD_LETTER_HASH_PREFIX)
-}
-
 fn dead_letter_move_id(
     source_stream: &str,
     source_consumer: &str,
@@ -1002,6 +998,39 @@ mod tests {
             broker.poll(&nested_dead_letter, "inspector"),
             Err(BrokerError::StreamNotFound(stream)) if stream == nested_dead_letter
         ));
+    }
+
+    #[test]
+    fn user_stream_with_dead_letter_hash_prefix_still_dead_letters() {
+        let directory = tempdir().unwrap();
+        let config = BrokerConfig {
+            ack_timeout: Duration::ZERO,
+            max_delivery_attempts: Some(1),
+        };
+        let broker = Broker::open(directory.path(), config).unwrap();
+        let source = "runnel.dead-letter.user";
+        broker
+            .publish(source, Some("order-1".to_owned()), b"poison".to_vec())
+            .unwrap();
+
+        assert!(matches!(
+            broker.poll(source, "worker").unwrap(),
+            PollResult::Message(Message {
+                delivery_attempt: Some(1),
+                ..
+            })
+        ));
+        assert_eq!(broker.poll(source, "worker").unwrap(), PollResult::Empty);
+
+        let dead_letter = dead_letter_stream_name(source).unwrap();
+        assert!(matches!(
+            broker.poll(&dead_letter, "inspector").unwrap(),
+            PollResult::Message(Message {
+                delivery_attempt: Some(1),
+                ..
+            })
+        ));
+        assert_eq!(broker.health().unwrap().dead_letters, 1);
     }
 
     #[test]
