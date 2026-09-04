@@ -254,7 +254,7 @@ def matrix_cases(args: argparse.Namespace) -> list[dict[str, Any]]:
         )
         retained_values = (
             args.retained_message_values
-            if scenario == "cluster_retained_recovery"
+            if scenario in {"cluster_retained_recovery", "retained_hot_path"}
             else args.retained_message_values[:1]
         )
         for runtime in args.runtimes:

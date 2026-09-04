@@ -93,6 +93,37 @@ class MatrixBenchmarkTests(unittest.TestCase):
         self.assertIn("/tmp/matrix/result.json", command)
         self.assertIn("--log-dir", command)
 
+    def test_retained_hot_path_expands_each_retained_history_value(self) -> None:
+        args = self.parse(
+            "--scenarios",
+            "retained_hot_path",
+            "--payload-sizes",
+            "100",
+            "--retained-message-values",
+            "1025,2048",
+            "--repetitions",
+            "2",
+        )
+
+        cases = matrix.matrix_cases(args)
+
+        self.assertEqual(len(cases), 4)
+        self.assertEqual(
+            {case["retained_messages"] for case in cases}, {1025, 2048}
+        )
+        self.assertEqual({case["scenario"] for case in cases}, {"retained_hot_path"})
+        self.assertEqual({case["repetition"] for case in cases}, {1, 2})
+
+        command = matrix.case_command(
+            args,
+            cases[1],
+            Path("/tmp/matrix/result.json"),
+            Path("/tmp/matrix/logs"),
+            build=False,
+        )
+        retained_index = command.index("--retained-messages")
+        self.assertEqual(command[retained_index + 1], str(cases[1]["retained_messages"]))
+
     def test_run_matrix_keeps_each_case_and_builds_a_machine_readable_envelope(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             output = Path(directory) / "matrix.json"

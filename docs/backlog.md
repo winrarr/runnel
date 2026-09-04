@@ -304,7 +304,7 @@ Goal: keep publish, consume, recovery, and resource behavior predictable as a st
 
 Rationale: a broker cannot meet its throughput, latency, and bounded-memory goals if each new message requires work proportional to all retained state.
 
-Current progress: retained-history benchmarks now cross the bounded local tail index, clustered recovery replays retained data after a real node restart, and clustered snapshot/journal paths avoid several redundant retained-payload copies. Segmented storage, bounded storage amplification, retention behavior, and a complete growth benchmark matrix remain open.
+Current progress: retained-history benchmarks now cross the bounded local tail index, clustered recovery replays retained data after a real node restart, the opt-in clustered hot-path probe measures durable publishes after a controlled retained-history preload, and clustered snapshot/journal paths avoid several redundant retained-payload copies. Segmented storage, bounded storage amplification, retention behavior, and a complete growth benchmark matrix remain open.
 
 Constraints:
 

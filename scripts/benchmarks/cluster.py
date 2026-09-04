@@ -102,6 +102,7 @@ DEFAULT_SCENARIOS = (
 )
 SCENARIO_NAMES = (
     *DEFAULT_SCENARIOS,
+    "retained_hot_path",
     "peer_forwarding",
     "publish_batch",
     "hot_ordering",
@@ -648,6 +649,41 @@ def run_consume_ack(
                 ack_client_for=lambda offset: clients[(offset + 1) % len(clients)],
             ),
             metadata={"nodes": cluster.node_count, "publish_setup_excluded": True},
+            metrics=cluster.metrics,
+        )
+
+
+def run_retained_hot_path(
+    cluster: Cluster, stream: str, payload: str, messages: int, retained_messages: int
+) -> dict[str, Any]:
+    """Measure durable publishes after preloading a retained history.
+
+    The retained-history preload is deliberately excluded from measurement so
+    the result isolates the append hot path after the stream already contains
+    a controlled amount of retained state.
+    """
+    preload(cluster, stream, payload, retained_messages)
+    with cluster.connected_clients() as clients:
+        return measure_message_batch(
+            cluster.stats,
+            "cluster_retained_hot_path",
+            len(payload),
+            lambda: publish_messages(
+                lambda offset: clients[offset % len(clients)],
+                stream,
+                payload,
+                messages,
+                expected_offset=retained_messages,
+            ),
+            metadata={
+                "nodes": cluster.node_count,
+                "retained_messages": retained_messages,
+                "retained_logical_payload_bytes": retained_messages * len(payload),
+                "publish_setup_excluded": True,
+                "preload_scope": "same stream and payload before measured publishes",
+                "latency_scope": "one public durable publish roundtrip per sample",
+                "throughput_scope": "measured publishes after retained-history preload",
+            },
             metrics=cluster.metrics,
         )
 
@@ -1933,8 +1969,9 @@ def parse_args() -> argparse.Namespace:
         default=list(DEFAULT_SCENARIOS),
         help=(
             "comma-separated scenarios to run (default: existing clustered workload; "
-            "add peer_forwarding, publish_batch, hot_ordering, leader_failure_recovery, "
-            "or follower_failure_recovery explicitly for focused probes)"
+            "add retained_hot_path, peer_forwarding, publish_batch, hot_ordering, "
+            "leader_failure_recovery, or follower_failure_recovery explicitly for "
+            "focused probes)"
         ),
     )
     parser.add_argument("--ack-timeout-ms", type=int, default=DEFAULT_ACK_TIMEOUT_MS)
@@ -2165,6 +2202,16 @@ def main() -> int:
                         args.messages,
                     )
                 )
+            if "retained_hot_path" in selected_scenarios:
+                scenarios.append(
+                    run_retained_hot_path(
+                        cluster,
+                        f"cluster_{run_id}_retained_hot_path_{size}",
+                        payload,
+                        args.messages,
+                        args.retained_messages,
+                    )
+                )
             if "slow_consumer" in selected_scenarios:
                 scenarios.append(
                     run_slow_consumer(
@@ -2293,6 +2340,8 @@ def main() -> int:
     }
     if not args.skip_recovery and "cluster_retained_recovery" in selected_scenarios:
         workload["retained_recovery_messages"] = args.retained_messages
+    if "retained_hot_path" in selected_scenarios:
+        workload["retained_hot_path_messages"] = args.retained_messages
 
     result = {
         **result_metadata(
