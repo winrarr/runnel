@@ -38,6 +38,12 @@ SCENARIO_COMPARISON_CLASSES = {
     "consume_ack": "consume-with-ack",
     "consume": "consume-without-ack",
 }
+SUMMARY_RESOURCE_LIMIT_FIELDS = (
+    "broker_cpu",
+    "broker_memory",
+    "client_cpu",
+    "client_memory",
+)
 
 
 def scenario_operation(scenario: dict[str, Any]) -> str:
@@ -124,7 +130,9 @@ def _require_nonempty_text(value: Any, description: str) -> str:
     return value
 
 
-def validate_backend_record(name: str, backend: dict[str, Any]) -> None:
+def validate_backend_record(
+    name: str, backend: dict[str, Any], *, expected_nodes: int | None = None
+) -> None:
     """Reject a backend record that cannot be interpreted semantically."""
     if not isinstance(backend, dict):
         raise ComparisonError(f"backend {name!r} is not an object")
@@ -140,6 +148,10 @@ def validate_backend_record(name: str, backend: dict[str, Any]) -> None:
     )
     measurement_client = _require_nonempty_text(
         backend.get("measurement_client"), f"client identity for {name!r}"
+    )
+    cpu_limit = _require_nonempty_text(backend.get("cpu_limit"), f"cpu_limit for {name!r}")
+    memory_limit = _require_nonempty_text(
+        backend.get("memory_limit"), f"memory_limit for {name!r}"
     )
 
     semantic = backend.get("semantic_metadata")
@@ -208,6 +220,34 @@ def validate_backend_record(name: str, backend: dict[str, Any]) -> None:
     )
     if client_image != declared_client_image:
         raise ComparisonError(f"backend {name!r} has inconsistent client image metadata")
+
+    if expected_nodes is not None:
+        node_records = backend.get("nodes")
+        if expected_nodes == THREE_NODE_COUNT and not isinstance(node_records, list):
+            raise ComparisonError(
+                f"backend {name!r} must declare {expected_nodes} measured node records"
+            )
+        if node_records is not None:
+            if not isinstance(node_records, list) or len(node_records) != expected_nodes:
+                raise ComparisonError(
+                    f"backend {name!r} measured node records do not match the "
+                    f"{expected_nodes}-node workload topology"
+                )
+            for index, node in enumerate(node_records):
+                if not isinstance(node, dict):
+                    raise ComparisonError(
+                        f"backend {name!r} measured node {index} is not an object"
+                    )
+                node_cpu = _require_nonempty_text(
+                    node.get("cpu_limit"), f"cpu_limit for {name!r} node {index}"
+                )
+                node_memory = _require_nonempty_text(
+                    node.get("memory_limit"), f"memory_limit for {name!r} node {index}"
+                )
+                if node_cpu != cpu_limit or node_memory != memory_limit:
+                    raise ComparisonError(
+                        f"backend {name!r} measured node {index} has inconsistent resource limits"
+                    )
 
     comparison = semantic.get("comparison")
     if not isinstance(comparison, dict):
@@ -278,6 +318,15 @@ def validate_comparison_summary(summary: dict[str, Any]) -> None:
         THREE_NODE_COUNT,
     }:
         raise ComparisonError("comparison result is missing a valid workload node count")
+    resource_limits = summary.get("resource_limits")
+    if not isinstance(resource_limits, dict):
+        raise ComparisonError("comparison result is missing resource_limits metadata")
+    declared_limits = {
+        field: _require_nonempty_text(
+            resource_limits.get(field), f"{field} resource limit"
+        )
+        for field in SUMMARY_RESOURCE_LIMIT_FIELDS
+    }
     expected_guardrail = comparison_guardrail_metadata(nodes)
     if any(guardrail.get(key) != value for key, value in expected_guardrail.items()):
         raise ComparisonError("comparison result has incomplete or inconsistent guardrail metadata")
@@ -285,7 +334,17 @@ def validate_comparison_summary(summary: dict[str, Any]) -> None:
     if not isinstance(backends, dict) or not backends:
         raise ComparisonError("comparison result must contain backend records")
     for name, backend in backends.items():
-        validate_backend_record(str(name), backend)
+        backend_name = str(name)
+        validate_backend_record(backend_name, backend, expected_nodes=nodes)
+        if backend["cpu_limit"] != declared_limits["broker_cpu"]:
+            raise ComparisonError(
+                f"backend {backend_name!r} cpu_limit does not match the summary broker_cpu limit"
+            )
+        if backend["memory_limit"] != declared_limits["broker_memory"]:
+            raise ComparisonError(
+                f"backend {backend_name!r} memory_limit does not match the summary "
+                "broker_memory limit"
+            )
 
 
 def benchmark_suite(nodes: int, backends: list[str]) -> str:
