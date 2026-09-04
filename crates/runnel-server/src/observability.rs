@@ -12,7 +12,7 @@ use runnel_protocol::Request;
 use runnel_raft::{GroupManager, SnapshotMetricsSnapshot};
 use tracing::error;
 
-use crate::ProtocolAdmission;
+use crate::protocol::ProtocolAdmission;
 
 const HEALTH_CHECK_TIMEOUT: Duration = Duration::from_secs(1);
 

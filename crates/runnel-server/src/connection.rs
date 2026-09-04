@@ -12,13 +12,12 @@ use tokio::sync::{OwnedSemaphorePermit, Semaphore, watch};
 use tokio::task::{JoinHandle, JoinSet};
 use tracing::warn;
 
-use crate::ProtocolAdmission;
 use crate::dispatch::handle_request;
 use crate::observability::{ActiveConnection, ActiveRequest, RequestOperation, ServerMetrics};
 use crate::protocol::{
-    Frame, invalid_request_response, read_frame, reject_connection, remaining_timeout,
-    request_line, request_size_response, response_write_timeout, saturated_response, send_response,
-    timeout_response, wait_for_request_data,
+    Frame, ProtocolAdmission, invalid_request_response, read_frame, reject_connection,
+    remaining_timeout, request_line, request_size_response, response_write_timeout,
+    saturated_response, send_response, timeout_response, wait_for_request_data,
 };
 
 pub(crate) fn spawn(

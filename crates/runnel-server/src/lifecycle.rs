@@ -9,9 +9,9 @@ use tokio::net::TcpListener;
 use tokio::sync::watch;
 use tracing::{error, info, warn};
 
-use crate::ProtocolAdmission;
 use crate::connection;
 use crate::observability::{self, ServerMetrics};
+use crate::protocol::ProtocolAdmission;
 
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(25);
 
