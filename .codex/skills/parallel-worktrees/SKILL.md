@@ -138,10 +138,12 @@ Report blocked or inconclusive work explicitly.
 The worker must create and own its PR; the orchestrator must review the PR and
 make the final recommendation. Review the diff against the recorded baseline,
 the worker's evidence and planning assessment, required checks, mergeability,
-and relevant repository gates. If the orchestrator recommends merge, merge only
-after required checks pass. In rolling mode, refresh the default-branch baseline
-and start exactly one replacement from a newly validated worktree after the
-actual merge, unless a stop condition has been reached.
+and relevant repository gates. If the orchestrator recommends merge, either
+wait for required checks and merge when they pass, or enable auto-merge while
+checks are pending when the repository supports it. Auto-merge does not bypass
+required checks. In rolling mode, refresh the default-branch baseline and start
+exactly one replacement only after the actual merge, never merely because
+auto-merge was enabled, unless a stop condition has been reached.
 
 If the orchestrator does not recommend merging a work item—including when it
 recommends revise, rerun, defer, or records blocked/inconclusive evidence—leave
@@ -166,7 +168,7 @@ the orchestrator's review or merge recommendation.
 
 Review each branch independently before integration. Check the diff against the recorded baseline, rerun focused tests in a clean worktree, and run the repository verification path. Do not merge an optimization solely because a microbenchmark improved: preserve durability, ordering, timeout, ambiguous-outcome, bounded-resource, and recovery guarantees.
 
-Merge independently reviewable pull requests in parallel once their required pull-request checks pass. Coordinate or serialize changes that overlap in files, shared contracts, dependencies, generated output, or integration behavior; overlapping architectural refactors require integration review and must not be merged independently just because their pull requests are individually green. Never bypass required checks to compensate for a flaky test; diagnose whether the failure is in the implementation, test harness, environment, or resource isolation.
+Merge independently reviewable pull requests in parallel once their required pull-request checks pass, or enable auto-merge after the orchestrator's recommendation while checks are pending. Coordinate or serialize changes that overlap in files, shared contracts, dependencies, generated output, or integration behavior; overlapping architectural refactors require integration review and must not be merged independently just because their pull requests are individually green. Never bypass required checks to compensate for a flaky test; diagnose whether the failure is in the implementation, test harness, environment, or resource isolation.
 
 - If delegation dirties the coordinator worktree or mixes task files, stop the affected workers before changing branches. Preserve the mixed state in a recoverable stash or explicit patch, restore the coordinator worktree to the default branch, and re-home only verified task files into dedicated worktrees. Never reset or discard the mixed state to repair allocation.
 
