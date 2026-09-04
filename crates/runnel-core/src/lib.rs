@@ -1,6 +1,6 @@
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
-use std::fs::{self, File, OpenOptions};
-use std::io::{self, Read, Seek, SeekFrom, Write};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::fs;
+use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
@@ -17,33 +17,27 @@ use runnel_engine::{
 
 mod consumer_state;
 mod storage;
+mod stream_log;
 
 #[cfg(test)]
 use consumer_state::MAX_CONSUMER_STATE_JOURNAL_BYTES;
 use consumer_state::{
     ConsumerState, ConsumerStateEvent, load_consumer_state, persist_consumer_event,
 };
+#[cfg(test)]
+use std::fs::OpenOptions;
+#[cfg(test)]
+use std::io::Write;
 use storage::StorageExecutor;
-
-const LEGACY_MAGIC: &[u8; 4] = b"RNL1";
-const VERSIONED_MAGIC: &[u8; 4] = b"RNL2";
-const REQUEST_ID_MAGIC: &[u8; 4] = b"RNL3";
-const LEGACY_HEADER_LEN: usize = 28;
-const VERSIONED_HEADER_LEN: usize = 44;
-const REQUEST_ID_HEADER_LEN: usize = 48;
-const VERSIONED_FORMAT_VERSION: u8 = 1;
-const REQUEST_ID_FORMAT_VERSION: u8 = 1;
-const VERSIONED_ENCODING_BYTES: u8 = 0;
-const VERSIONED_COMPRESSION_NONE: u8 = 0;
-const VERSIONED_MAX_KEY_LEN: u32 = 128;
-const VERSIONED_MAX_BODY_LEN: u32 = 64 * 1024 * 1024;
-const REQUEST_ID_MAX_LEN: u32 = 1024;
-const REQUEST_ID_MAX_KEY_LEN: u32 = 128;
-const REQUEST_ID_MAX_BODY_LEN: u32 = 64 * 1024 * 1024;
-const MAX_IN_MEMORY_RECORDS: usize = 1024;
+#[cfg(test)]
+use stream_log::{
+    LEGACY_HEADER_LEN, LEGACY_MAGIC, MAX_IN_MEMORY_RECORDS, REQUEST_ID_FORMAT_VERSION,
+    REQUEST_ID_HEADER_LEN, REQUEST_ID_MAGIC, REQUEST_ID_MAX_BODY_LEN, REQUEST_ID_MAX_KEY_LEN,
+    VERSIONED_FORMAT_VERSION, VERSIONED_HEADER_LEN, VERSIONED_MAGIC, VERSIONED_MAX_BODY_LEN,
+    VERSIONED_MAX_KEY_LEN,
+};
+use stream_log::{REQUEST_ID_MAX_LEN, RecordIndex, StreamLog};
 const MAX_CACHED_CONSUMER_STATES: usize = 1024;
-const SPARSE_INDEX_STRIDE: Offset = 64;
-const MAX_SPARSE_INDEX_ENTRIES: usize = 1024;
 const DEFAULT_ACK_TIMEOUT: Duration = Duration::from_secs(30);
 const DEAD_LETTER_SUFFIX: &str = ".dead-letter";
 
@@ -60,27 +54,6 @@ pub use runnel_engine::{
 pub enum DurableFormat {
     Rnl1,
     VersionedV1,
-}
-
-#[derive(Debug, Clone, Copy)]
-struct RequestAwareLimits {
-    max_key_len: u32,
-    max_body_len: u32,
-}
-
-fn request_aware_limits(durable_format: DurableFormat) -> RequestAwareLimits {
-    match durable_format {
-        // Keep the legacy no-request-id writer and reader unchanged. Request-aware frames have
-        // their own bounded limits so malformed headers cannot force unbounded allocations.
-        DurableFormat::Rnl1 => RequestAwareLimits {
-            max_key_len: REQUEST_ID_MAX_KEY_LEN,
-            max_body_len: REQUEST_ID_MAX_BODY_LEN,
-        },
-        DurableFormat::VersionedV1 => RequestAwareLimits {
-            max_key_len: VERSIONED_MAX_KEY_LEN,
-            max_body_len: VERSIONED_MAX_BODY_LEN,
-        },
-    }
 }
 
 #[derive(Debug, Clone)]
@@ -154,17 +127,6 @@ struct ConsumerInFlightIndex {
     offsets: HashSet<Offset>,
     keys: HashSet<String>,
     members: HashMap<String, Offset>,
-}
-
-struct StreamLog {
-    file: File,
-    durable_format: DurableFormat,
-    // The durable log retains the complete history; this tail cache keeps normal delivery
-    // bounded while older replay requests use the bounded sparse index as a scan starting point.
-    records: VecDeque<RecordIndex>,
-    sparse_index: VecDeque<LogCheckpoint>,
-    request_ids: HashMap<String, Offset>,
-    next_offset: Offset,
 }
 
 impl StreamState {
@@ -264,28 +226,11 @@ impl StreamState {
             in_flight_by_consumer,
             ..
         } = self;
-        log.find_candidate(
-            committed_offset,
-            acknowledged_offsets,
-            in_flight_by_consumer.get(consumer),
-        )
+        let in_flight = in_flight_by_consumer
+            .get(consumer)
+            .map(|index| (&index.offsets, &index.keys));
+        log.find_candidate(committed_offset, acknowledged_offsets, in_flight)
     }
-}
-
-#[derive(Debug, Clone)]
-struct RecordIndex {
-    offset: Offset,
-    payload_offset: u64,
-    payload_len: u32,
-    key: Option<String>,
-    request_id: Option<String>,
-    published_at_ms: u64,
-}
-
-#[derive(Debug, Clone, Copy)]
-struct LogCheckpoint {
-    offset: Offset,
-    cursor: u64,
 }
 
 impl Broker {
@@ -387,11 +332,11 @@ impl Broker {
         let stream_state = self.get_or_create_stream(stream)?;
         let mut stream_state = self.lock_stream(&stream_state)?;
         if let Some(request_id) = request_id.as_ref()
-            && let Some(offset) = stream_state.log.request_ids.get(request_id)
+            && let Some(offset) = stream_state.log.request_offset(request_id)
         {
             // As with the clustered engine, a repeated identity resolves to its original
             // offset; payload and key mismatches are intentionally ignored for compatibility.
-            return Ok(*offset);
+            return Ok(offset);
         }
         match request_id {
             Some(request_id) => stream_state
@@ -517,6 +462,7 @@ impl Broker {
                 continue;
             }
 
+            let candidate_offset = candidate.offset;
             let delivery_attempt = attempts.saturating_add(1);
             let mut message = stream_state.log.read_message(stream, candidate.offset)?;
             persist_consumer_event(
@@ -546,8 +492,8 @@ impl Broker {
                 },
                 InFlight {
                     member: member.to_owned(),
-                    offset: candidate.offset,
-                    key: candidate.key,
+                    offset: candidate_offset,
+                    key: candidate.into_key(),
                     delivery_attempt,
                     delivery_token,
                     deadline: Instant::now() + ack_timeout,
@@ -646,7 +592,7 @@ impl Broker {
         let mut in_flight_deliveries = 0;
         for stream in &streams {
             let stream = self.lock_stream(stream)?;
-            storage_bytes += stream.log.file.metadata()?.len();
+            storage_bytes += stream.log.storage_bytes()?;
             in_flight_deliveries += stream.in_flight.len() as u64;
         }
         Ok(HealthSnapshot {
@@ -877,869 +823,6 @@ impl Engine for Broker {
     }
 }
 
-impl StreamLog {
-    fn create(path: &Path, durable_format: DurableFormat) -> Result<Self, BrokerError> {
-        let file = OpenOptions::new()
-            .create_new(true)
-            .read(true)
-            .append(true)
-            .open(path)?;
-        Ok(Self {
-            file,
-            durable_format,
-            records: VecDeque::with_capacity(MAX_IN_MEMORY_RECORDS),
-            sparse_index: VecDeque::with_capacity(MAX_SPARSE_INDEX_ENTRIES),
-            request_ids: HashMap::new(),
-            next_offset: 0,
-        })
-    }
-
-    fn open(path: &Path, durable_format: DurableFormat) -> Result<Self, BrokerError> {
-        let mut file = OpenOptions::new().read(true).append(true).open(path)?;
-        let file_len = file.metadata()?.len();
-        let mut records = VecDeque::with_capacity(MAX_IN_MEMORY_RECORDS);
-        let mut sparse_index = VecDeque::with_capacity(MAX_SPARSE_INDEX_ENTRIES);
-        let mut request_ids = HashMap::new();
-        let mut cursor = 0;
-        let mut next_offset = 0;
-        while let Some(parsed) = read_record(&mut file, cursor, file_len, durable_format)? {
-            remember_checkpoint(&mut sparse_index, parsed.index.offset, cursor);
-            cursor = parsed.next_cursor;
-            next_offset = parsed.index.offset.saturating_add(1);
-            if let Some(request_id) = parsed.index.request_id.as_ref() {
-                request_ids
-                    .entry(request_id.clone())
-                    .or_insert(parsed.index.offset);
-            }
-            remember_record(&mut records, parsed.index);
-        }
-
-        if cursor != file_len {
-            file.set_len(cursor)?;
-        }
-        file.seek(SeekFrom::End(0))?;
-        Ok(Self {
-            file,
-            durable_format,
-            records,
-            sparse_index,
-            request_ids,
-            next_offset,
-        })
-    }
-
-    fn append(&mut self, key: Option<String>, payload: Vec<u8>) -> Result<Offset, BrokerError> {
-        self.append_with_sync(key, payload, true)
-    }
-
-    fn append_with_sync(
-        &mut self,
-        key: Option<String>,
-        payload: Vec<u8>,
-        sync: bool,
-    ) -> Result<Offset, BrokerError> {
-        #[cfg(feature = "instrumentation")]
-        let _stage_timer = StageTimer::new("core.storage_append");
-        if self.durable_format == DurableFormat::VersionedV1 {
-            return self.append_versioned_with_sync(key, payload, sync);
-        }
-
-        let key_bytes = key.as_deref().unwrap_or_default().as_bytes();
-        let key_len = u32::try_from(key_bytes.len()).map_err(|_| {
-            BrokerError::Io(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "message key exceeds u32 length",
-            ))
-        })?;
-        let payload_len = u32::try_from(payload.len()).map_err(|_| {
-            BrokerError::Io(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "message payload exceeds u32 length",
-            ))
-        })?;
-        let offset = self.next_offset;
-        let published_at_ms = now_ms();
-
-        let mut header = Vec::with_capacity(LEGACY_HEADER_LEN);
-        header.extend_from_slice(LEGACY_MAGIC);
-        header.extend_from_slice(&offset.to_le_bytes());
-        header.extend_from_slice(&published_at_ms.to_le_bytes());
-        header.extend_from_slice(&key_len.to_le_bytes());
-        header.extend_from_slice(&payload_len.to_le_bytes());
-
-        self.file.write_all(&header)?;
-        self.file.write_all(key_bytes)?;
-        self.file.write_all(&payload)?;
-        if sync {
-            self.file.sync_data()?;
-        }
-
-        let payload_offset = self.file.stream_position()? - payload.len() as u64;
-        let record_cursor = payload_offset - key_bytes.len() as u64 - LEGACY_HEADER_LEN as u64;
-        remember_checkpoint(&mut self.sparse_index, offset, record_cursor);
-        remember_record(
-            &mut self.records,
-            RecordIndex {
-                offset,
-                payload_offset,
-                payload_len,
-                key,
-                request_id: None,
-                published_at_ms,
-            },
-        );
-        self.next_offset = offset.saturating_add(1);
-        Ok(offset)
-    }
-
-    fn append_versioned_with_sync(
-        &mut self,
-        key: Option<String>,
-        payload: Vec<u8>,
-        sync: bool,
-    ) -> Result<Offset, BrokerError> {
-        let key_bytes = key.as_deref().unwrap_or_default().as_bytes();
-        let key_len = u32::try_from(key_bytes.len()).map_err(|_| {
-            BrokerError::Io(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "message key exceeds u32 length",
-            ))
-        })?;
-        if key_len > VERSIONED_MAX_KEY_LEN {
-            return Err(BrokerError::Io(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "message key exceeds versioned storage limit",
-            )));
-        }
-        let body_len = u32::try_from(payload.len()).map_err(|_| {
-            BrokerError::Io(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "message payload exceeds u32 length",
-            ))
-        })?;
-        if body_len > VERSIONED_MAX_BODY_LEN {
-            return Err(BrokerError::Io(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "message payload exceeds versioned storage limit",
-            )));
-        }
-
-        let offset = self.next_offset;
-        let published_at_ms = now_ms();
-        let mut header = [0; VERSIONED_HEADER_LEN];
-        header[..4].copy_from_slice(VERSIONED_MAGIC);
-        header[4] = VERSIONED_FORMAT_VERSION;
-        header[6..8].copy_from_slice(&(VERSIONED_HEADER_LEN as u16).to_le_bytes());
-        header[8..12].copy_from_slice(&body_len.to_le_bytes());
-        header[12..16].copy_from_slice(&body_len.to_le_bytes());
-        header[16..24].copy_from_slice(&offset.to_le_bytes());
-        header[24..32].copy_from_slice(&published_at_ms.to_le_bytes());
-        header[32..36].copy_from_slice(&key_len.to_le_bytes());
-        header[36] = VERSIONED_ENCODING_BYTES;
-        header[37] = VERSIONED_COMPRESSION_NONE;
-        let checksum = versioned_checksum(&header, key_bytes, &payload);
-        header[40..44].copy_from_slice(&checksum.to_le_bytes());
-
-        self.file.write_all(&header)?;
-        self.file.write_all(key_bytes)?;
-        self.file.write_all(&payload)?;
-        if sync {
-            self.file.sync_data()?;
-        }
-
-        let payload_offset = self.file.stream_position()? - payload.len() as u64;
-        let record_cursor = payload_offset - key_bytes.len() as u64 - VERSIONED_HEADER_LEN as u64;
-        remember_checkpoint(&mut self.sparse_index, offset, record_cursor);
-        remember_record(
-            &mut self.records,
-            RecordIndex {
-                offset,
-                payload_offset,
-                payload_len: body_len,
-                key,
-                request_id: None,
-                published_at_ms,
-            },
-        );
-        self.next_offset = offset.saturating_add(1);
-        Ok(offset)
-    }
-
-    fn append_with_request_id(
-        &mut self,
-        key: Option<String>,
-        payload: Vec<u8>,
-        request_id: String,
-    ) -> Result<Offset, BrokerError> {
-        self.append_with_request_id_sync(key, payload, request_id, true)
-    }
-
-    fn append_with_move_id(
-        &mut self,
-        key: Option<String>,
-        payload: Vec<u8>,
-        move_id: String,
-    ) -> Result<Offset, BrokerError> {
-        if let Some(offset) = self.request_ids.get(&move_id).copied() {
-            let existing = self.find_record(offset)?;
-            if existing.key.as_ref() != key.as_ref() || self.read_payload(&existing)? != payload {
-                return Err(dead_letter_move_content_mismatch());
-            }
-            return Ok(offset);
-        }
-
-        // Move identities are internal request-aware records. Unlike public request IDs, their
-        // key and payload are part of the identity invariant and are checked on every retry.
-        self.append_with_request_id(key, payload, move_id)
-    }
-
-    fn append_with_request_id_sync(
-        &mut self,
-        key: Option<String>,
-        payload: Vec<u8>,
-        request_id: String,
-        sync: bool,
-    ) -> Result<Offset, BrokerError> {
-        let limits = request_aware_limits(self.durable_format);
-        let key_bytes = key.as_deref().unwrap_or_default().as_bytes();
-        let key_len = u32::try_from(key_bytes.len()).map_err(|_| {
-            BrokerError::Io(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "message key exceeds u32 length",
-            ))
-        })?;
-        if key_len > limits.max_key_len {
-            return Err(BrokerError::Io(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "message key exceeds request-aware storage limit",
-            )));
-        }
-        let request_id_bytes = request_id.as_bytes();
-        let request_id_len = u32::try_from(request_id_bytes.len()).map_err(|_| {
-            BrokerError::Io(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "request ID exceeds u32 length",
-            ))
-        })?;
-        if request_id_len > REQUEST_ID_MAX_LEN {
-            return Err(BrokerError::Io(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "request ID exceeds request-aware storage limit",
-            )));
-        }
-        let payload_len = u32::try_from(payload.len()).map_err(|_| {
-            BrokerError::Io(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "message payload exceeds u32 length",
-            ))
-        })?;
-        if payload_len > limits.max_body_len {
-            return Err(BrokerError::Io(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "message payload exceeds request-aware storage limit",
-            )));
-        }
-        let offset = self.next_offset;
-        let published_at_ms = now_ms();
-        let mut header = [0; REQUEST_ID_HEADER_LEN];
-        header[..4].copy_from_slice(REQUEST_ID_MAGIC);
-        header[4] = REQUEST_ID_FORMAT_VERSION;
-        header[6..8].copy_from_slice(&(REQUEST_ID_HEADER_LEN as u16).to_le_bytes());
-        header[8..12].copy_from_slice(&payload_len.to_le_bytes());
-        header[12..16].copy_from_slice(&payload_len.to_le_bytes());
-        header[16..24].copy_from_slice(&offset.to_le_bytes());
-        header[24..32].copy_from_slice(&published_at_ms.to_le_bytes());
-        header[32..36].copy_from_slice(&key_len.to_le_bytes());
-        header[36..40].copy_from_slice(&request_id_len.to_le_bytes());
-        let checksum = request_id_checksum(&header, key_bytes, request_id_bytes, &payload);
-        header[44..48].copy_from_slice(&checksum.to_le_bytes());
-
-        self.file.write_all(&header)?;
-        self.file.write_all(key_bytes)?;
-        self.file.write_all(request_id_bytes)?;
-        self.file.write_all(&payload)?;
-        if sync {
-            self.file.sync_data()?;
-        }
-
-        let payload_offset = self.file.stream_position()? - payload.len() as u64;
-        let record_cursor = payload_offset
-            - request_id_bytes.len() as u64
-            - key_bytes.len() as u64
-            - REQUEST_ID_HEADER_LEN as u64;
-        remember_checkpoint(&mut self.sparse_index, offset, record_cursor);
-        remember_record(
-            &mut self.records,
-            RecordIndex {
-                offset,
-                payload_offset,
-                payload_len,
-                key,
-                request_id: Some(request_id.clone()),
-                published_at_ms,
-            },
-        );
-        self.request_ids.insert(request_id, offset);
-        self.next_offset = offset.saturating_add(1);
-        Ok(offset)
-    }
-
-    fn append_batch(
-        &mut self,
-        records: Vec<PublishRecord>,
-    ) -> Result<Vec<PublishRecordOutcome>, BrokerError> {
-        let mut outcomes = Vec::with_capacity(records.len());
-        let mut appended = false;
-
-        for PublishRecord {
-            key,
-            payload,
-            request_id,
-        } in records
-        {
-            if let Some(request_id) = request_id.as_ref()
-                && let Some(offset) = self.request_ids.get(request_id)
-            {
-                outcomes.push(Ok(*offset));
-                continue;
-            }
-
-            let outcome = match request_id {
-                Some(request_id) => {
-                    self.append_with_request_id_sync(key, payload, request_id, false)
-                }
-                None => self.append_with_sync(key, payload, false),
-            };
-            match outcome {
-                Ok(offset) => {
-                    appended = true;
-                    outcomes.push(Ok(offset));
-                }
-                Err(error) if is_invalid_input(&error) => outcomes.push(Err(error)),
-                Err(error) => return Err(error),
-            }
-        }
-
-        if appended {
-            self.file.sync_data()?;
-        }
-        Ok(outcomes)
-    }
-
-    fn read_message(&mut self, stream: &str, offset: Offset) -> Result<Message, BrokerError> {
-        #[cfg(feature = "instrumentation")]
-        let _stage_timer = StageTimer::new("core.storage_read");
-        let index = self.find_record(offset)?;
-        let payload = self.read_payload(&index)?;
-        Ok(Message {
-            stream: stream.to_owned(),
-            offset: index.offset,
-            key: index.key.clone(),
-            payload,
-            published_at_ms: index.published_at_ms,
-            delivery_token: None,
-            delivery_attempt: None,
-        })
-    }
-
-    fn read_replay_message(
-        &mut self,
-        stream: &str,
-        offset: Offset,
-    ) -> Result<ReplayMessage, BrokerError> {
-        if offset >= self.next_offset {
-            return Err(BrokerError::HistoryUnavailable {
-                stream: stream.to_owned(),
-                requested_offset: offset,
-                earliest_offset: 0,
-                next_offset: self.next_offset,
-            });
-        }
-
-        let index = self.find_record(offset)?;
-        let payload = self.read_payload(&index)?;
-        Ok(ReplayMessage {
-            stream: stream.to_owned(),
-            offset: index.offset,
-            key: index.key,
-            payload,
-            published_at_ms: index.published_at_ms,
-        })
-    }
-
-    fn read_payload(&mut self, record: &RecordIndex) -> Result<Vec<u8>, BrokerError> {
-        let mut payload = vec![0; record.payload_len as usize];
-        self.file.seek(SeekFrom::Start(record.payload_offset))?;
-        self.file.read_exact(&mut payload)?;
-        Ok(payload)
-    }
-
-    fn find_candidate(
-        &mut self,
-        committed_offset: Offset,
-        acknowledged_offsets: &BTreeSet<Offset>,
-        in_flight: Option<&ConsumerInFlightIndex>,
-    ) -> Result<Option<RecordIndex>, BrokerError> {
-        let Some(first_indexed_offset) = self.records.front().map(|record| record.offset) else {
-            return Ok(None);
-        };
-        if committed_offset >= first_indexed_offset {
-            return Ok(self
-                .records
-                .iter()
-                .filter(|record| record.offset >= committed_offset)
-                .find(|record| record_is_candidate(record, acknowledged_offsets, in_flight))
-                .cloned());
-        }
-
-        // A consumer that has fallen behind the bounded tail index still has the same replay
-        // rights. Start at the nearest sparse checkpoint so cold replay does not always scan
-        // from byte zero.
-        let file_len = self.file.metadata()?.len();
-        let mut cursor = self.scan_start(committed_offset);
-        while let Some(parsed) = read_record(&mut self.file, cursor, file_len, self.durable_format)?
-        {
-            cursor = parsed.next_cursor;
-            if parsed.index.offset < committed_offset {
-                continue;
-            }
-            if record_is_candidate(&parsed.index, acknowledged_offsets, in_flight) {
-                return Ok(Some(parsed.index));
-            }
-        }
-        Ok(None)
-    }
-
-    fn find_record(&mut self, offset: Offset) -> Result<RecordIndex, BrokerError> {
-        if let Some(record) = self.records.iter().find(|record| record.offset == offset) {
-            return Ok(record.clone());
-        }
-
-        let file_len = self.file.metadata()?.len();
-        let mut cursor = self.scan_start(offset);
-        while let Some(parsed) = read_record(&mut self.file, cursor, file_len, self.durable_format)?
-        {
-            cursor = parsed.next_cursor;
-            if parsed.index.offset == offset {
-                return Ok(parsed.index);
-            }
-        }
-        Err(BrokerError::CorruptRecord(offset))
-    }
-
-    fn scan_start(&self, offset: Offset) -> u64 {
-        self.sparse_index
-            .iter()
-            .rev()
-            .find(|checkpoint| checkpoint.offset <= offset)
-            .map_or(0, |checkpoint| checkpoint.cursor)
-    }
-}
-
-struct ParsedRecord {
-    index: RecordIndex,
-    next_cursor: u64,
-}
-
-fn read_record(
-    file: &mut File,
-    cursor: u64,
-    file_len: u64,
-    durable_format: DurableFormat,
-) -> Result<Option<ParsedRecord>, BrokerError> {
-    if file_len.saturating_sub(cursor) < 4 {
-        return Ok(None);
-    }
-
-    file.seek(SeekFrom::Start(cursor))?;
-    let mut magic = [0; 4];
-    file.read_exact(&mut magic)?;
-    if &magic == VERSIONED_MAGIC {
-        return read_versioned_record(file, cursor, file_len);
-    }
-    if &magic == REQUEST_ID_MAGIC {
-        return read_request_id_record(file, cursor, file_len, durable_format);
-    }
-    if &magic != LEGACY_MAGIC {
-        return Err(invalid_record_data("unsupported record magic"));
-    }
-    read_legacy_record(file, cursor, file_len, magic)
-}
-
-fn read_legacy_record(
-    file: &mut File,
-    cursor: u64,
-    file_len: u64,
-    magic: [u8; 4],
-) -> Result<Option<ParsedRecord>, BrokerError> {
-    if file_len.saturating_sub(cursor) < LEGACY_HEADER_LEN as u64 {
-        return Ok(None);
-    }
-
-    let mut header = [0; LEGACY_HEADER_LEN];
-    header[..4].copy_from_slice(&magic);
-    file.read_exact(&mut header[4..])?;
-
-    let offset = u64::from_le_bytes(header[4..12].try_into().unwrap());
-    let published_at_ms = u64::from_le_bytes(header[12..20].try_into().unwrap());
-    let key_len = u32::from_le_bytes(header[20..24].try_into().unwrap());
-    let payload_len = u32::from_le_bytes(header[24..28].try_into().unwrap());
-    let record_len = (LEGACY_HEADER_LEN as u64)
-        .checked_add(u64::from(key_len))
-        .and_then(|length| length.checked_add(u64::from(payload_len)))
-        .ok_or_else(|| {
-            BrokerError::Io(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "record length overflows u64",
-            ))
-        })?;
-    if file_len.saturating_sub(cursor) < record_len {
-        return Ok(None);
-    }
-
-    let mut key_bytes = vec![0; key_len as usize];
-    file.read_exact(&mut key_bytes)?;
-    let key = if key_bytes.is_empty() {
-        None
-    } else {
-        let Ok(key) = std::str::from_utf8(&key_bytes) else {
-            return Err(invalid_record_data("legacy record key is not UTF-8"));
-        };
-        Some(key.to_owned())
-    };
-    let payload_offset = cursor + LEGACY_HEADER_LEN as u64 + u64::from(key_len);
-    file.seek(SeekFrom::Start(payload_offset + u64::from(payload_len)))?;
-    Ok(Some(ParsedRecord {
-        index: RecordIndex {
-            offset,
-            payload_offset,
-            payload_len,
-            key,
-            request_id: None,
-            published_at_ms,
-        },
-        next_cursor: cursor + record_len,
-    }))
-}
-
-fn read_versioned_record(
-    file: &mut File,
-    cursor: u64,
-    file_len: u64,
-) -> Result<Option<ParsedRecord>, BrokerError> {
-    if file_len.saturating_sub(cursor) < VERSIONED_HEADER_LEN as u64 {
-        return Ok(None);
-    }
-
-    file.seek(SeekFrom::Start(cursor))?;
-    let mut header = [0; VERSIONED_HEADER_LEN];
-    file.read_exact(&mut header)?;
-    if header[4] != VERSIONED_FORMAT_VERSION {
-        return Err(invalid_record_data("unsupported versioned record version"));
-    }
-    if header[5] != 0 {
-        return Err(invalid_record_data("unsupported versioned record flags"));
-    }
-    let header_len = u16::from_le_bytes(header[6..8].try_into().unwrap()) as usize;
-    if header_len != VERSIONED_HEADER_LEN {
-        return Err(invalid_record_data(
-            "invalid versioned record header length",
-        ));
-    }
-    let stored_len = u32::from_le_bytes(header[8..12].try_into().unwrap());
-    let logical_len = u32::from_le_bytes(header[12..16].try_into().unwrap());
-    let key_len = u32::from_le_bytes(header[32..36].try_into().unwrap());
-    if stored_len > VERSIONED_MAX_BODY_LEN || logical_len > VERSIONED_MAX_BODY_LEN {
-        return Err(invalid_record_data(
-            "versioned record exceeds storage limit",
-        ));
-    }
-    if logical_len != stored_len {
-        return Err(invalid_record_data(
-            "compressed versioned records are not supported",
-        ));
-    }
-    if key_len > VERSIONED_MAX_KEY_LEN {
-        return Err(invalid_record_data(
-            "versioned record key exceeds storage limit",
-        ));
-    }
-    if header[36] != VERSIONED_ENCODING_BYTES {
-        return Err(invalid_record_data("unsupported versioned record encoding"));
-    }
-    if header[37] != VERSIONED_COMPRESSION_NONE {
-        return Err(invalid_record_data(
-            "unsupported versioned record compression",
-        ));
-    }
-    if u16::from_le_bytes(header[38..40].try_into().unwrap()) != 0 {
-        return Err(invalid_record_data(
-            "unsupported versioned record header fields",
-        ));
-    }
-
-    let record_len = (VERSIONED_HEADER_LEN as u64)
-        .checked_add(u64::from(key_len))
-        .and_then(|length| length.checked_add(u64::from(stored_len)))
-        .ok_or_else(|| invalid_record_data("versioned record length overflows u64"))?;
-    if file_len.saturating_sub(cursor) < record_len {
-        return Ok(None);
-    }
-
-    let mut key_bytes = vec![0; key_len as usize];
-    file.read_exact(&mut key_bytes)?;
-    let key = if key_bytes.is_empty() {
-        None
-    } else {
-        let key = std::str::from_utf8(&key_bytes)
-            .map_err(|_| invalid_record_data("versioned record key is not UTF-8"))?;
-        Some(key.to_owned())
-    };
-
-    let mut checksum_header = header;
-    let expected_checksum = u32::from_le_bytes(header[40..44].try_into().unwrap());
-    checksum_header[40..44].fill(0);
-    let mut checksum = crc32c_update(!0, &checksum_header);
-    checksum = crc32c_update(checksum, &key_bytes);
-    let mut remaining = u64::from(stored_len);
-    let mut buffer = [0; 8192];
-    while remaining > 0 {
-        let read_len = remaining.min(buffer.len() as u64) as usize;
-        file.read_exact(&mut buffer[..read_len])?;
-        checksum = crc32c_update(checksum, &buffer[..read_len]);
-        remaining -= read_len as u64;
-    }
-    if !crc32c_finalize(checksum).eq(&expected_checksum) {
-        return Err(invalid_record_data("versioned record checksum mismatch"));
-    }
-
-    let payload_offset = cursor + VERSIONED_HEADER_LEN as u64 + u64::from(key_len);
-    Ok(Some(ParsedRecord {
-        index: RecordIndex {
-            offset: u64::from_le_bytes(header[16..24].try_into().unwrap()),
-            payload_offset,
-            payload_len: stored_len,
-            key,
-            request_id: None,
-            published_at_ms: u64::from_le_bytes(header[24..32].try_into().unwrap()),
-        },
-        next_cursor: cursor + record_len,
-    }))
-}
-
-fn read_request_id_record(
-    file: &mut File,
-    cursor: u64,
-    file_len: u64,
-    durable_format: DurableFormat,
-) -> Result<Option<ParsedRecord>, BrokerError> {
-    if file_len.saturating_sub(cursor) < REQUEST_ID_HEADER_LEN as u64 {
-        return Ok(None);
-    }
-
-    file.seek(SeekFrom::Start(cursor))?;
-    let mut header = [0; REQUEST_ID_HEADER_LEN];
-    file.read_exact(&mut header)?;
-    if header[4] != REQUEST_ID_FORMAT_VERSION {
-        return Err(invalid_record_data(
-            "unsupported request-aware record version",
-        ));
-    }
-    if header[5] != 0 {
-        return Err(invalid_record_data(
-            "unsupported request-aware record flags",
-        ));
-    }
-    let header_len = u16::from_le_bytes(header[6..8].try_into().unwrap()) as usize;
-    if header_len != REQUEST_ID_HEADER_LEN {
-        return Err(invalid_record_data(
-            "invalid request-aware record header length",
-        ));
-    }
-    let stored_len = u32::from_le_bytes(header[8..12].try_into().unwrap());
-    let logical_len = u32::from_le_bytes(header[12..16].try_into().unwrap());
-    let key_len = u32::from_le_bytes(header[32..36].try_into().unwrap());
-    let request_id_len = u32::from_le_bytes(header[36..40].try_into().unwrap());
-    let limits = request_aware_limits(durable_format);
-    if key_len > limits.max_key_len {
-        return Err(invalid_record_data(
-            "request-aware record key exceeds storage limit",
-        ));
-    }
-    if request_id_len > REQUEST_ID_MAX_LEN {
-        return Err(invalid_record_data(
-            "request-aware record ID exceeds storage limit",
-        ));
-    }
-    if stored_len > limits.max_body_len || logical_len > limits.max_body_len {
-        return Err(invalid_record_data(
-            "request-aware record exceeds storage limit",
-        ));
-    }
-    if logical_len != stored_len {
-        return Err(invalid_record_data(
-            "compressed request-aware records are not supported",
-        ));
-    }
-    if header[40..44] != [0; 4] {
-        return Err(invalid_record_data(
-            "unsupported request-aware record header fields",
-        ));
-    }
-
-    let record_len = (REQUEST_ID_HEADER_LEN as u64)
-        .checked_add(u64::from(key_len))
-        .and_then(|length| length.checked_add(u64::from(request_id_len)))
-        .and_then(|length| length.checked_add(u64::from(stored_len)))
-        .ok_or_else(|| invalid_record_data("request-aware record length overflows u64"))?;
-    if file_len.saturating_sub(cursor) < record_len {
-        return Ok(None);
-    }
-
-    let mut key_bytes = vec![0; key_len as usize];
-    file.read_exact(&mut key_bytes)?;
-    let key = if key_bytes.is_empty() {
-        None
-    } else {
-        let key = std::str::from_utf8(&key_bytes)
-            .map_err(|_| invalid_record_data("request-aware record key is not UTF-8"))?;
-        Some(key.to_owned())
-    };
-
-    let mut request_id_bytes = vec![0; request_id_len as usize];
-    file.read_exact(&mut request_id_bytes)?;
-    let request_id = std::str::from_utf8(&request_id_bytes)
-        .map_err(|_| invalid_record_data("request-aware record ID is not UTF-8"))?
-        .to_owned();
-
-    let expected_checksum = u32::from_le_bytes(header[44..48].try_into().unwrap());
-    let mut checksum_header = header;
-    checksum_header[44..48].fill(0);
-    let mut checksum = crc32c_update(!0, &checksum_header);
-    checksum = crc32c_update(checksum, &key_bytes);
-    checksum = crc32c_update(checksum, &request_id_bytes);
-    let mut remaining = u64::from(stored_len);
-    let mut buffer = [0; 8192];
-    while remaining > 0 {
-        let read_len = remaining.min(buffer.len() as u64) as usize;
-        file.read_exact(&mut buffer[..read_len])?;
-        checksum = crc32c_update(checksum, &buffer[..read_len]);
-        remaining -= read_len as u64;
-    }
-    if crc32c_finalize(checksum) != expected_checksum {
-        return Err(invalid_record_data(
-            "request-aware record checksum mismatch",
-        ));
-    }
-
-    let payload_offset =
-        cursor + REQUEST_ID_HEADER_LEN as u64 + u64::from(key_len) + u64::from(request_id_len);
-    Ok(Some(ParsedRecord {
-        index: RecordIndex {
-            offset: u64::from_le_bytes(header[16..24].try_into().unwrap()),
-            payload_offset,
-            payload_len: stored_len,
-            key,
-            request_id: Some(request_id),
-            published_at_ms: u64::from_le_bytes(header[24..32].try_into().unwrap()),
-        },
-        next_cursor: cursor + record_len,
-    }))
-}
-
-fn invalid_record_data(message: &'static str) -> BrokerError {
-    BrokerError::Io(io::Error::new(io::ErrorKind::InvalidData, message))
-}
-
-const CRC32C_TABLE: [u32; 256] = crc32c_table();
-
-const fn crc32c_table() -> [u32; 256] {
-    let mut table = [0; 256];
-    let mut index = 0;
-    while index < table.len() {
-        let mut value = index as u32;
-        let mut bit = 0;
-        while bit < 8 {
-            value = if value & 1 == 1 {
-                (value >> 1) ^ 0x82f6_3b78
-            } else {
-                value >> 1
-            };
-            bit += 1;
-        }
-        table[index] = value;
-        index += 1;
-    }
-    table
-}
-
-fn crc32c_update(mut checksum: u32, bytes: &[u8]) -> u32 {
-    for &byte in bytes {
-        let table_index = ((checksum ^ u32::from(byte)) & 0xff) as usize;
-        checksum = (checksum >> 8) ^ CRC32C_TABLE[table_index];
-    }
-    checksum
-}
-
-fn crc32c_finalize(checksum: u32) -> u32 {
-    !checksum
-}
-
-fn versioned_checksum(header: &[u8; VERSIONED_HEADER_LEN], key: &[u8], body: &[u8]) -> u32 {
-    let mut checksum_header = *header;
-    checksum_header[40..44].fill(0);
-    let checksum = crc32c_update(!0, &checksum_header);
-    let checksum = crc32c_update(checksum, key);
-    crc32c_finalize(crc32c_update(checksum, body))
-}
-
-fn request_id_checksum(
-    header: &[u8; REQUEST_ID_HEADER_LEN],
-    key: &[u8],
-    request_id: &[u8],
-    body: &[u8],
-) -> u32 {
-    let mut checksum_header = *header;
-    checksum_header[44..48].fill(0);
-    let mut checksum = crc32c_update(!0, &checksum_header);
-    checksum = crc32c_update(checksum, key);
-    checksum = crc32c_update(checksum, request_id);
-    crc32c_finalize(crc32c_update(checksum, body))
-}
-
-fn remember_record(records: &mut VecDeque<RecordIndex>, record: RecordIndex) {
-    if records.len() == MAX_IN_MEMORY_RECORDS {
-        records.pop_front();
-    }
-    records.push_back(record);
-}
-
-fn remember_checkpoint(checkpoints: &mut VecDeque<LogCheckpoint>, offset: Offset, cursor: u64) {
-    if !offset.is_multiple_of(SPARSE_INDEX_STRIDE) {
-        return;
-    }
-    if checkpoints.len() == MAX_SPARSE_INDEX_ENTRIES {
-        checkpoints.pop_front();
-    }
-    checkpoints.push_back(LogCheckpoint { offset, cursor });
-}
-
-fn record_is_candidate(
-    record: &RecordIndex,
-    acknowledged_offsets: &BTreeSet<Offset>,
-    in_flight: Option<&ConsumerInFlightIndex>,
-) -> bool {
-    if acknowledged_offsets.contains(&record.offset)
-        || in_flight.is_some_and(|index| index.offsets.contains(&record.offset))
-    {
-        return false;
-    }
-    record
-        .key
-        .as_ref()
-        .is_none_or(|key| in_flight.is_none_or(|index| !index.keys.contains(key)))
-}
-
 fn stream_path(root: &Path, stream: &str) -> PathBuf {
     root.join("streams").join(format!("{stream}.log"))
 }
@@ -1778,10 +861,6 @@ fn dead_letter_move_id(
         io::ErrorKind::InvalidInput,
         "dead-letter move identity exceeds storage limit",
     )))
-}
-
-fn dead_letter_move_content_mismatch() -> BrokerError {
-    invalid_record_data("dead-letter move identity has different key or payload")
 }
 
 fn load_consumer_state_for_request(
@@ -1832,20 +911,6 @@ fn validate_name(kind: &'static str, name: &str) -> Result<(), BrokerError> {
         kind,
         name: name.to_owned(),
     })
-}
-
-fn is_invalid_input(error: &BrokerError) -> bool {
-    matches!(
-        error,
-        BrokerError::Io(io_error) if io_error.kind() == io::ErrorKind::InvalidInput
-    )
-}
-
-fn now_ms() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis() as u64
 }
 
 fn delivery_epoch() -> u128 {
@@ -2619,8 +1684,8 @@ mod tests {
 
         let target = broker.get_stream("events.dead-letter").unwrap();
         let target = broker.lock_stream(&target).unwrap();
-        assert_eq!(target.log.next_offset, 1);
-        assert_eq!(target.log.request_ids.len(), 1);
+        assert_eq!(target.log.next_offset(), 1);
+        assert_eq!(target.log.request_id_count(), 1);
     }
 
     #[test]
@@ -2705,8 +1770,8 @@ mod tests {
 
             let target = broker.get_stream("events.dead-letter").unwrap();
             let target = broker.lock_stream(&target).unwrap();
-            assert_eq!(target.log.next_offset, 1);
-            assert_eq!(target.log.request_ids.get(&move_id), Some(&0));
+            assert_eq!(target.log.next_offset(), 1);
+            assert_eq!(target.log.request_offset(&move_id), Some(0));
         }
 
         {
@@ -2719,16 +1784,16 @@ mod tests {
 
             let target = broker.get_stream("events.dead-letter").unwrap();
             let target = broker.lock_stream(&target).unwrap();
-            assert_eq!(target.log.next_offset, 1);
-            assert_eq!(target.log.request_ids.get(&move_id), Some(&0));
+            assert_eq!(target.log.next_offset(), 1);
+            assert_eq!(target.log.request_offset(&move_id), Some(0));
         }
 
         let broker = Broker::open(directory.path(), config).unwrap();
         assert_eq!(broker.poll("events", "worker").unwrap(), PollResult::Empty);
         let target = broker.get_stream("events.dead-letter").unwrap();
         let target = broker.lock_stream(&target).unwrap();
-        assert_eq!(target.log.next_offset, 1);
-        assert_eq!(target.log.request_ids.get(&move_id), Some(&0));
+        assert_eq!(target.log.next_offset(), 1);
+        assert_eq!(target.log.request_offset(&move_id), Some(0));
     }
 
     #[test]
@@ -2936,9 +2001,9 @@ mod tests {
             drop(streams);
             let stream = stream.lock().unwrap();
             let log = &stream.log;
-            assert_eq!(log.records.len(), MAX_IN_MEMORY_RECORDS);
-            assert_eq!(log.records.front().unwrap().offset, 8);
-            assert_eq!(log.next_offset, retained_message_count);
+            assert_eq!(log.in_memory_record_count(), MAX_IN_MEMORY_RECORDS);
+            assert_eq!(log.first_in_memory_offset(), Some(8));
+            assert_eq!(log.next_offset(), retained_message_count);
         }
 
         let path = directory.path().join("streams/events.log");
@@ -2953,9 +2018,9 @@ mod tests {
         let stream = streams.get("events").unwrap().clone();
         drop(streams);
         let stream = stream.lock().unwrap();
-        assert_eq!(stream.log.sparse_index.len(), 17);
-        assert_eq!(stream.log.sparse_index.front().unwrap().offset, 0);
-        assert_eq!(stream.log.sparse_index.back().unwrap().offset, 1024);
+        assert_eq!(stream.log.sparse_index_len(), 17);
+        assert_eq!(stream.log.first_sparse_offset(), Some(0));
+        assert_eq!(stream.log.last_sparse_offset(), Some(1024));
         assert!(stream.log.scan_start(512) > 0);
         drop(stream);
 
@@ -2974,26 +2039,6 @@ mod tests {
         assert_eq!(
             broker.poll("events", "replayer").unwrap(),
             PollResult::Empty
-        );
-    }
-
-    #[test]
-    fn sparse_lookup_index_keeps_only_a_bounded_recent_window() {
-        let mut checkpoints = VecDeque::new();
-        for index in 0..=MAX_SPARSE_INDEX_ENTRIES {
-            let offset = index as Offset * SPARSE_INDEX_STRIDE;
-            remember_checkpoint(&mut checkpoints, offset, offset * 10);
-        }
-
-        assert_eq!(checkpoints.len(), MAX_SPARSE_INDEX_ENTRIES);
-        assert_eq!(checkpoints.front().unwrap().offset, SPARSE_INDEX_STRIDE);
-        assert_eq!(
-            checkpoints.back().unwrap().offset,
-            MAX_SPARSE_INDEX_ENTRIES as Offset * SPARSE_INDEX_STRIDE
-        );
-        assert_eq!(
-            checkpoints.back().unwrap().cursor,
-            MAX_SPARSE_INDEX_ENTRIES as Offset * SPARSE_INDEX_STRIDE * 10
         );
     }
 
