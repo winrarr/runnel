@@ -5,9 +5,16 @@ use runnel_protocol::{
     BinaryPayload, MAX_PUBLISH_BATCH_BYTES, MAX_PUBLISH_BATCH_RECORDS,
     PublishBatchRecord as WirePublishBatchRecord, PublishBatchRecordResponse, Request, Response,
 };
+pub use runnel_protocol::{PayloadEncoding, ProtocolSupport, ProtocolVersionRange};
 use thiserror::Error;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, ReadHalf, WriteHalf};
 use tokio::net::{TcpStream, ToSocketAddrs};
+
+/// Protocol compatibility declared by this client and its broker-facing types.
+///
+/// The current JSON-lines listener has no runtime handshake, so this is a
+/// source-level declaration rather than a negotiated connection property.
+pub const PROTOCOL_SUPPORT: ProtocolSupport = runnel_protocol::PROTOCOL_SUPPORT;
 
 /// Timeouts applied to each stage of a client connection and request.
 #[derive(Debug, Clone, Copy)]
@@ -2487,5 +2494,13 @@ mod tests {
             outcome,
             AttemptOutcome::Retryable(AttemptFailure::Client(ClientError::ConnectionUnavailable))
         ));
+    }
+
+    #[test]
+    fn client_uses_shared_protocol_support() {
+        assert_eq!(PROTOCOL_SUPPORT, runnel_protocol::PROTOCOL_SUPPORT);
+        assert!(PROTOCOL_SUPPORT.supports_version(runnel_protocol::PROTOCOL_VERSION));
+        assert!(PROTOCOL_SUPPORT.supports_payload_encoding(PayloadEncoding::Utf8Text));
+        assert!(PROTOCOL_SUPPORT.supports_payload_encoding(PayloadEncoding::Base64));
     }
 }

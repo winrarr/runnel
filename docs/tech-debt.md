@@ -12,8 +12,8 @@ This register records known implementation shortcuts in the current vertical sli
 ## TD-003: Provisional JSON-lines protocol and limited payload compatibility
 
 - Status: open
-- Impact: the current wire format is not a compatibility contract, the development CLI still opens one connection per invocation, and the legacy text path still maps payloads through UTF-8 strings at the server boundary. Binary-safe client and server methods now carry opaque payloads as padded base64 inside JSON, preserving bytes at the cost of representation overhead.
-- Context: JSON makes the first vertical slice inspectable and easy to exercise from shell tools. The reusable client now supports persistent sequential connections, bounded timeouts, and binary payload methods, but protocol versioning, negotiation, and compatibility policy remain undefined.
+- Impact: the current wire format is still not a negotiated compatibility contract, the development CLI still opens one connection per invocation, and the legacy text path still maps payloads through UTF-8 strings at the server boundary. Binary-safe client and server methods now carry opaque payloads as padded base64 inside JSON, preserving bytes at the cost of representation overhead.
+- Context: JSON makes the first vertical slice inspectable and easy to exercise from shell tools. The reusable client now supports persistent sequential connections, bounded timeouts, binary payload methods, and the same explicit provisional `runnel-json-lines` v1 support declaration as the protocol crate. That declaration covers the exact supported version range and UTF-8 text/base64 payload representations, with exhaustive wire fixtures checking each payload-bearing request and response shape. It is source-level metadata only: the current server does not advertise or negotiate it, and cross-version interoperability and upgrade/recovery behavior remain untested.
 - Retirement condition: a versioned protocol preserves binary payloads, explicit outcome classes, compatibility policy, and interoperability tests.
 
 ## TD-004: Local and clustered durable state have no supported migration path

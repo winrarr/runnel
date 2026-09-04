@@ -2,6 +2,73 @@ use base64::{Engine as _, engine::general_purpose::STANDARD};
 use serde::de::Error as _;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
+/// Name of the current provisional application protocol.
+pub const PROTOCOL_NAME: &str = "runnel-json-lines";
+/// Version of the current provisional JSON-lines protocol.
+pub const PROTOCOL_VERSION: u16 = 1;
+/// Lowest protocol version supported by this crate.
+pub const MIN_SUPPORTED_PROTOCOL_VERSION: u16 = PROTOCOL_VERSION;
+/// Highest protocol version supported by this crate.
+pub const MAX_SUPPORTED_PROTOCOL_VERSION: u16 = PROTOCOL_VERSION;
+
+/// A closed version range supported by one protocol implementation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ProtocolVersionRange {
+    /// Lowest supported version, inclusive.
+    pub min: u16,
+    /// Highest supported version, inclusive.
+    pub max: u16,
+}
+
+impl ProtocolVersionRange {
+    /// Return whether a version is in this range.
+    pub const fn contains(self, version: u16) -> bool {
+        version >= self.min && version <= self.max
+    }
+}
+
+/// Payload representation supported by the provisional wire protocol.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PayloadEncoding {
+    /// UTF-8 text in the legacy `payload` field.
+    Utf8Text,
+    /// Exact application bytes in the padded `payload_base64` field.
+    Base64,
+}
+
+/// Version and payload compatibility declared by this protocol implementation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ProtocolSupport {
+    /// Stable name for the protocol family.
+    pub name: &'static str,
+    /// Supported protocol versions, inclusive.
+    pub versions: ProtocolVersionRange,
+    /// Payload representations accepted and emitted by this protocol.
+    pub payload_encodings: &'static [PayloadEncoding],
+}
+
+impl ProtocolSupport {
+    /// Return whether a protocol version is supported.
+    pub const fn supports_version(self, version: u16) -> bool {
+        self.versions.contains(version)
+    }
+
+    /// Return whether a payload representation is supported.
+    pub fn supports_payload_encoding(self, encoding: PayloadEncoding) -> bool {
+        self.payload_encodings.contains(&encoding)
+    }
+}
+
+/// The compatibility declaration shared by the broker and reusable client.
+pub const PROTOCOL_SUPPORT: ProtocolSupport = ProtocolSupport {
+    name: PROTOCOL_NAME,
+    versions: ProtocolVersionRange {
+        min: MIN_SUPPORTED_PROTOCOL_VERSION,
+        max: MAX_SUPPORTED_PROTOCOL_VERSION,
+    },
+    payload_encodings: &[PayloadEncoding::Utf8Text, PayloadEncoding::Base64],
+};
+
 /// Maximum number of records accepted in one publish-batch request.
 pub const MAX_PUBLISH_BATCH_RECORDS: usize = 1024;
 /// Maximum encoded request size supported by the protocol's publish-batch path.
@@ -30,6 +97,11 @@ impl BinaryPayload {
     /// Consume the payload and return its application bytes.
     pub fn into_bytes(self) -> Vec<u8> {
         self.0
+    }
+
+    /// Return the wire representation used by this payload.
+    pub const fn encoding(&self) -> PayloadEncoding {
+        PayloadEncoding::Base64
     }
 }
 
@@ -60,6 +132,13 @@ pub struct PublishBatchRecord {
     pub payload_base64: BinaryPayload,
     #[serde(default)]
     pub request_id: Option<String>,
+}
+
+impl PublishBatchRecord {
+    /// Return the wire representation used by this record's payload.
+    pub const fn payload_encoding(&self) -> PayloadEncoding {
+        PayloadEncoding::Base64
+    }
 }
 
 /// The broker's result for one publish-batch record.
@@ -125,6 +204,23 @@ pub enum Request {
         delivery_token: String,
     },
     Health,
+}
+
+impl Request {
+    /// Return the payload representation used by this request, if it carries a payload.
+    pub const fn payload_encoding(&self) -> Option<PayloadEncoding> {
+        match self {
+            Self::Publish { .. } => Some(PayloadEncoding::Utf8Text),
+            Self::PublishBytes { .. } | Self::PublishBatch { .. } => Some(PayloadEncoding::Base64),
+            Self::CreateStream { .. }
+            | Self::Poll { .. }
+            | Self::Replay { .. }
+            | Self::PollGroup { .. }
+            | Self::Ack { .. }
+            | Self::AckGroup { .. }
+            | Self::Health => None,
+        }
+    }
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -207,4 +303,23 @@ pub enum Response {
         code: String,
         message: String,
     },
+}
+
+impl Response {
+    /// Return the payload representation used by this response, if it carries a payload.
+    pub const fn payload_encoding(&self) -> Option<PayloadEncoding> {
+        match self {
+            Self::Message { .. } | Self::ReplayMessage { .. } => Some(PayloadEncoding::Utf8Text),
+            Self::MessageBytes { .. } | Self::ReplayMessageBytes { .. } => {
+                Some(PayloadEncoding::Base64)
+            }
+            Self::StreamCreated { .. }
+            | Self::Published { .. }
+            | Self::PublishBatch { .. }
+            | Self::Empty { .. }
+            | Self::Acknowledged { .. }
+            | Self::Health { .. }
+            | Self::Error { .. } => None,
+        }
+    }
 }
