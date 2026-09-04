@@ -160,15 +160,6 @@ This register records known implementation shortcuts in the current vertical sli
 - Progress: state-machine journal framing, persistence, validation, partial-tail recovery, and replay ordering now have private ownership in `crates/runnel-raft/src/state_machine_journal.rs` with focused unit coverage. Materialized state, delivery transitions, snapshots, group management, forwarding, and engine adaptation remain in `lib.rs`, so this debt stays open.
 - Retirement condition: state-machine persistence, delivery transitions, group management, forwarding, and engine adaptation have explicit private module ownership; focused unit and cluster recovery tests cover the boundaries; `just verify` and `just cluster-test` pass with unchanged public behavior and storage compatibility.
 
-## TD-026: Peer transport mixes outbound networking and inbound peer serving
-
-- Status: open
-- Goal: separate the OpenRaft outbound network implementation and connection pools from the inbound framed peer RPC server and forwarded-operation handling.
-- Rationale: `crates/runnel-raft/src/network.rs` is a 1,750-line module containing Raft client connections, pooled transport admission, peer request/response framing, inbound connection handling, forwarding, and error conversion. Pooling or protocol changes therefore share implementation seams with server-side request handling, which increases the risk and cost of transport evolution. This is a code-organization debt distinct from TD-012's incomplete connection strategy.
-- Constraints: preserve bounded control/data capacity, timeouts, cleanup, framed request boundaries, forwarding outcomes, and stale-delivery or leader errors; keep peer transport private to the clustered adapter; retain real-process and transport-lifecycle coverage.
-- Context: the inbound listener, framed connection dispatch, forwarded-operation execution, and forwarding error mapping now live in the private `crates/runnel-raft/src/network/inbound.rs` module, while outbound Raft networking, connection-pool ownership, and forwarding requests live in `crates/runnel-raft/src/network/outbound.rs`. Focused transport tests and the real-process cluster smoke pass; shared peer wire/framing ownership remains in `network.rs` for a later slice.
-- Retirement condition: outbound Raft transport, connection-pool policy, inbound peer serving, and forwarding/error mapping have separate private modules with focused tests; cluster smoke and transport tests pass without changing wire semantics or resource bounds.
-
 ## TD-027: Server entrypoint combines lifecycle, protocol, admission, and observability
 
 - Status: open
