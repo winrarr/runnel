@@ -470,6 +470,20 @@ fn current_request_fixtures_pin_v1_tags_and_fields() {
             }),
         ),
         (
+            "replay",
+            Request::Replay {
+                stream: "events".to_owned(),
+                consumer: "worker".to_owned(),
+                offset: 7,
+            },
+            serde_json::json!({
+                "op": "replay",
+                "stream": "events",
+                "consumer": "worker",
+                "offset": 7
+            }),
+        ),
+        (
             "poll",
             Request::Poll {
                 stream: "events".to_owned(),
@@ -616,6 +630,46 @@ fn current_response_fixtures_pin_v1_tags_and_fields() {
                 "consumer": "worker",
                 "offset": 7,
                 "key": null,
+                "payload_base64": "AP8=",
+                "published_at_ms": 10
+            }),
+        ),
+        (
+            "replay_message",
+            Response::ReplayMessage {
+                stream: "events".to_owned(),
+                consumer: "worker".to_owned(),
+                offset: 7,
+                key: Some("order-1".to_owned()),
+                payload: "hello".to_owned(),
+                published_at_ms: 10,
+            },
+            serde_json::json!({
+                "type": "replay_message",
+                "stream": "events",
+                "consumer": "worker",
+                "offset": 7,
+                "key": "order-1",
+                "payload": "hello",
+                "published_at_ms": 10
+            }),
+        ),
+        (
+            "replay_message_bytes",
+            Response::ReplayMessageBytes {
+                stream: "events".to_owned(),
+                consumer: "worker".to_owned(),
+                offset: 7,
+                key: Some("order-1".to_owned()),
+                payload_base64: BinaryPayload::new([0, 255]),
+                published_at_ms: 10,
+            },
+            serde_json::json!({
+                "type": "replay_message_bytes",
+                "stream": "events",
+                "consumer": "worker",
+                "offset": 7,
+                "key": "order-1",
                 "payload_base64": "AP8=",
                 "published_at_ms": 10
             }),
