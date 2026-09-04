@@ -804,19 +804,24 @@ impl RaftStateMachine<TypeConfig> for Arc<StateMachineStore> {
                 })?;
             let snapshot_state = snapshot_state_from_persisted(persisted_snapshot);
             let mut state = self.state.write().await;
-            state.last_applied_log = meta.last_log_id;
-            state.last_membership = meta.last_membership.clone();
-            state.state = snapshot_state;
-            self.persist_checkpoint(&state)?;
-            let last_applied_log = state.last_applied_log;
-            drop(state);
-            self.compact_journal(last_applied_log)?;
+            let next_state = StateMachineData {
+                last_applied_log: meta.last_log_id,
+                last_membership: meta.last_membership.clone(),
+                state: snapshot_state,
+            };
             let stored_snapshot = StoredSnapshot {
                 meta: meta.clone(),
                 data,
             };
-            *self.current_snapshot.write().await = Some(stored_snapshot.clone());
+
+            // Keep the in-memory state and snapshot cache unchanged until all durable writes
+            // succeed. The owned snapshot can then move into the cache without cloning its data.
             self.persist_snapshot(&stored_snapshot).await?;
+            self.persist_checkpoint(&next_state)?;
+            self.compact_journal(next_state.last_applied_log)?;
+            *state = next_state;
+            drop(state);
+            *self.current_snapshot.write().await = Some(stored_snapshot);
             Ok(data_len)
         }
         .await;
@@ -896,4 +901,88 @@ pub(super) fn snapshot_state_from_persisted(persisted: PersistedSnapshotState) -
 
 fn legacy_format_version() -> u32 {
     1
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use openraft::storage::RaftStateMachine;
+
+    fn snapshot_meta(index: u64, snapshot_id: &str) -> SnapshotMeta<NodeId, BasicNode> {
+        SnapshotMeta {
+            last_log_id: Some(LogId {
+                leader_id: openraft::CommittedLeaderId::new(1, 1),
+                index,
+            }),
+            last_membership: StoredMembership::default(),
+            snapshot_id: snapshot_id.to_owned(),
+        }
+    }
+
+    fn snapshot_data(payload: &[u8]) -> Vec<u8> {
+        let mut state = SnapshotState::default();
+        state.streams.insert(
+            "events".to_owned(),
+            StreamState {
+                stream_id: "stream/events".to_owned(),
+                group_id: "group/events/data".to_owned(),
+                lifecycle: StreamLifecycle::Active,
+                messages: vec![StoredMessage {
+                    key: Some("key".to_owned()),
+                    payload: payload.to_vec(),
+                    published_at_ms: 1,
+                }],
+            },
+        );
+        serde_json::to_vec(&PersistedSnapshotStateRef::new(&state)).unwrap()
+    }
+
+    #[tokio::test]
+    async fn failed_snapshot_persistence_keeps_previous_state_and_recovers_checkpoint() {
+        let directory = tempfile::tempdir().unwrap();
+        let state_directory = directory.path().join("state-machine");
+        let store =
+            Arc::new(StateMachineStore::open(&state_directory, GroupKind::Combined).unwrap());
+
+        let first_meta = snapshot_meta(1, "first");
+        let first_data = snapshot_data(b"first");
+        let mut state_machine = store.clone();
+        state_machine
+            .install_snapshot(&first_meta, Box::new(Cursor::new(first_data.clone())))
+            .await
+            .unwrap();
+
+        let snapshot_path = state_directory.join("snapshot.json");
+        fs::remove_file(&snapshot_path).unwrap();
+        fs::create_dir(&snapshot_path).unwrap();
+
+        let second_meta = snapshot_meta(2, "second");
+        let second_data = snapshot_data(b"second");
+        let error = state_machine
+            .install_snapshot(&second_meta, Box::new(Cursor::new(second_data)))
+            .await;
+        assert!(error.is_err());
+
+        {
+            let state = store.state.read().await;
+            let message = &state.state.streams["events"].messages[0];
+            assert_eq!(message.payload, b"first");
+        }
+        let current = state_machine
+            .get_current_snapshot()
+            .await
+            .unwrap()
+            .expect("failed install must not publish a new current snapshot");
+        assert_eq!(current.meta, first_meta);
+        assert_eq!(current.snapshot.into_inner(), first_data);
+
+        drop(state_machine);
+        drop(store);
+        fs::remove_dir(&snapshot_path).unwrap();
+
+        let reopened = StateMachineStore::open(&state_directory, GroupKind::Combined).unwrap();
+        let state = reopened.state.read().await;
+        let message = &state.state.streams["events"].messages[0];
+        assert_eq!(message.payload, b"first");
+    }
 }
