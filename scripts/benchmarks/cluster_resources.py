@@ -22,6 +22,25 @@ class ResourceCluster(Protocol):
     nodes: list[Any]
 
 
+def resource_limits(*, runtime: str, cpus: str, memory: str) -> dict[str, str]:
+    """Describe the cgroup budget used by a clustered benchmark run."""
+    if runtime == "container":
+        return {
+            "processes": "Docker containers; benchmark client remains host-side",
+            "cpu_per_broker": cpus,
+            "memory_per_broker": memory,
+        }
+    native_cpu = os.environ.get("RUNNEL_BENCHMARK_CPU_LIMIT")
+    native_memory = os.environ.get("RUNNEL_BENCHMARK_MEMORY_LIMIT")
+    if native_cpu and native_memory:
+        return {
+            "processes": "systemd user scope; benchmark client and broker nodes",
+            "cpu": native_cpu,
+            "memory": native_memory,
+        }
+    return {"processes": "host-scheduled; no cgroup limit"}
+
+
 def process_stats(pid: int) -> tuple[float, int] | None:
     """Return process CPU seconds and resident bytes on Linux."""
     try:

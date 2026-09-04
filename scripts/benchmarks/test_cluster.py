@@ -5,6 +5,7 @@ import sys
 import tempfile
 import threading
 import unittest
+from datetime import UTC, datetime
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -13,8 +14,12 @@ from unittest.mock import patch
 SCRIPT_DIR = Path(__file__).resolve().parent
 sys.path.insert(0, str(SCRIPT_DIR))
 
+import cluster_cli  # noqa: E402
+import cluster_lifecycle  # noqa: E402
+import cluster_results  # noqa: E402
 from cluster import parse_args, parse_positive_float, resource_limits  # noqa: E402
 from cluster_faults import PeerResponseDelayProxy  # noqa: E402
+from cluster_lifecycle import Cluster  # noqa: E402
 from cluster_resources import ProcessStats, process_stats  # noqa: E402
 from cluster_scenarios import (  # noqa: E402
     DEFAULT_COLD_KEY_COUNT,
@@ -64,6 +69,127 @@ class _ClientsContext:
 
 
 class ClusterBenchmarkTests(unittest.TestCase):
+    def test_cli_dispatch_preserves_payload_and_recovery_order(self) -> None:
+        with patch.object(
+            sys,
+            "argv",
+            [
+                "cluster.py",
+                "--scenarios",
+                "durable_publish,consume_ack,restart_recovery",
+                "--payload-sizes",
+                "100,200",
+            ],
+        ):
+            args = parse_args()
+
+        calls: list[str] = []
+
+        def record(name: str):
+            def scenario(*_: object) -> dict[str, str]:
+                calls.append(name)
+                return {"operation": name}
+
+            return scenario
+
+        cluster = SimpleNamespace()
+        with (
+            patch.object(cluster_cli, "run_durable_publish", side_effect=record("publish")),
+            patch.object(cluster_cli, "run_consume_ack", side_effect=record("consume")),
+            patch.object(cluster_cli, "run_restart_recovery", side_effect=record("restart")),
+        ):
+            results = cluster_cli.run_scenarios(args, cluster, "run-id")
+
+        self.assertEqual(calls, ["publish", "consume", "restart", "publish", "consume"])
+        self.assertEqual([result["operation"] for result in results], calls)
+
+    def test_result_builder_keeps_schema_envelope_and_optional_workload_fields(self) -> None:
+        with patch.object(
+            sys,
+            "argv",
+            [
+                "cluster.py",
+                "--scenarios",
+                "retained_hot_path",
+                "--payload-sizes",
+                "100",
+                "--retained-messages",
+                "2048",
+                "--skip-recovery",
+            ],
+        ):
+            args = parse_args()
+        cluster = SimpleNamespace(
+            image_id="sha256:test",
+            startup_ns=2_000_000_000,
+            peer_proxy_summary=lambda: {"enabled": False, "response_delay_ms": 0},
+            stats=SimpleNamespace(summary=lambda: {"samples": 2}),
+        )
+        with (
+            patch.object(
+                cluster_results,
+                "result_metadata",
+                return_value={"schema_version": 2, "run_id": "run-id"},
+            ),
+            patch.object(
+                cluster_results,
+                "resource_limits",
+                return_value={"processes": "host-scheduled; no cgroup limit"},
+            ),
+        ):
+            result = cluster_results.build_result(
+                args,
+                run_id="run-id",
+                started_at=datetime(2026, 1, 1, tzinfo=UTC),
+                cluster=cluster,
+                scenarios=[{"operation": "cluster_retained_hot_path"}],
+            )
+
+        self.assertEqual(result["schema_version"], 2)
+        self.assertEqual(result["run_id"], "run-id")
+        self.assertEqual(result["workload"]["retained_hot_path_messages"], 2048)
+        self.assertNotIn("retained_recovery_messages", result["workload"])
+        self.assertEqual(result["backends"]["runnel-cluster"]["startup_seconds"], 2.0)
+        self.assertEqual(
+            result["backends"]["runnel-cluster"]["scenarios"],
+            [{"operation": "cluster_retained_hot_path"}],
+        )
+
+    def test_native_log_handle_closes_when_a_node_stops(self) -> None:
+        class FakeProcess:
+            pid = 123
+
+            def poll(self) -> int:
+                return 0
+
+            def wait(self, **_: object) -> int:
+                return 0
+
+        with tempfile.TemporaryDirectory() as directory:
+            cluster = Cluster(
+                Path("/tmp/runnel"),
+                node_count=3,
+                ack_timeout_ms=30_000,
+                log_dir=Path(directory),
+            )
+            try:
+                with patch.object(
+                    cluster_lifecycle.subprocess,
+                    "Popen",
+                    return_value=FakeProcess(),
+                ):
+                    cluster._start_node(0, bootstrap=True)
+                log_handle = cluster.nodes[0].log_handle
+                self.assertIsNotNone(log_handle)
+                self.assertFalse(log_handle.closed)
+
+                cluster.stop_node(0)
+
+                self.assertTrue(log_handle.closed)
+                self.assertIsNone(cluster.nodes[0].log_handle)
+            finally:
+                cluster.close()
+
     def test_default_scenarios_preserve_the_existing_entrypoint_workload(self) -> None:
         with patch.object(sys, "argv", ["cluster.py"]):
             args = parse_args()
