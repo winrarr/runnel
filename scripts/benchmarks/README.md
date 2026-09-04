@@ -192,6 +192,8 @@ The pinned images are Apache Kafka `4.3.1`, Redpanda `v26.2.1`, NATS Server `2.1
 
 This is intentionally a first baseline built around native benchmark clients. Runnel and JetStream report durable publish latency; Kafka and Redpanda use Kafka's native producer performance client, whose latency includes its configured client batching, and their native consumer performance client reports fetch throughput without application-level acknowledgement. The JSON records these boundaries and marks the output as non-equivalent. Do not present the single-node output as a final cross-product ranking until a common client workload and equivalent consumer acknowledgement path exist.
 
+The comparison entrypoint is kept stable at `compare.py`; its shared lifecycle and resource cleanup, semantic result policy, backend execution, and CLI/result-envelope responsibilities have focused private ownership in `compare_lifecycle.py`, `compare_results.py`, `compare_backends.py`, and `compare_cli.py`. This is a maintainability extraction only: it does not make the native workloads equivalent or change the comparison guardrails.
+
 The bounded three-node slice measures only replicated durable publish for the three external competitors:
 
 ```text
