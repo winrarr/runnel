@@ -77,6 +77,7 @@ Performance work should use representative end-to-end application workflows and 
 
 This thesis is specific enough to guide development, but it still needs validation. Before calling the initial product ready, the project should establish:
 
+- repository-level semantic evidence for the representative slices, recorded in the [initial product-fit validation](research/initial-product-fit-validation.md), while keeping that evidence separate from user adoption and operating-envelope claims;
 - two or three representative end-to-end reference workloads with explicit latency, throughput, memory, storage-growth, recovery, and operator-effort budgets;
 - onboarding and failure-recovery exercises with engineers from the intended audience;
 - clear tested limits for message size, connection count, in-flight work, retained history, consumer lag, and supported deployment scale;

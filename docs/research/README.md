@@ -31,6 +31,9 @@ accepts it and the relevant implementation and verification work is complete.
 
 ## Current research
 
+- [Initial product-fit validation](initial-product-fit-validation.md) records
+  the repository-backed workload checks, operating boundaries, budget
+  dispositions, and evidence gaps for the initial product thesis.
 - [Distributed architecture options](distributed-architecture-options.md)
   compares Multi-Raft, sequenced quorum/copysets, chain replication, and other
   multi-node approaches against Runnel's workload profiles.
