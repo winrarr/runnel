@@ -1,6 +1,6 @@
 ---
 name: parallel-worktrees
-description: Coordinate independent coding, coordinated refactors, and benchmark tasks in isolated Git worktrees with explicit responsibility and resource isolation. Use when parallel delegated work is authorized and tests or containers must not interfere.
+description: Coordinate authorized fixed or rolling pools of independent coding, refactor, and benchmark tasks in isolated Git worktrees with explicit responsibility and resource isolation.
 ---
 
 # Parallel worktrees
@@ -15,11 +15,10 @@ the rule to parallel work.
 
 - Identify the immediate local task and keep it on the critical path.
 - Split independent work by responsibility, file ownership, and an explicit domain boundary. The refactoring and backlog/tech-debt policy is defined once in the repository root `AGENTS.md`; workers and coordinators must follow that policy. For an explicitly coordinated architectural refactor, overlapping paths are allowed when they reflect the domain; name an integration owner, explain the overlap, and define how shared changes will be reconciled.
-- Establish a committed baseline revision. Do not assume that uncommitted edits in the main worktree are visible in another worktree; if they matter, create a clearly identified local baseline or provide an explicit patch.
-- Before spawning, fetch `origin/main`, record its revision, and inspect the latest `ci.yml` run for that SHA when GitHub access is available. Give every worker the baseline revision, its owned paths, its expected result, and the instruction not to revert unrelated work.
+- Establish a committed baseline before spawning. Fetch `origin/main`, record its revision, and inspect the latest `ci.yml` run for that SHA when GitHub access is available. If uncommitted edits matter, create a clearly identified local baseline or explicit patch.
+- Give every worker the baseline revision, owned paths, expected result, and instruction not to revert unrelated work.
 - Before spawning, give the user a short summary of each proposed worker's feature or outcome and primary evidence class, such as performance, correctness, reliability, or benchmark infrastructure. For performance-sensitive work, include a best-effort expectation of the likely direction and rough magnitude of change when possible, or explicitly say that no direct performance change is expected or that the magnitude is unclear. Label estimates as expectations rather than measured results; do not invent precision.
-- Tell every worker, including nested subagents, to read the repository root `AGENTS.md` before starting. Do not assume the delegated environment loads project instructions automatically.
-- Give workers the recorded starting baseline and its default-branch CI result; they do not need to repeat that check before handoff. A newer `main` commit requires an update when it is known to overlap the worker's paths or shared contracts, dependencies, generated output, or integration behavior; independent work may remain based on the original baseline when it is cleanly mergeable.
+- A newer `main` commit requires a worker update when it overlaps the worker's paths or shared contracts, dependencies, generated output, or integration behavior; independent work may remain on the recorded baseline when it is cleanly mergeable.
 - Treat implicit worktree allocation as a serialized critical section. Do not issue concurrent spawn or resume calls until each prior worker's worktree identity has been validated, unless all worktrees were explicitly provisioned beforehand.
 - After each worker is provisioned and before it edits, verify `git worktree list --porcelain` and record a task-to-path-to-branch mapping. The coordinator worktree must remain on the default branch; every worker path must be distinct, outside the repository root, on its assigned branch, and at the recorded baseline. If any check fails, interrupt the worker before editing, preserve any patch, and provision a replacement worktree; do not switch branches inside a shared or ambiguous worktree.
 
@@ -86,48 +85,63 @@ evidence.
 
 Tell each worker to:
 
-- stay inside its assigned worktree and write scope;
-- follow the single-source refactoring and planning-record policy in the repository root `AGENTS.md`, including its requirements for within-domain refactors, cross-boundary tech debt, and handoff reporting;
-- read the repository root `AGENTS.md` before editing and follow its change-run baseline and handoff requirements;
+- read the repository root `AGENTS.md` and this skill before editing; if spawning nested workers, pass the same requirement through; stay inside the assigned worktree and write scope; do not revert unrelated work;
+- follow the single-source refactoring and planning-record policy in `AGENTS.md`, including within-domain refactors, cross-boundary tech debt, and handoff reporting;
 - for non-trivial architectural changes, follow `AGENTS.md`'s requirement to compare relevant competitor or reference designs and primary research, and include the sources, differences, alternatives, hypotheses, and unresolved risks in the handoff;
 - classify the work by one primary evidence class and optional secondary tags, follow the applicable gate in [docs/testing.md](../../../docs/testing.md), and do not use a classification to waive global safety, baseline, CI, pull-request, or cleanup requirements;
 - use the repository's canonical `just` commands and existing benchmark harnesses;
 - apply the backlog and tech-debt update requirements in `AGENTS.md`, and include the resulting update or explicit no-update rationale in the handoff;
 - record the exact revision, workload, resource limits, isolation settings, and commands;
-- for performance-sensitive work, determine whether the standard benchmark meaningfully covers the PR, run the local benchmark sequentially with a fixed CPU/memory budget, and record the actual repetition count, stability thresholds, and stable status; if standard coverage is insufficient, run a focused targeted benchmark when it is relevant and feasible, or record why no such benchmark can be run; treat an inconclusive authoritative run as unfinished evidence;
+- for performance-sensitive work, follow the benchmark policy above, run the applicable benchmark before claiming an improvement, and report the exact workload, resources, repetitions, stability thresholds, and result; treat inconclusive evidence as unfinished;
 - distinguish a confirmed improvement from noise, a blocked run, and an inconclusive result;
-- report changed files, correctness and crash-recovery considerations, test results, and remaining risks. Follow [docs/testing.md](../../../docs/testing.md) for the class-specific merge gate and [docs/benchmarking.md](../../../docs/benchmarking.md) for expected effects, non-performance improvements, benchmark applicability, exact findings, repetition and stability results, directional medians, outlier diagnostics, and the evidence-based recommendation to merge, revise, rerun, or defer. Include blocked or inconclusive results rather than omitting them;
+- report changed files, expected effects and non-effects, correctness and crash-recovery considerations, evidence, coverage gaps, and an evidence-based recommendation to merge, revise, rerun, or defer. Include blocked or inconclusive results rather than omitting them;
 - report the recorded baseline revision and whether the branch was refreshed;
 - commit the result on its task branch when code is ready, or leave a clearly documented uncommitted patch when it is not.
 
 When coordinating delegated work, the orchestrator must collect each worker's
-expected effects, non-performance improvements, benchmark applicability and
-findings, and recommendation and include them in the final status, review, or
-pull-request handoff. A worker's missing, blocked, or inconclusive benchmark
-report remains an explicit unresolved result; it must not be silently collapsed
-into the orchestrator's own summary. Before accepting each worker's final
-handoff, verify that the refactor and backlog/tech-debt assessment required by
-`AGENTS.md` is present and that any relevant planning-file updates are
-included. Do not turn an omitted update into an untracked coordinator
-follow-up.
+expected effects and non-effects, evidence and coverage gaps, recommendation,
+baseline, and refactor/planning assessment. Preserve blocked or inconclusive
+results in the final status and do not turn an omitted planning update into an
+untracked coordinator follow-up.
 
-## Orchestrator lifecycle
+## Lifecycle and invocation modes
 
-After spawning workers, retain their identifiers and keep the coordination run
-active until every requested worker reaches a final status or is explicitly
-cancelled. Wait for workers with grouped, non-busy-polling waits. When a worker
-finishes, promptly provide a concise progress/output update containing its
-result, changed branch or pull request, tests, benchmark evidence and gaps,
-and recommendation; then continue monitoring the remaining workers. Do not
-silently end the coordination run while requested workers are still pending.
-If a worker is blocked or inconclusive, report that state explicitly and keep
-it in the final handoff.
+Interpret these concise requests as predefined coordination modes:
+
+- “run parallel-worktrees with N subagents”: start a fixed pool of exactly N
+  workers and do not start replacements.
+- “run parallel-worktrees with N subagents and rolling pool”: start up to N
+  workers and replace a worker only after its recommended PR actually merges.
+  Worker completion, PR creation, or green checks do not trigger replacement.
+
+For both modes, N is the requested initial and maximum worker count unless the
+user gives a different concurrency limit. Record the count, mode, baseline,
+task-to-worktree mapping, and stop condition. In rolling mode, a slot may remain
+unfilled while a recommended PR awaits checks or merge, or while work is deferred.
+
+After spawning, retain worker identifiers and keep the run active until every
+requested worker reaches a final status or is explicitly cancelled. Use grouped,
+non-busy-polling waits, check open PRs periodically, and report each completion
+with its branch or PR, result, evidence, gaps, and recommendation. Report blocked
+or inconclusive work explicitly.
+
+When a worker recommends merge, review its branch and merge only after required
+checks pass. In rolling mode, refresh the default-branch baseline and start one
+replacement from a newly validated worktree after the actual merge, unless the
+user has asked to stop. When a worker does not recommend merge, report the branch,
+evidence, gaps, and recommendation immediately; do not replace it automatically.
+
+A stop request prevents all replacements. Let already-started workers reach a
+final status when practical and process their recommendations. Auto-merge remains
+opt-in; if explicitly requested but unsupported by the repository, leave the PR
+open and report that limitation.
 
 ## Integration
 
 Review each branch independently before integration. Check the diff against the recorded baseline, rerun focused tests in a clean worktree, and run the repository verification path. Do not merge an optimization solely because a microbenchmark improved: preserve durability, ordering, timeout, ambiguous-outcome, bounded-resource, and recovery guarantees.
 
 Merge independently reviewable pull requests in parallel once their required pull-request checks pass. Coordinate or serialize changes that overlap in files, shared contracts, dependencies, generated output, or integration behavior; overlapping architectural refactors require integration review and must not be merged independently just because their pull requests are individually green. Never bypass required checks to compensate for a flaky test; diagnose whether the failure is in the implementation, test harness, environment, or resource isolation.
+
 - If delegation dirties the coordinator worktree or mixes task files, stop the affected workers before changing branches. Preserve the mixed state in a recoverable stash or explicit patch, restore the coordinator worktree to the default branch, and re-home only verified task files into dedicated worktrees. Never reset or discard the mixed state to repair allocation.
 
 ## Cleanup and handoff
