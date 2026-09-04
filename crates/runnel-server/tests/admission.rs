@@ -784,6 +784,105 @@ fn storage_stall_is_bounded_and_durable_traffic_continues() {
 
 #[cfg(unix)]
 #[test]
+fn timed_out_same_stream_waiter_does_not_poison_following_request() {
+    let directory = TempDir::new().unwrap();
+    let server = RunningServer::start(
+        directory.path(),
+        &[
+            "--request-timeout-ms",
+            "1500",
+            "--max-in-flight-requests",
+            "2",
+        ],
+    );
+
+    assert!(matches!(
+        request(
+            server.broker_addr,
+            Request::CreateStream {
+                stream: "stalled".to_owned(),
+            },
+        ),
+        Response::StreamCreated { .. }
+    ));
+    assert!(matches!(
+        request(
+            server.broker_addr,
+            Request::Publish {
+                stream: "stalled".to_owned(),
+                key: None,
+                payload: "survives-queued-timeout".to_owned(),
+                request_id: None,
+            },
+        ),
+        Response::Published { offset: 0, .. }
+    ));
+
+    let consumer_directory = directory.path().join("consumers/stalled");
+    fs::create_dir_all(&consumer_directory).unwrap();
+    let fifo = consumer_directory.join("blocked.json.tmp");
+    create_fifo(&fifo);
+
+    let stalled_address = server.broker_addr;
+    let stalled_request = std::thread::spawn(move || {
+        request(
+            stalled_address,
+            Request::Poll {
+                stream: "stalled".to_owned(),
+                consumer: "blocked".to_owned(),
+            },
+        )
+    });
+    wait_for_metric_at_least(server.http_addr, "runnel_active_requests", 1);
+
+    let started = Instant::now();
+    assert!(matches!(
+        request(
+            server.broker_addr,
+            Request::Poll {
+                stream: "stalled".to_owned(),
+                consumer: "queued".to_owned(),
+            },
+        ),
+        Response::Error { code, .. } if code == "request_timeout"
+    ));
+    assert!(
+        started.elapsed() < Duration::from_secs(2),
+        "a same-stream waiter must be canceled by the protocol request timeout"
+    );
+    assert!(matches!(
+        stalled_request.join().unwrap(),
+        Response::Error { code, .. } if code == "request_timeout"
+    ));
+
+    release_fifo_stall(&fifo);
+    fs::remove_file(&fifo).unwrap();
+
+    let started = Instant::now();
+    assert!(matches!(
+        request(
+            server.broker_addr,
+            Request::Poll {
+                stream: "stalled".to_owned(),
+                consumer: "queued".to_owned(),
+            },
+        ),
+        Response::Message { payload, .. } if payload == "survives-queued-timeout"
+    ));
+    assert!(
+        started.elapsed() < Duration::from_secs(2),
+        "a timed-out same-stream waiter must not block the next durable request"
+    );
+    assert!(matches!(
+        request(server.broker_addr, Request::Health),
+        Response::Health { streams: 1, .. }
+    ));
+    let metrics = wait_for_metric_at_most(server.http_addr, "runnel_active_requests", 0);
+    assert_eq!(metric_value(&metrics, "runnel_engine_health_available"), 1);
+}
+
+#[cfg(unix)]
+#[test]
 fn storage_stall_shutdown_is_bounded_and_restart_recovers() {
     let directory = TempDir::new().unwrap();
     let mut server = RunningServer::start(
