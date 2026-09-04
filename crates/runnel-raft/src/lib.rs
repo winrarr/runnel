@@ -397,6 +397,90 @@ mod tests {
     }
 
     #[test]
+    fn grouped_lease_successor_backward_offset_delays_expiry_until_floor_catches_up() {
+        let mut state = grouped_test_state();
+        let old_token = match poll_group_with_log_id_for_test(
+            &mut state,
+            "events",
+            "workers",
+            "member-a",
+            1_000,
+            2_000,
+            LogId {
+                leader_id: openraft::CommittedLeaderId::new(1, 1),
+                index: 0,
+            },
+        ) {
+            PollResult::Message(message) => message.delivery_token.unwrap(),
+            PollResult::Empty => panic!("expected initial delivery"),
+        };
+
+        // At the old leader's deadline boundary, a successor whose clock is
+        // fixed 500 ms behind reports 1_500. The floor cannot infer elapsed
+        // real time, so it must leave the old delivery in flight.
+        assert_eq!(
+            poll_group_with_log_id_for_test(
+                &mut state,
+                "events",
+                "workers",
+                "member-b",
+                1_500,
+                2_500,
+                LogId {
+                    leader_id: openraft::CommittedLeaderId::new(2, 2),
+                    index: 0,
+                },
+            ),
+            PollResult::Empty
+        );
+        assert_eq!(state.lease_clock_ms, 1_500);
+        let delivery = state
+            .group_consumers
+            .get(&("events".to_owned(), "workers".to_owned()))
+            .and_then(|consumer| consumer.in_flight.get(&0))
+            .expect("backward-skewed successor must retain the delivery");
+        assert_eq!(delivery.delivery_token, old_token);
+        assert_eq!(delivery.deadline_ms, 2_000);
+
+        let new_token = match poll_group_with_log_id_for_test(
+            &mut state,
+            "events",
+            "workers",
+            "member-b",
+            2_000,
+            3_000,
+            LogId {
+                leader_id: openraft::CommittedLeaderId::new(2, 2),
+                index: 1,
+            },
+        ) {
+            PollResult::Message(message) => {
+                assert_eq!(message.delivery_attempt, Some(2));
+                message.delivery_token.unwrap()
+            }
+            PollResult::Empty => panic!("expected delivery after the floor reaches its deadline"),
+        };
+        assert_ne!(new_token, old_token);
+        assert_eq!(state.lease_clock_ms, 2_000);
+
+        assert_eq!(
+            ack_group_for_test(
+                &mut state, "events", "workers", "member-a", 0, &old_token, 2_000,
+            ),
+            CommandResponse::GroupStaleDelivery {
+                consumer: "workers".to_owned(),
+                offset: 0,
+            }
+        );
+        assert_eq!(
+            ack_group_for_test(
+                &mut state, "events", "workers", "member-b", 0, &new_token, 2_000,
+            ),
+            CommandResponse::GroupAcknowledged
+        );
+    }
+
+    #[test]
     fn grouped_lease_clock_floor_survives_snapshot_recovery_and_backward_time() {
         let mut state = grouped_test_state();
         poll_group_for_test(&mut state, "events", "workers", "member-a", 100, 200, 0);
