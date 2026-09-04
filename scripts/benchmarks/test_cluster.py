@@ -13,47 +13,42 @@ from unittest.mock import patch
 SCRIPT_DIR = Path(__file__).resolve().parent
 sys.path.insert(0, str(SCRIPT_DIR))
 
-from cluster import (  # noqa: E402
-    BenchmarkError,
-    DEFAULT_SCENARIOS,
-    DEFAULT_PUBLISH_BATCH_SIZE,
-    DEFAULT_HOT_KEY_MESSAGES,
+from cluster import parse_args, parse_positive_float, resource_limits  # noqa: E402
+from cluster_faults import PeerResponseDelayProxy  # noqa: E402
+from cluster_resources import ProcessStats, process_stats  # noqa: E402
+from cluster_scenarios import (  # noqa: E402
     DEFAULT_COLD_KEY_COUNT,
     DEFAULT_COLD_MESSAGES_PER_KEY,
-    DEFAULT_HOT_ORDERING_CONCURRENCY,
+    DEFAULT_HOT_KEY_MESSAGES,
     DEFAULT_HOT_KEY_PROCESSING_DELAY_MS,
+    DEFAULT_HOT_ORDERING_CONCURRENCY,
     DEFAULT_HOT_ORDERING_TIMEOUT_SECONDS,
-    MAX_HOT_ORDERING_CONCURRENCY,
+    DEFAULT_PUBLISH_BATCH_SIZE,
+    DEFAULT_RETAINED_RECOVERY_MESSAGES,
+    DEFAULT_SCENARIOS,
+    HotOrderingObservation,
     MAX_HOT_KEY_PROCESSING_DELAY_MS,
-    MAX_HOT_ORDERING_TIMEOUT_SECONDS,
+    MAX_HOT_ORDERING_CONCURRENCY,
     MAX_HOT_ORDERING_MESSAGES,
-    MAX_PUBLISH_BATCH_SIZE,
+    MAX_HOT_ORDERING_TIMEOUT_SECONDS,
     MAX_LEADER_FAILURE_TIMEOUT_SECONDS,
+    MAX_PUBLISH_BATCH_SIZE,
+    MIN_RETAINED_RECOVERY_MESSAGES,
+    _hot_ordering_metadata,
     batch_metric,
     hot_ordering_records,
-    HotOrderingObservation,
-    _hot_ordering_metadata,
-    metric,
-    MIN_RETAINED_RECOVERY_MESSAGES,
-    DEFAULT_RETAINED_RECOVERY_MESSAGES,
-    parse_args,
-    parse_nonnegative_int,
     parse_retained_messages,
     parse_scenarios,
-    parse_positive_float,
-    percentile,
-    publish_batch_request,
     poll_until_redelivered,
-    resource_limits,
-    run_publish_batch,
-    run_peer_forwarding,
+    publish_batch_request,
     run_follower_failure_recovery,
     run_leader_failure_recovery,
+    run_peer_forwarding,
+    run_publish_batch,
     run_retained_hot_path,
     run_retained_recovery,
 )
-from cluster_faults import PeerResponseDelayProxy  # noqa: E402
-from cluster_resources import ProcessStats, process_stats  # noqa: E402
+from common import BenchmarkError, metric, parse_nonnegative_int, percentile  # noqa: E402
 from profile import summarize_timing_logs  # noqa: E402
 
 
@@ -441,9 +436,9 @@ class ClusterBenchmarkTests(unittest.TestCase):
             return operation()
 
         with (
-            patch("cluster.publish_stream") as publish_stream,
-            patch("cluster.publish_batch_request", side_effect=publish_batch_message),
-            patch("cluster.measure_scenario", side_effect=run_measurement),
+            patch("cluster_scenarios.publish_stream") as publish_stream,
+            patch("cluster_scenarios.publish_batch_request", side_effect=publish_batch_message),
+            patch("cluster_scenarios.measure_scenario", side_effect=run_measurement),
         ):
             result = run_publish_batch(
                 cluster,
@@ -568,9 +563,9 @@ class ClusterBenchmarkTests(unittest.TestCase):
             return operation()
 
         with (
-            patch("cluster.publish_stream"),
-            patch("cluster.measure_scenario", side_effect=run_measurement),
-            patch("cluster.publish", return_value=(0, 100)),
+            patch("cluster_scenarios.publish_stream"),
+            patch("cluster_scenarios.measure_scenario", side_effect=run_measurement),
+            patch("cluster_scenarios.publish", return_value=(0, 100)),
         ):
             with self.assertRaisesRegex(BenchmarkError, "non-contiguous offsets"):
                 run_peer_forwarding(
@@ -604,9 +599,9 @@ class ClusterBenchmarkTests(unittest.TestCase):
             return operation()
 
         with (
-            patch("cluster.publish_stream"),
-            patch("cluster.measure_scenario", side_effect=run_measurement),
-            patch("cluster.publish", side_effect=publish_message),
+            patch("cluster_scenarios.publish_stream"),
+            patch("cluster_scenarios.measure_scenario", side_effect=run_measurement),
+            patch("cluster_scenarios.publish", side_effect=publish_message),
         ):
             result = run_peer_forwarding(
                 cluster,
@@ -671,8 +666,8 @@ class ClusterBenchmarkTests(unittest.TestCase):
         def run_measurement(_stats: object, operation: object, **_: object) -> dict:
             return operation()
 
-        with patch("cluster.measure_scenario", side_effect=run_measurement), patch(
-            "cluster.time.sleep"
+        with patch("cluster_scenarios.measure_scenario", side_effect=run_measurement), patch(
+            "cluster_scenarios.time.sleep"
         ):
             result = run_leader_failure_recovery(
                 cluster, "leader-failure-events", "payload", timeout_seconds=1
@@ -747,8 +742,8 @@ class ClusterBenchmarkTests(unittest.TestCase):
         def run_measurement(_stats: object, operation: object, **_: object) -> dict:
             return operation()
 
-        with patch("cluster.measure_scenario", side_effect=run_measurement), patch(
-            "cluster.time.sleep"
+        with patch("cluster_scenarios.measure_scenario", side_effect=run_measurement), patch(
+            "cluster_scenarios.time.sleep"
         ):
             result = run_follower_failure_recovery(
                 cluster, "follower-failure-events", "payload", timeout_seconds=1
@@ -890,10 +885,10 @@ class ClusterBenchmarkTests(unittest.TestCase):
             return operation()
 
         with (
-            patch("cluster.preload") as preload,
-            patch("cluster.measure_scenario", side_effect=run_measurement),
-            patch("cluster.poll", return_value=({"offset": 0, "payload": payload}, 100)),
-            patch("cluster.acknowledge", return_value=200) as acknowledge,
+            patch("cluster_scenarios.preload") as preload,
+            patch("cluster_scenarios.measure_scenario", side_effect=run_measurement),
+            patch("cluster_scenarios.poll", return_value=({"offset": 0, "payload": payload}, 100)),
+            patch("cluster_scenarios.acknowledge", return_value=200) as acknowledge,
         ):
             result = run_retained_recovery(
                 cluster, "retained-events", payload, retained_messages
@@ -924,13 +919,13 @@ class ClusterBenchmarkTests(unittest.TestCase):
             return operation()
 
         with (
-            patch("cluster.preload"),
-            patch("cluster.measure_scenario", side_effect=run_measurement),
+            patch("cluster_scenarios.preload"),
+            patch("cluster_scenarios.measure_scenario", side_effect=run_measurement),
             patch(
-                "cluster.poll",
+                "cluster_scenarios.poll",
                 return_value=({"offset": 0, "payload": "corrupt"}, 100),
             ),
-            patch("cluster.acknowledge") as acknowledge,
+            patch("cluster_scenarios.acknowledge") as acknowledge,
         ):
             with self.assertRaisesRegex(
                 BenchmarkError,
@@ -975,9 +970,9 @@ class ClusterBenchmarkTests(unittest.TestCase):
             )
 
         with (
-            patch("cluster.preload") as preload,
-            patch("cluster.publish_messages", return_value=[100, 200]) as publish_messages,
-            patch("cluster.measure_message_batch", side_effect=run_measurement),
+            patch("cluster_scenarios.preload") as preload,
+            patch("cluster_scenarios.publish_messages", return_value=[100, 200]) as publish_messages,
+            patch("cluster_scenarios.measure_message_batch", side_effect=run_measurement),
         ):
             result = run_retained_hot_path(
                 cluster,
