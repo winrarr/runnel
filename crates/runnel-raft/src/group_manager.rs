@@ -103,6 +103,12 @@ pub struct GroupManager {
     peer_transport: Arc<network::PeerTransport>,
 }
 
+impl Drop for GroupManager {
+    fn drop(&mut self) {
+        self.peer_transport.shutdown();
+    }
+}
+
 impl GroupManager {
     pub(super) async fn open(
         node_id: NodeId,
