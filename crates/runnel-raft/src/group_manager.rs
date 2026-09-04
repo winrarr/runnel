@@ -11,11 +11,13 @@ use runnel_engine::{AckResult, BrokerError, Offset, PollResult, ReplayMessage};
 use serde::{Deserialize, Serialize};
 use tokio::sync::{Mutex, RwLock};
 
-use super::state_machine_store::validate_state_machine_storage;
+use super::engine::RaftGroup;
+use super::forwarding::forward_error_to_broker;
+use super::state_machine::{GroupKind, StreamLifecycle, StreamMetadata, stream_identity};
+use super::state_machine_store::{StateMachineStore, validate_state_machine_storage};
 use super::{
-    GroupKind, METADATA_GROUP_ID, NodeId, Raft, RaftGroup, SnapshotMetricsSnapshot,
-    StateMachineStore, StreamLifecycle, StreamMetadata, TypeConfig, atomic_write,
-    forward_error_to_broker, log_store, network, path_component, stream_identity, validate_name,
+    METADATA_GROUP_ID, NodeId, Raft, SnapshotMetricsSnapshot, TypeConfig, atomic_write, log_store,
+    network, path_component, validate_name,
 };
 
 // These defaults keep the consensus log bounded while the snapshot format is

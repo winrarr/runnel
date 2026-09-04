@@ -18,16 +18,17 @@ use runnel_engine::{Message, PollResult};
 use serde::{Deserialize, Serialize};
 use tokio::sync::RwLock;
 
+use super::delivery::{GroupConsumerState, dead_letter_stream_name};
+use super::state_machine::{
+    CommandResponse, GroupKind, SnapshotState, StateMachineData, StoredMessage, StreamLifecycle,
+    StreamMetadata, StreamState, apply_command, stream_identity,
+};
 use super::state_machine_journal::{
     FILE as STATE_MACHINE_JOURNAL_FILE, JournalEntryRef as StateMachineJournalEntryRef,
     append as append_state_machine_journal_entry, is_log_after, read as read_state_machine_journal,
     replay as replay_state_machine_journal, validate as validate_state_machine_journal,
 };
-use super::{
-    CommandResponse, FORMAT_VERSION, GroupConsumerState, GroupKind, SnapshotState,
-    StateMachineData, StoredMessage, StreamLifecycle, StreamMetadata, StreamState, TypeConfig,
-    apply_command, atomic_write, dead_letter_stream_name, stream_identity,
-};
+use super::{FORMAT_VERSION, TypeConfig, atomic_write};
 use crate::NodeId;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -7,7 +7,8 @@ use openraft::{EntryPayload, LogId};
 use runnel_engine::BrokerError;
 use serde::{Deserialize, Serialize};
 
-use super::{GroupKind, NodeId, StateMachineData, TypeConfig, apply_command};
+use super::state_machine::{GroupKind, StateMachineData, apply_command};
+use super::{NodeId, TypeConfig};
 
 pub(super) const FORMAT_VERSION: u32 = 1;
 pub(super) const FILE: &str = "state-machine.log";
