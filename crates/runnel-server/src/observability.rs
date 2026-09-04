@@ -1,7 +1,7 @@
 use std::fmt::Write as _;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use axum::extract::State;
 use axum::http::StatusCode;
@@ -53,6 +53,7 @@ pub(crate) fn router(
 }
 
 pub(crate) struct ServerMetrics {
+    process_started_at: Instant,
     pub(crate) active_connections: AtomicU64,
     pub(crate) connections_accepted: AtomicU64,
     pub(crate) connections_rejected: AtomicU64,
@@ -174,6 +175,7 @@ impl Default for RequestDuration {
 impl Default for ServerMetrics {
     fn default() -> Self {
         Self {
+            process_started_at: Instant::now(),
             active_connections: AtomicU64::new(0),
             connections_accepted: AtomicU64::new(0),
             connections_rejected: AtomicU64::new(0),
@@ -228,6 +230,10 @@ impl ServerMetrics {
         {
             duration.buckets[bucket].fetch_add(1, Ordering::Relaxed);
         }
+    }
+
+    fn process_uptime_seconds(&self) -> f64 {
+        self.process_started_at.elapsed().as_secs_f64()
     }
 
     pub(crate) fn record_rejected_request(&self, operation: RequestOperation, elapsed: Duration) {
@@ -373,6 +379,17 @@ fn format_metrics(
     admission: ProtocolAdmission,
 ) -> String {
     let mut output = String::with_capacity(5_000);
+    writeln!(
+        output,
+        "# HELP runnel_process_uptime_seconds Seconds since this broker process started."
+    )
+    .unwrap();
+    writeln!(
+        output,
+        "# TYPE runnel_process_uptime_seconds gauge\nrunnel_process_uptime_seconds {:.6}",
+        metrics.process_uptime_seconds()
+    )
+    .unwrap();
     if let Some(health) = health {
         writeln!(
             output,

@@ -468,6 +468,31 @@ fn metrics_report_messages_returned_by_polls() {
 }
 
 #[test]
+fn metrics_report_process_uptime() {
+    let directory = TempDir::new().unwrap();
+    let server = RunningServer::start(directory.path());
+
+    let initial_metrics = http_metrics(server.http_addr);
+    let initial_uptime = metric_float_value(&initial_metrics, "runnel_process_uptime_seconds");
+    assert!(initial_uptime.is_finite());
+    assert!(initial_uptime >= 0.0);
+    assert!(initial_metrics.contains(
+        "# HELP runnel_process_uptime_seconds Seconds since this broker process started."
+    ));
+    assert!(initial_metrics.contains("# TYPE runnel_process_uptime_seconds gauge"));
+
+    sleep(Duration::from_millis(20));
+    let later_uptime = metric_float_value(
+        &http_metrics(server.http_addr),
+        "runnel_process_uptime_seconds",
+    );
+    assert!(
+        later_uptime > initial_uptime,
+        "process uptime should increase between scrapes: initial={initial_uptime}, later={later_uptime}"
+    );
+}
+
+#[test]
 fn metrics_report_connection_lifecycle_and_framing_errors() {
     let directory = TempDir::new().unwrap();
     let server = RunningServer::start(directory.path());
@@ -1070,6 +1095,14 @@ fn http_metrics(address: SocketAddr) -> String {
 }
 
 fn metric_value(metrics: &str, name: &str) -> u64 {
+    metrics
+        .lines()
+        .find_map(|line| line.strip_prefix(&format!("{name} ")))
+        .and_then(|value| value.parse().ok())
+        .unwrap_or_default()
+}
+
+fn metric_float_value(metrics: &str, name: &str) -> f64 {
     metrics
         .lines()
         .find_map(|line| line.strip_prefix(&format!("{name} ")))

@@ -159,15 +159,19 @@ the readiness-filtered client Service load-balances requests and does not give
 a stable per-pod time series; configure per-pod discovery or an equivalent
 monitoring resource outside this manifest if metrics are needed.
 
-Current metrics cover broker request counts and latency buckets, connection
-and request admission, traffic bytes, publish/delivery/acknowledgement
-counters, in-flight deliveries, redelivery and dead-letter totals, health
-check failures, logical storage bytes, and clustered snapshot lifecycle
-counters. They do not expose per-group leadership, replication progress or
-lag, forwarding or peer error state, consumer lag, reclaimable storage, PVC
-free space, CPU or memory pressure, or queue depth. A metrics scrape itself
-performs the bounded engine health check and returns `503` when that check
-fails, so metrics are not an independent liveness path.
+Current metrics cover process uptime, broker request counts and latency
+buckets, connection and request admission, traffic bytes,
+publish/delivery/acknowledgement counters, in-flight deliveries, redelivery
+and dead-letter totals, health check failures, logical storage bytes, and
+clustered snapshot lifecycle counters. `runnel_process_uptime_seconds` is a
+label-free gauge based on a monotonic clock; it resets when the broker process
+restarts and remains available during a stalled engine health check. Metrics
+do not expose per-group leadership, replication progress or lag, forwarding or
+peer error state, consumer lag, reclaimable storage, PVC free space, CPU or
+memory pressure, or queue depth. A metrics scrape performs the bounded engine
+health check, but returns `200` with process and admission metrics when that
+check fails and omits unavailable engine-derived samples; metrics are not an
+independent liveness path.
 
 For the current implementation and its limitations, see [the operational
 telemetry debt item](../../docs/tech-debt.md#td-006-operational-telemetry-remains-incomplete)

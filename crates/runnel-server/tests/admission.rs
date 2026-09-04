@@ -747,6 +747,7 @@ fn storage_stall_is_bounded_and_durable_traffic_continues() {
         0
     );
     assert!(has_metric(stalled_metrics, "runnel_active_connections"));
+    assert!(has_metric(stalled_metrics, "runnel_process_uptime_seconds"));
     assert!(has_metric(
         stalled_metrics,
         "runnel_broker_max_in_flight_requests"
