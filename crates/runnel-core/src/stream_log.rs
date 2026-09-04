@@ -523,10 +523,11 @@ impl StreamLog {
             return Ok(None);
         };
         if committed_offset >= first_indexed_offset {
+            let start = self.tail_start_index(committed_offset);
             return Ok(self
                 .records
                 .iter()
-                .filter(|record| record.offset >= committed_offset)
+                .skip(start)
                 .find(|record| record_is_candidate(record, acknowledged_offsets, in_flight))
                 .cloned());
         }
@@ -547,6 +548,20 @@ impl StreamLog {
             }
         }
         Ok(None)
+    }
+
+    fn tail_start_index(&self, offset: Offset) -> usize {
+        let mut low = 0;
+        let mut high = self.records.len();
+        while low < high {
+            let middle = low + (high - low) / 2;
+            if self.records[middle].offset < offset {
+                low = middle + 1;
+            } else {
+                high = middle;
+            }
+        }
+        low
     }
 
     pub(super) fn find_record(&mut self, offset: Offset) -> Result<RecordIndex, BrokerError> {
@@ -1018,6 +1033,28 @@ fn now_ms() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn tail_candidate_lookup_lower_bounds_the_committed_offset() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut log =
+            StreamLog::create(&directory.path().join("events.log"), DurableFormat::Rnl1).unwrap();
+        for offset in 0..8 {
+            assert_eq!(log.append(None, vec![offset as u8]).unwrap(), offset);
+        }
+
+        assert_eq!(log.tail_start_index(0), 0);
+        assert_eq!(log.tail_start_index(3), 3);
+        assert_eq!(log.tail_start_index(7), 7);
+        assert_eq!(log.tail_start_index(8), 8);
+
+        let acknowledged_offsets = BTreeSet::from([3]);
+        let candidate = log
+            .find_candidate(3, &acknowledged_offsets, None)
+            .unwrap()
+            .unwrap();
+        assert_eq!(candidate.offset, 4);
+    }
 
     #[test]
     fn sparse_lookup_index_keeps_only_a_bounded_recent_window() {

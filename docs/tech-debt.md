@@ -97,7 +97,7 @@ This register records known implementation shortcuts in the current vertical sli
 
 - Status: open
 - Impact: grouped polling scans the in-memory record index and allows only one outstanding delivery per member. This bounds the first implementation and keeps its behavior inspectable, but it limits throughput, batching, and scalability for large or highly concurrent worker pools.
-- Context: the first implementation is a semantic baseline for demand-driven delivery, not a target storage or scheduling architecture. Due-delivery polling now uses a bounded deadline index, so it no longer scans every active delivery to find expired leases. Candidate selection and the one-outstanding-delivery-per-member limit remain; the stable-placement design records a possible future virtual-lane direction without changing the default scheduler.
+- Context: the first implementation is a semantic baseline for demand-driven delivery, not a target storage or scheduling architecture. Due-delivery polling now uses a bounded deadline index, so it no longer scans every active delivery to find expired leases. Candidate selection lower-bounds the committed offset in the bounded tail index before applying its key and in-flight filters, while cold history still uses the sparse checkpoint scan. The one-outstanding-delivery-per-member limit remains; the stable-placement design records a possible future virtual-lane direction without changing the default scheduler.
 - Retirement condition: workload benchmarks justify bounded scheduling, batching, or stable internal placement improvements while preserving scoped ordering, backpressure, and stale-delivery fencing.
 
 ## TD-017: Dead-letter movement spans separate durable records
