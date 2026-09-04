@@ -124,6 +124,53 @@ class MatrixBenchmarkTests(unittest.TestCase):
         retained_index = command.index("--retained-messages")
         self.assertEqual(command[retained_index + 1], str(cases[1]["retained_messages"]))
 
+    def test_publish_batch_expands_each_batch_size_value(self) -> None:
+        args = self.parse(
+            "--scenarios",
+            "publish_batch",
+            "--payload-sizes",
+            "100,1024",
+            "--batch-size-values",
+            "1,8,32",
+            "--repetitions",
+            "2",
+        )
+
+        cases = matrix.matrix_cases(args)
+
+        self.assertEqual(len(cases), 12)
+        self.assertEqual({case["batch_size"] for case in cases}, {1, 8, 32})
+        self.assertEqual({case["scenario"] for case in cases}, {"publish_batch"})
+        self.assertEqual({case["repetition"] for case in cases}, {1, 2})
+        self.assertEqual(
+            len({matrix.case_id(index, case) for index, case in enumerate(cases, 1)}),
+            len(cases),
+        )
+
+        command = matrix.case_command(
+            args,
+            cases[1],
+            Path("/tmp/matrix/result.json"),
+            Path("/tmp/matrix/logs"),
+            build=False,
+        )
+        batch_index = command.index("--batch-size")
+        self.assertEqual(command[batch_index + 1], str(cases[1]["batch_size"]))
+
+    def test_publish_batch_values_are_bounded_and_keep_legacy_single_size(self) -> None:
+        args = self.parse("--scenarios", "publish_batch")
+        self.assertEqual(args.batch_size, 32)
+        self.assertEqual(args.batch_size_values, [32])
+
+        with self.assertRaises(SystemExit):
+            self.parse("--batch-size-values", "0")
+        with self.assertRaises(SystemExit):
+            self.parse("--batch-size-values", "1,1")
+        with self.assertRaises(SystemExit):
+            self.parse("--batch-size-values", "1025")
+        with self.assertRaises(SystemExit):
+            self.parse("--batch-size", "16", "--batch-size-values", "1,8")
+
     def test_run_matrix_keeps_each_case_and_builds_a_machine_readable_envelope(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             output = Path(directory) / "matrix.json"
@@ -166,6 +213,7 @@ class MatrixBenchmarkTests(unittest.TestCase):
         self.assertEqual(envelope["matrix"]["attempted_cases"], 2)
         self.assertEqual(envelope["matrix"]["completed_cases"], 2)
         self.assertEqual(len(envelope["cases"]), 2)
+        self.assertEqual(envelope["workload"]["batch_size_values"], [32])
 
     def test_case_timeout_is_bounded_and_native_scope_is_explicit(self) -> None:
         args = self.parse(
