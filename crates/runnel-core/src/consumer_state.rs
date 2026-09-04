@@ -107,9 +107,9 @@ pub(super) fn persist_consumer_event(
     let mut encoded = serde_json::to_vec(&event)?;
     encoded.push(b'\n');
 
-    let journal_len = match fs::metadata(&path) {
-        Ok(metadata) => metadata.len(),
-        Err(error) if error.kind() == io::ErrorKind::NotFound => 0,
+    let (journal_len, journal_exists) = match fs::metadata(&path) {
+        Ok(metadata) => (metadata.len(), true),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => (0, false),
         Err(error) => return Err(error.into()),
     };
     if journal_len.saturating_add(encoded.len() as u64) > MAX_CONSUMER_STATE_JOURNAL_BYTES {
@@ -126,7 +126,15 @@ pub(super) fn persist_consumer_event(
     fs::create_dir_all(parent)?;
     let mut file = OpenOptions::new().create(true).append(true).open(path)?;
     file.write_all(&encoded)?;
-    file.sync_all()?;
+    if journal_exists {
+        // The journal's directory entry is already durable. Appending changes the data and
+        // length needed for replay, which sync_data persists without another metadata flush.
+        file.sync_data()?;
+    } else {
+        // A newly created journal needs its directory entry persisted before the delivery is
+        // considered durable.
+        file.sync_all()?;
+    }
     Ok(())
 }
 
@@ -224,6 +232,7 @@ fn persist_consumer_state(root: &Path, state: &ConsumerState) -> Result<(), Brok
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tempfile::tempdir;
 
     fn state() -> ConsumerState {
         ConsumerState {
@@ -275,5 +284,43 @@ mod tests {
         assert!(
             matches!(error, Err(BrokerError::Io(error)) if error.kind() == io::ErrorKind::InvalidData)
         );
+    }
+
+    #[test]
+    fn appended_events_recover_acknowledgement_state() {
+        let directory = tempdir().unwrap();
+        let mut current = state();
+
+        persist_consumer_event(
+            directory.path(),
+            "events",
+            "worker",
+            &current,
+            ConsumerStateEvent::DeliveryAttempt {
+                offset: 0,
+                attempt: 1,
+            },
+        )
+        .unwrap();
+        current
+            .apply_event(ConsumerStateEvent::DeliveryAttempt {
+                offset: 0,
+                attempt: 1,
+            })
+            .unwrap();
+
+        persist_consumer_event(
+            directory.path(),
+            "events",
+            "worker",
+            &current,
+            ConsumerStateEvent::Acknowledge { offset: 0 },
+        )
+        .unwrap();
+
+        let recovered = load_consumer_state(directory.path(), "events", "worker").unwrap();
+        assert_eq!(recovered.committed_offset, 1);
+        assert!(recovered.acknowledged_offsets.is_empty());
+        assert!(recovered.delivery_attempts.is_empty());
     }
 }
