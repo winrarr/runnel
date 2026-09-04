@@ -1,10 +1,10 @@
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap};
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant};
 
 #[cfg(test)]
 use std::sync::atomic::AtomicBool;
@@ -16,14 +16,18 @@ use runnel_engine::{
 };
 
 mod consumer_state;
+mod delivery_state;
 mod storage;
 mod stream_log;
 
 #[cfg(test)]
 use consumer_state::MAX_CONSUMER_STATE_JOURNAL_BYTES;
-use consumer_state::{
-    ConsumerState, ConsumerStateEvent, load_consumer_state, persist_consumer_event,
-};
+#[cfg(test)]
+use consumer_state::load_consumer_state;
+use consumer_state::{ConsumerState, ConsumerStateEvent, persist_consumer_event};
+#[cfg(test)]
+use delivery_state::MAX_CACHED_CONSUMER_STATES;
+use delivery_state::{DeliveryState, DeliveryTokenGenerator, InFlight};
 #[cfg(test)]
 use std::fs::OpenOptions;
 #[cfg(test)]
@@ -37,7 +41,6 @@ use stream_log::{
     VERSIONED_MAX_KEY_LEN,
 };
 use stream_log::{REQUEST_ID_MAX_LEN, RecordIndex, StreamLog};
-const MAX_CACHED_CONSUMER_STATES: usize = 1024;
 const DEFAULT_ACK_TIMEOUT: Duration = Duration::from_secs(30);
 const DEAD_LETTER_SUFFIX: &str = ".dead-letter";
 
@@ -84,8 +87,7 @@ struct BrokerState {
     max_delivery_attempts: Option<u32>,
     redeliveries: AtomicU64,
     dead_letters: AtomicU64,
-    delivery_epoch: u128,
-    next_delivery_id: AtomicU64,
+    delivery_tokens: DeliveryTokenGenerator,
     storage_executor: Arc<StorageExecutor>,
     #[cfg(test)]
     fail_next_dead_letter_ack_persist: AtomicBool,
@@ -93,126 +95,15 @@ struct BrokerState {
 
 struct StreamState {
     log: StreamLog,
-    // Consumer state and in-flight deliveries are owned by the stream so independent streams
-    // do not contend on a process-wide broker lock. The bounded cache is only a best-effort
-    // fast path; the durable checkpoint remains the source of truth across restart and eviction.
-    consumer_states: HashMap<String, ConsumerState>,
-    in_flight: HashMap<DeliveryKey, InFlight>,
-    // This index keeps expiry checks proportional to deliveries that are due instead of scanning
-    // every outstanding delivery on each poll. Entries are removed when a delivery is acked.
-    in_flight_deadlines: BTreeMap<Instant, Vec<DeliveryKey>>,
-    // This index mirrors only active deliveries and is removed when a consumer has no deliveries.
-    // It avoids rebuilding per-consumer offset/key sets and scanning members on every poll.
-    in_flight_by_consumer: HashMap<String, ConsumerInFlightIndex>,
-}
-
-#[derive(Debug, Clone, Hash, PartialEq, Eq)]
-struct DeliveryKey {
-    consumer: String,
-    offset: Offset,
-}
-
-#[derive(Debug, Clone)]
-struct InFlight {
-    member: String,
-    offset: Offset,
-    key: Option<String>,
-    delivery_attempt: u32,
-    delivery_token: String,
-    deadline: Instant,
-}
-
-#[derive(Default)]
-struct ConsumerInFlightIndex {
-    offsets: HashSet<Offset>,
-    keys: HashSet<String>,
-    members: HashMap<String, Offset>,
+    delivery: DeliveryState,
 }
 
 impl StreamState {
     fn new(log: StreamLog) -> Self {
         Self {
             log,
-            consumer_states: HashMap::new(),
-            in_flight: HashMap::new(),
-            in_flight_deadlines: BTreeMap::new(),
-            in_flight_by_consumer: HashMap::new(),
+            delivery: DeliveryState::new(),
         }
-    }
-
-    fn expire_in_flight(&mut self, now: Instant) {
-        while let Some((&deadline, _)) = self.in_flight_deadlines.first_key_value() {
-            if deadline > now {
-                break;
-            }
-
-            let Some((_, delivery_keys)) = self.in_flight_deadlines.pop_first() else {
-                break;
-            };
-            for delivery_key in delivery_keys {
-                if self
-                    .in_flight
-                    .get(&delivery_key)
-                    .is_some_and(|in_flight| in_flight.deadline <= now)
-                {
-                    self.remove_in_flight(&delivery_key);
-                }
-            }
-        }
-    }
-
-    fn insert_in_flight(&mut self, delivery_key: DeliveryKey, in_flight: InFlight) {
-        let consumer = delivery_key.consumer.clone();
-        let offset = delivery_key.offset;
-        let member = in_flight.member.clone();
-        let key = in_flight.key.clone();
-        debug_assert!(!self.in_flight.contains_key(&delivery_key));
-        let deadline = in_flight.deadline;
-        self.in_flight.insert(delivery_key.clone(), in_flight);
-        self.in_flight_deadlines
-            .entry(deadline)
-            .or_default()
-            .push(delivery_key);
-
-        let index = self.in_flight_by_consumer.entry(consumer).or_default();
-        index.offsets.insert(offset);
-        if let Some(key) = key {
-            index.keys.insert(key);
-        }
-        index.members.insert(member, offset);
-    }
-
-    fn remove_in_flight(&mut self, delivery_key: &DeliveryKey) -> Option<InFlight> {
-        let in_flight = self.in_flight.remove(delivery_key)?;
-        let mut remove_deadline_index = false;
-        if let Some(deliveries) = self.in_flight_deadlines.get_mut(&in_flight.deadline) {
-            if let Some(index) = deliveries.iter().position(|key| key == delivery_key) {
-                deliveries.swap_remove(index);
-            }
-            remove_deadline_index = deliveries.is_empty();
-        }
-        if remove_deadline_index {
-            self.in_flight_deadlines.remove(&in_flight.deadline);
-        }
-        let mut remove_consumer_index = false;
-        if let Some(index) = self.in_flight_by_consumer.get_mut(&delivery_key.consumer) {
-            index.offsets.remove(&delivery_key.offset);
-            if let Some(key) = in_flight.key.as_ref() {
-                index.keys.remove(key);
-            }
-            if index
-                .members
-                .get(&in_flight.member)
-                .is_some_and(|offset| *offset == delivery_key.offset)
-            {
-                index.members.remove(&in_flight.member);
-            }
-            remove_consumer_index = index.offsets.is_empty();
-        }
-        if remove_consumer_index {
-            self.in_flight_by_consumer.remove(&delivery_key.consumer);
-        }
-        Some(in_flight)
     }
 
     fn find_candidate(
@@ -221,15 +112,9 @@ impl StreamState {
         committed_offset: Offset,
         acknowledged_offsets: &BTreeSet<Offset>,
     ) -> Result<Option<RecordIndex>, BrokerError> {
-        let StreamState {
-            log,
-            in_flight_by_consumer,
-            ..
-        } = self;
-        let in_flight = in_flight_by_consumer
-            .get(consumer)
-            .map(|index| (&index.offsets, &index.keys));
-        log.find_candidate(committed_offset, acknowledged_offsets, in_flight)
+        let in_flight = self.delivery.in_flight_filter(consumer);
+        self.log
+            .find_candidate(committed_offset, acknowledged_offsets, in_flight)
     }
 }
 
@@ -279,8 +164,7 @@ impl Broker {
                 max_delivery_attempts: config.max_delivery_attempts,
                 redeliveries: AtomicU64::new(0),
                 dead_letters: AtomicU64::new(0),
-                delivery_epoch: delivery_epoch(),
-                next_delivery_id: AtomicU64::new(0),
+                delivery_tokens: DeliveryTokenGenerator::new(),
                 storage_executor: Arc::new(StorageExecutor::new()),
                 #[cfg(test)]
                 fail_next_dead_letter_ack_persist: AtomicBool::new(false),
@@ -400,29 +284,18 @@ impl Broker {
         let mut stream_state = self.lock_stream(&stream_state)?;
         let root = self.inner.root.clone();
         let now = Instant::now();
-        stream_state.expire_in_flight(now);
+        stream_state.delivery.expire(now);
 
-        let existing_offset = stream_state
-            .in_flight_by_consumer
-            .get(consumer)
-            .and_then(|index| index.members.get(member))
-            .copied();
-        if let Some(offset) = existing_offset {
-            let delivery_key = DeliveryKey {
-                consumer: consumer.to_owned(),
-                offset,
-            };
-            let Some(in_flight) = stream_state.in_flight.get(&delivery_key).cloned() else {
-                return Err(BrokerError::CorruptRecord(offset));
-            };
-            let mut message = stream_state.log.read_message(stream, in_flight.offset)?;
-            message.delivery_token = Some(in_flight.delivery_token);
-            message.delivery_attempt = Some(in_flight.delivery_attempt);
+        if let Some(in_flight) = stream_state.delivery.member_delivery(consumer, member)? {
+            let mut message = stream_state.log.read_message(stream, in_flight.offset())?;
+            message.delivery_token = Some(in_flight.delivery_token().to_owned());
+            message.delivery_attempt = Some(in_flight.delivery_attempt());
             return Ok(PollResult::Message(message));
         }
 
-        let mut consumer_state =
-            load_consumer_state_for_request(&mut stream_state, &root, stream, consumer)?;
+        let mut consumer_state = stream_state
+            .delivery
+            .load_consumer_state_for_request(&root, stream, consumer)?;
         loop {
             let candidate = stream_state.find_candidate(
                 consumer,
@@ -453,11 +326,9 @@ impl Broker {
                     candidate.offset,
                 )?;
                 consumer_state.acknowledge(candidate.offset);
-                cache_consumer_state(
-                    &mut stream_state,
-                    consumer.to_owned(),
-                    consumer_state.clone(),
-                );
+                stream_state
+                    .delivery
+                    .cache_consumer_state(consumer.to_owned(), consumer_state.clone());
                 self.inner.dead_letters.fetch_add(1, Ordering::Relaxed);
                 continue;
             }
@@ -478,28 +349,27 @@ impl Broker {
             consumer_state
                 .delivery_attempts
                 .insert(candidate.offset, delivery_attempt);
-            let delivery_token = self.next_delivery_token();
+            let delivery_token = self.inner.delivery_tokens.next();
             message.delivery_token = Some(delivery_token.clone());
             message.delivery_attempt = Some(delivery_attempt);
             if delivery_attempt > 1 {
                 self.inner.redeliveries.fetch_add(1, Ordering::Relaxed);
             }
             let ack_timeout = self.inner.ack_timeout;
-            stream_state.insert_in_flight(
-                DeliveryKey {
-                    consumer: consumer.to_owned(),
-                    offset: candidate.offset,
-                },
-                InFlight {
-                    member: member.to_owned(),
-                    offset: candidate_offset,
-                    key: candidate.into_key(),
+            stream_state.delivery.insert(
+                consumer,
+                InFlight::new(
+                    member,
+                    candidate_offset,
+                    candidate.into_key(),
                     delivery_attempt,
                     delivery_token,
-                    deadline: Instant::now() + ack_timeout,
-                },
+                    Instant::now() + ack_timeout,
+                ),
             );
-            cache_consumer_state(&mut stream_state, consumer.to_owned(), consumer_state);
+            stream_state
+                .delivery
+                .cache_consumer_state(consumer.to_owned(), consumer_state);
             return Ok(PollResult::Message(message));
         }
     }
@@ -529,19 +399,16 @@ impl Broker {
         let stream_state = self.get_stream(stream)?;
         let mut stream_state = self.lock_stream(&stream_state)?;
         let root = self.inner.root.clone();
-        let mut consumer_state =
-            load_consumer_state_for_request(&mut stream_state, &root, stream, consumer)?;
+        let mut consumer_state = stream_state
+            .delivery
+            .load_consumer_state_for_request(&root, stream, consumer)?;
         if offset < consumer_state.committed_offset {
             return Ok(AckResult::AlreadyAcknowledged);
         }
         if consumer_state.acknowledged_offsets.contains(&offset) {
             return Ok(AckResult::AlreadyAcknowledged);
         }
-        let delivery_key = DeliveryKey {
-            consumer: consumer.to_owned(),
-            offset,
-        };
-        let Some(in_flight) = stream_state.in_flight.get(&delivery_key) else {
+        let Some(in_flight) = stream_state.delivery.get_in_flight(consumer, offset) else {
             if !delivery_token.is_empty() {
                 return Err(BrokerError::StaleDelivery {
                     consumer: consumer.to_owned(),
@@ -553,8 +420,8 @@ impl Broker {
                 offset,
             });
         };
-        if in_flight.member != member
-            || (!delivery_token.is_empty() && in_flight.delivery_token != delivery_token)
+        if in_flight.member() != member
+            || (!delivery_token.is_empty() && in_flight.delivery_token() != delivery_token)
         {
             return Err(BrokerError::StaleDelivery {
                 consumer: consumer.to_owned(),
@@ -572,8 +439,10 @@ impl Broker {
         consumer_state.acknowledge(offset);
         consumer_state.stream = stream.to_owned();
         consumer_state.consumer = consumer.to_owned();
-        stream_state.remove_in_flight(&delivery_key);
-        cache_consumer_state(&mut stream_state, consumer.to_owned(), consumer_state);
+        stream_state.delivery.remove(consumer, offset);
+        stream_state
+            .delivery
+            .cache_consumer_state(consumer.to_owned(), consumer_state);
         Ok(AckResult::Acknowledged)
     }
 
@@ -593,7 +462,7 @@ impl Broker {
         for stream in &streams {
             let stream = self.lock_stream(stream)?;
             storage_bytes += stream.log.storage_bytes()?;
-            in_flight_deliveries += stream.in_flight.len() as u64;
+            in_flight_deliveries += stream.delivery.in_flight_count() as u64;
         }
         Ok(HealthSnapshot {
             streams: streams.len(),
@@ -704,15 +573,6 @@ impl Broker {
         self.inner
             .fail_next_dead_letter_ack_persist
             .store(true, Ordering::Release);
-    }
-
-    fn next_delivery_token(&self) -> String {
-        let next_id = self
-            .inner
-            .next_delivery_id
-            .fetch_add(1, Ordering::Relaxed)
-            .wrapping_add(1);
-        format!("{:x}-{:x}", self.inner.delivery_epoch, next_id)
     }
 }
 
@@ -863,42 +723,6 @@ fn dead_letter_move_id(
     )))
 }
 
-fn load_consumer_state_for_request(
-    stream_state: &mut StreamState,
-    root: &Path,
-    stream: &str,
-    consumer: &str,
-) -> Result<ConsumerState, BrokerError> {
-    if let Some(cached) = stream_state.consumer_states.get(consumer) {
-        return Ok(cached.clone());
-    }
-
-    load_consumer_state(root, stream, consumer)
-}
-
-fn cache_consumer_state(stream_state: &mut StreamState, consumer: String, state: ConsumerState) {
-    stream_state.consumer_states.insert(consumer, state);
-    while stream_state.consumer_states.len() > MAX_CACHED_CONSUMER_STATES {
-        let evicted = {
-            let active_consumers: HashSet<&str> = stream_state
-                .in_flight
-                .keys()
-                .map(|delivery_key| delivery_key.consumer.as_str())
-                .collect();
-            stream_state
-                .consumer_states
-                .keys()
-                .find(|consumer| !active_consumers.contains((*consumer).as_str()))
-                .cloned()
-                .or_else(|| stream_state.consumer_states.keys().next().cloned())
-        };
-        let Some(evicted) = evicted else {
-            break;
-        };
-        stream_state.consumer_states.remove(&evicted);
-    }
-}
-
 fn validate_name(kind: &'static str, name: &str) -> Result<(), BrokerError> {
     let valid_length = (1..=128).contains(&name.len());
     let valid_characters = name
@@ -911,13 +735,6 @@ fn validate_name(kind: &'static str, name: &str) -> Result<(), BrokerError> {
         kind,
         name: name.to_owned(),
     })
-}
-
-fn delivery_epoch() -> u128 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_nanos()
 }
 
 #[cfg(test)]
@@ -985,12 +802,12 @@ mod tests {
         let stream_state = broker.get_stream("events").unwrap();
         let stream_state = broker.lock_stream(&stream_state).unwrap();
         assert_eq!(
-            stream_state.consumer_states.len(),
+            stream_state.delivery.consumer_state_cache_len(),
             MAX_CACHED_CONSUMER_STATES
         );
         let evicted_consumer = (0..=MAX_CACHED_CONSUMER_STATES)
             .map(|index| format!("consumer-{index}"))
-            .find(|consumer| !stream_state.consumer_states.contains_key(consumer))
+            .find(|consumer| !stream_state.delivery.has_cached_consumer(consumer))
             .expect("one consumer should have been evicted");
         drop(stream_state);
         assert_eq!(
@@ -1528,9 +1345,7 @@ mod tests {
 
         let stream_state = broker.get_stream("events").unwrap();
         let stream_state = broker.lock_stream(&stream_state).unwrap();
-        assert!(stream_state.in_flight.is_empty());
-        assert!(stream_state.in_flight_deadlines.is_empty());
-        assert!(stream_state.in_flight_by_consumer.is_empty());
+        assert!(stream_state.delivery.is_empty());
     }
 
     #[test]
