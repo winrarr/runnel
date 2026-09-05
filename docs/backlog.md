@@ -344,7 +344,7 @@ Goal: allow independent publishing, consuming, acknowledgement, health, and reco
 
 Rationale: a single serialized execution path can hide the performance characteristics needed for low tail latency and high throughput.
 
-Current progress: local storage work now has bounded asynchronous admission, a blocking-I/O executor, and per-stream lanes that preserve order while allowing unrelated streams to progress. Grouped expiry lookup also avoids scanning all active deliveries. The broker still has broader serialized state and scheduling boundaries, and predictable concurrent p50/p99/p99.9 evidence remains incomplete.
+Current progress: local storage work now has bounded asynchronous admission, a blocking-I/O executor, and per-stream lanes that preserve order while allowing unrelated streams to progress. Grouped expiry lookup also avoids scanning all active deliveries. A 2026-09-05 targeted comparison of replacing `sync_all` with `sync_data` for existing local consumer-journal appends passed its replay checks but produced mixed or neutral results across repeated acknowledgement and shared-delivery workloads, so the proposed optimization was rejected in closed PR #222. The broker still has broader serialized state and scheduling boundaries, and predictable concurrent p50/p99/p99.9 evidence remains incomplete.
 
 Constraints:
 
