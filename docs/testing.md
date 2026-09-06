@@ -88,7 +88,7 @@ The Criterion suite includes durable publish, legacy publish/poll/ack, two-membe
 - `just cluster-test` starts three real Raft-backed broker processes and verifies quorum replication, grouped and non-grouped delivery through follower forwarding, reassignment after node failure, retry limits, dead-letter recovery, follower restart, leader election, post-failure recovery, and recovery metrics through the public protocol.
 - `just cluster-replacement-test` explicitly enables the test-only permissive recovery feature and runs the experimental empty replacement-node snapshot recovery and interrupted snapshot transfer checks.
 - `just bench-test` runs the benchmark normalization and dashboard tests.
-- `just ci` runs verification, the smoke test, the container build, and the container benchmark smoke check.
+- `just ci` runs `just verify` and `just integration`; integration exercises the isolated process smoke and both single-node and three-node container smoke workflows, building an image unless a prebuilt integration image is supplied.
 
 Benchmark workflows, applicability, interpretation, and required handoff evidence are documented in [benchmarking.md](benchmarking.md). Workload semantics, comparison boundaries, and harness-specific options are documented in [scripts/benchmarks/README.md](../scripts/benchmarks/README.md).
 

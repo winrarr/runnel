@@ -67,7 +67,7 @@ Teams that require those properties should use an established system that provid
 
 ## How product decisions should be made
 
-Near-term work should improve the complete experience of the initial workloads before expanding the platform surface. In particular, the stable client contract, retention and disk-pressure behavior, overload control, replay, batching, security, observability, and single-node-to-cluster migration take priority over more sophisticated placement or additional distributed engines. This is sequencing, not a limit on the intended scale of the finished broker.
+The complete experience of the initial workloads defines product readiness: the stable client contract, retention and disk-pressure behavior, overload control, replay, batching, security, observability, and single-node-to-cluster migration must be dependable before the corresponding product promises are made. These readiness requirements do not prescribe the order of every development task. Early correctness work and reusable tests and benchmarks build implementation knowledge and regression protection for later features; long-horizon research helps evaluate viability and architectural options before implementation is scheduled.
 
 The three-node backend remains valuable before the single-node product is complete because it tests whether the public model and durability boundaries can grow without an application rewrite. Its role is to retire that architectural risk and establish the first distributed operating point. Later placement, balancing, membership, storage, and replication work should extend that foundation when evidence justifies it, while keeping unavoidable complexity primarily inside the broker and its administrative surfaces.
 

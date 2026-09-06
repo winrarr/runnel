@@ -1,18 +1,15 @@
 # Dead-letter recovery across durable boundaries
 
-- Status: exploratory design note; no runtime semantics are changed here
+- Status: exploratory design note; local identity/reconciliation slice implemented, broader recovery evidence remains open
 - Date: 2026-09-01
 - Related debt: [TD-017](../tech-debt.md#td-017-dead-letter-movement-spans-separate-durable-records)
 - Related decisions: [ADR 0014](../decisions/0014-local-retry-and-dead-letter-policy.md) and [ADR 0016](../decisions/0016-clustered-retry-and-dead-letter-policy.md)
 
-This note investigates the failure boundary in which dead-letter movement
-updates a source consumer and a derived stream. It is a design input for a
-future implementation, not an acceptance of new protocol behavior.
+This note investigates the failure boundary in which dead-letter movement updates a source consumer and a derived stream. It is a design input for further recovery work, not an acceptance of new protocol behavior. The local identity/reconciliation slice is now implemented; [ADR 0014](../decisions/0014-local-retry-and-dead-letter-policy.md) records current behavior and [TD-017](../tech-debt.md#td-017-dead-letter-movement-spans-separate-durable-records) separates its focused evidence from remaining failure-boundary work. The stages below are proposal context, not an instruction to repeat completed work.
 
 ## Outcome and non-goals
 
-The smallest useful local improvement is recovery reconciliation with a stable
-dead-letter move identity:
+The local reconciliation approach uses a stable dead-letter move identity:
 
 1. Keep the existing safety order: durably append the derived record before
    durably advancing the source consumer.
@@ -27,18 +24,13 @@ dead-letter move identity:
    progress unchanged and return a storage failure; a later poll/recovery
    attempt retries the same identity.
 
-The repository already has a durable request-aware record identity that is
-rebuilt from the stream log on open. Reusing that mechanism for an internal
-move identity is a hypothesis to validate, not a new public request contract.
+The implementation reuses durable request-aware record identity, rebuilt from the stream log on open, for an internal move identity. This is not a new public request contract.
 The identity must be scoped to the target stream and must reject a same-ID
 key/payload mismatch as corruption or an explicit storage error. The current
 public publish request-ID behavior, which intentionally ignores mismatched
 payloads for compatibility, is not sufficient for this internal invariant.
 
-This direction provides at most one durable derived record per move identity
-once implemented. It does not provide exactly-once delivery or exactly-once
-application processing: a dead-letter consumer can still be redelivered, and
-its external side effects remain the consumer’s responsibility.
+The full recovery goal is at most one durable derived record per move identity; current focused tests establish reuse after a completed target append, but do not close the remaining I/O failure and legacy-record gaps. It does not provide exactly-once delivery or exactly-once application processing: a dead-letter consumer can still be redelivered, and its external side effects remain the consumer’s responsibility.
 
 ## Current behavior and crash boundary
 
@@ -72,16 +64,12 @@ The meaningful process-crash states are:
 
 | Crash point | Durable state after recovery | Current result |
 | --- | --- | --- |
-| Before the target append reaches its durable point | Source remains eligible. Depending on the filesystem outcome, the target may be absent, have a torn tail that recovery truncates, or appear complete despite an uncertain sync. | Safe retry, no known loss; the operation may return an I/O error. The current path can duplicate even when recovery finds a complete-looking record. |
-| After the target append is durable, before the source event is durable | Target contains the copied record; source attempt state has not advanced. | The source is retried and a second target record can be appended. This is the TD-017 duplicate window. |
+| Before the target append reaches its durable point | Source remains eligible. Depending on the filesystem outcome, the target may be absent, have a torn tail that recovery truncates, or appear complete despite an uncertain sync. | The operation may return an I/O error. Ambiguous write/sync recovery requires further fault-injection evidence; a complete-looking record alone is not a durability proof. |
+| After the target append is durable, before the source event is durable | Target contains the copied record and internal move identity; source progress has not advanced. | New moves reuse the same-content target record before advancing source progress. A pre-source-persistence failure followed by reopen is covered; failures within the underlying write/sync remain open in TD-017. |
 | After the source event is durable | Target contains the record and source progress advances during recovery. | No second move is required for that source consumer and offset. |
 | Target write or source event has an ambiguous I/O result | The result depends on which bytes and sync boundaries reached durable storage. | The source must not be advanced on an unknown target result; recovery must inspect or retry using the same move identity. |
 
-The current dead-letter record carries only the original key and payload. It
-does not carry a source offset, source consumer, attempt history, or an
-idempotency identity. Those are separate provenance work tracked by TD-018;
-the recovery identity proposed here can remain internal even if provenance is
-later exposed to clients.
+The public dead-letter record exposes the original key and payload, without source offset, source consumer, or attempt-history provenance. New local records also persist an internal recovery identity that is not exposed as public provenance. Public provenance remains separate work tracked by TD-018.
 
 The clustered engine has a different boundary. A grouped `PollGroup` is one
 Raft command. In `apply_group_poll`, the original message is appended to the
@@ -162,7 +150,7 @@ The semantic contract for both engines should remain:
 
 | Alternative | Benefit | Cost or reason not selected as the smallest direction |
 | --- | --- | --- |
-| Keep append-then-checkpoint without an identity | Minimal code and already preserves no-loss ordering. | The known duplicate window remains; dead-letter consumers must deduplicate opaque copies. This is the current interim behavior, not a retirement of TD-017. |
+| Keep append-then-checkpoint without an identity | Minimal code and preserves the append-before-progress order. | This was the original local behavior; legacy records remain opaque. New moves now use reconciliation identity, while TD-017 retains the broader recovery gaps. |
 | Full local two-phase commit across source state and target log | Can make target visibility and source advancement one all-or-none transaction. | Requires a transaction coordinator or shared commit log, prepare/commit markers, recovery of prepared work, locking/order rules across two stream files, and format/version migration. It is not justified as the smallest first repair. |
 | Durable source outbox or pending-move journal plus a relay | Makes the intent to move recoverable even if the process stops before sending to the target and can provide operator-visible backlog. | Adds another durable state machine and relay lifecycle. Without target move-ID deduplication, a crash after target append still duplicates. It is a possible follow-on if lazy reconciliation is operationally insufficient. |
 | Put the local derived record in the source log or a single combined transaction log | Gives one physical durability boundary, similar to the current clustered state machine. | Changes local stream layout, target offsets, retention, recovery, and the separation between source and derived streams. It would also make a local storage choice dictate the future engine contract. |
