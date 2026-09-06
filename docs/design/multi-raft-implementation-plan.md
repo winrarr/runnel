@@ -2,15 +2,16 @@
 
 - Status: accepted direction; staged implementation plan
 - Last reviewed: 2026-09-06
+- Baseline: `origin/main` `16b3c63cd4478eb49b960a70565a718db8d235ac`
 - Scope: the smallest credible three-node implementation, designed to leave room for alternative distributed engines
 
-ADR 0004 accepts the distributed-engine direction and its initial defaults. This document records the staged implementation plan and the evidence gates that still apply before production clustering is enabled.
+ADR 0004 accepts the distributed-engine direction and its initial defaults. ADRs 0006, 0007, 0015, 0016, 0018, 0019, 0023, 0024, and 0026 refine the current lifecycle, recovery, delivery, placement, replay, identity, and engine-outcome boundaries. This document records the staged implementation plan and the evidence gates that still apply before production clustering is enabled.
 
 ## Current implementation status
 
-The repository now has a metadata Raft group, one group-addressed data Raft runtime per stream, versioned durable Raft and state-machine files, reconciled `Creating` to `Active` stream creation, framed TCP peer transport, `--engine raft` server selection, hostname-capable peer addresses, durable publish request deduplication, replicated shared-consumer ownership and retry/dead-letter outcomes, automatic consensus-log snapshots and purge, bounded snapshot chunks, lazy group materialization for replacement nodes, clustered storage identity validation, snapshot lifecycle metrics, real three-process failure tests, a separate test-only interrupted-transfer retry experiment, and a three-replica Kubernetes development manifest. The three-node process test is the current development profile, but the runtime accepts any non-empty configured peer set; three voters and one-failure quorum durability are not enforced by configuration validation. The current clustered state machine still stores retained messages in memory and JSON-based journal/checkpoint/snapshot files. Repeated interruption cost, broader observability, dynamic membership, placement, replica/replacement fencing, and the later stages remain necessary before treating clustered operation as production-ready.
+At this baseline, the repository has a metadata Raft group, one group-addressed data Raft runtime per stream, reconciled `Creating` to `Active` stream creation, framed TCP peer transport, `--engine raft` server selection, hostname-capable peer addresses, durable publish request deduplication, replicated shared-consumer ownership and retry/dead-letter outcomes, automatic consensus-log snapshots and purge, bounded snapshot chunks, lazy group materialization from committed metadata, clustered storage identity validation, snapshot lifecycle metrics, real three-process failure tests, a separate test-only interrupted-transfer retry experiment, and a three-replica Kubernetes development manifest. The shared engine boundary now includes bounded per-record publish batches, explicit offset replay, health, and stable error kind/outcome classification; the clustered engine uses the default per-record batch implementation and does not promise batch atomicity. The three-node process test is the current development profile, but the runtime accepts any non-empty configured peer set; three voters and one-failure quorum durability are not enforced by configuration validation. The current clustered state machine still owns retained messages in memory and persists a JSON write-ahead journal plus JSON checkpoint and complete-snapshot files. The peer protocol is length-bounded framed JSON without runtime version negotiation. Repeated interruption cost, broader observability, dynamic membership, placement, replica/replacement fencing, and the later stages remain necessary before treating clustered operation as production-ready. The [TD-008 static-cluster evidence](td-008-static-cluster-evidence.md), [TD-009 snapshot evidence](td-009-snapshot-evidence.md), and [TD-010 retained-state evidence](td-010-retained-state-evidence.md) record the corresponding limits.
 
-The current implementation evidence is intentionally narrower than the target invariants and stage exit criteria below. The persistent engine validates clustered storage identity and layout before opening groups, while `GroupManager` opens metadata and materializes data groups from committed stream metadata. The process-level cluster path covers publish, follower forwarding, grouped delivery, node failure, restart, and the test-only empty replacement experiment; it does not establish a production replacement, rolling-upgrade, or dynamic-membership contract. See the [persistent engine startup path](../../crates/runnel-raft/src/engine.rs), [group manager](../../crates/runnel-raft/src/group_manager.rs), and [cluster smoke tests](../../crates/runnel-server/tests/cluster_smoke.rs).
+The current implementation evidence is intentionally narrower than the target invariants and stage exit criteria below. The persistent engine validates clustered storage identity and layout before opening groups, while `GroupManager` opens metadata and materializes data groups from committed stream metadata. The process-level cluster path covers publish, replay, follower forwarding, grouped delivery, node failure, restart, and the test-only empty replacement experiment; it does not establish a production replacement, rolling-upgrade, or dynamic-membership contract. The current grouped path also replicates ownership, attempts, lease deadlines, and delivery tokens, while member registration and final clock/fencing policy remain unresolved. See the [persistent engine startup path](../../crates/runnel-raft/src/engine.rs), [group manager](../../crates/runnel-raft/src/group_manager.rs), [state-machine store](../../crates/runnel-raft/src/state_machine_store.rs), and [cluster smoke tests](../../crates/runnel-server/tests/cluster_smoke.rs).
 
 The configured three-node topology is a deployment convention rather than an engine invariant: `PersistentEngine` and the server parser do not reject one, two, or more configured peers. `InMemoryCluster` likewise supports arbitrary non-empty node sets for focused tests. Any future claim about tolerated node failures must therefore name the configured membership and quorum rather than relying on the plan's three-node wording.
 
@@ -58,7 +59,7 @@ OpenRaft is the better first fit. It supplies the asynchronous Raft runtime, rep
 
 TiKV's `raft` crate is a strong production-proven consensus core and remains the fallback if OpenRaft's runtime model becomes a measured limitation. It intentionally supplies only the consensus module: Runnel would have to implement and correctly order ticking, `Ready` processing, stable log writes, state-machine application, outbound messages, snapshots, and advancement. That control may eventually suit a thread-per-core runtime, but it creates substantially more integration and proof work for the first cluster. Its Prost build also expects `protoc` in the development environment unless the dependency is wrapped with a vendored toolchain, which conflicts with the preference for minimal setup.
 
-Do not implement Raft from scratch and do not start on OpenRaft 0.10 alpha. Keep a small library-evaluation test fixture so the decision can be revisited against a representative Runnel batch and storage adapter instead of synthetic consensus-only results.
+Do not implement Raft from scratch or upgrade to a newer OpenRaft line without a fresh compatibility and recovery evaluation. Keep a small library-evaluation test fixture so the decision can be revisited against a representative Runnel batch and storage adapter instead of synthetic consensus-only results.
 
 Relevant primary sources:
 
@@ -103,7 +104,7 @@ The exact crate names can be adjusted during the first structural change, but ow
 | Group manager | Hosts many group runtimes in one process, dispatches internal messages by group ID, and bounds per-group work |
 | Internal transport | Length-bounded framed peer protocol and bounded connection ownership per peer, carrying group-addressed Raft and forwarding traffic; protocol version negotiation remains future work |
 | Durable storage | Runnel-owned encodings and atomic apply contract over an interchangeable local storage implementation |
-| Public protocol | Topology-free client requests and explicit success, rejection, retryable, redirect-hidden, and unknown outcomes |
+| Public protocol | Topology-free client requests and explicit success, rejected, retryable, and unknown outcomes; physical redirects remain hidden |
 
 Only create an abstraction when the local and Raft implementations give it two real users. The first step should extract the smallest contract needed by both, not design a universal plugin framework. Engine selection should initially occur once at startup. Hot swapping, per-stream engine choice, and mixed-engine clusters require migration and compatibility protocols and remain future work.
 
@@ -139,15 +140,18 @@ Writes complete only after OpenRaft reports the command committed and durably ap
 
 Commands must contain all nondeterministic choices made by the leader. Followers must not generate timestamps, offsets, retry deadlines, or identities from their local clock or random source while applying a command.
 
-The first data-group command family should cover:
+The initial data-group command family now covers:
 
 - publish a record with stable producer/request identity, payload, optional ordering key, assigned logical position, and leader-selected timestamp;
+- read a committed record for ordinary poll or explicit offset replay without exposing uncommitted state;
 - advance a durable consumer checkpoint after validating the acknowledgement against the delivered record;
+- assign shared-consumer ownership with a leader-selected lease deadline and token, record attempts, and apply stale-delivery fencing;
+- commit source progress and the derived dead-letter record together when the configured attempt limit is reached; and
 - create any stream-local durable metadata required for those operations.
 
 Application produces a stable request ID before retrying. The current clustered state stores a durable map from stream/request identity to the committed offset; the map is not bounded by the implementation, and conflicting payload or key reuse is not currently reported as a distinct outcome. If the client loses its connection after submission and cannot prove whether commit occurred, the response is `unknown`; retrying the same identity resolves to the original offset when the identity is retained.
 
-In-flight delivery leases and acknowledgement deadlines may remain reconstructible volatile state in the first version. The durable checkpoint is replicated. Consumer groups, ownership epochs, and incremental rebalance are later commands, but consumer identity and state must not be encoded as local file ownership.
+The initial clustered implementation replicates in-flight delivery ownership, attempts, absolute lease deadlines, and fencing tokens alongside the durable checkpoint. This is a failover baseline, not a final clock or lease policy: the configured timeout must be consistent across nodes, the lease-clock floor only advances when commands observe time, and there is no durable member registry or incremental rebalance. Consumer identity and state must not be encoded as local file ownership.
 
 ## Storage, snapshots, and recovery
 
@@ -157,7 +161,7 @@ Maintain three explicit layers:
 2. the durable materialized broker state used for retention, replay, consumer progress, and deduplication;
 3. a versioned snapshot that lets a replacement replica reconstruct the state machine independently of purged consensus entries.
 
-Applying a committed command atomically writes its broker-state changes and last-applied log identity. Reapplication after a crash is a no-op or returns the same outcome. A publish is not acknowledged until that durable apply has completed locally after quorum commit. The current implementation provides this boundary with a Runnel-owned JSON journal plus checkpoint and snapshot files; it has not yet introduced the proposed interchangeable transactional storage adapter.
+Applying a committed command first appends a Runnel-owned journal record and syncs it before moving the command into the in-memory materialized state. On reopen, journal replay skips entries at or before the recovered applied-log boundary and reconstructs the state from the durable record; stable publish request IDs provide application-level duplicate suppression, but this is not a guarantee that an arbitrary command is safe to apply twice. A publish is not acknowledged until that durable apply has completed locally after quorum commit. The current implementation provides this write-ahead/replay boundary with JSON journal, checkpoint, and snapshot files; it is not an atomic embedded-database transaction and has not introduced the proposed interchangeable transactional storage adapter.
 
 The first snapshot may be a consistent snapshot of the embedded state store. The interface should describe a snapshot manifest and byte stream, not a database-specific file path. A future extent engine can snapshot metadata and immutable extent manifests while transferring payload extents separately. Snapshot creation must coexist safely with continued applies, and installation must use a staged, validated, atomic cutover.
 
@@ -177,19 +181,19 @@ Exit evidence: accepted ADR, clean pinned-toolchain build of the selected librar
 
 ### Stage 1: establish the semantic engine seam (implemented; broader outcome work remains)
 
-- Define topology-free broker command, query, outcome, durability, and error types from current behavior.
-- Adapt the existing local implementation as the first engine without changing its public behavior.
-- Move shared conformance cases for publish, poll, acknowledge, redelivery, restart, and ambiguous outcomes to an engine test suite.
-- Add stable producer/request identity to the provisional protocol before clustered retries depend on it.
+- The current seam defines topology-free broker command, query, outcome, durability, and error types from current behavior.
+- The existing local implementation is adapted as the first engine without changing its public behavior.
+- Shared conformance cases now cover publish, independent and shared poll, acknowledge, redelivery, replay, publish batches, restart, key ordering, and error classification.
+- Keep stable producer/request identity in the provisional protocol before clustered retries depend on it; its retention and conflict policy remain open.
 
-Exit evidence: the local broker passes all existing tests plus the engine conformance suite, and no Raft type crosses the engine boundary.
+Exit evidence: the local broker and the persistent clustered engine pass the applicable shared contract assertions, the batch contract remains explicitly non-atomic, and no Raft type crosses the engine boundary. Stage 1 does not imply that the public wire protocol exposes stage-aware outcomes.
 
 ### Stage 2: prove one durable replicated stream (implemented as a development slice; evidence gaps remain)
 
-- Add the OpenRaft adapter, versioned internal transport, group manager, and durable storage adapter.
+- The development slice uses an OpenRaft adapter, length-bounded framed internal transport, group manager, and versioned Runnel-owned persistence boundary; an interchangeable transactional storage adapter remains future work.
 - Run one statically identified data group across three independent local processes.
 - Support durable publish, leader-routed poll, and durable acknowledgement for that stream.
-- Make forwarding, duplicate requests, retryable failures, and unknown outcomes explicit.
+- Make forwarding, duplicate requests, retryable failures, and unknown outcomes explicit; protocol-level outcome and stage reporting remains future work.
 - Add process-kill and restart tests at proposal, persistence, commit, apply, and response boundaries.
 
 Exit evidence: a three-process test demonstrates quorum commit, leader loss, redelivery, duplicate suppression, restart, and no observation of uncommitted records.
@@ -198,7 +202,7 @@ This intentionally fixed-stream milestone is a test fixture, not the public clus
 
 ### Stage 3: add replicated metadata and stream lifecycle
 
-The initial slice of this stage is implemented. Metadata and data groups are separate, stream creation records `Creating`, prepares the data group on the configured nodes, initializes its durable state, and then records `Active`. Group-addressed peer RPCs and restart restoration keep per-stream runtimes independent. The remaining work in this stage is stronger reconciliation and failure-boundary coverage, including durable consumer ownership and cases where membership or placement changes during creation.
+The initial slice of this stage is implemented. Metadata and data groups are separate, stream creation records `Creating`, prepares the data group on the configured nodes, initializes its durable state, and then records `Active`. Group-addressed peer RPCs and restart restoration keep per-stream runtimes independent. Shared-consumer ownership and retry/dead-letter outcomes are now replicated in the data group; the remaining work is stronger reconciliation and failure-boundary coverage, including process failure at each creation boundary and cases where configured membership or future placement changes during creation. Durable member registration and placement-aware ownership remain later work.
 
 - Add the metadata group and stable cluster, node, stream, and group identities.
 - Implement idempotent bootstrap and reconciled `Creating` to `Active` stream lifecycle.
@@ -211,7 +215,7 @@ Exit evidence: streams can be created through the existing public intent on any 
 
 - Add cluster health, per-group leadership and replication lag metrics, quorum/readiness semantics, storage pressure, and forwarding metrics. Aggregate health and snapshot lifecycle metrics exist; per-group leadership/lag, storage pressure, and forwarding-specific metrics remain incomplete.
 - Add bounded admission, queue, batch, connection, and timeout configuration with strong defaults. Public request connections, frames, in-flight work, and request duration are bounded; per-group Raft queues, batching policy, and internal resource budgets remain incomplete.
-- Add graceful shutdown that stops admission, drains only within a deadline, transfers leadership when practical, and never weakens acknowledged durability.
+- Add graceful shutdown that stops admission, drains only within a deadline, transfers leadership when practical, and never weakens acknowledged durability. The server now stops new work, cancels frame reads, and drains listener tasks under a fixed deadline; leadership transfer and cluster-wide drain semantics are not implemented.
 - Provide one local `just` workflow that starts three real processes and drives the CLI through creation, publish, consume, acknowledgement, failover, and restart.
 - Add a three-replica Kubernetes development manifest with independent persistent volumes and broker-owned bootstrap semantics.
 
@@ -235,7 +239,7 @@ Use several complementary layers:
 - OpenRaft storage-contract tests and restart tests for every persisted transition;
 - deterministic simulated-network tests for elections, partitions, delayed messages, duplicate messages, and stale leaders (not yet present; the current in-memory cluster exercises OpenRaft with an in-memory transport but does not provide fault injection);
 - real three-process tests using temporary directories and dynamically allocated ports;
-- fault-injection tests that kill a process after durable write, before response, during snapshot, and during stream creation (only selected process-failure and test-only snapshot interruption cases exist today);
+- fault-injection tests that kill or interrupt a process after durable write, before response, during snapshot, and during stream creation (the current suite covers selected leader/follower process failures, preserved-state restart, and test-only snapshot-transfer interruption, but not response-loss or every persistence boundary);
 - model or property tests for monotonic committed positions, no conflicting committed leaders, deduplication, and checkpoint monotonicity (not yet present as a model/property suite);
 - local cluster smoke tests driven through `runnelctl`, not through internal test hooks;
 - benchmark profiles that state hardware, topology, storage, fsync policy, batch size, and failure state.
@@ -263,7 +267,7 @@ These remain design constraints. The initial identities, lifecycle states, seman
 |---|---|
 | A consensus library bug or breaking API change | Pin a reviewed 0.9 patch, isolate it, run fault tests, and keep Runnel-owned stored encodings |
 | Raft log incorrectly becomes retained message history | Separate consensus, materialized state, and snapshot contracts and test retention-independent compaction |
-| Crash between commit and broker-state materialization | Atomic applied-state transaction plus idempotent command identity and restart replay tests |
+| Crash between commit and broker-state materialization | Durable state-machine write-ahead journal, idempotent command identity, and restart replay tests; replace with a transactional applied-state adapter only after the storage evidence gate |
 | Partial stream creation leaks unusable groups | Persist lifecycle state and reconcile idempotently |
 | Forwarding creates loops or duplicate writes | Origin-side bounded forwarding attempts, stable request IDs, and durable deduplication; recursive peer forwarding is not part of the current path |
 | One process accumulates too many tasks and timers | Start with few groups; measure idle memory, task count, timers, file descriptors, and group density |
@@ -281,8 +285,8 @@ ADR 0004 accepts the following defaults:
 3. Three static voters in the initial development profile, one metadata group, and one data group per stream, with all first-version groups replicated to all three configured nodes. The runtime does not currently enforce this membership shape.
 4. Any-node client access with internal forwarding; committed leader-authorized commands for the initial read and write paths. A separate linearizable read-index contract is not yet established.
 5. Publish success only after quorum commit and durable state-machine apply.
-6. Replicate durable consumer checkpoints with stream data; keep delivery deadlines reconstructible and volatile initially.
+6. Replicate durable consumer checkpoints and the initial shared-consumer ownership, attempt, lease-deadline, and fencing state with stream data; keep the final clock, member-lifecycle, and fencing policy open.
 7. Evaluate redb as a possible first transactional durable adapter, with a short evidence gate against Fjall and the current append log; no clustered storage engine has been accepted yet.
 8. Keep local and Multi-Raft engines selectable only at process startup; defer mixed engines and live migration.
 
-The current implementation has completed the semantic seam, versioned durable Raft/state-machine files, framed TCP peer transport, topology-free client forwarding, committed data-group command handling for reads and writes, durable publish request deduplication, replicated shared-consumer ownership, clustered retry and dead-letter outcomes, server engine selection, and a real three-process failure test. The remaining Stage 2 evidence includes explicit stale-participant behavior and broader storage/transport fault coverage; Stage 4 still needs per-group operational signals, internal resource bounds, and production failure/upgrade policy.
+The current implementation has completed the semantic seam (including publish batches, replay, shared-delivery assertions, and engine error classification), versioned durable Raft/state-machine files, framed TCP peer transport, topology-free client forwarding, committed data-group command handling for reads and writes, durable publish request deduplication, replicated shared-consumer ownership, clustered retry and dead-letter outcomes, server engine selection, graceful listener drain, and real three-process failure tests. The remaining Stage 2 evidence includes explicit stale-participant behavior, response-loss/unknown resolution, and broader storage/transport fault coverage; Stage 3 still needs stronger lifecycle reconciliation and durable member semantics; Stage 4 still needs per-group operational signals, internal resource budgets, leadership handoff semantics, and production failure/upgrade policy. These gaps are tracked separately in the [clustered outcome contract](clustered-outcome-contract.md), [durability and delivery policy](durability-delivery-policy.md), [recovery research](../research/raft-recovery-and-replacement.md), and [static-cluster evidence](td-008-static-cluster-evidence.md).
