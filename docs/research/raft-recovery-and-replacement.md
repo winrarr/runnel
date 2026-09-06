@@ -2,15 +2,20 @@
 
 - Status: exploratory evidence note; no replacement implementation authorized
 - Last reviewed: 2026-09-06
-- Baseline: `origin/main` `8dc9eb2955fbaffc0b7dae158acb0fb88300841a`
+- Baseline: `origin/main` `8a35c83c239bfeacac9e071d71e0cbafca47f23a`
 - Scope: the early static Multi-Raft backend, ordinary process restart,
   snapshot transfer, and replacement of a node whose local state is missing
   or inconsistent
 - Related: [ADR 0004](../decisions/0004-multi-raft-first-distributed-engine.md),
   [ADR 0007](../decisions/0007-snapshot-based-replica-recovery.md),
   [ADR 0018](../decisions/0018-safe-replica-recovery-boundary.md),
+  [ADR 0019](../decisions/0019-clustered-storage-identity.md),
+  [ADR 0023](../decisions/0023-independent-retained-storage-and-placement.md),
+  [TD-007 storage compatibility evidence](../design/td-007-storage-compatibility-evidence.md),
   [TD-008 static-cluster evidence](../design/td-008-static-cluster-evidence.md),
-  and [TD-009 snapshot evidence](../design/td-009-snapshot-evidence.md)
+  [TD-009 snapshot evidence](../design/td-009-snapshot-evidence.md),
+  [TD-010 retained-state evidence](../design/td-010-retained-state-evidence.md),
+  and [stable work placement](../design/stable-work-placement.md)
 
 This note records external recovery evidence and the current Runnel boundary.
 It is not a production replacement procedure, a public protocol proposal, or
@@ -53,7 +58,9 @@ Raft groups. [`engine.rs`](../../crates/runnel-raft/src/engine.rs#L804-L862)
 `GroupManager` opens the metadata group first and restores data groups from
 their validated `group.json` manifests. A stream data group may also be
 materialized lazily from committed metadata when a peer requests an unknown
-group, which is necessary for the snapshot experiment. [`group_manager.rs`](../../crates/runnel-raft/src/group_manager.rs#L112-L216)
+group, which is necessary for the snapshot experiment. This is group
+bootstrap, not a supported replica-replacement or membership protocol.
+[`group_manager.rs`](../../crates/runnel-raft/src/group_manager.rs#L112-L216)
 [`group_manager.rs`](../../crates/runnel-raft/src/group_manager.rs#L228-L335)
 [`inbound.rs`](../../crates/runnel-raft/src/network/inbound.rs#L50-L115)
 
@@ -69,8 +76,9 @@ The current persistent artifacts have separate roles:
 
 The Raft log's committed pointer and entry indexes are checked for impossible
 or contradictory combinations, including gaps, entry/index mismatches,
-committed progress beyond the persisted log, and a committed entry with no
-persisted log. [`log_store.rs`](../../crates/runnel-raft/src/log_store.rs#L67-L205)
+and committed progress that is beyond both the retained log and the purge
+boundary. An entry compacted behind a recorded purge boundary is an expected
+recovery case, not an invalid missing entry. [`log_store.rs`](../../crates/runnel-raft/src/log_store.rs#L67-L205)
 
 State-machine open chooses a newer snapshot over an older checkpoint when the
 snapshot's applied log is after the checkpoint, then replays journal entries
@@ -87,6 +95,29 @@ configuration; although OpenRaft membership is persisted as part of group
 state, there is no durable node incarnation or supported membership-transition
 and replacement lifecycle in the current public or operational interface.
 
+### Static topology and placement boundary
+
+The current cluster uses one metadata group and one data group per stream. A
+newly initialized group takes its voters from the configured peer map, and the
+three-process scenarios are a development profile rather than an engine
+invariant: configuration does not establish that every deployment has three
+nodes or tolerates one failure. There is no supported add, remove, learner,
+promotion, or dynamic replica assignment operation. Claims about quorum or
+failure tolerance must therefore name the configured membership and the
+observed scenario. [`engine.rs`](../../crates/runnel-raft/src/engine.rs#L804-L862)
+[`group_manager.rs`](../../crates/runnel-raft/src/group_manager.rs#L358-L433)
+[`TD-008 static-cluster evidence`](../design/td-008-static-cluster-evidence.md#observed-baseline)
+
+Replica placement and shared-consumer work placement are separate concerns.
+The current backend has no durable placement map, movement, split, balancing,
+or replica handoff. [ADR 0023](../decisions/0023-independent-retained-storage-and-placement.md)
+accepts a future hidden placement identity distinct from the public stream,
+but implementation is deferred. The [stable work placement design](../design/stable-work-placement.md)
+is an exploratory scheduler proposal for consumer execution lanes; it does not
+establish replica placement, membership, or replacement safety. Recovery and
+membership/fencing evidence must be established before placement movement is
+treated as supported.
+
 ### Snapshot build, transfer, and installation
 
 The current state-machine snapshot includes the complete materialized state of
@@ -101,7 +132,8 @@ protocol.
 Snapshot creation serializes a borrowed view while holding the state read lock,
 then persists the complete encoded image and compacts the apply journal. This
 avoids cloning every retained message before encoding but remains proportional
-to the complete materialized state. The current defaults trigger snapshots
+to the complete materialized state; the JSON wrapper also adds representation
+overhead beyond the encoded payload. The current defaults trigger snapshots
 after 32 log entries, retain four entries, and bound peer chunks at 64 KiB;
 these are conservative development defaults, not measured production tuning.
 [`group_manager.rs`](../../crates/runnel-raft/src/group_manager.rs#L23-L31)
@@ -112,6 +144,10 @@ snapshot in memory, validates the complete payload, persists the snapshot and
 checkpoint, compacts the journal, and only then publishes the new in-memory
 state and snapshot cache. A failed install therefore leaves the prior
 in-memory state and current snapshot visible in the tested failure boundary.
+If a later durable step fails after an earlier atomic write, restart may
+recover a complete newer snapshot even though the live process retained its
+previous state; this is a previous-valid-or-complete-newer boundary, not an
+all-files-unchanged rollback guarantee.
 [`outbound.rs`](../../crates/runnel-raft/src/network/outbound.rs#L557-L583)
 [`state_machine_store.rs`](../../crates/runnel-raft/src/state_machine_store.rs#L781-L855)
 
@@ -151,9 +187,10 @@ identity in a production cluster. [`cluster_smoke.rs`](../../crates/runnel-serve
 The experiment does not test partitions, corruption during transfer,
 disk-full behavior, response loss at each persistence boundary, durable
 membership changes, resumable transfer, promotion fencing, rollback, or
-mixed-version operation. The default `cluster-test` path deliberately excludes
-the permissive feature and covers preserved-state follower restart, leader
-failure, forwarding, and clustered consumer recovery instead.
+mixed-version operation. It also does not establish a three-node quorum rule
+for arbitrary deployments. The default `cluster-test` path deliberately
+excludes the permissive feature and covers preserved-state follower restart,
+leader failure, forwarding, and clustered consumer recovery instead.
 
 ## External evidence
 
@@ -201,6 +238,9 @@ not accepted design decisions:
 - Preserve explicit failure outcomes. A transfer or recovery request that
   times out after the source may have committed must not be silently treated as
   an uncommitted operation.
+- Keep recovery and membership evidence ahead of placement movement. A future
+  hidden placement unit or consumer work lane must not be used to imply that a
+  replica has been fenced, caught up, or promoted.
 
 Candidate directions to compare before implementation are:
 
@@ -230,6 +270,9 @@ mandate a particular OpenRaft API or file layout.
 - Cluster identity, group identity, node incarnation, and active membership
   are durable and validated. Reusing a node ID cannot make an old or
   contradictory participant authoritative.
+- The claimed quorum and failure tolerance name the configured membership; the
+  current three-process development profile is not a universal engine
+  invariant. Replica placement and consumer work placement remain distinct.
 - Add, remove, learner, promotion, and fencing transitions preserve a
   failure-surviving quorum at every committed boundary and define behavior
   when the target is unavailable or recovery is interrupted.
