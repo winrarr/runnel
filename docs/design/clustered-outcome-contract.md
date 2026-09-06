@@ -3,7 +3,7 @@
 - Status: proposed design note; not an accepted wire or compatibility decision
 - Date: 2026-09-03
 - Last reviewed: 2026-09-06
-- Baseline: `62815a56e5b418152532fd05999f7a72fc47a008`
+- Baseline: `006cd720046808c32f325f8de18694ce95d798b5`
 - Scope: clustered writes, leader forwarding, client retry boundaries, and the evidence required to make those behaviors public
 - Related work: [clustered durability and outcomes backlog item](../backlog.md#make-clustered-durability-and-outcomes-explicit), [current architecture](../architecture.md), [Multi-Raft implementation plan](multi-raft-implementation-plan.md), [protocol compatibility design](protocol-compatibility.md), and [ADR 0026](../decisions/0026-semantic-engine-error-classification.md)
 
@@ -24,16 +24,46 @@ The contract has four attempt outcomes:
 
 `unknown` describes the result of one attempt, not a permanent broker state. Reusing the stable operation identity must eventually return the original result, a definitive rejection, or an explicitly documented unresolved result while the identity is retained. A client must not infer “not applied” from a timeout, EOF, or lost response.
 
+## Outcome and stage are separate dimensions
+
+An outcome answers what the caller may safely do next. A stage answers the
+furthest broker-side progress point that the broker can establish for that
+attempt. They must not be collapsed into one enum or inferred from a transport
+error:
+
+| Dimension | Meaning | Topology-neutral vocabulary | What it must not imply |
+| --- | --- | --- | --- |
+| Outcome | Whether the intent is confirmed, definitely not applied, safe to retry, or unresolved. | `confirmed`, `rejected`, `retryable`, `unknown` | A particular storage primitive, Raft term, node, or response path. |
+| Stage | The last authoritative point known to have been reached. | `received`, `validated`, `proposed`, `committed`, `applied`, `responded`, or `unknown` | That later stages were not reached, especially after a disconnect or cancellation. |
+
+The stage vocabulary is illustrative and describes evidence, not a required
+API. A future public response can use different names if it preserves the same
+ordering and uncertainty rules. `responded` is evidence that the response was
+produced, but only a client-observed success response is `confirmed`. An
+`applied` stage with a lost response remains `unknown` unless the operation's
+stable identity resolves the result. Conversely, `retryable` is valid only
+when the broker can prove that no durable proposal or application occurred;
+`validated` alone is not proof if work was forwarded or queued after that
+point.
+
+The engine classification intentionally exposes only the outcome boundary:
+`BrokerError::kind()` is a semantic reason and `BrokerError::outcome()` is a
+safe retry classification. It does not claim to know a stage for every
+failure, and it must not be extended with backend stages merely to make a
+future wire response convenient. Stage evidence belongs at the layer that can
+observe it, while the public contract should describe the evidence without
+leaking topology or persistence layout.
+
 ## Current behavior and the target durability point
 
 The current layers already provide most of the mechanical boundary needed for this contract:
 
 | Layer | Current behavior | Contract consequence |
 | --- | --- | --- |
-| `runnel-engine` | Mutations return `Result<T, BrokerError>`. `BrokerError::kind()` provides a stable semantic reason and `BrokerError::outcome()` classifies failures as rejected, retryable, or unknown; successful `Result` values are confirmed. Concrete variants and diagnostic sources remain available. | The engine now has a backend-independent failure boundary. It still does not expose consensus stage or durability evidence, so the versioned public outcome contract remains future work. |
+| `runnel-engine` | Operations return `Result<T, BrokerError>`. `BrokerError::kind()` provides a stable semantic reason and `BrokerError::outcome()` classifies failures as rejected, retryable, or unknown; successful results are confirmed at the engine boundary. Concrete variants and diagnostic sources remain available. | The engine has a backend-independent outcome boundary, but it does not expose operation stage or a universal durability point. A caller must not treat a `BrokerError` variant or its text as stage evidence. |
 | `runnel-raft` | Stream and consumer mutations use OpenRaft `client_write`; the static cluster has three voters and forwards requests to a group leader. | A successful mutation is intended to mean committed and applied, not merely accepted by a follower. |
 | Durable storage | Consensus log entries are persisted with `sync_all`; the state-machine journal is synced before in-memory application; snapshots include broker state and dedup/checkpoint state. | Recovery must test both the consensus record and the materialized broker state. Filesystem and hardware flush semantics remain an explicit assumption. |
-| Server/protocol | v1 returns `Published` or an error with `code` and `message`; `not_leader` is mapped to `cluster_error`. | v1 does not expose authoritative outcome classes or a commit/apply stage. Generic `cluster_error` cannot safely drive automatic retry. |
+| Server/protocol | v1 returns `Published` or an error with `code` and `message`; `NotLeader` is mapped to `cluster_error`. | v1 does not expose authoritative outcome classes or a commit/apply stage. Generic `cluster_error` cannot safely drive automatic retry, even though the engine can classify an internal `NotLeader` as retryable. |
 | Client | A successful response is `Confirmed`; local encoding errors are `Rejected`; pre-connect failures are `Retryable`; write/read/EOF/timeout failures after request work begins are `Unknown`. No automatic replay is performed. | This is a useful v1 client safety baseline, but the broker must eventually provide the evidence needed to resolve unknowns. |
 
 The target success point for a mutating operation in one data group is:
