@@ -2,7 +2,7 @@
 
 - Status: exploratory design note; not an accepted compatibility decision
 - Last reviewed: 2026-09-06
-- Baseline: `cfedaed1fa7f7e980cfd62db68de398c2ce53873`
+- Baseline: `8e7857221870a205553c94fa88df45a0dda1c991`
 - Reading guide: [design-note conventions](README.md)
 - Scope: backlog outcome [Make growth from one node to a cluster non-disruptive](../backlog.md#make-growth-from-one-node-to-a-cluster-non-disruptive) and [TD-004](../tech-debt.md#td-004-local-and-clustered-durable-state-have-no-supported-migration-path)
 
@@ -44,9 +44,9 @@ boundary; it does not turn the current engine into a migration service.
 | Classification | Evidence in the current repository | Consequence for this note |
 | --- | --- | --- |
 | Observed local behavior | The local broker selects one durable writer format at startup, scans known `RNL1`, `RNL2`, and `RNL3` frame magics, truncates an incomplete trailing frame during normal recovery, and persists consumer checkpoints/journal events. Active delivery members, tokens, and `Instant` deadlines are process memory. See [`BrokerState::open`](../../crates/runnel-core/src/broker.rs), [`StreamLog::open`](../../crates/runnel-core/src/stream_log.rs), and the recovery tests in [`runnel-core`](../../crates/runnel-core/src/lib.rs). | A converter can preserve logical records and durable consumer state only after a normal source recovery boundary. It cannot copy volatile delivery ownership. |
-| Observed clustered behavior | The clustered engine selects the Raft backend at process startup. Startup validates clustered storage identity and persisted artifacts before opening groups; stream creation reconciles metadata `Creating`/`Active` state with one data group per stream and the configured peer set. See [`PersistentEngine::open_with_config`](../../crates/runnel-raft/src/engine.rs), [`GroupManager`](../../crates/runnel-raft/src/group_manager.rs), and [`SnapshotState`](../../crates/runnel-raft/src/state_machine.rs). | A fresh target can be populated only through a future logical import path. The existing public `Publish`, `CreateStream`, and snapshot-recovery paths are not a local-to-cluster interchange format. |
-| Observed absence | There is no migration command, import/export schema, durable migration phase, writer-fence epoch, endpoint-generation owner, or migration-specific status/metric in the current code. The engine now exposes backend-independent failure kind and safe attempt-outcome classification, but the provisional server still emits its existing error codes and has no migration or stage-aware outcome vocabulary. Existing clustered identity checks intentionally reject ambiguous state; they do not convert it. The current tests cover local recovery and clustered restart/failure, not cross-engine migration. | Any phase, fence, activation, rollback, or migration-status behavior below is proposed work and must not be described as current support. |
-| Proposed first supported slice | Side-by-side logical export/import into an empty, current three-node target, with a source fence for the final boundary, validation before serving, external endpoint cutover, and source retention until the recovery window ends. | This is the narrow retirement shape for TD-004. It preserves the application messaging model, not zero downtime or automatic downgrade. |
+| Observed clustered behavior | The clustered engine selects the Raft backend at process startup. Startup validates clustered storage identity and persisted artifacts before opening groups; stream creation reconciles metadata `Creating`/`Active` state with one data group per stream and the configured peer set. The current layout uses `storage.json`, `groups/metadata`, and `groups/data/<hex-stream>` with an identity-bearing `group.json`. See [`PersistentEngine::open_with_config`](../../crates/runnel-raft/src/engine.rs), [`GroupManager`](../../crates/runnel-raft/src/group_manager.rs), [`StateMachineStore`](../../crates/runnel-raft/src/state_machine_store.rs), and [`SnapshotState`](../../crates/runnel-raft/src/state_machine.rs). The detailed current artifact/version evidence is in the [TD-007 compatibility note](td-007-storage-compatibility-evidence.md) and [TD-009 snapshot note](td-009-snapshot-evidence.md). | A fresh target can be populated only through a future logical import path. The existing public `Publish`, `CreateStream`, and snapshot-recovery paths are not a local-to-cluster interchange format. |
+| Observed absence | There is no migration command, import/export schema, durable migration phase, writer-fence epoch, endpoint-generation owner, or migration-specific status/metric in the current code. The engine now exposes backend-independent failure kind and safe attempt-outcome classification, but the provisional server still emits its existing error codes and has no migration or stage-aware outcome vocabulary. Existing clustered identity checks intentionally reject ambiguous state; they do not convert it. Current snapshot and peer metrics describe recovery activity only. The current tests cover local recovery and clustered restart/failure, not cross-engine migration. | Any phase, fence, activation, rollback, or migration-status behavior below is proposed work and must not be described as current support. |
+| Proposed first supported slice | Side-by-side logical export/import into an empty target using the configured static voter set (the initial supported shape is three nodes), with a source fence for the final boundary, validation before serving, external endpoint cutover, and source retention until the recovery window ends. | This is the narrow retirement shape for TD-004. It preserves the application messaging model, not zero downtime or automatic downgrade. |
 
 The current evidence is useful but deliberately weaker than migration evidence.
 Local tests cover request-ID recovery, mixed legacy/versioned frame replay,
@@ -63,6 +63,15 @@ application-shaped typed-client restart flow and ambiguous dead-letter
 reconciliation, but those tests still keep one engine and one durable
 representation throughout ([`client_path.rs`](../../crates/runnel-server/tests/client_path.rs),
 [`server_smoke.rs`](../../crates/runnel-server/tests/server_smoke.rs)).
+
+The later storage and engine evidence notes refine this boundary without
+changing it: [TD-007](td-007-storage-compatibility-evidence.md) records the
+tested read-forward and fail-closed storage cases, [TD-008](td-008-static-cluster-evidence.md)
+separates static-cluster evidence from replacement support, [TD-009](td-009-snapshot-evidence.md)
+and [TD-010](td-010-retained-state-evidence.md) document snapshot and retained-state
+cost boundaries, and the [clustered outcome contract](clustered-outcome-contract.md)
+keeps safe attempt outcomes separate from operation-stage evidence. None of
+those notes implements or authorizes migration.
 
 The test-to-claim mapping is:
 
@@ -90,12 +99,12 @@ explicitly defers mixed engines and live engine migration.
 
 | State | Current representation | Migration consequence |
 | --- | --- | --- |
-| Stream history | `streams/<stream>.log`, with legacy `RNL1`, versioned `RNL2`, and request-aware `RNL3` record families. Each frame carries a logical offset, publish timestamp, optional UTF-8 key, payload lengths, and, for `RNL3`, a request ID. | Read records in logical offset order and write an explicitly versioned import representation. Preserve fields and bytes, not the local frame layout or file name. A mixed valid frame history is a source format case, not a target cluster format. |
-| Recovery/index state | The local log scans complete frames on open, truncates only an incomplete trailing frame, retains a bounded recent index, and uses a bounded sparse index for older reads. | Export only after normal recovery has established a complete source boundary. A malformed complete frame is a validation failure; it must not be skipped or turned into a gap. |
+| Stream history | `streams/<stream>.log`, with legacy `RNL1`, versioned `RNL2`, and request-aware `RNL3` record families. Each frame carries a logical offset, publish timestamp, optional UTF-8 key, payload lengths, and, for `RNL3`, a request ID. Current versioned/request-aware writers bound keys to 128 bytes, payloads to 64 MiB, and request IDs to 1 KiB. | Read records in logical offset order and write an explicitly versioned import representation. Preserve fields and bytes, not the local frame layout or file name. A mixed valid frame history is a source format case, not a target cluster format. |
+| Recovery/index state | The local log scans complete frames on open, truncates only an incomplete trailing frame, retains a bounded recent index, and uses a bounded sparse index for older reads. The async engine dispatches this synchronous work through bounded per-stream storage lanes; those lanes are execution isolation, not a migration boundary. | Export only after normal recovery has established a complete source boundary. A malformed complete frame is a validation failure; it must not be skipped or turned into a gap. |
 | Producer retry identity | The local `request_ids` map is rebuilt from request-aware frames. A repeated request ID returns its first recovered offset and, for public publishes, preserves the current behavior of ignoring a key/payload mismatch. | Export every recovered request ID and its original offset. The importer must reject an offset mismatch or duplicate conflicting mapping, while preserving the current public retry result. Records without a request ID remain non-deduplicated. |
-| Ordinary and grouped consumer state | `consumers/<stream>/<consumer>.json` contains `committed_offset`, out-of-order `acknowledged_offsets`, and `delivery_attempts`. The adjacent `.json.tmp` path is an append-only event journal with a bounded size and atomic checkpoint compaction. | Convert the logical state into the clustered consumer-state schema. Do not copy the JSON file as if it were a clustered snapshot. Validate every offset against the imported stream and preserve attempts. |
+| Ordinary and grouped consumer state | `consumers/<stream>/<consumer>.json` contains `committed_offset`, out-of-order `acknowledged_offsets`, and `delivery_attempts`. The adjacent `.json.tmp` path is an append-only event journal with a bounded size; checkpoint compaction writes a separate `.checkpoint.tmp` file and renames it into place. | Convert the logical state into the clustered consumer-state schema. Do not copy the JSON file or either temporary path as if it were a clustered snapshot. Validate every offset against the imported stream and preserve attempts. |
 | Active deliveries | Local in-flight ownership, deadlines, and delivery tokens are process memory. Attempts are persisted before a delivery is returned, but local tokens do not survive restart. | Do not transfer local tokens, members, or `Instant` deadlines. At the fence, outstanding deliveries become eligible redeliveries on the target; an acknowledgement that races after the fence is rejected and must be retried against the target. |
-| Stream names and paths | Names are restricted to 1–128 ASCII letters, digits, `.`, `_`, and `-`; names are later used below the local `streams` and `consumers` directories. | Validate names before export and again before import. A migration tool must never accept an arbitrary source path or infer a name from an unsafe filename. |
+| Stream and consumer names/paths | Stream, consumer, and member names are restricted to 1–128 ASCII letters, digits, `.`, `_`, and `-`; stream and consumer names are later used below the local `streams` and `consumers` directories. | Validate names before export and again before import. A migration tool must never accept an arbitrary source path or infer a name from an unsafe filename. |
 
 The local durable log retains all history in the current slice. Its bounded
 in-memory indexes do not mean that old records are unavailable: old replay and
@@ -107,14 +116,21 @@ when estimating migration work and memory.
 `runnel-raft` uses a metadata Raft group and one data group per stream. The
 metadata group records stream identity and the `Creating` to `Active` lifecycle;
 the data group contains the stream records and consumer state. The first
-clustered topology statically replicates every group to the configured three
-voters. [ADR 0006](../decisions/0006-separate-metadata-and-data-groups.md)
-and [ADR 0007](../decisions/0007-snapshot-based-replica-recovery.md) make those
-group and snapshot boundaries explicit.
+clustered topology statically replicates every group to the configured voter
+set, which is three voters in the initial deployment. The current data-group
+identity is derived deterministically from the stream name rather than
+allocated as an arbitrary migration identity. [ADR 0006](../decisions/0006-separate-metadata-and-data-groups.md),
+[ADR 0007](../decisions/0007-snapshot-based-replica-recovery.md), and [ADR 0023](../decisions/0023-independent-retained-storage-and-placement.md)
+make those group, snapshot, and retained-storage boundaries explicit.
 
-The clustered state machine currently materializes complete retained messages
-and stores versioned checkpoints, snapshots, and an incremental journal. Its
-state includes:
+The clustered state machine currently materializes complete retained messages.
+`state-machine.json` and snapshot payloads emit format version 2 and read the
+tested version-1 forms; the OpenRaft `snapshot.json` wrapper also carries
+snapshot metadata. `state-machine.log` is a separate length-prefixed JSON
+journal with record format version 1 and a 64 MiB record bound. These are
+separate persistence and recovery boundaries, as documented in the [TD-009
+snapshot evidence note](td-009-snapshot-evidence.md) and [TD-010 retained-state
+evidence note](td-010-retained-state-evidence.md). Its state includes:
 
 - stream metadata, lifecycle, and `StoredMessage` values, with offsets implied
   by their position in the stream vector;
@@ -131,11 +147,14 @@ state; the migration may reset them while reporting the reset in diagnostics.
 Existing dead-letter streams and their records are ordinary streams and must be
 copied. Historical duplicate dead-letter records must not be silently merged.
 
-Cluster startup validates `storage.json`, group directories, data-group
-manifests, Raft logs, state-machine checkpoints, snapshots, and journals before
-opening groups. It refuses legacy single-group layouts, unmarked clustered
-state, partial layouts, and cluster/node identity mismatches. Those checks are
-important safety boundaries, but they are not a local-to-cluster converter:
+Cluster startup validates existing `storage.json`, group directories,
+data-group manifests, Raft logs, state-machine checkpoints, snapshots, and
+journals before opening groups. It refuses legacy single-group layouts,
+unmarked clustered state, partial layouts, and cluster/node identity
+mismatches. An actually empty directory is intentionally initialized with
+`storage.json`; that initialization is not conversion or migration. These
+checks are important safety boundaries, but they are not a local-to-cluster
+converter:
 [ADR 0019](../decisions/0019-clustered-storage-identity.md) says that storage
 identity must not be guessed, and [ADR 0018](../decisions/0018-safe-replica-recovery-boundary.md)
 keeps empty-replica recovery test-only.
@@ -262,7 +281,8 @@ matrix; this is not current migration support.
 ### Target
 
 - A freshly initialized current clustered deployment with a new, explicit
-  cluster identity and the configured static three-voter membership.
+  cluster identity and the configured static voter membership (three voters in
+  the initial deployment).
 - Empty metadata and data-group state, or an explicitly marked migration
   staging generation that contains no unrelated streams. Existing non-empty or
   identity-mismatched target state is rejected.
@@ -431,11 +451,13 @@ and migration decision.
 The target cluster should be created as a staging generation, not as a normal
 serving cluster with empty streams. A proposed sequence is:
 
-1. initialize target `storage.json` with a new cluster identity and validate all
-   three node identities and addresses;
+1. initialize target `storage.json` with a new cluster identity and validate
+   every configured voter identity and address (three in the initial
+   deployment);
 2. create metadata records in `Creating` state and prepare one data group per
-   source stream, preserving deterministic stream identity while assigning the
-   new target group identity;
+   source stream, deriving the current target stream/group identities from the
+   stream name (`stream/<name>` and `group/<name>/data`) while binding them to
+   the new cluster identity;
 3. import stream chunks and consumer state into data groups through the
    migration protocol, with each committed chunk carrying migration ID, stream
    identity, ordinal, expected next offset, and digest;
@@ -580,10 +602,10 @@ small compatibility matrix:
 | --- | --- | --- |
 | Public protocol | The current client and server share the provisional `runnel-json-lines` v1 declaration and UTF-8/base64 payload representations; existing requests/responses and client outcome classes remain valid after reconnect. | This declaration is source-level only because v1 has no runtime handshake. Protocol redesign, transparent automatic client reconnection, and new topology fields remain deferred. |
 | Local record encoding | Valid source histories read by the current local reader, including supported mixed `RNL1`/`RNL2`/`RNL3` frames. | Unknown versions, malformed complete frames, unbounded lengths, or guessed format conversion. |
-| Cluster representation | Current target metadata/data-group, checkpoint, snapshot, journal, and manifest versions. | Import into an older target, unknown target schema, or arbitrary OpenRaft on-disk layout. |
+| Cluster representation | Current target metadata/data-group layout: `storage.json` and the Raft log use version 1, the state-machine journal uses record version 1, checkpoint and snapshot payloads emit version 2 with narrow version-1 read-forward support, and the current `group.json` manifest shape binds stream/group identity. | Import into an older target, unknown target schema, or arbitrary OpenRaft on-disk layout. |
 | Consumer semantics | Local committed and out-of-order acknowledged progress plus delivery attempts convert into coherent clustered state. Outstanding local tokens become redelivery. | Transferring local volatile leases/tokens or changing retry/ack semantics during migration. |
 | Producer identity | All recovered source request IDs map to the same logical offsets after import. | Deduplicating requests that had no ID, inventing IDs, or silently changing key/payload conflict behavior. |
-| Configuration | Equal acknowledgement timeout, attempt limit, and current retention/replay policy. | An unreviewed policy change whose effects could alter redelivery, dead letters, or replay eligibility. |
+| Configuration | Equal acknowledgement timeout, attempt limit, current unlimited-retention policy, and one-record inclusive offset-replay contract. | An unreviewed policy change whose effects could alter redelivery, dead letters, retention floors, or replay eligibility. |
 | Identity | New target cluster identity; deterministic target stream identity and validated data-group manifests. | Copying local state into a target `storage.json`, reusing a different cluster/node identity, or guessing ownership. |
 | Downgrade | Abort and source recovery before activation. | Automatic post-activation downgrade, old-binary startup against target-only state, or source pointer rollback after target writes. |
 
@@ -660,9 +682,9 @@ The current clustered state keeps complete retained history in each data-group
 state machine and snapshots rewrite complete materialized state. A large
 source stream therefore has both network/disk transfer cost and a target
 materialization cost. The design must not make a runtime or performance claim
-until that cost is measured. The eventual segmented-storage work in TD-002,
-TD-009, and TD-010 may change the efficient import representation without
-changing this logical contract.
+until that cost is measured. Future local storage, snapshot, and retained-state
+work tracked by TD-002, TD-009, and TD-010 may change the efficient import
+representation without changing this logical contract.
 
 ## Reference designs and research
 
@@ -933,6 +955,13 @@ shortcuts.
 - [Growth-from-one-node backlog outcome](../backlog.md#make-growth-from-one-node-to-a-cluster-non-disruptive)
 - [TD-004](../tech-debt.md#td-004-local-and-clustered-durable-state-have-no-supported-migration-path)
 - [Safe durable storage upgrades](storage-upgrade-safety-plan.md)
+- [Durable storage upgrade policy](storage-upgrade-policy.md)
+- [TD-007 storage compatibility evidence](td-007-storage-compatibility-evidence.md)
+- [TD-008 static-cluster evidence](td-008-static-cluster-evidence.md)
+- [TD-009 snapshot scalability evidence](td-009-snapshot-evidence.md)
+- [TD-010 retained-state evidence](td-010-retained-state-evidence.md)
+- [TD-022 storage-executor evidence](td-022-storage-executor-evidence.md)
+- [Clustered outcome contract](clustered-outcome-contract.md)
 - [ADR 0004: Multi-Raft first distributed engine](../decisions/0004-multi-raft-first-distributed-engine.md)
 - [ADR 0006: separate metadata and stream data groups](../decisions/0006-separate-metadata-and-data-groups.md)
 - [ADR 0007: snapshot-based replica recovery](../decisions/0007-snapshot-based-replica-recovery.md)
