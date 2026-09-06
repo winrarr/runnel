@@ -1,9 +1,9 @@
 use runnel_core::{Broker, BrokerConfig};
 use runnel_engine::{AckResult, BrokerError, Engine, PollResult};
 use runnel_test_support::{
-    assert_expired_delivery_is_fenced, assert_independent_consumers_contract,
-    assert_key_ordering_contract, assert_publish_batch_contract, assert_replay_contract,
-    assert_shared_delivery_contract,
+    assert_error_classification_contract, assert_expired_delivery_is_fenced,
+    assert_independent_consumers_contract, assert_key_ordering_contract,
+    assert_publish_batch_contract, assert_replay_contract, assert_shared_delivery_contract,
 };
 use tempfile::tempdir;
 
@@ -36,6 +36,14 @@ async fn local_broker_implements_the_engine_contract() {
         engine.poll("events", "worker").await.unwrap(),
         PollResult::Empty
     );
+}
+
+#[tokio::test]
+async fn local_broker_uses_semantic_error_classification() {
+    let directory = tempdir().unwrap();
+    let broker = Broker::open(directory.path(), BrokerConfig::default()).unwrap();
+
+    assert_error_classification_contract(&broker).await;
 }
 
 #[tokio::test]

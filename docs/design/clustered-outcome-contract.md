@@ -2,8 +2,10 @@
 
 - Status: proposed design note; not an accepted wire or compatibility decision
 - Date: 2026-09-03
+- Last reviewed: 2026-09-06
+- Baseline: `62815a56e5b418152532fd05999f7a72fc47a008`
 - Scope: clustered writes, leader forwarding, client retry boundaries, and the evidence required to make those behaviors public
-- Related work: [clustered durability and outcomes backlog item](../backlog.md#make-clustered-durability-and-outcomes-explicit), [current architecture](../architecture.md), [Multi-Raft implementation plan](multi-raft-implementation-plan.md), and [protocol compatibility design](protocol-compatibility.md)
+- Related work: [clustered durability and outcomes backlog item](../backlog.md#make-clustered-durability-and-outcomes-explicit), [current architecture](../architecture.md), [Multi-Raft implementation plan](multi-raft-implementation-plan.md), [protocol compatibility design](protocol-compatibility.md), and [ADR 0026](../decisions/0026-semantic-engine-error-classification.md)
 
 This note turns the current clustered implementation and the remaining durability backlog into an implementation-ready semantic target. It does not change the runtime, protocol, backlog, or compatibility policy. In particular, the line-delimited JSON protocol remains provisional v1, and no field or error code proposed below is accepted for v1 without a separate compatibility decision.
 
@@ -28,7 +30,7 @@ The current layers already provide most of the mechanical boundary needed for th
 
 | Layer | Current behavior | Contract consequence |
 | --- | --- | --- |
-| `runnel-engine` | Mutations return `Result` and have no public outcome or durability type. | The semantic contract belongs above the current `Result` boundary; adding a type is a compatibility change to review. |
+| `runnel-engine` | Mutations return `Result<T, BrokerError>`. `BrokerError::kind()` provides a stable semantic reason and `BrokerError::outcome()` classifies failures as rejected, retryable, or unknown; successful `Result` values are confirmed. Concrete variants and diagnostic sources remain available. | The engine now has a backend-independent failure boundary. It still does not expose consensus stage or durability evidence, so the versioned public outcome contract remains future work. |
 | `runnel-raft` | Stream and consumer mutations use OpenRaft `client_write`; the static cluster has three voters and forwards requests to a group leader. | A successful mutation is intended to mean committed and applied, not merely accepted by a follower. |
 | Durable storage | Consensus log entries are persisted with `sync_all`; the state-machine journal is synced before in-memory application; snapshots include broker state and dedup/checkpoint state. | Recovery must test both the consensus record and the materialized broker state. Filesystem and hardware flush semantics remain an explicit assumption. |
 | Server/protocol | v1 returns `Published` or an error with `code` and `message`; `not_leader` is mapped to `cluster_error`. | v1 does not expose authoritative outcome classes or a commit/apply stage. Generic `cluster_error` cannot safely drive automatic retry. |
@@ -173,6 +175,12 @@ The current v1 line protocol remains unchanged by this design. In v1:
 - the client does not automatically replay requests;
 - `cluster_error`, timeout, EOF, and response loss must be treated conservatively as ambiguous once request work may have begun.
 
+The accepted engine classification in [ADR 0026](../decisions/0026-semantic-engine-error-classification.md)
+does not change these wire rules. In particular, a `NotLeader` engine error is
+retryable to an engine caller, while v1 still maps it to `cluster_error` and
+the client conservatively treats that response as unknown. Only a future
+versioned response can carry an authoritative outcome class to applications.
+
 A future negotiated protocol version may add a response outcome class, per-attempt correlation ID, stable operation identity, fingerprint conflict, and explicit retry/resolution metadata. The wire names, identity scope, retention behavior, batch semantics, and error-code vocabulary require a compatibility decision and interoperability fixtures. Adding fields that old v1 clients ignore is not sufficient if the meaning of an existing response changes. No storage-path, offset-layout, Raft term, or node-placement concept should become public as part of this work.
 
 ## Alternatives and reference comparison
@@ -207,10 +215,22 @@ The implementation should validate these hypotheses rather than silently convert
 - Cancellation of a client future and cancellation of a server-side `client_write` are not the same event. A cancelled request may still commit; tests must cover this boundary.
 - There is currently no authenticated producer namespace or TLS-level identity contract. Collision resistance and malicious reuse of operation IDs remain unresolved until authentication is designed.
 
-This note intentionally does not update the backlog: the outcome remains unimplemented, so the backlog item is neither retired nor materially changed.
+This note intentionally does not update the clustered durability backlog: the
+engine classification is an enabling boundary, while the durable operation
+identity, stage-aware responses, and real-process ambiguity gates remain
+unimplemented.
 
 ## Evidence and recommendation
 
-Primary evidence class: Design/research. Secondary tags: public-contract, storage/recovery, compatibility.
+Primary evidence class: Contract/semantic. Secondary tags: public-contract, storage/recovery, compatibility.
 
-This is a design-only change. It has no runtime, wire, storage, or performance effect, and no benchmark is applicable. The required implementation gates above remain coverage gaps; existing `just cluster-test` and `just verify` coverage is useful but insufficient for the new public outcome claims. Recommendation: merge the design note as an implementation baseline, then implement the contract behind an explicit compatibility/ADR decision and rerun the real-process/restart gates before making any guarantee public.
+The engine classification is implemented and has no wire, storage, or
+performance effect. Unit coverage exercises every current error variant, and
+shared contract assertions run against both local and persistent clustered
+engines. Existing real-server retry, timeout, forwarding, restart, and stale
+delivery tests remain the evidence for transport boundaries. The broader
+four-outcome protocol, durable operation identities, stage-aware ambiguity
+resolution, and related metrics remain coverage gaps. Recommendation: retain
+this note as the target for that future protocol work; use the accepted engine
+classification now for backend-independent retry decisions without treating it
+as a public v1 guarantee.

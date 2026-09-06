@@ -118,6 +118,61 @@ pub struct HealthSnapshot {
     pub dead_letters: u64,
 }
 
+/// Stable semantic category for a broker failure.
+///
+/// The category deliberately does not expose the representation of the
+/// backend that produced the error. Callers that need a human-readable cause
+/// should retain the [`BrokerError`] itself and its [`std::error::Error`]
+/// source; callers deciding whether an operation may be retried should use
+/// [`BrokerError::outcome`] instead of matching backend-specific variants.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BrokerErrorKind {
+    /// The request or its arguments are invalid.
+    InvalidRequest,
+    /// The requested stream or other durable resource does not exist.
+    ResourceNotFound,
+    /// The resource exists but is not currently available for serving.
+    ResourceNotReady,
+    /// The delivery state rejects this acknowledgement or delivery attempt.
+    DeliveryRejected,
+    /// The requested retained history is not available.
+    HistoryUnavailable,
+    /// Durable message data could not be decoded or validated.
+    CorruptData,
+    /// A durable storage operation failed.
+    Storage,
+    /// Consumer-state persistence or another internal state operation failed.
+    State,
+    /// The broker configuration is invalid.
+    Configuration,
+    /// The request needs routing or leadership that is not currently present.
+    Routing,
+    /// A distributed-engine failure occurred without a more specific
+    /// semantic category.
+    Cluster,
+    /// An unexpected in-process failure occurred.
+    Internal,
+}
+
+/// What an engine can safely say about a failed operation.
+///
+/// `Confirmed` is represented by a successful `Result`; this enum only covers
+/// failures. `Unknown` is intentionally conservative: the engine could not
+/// prove that the operation was not applied, so a caller must resolve the
+/// intent before replaying it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BrokerErrorOutcome {
+    /// The operation was definitely not applied and the request or state is
+    /// not valid for an unchanged retry.
+    Rejected,
+    /// The operation was definitely not applied, but a later attempt may
+    /// succeed.
+    Retryable,
+    /// The operation may have crossed a durable boundary; do not blindly
+    /// replay it.
+    Unknown,
+}
+
 #[derive(Debug, Error)]
 pub enum BrokerError {
     #[error("invalid {kind} name '{name}'; use 1-128 ASCII letters, digits, '.', '_', or '-'")]
@@ -159,6 +214,57 @@ pub enum BrokerError {
     NotLeader { leader_id: Option<u64> },
     #[error("cluster error: {0}")]
     Cluster(String),
+}
+
+impl BrokerError {
+    /// Return the stable semantic category for this failure.
+    ///
+    /// This is the engine-facing boundary. The concrete variants remain
+    /// available so operators can inspect diagnostic details, but callers do
+    /// not need to know whether a storage error came from an `io::Error`, a
+    /// JSON state file, a lock, or a distributed transport.
+    pub fn kind(&self) -> BrokerErrorKind {
+        match self {
+            Self::InvalidName { .. } => BrokerErrorKind::InvalidRequest,
+            Self::StreamNotFound(_) => BrokerErrorKind::ResourceNotFound,
+            Self::StreamNotReady(_) => BrokerErrorKind::ResourceNotReady,
+            Self::AckNotInFlight { .. }
+            | Self::StaleDelivery { .. }
+            | Self::OutOfOrderAck { .. } => BrokerErrorKind::DeliveryRejected,
+            Self::HistoryUnavailable { .. } => BrokerErrorKind::HistoryUnavailable,
+            Self::CorruptRecord(_) => BrokerErrorKind::CorruptData,
+            Self::Io(_) => BrokerErrorKind::Storage,
+            Self::State(_) => BrokerErrorKind::State,
+            Self::LockPoisoned => BrokerErrorKind::Internal,
+            Self::Configuration(_) => BrokerErrorKind::Configuration,
+            Self::NotLeader { .. } => BrokerErrorKind::Routing,
+            Self::Cluster(_) => BrokerErrorKind::Cluster,
+        }
+    }
+
+    /// Return the safe retry boundary for this failure.
+    ///
+    /// The result is independent of storage representation and cluster
+    /// topology. In particular, generic storage, state, and cluster failures
+    /// remain `Unknown` because an engine cannot prove that a mutation did not
+    /// commit merely from the backend error it received.
+    pub fn outcome(&self) -> BrokerErrorOutcome {
+        match self.kind() {
+            BrokerErrorKind::ResourceNotReady | BrokerErrorKind::Routing => {
+                BrokerErrorOutcome::Retryable
+            }
+            BrokerErrorKind::CorruptData
+            | BrokerErrorKind::Storage
+            | BrokerErrorKind::State
+            | BrokerErrorKind::Internal
+            | BrokerErrorKind::Cluster => BrokerErrorOutcome::Unknown,
+            BrokerErrorKind::InvalidRequest
+            | BrokerErrorKind::ResourceNotFound
+            | BrokerErrorKind::DeliveryRejected
+            | BrokerErrorKind::HistoryUnavailable
+            | BrokerErrorKind::Configuration => BrokerErrorOutcome::Rejected,
+        }
+    }
 }
 
 pub trait Engine: Send + Sync {
@@ -249,4 +355,120 @@ pub trait Engine: Send + Sync {
     }
 
     fn health<'a>(&'a self) -> EngineFuture<'a, HealthSnapshot>;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{BrokerError, BrokerErrorKind, BrokerErrorOutcome};
+    use std::io;
+
+    #[test]
+    fn classifies_failures_without_exposing_backend_details() {
+        let state_error = serde_json::from_str::<String>("not-json").unwrap_err();
+        let cases = [
+            (
+                BrokerError::InvalidName {
+                    kind: "stream",
+                    name: "bad/name".to_owned(),
+                },
+                BrokerErrorKind::InvalidRequest,
+                BrokerErrorOutcome::Rejected,
+            ),
+            (
+                BrokerError::StreamNotFound("events".to_owned()),
+                BrokerErrorKind::ResourceNotFound,
+                BrokerErrorOutcome::Rejected,
+            ),
+            (
+                BrokerError::StreamNotReady("events".to_owned()),
+                BrokerErrorKind::ResourceNotReady,
+                BrokerErrorOutcome::Retryable,
+            ),
+            (
+                BrokerError::AckNotInFlight {
+                    consumer: "worker".to_owned(),
+                    offset: 0,
+                },
+                BrokerErrorKind::DeliveryRejected,
+                BrokerErrorOutcome::Rejected,
+            ),
+            (
+                BrokerError::StaleDelivery {
+                    consumer: "worker".to_owned(),
+                    offset: 0,
+                },
+                BrokerErrorKind::DeliveryRejected,
+                BrokerErrorOutcome::Rejected,
+            ),
+            (
+                BrokerError::OutOfOrderAck {
+                    consumer: "worker".to_owned(),
+                    expected: 0,
+                    received: 1,
+                },
+                BrokerErrorKind::DeliveryRejected,
+                BrokerErrorOutcome::Rejected,
+            ),
+            (
+                BrokerError::HistoryUnavailable {
+                    stream: "events".to_owned(),
+                    requested_offset: 10,
+                    earliest_offset: 0,
+                    next_offset: 1,
+                },
+                BrokerErrorKind::HistoryUnavailable,
+                BrokerErrorOutcome::Rejected,
+            ),
+            (
+                BrokerError::CorruptRecord(0),
+                BrokerErrorKind::CorruptData,
+                BrokerErrorOutcome::Unknown,
+            ),
+            (
+                BrokerError::Io(io::Error::other("disk failure")),
+                BrokerErrorKind::Storage,
+                BrokerErrorOutcome::Unknown,
+            ),
+            (
+                BrokerError::State(state_error),
+                BrokerErrorKind::State,
+                BrokerErrorOutcome::Unknown,
+            ),
+            (
+                BrokerError::LockPoisoned,
+                BrokerErrorKind::Internal,
+                BrokerErrorOutcome::Unknown,
+            ),
+            (
+                BrokerError::Configuration("bad setting".to_owned()),
+                BrokerErrorKind::Configuration,
+                BrokerErrorOutcome::Rejected,
+            ),
+            (
+                BrokerError::NotLeader { leader_id: Some(2) },
+                BrokerErrorKind::Routing,
+                BrokerErrorOutcome::Retryable,
+            ),
+            (
+                BrokerError::Cluster("quorum lost".to_owned()),
+                BrokerErrorKind::Cluster,
+                BrokerErrorOutcome::Unknown,
+            ),
+        ];
+
+        for (error, expected_kind, expected_outcome) in cases {
+            assert_eq!(error.kind(), expected_kind, "{error}");
+            assert_eq!(error.outcome(), expected_outcome, "{error}");
+        }
+    }
+
+    #[test]
+    fn retains_diagnostic_sources_for_backend_failures() {
+        let io_error = BrokerError::Io(io::Error::other("disk failure"));
+        assert!(std::error::Error::source(&io_error).is_some());
+
+        let state_error = serde_json::from_str::<String>("not-json").unwrap_err();
+        let state_error = BrokerError::State(state_error);
+        assert!(std::error::Error::source(&state_error).is_some());
+    }
 }

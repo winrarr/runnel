@@ -40,7 +40,7 @@ The external and peer protocols and clustered materialized persistence use JSON;
 ## Deliberate boundaries
 
 - runnel-core owns persistence and delivery state; it must not depend on a particular network transport.
-- runnel-engine owns the topology-free semantic contract shared by local and distributed engines.
+- runnel-engine owns the topology-free semantic contract shared by local and distributed engines. `BrokerError::kind()` and `BrokerError::outcome()` provide a stable semantic failure boundary; concrete backend causes remain available for diagnostics, while stage-aware public outcomes remain a future protocol concern.
 - runnel-raft owns the early static Multi-Raft backend, including the metadata group, one data group per stream, versioned local Raft/state-machine files, group-addressed framed TCP peer transport, topology-free client forwarding, replicated publish request deduplication, replicated shared-consumer ownership, clustered retry limits and dead-letter outcomes, consensus-log compaction, and snapshot transfer. It is not yet a complete production cluster: safe empty-replica replacement, dynamic membership, scalable placement, final lease/fencing policy, backoff and dead-letter provenance, repeated-interruption cost controls, and broader failure semantics remain unfinished.
 - runnel-protocol owns the provisional external request/response representation; it must not encode filesystem layout.
 - runnel-server owns sockets, HTTP, shutdown, and mapping core errors into protocol responses.

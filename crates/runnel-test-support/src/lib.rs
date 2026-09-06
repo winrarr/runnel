@@ -1,6 +1,58 @@
 use std::time::Duration;
 
-use runnel_engine::{AckResult, BrokerError, Engine, PollResult, PublishRecord};
+use runnel_engine::{
+    AckResult, BrokerError, BrokerErrorKind, BrokerErrorOutcome, Engine, PollResult, PublishRecord,
+};
+
+/// Verify the semantic error boundary shared by local and distributed engines.
+///
+/// The assertions intentionally use public engine operations rather than
+/// backend-specific helpers. Concrete error values remain available for
+/// diagnostics, while callers can make the same retry decision from the
+/// stable kind/outcome pair.
+pub async fn assert_error_classification_contract(engine: &dyn Engine) {
+    let invalid_name = engine
+        .create_stream("invalid/name")
+        .await
+        .expect_err("invalid stream names must be rejected");
+    assert_eq!(invalid_name.kind(), BrokerErrorKind::InvalidRequest);
+    assert_eq!(invalid_name.outcome(), BrokerErrorOutcome::Rejected);
+
+    let missing_stream = engine
+        .poll("missing", "worker")
+        .await
+        .expect_err("missing streams must be reported");
+    assert_eq!(missing_stream.kind(), BrokerErrorKind::ResourceNotFound);
+    assert_eq!(missing_stream.outcome(), BrokerErrorOutcome::Rejected);
+
+    assert!(engine.create_stream("contract.errors").await.unwrap());
+
+    engine
+        .publish("contract.errors", None, b"work".to_vec(), None)
+        .await
+        .expect("the error contract should have a delivery to validate");
+    assert!(matches!(
+        engine.poll("contract.errors", "worker").await,
+        Ok(PollResult::Message(message)) if message.offset == 0
+    ));
+
+    let missing_delivery = engine
+        .ack("contract.errors", "worker", 1)
+        .await
+        .expect_err("acknowledging an unknown delivery must be rejected");
+    assert_eq!(missing_delivery.kind(), BrokerErrorKind::DeliveryRejected);
+    assert_eq!(missing_delivery.outcome(), BrokerErrorOutcome::Rejected);
+
+    let unavailable_history = engine
+        .replay("contract.errors", "worker", 1)
+        .await
+        .expect_err("replaying beyond retained history must report unavailability");
+    assert_eq!(
+        unavailable_history.kind(),
+        BrokerErrorKind::HistoryUnavailable
+    );
+    assert_eq!(unavailable_history.outcome(), BrokerErrorOutcome::Rejected);
+}
 
 pub async fn assert_replay_contract(engine: &dyn Engine) {
     assert!(engine.create_stream("contract.replay").await.unwrap());
