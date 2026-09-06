@@ -2,7 +2,7 @@
 
 - Status: exploratory design proposal; no runtime implementation commitment
 - Last reviewed: 2026-09-06
-- Baseline: `3423f5c7e1612c915cd8fcb89b1e0639b17fd254`
+- Baseline: `dcf54855dd0ce7d55e9860cfceace582df803cf0`
 - Reading guide: [design-note conventions](README.md)
 - Scope: stable scheduling units for large shared-consumer pools
 - Related outcome: [Explore stable internal work placement](../backlog.md)
@@ -14,10 +14,10 @@ units. It does not change the runtime, public protocol, wire compatibility, or
 the current placement of streams and replicas. It is not an ADR and makes no
 performance claim about the current or proposed implementation.
 
-Under the current one-region, topology-free contract, the leading candidate
-for a future experiment is a fixed set of virtual lanes whose ownership is
-assigned cooperatively to active members. A record's ordering key maps to a
-lane, while the lane's owner is an internal scheduler fact. This is a
+Under the current topology-free public contract, the leading candidate for a
+future experiment is a fixed set of virtual lanes whose ownership is assigned
+cooperatively to active members. A record's ordering key maps to a lane, while
+the lane's owner is an internal scheduler fact. This is a
 recommendation under explicit workload and failure assumptions, not a measured
 ranking or accepted direction. The current demand-driven scheduler remains the
 default until a focused comparison demonstrates a material benefit for a
@@ -30,7 +30,10 @@ Current placement and delivery constraints are authoritative in
 [ADR 0023](../decisions/0023-independent-retained-storage-and-placement.md),
 and [architecture](../architecture.md). Lane state, ownership transitions,
 and the experiment stages below are illustrative mechanisms and
-outcome/evidence gates; they are not public API or module prescriptions.
+outcome/evidence gates; they are not public API or module prescriptions. The
+related [hot-ordering exploration](hot-ordering-domains.md) covers bounded
+candidate work and overloaded ordering domains; this note focuses on whether
+the resulting work should have stable internal ownership.
 
 ## Terminology and implementation boundary
 
@@ -41,7 +44,7 @@ lane per stream, gives it FIFO execution ownership, and bounds its waiter queue;
 it serializes synchronous storage operations and does not assign records,
 ordering keys, or shared-consumer members. It is therefore an execution and
 backpressure mechanism, not an answer to TD-016. See [`StorageExecutor` and
-`StorageLane`](../../crates/runnel-core/src/storage.rs#L15-L340).
+`StorageLane`](../../crates/runnel-core/src/storage.rs#L15-L342).
 
 The shared-consumer scheduler is the grouped delivery path: local
 [`Broker::poll_group`](../../crates/runnel-core/src/broker.rs#L233-L335) and
@@ -63,10 +66,10 @@ that placement must preserve:
 | Public model | The engine and provisional protocol expose a stream, durable consumer, transient member, record, acknowledgement, opaque token, and attempt. They do not expose a partition, lane, node, or assignment. See [`Engine::poll_group`](../../crates/runnel-engine/src/lib.rs#L322-L333) and [`Request::PollGroup`/`AckGroup`](../../crates/runnel-protocol/src/lib.rs#L195-L211). | A future scheduler may add internal state, but no response or required client operation may expose its units or owners. |
 | Selection | Both paths first return an existing unexpired delivery for the requesting member. They then select from records at or after the committed offset, skipping acknowledged offsets, all in-flight offsets, and a record whose key is already in flight for the consumer. The local warm path scans its bounded tail index and its cold path scans the log from a sparse checkpoint; the cluster scans the materialized message vector. | Stable routing must be an eligibility filter or indexed candidate path, not a second acknowledgement model. It must preserve the current empty, retry, and out-of-order acknowledgement meanings. |
 | Concurrency | The first slice allows one outstanding delivery per member: local state indexes one offset per member and clustered polls find the member's existing delivery before selecting another. Unrelated keys can progress concurrently across members; a key is not delivered concurrently within one shared consumer. | Placement cannot claim batching or higher parallelism while this limit remains. A first experiment must isolate routing effects before adding read-ahead or multi-delivery credits. |
-| Membership | A member is observed only through grouped poll and acknowledgement requests. There is no durable member registry, assignment map, explicit join protocol, or public graceful-leave operation. | Stable ownership needs an authoritative bounded member lease/lifecycle. The exact renewal, duplicate-identity, and graceful-leave behavior is unresolved and must not be smuggled into the public placement model. |
+| Membership | A member is observed only through grouped poll and acknowledgement requests. Its name is syntactically validated, but is not an authenticated or durable lease identity. There is no durable member registry, assignment map, explicit join protocol, or public graceful-leave operation. | Stable ownership needs an authoritative bounded member lease/lifecycle. The exact renewal, duplicate-identity, and graceful-leave behavior is unresolved and must not be smuggled into the public placement model. |
 | Durability | Local consumer progress and delivery attempts are appended and synced in the consumer-state journal; active delivery ownership and deadlines are process-local. Clustered progress, attempts, in-flight ownership, lease deadlines, and tokens are fields of the replicated stream-data-group state. | A local prototype may use the existing recovery boundary, but a clustered version must replicate placement epoch and handoff state with the authoritative consumer state. |
-| Fencing | The public grouped acknowledgement carries the member and opaque delivery token. Both current engines require the current member and compare the token when it is non-empty; the legacy `ack` path intentionally passes an empty token with `member == consumer`, and the core does not reject an empty token for a matching member. A token-bearing expired or replaced assignment is stale. | Every ownership transition must advance a durable or committed epoch/generation before a new owner can acknowledge. A delayed old request must fail closed as stale. |
-| State bounds | Local record and sparse indexes are bounded, and its consumer-state cache and journal have fixed bounds, but grouped in-flight/attempt entries have no configured member-count bound because arbitrary member names are accepted. Clustered retained messages are materialized in a `Vec`, and grouped maps likewise have no placement-specific capacity. | A placement design must use a fixed lane/unit budget and must not create one durable owner entry, timer, or metric label per key or record. It must also state how member churn is bounded. |
+| Fencing | The public grouped acknowledgement carries the member and opaque delivery token. Both current engines require the current member and compare the token when it is non-empty; the legacy `ack` path intentionally passes an empty token with `member == consumer`, and the core does not reject an empty token for a matching member. A token-bearing expired or replaced assignment is stale. The current token is not a placement epoch: local tokens use a process epoch/counter, while clustered tokens derive from the committed assignment log identity. | Every ownership transition must advance a durable or committed epoch/generation before a new owner can acknowledge. A delayed old request must fail closed as stale; placement must not depend on either current token format. |
+| State bounds | Local record and sparse indexes are bounded. The best-effort consumer-state cache is capped at 1,024 consumers and its append journal at 64 KiB before checkpoint compaction, but each materialized checkpoint's acknowledged/attempt maps and grouped in-flight/attempt entries have no placement-specific member-count bound because arbitrary member names are accepted. Clustered retained messages are materialized in a `Vec`, and grouped maps likewise have no placement-specific capacity. | A placement design must use a fixed lane/unit budget and must not create one durable owner entry, timer, or metric label per key or record. It must also state how member churn and materialized state are bounded. |
 | Recovery | A process or leader failure can cause an unacknowledged delivery to be redelivered after its lease boundary. The public model does not promise exactly-once processing. | Handoff must permit duplicate delivery after failure while protecting acknowledged progress and rejecting stale acknowledgements. |
 
 ### Exact current control flow and cost model
@@ -155,6 +158,16 @@ there is no owner-local ready queue, and one-delivery-per-member limits the
 amount of work that can be prefetched or processed in a batch. Stable placement
 could reduce selection and state-cache churn, but it can also pin work to a
 slow member or a hot key. Those are workload hypotheses, not measured results.
+
+Stable placement and hot-domain handling are related but not interchangeable. A
+placement lane may contain one hot ordering domain and many cold domains, while
+the hot-ordering exploration may bound selector work without assigning an
+owner. A lane-level drain can therefore pause unrelated cold keys that share
+the lane; a per-key handoff would be a different ownership boundary and must
+still prove that old and new generations cannot deliver the same key
+concurrently. Use the hot-ordering note's bounded top-K and
+demand-normalized fairness measures when evaluating that tradeoff, rather than
+using equal per-member throughput as a fairness proxy.
 
 ## Invariants and non-goals
 
@@ -461,13 +474,14 @@ per key, offset, or unbounded member name.
 
 Keep *member population* separate from *simultaneous request concurrency* in
 every artifact. The local direct Criterion cases call the broker synchronously
-and therefore do not exercise the storage executor; real-process cases also
-include the existing per-stream FIFO storage lane and bounded waiter queue. A
-64-member case must state both how many members exist and how many polls can be
-outstanding, keep the executor settings equal between candidates, and report
-storage-queue rejection or wait separately from scheduler work. Otherwise a
-placement result can be measuring admission pressure rather than work
-placement.
+and therefore do not exercise the storage executor. Local real-process cases
+also include the existing per-stream FIFO storage lane and bounded waiter
+queue; clustered real-process cases execute through the replicated stream data
+group instead. A 64-member case must state both how many members exist and how
+many polls can be outstanding, keep the applicable execution settings equal
+between candidates, and report storage-queue rejection or wait separately from
+scheduler work. Otherwise a placement result can be measuring admission
+pressure rather than work placement.
 
 Compare in this order:
 
@@ -550,8 +564,9 @@ accepted architectural choice:
 7. How should heterogeneous members be weighted without allowing a fast
    member to starve a slow one or making capacity a public placement setting?
 8. How are hot lanes detected and split without moving one ordering key or
-   creating unbounded per-key state? This belongs with the separate hot-domain
-   exploration.
+   creating unbounded per-key state? This belongs with the separate
+   [hot-domain exploration](hot-ordering-domains.md), whose strict-mode
+   boundary must remain separate from placement ownership.
 9. Does handoff wait for all active deliveries, only per-key deliveries, or
    fence immediately and redeliver? Each choice changes duplicate side effects,
    latency, and recovery cost.
@@ -579,13 +594,14 @@ remains an optimization hypothesis.
 - [Local shared-consumer delivery, ADR 0013](../decisions/0013-local-shared-consumer-delivery.md)
 - [Clustered shared-consumer ownership, ADR 0015](../decisions/0015-clustered-shared-consumer-ownership.md)
 - [Independent retained storage and placement, ADR 0023](../decisions/0023-independent-retained-storage-and-placement.md)
-- [`StorageExecutor` and `StorageLane`](../../crates/runnel-core/src/storage.rs#L15-L340)
+- [Adaptive handling of hot ordering domains](hot-ordering-domains.md)
+- [`StorageExecutor` and `StorageLane`](../../crates/runnel-core/src/storage.rs#L15-L342)
 - [`Broker::poll_group` and local acknowledgement](../../crates/runnel-core/src/broker.rs#L233-L407)
 - [`StreamLog::find_candidate` and local eligibility predicate](../../crates/runnel-core/src/stream_log.rs#L520-L555)
 - [`apply_group_poll` and clustered acknowledgement](../../crates/runnel-raft/src/delivery.rs#L49-L312)
 - [Shared-consumer Criterion benchmarks](../../crates/runnel-core/benches/broker.rs#L172-L275)
 - [Clustered grouped benchmark scenarios](../../scripts/benchmarks/cluster_scenarios.py#L693-L794)
-- [Reusable shared-delivery contract assertions](../../crates/runnel-test-support/src/lib.rs#L96-L324)
+- [Reusable shared-delivery contract assertions](../../crates/runnel-test-support/src/lib.rs#L255-L340)
 - [Local grouped restart and expiry tests](../../crates/runnel-core/src/lib.rs#L783-L870)
 - [Local grouped restart recovery test](../../crates/runnel-core/src/lib.rs#L1437-L1488)
 - [Clustered grouped restart and dead-letter tests](../../crates/runnel-raft/src/lib.rs#L1220-L1428)
