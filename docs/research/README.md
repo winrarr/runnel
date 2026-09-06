@@ -50,3 +50,6 @@ for the same evidence labels and outcome/evidence gates.
 - [TD-012 peer transport ownership](td-012-peer-transport-ownership.md)
   records the OpenRaft network lifecycle constraints, scoped ownership choice,
   alternatives, and unresolved pooling questions.
+- [TD-013 native competitor benchmark semantics](td-013-native-competitor-semantics.md)
+  records the current native-tool boundaries and a future common workload
+  envelope without treating the comparison as a ranking.
