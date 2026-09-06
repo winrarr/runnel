@@ -2,7 +2,7 @@ use std::io;
 use std::time::Duration;
 
 use runnel_protocol::{
-    BinaryPayload, MAX_PUBLISH_BATCH_BYTES, MAX_PUBLISH_BATCH_RECORDS,
+    BinaryPayload, MAX_PUBLISH_BATCH_BYTES, MAX_PUBLISH_BATCH_RECORDS, MAX_RESPONSE_BYTES,
     PublishBatchRecord as WirePublishBatchRecord, PublishBatchRecordResponse, Request, Response,
 };
 pub use runnel_protocol::{PayloadEncoding, ProtocolSupport, ProtocolVersionRange};
@@ -25,6 +25,14 @@ pub struct ClientConfig {
     pub request_timeout: Duration,
     /// Maximum time allowed to read one complete response line.
     pub response_timeout: Duration,
+    /// Maximum encoded response size, including the optional line terminator.
+    ///
+    /// The default is [`runnel_protocol::MAX_RESPONSE_BYTES`], which covers
+    /// responses for the largest request the provisional protocol accepts.
+    /// Lower this bound when a client needs a smaller memory budget. A response
+    /// that exceeds the bound invalidates the connection and is classified as
+    /// an unknown operation outcome once its request may have been sent.
+    pub max_response_bytes: usize,
 }
 
 impl Default for ClientConfig {
@@ -33,6 +41,7 @@ impl Default for ClientConfig {
             connect_timeout: Duration::from_secs(5),
             request_timeout: Duration::from_secs(5),
             response_timeout: Duration::from_secs(30),
+            max_response_bytes: MAX_RESPONSE_BYTES,
         }
     }
 }
@@ -73,6 +82,12 @@ pub enum ClientError {
 
     #[error("reading response timed out after {timeout:?}")]
     ResponseTimeout { timeout: Duration },
+
+    #[error("broker response exceeds the configured maximum of {max_bytes} bytes")]
+    ResponseTooLarge { max_bytes: usize },
+
+    #[error("maximum response size must be greater than zero")]
+    InvalidResponseLimit,
 
     #[error("reading response failed: {source}")]
     Read {
@@ -346,6 +361,7 @@ impl AttemptOutcome {
             | ClientError::ConnectionUnavailable => Self::Retryable(AttemptFailure::Client(error)),
             ClientError::EncodeRequest { .. } => Self::Rejected(AttemptFailure::Client(error)),
             ClientError::InvalidBatch { .. } => Self::Rejected(AttemptFailure::Client(error)),
+            ClientError::InvalidResponseLimit => Self::Rejected(AttemptFailure::Client(error)),
             _ => Self::Unknown(AttemptFailure::Client(error)),
         }
     }
@@ -411,11 +427,14 @@ impl Client {
         Self::connect_with_config(address, ClientConfig::default()).await
     }
 
-    /// Connect to a broker using explicit connection, request, and response timeouts.
+    /// Connect to a broker using explicit connection, request, response-size, and response timeouts.
     pub async fn connect_with_config(
         address: impl ToSocketAddrs,
         config: ClientConfig,
     ) -> Result<Self, ClientError> {
+        if config.max_response_bytes == 0 {
+            return Err(ClientError::InvalidResponseLimit);
+        }
         let connection = connect(address, config).await?;
 
         Ok(Self {
@@ -489,23 +508,16 @@ impl Client {
             })?
             .map_err(|source| ClientError::Write { source })?;
 
-            let mut response_line = String::new();
-            let bytes_read = tokio::time::timeout(
+            let response = tokio::time::timeout(
                 config.response_timeout,
-                connection.reader.read_line(&mut response_line),
+                read_response(&mut connection.reader, config.max_response_bytes),
             )
             .await
             .map_err(|_| ClientError::ResponseTimeout {
                 timeout: config.response_timeout,
-            })?
-            .map_err(|source| ClientError::Read { source })?;
+            })??;
 
-            if bytes_read == 0 {
-                return Err(ClientError::Eof);
-            }
-
-            serde_json::from_str(&response_line)
-                .map_err(|source| ClientError::InvalidResponse { source })
+            Ok(response)
         }
         .await;
 
@@ -1178,6 +1190,60 @@ async fn connect(
     })
 }
 
+async fn read_response(
+    reader: &mut BufReader<ReadHalf<TcpStream>>,
+    max_response_bytes: usize,
+) -> Result<Response, ClientError> {
+    let mut response_bytes = Vec::with_capacity(max_response_bytes.min(8 * 1024));
+
+    loop {
+        let buffered = reader
+            .fill_buf()
+            .await
+            .map_err(|source| ClientError::Read { source })?;
+        if buffered.is_empty() {
+            if response_bytes.is_empty() {
+                return Err(ClientError::Eof);
+            }
+            return serde_json::from_slice(&response_bytes)
+                .map_err(|source| ClientError::InvalidResponse { source });
+        }
+
+        let newline = buffered.iter().position(|byte| *byte == b'\n');
+        let bytes_to_consume = newline.map_or(buffered.len(), |index| index + 1);
+        if bytes_to_consume > max_response_bytes.saturating_sub(response_bytes.len()) {
+            return Err(ClientError::ResponseTooLarge {
+                max_bytes: max_response_bytes,
+            });
+        }
+
+        response_bytes.extend_from_slice(&buffered[..bytes_to_consume]);
+        reader.consume(bytes_to_consume);
+        if newline.is_some() {
+            return serde_json::from_slice(&response_bytes)
+                .map_err(|source| ClientError::InvalidResponse { source });
+        }
+
+        // An EOF-terminated JSON response was accepted by the previous
+        // read_line-based implementation. If the buffer is exactly full, make
+        // one bounded probe for either EOF (still parseable) or another byte
+        // (definitively oversized) without retaining that extra byte.
+        if response_bytes.len() == max_response_bytes {
+            let next = reader
+                .fill_buf()
+                .await
+                .map_err(|source| ClientError::Read { source })?;
+            if !next.is_empty() {
+                return Err(ClientError::ResponseTooLarge {
+                    max_bytes: max_response_bytes,
+                });
+            }
+            return serde_json::from_slice(&response_bytes)
+                .map_err(|source| ClientError::InvalidResponse { source });
+        }
+    }
+}
+
 fn classify_response(response: Response) -> AttemptOutcome {
     let Response::Error { ref code, .. } = response else {
         return AttemptOutcome::Confirmed(response);
@@ -1350,6 +1416,7 @@ mod tests {
             connect_timeout: Duration::from_secs(1),
             request_timeout: Duration::from_secs(1),
             response_timeout: Duration::from_millis(100),
+            max_response_bytes: 64 * 1024,
         }
     }
 
@@ -2412,6 +2479,22 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn rejects_a_zero_response_limit_before_connecting() {
+        let (listener, address) = listener().await;
+        let result = Client::connect_with_config(
+            address,
+            ClientConfig {
+                max_response_bytes: 0,
+                ..test_config()
+            },
+        )
+        .await;
+
+        assert!(matches!(result, Err(ClientError::InvalidResponseLimit)));
+        drop(listener);
+    }
+
+    #[tokio::test]
     async fn request_too_large_response_invalidates_persistent_connection() {
         let (listener, address) = listener().await;
         let server = tokio::spawn(async move {
@@ -2438,6 +2521,161 @@ mod tests {
         assert!(matches!(
             client.request(&Request::Health).await,
             Err(ClientError::ConnectionUnavailable)
+        ));
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn oversized_terminated_response_is_bounded_and_invalidates_connection() {
+        let (listener, address) = listener().await;
+        let max_response_bytes = 64;
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut reader = BufReader::new(stream);
+            assert!(matches!(read_request(&mut reader).await, Request::Health));
+            let mut response = vec![b'{'; max_response_bytes + 1];
+            response.push(b'}');
+            response.push(b'\n');
+            reader.get_mut().write_all(&response).await.unwrap();
+        });
+
+        let mut client = Client::connect_with_config(
+            address,
+            ClientConfig {
+                max_response_bytes,
+                ..test_config()
+            },
+        )
+        .await
+        .unwrap();
+        let result = client.request(&Request::Health).await;
+        assert!(
+            matches!(
+                result,
+                Err(ClientError::ResponseTooLarge { max_bytes }) if max_bytes == max_response_bytes
+            ),
+            "unexpected result: {result:?}"
+        );
+        assert!(matches!(
+            client.request(&Request::Health).await,
+            Err(ClientError::ConnectionUnavailable)
+        ));
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn oversized_unterminated_response_is_bounded_and_invalidates_connection() {
+        let (listener, address) = listener().await;
+        let max_response_bytes = 64;
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut reader = BufReader::new(stream);
+            assert!(matches!(read_request(&mut reader).await, Request::Health));
+            reader
+                .get_mut()
+                .write_all(&vec![b'x'; max_response_bytes + 1])
+                .await
+                .unwrap();
+        });
+
+        let mut client = Client::connect_with_config(
+            address,
+            ClientConfig {
+                max_response_bytes,
+                ..test_config()
+            },
+        )
+        .await
+        .unwrap();
+        let result = client.request(&Request::Health).await;
+        assert!(
+            matches!(
+                result,
+                Err(ClientError::ResponseTooLarge { max_bytes }) if max_bytes == max_response_bytes
+            ),
+            "unexpected result: {result:?}"
+        );
+        assert!(matches!(
+            client.request(&Request::Health).await,
+            Err(ClientError::ConnectionUnavailable)
+        ));
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn oversized_response_is_unknown_after_the_request_was_sent() {
+        let (listener, address) = listener().await;
+        let max_response_bytes = 64;
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut reader = BufReader::new(stream);
+            assert!(matches!(read_request(&mut reader).await, Request::Health));
+            reader
+                .get_mut()
+                .write_all(&vec![b'x'; max_response_bytes + 1])
+                .await
+                .unwrap();
+        });
+
+        let mut client = Client::connect_with_config(
+            address,
+            ClientConfig {
+                max_response_bytes,
+                ..test_config()
+            },
+        )
+        .await
+        .unwrap();
+        assert!(matches!(
+            client.request_with_outcome(&Request::Health).await,
+            AttemptOutcome::Unknown(AttemptFailure::Client(
+                ClientError::ResponseTooLarge { max_bytes }
+            )) if max_bytes == max_response_bytes
+        ));
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn accepts_a_fragmented_response_at_the_configured_limit() {
+        let (listener, address) = listener().await;
+        let response = serde_json::to_vec(&Response::Health {
+            status: "ok".to_owned(),
+            streams: 0,
+            storage_bytes: 0,
+        })
+        .unwrap();
+        let max_response_bytes = response.len() + 5;
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut reader = BufReader::new(stream);
+            assert!(matches!(read_request(&mut reader).await, Request::Health));
+            let split = response.len() / 2;
+            reader
+                .get_mut()
+                .write_all(&response[..split])
+                .await
+                .unwrap();
+            reader
+                .get_mut()
+                .write_all(&response[split..])
+                .await
+                .unwrap();
+            reader.get_mut().write_all(&[b' '; 4]).await.unwrap();
+            reader.get_mut().write_all(b"\n").await.unwrap();
+        });
+
+        let mut client = Client::connect_with_config(
+            address,
+            ClientConfig {
+                max_response_bytes,
+                ..test_config()
+            },
+        )
+        .await
+        .unwrap();
+        assert!(matches!(
+            client.request(&Request::Health).await,
+            Ok(Response::Health { status, .. }) if status == "ok"
         ));
         server.await.unwrap();
     }

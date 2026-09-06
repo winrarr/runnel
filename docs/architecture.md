@@ -45,7 +45,7 @@ The external and peer protocols and clustered materialized persistence use JSON;
 - runnel-protocol owns the provisional external request/response representation; it must not encode filesystem layout.
 - runnel-server owns sockets, HTTP, shutdown, and mapping core errors into protocol responses.
 - runnel-cli is a development client and is not a compatibility reference for future language SDKs.
-- runnel-client owns reusable persistent client transport, typed operations, and explicit outcome classification for the provisional protocol.
+- runnel-client owns reusable persistent client transport, bounded response buffering, typed operations, and explicit outcome classification for the provisional protocol.
 - runnel-test-support owns reusable semantic conformance assertions shared by engine implementations.
 
 Future architectural work should preserve these boundaries while addressing segmented storage, remaining overload and storage-stall evidence, migration between local and clustered durable state, and safe membership and placement changes. The backlog and design notes describe candidate work, not a required execution order.

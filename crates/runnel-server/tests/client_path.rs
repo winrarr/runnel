@@ -129,6 +129,35 @@ async fn typed_client_keeps_a_connection_and_preserves_binary_payloads() {
     assert_eq!(client.health().await.unwrap().streams, 1);
 }
 
+#[tokio::test]
+async fn typed_client_accepts_a_large_binary_response_within_its_byte_bound() {
+    let directory = TempDir::new().unwrap();
+    let server = RunningServer::start(directory.path(), &["--max-request-bytes", "32768"]);
+    let mut client = Client::connect_with_config(
+        server.broker_addr,
+        ClientConfig {
+            max_response_bytes: 32 * 1024,
+            ..ClientConfig::default()
+        },
+    )
+    .await
+    .unwrap();
+
+    client.create_stream("large").await.unwrap();
+    let payload: Vec<u8> = (0..16 * 1024).map(|index| (index % 251) as u8).collect();
+    client
+        .publish_bytes("large", payload.clone())
+        .await
+        .unwrap();
+
+    let message = client
+        .poll_bytes("large", "reader")
+        .await
+        .unwrap()
+        .expect("the large binary message should be available");
+    assert_eq!(message.payload, payload);
+}
+
 #[cfg(unix)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn typed_client_bounds_timeout_and_cancellation_before_reconnect() {
