@@ -3,14 +3,17 @@
 - Status: proposed design; not an accepted compatibility contract
 - Date: 2026-09-02
 - Last reviewed: 2026-09-06
-- Baseline: `2a917aeaf442a8970519206309852e12a20ca3c4`
+- Baseline: `8a35c83c239bfeacac9e071d71e0cbafca47f23a`
 - Scope: public client/broker requests and responses
-- Related debt: TD-003, TD-023, and [Make client interactions dependable and evolvable](../backlog.md#make-client-interactions-dependable-and-evolvable)
+- Related debt: TD-003, TD-018, TD-023, TD-025, and [Make client interactions dependable and evolvable](../backlog.md#make-client-interactions-dependable-and-evolvable)
+- Related evidence: [clustered outcome contract](clustered-outcome-contract.md), [application-aware retry policy](application-aware-retry-policy.md), [durability and delivery policy](durability-delivery-policy.md), [message encoding and compression research](../research/message-encoding-and-compression.md), [ADR 0022](../decisions/0022-provisional-binary-payloads.md), [ADR 0024](../decisions/0024-explicit-offset-replay-read.md), and [ADR 0026](../decisions/0026-semantic-engine-error-classification.md)
 
 This note defines the smallest useful compatibility policy for the current
 wire and a direction for its next evolution. It records observed behavior and
 proposals separately. Nothing here closes TD-003: the versioned runtime,
-interoperability matrix, and upgrade/recovery evidence are still required.
+interoperability matrix, and upgrade/recovery evidence are still required. ADR
+0026 closes the engine-level portion of TD-025, but stage-aware outcomes remain
+outside the provisional wire.
 
 ## Policy summary
 
@@ -41,8 +44,8 @@ automatically. The current operation surface is:
 
 | Direction | Tags | Compatibility-relevant fields |
 | --- | --- | --- |
-| Request | `create_stream`, `publish`, `publish_bytes`, `publish_batch`, `poll`, `poll_group`, `ack`, `ack_group`, `health` | UTF-8 names and keys; text `payload`; explicit `payload_base64`; optional publish `request_id`; batch records and ordered outcomes |
-| Response | `stream_created`, `published`, `publish_batch`, `message`, `message_bytes`, `empty`, `acknowledged`, `health`, `error` | offsets, text or binary payload, optional group delivery fields, acknowledgement state, stable error `code` and human-readable `message` |
+| Request | `create_stream`, `publish`, `publish_bytes`, `publish_batch`, `poll`, `replay`, `poll_group`, `ack`, `ack_group`, `health` | UTF-8 names, keys, and consumer/member identities; text `payload`; explicit `payload_base64`; optional publish `request_id`; batch records and ordered outcomes; inclusive replay `offset` |
+| Response | `stream_created`, `published`, `publish_batch`, `message`, `message_bytes`, `replay_message`, `replay_message_bytes`, `empty`, `acknowledged`, `health`, `error` | offsets, text or binary payload, optional group delivery fields for normal delivery, replay without delivery state, acknowledgement state, stable error `code` and human-readable `message` |
 
 The current wire rules are deliberately narrow:
 
@@ -61,22 +64,33 @@ The current wire rules are deliberately narrow:
 - Missing optional request IDs and optional response delivery fields remain
   readable. A serializer currently emits `request_id: null` on publish
   requests and omits absent optional response fields.
-- `payload` is UTF-8 text. `publish_bytes` and `message_bytes` carry exact
-  application bytes as standard padded base64 in `payload_base64`; the legacy
-  text shape is not silently reinterpreted as base64. Base64 expansion counts
-  against the current request-frame limit; responses have no negotiated
-  maximum yet and remain subject to current write behavior.
+- `payload` is UTF-8 text. `publish_bytes` and binary publish-batch records,
+  plus `message_bytes` and `replay_message_bytes`, carry exact application
+  bytes as standard padded base64 in `payload_base64`; the legacy text shape is
+  not silently reinterpreted as base64. Base64 expansion counts against the
+  current request-frame limit. The client has a local response-buffer limit,
+  defaulting to `MAX_RESPONSE_BYTES`, while the server has no negotiated or
+  equivalent response-size bound and serializes a response before writing it.
+- `replay` is an inclusive, one-offset, read-only operation. Its successful
+  response has no delivery token or attempt, and an unavailable offset returns
+  `history_unavailable` rather than the ordinary `empty` poll result. It does
+  not change consumer progress or delivery state.
 - `request_id` is an application-provided publish identity. It is present on
   single publishes and batch records, is not echoed in the current response,
-  and is not a general response correlation ID.
+  and is not a general response correlation ID. The local and clustered
+  engines scope it per stream and return the original offset when it is reused,
+  even if the retry's key or payload differs; there is no producer namespace,
+  request fingerprint, or retention window in the current v1 contract.
 
 The current [server retry test](../../crates/runnel-server/tests/client_retry.rs)
 demonstrates the important outcome boundary: after a response is lost, the
 client reports an unknown publish attempt, and explicitly replaying the same
-publish identity returns the existing result without a duplicate. A connection
-failure before any request bytes are sent is retryable; a write, timeout, EOF,
-or cancellation after writing may have reached the broker and is unknown. The
-client intentionally leaves retry policy to the caller.
+publish identity returns the existing result without a duplicate. The local
+and clustered engine tests also cover persistence of that identity and the
+current per-stream, mismatch-ignoring behavior. A connection failure before
+any request bytes are sent is retryable; a write, timeout, EOF, or cancellation
+after writing may have reached the broker and is unknown. The client
+intentionally leaves retry policy to the caller.
 
 These facts describe the implementation at this baseline. They are not a
 claim that arbitrary v1 clients and future servers interoperate.
@@ -135,6 +149,16 @@ independent from a connection-scoped version/capability handshake, explicitly
 negotiate any limits that affect wire behavior, and add the real-server
 old/new, no-overlap, reconnect, and malformed-preface tests listed below.
 
+The accepted [engine error classification](../decisions/0026-semantic-engine-error-classification.md)
+is deliberately narrower than a future wire outcome contract. `BrokerError::kind()`
+provides a backend-independent reason and `BrokerError::outcome()` provides a
+conservative `Rejected`, `Retryable`, or `Unknown` engine result; successful
+engine results are confirmed. The v1 server still emits only its existing
+`code` and `message` fields, maps internal routing failures to `cluster_error`,
+and the reusable client keeps that generic response `Unknown`. Neither an
+engine outcome nor a transport error establishes a commit/apply stage for a
+client.
+
 ## Proposed v2 compatibility policy
 
 ### Version and framing
@@ -150,10 +174,11 @@ connection; it must not guess a format from malformed bytes.
 V2 frames are length-delimited and bounded before allocation. Each application
 frame carries an opaque `correlation_id`; the response repeats it. This is
 needed for matching responses if v2 later permits concurrent in-flight
-requests. It is distinct from the operation-level `request_id`, which remains
-the stable producer identity used to resolve an ambiguous publish. A retry may
-use a new correlation ID and must reuse the same request ID when deduplication
-is requested.
+requests. It is distinct from the application operation identity used to
+resolve an ambiguous mutation. V1 `request_id` is publish-only; v2 may define a
+generic `operation_id` or another name, but must not silently broaden the v1
+field's scope. A retry may use a new correlation ID and must reuse the same
+stable operation identity when deduplication or resolution is requested.
 
 Negotiation is connection-scoped. A reconnect performs Hello again because
 the peer may have been upgraded or rolled back. A v2 connection never changes
@@ -161,7 +186,7 @@ frame format midstream, and a v1 client never sends a v2 operation merely
 because a server understands it.
 
 This direction follows two useful reference patterns. [Kafka's protocol
-guide](https://kafka.apache.org/41/design/protocol/) versions each API, has a
+guide](https://kafka.apache.org/42/design/protocol/) versions each API, has a
 client select the highest mutually supported version, returns the response
 shape for the requested version, and repeats discovery after reconnect. [NATS's
 client protocol](https://docs.nats.io/reference/protocols/client) keeps a
@@ -226,7 +251,9 @@ silent loss of required behavior.
 
 Unknown operation/discriminator values are never treated as a known operation.
 Return an explicit unsupported result and keep the connection usable only if
-the framing/parser state is known to be intact.
+the framing/parser state is known to be intact. A malformed preface or an
+invalid frame may not have enough structure for a typed response and may need
+to close the connection instead.
 
 V2 enum fields should use an open representation or preserve the raw value.
 An unknown value must be surfaced as unknown, not silently mapped to a
@@ -242,9 +269,12 @@ numbers and use an explicit zero/unspecified enum value.
 
 V1 keeps the additive `publish_bytes`/`message_bytes` forms established by
 [ADR 0022](../decisions/0022-provisional-binary-payloads.md). They make the
-binary boundary explicit and preserve text readability. V2 should carry the
-logical payload as a length-delimited byte field in the negotiated envelope;
-base64 may remain a JSON bridge, but it must not become the logical model.
+binary boundary explicit and preserve text readability. The additive publish
+batch and replay shapes are also part of the current v1 boundary; replay is a
+read-only offset operation as accepted by [ADR 0024](../decisions/0024-explicit-offset-replay-read.md).
+V2 should carry the logical payload as a length-delimited byte field in the
+negotiated envelope; base64 may remain a JSON bridge, but it must not become
+the logical model.
 Compression, if added, is a transport or storage content coding and must be
 identified separately from payload encoding. A consumer always receives the
 same logical bytes, regardless of representation.
@@ -262,7 +292,8 @@ V2 should make these concepts explicit:
 | Concept | Meaning | Retry rule |
 | --- | --- | --- |
 | `correlation_id` | Matches one response to one wire attempt | New value is valid on a retry; never implies deduplication |
-| `request_id` | Stable application identity for an idempotent publish attempt | Reuse exactly when resolving an unknown publish; a mismatch must be an explicit error |
+| `operation_id` | Future stable application identity for one operation intent across retries and forwarding | Reuse exactly when resolving an unknown operation; a mismatch must be an explicit error |
+| v1 `request_id` | Current publish-only identity, scoped per stream and without a stored fingerprint | Reuse resolves the stored offset today; v2 must not assume this behavior is sufficient for generic operations |
 | confirmed | The broker returned the operation's success result | Do not replay unless the application intentionally requests another message |
 | rejected | The broker definitely did not apply the operation | Fix the request or policy before retrying |
 | retryable | The broker definitely did not apply it and a new connection/attempt is safe | Retry with the same intent; preserve request identity when applicable |
@@ -271,25 +302,27 @@ V2 should make these concepts explicit:
 V2 error responses should carry an explicit outcome class in addition to a
 stable machine-readable code and diagnostic message. This avoids forcing each
 client implementation to infer retry safety from an ever-growing code list.
-The server must never label an operation retryable when it may have crossed the
-durability or application boundary. Publish batches must retain one outcome per
-record and must not imply atomicity unless a separately negotiated operation
-provides it.
+The class should describe the attempt outcome, not pretend to be stage
+evidence; a separate stage field is useful only if the broker can establish it
+authoritatively. The server must never label an operation retryable when it may
+have crossed the durability or application boundary. Publish batches must
+retain one outcome per record and must not imply atomicity unless a separately
+negotiated operation provides it.
 
-The reference point is [Kafka's producer design](https://kafka.apache.org/41/design/design/):
+The reference point is [Kafka's producer design](https://kafka.apache.org/42/design/design/):
 it distinguishes a network error after a publish from a definitely failed
 operation and provides idempotent producer sequencing so retries do not create
-duplicates. Runnel's current request identity is deliberately smaller and
-application-provided, so the future contract must document its scope, lifetime,
-collision behavior, and whether it applies to single publishes and batch
-records independently.
+duplicates. Runnel's current v1 request identity is deliberately smaller and
+application-provided, so the future contract must document the generic
+identity's scope, lifetime, collision behavior, fingerprint, and whether it
+applies to single publishes and batch records independently.
 
 ### Upgrade and rollback
 
 The supported rollout shape should be server-first and additive:
 
-1. Deploy a server that still accepts v1 and advertises v2, without making v2
-   the default.
+1. Deploy a server that still accepts v1 and also supports a v2 negotiation
+   path, without making v2 the default for existing clients.
 2. Deploy clients that can negotiate v2 but retain v1 fallback and preserve
    explicit outcome handling.
 3. Enable v2 features only after capability and restart/unknown-outcome checks
@@ -300,9 +333,11 @@ The supported rollout shape should be server-first and additive:
 Rollback to an older server is safe only while clients can use v1 and no
 v2-only operation or required semantic has been enabled. Once v2 frames or
 v2-only semantics are in flight, drain or fence those clients before rollback;
-do not downgrade mid-connection. This note makes no claim that a future wire
-upgrade automatically migrates retained storage, journals, snapshots, or
-consumer state. Those formats need their own version and rollback policy.
+do not downgrade mid-connection. A wire upgrade also does not automatically
+migrate retained storage, journals, snapshots, consumer state, or engine
+selection; those boundaries need their own version and rollback policy. The
+single-node-to-cluster migration design is a separate logical data-movement
+problem, not a protocol-version fallback.
 
 ## Compatibility fixtures and enforcement
 
@@ -322,7 +357,8 @@ language-neutral:
 - binary fixtures include empty bytes, NUL, non-UTF-8 bytes, standard padded
   base64, and malformed encodings;
 - request-ID fixtures prove IDs survive serialization on publish forms and are
-  not accidentally confused with response correlation; and
+  not accidentally confused with response correlation; replay fixtures prove
+  the read-only response has no delivery token or attempt; and
 - batch fixtures preserve input order and one per-record outcome without
   asserting batch atomicity.
 
@@ -345,8 +381,10 @@ No real-server compatibility test is added in this slice. The server has no
 version negotiation or v2 framing to exercise; a proxy that merely injects an
 unsupported version would test a fake runtime. The existing process-level
 retry test remains the appropriate evidence for current unknown publish
-outcomes. Implementing the negotiation boundary, then adding the real-server
-matrix above, is a follow-up required to retire TD-003.
+outcomes, while the replay tests establish the additive read-only operation
+and the clustered outcome tests establish only the engine-level classification.
+Implementing the negotiation boundary, then adding the real-server matrix
+above, is a follow-up required to retire TD-003.
 
 ## Unresolved decisions
 
