@@ -26,9 +26,9 @@ This register records known implementation and documentation shortcomings. Produ
 ## TD-005: Durability and delivery policies are hard-coded
 
 - Status: open
-- Impact: direct `sync_data` publishing and broker-wide acknowledgement timeout and attempt-limit settings are useful defaults but do not yet expose a documented durability mode, consumer-scoped retry policy, retention policy, or backpressure budget.
-- Context: the current implementation intentionally chooses one conservative path while semantics are being established.
-- Retirement condition: each configurable policy has an explicit guarantee, bounded-resource behavior, and focused failure tests before it is exposed publicly.
+- Impact: local durable writes, clustered quorum writes, broker-wide acknowledgement timeout and attempt-limit settings, unlimited retention, and bounded request/storage queues are useful defaults, but they are different policy axes rather than one selectable contract. The broker does not yet expose a documented durability mode, consumer-scoped retry policy, retention policy, or storage-capacity/backpressure budget.
+- Context: the current implementation intentionally chooses conservative paths while semantics are being established: local stream appends call `sync_data`, local consumer events call `sync_all`, clustered commands cross replicated log and state-machine journal boundaries, the acknowledgement timeout doubles as the initial redelivery delay, and an optional broker-wide attempt limit controls derived dead-letter movement. The [durability and delivery policy boundary](design/durability-delivery-policy.md) records the observed behavior, separates these concerns, and defines evidence gates without prescribing an API or storage layout.
+- Retirement condition: each public policy axis has an explicit guarantee and outcome model, bounded-resource behavior, migration/compatibility consequences, and focused restart, failure, and resource tests for local and clustered paths where applicable. The policy must be inspectable and recorded in an accepted ADR before the conservative defaults are replaced.
 
 ## TD-006: Operational telemetry remains incomplete
 
