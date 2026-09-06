@@ -2,7 +2,7 @@
 
 - Status: exploratory design note; not an accepted compatibility decision
 - Last reviewed: 2026-09-06
-- Baseline: `d5f033ec1db8ee7402e5b7a96ef2935f0a1325d6`
+- Baseline: `cfedaed1fa7f7e980cfd62db68de398c2ce53873`
 - Reading guide: [design-note conventions](README.md)
 - Scope: backlog outcome [Make growth from one node to a cluster non-disruptive](../backlog.md#make-growth-from-one-node-to-a-cluster-non-disruptive) and [TD-004](../tech-debt.md#td-004-local-and-clustered-durable-state-have-no-supported-migration-path)
 
@@ -45,7 +45,7 @@ boundary; it does not turn the current engine into a migration service.
 | --- | --- | --- |
 | Observed local behavior | The local broker selects one durable writer format at startup, scans known `RNL1`, `RNL2`, and `RNL3` frame magics, truncates an incomplete trailing frame during normal recovery, and persists consumer checkpoints/journal events. Active delivery members, tokens, and `Instant` deadlines are process memory. See [`BrokerState::open`](../../crates/runnel-core/src/broker.rs), [`StreamLog::open`](../../crates/runnel-core/src/stream_log.rs), and the recovery tests in [`runnel-core`](../../crates/runnel-core/src/lib.rs). | A converter can preserve logical records and durable consumer state only after a normal source recovery boundary. It cannot copy volatile delivery ownership. |
 | Observed clustered behavior | The clustered engine selects the Raft backend at process startup. Startup validates clustered storage identity and persisted artifacts before opening groups; stream creation reconciles metadata `Creating`/`Active` state with one data group per stream and the configured peer set. See [`PersistentEngine::open_with_config`](../../crates/runnel-raft/src/engine.rs), [`GroupManager`](../../crates/runnel-raft/src/group_manager.rs), and [`SnapshotState`](../../crates/runnel-raft/src/state_machine.rs). | A fresh target can be populated only through a future logical import path. The existing public `Publish`, `CreateStream`, and snapshot-recovery paths are not a local-to-cluster interchange format. |
-| Observed absence | There is no migration command, import/export schema, durable migration phase, writer-fence epoch, endpoint-generation owner, or migration-specific status/metric in the current code. Existing clustered identity checks intentionally reject ambiguous state; they do not convert it. The current tests cover local recovery and clustered restart/failure, not cross-engine migration. | Any phase, fence, activation, rollback, or migration-status behavior below is proposed work and must not be described as current support. |
+| Observed absence | There is no migration command, import/export schema, durable migration phase, writer-fence epoch, endpoint-generation owner, or migration-specific status/metric in the current code. The engine now exposes backend-independent failure kind and safe attempt-outcome classification, but the provisional server still emits its existing error codes and has no migration or stage-aware outcome vocabulary. Existing clustered identity checks intentionally reject ambiguous state; they do not convert it. The current tests cover local recovery and clustered restart/failure, not cross-engine migration. | Any phase, fence, activation, rollback, or migration-status behavior below is proposed work and must not be described as current support. |
 | Proposed first supported slice | Side-by-side logical export/import into an empty, current three-node target, with a source fence for the final boundary, validation before serving, external endpoint cutover, and source retention until the recovery window ends. | This is the narrow retirement shape for TD-004. It preserves the application messaging model, not zero downtime or automatic downgrade. |
 
 The current evidence is useful but deliberately weaker than migration evidence.
@@ -58,7 +58,11 @@ experiment. The real-process coverage is in
 [`cluster_smoke.rs`](../../crates/runnel-server/tests/cluster_smoke.rs). None
 of these tests proves a local export, cross-engine state conversion, writer
 fence, endpoint switch, or rollback boundary; those remain explicit gaps in
-the verification plan below.
+the verification plan below. Separate real-server coverage now exercises an
+application-shaped typed-client restart flow and ambiguous dead-letter
+reconciliation, but those tests still keep one engine and one durable
+representation throughout ([`client_path.rs`](../../crates/runnel-server/tests/client_path.rs),
+[`server_smoke.rs`](../../crates/runnel-server/tests/server_smoke.rs)).
 
 The test-to-claim mapping is:
 
@@ -68,6 +72,8 @@ The test-to-claim mapping is:
 | Local durable consumer and retry state survives failures | `consumer_delivery_journal_recovers_committed_events_and_discards_partial_tail`, `acknowledged_group_progress_and_retry_state_survive_restart`, and `request_id_deduplication_survives_restart` in [`runnel-core/src/lib.rs`](../../crates/runnel-core/src/lib.rs). | Conversion into clustered state or behavior for a fence racing with an acknowledgement. |
 | Cluster state recovers and rejects ambiguous storage | `persistent_engine_recovers_committed_state_after_reopen`, `persisted_storage_rejects_cluster_identity_mismatch_without_rewriting_data`, `partial_cluster_layout_is_rejected_without_opening_as_empty`, and `rejected_snapshot_install_preserves_existing_state` in [`runnel-raft/src/lib.rs`](../../crates/runnel-raft/src/lib.rs). | Local-to-cluster import, migration authority, endpoint ownership, or production replica replacement. |
 | Cluster delivery and process failures have a correctness baseline | `three_process_cluster_preserves_group_delivery_through_replica_restart`, `three_process_cluster_reassigns_group_delivery_after_node_failure`, and `three_process_cluster_replicates_and_recovers_after_failures` in [`cluster_smoke.rs`](../../crates/runnel-server/tests/cluster_smoke.rs). | Any cross-engine cutover, stale local writer rejection, or rollback after target writes. |
+| Engine failures have a backend-independent retry boundary | `classifies_failures_without_exposing_backend_details` and `retains_diagnostic_sources_for_backend_failures` in [`runnel-engine/src/lib.rs`](../../crates/runnel-engine/src/lib.rs), with shared local and clustered assertions in [`engine_contract.rs`](../../crates/runnel-core/tests/engine_contract.rs) and [`runnel-raft/src/lib.rs`](../../crates/runnel-raft/src/lib.rs). | The classification does not identify a migration phase, writer-fence epoch, commit/apply stage, or endpoint authority; a future migration surface still needs explicit evidence for those boundaries. |
+| Provisional protocol support is declared consistently | `protocol_support_stays_aligned_across_wire_client_and_server` in [`runnel-server/src/protocol.rs`](../../crates/runnel-server/src/protocol.rs) checks the shared `runnel-json-lines` v1 and UTF-8/base64 declarations. | The declaration is source-level only: the listener has no runtime handshake or cross-version migration guarantee. |
 
 ## Current evidence and the boundary it creates
 
@@ -139,9 +145,14 @@ keeps empty-replica recovery test-only.
 The provisional client makes transport failures after a request may have been
 written `Unknown`. A publish with a stable request ID can be retried explicitly
 and resolve to the original offset; a publish without one remains ambiguous.
-The server also treats request timeouts conservatively because engine work may
-already have committed. The migration cannot turn an unknown pre-fence publish
-without a request ID into a confirmed or deduplicated result.
+At the engine boundary, `BrokerError::kind()` and `BrokerError::outcome()` now
+provide a backend-independent reason and conservative rejected/retryable/
+unknown attempt classification, as accepted by [ADR 0026](../decisions/0026-semantic-engine-error-classification.md).
+That classification does not expose a commit/apply stage or migration
+authority, and the v1 server still maps existing variants to its provisional
+codes. The server also treats request timeouts conservatively because engine
+work may already have committed. The migration cannot turn an unknown
+pre-fence publish without a request ID into a confirmed or deduplicated result.
 
 After activation, the same public protocol and engine contract remain in use.
 Clients reconnect to the target endpoint; they do not learn Raft groups,
@@ -567,7 +578,7 @@ small compatibility matrix:
 
 | Dimension | Supported first slice | Refused or deferred |
 | --- | --- | --- |
-| Public protocol | Existing provisional JSON-lines requests/responses and client outcome classes remain valid after reconnect. | Protocol redesign, transparent automatic client reconnection, and new topology fields. |
+| Public protocol | The current client and server share the provisional `runnel-json-lines` v1 declaration and UTF-8/base64 payload representations; existing requests/responses and client outcome classes remain valid after reconnect. | This declaration is source-level only because v1 has no runtime handshake. Protocol redesign, transparent automatic client reconnection, and new topology fields remain deferred. |
 | Local record encoding | Valid source histories read by the current local reader, including supported mixed `RNL1`/`RNL2`/`RNL3` frames. | Unknown versions, malformed complete frames, unbounded lengths, or guessed format conversion. |
 | Cluster representation | Current target metadata/data-group, checkpoint, snapshot, journal, and manifest versions. | Import into an older target, unknown target schema, or arbitrary OpenRaft on-disk layout. |
 | Consumer semantics | Local committed and out-of-order acknowledged progress plus delivery attempts convert into coherent clustered state. Outstanding local tokens become redelivery. | Transferring local volatile leases/tokens or changing retry/ack semantics during migration. |
@@ -929,6 +940,7 @@ shortcuts.
 - [ADR 0019: clustered storage identity](../decisions/0019-clustered-storage-identity.md)
 - [ADR 0023: independent retained storage and placement](../decisions/0023-independent-retained-storage-and-placement.md)
 - [ADR 0024: explicit offset replay](../decisions/0024-explicit-offset-replay-read.md)
+- [ADR 0026: semantic engine error classification](../decisions/0026-semantic-engine-error-classification.md)
 - [Raft follower recovery and replacement research](../research/raft-recovery-and-replacement.md)
 - [Testing and local operation](../testing.md)
 
