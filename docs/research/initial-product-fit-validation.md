@@ -2,6 +2,7 @@
 
 - Status: repeatable repository harness recorded; product-fit claim remains unknown
 - Last reviewed: 2026-09-06
+- Evidence baseline: `90582712d8a67154cd12746cbc3cee07566038c4`
 - Scope: validate the audience, workloads, and product promise in
   [product-fit.md](../product-fit.md) against the current single-node and early
   three-node slices.
@@ -22,6 +23,11 @@ Keep these categories separate in every result:
   envelope that the exercises below must test.
 - **Unresolved questions** are gaps that must remain visible when a workload
   cannot be evaluated honestly.
+- **Attempt outcomes** are separate from product-fit evidence: the engine now
+  classifies failures as rejected, retryable, or unknown, while the provisional
+  protocol and client still keep post-request transport uncertainty explicit.
+  A successful local request is evidence only for the selected local
+  durability boundary, not a general guarantee about ambiguous failures.
 
 Before each run, create a validation manifest containing the revision, binary
 and configuration, message size and encoding, message volume, key distribution,
@@ -29,22 +35,24 @@ consumer concurrency, retained history, failure injection, hardware, and
 numeric budgets. The following names make the required budgets explicit without
 inventing measurements or choosing thresholds after seeing results:
 
-| Dimension | Pre-registered budget and pass condition |
+| Dimension | Required budget, current registration, and pass condition |
 | --- | --- |
-| Delivery and durability | `B_safety` requires zero loss of a confirmed durable publish, zero successful stale acknowledgements, and zero concurrent delivery of the same requested ordering key. Redelivery of work that was not durably acknowledged is allowed and must be counted. |
-| End-to-end latency | Record numeric `B_p95` and `B_p99` limits for publish-to-confirm, publish-to-consume, and consume-to-ack in the manifest. Each observed percentile must be at or below its workload limit under the stated durability mode. |
-| Throughput | Record a numeric sustained `B_rate`, workload volume, duration, and allowed error count. The run must sustain the rate without violating `B_safety`, the memory limit, or the storage limit. |
-| Memory and in-flight work | Record a numeric `B_rss` peak and the permitted in-flight count. Peak resident memory must stay within the ceiling, and a steady workload or slow consumer must not show unbounded growth. |
-| Storage growth | Record the retained logical bytes and numeric `B_disk` ceiling. Report physical bytes, bytes per logical record, and recovery headroom; do not treat an unbounded append-only log as a retention guarantee. |
-| Recovery | Record a numeric `B_rto` from failure injection to ready service and a workload-specific replay/recovery window. Confirmed durable data has zero recovery-point loss; allowed duplicates and redeliveries are classified rather than hidden. |
-| Operator effort | Record numeric `B_onboard` and `B_recover` time limits plus the critical task list. An intended participant must complete every critical task without editing broker files or learning internal storage/topology concepts. |
+| Delivery and durability | `B_safety` requires zero loss of a confirmed durable publish, zero successful stale acknowledgements, and zero concurrent delivery of the same requested ordering key. Redelivery of work that was not durably acknowledged is allowed and must be counted. The current representative harness asserts the first two and records delivery evidence; keyed-overlap measurement remains separate. |
+| End-to-end latency | The current manifest registers `publish_p95_ms` and `publish_p99_ms` for publish-to-confirm request latency only. Each observed publish percentile must be at or below its workload limit under the stated local durability mode. Publish-to-consume and consume-to-ack distributions are recorded by the harness but have no registered pass limits yet. |
+| Throughput | The current manifest registers a minimum scenario rate and workload volume; each run has a finite measured duration. It is useful as a repeatable engineering check, not a sustained-rate claim; an intended workload must register duration, allowed errors, and a sustained `B_rate` before making that claim. |
+| Memory and in-flight work | The current manifest registers an `rss_peak_bytes` ceiling. Peak resident memory must stay within it, but the harness only observes in-flight delivery metrics; a permitted in-flight/lag envelope and a steady slow-consumer test remain open. |
+| Storage growth | The current manifest registers a physical directory-growth ceiling. Report physical bytes and bytes per logical record when useful, but logical retained bytes, recovery headroom, and an enforceable retention boundary remain unregistered; an unbounded append-only log is not a retention guarantee. |
+| Recovery | The current manifest registers `recovery_seconds` from local broker restart to ready service. Confirmed durable data has zero recovery-point loss in the exercised workload; allowed duplicates and redeliveries are classified rather than hidden. Cluster recovery and migration need separate budgets. |
+| Operator effort | The current representative manifest does not register `B_onboard` or `B_recover`. An intended-user study must add numeric limits and a critical task list; the participant must complete the tasks without editing broker files or learning internal storage/topology concepts. |
 
-The numeric values are part of the signed-off workload manifest and must come
-from the intended application or an explicitly documented representative
-workload. The repository manifest at
+The numeric values for a product-fit claim must be part of a signed-off
+workload manifest and come from the intended application or an explicitly
+documented representative workload. The repository manifest at
 [`product-fit-manifests/local-reference.json`](product-fit-manifests/local-reference.json)
-is explicitly a representative engineering envelope. It keeps the automated
-run reproducible without turning host measurements into a product SLO.
+is explicitly a representative engineering envelope: it currently covers
+publish latency, scenario rate, RSS, physical growth, and local restart
+budgets, not the complete intended-user budget set. It keeps the automated run
+reproducible without turning host measurements into a product SLO.
 
 ## Repeatable repository workload harness
 
@@ -105,7 +113,7 @@ resident-memory samples, storage growth, or participant task times.
 | Criterion | Disposition from this run |
 | --- | --- |
 | `B_safety` and semantic delivery behavior | **Pass for the harness assertions:** confirmed messages remained available, acknowledged progress survived restart, shared members received distinct records, retry/dead-letter transitions completed, independent consumers advanced separately, and stale delivery state was rejected. Concurrent keyed-overlap measurement remains open; existing contract and engine tests cover that predicate separately. |
-| `B_p95`, `B_p99`, and `B_rate` | **Pass for this representative run only:** both workloads stayed below the manifest's registered publish percentile and scenario-throughput budgets. These are engineering-envelope measurements, not application SLOs or a sustained-load claim. |
+| `B_p95`, `B_p99`, and `B_rate` | **Pass for the registered subset only:** both workloads stayed below the manifest's publish percentile and scenario-throughput budgets. Poll/ack end-to-end budgets are not registered, and the 20-message scenario rate is not a sustained-load claim. These are engineering-envelope measurements, not application SLOs. |
 | `B_rss`, in-flight, and `B_disk` | **Partial:** RSS and physical storage growth stayed below the registered ceilings, and in-flight metrics were captured in the Prometheus snapshots. The run was host-unconstrained and did not register or prove a bounded in-flight/lag envelope. |
 | `B_rto` and replay/recovery window | **Pass for the exercised local restart:** both workloads became ready in about 53 ms and recovered their expected state within the 5 s representative budget. This does not establish a cluster RTO or migration procedure. |
 | `B_onboard` and `B_recover` | **Unknown:** maintainers ran the commands; no intended-user onboarding or recovery exercise was performed, and no operator-effort times or help requests were recorded. |
@@ -118,25 +126,28 @@ redelivery, stale acknowledgements, or cluster recovery.
 
 ### Current reference workload run (2026-09-06)
 
-The new harness was run from revision
-`554fd37e97b9d65baccb97a00f04630f2436b83b` with
-`just product-fit --output-dir benchmark-results/product-fit/20260906-554fd37`.
+The harness was run from the current evidence baseline
+`90582712d8a67154cd12746cbc3cee07566038c4` with
+`just product-fit --output-dir /tmp/runnel-product-fit-9058271`.
 The host was Linux 7.0.0-31-generic on x86_64 with 20 logical CPUs; this was a
 native, unconstrained local process run. Both workloads completed with an
 automated `pass` against the representative manifest budgets:
 
 | Workload | Messages | Publish p95 / p99 | Scenario throughput | RSS peak | Storage growth | Restart-to-ready |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: |
-| Durable background work | 20 | 0.135 / 0.159 ms | 29.34 msg/s | 14.9 MiB | 4,735 B | 0.054 s |
-| Application events and replay | 20 | 0.631 / 0.658 ms | 126.37 msg/s | 14.0 MiB | 5,862 B | 0.053 s |
+| Durable background work | 20 | 0.075 / 0.102 ms | 29.86 msg/s | 15.0 MiB | 4,735 B | 0.053 s |
+| Application events and replay | 20 | 0.769 / 0.787 ms | 122.59 msg/s | 14.7 MiB | 6,740 B | 0.054 s |
 
 The packages contained 74 and 103 protocol transcript entries respectively,
 message ledgers with 68 and 102 events, three readiness/metrics phases, raw
 resource samples, and per-workload broker logs. The harness exercised keyed
 fields, two-member grouped delivery, expiry/redelivery, stale-token rejection,
 dead-letter handling, independent consumers, replay, and restart recovery. It
-does not establish concurrent keyed-overlap absence, a sustained-rate envelope,
-or an operator-effort result; those remain separate evidence requirements.
+records poll and acknowledgement distributions without registering their
+end-to-end limits, and does not establish concurrent keyed-overlap absence, a
+sustained-rate envelope, or an operator-effort result; those remain separate
+evidence requirements. The generated package was kept in the temporary output
+directory rather than committed to the repository.
 
 ### Evidence-supported operating point and explicit boundaries
 
@@ -187,9 +198,10 @@ documented client or CLI path and inspect readiness and metrics during the run.
 no same-key overlap, durable acknowledgement before progress advances, stale
 acknowledgements rejected, and poison work isolated according to the selected
 policy. The final inventory accounts for every published record, attempt,
-redelivery, dead-letter record, and permitted duplicate. `B_p95`, `B_p99`,
-`B_rate`, `B_rss`, `B_disk`, `B_rto`, and operator budgets pass for the
-declared workload.
+redelivery, dead-letter record, and permitted duplicate. The registered
+publish, scenario-rate, RSS, physical-growth, and local-restart budgets pass
+for the declared representative workload. Poll/ack, in-flight, and operator
+budgets must be registered before this is a full product-fit pass.
 
 **Current repository evidence.** [`just smoke`](../testing.md) runs a real
 broker and CLI through publish, consume, acknowledgement, shared members,
@@ -356,6 +368,9 @@ be generalized to the others.
   and consumer-lag limits, and what happens under disk pressure?
 - What retry, backoff, provenance, redrive, and duplicate policy does an
   application need for each workload?
+- Can the engine's rejected/retryable/unknown outcome classification be exposed
+  through a versioned client contract without treating transport uncertainty as
+  safe to retry?
 - Can a one-node deployment be migrated to three nodes with a rollback and
   compatibility procedure that preserves offsets, replay eligibility, and
   consumer progress? What operator state must be transferred?
@@ -377,6 +392,14 @@ market claim.
 ## Reference designs and implications for the test shape
 
 These sources are used as reference points, not compatibility targets:
+
+The current Runnel evidence is bounded by [ADR 0026](../decisions/0026-semantic-engine-error-classification.md),
+the [durability and delivery policy boundary](../design/durability-delivery-policy.md),
+and the [application-aware retry design](../design/application-aware-retry-policy.md).
+Together they distinguish durable-write, delivery, retention, overload, and
+attempt-outcome questions. They are not product-fit evidence by themselves:
+the harness must still measure the selected workload, and intended users must
+still demonstrate that the resulting guarantees and recovery steps are usable.
 
 - [RabbitMQ consumer acknowledgements and publisher
   confirms](https://www.rabbitmq.com/docs/confirms) makes the acknowledgement
