@@ -2,11 +2,11 @@
 
 - Status: exploratory design note; decision-ready for a scoped first slice; no runtime semantics are changed here
 - Last reviewed: 2026-09-06
-- Baseline: `d5f033ec1db8ee7402e5b7a96ef2935f0a1325d6`
+- Baseline: `3d87e9316a2d6255e5660535ee340e76f3ed679a`
 - Reading guide: [design-note conventions](README.md)
 - Related debt: [TD-018](../tech-debt.md#td-018-retry-policy-and-dead-letter-provenance-are-coarse)
 - Related outcome: [Make retry policy application-aware](../backlog.md#make-retry-policy-application-aware)
-- Related decisions: [ADR 0014](../decisions/0014-local-retry-and-dead-letter-policy.md), [ADR 0015](../decisions/0015-clustered-shared-consumer-ownership.md), and [ADR 0016](../decisions/0016-clustered-retry-and-dead-letter-policy.md)
+- Related decisions: [ADR 0014](../decisions/0014-local-retry-and-dead-letter-policy.md), [ADR 0015](../decisions/0015-clustered-shared-consumer-ownership.md), [ADR 0016](../decisions/0016-clustered-retry-and-dead-letter-policy.md), and [ADR 0026](../decisions/0026-semantic-engine-error-classification.md)
 - Companion design: [Dead-letter recovery across durable boundaries](dead-letter-recovery.md)
 
 This note proposes the application-facing retry and dead-letter contract for
@@ -112,7 +112,14 @@ The current behavior is a useful compatibility baseline:
 | Delivery API | The provisional protocol has `poll`, `poll_group`, `ack`, `ack_group`, an attempt number, and an opaque grouped-delivery token. It has no negative acknowledgement, consumer configuration, provenance field, or redrive operation. | Additive capability-gated operations and optional response metadata are required. Existing payloads and legacy dead-letter records must remain readable. |
 | Observability | Health exposes process-lifetime redelivery and dead-letter counters; `/metrics` exposes those counters and general request/storage metrics. | Add retry schedule, terminal reason, move, redrive, and blocked-target signals without unbounded stream/consumer label cardinality. |
 
-The local attempt and move paths are visible in the [local poll and attempt handling](../../crates/runnel-core/src/lib.rs#L388), [local dead-letter append](../../crates/runnel-core/src/lib.rs#L655), and [request-aware move identity](../../crates/runnel-core/src/lib.rs#L845). The clustered state shape and grouped transition are visible in the [clustered consumer state](../../crates/runnel-raft/src/lib.rs#L240) and [grouped poll state machine](../../crates/runnel-raft/src/lib.rs#L572). The current public message has only `delivery_attempt` and no provenance object ([engine contract](../../crates/runnel-engine/src/lib.rs#L73), [protocol response](../../crates/runnel-protocol/src/lib.rs#L145)).
+The local attempt and move paths are visible in [`Broker::poll_group`](../../crates/runnel-core/src/broker.rs#L233), [`Broker::dead_letter_record`](../../crates/runnel-core/src/broker.rs#L505), and [`dead_letter_move_id`](../../crates/runnel-core/src/lib.rs#L198). The clustered state shape and grouped transition are visible in [`SnapshotState`](../../crates/runnel-raft/src/state_machine.rs#L182) and [`apply_group_poll`](../../crates/runnel-raft/src/delivery.rs#L49). The current public message has only `delivery_attempt` and no provenance object ([engine contract](../../crates/runnel-engine/src/lib.rs#L73), [protocol response](../../crates/runnel-protocol/src/lib.rs#L247)).
+
+At the engine boundary, [ADR 0026](../decisions/0026-semantic-engine-error-classification.md)
+now provides backend-independent `BrokerError::kind()` and
+`BrokerError::outcome()` classifications. This is an accepted source-level
+failure boundary, not operation-stage evidence: the provisional v1 server and
+wire response still do not tell an application whether a mutation crossed a
+proposal, commit, apply, or response boundary.
 
 ### Current evidence snapshot
 
@@ -123,17 +130,22 @@ must preserve:
   expiry, stale acknowledgement fencing, scoped key exclusion, and restart
   recovery in [`crates/runnel-core/tests/engine_contract.rs`](../../crates/runnel-core/tests/engine_contract.rs).
 - Local unit tests cover durable attempt counting and the existing derived
-  dead-letter transition ([attempt limit](../../crates/runnel-core/src/lib.rs#L1565),
-  [stable move identity](../../crates/runnel-core/src/lib.rs#L1646),
-  [restart reconciliation](../../crates/runnel-core/src/lib.rs#L1692), and
-  [content mismatch](../../crates/runnel-core/src/lib.rs#L1800)).
+  dead-letter transition ([attempt limit](../../crates/runnel-core/src/lib.rs#L873),
+  [stable move identity](../../crates/runnel-core/src/lib.rs#L1037),
+  [restart reconciliation](../../crates/runnel-core/src/lib.rs#L1083),
+  [source-ack persistence recovery](../../crates/runnel-core/src/lib.rs#L1129), and
+  [content mismatch](../../crates/runnel-core/src/lib.rs#L1191)).
 - Cluster tests cover the same broker-wide policy through restart, stale
   delivery fencing, leader/clock recovery, and a replicated derived
-  dead-letter transition ([cluster retry tests](../../crates/runnel-raft/src/lib.rs#L3579)
-  and [cluster dead-letter test](../../crates/runnel-raft/src/lib.rs#L3765)).
-- Real-server tests cover the provisional wire shape, restart recovery, and
-  attempt-limit/dead-letter behavior ([local protocol](../../crates/runnel-server/tests/server_smoke.rs#L612)
-  and [cluster process recovery](../../crates/runnel-server/tests/cluster_smoke.rs#L600)).
+  dead-letter transition ([lease/restart tests](../../crates/runnel-raft/src/lib.rs#L831),
+  [cluster retry test](../../crates/runnel-raft/src/lib.rs#L1220), and
+  [cluster dead-letter test](../../crates/runnel-raft/src/lib.rs#L1315)).
+- Real-server tests cover the provisional wire shape, restart recovery,
+  attempt-limit/dead-letter behavior, and ambiguous local dead-letter
+  response recovery ([local protocol](../../crates/runnel-server/tests/server_smoke.rs#L638),
+  [restart recovery](../../crates/runnel-server/tests/server_smoke.rs#L729),
+  [ambiguous recovery](../../crates/runnel-server/tests/server_smoke.rs#L821), and
+  [cluster process recovery](../../crates/runnel-server/tests/cluster_smoke.rs#L600)).
 
 There is currently no test evidence for consumer creation/configuration,
 different policies on two consumers of one stream, policy-version pinning,
@@ -141,14 +153,15 @@ durable retry deadlines, explicit failure dispositions, provenance, or
 redrive. The first slice's acceptance tests below are therefore future gates,
 not claims about the current implementation.
 
-One adjacent implementation gap is also relevant to the first slice's
-non-recursive dead-letter requirement: local polling excludes only stream names
-ending in `.dead-letter`, while clustered polling also recognizes the hashed
-fallback used when a derived name would exceed the 128-byte name limit. A
-maximum-length source name can therefore receive one extra local dead-letter
-hop through its hashed target. This design-only change does not alter that
-runtime behavior; a future implementation must centralize the derived-target
-predicate and add a boundary test before claiming the rule for all valid names.
+One adjacent implementation detail is relevant to the first slice's
+non-recursive dead-letter requirement: local and clustered polling keep
+separate predicates for recognizing generated targets. The current boundary
+tests show equivalent behavior for ordinary suffix targets, maximum-length
+hashed targets, and user streams that merely share the hash prefix
+([local tests](../../crates/runnel-core/src/lib.rs#L954) and
+[cluster tests](../../crates/runnel-raft/src/lib.rs#L319)). A shared helper could
+reduce future implementation drift, but the earlier local recursion mismatch
+is no longer an observed runtime gap.
 
 ## Proposed contract
 
@@ -865,11 +878,12 @@ sufficient before claiming scale.
   resource-efficient, but operators must use provenance to distinguish
   independent consumers. Per-consumer streams may be needed for isolation in a
   later product tier.
-- **Derived-name recursion boundary:** the local and clustered implementations
-  do not currently share the same predicate for identifying hashed derived
-  dead-letter streams. A maximum-length source name can expose the local
-  mismatch described above; normalize and test this before a policy slice
-  claims non-recursive dead-lettering for every valid stream name.
+- **Derived-name predicate drift:** local and clustered implementations retain
+  separate predicates for identifying generated dead-letter streams. Current
+  tests cover equivalent suffix, maximum-length hashed-target, and hash-prefix
+  collision behavior, so no runtime mismatch is known. A shared helper remains
+  an optional maintainability improvement; any future policy slice must keep
+  those boundary tests when changing either predicate.
 - **Retention versus retry:** `protect` can pin storage when a target is down;
   `expire` can end delivery eligibility. The policy and operator UI must make
   that trade-off explicit rather than hiding it in a cleanup loop.
@@ -894,8 +908,8 @@ No benchmark is required for this design-only change. The implementation gates
 above name the real-process, crash/recovery, compatibility, and bounded-resource
 evidence required before any future runtime change is recommended for merge.
 
-No backlog or ADR is changed here: the backlog outcome remains open and no
-wire/storage choice is accepted. TD-018 is updated only to record the newly
-verified hashed-derived-target predicate gap and its concrete retirement test;
-accepting the policy contract and retiring the debt remain future work after
+No backlog, TD-018, or ADR is changed here: the backlog outcome remains open,
+TD-018 already records the implemented hashed-derived-target guard and its
+remaining policy/provenance gates, and no wire/storage choice is accepted.
+Accepting the policy contract and retiring the debt remain future work after
 implementation evidence.
