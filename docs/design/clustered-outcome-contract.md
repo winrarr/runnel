@@ -3,11 +3,11 @@
 - Status: proposed design note; not an accepted wire or compatibility decision
 - Date: 2026-09-03
 - Last reviewed: 2026-09-06
-- Baseline: `006cd720046808c32f325f8de18694ce95d798b5`
+- Baseline: `190758439fc240808795398d57c6d75a0416f807`
 - Scope: clustered writes, leader forwarding, client retry boundaries, and the evidence required to make those behaviors public
-- Related work: [clustered durability and outcomes backlog item](../backlog.md#make-clustered-durability-and-outcomes-explicit), [current architecture](../architecture.md), [Multi-Raft implementation plan](multi-raft-implementation-plan.md), [protocol compatibility design](protocol-compatibility.md), and [ADR 0026](../decisions/0026-semantic-engine-error-classification.md)
+- Related work: [clustered durability and outcomes backlog item](../backlog.md#make-clustered-durability-and-outcomes-explicit), [current architecture](../architecture.md), [distributed architecture research](../research/distributed-architecture-options.md), [Multi-Raft implementation plan](multi-raft-implementation-plan.md), [durability and delivery policy](durability-delivery-policy.md), [application-aware retry policy](application-aware-retry-policy.md), [Raft recovery research](../research/raft-recovery-and-replacement.md), [protocol compatibility design](protocol-compatibility.md), and [ADR 0026](../decisions/0026-semantic-engine-error-classification.md)
 
-This note turns the current clustered implementation and the remaining durability backlog into an implementation-ready semantic target. It does not change the runtime, protocol, backlog, or compatibility policy. In particular, the line-delimited JSON protocol remains provisional v1, and no field or error code proposed below is accepted for v1 without a separate compatibility decision.
+This note turns the current clustered implementation and the remaining durability backlog into an implementation-ready semantic target. It does not change the runtime, protocol, backlog, or compatibility policy. In particular, the line-delimited JSON protocol remains provisional v1, and no field or error code proposed below is accepted for v1 without a separate compatibility decision. Example fields, stage names, state transitions, and test gates are illustrative outcome requirements, not an accepted API, module layout, storage format, or implementation sequence.
 
 ## Contract boundary
 
@@ -56,24 +56,26 @@ leaking topology or persistence layout.
 
 ## Current behavior and the target durability point
 
-The current layers already provide most of the mechanical boundary needed for this contract:
+The following is the observed baseline at the revision recorded above. The
+current layers provide useful mechanics for this contract, but they do not by
+themselves establish the proposed public guarantee:
 
 | Layer | Current behavior | Contract consequence |
 | --- | --- | --- |
 | `runnel-engine` | Operations return `Result<T, BrokerError>`. `BrokerError::kind()` provides a stable semantic reason and `BrokerError::outcome()` classifies failures as rejected, retryable, or unknown; successful results are confirmed at the engine boundary. Concrete variants and diagnostic sources remain available. | The engine has a backend-independent outcome boundary, but it does not expose operation stage or a universal durability point. A caller must not treat a `BrokerError` variant or its text as stage evidence. |
-| `runnel-raft` | Stream and consumer mutations use OpenRaft `client_write`; the static cluster has three voters and forwards requests to a group leader. | A successful mutation is intended to mean committed and applied, not merely accepted by a follower. |
-| Durable storage | Consensus log entries are persisted with `sync_all`; the state-machine journal is synced before in-memory application; snapshots include broker state and dedup/checkpoint state. | Recovery must test both the consensus record and the materialized broker state. Filesystem and hardware flush semantics remain an explicit assumption. |
+| `runnel-raft` | Stream and consumer mutations use OpenRaft `client_write`; the backend opens one metadata group and one data group per stream, with each initialized group using the configured peer map as its membership. The three-process tests use three voters, but startup accepts any non-empty configured peer set and has no dynamic membership lifecycle. | A successful mutation is intended to mean committed and applied, not merely accepted by a follower. Quorum size and failure tolerance must be stated for the configured membership rather than inferred from the development topology. |
+| Durable storage | The custom Raft log uses an atomic replacement whose file and parent directory are synced. The state-machine apply journal is synced with `sync_data` before in-memory application; checkpoints and snapshots are atomically replaced, and snapshots include retained messages, consumer state, and deduplication state. | Recovery must test both the consensus record and the materialized broker state. Filesystem and hardware flush semantics remain an explicit assumption. |
 | Server/protocol | v1 returns `Published` or an error with `code` and `message`; `NotLeader` is mapped to `cluster_error`. | v1 does not expose authoritative outcome classes or a commit/apply stage. Generic `cluster_error` cannot safely drive automatic retry, even though the engine can classify an internal `NotLeader` as retryable. |
 | Client | A successful response is `Confirmed`; local encoding errors are `Rejected`; pre-connect failures are `Retryable`; write/read/EOF/timeout failures after request work begins are `Unknown`. No automatic replay is performed. | This is a useful v1 client safety baseline, but the broker must eventually provide the evidence needed to resolve unknowns. |
 
 The target success point for a mutating operation in one data group is:
 
 1. The current leader accepts a valid command.
-2. OpenRaft appends it and establishes quorum commit. In the current three-voter deployment, quorum is two voters.
+2. The selected replication engine appends it and establishes quorum commit for the configured membership. In the current three-process evidence profile, a three-voter group has a two-voter majority; this is not a universal setting or guarantee.
 3. The leader’s state machine durably records and applies the command, including the retained record, consumer checkpoint, deduplication result, or other materialized state.
 4. The response is produced from that applied result.
 
-Followers need not have applied the command before the response. The guarantee is that a committed command is replicated to a quorum and can be recovered by the surviving cluster; replicas may apply it asynchronously. A confirmed write in the current static deployment must survive restart or loss of one voter, with the two remaining voters able to recover and serve. Runnel must not promise availability, recovery, or data preservation after loss of two voters, nor permit an unclean single-voter continuation to manufacture confirmation.
+Followers need not have applied the command before the response. The guarantee is that a committed command is replicated to the required quorum and can be recovered by the surviving cluster; replicas may apply it asynchronously. For a documented three-voter durability profile, a confirmed write should survive restart or loss of one voter, with the two remaining voters able to recover and serve. The current configuration does not expose selectable durability modes or a general failure-tolerance declaration, so this remains a target contract rather than a promise for arbitrary peer sets. Runnel must not promise availability, recovery, or data preservation after loss of the quorum required by the selected profile, nor permit an unclean continuation to manufacture confirmation.
 
 The guarantee concerns the retained broker state, not only the Raft log. A record is not confirmed merely because it is in a leader’s memory or because a follower accepted a forwarded frame. Conversely, a committed log entry whose state-machine application failed is not a rejection: it is a recovery/reconciliation condition that must remain visible until the state machine catches up or the group reports an operational fault.
 
@@ -102,7 +104,15 @@ Each forwarded request should carry:
 - an absolute deadline or remaining budget;
 - enough group/term context for diagnostics, without exposing topology in the public response.
 
-The current implementation makes up to three forwarding attempts with a two-second per-attempt timeout. That is liveness behavior, not a safety boundary: a timeout can occur after the target leader has committed, and retrying the same mutation is safe only when durable identity makes it idempotent. A future forwarding layer should return the leader’s definitive response when possible, and otherwise preserve `unknown` through the public boundary. `NotLeader` and peer transport errors should not be exposed as a promise that the command was not applied.
+The current implementation makes up to three leader-refresh rounds, each with a
+two-second timeout per peer call. Each round can try every configured peer
+other than the receiving node, so the total number of forwarding calls can
+exceed three. This is liveness behavior, not a safety boundary: a timeout can
+occur after the target leader has committed, and retrying the same mutation is
+safe only when durable identity makes it idempotent. A future forwarding layer
+should return the leader’s definitive response when possible, and otherwise
+preserve `unknown` through the public boundary. `NotLeader` and peer transport
+errors should not be exposed as a promise that the command was not applied.
 
 ## Retry boundaries
 
@@ -194,7 +204,7 @@ Extend the existing three-process cluster coverage to include:
 6. Verify request-ID conflict, per-record batch ambiguity, restart recovery, and absence of topology/storage paths from public responses.
 7. Assert outcome, response-loss, forwarding, commit/apply, dedup, and quorum-health metrics for the corresponding scenarios.
 
-`just cluster-test` already covers follower forwarding, quorum replication, leader failure, restart, grouped delivery, stale tokens, and dead-letter behavior. It does not yet establish the public four-outcome contract, post-commit response loss, pre-proposal no-quorum classification, generic operation identity, or outcome metrics. `just verify` owns the real-process cluster smoke test in the normal verification path; `just integration` covers the separate process/container integration sequence. These commands should remain the canonical gates as the tests are added.
+`just cluster-test` already covers follower forwarding, quorum replication, leader failure, restart, grouped delivery, stale tokens, and dead-letter behavior. The local real-server [request-ID response-loss test](../../crates/runnel-server/tests/client_retry.rs) demonstrates conservative `unknown` classification and single-node deduplication, but the cluster tests do not yet combine post-commit response loss with clustered resolution. The public four-outcome contract, pre-proposal no-quorum classification, generic operation identity, and outcome metrics also remain unestablished. `just verify` owns the real-process cluster smoke test in the normal verification path; `just integration` covers the separate process/container integration sequence. These commands should remain the canonical gates as the tests are added.
 
 ## Compatibility and rollout boundary
 
@@ -221,7 +231,7 @@ The design follows the leader-and-quorum shape already selected for the clustere
 | --- | --- | --- |
 | [Raft paper, client interaction and commitment](https://raft.github.io/raft.pdf) | A leader replicates a command, commits it after a majority, then applies it and returns the result. A response lost after commit can cause duplicate execution unless clients use unique serials and the state machine stores the latest result. | This directly supports quorum confirmation plus durable operation-result deduplication. Runnel must implement the serial/result part rather than treating retry as a transport concern. |
 | [OpenRaft `client_write`](https://docs.rs/openraft/0.9.25/openraft/raft/struct.Raft.html#method.client_write) | The mutating client call is documented as append, commit, apply, and return; its client guidance also calls out duplicate execution after a lost response and serial-number deduplication. | Runnel already uses this path but does not expose the application stage or generic identity in its public engine/protocol. |
-| [Kafka design](https://kafka.apache.org/41/design/design/) and [producer protocol](https://kafka.apache.org/41/design/protocol/) | Producer acknowledgements vary by `acks` and in-sync replicas; idempotent producers use producer identity and sequence numbers; a network error after publish is unknown. | Runnel should begin with one explicit static-cluster safety point rather than expose `acks` choices, unclean leader behavior, transactions, or Kafka producer sessions. Its application-supplied identity is smaller and must document scope and retention. |
+| [Kafka design](https://kafka.apache.org/42/design/design/) and [producer protocol](https://kafka.apache.org/42/design/protocol/) | Producer acknowledgements vary by `acks` and in-sync replicas; idempotent producers use producer identity and sequence numbers; a network error after publish is unknown. | Runnel should begin with one explicit configured-membership safety point rather than expose `acks` choices, unclean leader behavior, transactions, or Kafka producer sessions. Its application-supplied identity is smaller and must document scope and retention. |
 | [RabbitMQ publisher confirms](https://www.rabbitmq.com/docs/confirms) and [quorum queues](https://www.rabbitmq.com/docs/quorum-queues) | Confirm/nack is an explicit publisher contract; quorum queues confirm after quorum replication. Confirms are asynchronous and may arrive out of order. | Runnel’s current request/response path is synchronous and serial per connection. It should add correlation before considering asynchronous confirms and must not assume response order beyond the current protocol behavior. Consumer acknowledgements remain distinct from publisher confirmation. |
 | [NATS JetStream stream configuration and deduplication](https://github.com/nats-io/nats.docs/blob/master/nats-concepts/jetstream/streams.md) | Streams can be replicated and use a client message ID for duplicate suppression within a configurable duplicate window. | Runnel should make the identity retention window and post-expiry behavior explicit. Its current persisted per-stream map is stronger in duration but unbounded; that is a storage risk, not a finished contract. |
 
