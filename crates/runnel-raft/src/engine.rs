@@ -414,6 +414,7 @@ impl RaftGroup {
     pub async fn create_stream(&self, stream: String) -> Result<bool, BrokerError> {
         #[cfg(feature = "instrumentation")]
         let _stage_timer = StageTimer::new("raft.create_stream");
+        validate_name("stream", &stream)?;
         let (stream_id, group_id) = stream_identity(&stream);
         let response = self
             .raft

@@ -997,6 +997,7 @@ mod tests {
     #[tokio::test]
     async fn single_node_raft_implements_shared_delivery_contract() {
         let engine = SingleNodeEngine::new(1).await.unwrap();
+        runnel_test_support::assert_error_classification_contract(&engine).await;
         runnel_test_support::assert_publish_batch_contract(&engine).await;
         runnel_test_support::assert_shared_delivery_contract(&engine).await;
     }
@@ -1024,6 +1025,23 @@ mod tests {
         runnel_test_support::assert_shared_delivery_contract(&engine).await;
         runnel_test_support::assert_independent_consumers_contract(&engine).await;
         runnel_test_support::assert_key_ordering_contract(&engine).await;
+    }
+
+    #[tokio::test]
+    async fn persistent_raft_uses_semantic_error_classification() {
+        let directory = tempfile::tempdir().unwrap();
+        let peers = BTreeMap::from([(1, "127.0.0.1:0".to_owned())]);
+        let engine = PersistentEngine::open(
+            1,
+            "runnel-persistent-error-contract-test".to_owned(),
+            directory.path(),
+            peers,
+            true,
+        )
+        .await
+        .unwrap();
+
+        runnel_test_support::assert_error_classification_contract(&engine).await;
     }
 
     #[tokio::test]

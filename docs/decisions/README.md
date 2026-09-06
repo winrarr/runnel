@@ -29,3 +29,4 @@ Current decisions:
 - 0023-independent-retained-storage-and-placement.md: accepted future storage and placement boundaries; implementation remains deferred.
 - 0024-explicit-offset-replay-read.md: first replay slice is a bounded, read-only logical-offset operation with explicit unavailable-history outcomes.
 - 0025-retain-github-actions-pending-hosted-ci-trial.md: retain GitHub Actions pending evidence from a hosted alternative trial.
+- 0026-semantic-engine-error-classification.md: classify shared engine failures by semantic kind and safe attempt outcome while retaining diagnostic causes.
