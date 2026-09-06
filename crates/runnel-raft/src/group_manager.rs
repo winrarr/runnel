@@ -728,3 +728,119 @@ pub(super) fn validate_persisted_cluster_storage(data_dir: &Path) -> Result<(), 
     }
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn empty_raft_log() -> Vec<u8> {
+        serde_json::to_vec(&serde_json::json!({
+            "version": 1,
+            "last_purged_log_id": null,
+            "log": {},
+            "committed": null,
+            "vote": null,
+        }))
+        .unwrap()
+    }
+
+    fn write_current_layout_fixture(directory: &Path, stream: &str) -> Vec<(PathBuf, Vec<u8>)> {
+        let groups = directory.join("groups");
+        let metadata_group = groups.join(METADATA_GROUP_ID);
+        let data_group = groups.join("data").join(path_component(stream));
+        fs::create_dir_all(&metadata_group).unwrap();
+        fs::create_dir_all(&data_group).unwrap();
+
+        let metadata = serde_json::json!({
+            "version": 1,
+            "cluster_name": "storage-preflight-test",
+            "node_id": 1,
+        });
+        let metadata_path = directory.join("storage.json");
+        let metadata_bytes = serde_json::to_vec(&metadata).unwrap();
+        fs::write(&metadata_path, &metadata_bytes).unwrap();
+
+        let metadata_log_path = metadata_group.join("raft-log.json");
+        let metadata_log = empty_raft_log();
+        fs::write(&metadata_log_path, &metadata_log).unwrap();
+
+        let manifest_path = data_group.join("group.json");
+        let manifest = DataGroupManifest {
+            stream: stream.to_owned(),
+            stream_id: format!("stream/{stream}"),
+            group_id: format!("group/{stream}/data"),
+        };
+        let manifest_bytes = serde_json::to_vec(&manifest).unwrap();
+        fs::write(&manifest_path, &manifest_bytes).unwrap();
+
+        let data_log_path = data_group.join("raft-log.json");
+        let data_log = empty_raft_log();
+        fs::write(&data_log_path, &data_log).unwrap();
+
+        vec![
+            (metadata_path, metadata_bytes),
+            (metadata_log_path, metadata_log),
+            (manifest_path, manifest_bytes),
+            (data_log_path, data_log),
+        ]
+    }
+
+    #[test]
+    fn current_cluster_layout_fixture_passes_read_only_preflight() {
+        let directory = tempfile::tempdir().unwrap();
+        let files = write_current_layout_fixture(directory.path(), "events");
+        let data_group = directory
+            .path()
+            .join("groups")
+            .join("data")
+            .join(path_component("events"));
+
+        validate_persisted_cluster_storage(directory.path()).unwrap();
+
+        for (path, bytes) in files {
+            assert_eq!(fs::read(path).unwrap(), bytes);
+        }
+        assert!(
+            !directory
+                .path()
+                .join("groups/metadata/state-machine")
+                .exists()
+        );
+        assert!(!data_group.join("state-machine").exists());
+    }
+
+    #[test]
+    fn contradictory_data_group_manifest_is_rejected_without_rewriting_fixture() {
+        let directory = tempfile::tempdir().unwrap();
+        let files = write_current_layout_fixture(directory.path(), "events");
+        let manifest_path = directory
+            .path()
+            .join("groups/data")
+            .join(path_component("events"))
+            .join("group.json");
+        let contradictory_manifest = DataGroupManifest {
+            stream: "orders".to_owned(),
+            stream_id: "stream/orders".to_owned(),
+            group_id: "group/orders/data".to_owned(),
+        };
+        let contradictory_bytes = serde_json::to_vec(&contradictory_manifest).unwrap();
+        fs::write(&manifest_path, &contradictory_bytes).unwrap();
+
+        let error = validate_persisted_cluster_storage(directory.path())
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("does not match its directory"));
+        assert_eq!(fs::read(&manifest_path).unwrap(), contradictory_bytes);
+        for (path, bytes) in files {
+            if path != manifest_path {
+                assert_eq!(fs::read(path).unwrap(), bytes);
+            }
+        }
+        assert!(
+            !directory
+                .path()
+                .join("groups/metadata/state-machine")
+                .exists()
+        );
+    }
+}
