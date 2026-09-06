@@ -2,7 +2,7 @@
 
 - Status: exploratory
 - Last reviewed: 2026-09-06
-- Baseline: `d5f033ec1db8ee7402e5b7a96ef2935f0a1325d6`
+- Baseline: `cb13eb1158098b183b3854cb88a630ee1027c949`
 - Reading guide: [research-note conventions](README.md)
 
 This document records candidate architectures for Runnel's distributed future beyond the early static Multi-Raft backend. It remains exploratory and does not change the current implementation. The product backlog describes the desired outcomes; this document explores ways to reach them. [ADR 0004](../decisions/0004-multi-raft-first-distributed-engine.md) accepts Multi-Raft as the first distributed direction, while later architectural choices still require their own decisions.
@@ -30,6 +30,60 @@ metadata plane are illustrative mechanisms, not an end-state ranking. Chain
 replication remains a first-class alternative for workloads that trade
 per-record latency for a deeply pipelined write path. No candidate has enough
 comparative implementation evidence to be called the strongest end state.
+
+## Observed current implementation
+
+The following is the evidence boundary at the recorded baseline. It is a
+description of the current vertical slice, not a promise that the target
+architecture or all matrix assumptions are already implemented:
+
+- `runnel-raft` opens one metadata group and one data group per stream. Data
+  groups use the configured peer map as their initial membership, and missing
+  groups may be materialized from committed metadata when a peer requests one.
+  See the [group manager](../../crates/runnel-raft/src/group_manager.rs) and
+  [Multi-Raft implementation evidence](../design/multi-raft-implementation-plan.md#current-implementation-status).
+- The three-process cluster is the current development profile, not an
+  enforced topology or durability mode. Server configuration requires a
+  non-empty peer set, but does not require exactly three voters or reject a
+  two-node or larger configuration. Claims about failure tolerance therefore
+  need to name the configured membership and quorum. See the [cluster
+  bootstrap](../../crates/runnel-server/src/bootstrap.rs) and [static-cluster
+  evidence](../design/td-008-static-cluster-evidence.md#observed-baseline).
+- The shared `Engine` contract is topology-free and currently covers stream
+  creation, single-record publish, bounded per-record publish batches, poll,
+  replay, acknowledgement, and health. `publish_batch` has no atomicity
+  guarantee, and the current Raft implementation does not make engine
+  identity, durability modes, lag, repair, or administrative transitions part
+  of that trait. Those remain future semantic capabilities, not current API
+  facts. See the [engine contract](../../crates/runnel-engine/src/lib.rs) and
+  [clustered outcome boundary](../design/clustered-outcome-contract.md).
+- Clustered publish, poll, replay, grouped delivery, and acknowledgement use
+  leader-authorized data-group commands or forwarding. The current boundary
+  distinguishes semantic failure outcomes, but the provisional wire protocol
+  does not expose a general stage-aware resolution operation for unknown
+  mutations. See the [current architecture](../architecture.md) and [outcome
+  contract](../design/clustered-outcome-contract.md).
+- Clustered broker state still materializes retained messages in memory and
+  JSON journal/checkpoint/snapshot files. Consensus-log compaction is separate
+  from retained history, but snapshot creation and installation remain
+  proportional to the complete materialized state; interrupted snapshot
+  transfer restarts from byte zero. See the [snapshot evidence](../design/td-009-snapshot-evidence.md),
+  [retained-state evidence](../design/td-010-retained-state-evidence.md), and
+  [Raft recovery research](raft-recovery-and-replacement.md).
+- Storage identity/layout preflight and preserved-state restart have focused
+  coverage. The empty-replica transfer path is an explicit test-only
+  experiment; dynamic membership, placement movement, production replacement,
+  and rolling-upgrade compatibility remain unestablished. See the [recovery
+  research](raft-recovery-and-replacement.md#question-and-current-conclusion)
+  and [static-cluster evidence](../design/td-008-static-cluster-evidence.md).
+
+These observations support Multi-Raft as a correctness baseline, but they do
+not establish that it is the best throughput, tail-latency, placement, or
+retention architecture. Current benchmark suites provide clustered workload
+and fault cases, while the retained-state, snapshot, placement, and alternative
+engine comparisons still need targeted prototypes and controlled evidence.
+The [benchmarking policy](../benchmarking.md) defines the boundary between
+diagnostic measurements and optimization evidence.
 
 ## Product invariants every engine must preserve
 
@@ -72,7 +126,12 @@ Candidate engines should be compared on evidence rather than familiarity:
 
 ### Multi-Raft replicated logs
 
-Each hidden ordering shard is a Raft group with one elected leader and a replica set. The leader assigns log order, replicates entries, and commits after quorum agreement. A separate Raft group may hold cluster metadata, or metadata may be represented through dedicated internal groups.
+Each hidden ordering shard is a Raft group with one elected leader and a
+replica set. The leader assigns log order, replicates entries, and commits
+after quorum agreement. A separate Raft group may hold cluster metadata, or
+metadata may be represented through dedicated internal groups. Runnel's
+accepted first slice uses one metadata group and one data group per stream;
+the alternative forms described here are exploratory.
 
 Why ADR 0004 selected it for the initial implementation:
 
@@ -278,7 +337,8 @@ These profiles should become reproducible benchmark and failure-test configurati
 
 The common boundary should describe what the broker needs, not how an engine achieves it. It should cover these semantic capabilities:
 
-- initialize or open durable cluster state and report the engine identity and guarantees;
+- represent engine identity, selected durability guarantees, and readiness at
+  the broker-facing level without exposing consensus-specific state;
 - append one or more records with stream identity, ordering intent, producer identity, and request identity;
 - return committed, rejected, retryable, or unknown outcomes;
 - read committed records from a logical cursor without exposing physical placement;
@@ -288,6 +348,13 @@ The common boundary should describe what the broker needs, not how an engine ach
 - perform engine-specific administrative changes through a stable broker-level intent such as adding or draining a node.
 
 The boundary should not expose Raft terms, sequencer epochs, replica indexes, chain positions, physical shards, copysets, or extents to normal broker code. Engine-specific diagnostics and administration may expose them through explicitly internal or advanced surfaces.
+
+These are candidate future capabilities, not the current `Engine` trait. The
+current trait is intentionally narrower and exposes operations plus a health
+snapshot; process startup selects the engine and clustered storage identity is
+validated inside `runnel-raft`. Any expansion should be driven by a second
+concrete engine or an accepted operational requirement, with outcome and
+compatibility semantics recorded separately.
 
 Avoid one large trait that embeds the entire broker. Streams, retries, dead-letter policy, group behavior, authentication, and public protocol semantics should remain common where their correctness does not depend on the engine. Conversely, do not split the engine into tiny consensus-flavored traits before two implementations prove that the seams are real.
 
@@ -388,7 +455,14 @@ operational evidence.
 - [ADR 0004: first distributed engine](../decisions/0004-multi-raft-first-distributed-engine.md)
 - [ADR 0023: independent retained storage and placement](../decisions/0023-independent-retained-storage-and-placement.md)
 - [Benchmarking and evidence policy](../benchmarking.md)
+- [Multi-Raft implementation evidence](../design/multi-raft-implementation-plan.md)
+- [Static-cluster evidence](../design/td-008-static-cluster-evidence.md)
+- [Snapshot evidence](../design/td-009-snapshot-evidence.md)
+- [Retained-state materialization evidence](../design/td-010-retained-state-evidence.md)
+- [Raft recovery and replacement research](raft-recovery-and-replacement.md)
+- [Current clustered outcome boundary](../design/clustered-outcome-contract.md)
 - [Raft consensus paper](https://raft.github.io/raft.pdf)
+- [OpenRaft 0.9.25 documentation](https://docs.rs/openraft/0.9.25/openraft/)
 - [Redpanda partition replication architecture](https://docs.redpanda.com/streaming/24.2/get-started/architecture/)
 - [LogDevice architecture](https://logdevice.io/docs/Concepts.html), [write path](https://logdevice.io/docs/Writepath.html), [replication](https://logdevice.io/docs/Replication.html), and [recovery](https://logdevice.io/docs/Recovery.html)
 - [Apache BookKeeper protocol](https://bookkeeper.apache.org/docs/development/protocol/)
