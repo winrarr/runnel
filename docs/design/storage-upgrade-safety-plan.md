@@ -1,10 +1,11 @@
 # Safe durable storage upgrades
 
 - Status: exploratory design proposal; not an accepted compatibility decision
-- Last reviewed: 2026-09-03
-- Baseline: 5bed1e052fcf907d2ab8ce3aa22da961b38540f1
+- Last reviewed: 2026-09-06
+- Baseline: `55b4714dcfb1343e11652d9e63323ad1b96c2451`
 - Scope: backlog outcome “Make durable storage upgrades safe” and TD-007
 - Related policy: [Durable storage upgrade policy](storage-upgrade-policy.md)
+- Current evidence: [TD-007 storage compatibility evidence](td-007-storage-compatibility-evidence.md)
 
 ## Purpose and non-claims
 
@@ -68,7 +69,9 @@ The implementation MUST preserve these invariants:
 Runnel has no global storage schema. The [local engine](../../crates/runnel-core/src/lib.rs)
 and [clustered engine](../../crates/runnel-raft/src/lib.rs) own different
 artifacts and use different recovery rules. The current implementation and
-tests are evidence for the rows below, not a cross-release promise.
+tests are evidence for the rows below, not a cross-release promise. Existing
+clustered storage is validated before groups open; an empty directory is
+different because startup intentionally initializes its identity metadata.
 
 ### Local engine
 
