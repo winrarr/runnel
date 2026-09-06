@@ -73,6 +73,12 @@ pub const PROTOCOL_SUPPORT: ProtocolSupport = ProtocolSupport {
 pub const MAX_PUBLISH_BATCH_RECORDS: usize = 1024;
 /// Maximum encoded request size supported by the protocol's publish-batch path.
 pub const MAX_PUBLISH_BATCH_BYTES: usize = 64 * 1024 * 1024;
+/// Maximum encoded response size supported by the provisional protocol.
+///
+/// Message responses can carry a payload accepted by a request at the maximum
+/// request size, plus response metadata. The additional 1 MiB leaves room for
+/// that metadata while keeping a finite default bound for clients.
+pub const MAX_RESPONSE_BYTES: usize = MAX_PUBLISH_BATCH_BYTES + 1024 * 1024;
 
 /// Opaque bytes represented as standard padded base64 on the provisional wire.
 #[derive(Debug, Clone, PartialEq, Eq)]
