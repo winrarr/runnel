@@ -1,8 +1,12 @@
 # Adaptive handling of hot ordering domains
 
 - Status: exploratory design proposal
+- Last reviewed: 2026-09-06
+- Baseline: `a950569c624da8d36a6e69c57a6891160bd8fc3c`
+- Reading guide: [design-note conventions](README.md)
 - Scope: detecting and scheduling overloaded ordering domains in shared consumers
 - Related outcome: [Explore adaptive handling of hot ordering domains](../backlog.md)
+- Related implementation debt: [TD-016](../tech-debt.md#td-016-initial-shared-dispatcher-uses-a-simple-scan-and-one-delivery-per-member)
 
 This note explores how Runnel could recognize a hot ordering domain and protect
 unrelated work without quietly weakening ordering. It is not an ADR, does not
@@ -10,6 +14,11 @@ change the protocol or runtime, and makes no performance claim about the
 current implementation or any candidate design. The current demand-driven
 grouped-delivery path remains the supported behavior until an implementation
 and failure-test sequence establishes otherwise.
+
+The current behavior described below is an **observed baseline** at the revision
+above. Candidate policies and mechanisms are **inferences**, **illustrative
+mechanisms**, or **outcome/evidence gates**, as called out by the design-note
+conventions; they are not implementation requirements.
 
 The working recommendation is to start with observation, bounded scheduler
 work, and explicit backpressure while retaining one active delivery per key.
@@ -23,7 +32,7 @@ broker should infer from traffic.
 The current grouped operation supplies a stream, durable consumer, and
 transient member. A successful response contains a record, an opaque delivery
 token, and an attempt number; no key owner, partition, or scheduler lane is
-public. The local path is [Broker::poll_group](../../crates/runnel-core/src/lib.rs#L791-L909) and its candidate search is [StreamLog::find_candidate](../../crates/runnel-core/src/lib.rs#L1591-L1625). The clustered path applies the analogous committed operation in [apply_group_poll](../../crates/runnel-raft/src/lib.rs#L1564-L1739).
+public. The local path is [Broker::poll_group](../../crates/runnel-core/src/broker.rs#L233-L335) and its candidate search is [StreamLog::find_candidate](../../crates/runnel-core/src/stream_log.rs#L520-L555). The clustered path applies the analogous committed operation in [apply_group_poll](../../crates/runnel-raft/src/delivery.rs#L49-L224).
 
 Both engines begin at the committed consumer position and skip acknowledged
 offsets, all in-flight offsets, and a keyed record whose key is already in
@@ -38,13 +47,23 @@ public placement unit.
 Delivery attempts are persisted before a message is returned. Expiry makes an
 unacknowledged delivery eligible for redelivery, and opaque tokens fence stale
 acknowledgements. The maximum attempt count and dead-letter behavior are
-broker-wide settings today. Local dead-letter movement crosses two durable
-operations and may duplicate a dead-letter record after a crash; clustered
-dead-letter movement is committed in the stream data group. Local and
-clustered expiry evaluation also have an implementation difference that a
-future scheduler must not widen accidentally. See the [current architecture](../architecture.md#delivery-behavior) and the [stable internal work placement exploration](stable-work-placement.md).
+broker-wide settings today. Local dead-letter movement still crosses separate
+target and source durable operations, but new moves use a stable move identity
+and same-content reconciliation; remaining failure boundaries and legacy
+records mean it does not provide a blanket duplicate-free guarantee. Clustered
+dead-letter movement is committed in the stream data group. Local expiry is
+evaluated when a later poll expires due deliveries, while clustered grouped
+acknowledgement evaluates the replicated lease clock before validating a token;
+this implementation difference must not widen accidentally. See the [current
+architecture](../architecture.md#delivery-behavior), [stable internal work
+placement exploration](stable-work-placement.md), and [TD-017](../tech-debt.md#td-017-dead-letter-movement-spans-separate-durable-records).
 
 These facts impose the design boundary:
+
+The accepted placement boundary in [ADR 0023](../decisions/0023-independent-retained-storage-and-placement.md)
+also separates public stream identity, ordering domains, future movable units,
+and physical replicas. The mechanisms below must fit that boundary; none of
+them selects the future unit, replica, or migration protocol.
 
 - A scheduler can change which eligible record is considered first, but it
   cannot remove the acknowledged, in-flight, or same-key gate.
@@ -56,7 +75,10 @@ These facts impose the design boundary:
   have a fixed bound or be rebuildable from authoritative retained state.
 - Placement and hotness are internal facts. The public protocol should not
   expose a lane ID, hash range, owner node, or physical offset layout.
-- The current in-process operation lock and one-delivery-per-member limit are
+- The local async path dispatches synchronous filesystem work through a bounded
+  `StorageExecutor` with per-stream FIFO lanes and stream locks; clustered
+  operations apply through one replicated stream-data-group state machine. The
+  one-delivery-per-member limit and these execution boundaries are
   vertical-slice constraints. A scheduler experiment must not attribute a
   benefit to hot-domain handling if it also changes concurrency, batching,
   storage execution, or the acknowledgement boundary.
@@ -324,7 +346,7 @@ compatible with their public topology.
 
 | Reference | Relevant evidence | Difference that matters to Runnel |
 | --- | --- | --- |
-| [Apache Kafka design documentation](https://kafka.apache.org/41/design/design/) and [Kafka consumer rebalance protocol](https://kafka.apache.org/42/operations/consumer-rebalance-protocol/) | Records with the same key are placed in one partition; a consumer group assigns each partition to one member, preserving partition order while parallelizing other partitions. | Partitions are explicit, provisioned units. A hot key or hot partition remains serial, and changing the partitioning model is visible to producers and consumers. Runnel’s lanes must stay internal and cannot be treated as a public partition count. |
+| [Apache Kafka design documentation](https://kafka.apache.org/41/design/design/) and [Kafka consumer rebalance protocol](https://kafka.apache.org/42/operations/consumer-rebalance-protocol/) | With Kafka’s key-based partitioning, records for one key are sent to one partition; a consumer group assigns each partition to one member, preserving partition order while parallelizing other partitions. Custom partitioners and explicit partition selection can change that default. | Partitions are explicit, provisioned units. A hot key or hot partition remains serial, and changing the partitioning model is visible to producers and consumers. Runnel’s lanes must stay internal and cannot be treated as a public partition count. |
 | [Apache Pulsar Key_Shared subscriptions](https://pulsar.apache.org/docs/next/concepts-messaging/) | Messages with the same key or ordering key are sent to one consumer. Sticky, auto-split hash range, and auto-split consistent hashing adjust mapping as consumers join or leave. | Pulsar supplies an explicit consumer-affinity model and discusses mapping changes. Runnel can borrow bounded range movement and drain/fence ideas, but its current transient member API does not define membership or assignment. |
 | [Google Cloud Pub/Sub ordered delivery](https://docs.cloud.google.com/pubsub/docs/ordering) | Ordered delivery is per key, different keys are independent, and a hot key is limited by subscriber processing. Pull delivery permits only one outstanding batch per ordering key; the documentation recommends finer-grained keys for hot-key mitigation. | This is a close semantic warning: one key’s serial processing speed is the ceiling in strict mode. Finer-grained keys change application meaning, and ordered delivery adds coordination and latency. |
 | [Amazon SQS FIFO message-group delivery](https://docs.aws.amazon.com/AWSSimpleQueueService/latest/SQSDeveloperGuide/FIFO-queues-understanding-logic.html) | A MessageGroupId is strictly ordered and processed one at a time; different groups can run concurrently, and a batch can include multiple groups. Additional messages for a group wait for deletion or visibility expiry. | SQS makes ordered groups explicit and does not let a consumer request a specific group. It supports the case for bounded group-level work and shows why a poison/visibility blocker affects one group. Runnel must retain its current per-record token and ack semantics. |
@@ -355,12 +377,20 @@ sequence.
 
 No benchmark is required for this design-only change because it adds no runtime
 path. The following plan applies when an implementation exists. The current
-Criterion suite and clustered runner establish small grouped baselines, but
-they do not cover hot-key skew, lane movement, grouped slow members, or
-failure during handoff. Any authoritative comparison must run sequentially
-under the repository’s benchmark lock against the recorded origin/main
-baseline; concurrent diagnostics are exploratory only. Follow the
-[benchmarking evidence policy](../benchmarking.md).
+Criterion suite and clustered runner establish small grouped baselines. The
+clustered runner also has an opt-in `hot_ordering` probe: it preloads a bounded
+mixed hot/cold keyed workload through the public protocol, drains it with
+concurrent grouped members, verifies per-key delivery and completion order plus
+same-key exclusion, and records hot-key backlog/progress and resource samples.
+The probe is a current clustered behavior control, not evidence that adaptive
+scheduling exists or improves performance; it does not test a candidate
+placement policy, and it has no local-engine equivalent yet. The current
+benchmark set still does not cover lane movement, concurrent membership churn,
+member-capacity skew, grouped slow-member isolation, failure during handoff, or
+consume-side batching. Any authoritative comparison must run sequentially under
+the repository’s benchmark lock against the recorded origin/main baseline;
+concurrent diagnostics are exploratory only. Follow the [benchmarking evidence
+policy](../benchmarking.md).
 
 ### Workload matrix
 
@@ -386,19 +416,22 @@ simultaneous request concurrency.
 ### Stages and evidence
 
 1. **Semantic and instrumentation control.** Exercise current local and
-   clustered grouped delivery with fixed key traces. Verify same-key overlap is
-   zero, key order is preserved, out-of-order acknowledgements remain valid,
-   stale tokens fail explicitly, and attempts survive restart. Add only
-   aggregate/bounded counters in this stage. Record poll/ack p50, p99, and
-   p99.9 separately from end-to-end delivery age.
+   clustered grouped delivery with fixed key traces. The existing clustered
+   `hot_ordering` probe is useful evidence for the mixed hot/cold control, but
+   it does not replace a local control or a future placement comparison. Verify
+   same-key overlap is zero, key order is preserved, out-of-order
+   acknowledgements remain valid, stale tokens fail explicitly, and attempts
+   survive restart. Add only aggregate/bounded counters in this stage. Record
+   poll/ack p50, p99, and p99.9 separately from end-to-end delivery age.
 2. **Selector-only comparison.** Run the existing scan and the candidate
    budget/lane selector over the same preloaded deterministic index without
    payload I/O or persistence in the measured loop. Measure candidate records
    examined, each rejection reason, budget exhaustion, ready-hint rebuilds,
    and selected-record distribution. This isolates scheduler work from storage
    and network effects.
-3. **Local real-process behavior.** Use just smoke plus a focused real broker
-   process workload with the hot-key matrix. Test slow members, bounded
+3. **Local real-process behavior.** Add a local equivalent of the current
+   clustered hot-ordering control, then use just smoke plus a focused real
+   broker process workload with the hot-key matrix. Test slow members, bounded
    credits, queue caps, restart, expiry, stale acknowledgements, and local
    dead-letter duplicate reconciliation. Report backlog count and oldest age
    p50/p99/p99.9, cold-domain delivery age, CPU, RSS, storage bytes/read work,
@@ -517,5 +550,17 @@ by the scheduler.
 - [Stable internal work placement exploration](stable-work-placement.md)
 - [Local shared-consumer delivery, ADR 0013](../decisions/0013-local-shared-consumer-delivery.md)
 - [Clustered shared-consumer ownership, ADR 0015](../decisions/0015-clustered-shared-consumer-ownership.md)
+- [Independent retained storage and placement, ADR 0023](../decisions/0023-independent-retained-storage-and-placement.md)
+- [`StorageExecutor` and `StorageLane`](../../crates/runnel-core/src/storage.rs#L15-L340)
+- [`Broker::poll_group` and local acknowledgement](../../crates/runnel-core/src/broker.rs#L233-L407)
+- [`StreamLog::find_candidate` and local eligibility predicate](../../crates/runnel-core/src/stream_log.rs#L520-L555)
+- [`apply_group_poll` and clustered acknowledgement](../../crates/runnel-raft/src/delivery.rs#L49-L312)
+- [Shared-consumer Criterion benchmarks](../../crates/runnel-core/benches/broker.rs#L172-L275)
+- [Clustered grouped benchmark scenarios](../../scripts/benchmarks/cluster_scenarios.py#L693-L794)
+- [Hot-ordering benchmark probe](../../scripts/benchmarks/cluster_scenarios.py#L1060-L1222)
+- [Reusable shared-delivery contract assertions](../../crates/runnel-test-support/src/lib.rs#L255-L340)
+- [Local grouped expiry and restart tests](../../crates/runnel-core/src/lib.rs#L783-L870)
+- [Local grouped restart recovery test](../../crates/runnel-core/src/lib.rs#L1437-L1488)
+- [Clustered grouped expiry, restart, and dead-letter tests](../../crates/runnel-raft/src/lib.rs#L1220-L1428)
 - [Repository testing and evidence gates](../testing.md)
 - [Repository benchmarking policy](../benchmarking.md)
