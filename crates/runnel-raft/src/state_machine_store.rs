@@ -12,7 +12,7 @@ use openraft::{
 };
 #[cfg(feature = "instrumentation")]
 use runnel_engine::StageTimer;
-use runnel_engine::{BrokerError, Offset};
+use runnel_engine::{BrokerError, ConsumerPolicy, Offset};
 #[cfg(test)]
 use runnel_engine::{Message, PollResult};
 use serde::{Deserialize, Serialize};
@@ -581,6 +581,29 @@ impl StateMachineStore {
             .get(stream)
             .map(|stream_state| stream_state.metadata(stream))
             .ok_or_else(|| BrokerError::StreamNotFound(stream.to_owned()))
+    }
+
+    pub(super) async fn consumer_policy(
+        &self,
+        stream: &str,
+        consumer: &str,
+        legacy: ConsumerPolicy,
+    ) -> Result<ConsumerPolicy, BrokerError> {
+        let state = self.state.read().await;
+        if !state
+            .state
+            .streams
+            .get(stream)
+            .is_some_and(StreamState::is_active)
+        {
+            return Err(BrokerError::StreamNotFound(stream.to_owned()));
+        }
+        Ok(state
+            .state
+            .group_consumers
+            .get(&(stream.to_owned(), consumer.to_owned()))
+            .and_then(|state| state.policy.clone())
+            .unwrap_or(legacy))
     }
 
     pub(super) async fn metadata_by_group_id(

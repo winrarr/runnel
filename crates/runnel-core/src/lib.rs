@@ -38,7 +38,8 @@ const DEAD_LETTER_SUFFIX: &str = ".dead-letter";
 const DEAD_LETTER_HASH_PREFIX: &str = "runnel.dead-letter.";
 
 pub use runnel_engine::{
-    AckResult, BrokerError, HealthSnapshot, Message, Offset, PollResult, ReplayMessage,
+    AckResult, BrokerError, ConsumerPolicy, HealthSnapshot, Message, Offset, PollResult,
+    ReplayMessage,
 };
 
 /// Selects the durable record format used for new appends.
@@ -108,6 +109,34 @@ impl Engine for Broker {
         let consumer = consumer.to_owned();
         Arc::clone(&self.inner.storage_executor)
             .dispatch_stream(stream, move |stream| broker.poll(stream, &consumer))
+    }
+
+    fn configure_consumer<'a>(
+        &'a self,
+        stream: &'a str,
+        consumer: &'a str,
+        ack_timeout_ms: u64,
+        max_delivery_attempts: Option<u32>,
+    ) -> EngineFuture<'a, ConsumerPolicy> {
+        let broker = self.clone();
+        let stream = stream.to_owned();
+        let consumer = consumer.to_owned();
+        Arc::clone(&self.inner.storage_executor).dispatch_stream(stream, move |stream| {
+            broker.configure_consumer(stream, &consumer, ack_timeout_ms, max_delivery_attempts)
+        })
+    }
+
+    fn inspect_consumer<'a>(
+        &'a self,
+        stream: &'a str,
+        consumer: &'a str,
+    ) -> EngineFuture<'a, ConsumerPolicy> {
+        let broker = self.clone();
+        let stream = stream.to_owned();
+        let consumer = consumer.to_owned();
+        Arc::clone(&self.inner.storage_executor).dispatch_stream(stream, move |stream| {
+            broker.inspect_consumer(stream, &consumer)
+        })
     }
 
     fn replay<'a>(
@@ -948,6 +977,72 @@ mod tests {
             reopened.poll("events.dead-letter", "inspector").unwrap(),
             PollResult::Empty
         );
+    }
+
+    #[test]
+    fn consumer_policy_is_isolated_durable_and_pinned_per_delivery() {
+        let directory = tempdir().unwrap();
+        let broker = Broker::open(directory.path(), BrokerConfig::default()).unwrap();
+        broker.create_stream("events").unwrap();
+        let policy = broker
+            .configure_consumer("events", "worker-a", 0, Some(2))
+            .unwrap();
+        assert_eq!(policy.version, 1);
+        assert!(policy.configured);
+        assert_eq!(
+            broker.inspect_consumer("events", "worker-a").unwrap(),
+            policy
+        );
+        assert!(
+            !broker
+                .inspect_consumer("events", "worker-b")
+                .unwrap()
+                .configured
+        );
+        broker.publish("events", None, b"poison".to_vec()).unwrap();
+
+        let first = broker.poll("events", "worker-a").unwrap();
+        assert!(matches!(
+            first,
+            PollResult::Message(Message {
+                delivery_attempt: Some(1),
+                ..
+            })
+        ));
+        // Updating a policy does not change the attempt budget of an in-flight record.
+        broker
+            .configure_consumer("events", "worker-a", 0, Some(1))
+            .unwrap();
+        std::thread::sleep(Duration::from_millis(100));
+        let second = broker.poll("events", "worker-a").unwrap();
+        assert!(matches!(
+            second,
+            PollResult::Message(Message {
+                delivery_attempt: Some(2),
+                ..
+            })
+        ));
+        std::thread::sleep(Duration::from_millis(100));
+        assert_eq!(
+            broker.poll("events", "worker-a").unwrap(),
+            PollResult::Empty
+        );
+
+        // The other consumer keeps its own independent policy and checkpoint.
+        assert!(matches!(
+            broker.poll("events", "worker-b").unwrap(),
+            PollResult::Message(Message {
+                offset: 0,
+                delivery_attempt: Some(1),
+                ..
+            })
+        ));
+
+        drop(broker);
+        let reopened = Broker::open(directory.path(), BrokerConfig::default()).unwrap();
+        let reopened_policy = reopened.inspect_consumer("events", "worker-a").unwrap();
+        assert_eq!(reopened_policy.version, 2);
+        assert_eq!(reopened_policy.max_delivery_attempts, Some(1));
     }
 
     #[test]

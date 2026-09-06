@@ -53,6 +53,13 @@ impl Drop for StageTimer {
 
 pub type Offset = u64;
 
+/// Maximum acknowledgement timeout accepted by a consumer-scoped policy.
+///
+/// The bound keeps an accidentally large policy from becoming an unbounded
+/// lease in either engine while leaving the broker-wide legacy setting
+/// unchanged for existing deployments.
+pub const MAX_CONSUMER_POLICY_ACK_TIMEOUT_MS: u64 = 7 * 24 * 60 * 60 * 1_000;
+
 /// Maximum number of records accepted by one publish-batch engine operation.
 pub const MAX_PUBLISH_BATCH_RECORDS: usize = 1024;
 
@@ -62,6 +69,64 @@ pub struct PublishRecord {
     pub key: Option<String>,
     pub payload: Vec<u8>,
     pub request_id: Option<String>,
+}
+
+/// Durable retry settings associated with one named consumer.
+///
+/// Version zero with `configured = false` represents the broker-wide legacy
+/// fallback. Configured policies start at version one and advance only when
+/// their values change. The version is persisted with the consumer so a
+/// delivery can retain the policy that selected its attempt budget.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ConsumerPolicy {
+    pub version: u64,
+    pub configured: bool,
+    pub ack_timeout_ms: u64,
+    pub max_delivery_attempts: Option<u32>,
+}
+
+impl ConsumerPolicy {
+    /// Construct the legacy broker-wide fallback view.
+    pub const fn legacy(ack_timeout_ms: u64, max_delivery_attempts: Option<u32>) -> Self {
+        Self {
+            version: 0,
+            configured: false,
+            ack_timeout_ms,
+            max_delivery_attempts,
+        }
+    }
+
+    /// Construct a configured policy with the supplied durable version.
+    pub const fn configured(
+        version: u64,
+        ack_timeout_ms: u64,
+        max_delivery_attempts: Option<u32>,
+    ) -> Self {
+        Self {
+            version,
+            configured: true,
+            ack_timeout_ms,
+            max_delivery_attempts,
+        }
+    }
+}
+
+/// Validate values supplied by a consumer-policy configuration request.
+pub fn validate_consumer_policy(
+    ack_timeout_ms: u64,
+    max_delivery_attempts: Option<u32>,
+) -> Result<(), BrokerError> {
+    if ack_timeout_ms > MAX_CONSUMER_POLICY_ACK_TIMEOUT_MS {
+        return Err(BrokerError::Configuration(format!(
+            "consumer acknowledgement timeout must not exceed {MAX_CONSUMER_POLICY_ACK_TIMEOUT_MS} milliseconds"
+        )));
+    }
+    if max_delivery_attempts == Some(0) {
+        return Err(BrokerError::Configuration(
+            "max delivery attempts must be greater than zero".to_owned(),
+        ));
+    }
+    Ok(())
 }
 
 /// The result for one record in a publish batch.
@@ -310,6 +375,37 @@ pub trait Engine: Send + Sync {
 
     fn poll<'a>(&'a self, stream: &'a str, consumer: &'a str) -> EngineFuture<'a, PollResult>;
 
+    /// Configure durable retry settings for one named consumer.
+    ///
+    /// Engines that do not support consumer configuration retain the shared
+    /// broker contract by returning a semantic unsupported-operation error.
+    fn configure_consumer<'a>(
+        &'a self,
+        _stream: &'a str,
+        _consumer: &'a str,
+        _ack_timeout_ms: u64,
+        _max_delivery_attempts: Option<u32>,
+    ) -> EngineFuture<'a, ConsumerPolicy> {
+        Box::pin(async {
+            Err(BrokerError::Cluster(
+                "consumer retry policy is not supported by this engine".to_owned(),
+            ))
+        })
+    }
+
+    /// Inspect durable retry settings for one named consumer.
+    fn inspect_consumer<'a>(
+        &'a self,
+        _stream: &'a str,
+        _consumer: &'a str,
+    ) -> EngineFuture<'a, ConsumerPolicy> {
+        Box::pin(async {
+            Err(BrokerError::Cluster(
+                "consumer retry policy is not supported by this engine".to_owned(),
+            ))
+        })
+    }
+
     /// Read one retained record at an inclusive logical offset without
     /// changing the consumer checkpoint or delivery state.
     fn replay<'a>(
@@ -359,7 +455,10 @@ pub trait Engine: Send + Sync {
 
 #[cfg(test)]
 mod tests {
-    use super::{BrokerError, BrokerErrorKind, BrokerErrorOutcome};
+    use super::{
+        BrokerError, BrokerErrorKind, BrokerErrorOutcome, MAX_CONSUMER_POLICY_ACK_TIMEOUT_MS,
+        validate_consumer_policy,
+    };
     use std::io;
 
     #[test]
@@ -460,6 +559,14 @@ mod tests {
             assert_eq!(error.kind(), expected_kind, "{error}");
             assert_eq!(error.outcome(), expected_outcome, "{error}");
         }
+    }
+
+    #[test]
+    fn validates_consumer_policy_bounds() {
+        assert!(validate_consumer_policy(0, Some(1)).is_ok());
+        assert!(validate_consumer_policy(MAX_CONSUMER_POLICY_ACK_TIMEOUT_MS, None).is_ok());
+        assert!(validate_consumer_policy(0, Some(0)).is_err());
+        assert!(validate_consumer_policy(MAX_CONSUMER_POLICY_ACK_TIMEOUT_MS + 1, None).is_err());
     }
 
     #[test]

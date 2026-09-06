@@ -169,6 +169,25 @@ async fn handle_forwarded(
                 .await
                 .map_err(forward_error),
         ),
+        ForwardedOperation::ConfigureConsumer {
+            stream,
+            consumer,
+            ack_timeout_ms,
+            max_delivery_attempts,
+        } => ForwardedResponse::ConsumerPolicy(
+            manager
+                .configure_consumer_local(stream, consumer, ack_timeout_ms, max_delivery_attempts)
+                .await
+                .map_err(forward_error),
+        ),
+        ForwardedOperation::InspectConsumer { stream, consumer } => {
+            ForwardedResponse::ConsumerPolicy(
+                manager
+                    .inspect_consumer_local(&stream, &consumer)
+                    .await
+                    .map_err(forward_error),
+            )
+        }
         ForwardedOperation::PollGroup {
             stream,
             consumer,

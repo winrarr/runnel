@@ -7,7 +7,7 @@ use std::time::Duration;
 use openraft::BasicNode;
 use openraft::network::RaftNetworkFactory;
 use openraft::{Config, SnapshotPolicy};
-use runnel_engine::{AckResult, BrokerError, Offset, PollResult, ReplayMessage};
+use runnel_engine::{AckResult, BrokerError, ConsumerPolicy, Offset, PollResult, ReplayMessage};
 use serde::{Deserialize, Serialize};
 use tokio::sync::{Mutex, RwLock};
 
@@ -524,6 +524,33 @@ impl GroupManager {
             .await?
             .poll_group(stream.to_owned(), consumer.to_owned(), consumer.to_owned())
             .await
+    }
+
+    pub(crate) async fn configure_consumer_local(
+        &self,
+        stream: String,
+        consumer: String,
+        ack_timeout_ms: u64,
+        max_delivery_attempts: Option<u32>,
+    ) -> Result<ConsumerPolicy, BrokerError> {
+        self.data_group_for_stream(&stream)
+            .await?
+            .configure_consumer(stream, consumer, ack_timeout_ms, max_delivery_attempts)
+            .await
+    }
+
+    pub(crate) async fn inspect_consumer_local(
+        &self,
+        stream: &str,
+        consumer: &str,
+    ) -> Result<ConsumerPolicy, BrokerError> {
+        let group = self.data_group_for_stream(stream).await?;
+        if group.raft().current_leader().await != Some(self.node_id) {
+            return Err(BrokerError::NotLeader {
+                leader_id: group.raft().current_leader().await,
+            });
+        }
+        group.inspect_consumer(stream, consumer).await
     }
 
     pub(crate) async fn replay_local(

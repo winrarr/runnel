@@ -323,6 +323,17 @@ pub struct Health {
     pub storage_bytes: u64,
 }
 
+/// Durable retry settings associated with one consumer.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConsumerPolicy {
+    pub stream: String,
+    pub consumer: String,
+    pub version: u64,
+    pub configured: bool,
+    pub ack_timeout_ms: u64,
+    pub max_delivery_attempts: Option<u32>,
+}
+
 /// The result classification for one request attempt.
 ///
 /// The classification is deliberately not serialized. It describes what the
@@ -746,6 +757,86 @@ impl Client {
     ) -> Result<Option<Message>, AttemptOutcome> {
         self.poll_request("poll", stream.into(), consumer.into(), None)
             .await
+    }
+
+    /// Configure durable retry settings for one consumer.
+    pub async fn configure_consumer(
+        &mut self,
+        stream: impl Into<String>,
+        consumer: impl Into<String>,
+        ack_timeout_ms: u64,
+        max_delivery_attempts: Option<u32>,
+    ) -> Result<ConsumerPolicy, AttemptOutcome> {
+        let stream = stream.into();
+        let consumer = consumer.into();
+        self.request_typed(
+            "configure_consumer",
+            Request::ConfigureConsumer {
+                stream: stream.clone(),
+                consumer: consumer.clone(),
+                ack_timeout_ms,
+                max_delivery_attempts,
+            },
+            move |response| match response {
+                Response::ConsumerPolicy {
+                    stream: response_stream,
+                    consumer: response_consumer,
+                    version,
+                    configured,
+                    ack_timeout_ms,
+                    max_delivery_attempts,
+                } if response_stream == stream && response_consumer == consumer => {
+                    Ok(ConsumerPolicy {
+                        stream: response_stream,
+                        consumer: response_consumer,
+                        version,
+                        configured,
+                        ack_timeout_ms,
+                        max_delivery_attempts,
+                    })
+                }
+                response => Err(Box::new(response)),
+            },
+        )
+        .await
+    }
+
+    /// Inspect the durable retry settings for one consumer.
+    pub async fn inspect_consumer(
+        &mut self,
+        stream: impl Into<String>,
+        consumer: impl Into<String>,
+    ) -> Result<ConsumerPolicy, AttemptOutcome> {
+        let stream = stream.into();
+        let consumer = consumer.into();
+        self.request_typed(
+            "inspect_consumer",
+            Request::InspectConsumer {
+                stream: stream.clone(),
+                consumer: consumer.clone(),
+            },
+            move |response| match response {
+                Response::ConsumerPolicy {
+                    stream: response_stream,
+                    consumer: response_consumer,
+                    version,
+                    configured,
+                    ack_timeout_ms,
+                    max_delivery_attempts,
+                } if response_stream == stream && response_consumer == consumer => {
+                    Ok(ConsumerPolicy {
+                        stream: response_stream,
+                        consumer: response_consumer,
+                        version,
+                        configured,
+                        ack_timeout_ms,
+                        max_delivery_attempts,
+                    })
+                }
+                response => Err(Box::new(response)),
+            },
+        )
+        .await
     }
 
     /// Poll a shared consumer member, returning `None` when the broker reports

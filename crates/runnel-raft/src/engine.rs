@@ -14,7 +14,8 @@ use openraft::raft::{
 #[cfg(feature = "instrumentation")]
 use runnel_engine::StageTimer;
 use runnel_engine::{
-    AckResult, BrokerError, Engine, EngineFuture, Offset, PollResult, ReplayMessage,
+    AckResult, BrokerError, ConsumerPolicy, Engine, EngineFuture, Offset, PollResult,
+    ReplayMessage, validate_consumer_policy,
 };
 use serde::{Deserialize, Serialize};
 use tokio::sync::RwLock;
@@ -506,6 +507,53 @@ impl RaftGroup {
             .await
     }
 
+    pub async fn configure_consumer(
+        &self,
+        stream: String,
+        consumer: String,
+        ack_timeout_ms: u64,
+        max_delivery_attempts: Option<u32>,
+    ) -> Result<ConsumerPolicy, BrokerError> {
+        validate_name("stream", &stream)?;
+        validate_name("consumer", &consumer)?;
+        validate_consumer_policy(ack_timeout_ms, max_delivery_attempts)?;
+        let response = self
+            .raft
+            .client_write(Command::ConfigureConsumer {
+                stream,
+                consumer,
+                ack_timeout_ms,
+                max_delivery_attempts,
+            })
+            .await
+            .map_err(map_client_write_error)?;
+        match response.data {
+            CommandResponse::ConsumerPolicy { policy } => Ok(policy),
+            CommandResponse::StreamNotFound => {
+                Err(BrokerError::StreamNotFound("consumer stream".to_owned()))
+            }
+            other => Err(BrokerError::Cluster(format!(
+                "unexpected consumer configuration response: {other:?}"
+            ))),
+        }
+    }
+
+    pub async fn inspect_consumer(
+        &self,
+        stream: &str,
+        consumer: &str,
+    ) -> Result<ConsumerPolicy, BrokerError> {
+        validate_name("stream", stream)?;
+        validate_name("consumer", consumer)?;
+        self.state_machine
+            .consumer_policy(
+                stream,
+                consumer,
+                ConsumerPolicy::legacy(duration_ms(self.ack_timeout), self.max_delivery_attempts),
+            )
+            .await
+    }
+
     pub async fn replay(
         &self,
         stream: String,
@@ -568,7 +616,13 @@ impl RaftGroup {
         #[cfg(feature = "instrumentation")]
         let _stage_timer = StageTimer::new("raft.poll_quorum");
         let now_ms = now_ms();
-        let lease_deadline_ms = now_ms.saturating_add(duration_ms(self.ack_timeout));
+        let legacy_policy =
+            ConsumerPolicy::legacy(duration_ms(self.ack_timeout), self.max_delivery_attempts);
+        let policy = self
+            .state_machine
+            .consumer_policy(&stream, &consumer, legacy_policy.clone())
+            .await?;
+        let lease_deadline_ms = now_ms.saturating_add(policy.ack_timeout_ms);
         let stream_name = stream.clone();
         let response = self
             .raft
@@ -579,6 +633,8 @@ impl RaftGroup {
                 now_ms,
                 lease_deadline_ms,
                 max_delivery_attempts: self.max_delivery_attempts,
+                legacy_ack_timeout_ms: Some(legacy_policy.ack_timeout_ms),
+                policy_version: policy.configured.then_some(policy.version),
             })
             .await
             .map_err(map_client_write_error)?;
@@ -689,6 +745,33 @@ impl Engine for SingleNodeEngine {
 
     fn poll<'a>(&'a self, stream: &'a str, consumer: &'a str) -> EngineFuture<'a, PollResult> {
         Box::pin(async move { self.group.poll(stream, consumer).await })
+    }
+
+    fn configure_consumer<'a>(
+        &'a self,
+        stream: &'a str,
+        consumer: &'a str,
+        ack_timeout_ms: u64,
+        max_delivery_attempts: Option<u32>,
+    ) -> EngineFuture<'a, ConsumerPolicy> {
+        Box::pin(async move {
+            self.group
+                .configure_consumer(
+                    stream.to_owned(),
+                    consumer.to_owned(),
+                    ack_timeout_ms,
+                    max_delivery_attempts,
+                )
+                .await
+        })
+    }
+
+    fn inspect_consumer<'a>(
+        &'a self,
+        stream: &'a str,
+        consumer: &'a str,
+    ) -> EngineFuture<'a, ConsumerPolicy> {
+        Box::pin(async move { self.group.inspect_consumer(stream, consumer).await })
     }
 
     fn replay<'a>(
@@ -943,6 +1026,67 @@ impl Engine for PersistentEngine {
                     .await;
             }
             self.manager.poll_local(stream, consumer).await
+        })
+    }
+
+    fn configure_consumer<'a>(
+        &'a self,
+        stream: &'a str,
+        consumer: &'a str,
+        ack_timeout_ms: u64,
+        max_delivery_attempts: Option<u32>,
+    ) -> EngineFuture<'a, ConsumerPolicy> {
+        Box::pin(async move {
+            let stream_name = stream.to_owned();
+            let consumer_name = consumer.to_owned();
+            let operation = super::network::ForwardedOperation::ConfigureConsumer {
+                stream: stream_name.clone(),
+                consumer: consumer_name.clone(),
+                ack_timeout_ms,
+                max_delivery_attempts,
+            };
+            match self
+                .manager
+                .configure_consumer_local(
+                    stream_name,
+                    consumer_name,
+                    ack_timeout_ms,
+                    max_delivery_attempts,
+                )
+                .await
+            {
+                Ok(policy) => Ok(policy),
+                Err(BrokerError::NotLeader { leader_id }) => {
+                    self.forwarder()
+                        .configure_consumer(operation, leader_id)
+                        .await
+                }
+                Err(error) => Err(error),
+            }
+        })
+    }
+
+    fn inspect_consumer<'a>(
+        &'a self,
+        stream: &'a str,
+        consumer: &'a str,
+    ) -> EngineFuture<'a, ConsumerPolicy> {
+        Box::pin(async move {
+            let data_group = self.manager.data_group_for_stream(stream).await?;
+            let Some(leader_id) = data_group.raft().current_leader().await else {
+                return Err(BrokerError::NotLeader { leader_id: None });
+            };
+            let operation = super::network::ForwardedOperation::InspectConsumer {
+                stream: stream.to_owned(),
+                consumer: consumer.to_owned(),
+            };
+            if leader_id != self.node_id {
+                return self
+                    .forwarder()
+                    .inspect_consumer(operation, Some(leader_id))
+                    .await;
+            }
+            self.manager.inspect_consumer_local(stream, consumer).await
         })
     }
 

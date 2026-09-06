@@ -1,6 +1,8 @@
 use std::sync::atomic::Ordering;
 
-use runnel_engine::{AckResult, BrokerError, Engine, PollResult, PublishRecord, ReplayMessage};
+use runnel_engine::{
+    AckResult, BrokerError, ConsumerPolicy, Engine, PollResult, PublishRecord, ReplayMessage,
+};
 use runnel_protocol::{
     BinaryPayload, MAX_PUBLISH_BATCH_RECORDS, PublishBatchRecordResponse, Request, Response,
 };
@@ -165,6 +167,19 @@ pub(crate) async fn handle_request(
                 PollResult::Empty => Response::Empty { stream, consumer },
             })
         }
+        Request::ConfigureConsumer {
+            stream,
+            consumer,
+            ack_timeout_ms,
+            max_delivery_attempts,
+        } => engine
+            .configure_consumer(&stream, &consumer, ack_timeout_ms, max_delivery_attempts)
+            .await
+            .map(|policy| consumer_policy_response(stream, consumer, policy)),
+        Request::InspectConsumer { stream, consumer } => engine
+            .inspect_consumer(&stream, &consumer)
+            .await
+            .map(|policy| consumer_policy_response(stream, consumer, policy)),
         Request::Ack {
             stream,
             consumer,
@@ -204,6 +219,17 @@ pub(crate) async fn handle_request(
     };
 
     result.unwrap_or_else(|error| error_response(&error))
+}
+
+fn consumer_policy_response(stream: String, consumer: String, policy: ConsumerPolicy) -> Response {
+    Response::ConsumerPolicy {
+        stream,
+        consumer,
+        version: policy.version,
+        configured: policy.configured,
+        ack_timeout_ms: policy.ack_timeout_ms,
+        max_delivery_attempts: policy.max_delivery_attempts,
+    }
 }
 
 fn replay_message_response(message: ReplayMessage, consumer: String) -> Response {

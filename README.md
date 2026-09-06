@@ -25,7 +25,7 @@ The workspace also contains `runnel-engine`, the shared semantic engine contract
 
 The workspace includes reusable `runnel-client` and `runnel-test-support` crates. The client provides persistent sequential request/response transport with bounded connection, write, response-size, and response timeouts for the provisional protocol; the test-support crate contains storage- and topology-independent assertions for the Engine contract.
 
-Retention, consume batching, compression, authentication, and TLS remain planned product work. Publish batches already provide independent per-record outcomes without batch atomicity. The current line-delimited JSON protocol is a development protocol and is not yet a compatibility promise. Retry limits and dead-letter streams are broker-wide configuration for local and clustered delivery; the early static Raft backend provides replicated ownership, expiry fencing, and dead-letter recovery without exposing its internal consumer state.
+Retention, consume batching, compression, authentication, and TLS remain planned product work. Publish batches already provide independent per-record outcomes without batch atomicity. The current line-delimited JSON protocol is a development protocol and is not yet a compatibility promise. Broker-wide retry settings remain the fallback for local and clustered delivery; `configure_consumer` and `inspect_consumer` provide durable per-consumer acknowledgement timeouts and attempt limits while the early static Raft backend preserves replicated ownership, expiry fencing, and dead-letter recovery without exposing its internal consumer state.
 
 ## Quick start
 
@@ -122,6 +122,8 @@ The current protocol accepts one JSON request per TCP line. For example:
     {"op":"poll","stream":"events","consumer":"worker"}
     {"op":"ack","stream":"events","consumer":"worker","offset":0}
     {"op":"replay","stream":"events","consumer":"worker","offset":0}
+    {"op":"configure_consumer","stream":"events","consumer":"worker","ack_timeout_ms":5000,"max_delivery_attempts":5}
+    {"op":"inspect_consumer","stream":"events","consumer":"worker"}
 
 Grouped delivery uses `poll_group` and `ack_group` requests with a consumer name, member name, and delivery token. These are provisional development-protocol operations.
 
@@ -131,7 +133,7 @@ delivery token; an unavailable offset returns `history_unavailable` with the
 available offset range. Replay sessions, time selectors, retention floors,
 and replay acknowledgements are not implemented yet.
 
-Message responses include a delivery attempt while retry state is being tracked. Dead-letter records are available on the source stream's derived dead-letter stream and preserve the original key and payload.
+Message responses include a delivery attempt while retry state is being tracked. Consumer policies are durable and pinned per delivery; unconfigured consumers use the broker-wide fallback. Dead-letter records are available on the source stream's derived dead-letter stream and preserve the original key and payload.
 
 See [docs/product-fit.md](docs/product-fit.md) for the initial audience and product boundaries, [docs/architecture.md](docs/architecture.md) for the current technical boundaries, [docs/benchmarking.md](docs/benchmarking.md) for benchmark policy, [docs/research/README.md](docs/research/README.md) for source-backed investigations, [docs/design/multi-raft-implementation-plan.md](docs/design/multi-raft-implementation-plan.md) for the first clustered plan, [docs/backlog.md](docs/backlog.md) for intended next outcomes, and [docs/tech-debt.md](docs/tech-debt.md) for known implementation shortcuts. Repository operating guidance lives in AGENTS.md.
 

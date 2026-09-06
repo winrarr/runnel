@@ -13,7 +13,7 @@ Each new assignment receives a token derived from the committed Raft log identit
 
 Lease deadlines are absolute millisecond timestamps selected by the leader and included in the replicated command. This makes state-machine application deterministic across replicas and provides a simple restart and leader-failover baseline. The configured acknowledgement timeout is expected to be consistent across nodes; a final lease and fencing model remains future work.
 
-The broker-wide maximum attempt setting applies to clustered grouped delivery. When a message reaches that limit, the source consumer's progress and a derived `.dead-letter` record are committed in the same stream data group. The derived stream is resolved back to that data group when addressed through the public protocol, and dead-letter streams are not recursively dead-lettered.
+The broker-wide maximum attempt setting remains the legacy fallback for clustered grouped delivery. A durable per-consumer policy may override it as described by [ADR 0027](0027-consumer-scoped-retry-policy.md). When the selected limit is reached, the source consumer's progress and a derived `.dead-letter` record are committed in the same stream data group. The derived stream is resolved back to that data group when addressed through the public protocol, and dead-letter streams are not recursively dead-lettered.
 
 ## Rationale
 
@@ -35,7 +35,7 @@ The design deliberately keeps the first scheduler demand-driven and bounded: one
 
 - The clustered backend now implements the reusable shared-delivery contract and process-level failure tests.
 - Consumer delivery state increases the replicated and snapshot state for each stream; the current materialized representation is not the long-term large-stream design.
-- Clustered backoff, richer dead-letter provenance, policy selection per consumer, and final fencing semantics are not enabled by this decision.
+- Clustered backoff, richer dead-letter provenance, and final fencing semantics are not enabled by this decision. Consumer policy selection is defined by ADR 0027.
 - Lease behavior depends on a consistent wall-clock configuration across nodes. The command carries the leader's chosen deadline, but clock quality and configuration drift remain operational concerns.
 - A future scheduler may replace the scan and one-delivery-per-member policy behind the same engine contract, subject to benchmarks and the ordering and fencing invariants.
 

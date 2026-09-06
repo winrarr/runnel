@@ -81,7 +81,7 @@ pub(crate) struct ServerMetrics {
     health_check_failures: AtomicU64,
 }
 
-const REQUEST_OPERATION_COUNT: usize = 9;
+const REQUEST_OPERATION_COUNT: usize = 11;
 const LATENCY_BUCKET_MICROS: [u64; 6] = [100, 1_000, 10_000, 100_000, 1_000_000, 10_000_000];
 const LATENCY_BUCKET_LABELS: [&str; LATENCY_BUCKET_MICROS.len()] =
     ["0.0001", "0.001", "0.01", "0.1", "1", "10"];
@@ -93,6 +93,8 @@ pub(crate) enum RequestOperation {
     Poll,
     Replay,
     PollGroup,
+    ConfigureConsumer,
+    InspectConsumer,
     Ack,
     AckGroup,
     Health,
@@ -106,6 +108,8 @@ impl RequestOperation {
         Self::Poll,
         Self::Replay,
         Self::PollGroup,
+        Self::ConfigureConsumer,
+        Self::InspectConsumer,
         Self::Ack,
         Self::AckGroup,
         Self::Health,
@@ -119,10 +123,12 @@ impl RequestOperation {
             Self::Poll => 2,
             Self::Replay => 3,
             Self::PollGroup => 4,
-            Self::Ack => 5,
-            Self::AckGroup => 6,
-            Self::Health => 7,
-            Self::InvalidRequest => 8,
+            Self::ConfigureConsumer => 5,
+            Self::InspectConsumer => 6,
+            Self::Ack => 7,
+            Self::AckGroup => 8,
+            Self::Health => 9,
+            Self::InvalidRequest => 10,
         }
     }
 
@@ -133,6 +139,8 @@ impl RequestOperation {
             Self::Poll => "poll",
             Self::Replay => "replay",
             Self::PollGroup => "poll_group",
+            Self::ConfigureConsumer => "configure_consumer",
+            Self::InspectConsumer => "inspect_consumer",
             Self::Ack => "ack",
             Self::AckGroup => "ack_group",
             Self::Health => "health",
@@ -149,6 +157,8 @@ impl RequestOperation {
             Request::Poll { .. } => Self::Poll,
             Request::Replay { .. } => Self::Replay,
             Request::PollGroup { .. } => Self::PollGroup,
+            Request::ConfigureConsumer { .. } => Self::ConfigureConsumer,
+            Request::InspectConsumer { .. } => Self::InspectConsumer,
             Request::Ack { .. } => Self::Ack,
             Request::AckGroup { .. } => Self::AckGroup,
             Request::Health => Self::Health,

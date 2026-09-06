@@ -129,6 +129,38 @@ fn payload_encoding_is_explicit_for_every_payload_wire_shape() {
 }
 
 #[test]
+fn consumer_policy_requests_and_responses_round_trip() {
+    let request = Request::ConfigureConsumer {
+        stream: "events".to_owned(),
+        consumer: "worker".to_owned(),
+        ack_timeout_ms: 250,
+        max_delivery_attempts: Some(3),
+    };
+    let encoded = serde_json::to_string(&request).unwrap();
+    assert_eq!(
+        encoded,
+        r#"{"op":"configure_consumer","stream":"events","consumer":"worker","ack_timeout_ms":250,"max_delivery_attempts":3}"#
+    );
+    let decoded: Request = serde_json::from_str(&encoded).unwrap();
+    assert!(matches!(decoded, Request::ConfigureConsumer { .. }));
+
+    let response = Response::ConsumerPolicy {
+        stream: "events".to_owned(),
+        consumer: "worker".to_owned(),
+        version: 1,
+        configured: true,
+        ack_timeout_ms: 250,
+        max_delivery_attempts: Some(3),
+    };
+    let decoded: Response =
+        serde_json::from_str(&serde_json::to_string(&response).unwrap()).unwrap();
+    assert!(matches!(
+        decoded,
+        Response::ConsumerPolicy { version: 1, .. }
+    ));
+}
+
+#[test]
 fn requests_and_responses_round_trip_as_json() {
     let request = Request::Publish {
         stream: "events".to_owned(),
