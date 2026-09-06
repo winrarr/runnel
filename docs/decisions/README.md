@@ -1,6 +1,6 @@
 # Architecture decisions
 
-Accepted decisions live here as one file per decision. Supersede an old decision with a new record rather than rewriting history.
+Accepted decisions live here as one file per decision. Keep records aligned with accepted current behavior: revise stale assumptions and scope when decisions evolve, retaining history where it explains a consequence, rejected alternative, or compatibility boundary. Use a superseding record when a distinct new decision needs its own rationale, and link the affected records so their authority is clear.
 
 Current decisions:
 
@@ -10,7 +10,7 @@ Current decisions:
 - 0004-multi-raft-first-distributed-engine.md: first distributed engine and three-node topology.
 - 0005-replicated-stream-metadata.md: historical stable stream identity decision; superseded by ADR 0006.
 - 0006-separate-metadata-and-data-groups.md: separate metadata and per-stream data groups with reconciled creation.
-- 0007-snapshot-based-replica-recovery.md: snapshot-based replacement replica recovery.
+- 0007-snapshot-based-replica-recovery.md: snapshot format and transfer; empty-replica recovery is restricted by ADR 0018.
 - 0008-container-benchmark-harness.md: resource-limited container benchmarks and comparable-broker adapter boundary.
 - 0009-native-broker-comparison-baseline.md: pinned native-tool comparison as an explicitly provisional baseline.
 - 0010-benchmark-history-pages.md: generated benchmark history and GitHub Pages dashboard.
@@ -25,4 +25,7 @@ Current decisions:
 - 0019-clustered-storage-identity.md: fail closed when persisted clustered state does not match its configured identity or format.
 - 0020-stable-optimization-evidence.md: benchmark requirements are evaluated by expected runtime impact, and optimization claims require stable authoritative evidence.
 - 0021-scheduled-benchmark-history.md: run the longer Runnel history suite on a schedule or manually instead of on every `main` push.
+- 0022-provisional-binary-payloads.md: opaque binary payloads in the provisional JSON protocol.
+- 0023-independent-retained-storage-and-placement.md: accepted future storage and placement boundaries; implementation remains deferred.
 - 0024-explicit-offset-replay-read.md: first replay slice is a bounded, read-only logical-offset operation with explicit unavailable-history outcomes.
+- 0025-retain-github-actions-pending-hosted-ci-trial.md: retain GitHub Actions pending evidence from a hosted alternative trial.

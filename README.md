@@ -25,7 +25,7 @@ The workspace also contains `runnel-engine`, the shared semantic engine contract
 
 The workspace includes reusable `runnel-client` and `runnel-test-support` crates. The client provides persistent sequential request/response transport with bounded connection, write, and response timeouts for the provisional protocol; the test-support crate contains storage- and topology-independent assertions for the Engine contract.
 
-Retention, batching, compression, authentication, and TLS remain planned product work. The current line-delimited JSON protocol is a development protocol and is not yet a compatibility promise. Retry limits and dead-letter streams are broker-wide configuration for local and clustered delivery; the early static Raft backend provides replicated ownership, expiry fencing, and dead-letter recovery without exposing its internal consumer state.
+Retention, consume batching, compression, authentication, and TLS remain planned product work. Publish batches already provide independent per-record outcomes without batch atomicity. The current line-delimited JSON protocol is a development protocol and is not yet a compatibility promise. Retry limits and dead-letter streams are broker-wide configuration for local and clustered delivery; the early static Raft backend provides replicated ownership, expiry fencing, and dead-letter recovery without exposing its internal consumer state.
 
 ## Quick start
 
@@ -54,7 +54,7 @@ The broker listens on 127.0.0.1:4222. Health endpoints and metrics listen on 127
 
 To demonstrate restart recovery, publish a message, consume it without acknowledging, stop and restart the broker with the same data directory, then consume with the same consumer name. The message is delivered again because the checkpoint did not advance.
 
-When max-delivery-attempts is set, a message that reaches the limit is copied to the stream's .dead-letter stream with its key and payload preserved. The acknowledgement timeout controls when the next attempt becomes eligible. The clustered path commits the dead-letter record and source progress in the same replicated data-group operation; the local path remains at least once across the source checkpoint and dead-letter log, so operators should tolerate duplicate dead-letter records after a local crash.
+When max-delivery-attempts is set, a message that reaches the limit is copied to a derived dead-letter stream with its key and payload preserved. The name uses the .dead-letter suffix, with a bounded hashed fallback for long source names. The acknowledgement timeout controls when the next attempt becomes eligible. The clustered path commits the dead-letter record and source progress in the same replicated data-group operation. New local moves preserve a stable internal identity so a retry or reopen can reuse a completed target append before advancing source progress. The local operation still spans two durable records; legacy records and incomplete I/O failure coverage mean operators should continue tolerating duplicates. See [TD-017](docs/tech-debt.md#td-017-dead-letter-movement-spans-separate-durable-records).
 
 ## Development
 
@@ -129,7 +129,7 @@ delivery token; an unavailable offset returns `history_unavailable` with the
 available offset range. Replay sessions, time selectors, retention floors,
 and replay acknowledgements are not implemented yet.
 
-Message responses include a delivery attempt while retry state is being tracked. Dead-letter records are available on the source stream's .dead-letter stream and preserve the original key and payload.
+Message responses include a delivery attempt while retry state is being tracked. Dead-letter records are available on the source stream's derived dead-letter stream and preserve the original key and payload.
 
 See [docs/product-fit.md](docs/product-fit.md) for the initial audience and product boundaries, [docs/architecture.md](docs/architecture.md) for the current technical boundaries, [docs/benchmarking.md](docs/benchmarking.md) for benchmark policy, [docs/research/README.md](docs/research/README.md) for source-backed investigations, [docs/design/multi-raft-implementation-plan.md](docs/design/multi-raft-implementation-plan.md) for the first clustered plan, [docs/backlog.md](docs/backlog.md) for intended next outcomes, and [docs/tech-debt.md](docs/tech-debt.md) for known implementation shortcuts. Repository operating guidance lives in AGENTS.md.
 

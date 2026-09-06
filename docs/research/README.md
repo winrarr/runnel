@@ -5,6 +5,8 @@ architecture and product choices. Research is evidence, not an accepted design:
 observations, inferences, hypotheses, and unresolved questions should remain
 clearly separated.
 
+Research may examine capabilities far beyond the next release. Explain concrete mechanisms, alternatives, assumptions, and failure tradeoffs so the work can inform viability and later decisions. Code-shaped examples may illustrate an approach, but hypothetical APIs, module layouts, and staged edits are not implementation requirements. Revisit baseline-specific observations when using a note for implementation; a historical review date does not establish current behavior.
+
 Each substantial note should record:
 
 - its scope, status, and last-review date;
