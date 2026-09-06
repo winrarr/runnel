@@ -4,7 +4,7 @@ Status: scoped research note; no compatibility or ranking decision
 
 Reviewed: 2026-09-06
 
-Baseline revision: `da31af5d55e40e85d491f1f8c5de42f27257f78d`
+Baseline revision: `460d1a8a40e50cc48fc00b9edfcb735dbf4b94a7`
 
 Scope: review the current native-tool comparison and define a concrete,
 implementation-independent path toward comparable broker workloads. This note
@@ -56,9 +56,19 @@ The current comparison is intentionally a native-tool baseline:
 
 - `compare.py` runs the Runnel host Python socket client, Kafka and Redpanda's
   Kafka performance clients, and NATS's `nats bench js` client in isolated
-  containers. The default run uses one broker, one stream or topic, one
-  partition where applicable, 10,000 records, 100-byte and 1 KiB payloads, and
-  explicit per-container CPU and memory limits.
+  containers. Each configured payload size gets its own stream or topic and,
+  where applicable, one partition. The default run uses one broker, 10,000
+  records per payload size, 100-byte and 1 KiB payloads, and explicit
+  per-container CPU and memory limits.
+- The broker images are pinned to Apache Kafka `4.3.1`, Redpanda `v26.2.1`,
+  NATS Server `2.14.5-alpine`, and `nats-box` `0.19.7`; the Runnel image is
+  built by the local comparison recipe. External native clients run in
+  short-lived containers under the client limit. Runnel's benchmark client is
+  the host-side Python process, so its client work is not subject to that
+  Docker client cgroup. The local recipe defaults to 2 CPUs and 2 GiB for both
+  broker and client containers, while the scheduled competitor workflow uses
+  2 CPUs/2 GiB for brokers and 1 CPU/512 MiB for clients; exact limits,
+  broker image IDs, and client image references remain part of every result.
 - Runnel runs one in-flight durable publish or one poll-and-ack sequence at a
   time. Its latency is the client request-to-response path for those operations.
 - Kafka and Redpanda publish with `acks=all`, idempotence enabled,
@@ -76,9 +86,18 @@ The current comparison is intentionally a native-tool baseline:
   `apples_to_apples: false`, `ranking_eligible: false`, and `experimental: true`.
   This is the correct disposition for the current evidence.
 
-The current script split and result validation are already clear enough to
-support this baseline. The material gap is not missing labels; it is the lack
-of a shared, externally verifiable workload contract for a later comparison.
+The measured scenario classes are intentionally asymmetric:
+
+| Mode | Runnel | Kafka/Redpanda | NATS JetStream |
+| --- | --- | --- | --- |
+| Single node | `publish-only`, `consume-with-ack` | `publish-only`, `consume-without-ack` | `publish-only`, `consume-with-ack` |
+| Three nodes | unsupported by this runner | `publish-only` | `publish-only` |
+
+The result validator checks the declared scenario classes, operation-specific
+boundaries, node records, and resource limits before writing an artifact. That
+prevents mislabeled output; it cannot prove that two adapters have equivalent
+semantics. The material gap is therefore not missing labels, but the lack of a
+shared, externally verifiable workload contract for a later comparison.
 
 ## Comparability envelope
 
@@ -186,8 +205,10 @@ into a misleading leaderboard:
 4. Require repeated runs under controlled resources for performance claims.
    Use the Runnel current-versus-default workflow for Runnel optimization
    claims; competitor comparisons remain positioning and engineering evidence
-   as defined by [ADR 0017](../decisions/0017-benchmark-cadence-and-evidence.md)
-   and [ADR 0020](../decisions/0020-stable-optimization-evidence.md).
+   under [ADR 0020](../decisions/0020-stable-optimization-evidence.md), with
+   their separate weekly/manual cadence defined by [ADR
+   0021](../decisions/0021-scheduled-benchmark-history.md). ADR 0017 records
+   the superseded cadence and acceptance wording.
 5. Keep native-tool and common-workload histories in separate series until the
    workload identity and semantic evidence are stable. Do not splice the
    current native points into a later common-client trend line.
@@ -244,5 +265,6 @@ then, the current machine-readable guardrails are the right result.
 
 Related records: [TD-013](../tech-debt.md#td-013-native-competitor-benchmark-semantics-are-not-equivalent),
 [cross-broker benchmark backlog](../backlog.md#make-cross-broker-benchmark-comparisons-reproducible),
-[ADR 0009](../decisions/0009-native-broker-comparison-baseline.md), and
+[ADR 0009](../decisions/0009-native-broker-comparison-baseline.md),
+[ADR 0021](../decisions/0021-scheduled-benchmark-history.md), and
 [benchmarking policy](../benchmarking.md).
