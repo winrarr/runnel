@@ -11,10 +11,12 @@ CircleCI Cloud remains a candidate for a bounded, shadow-only trial if the
 repository owner can provide an authorized account, GitHub App integration, and
 least-privilege benchmark publication credentials.
 
-The trial must preserve the current pull-request checks, security audit,
-scheduled/manual Runnel benchmark history, competitor benchmark history,
-artifacts, status reporting, and rollback path. It must run outside required
-checks until equivalent behavior is demonstrated.
+The trial must preserve the current required pull-request contexts (`Verify`,
+`Integration and container smoke tests`, and `audit`), the informational
+pull-request title check, the push-only main-commit subject check, the
+security audit, scheduled/manual Runnel benchmark history, competitor
+benchmark history, artifacts, status reporting, and rollback path. It must run
+outside required checks until equivalent behavior is demonstrated.
 
 ## Rationale
 
@@ -32,7 +34,10 @@ meaningful queue variability, but it is not controlled evidence that CircleCI
 would reduce it.
 
 The required evidence for a switch is therefore an actual equivalent-coverage
-trial, not a configuration translation or a vendor feature comparison.
+trial, not a configuration translation or a vendor feature comparison. The
+current required contexts and their required-versus-informational distinction
+are part of that equivalence; a candidate that reports only a green aggregate
+status is insufficient.
 
 ## Trial gate
 
@@ -57,6 +62,9 @@ can justify a limited pilot, but not an unmeasured migration.
   not change required checks or expose write credentials to untrusted PRs.
 - Rollback is to disable the CircleCI project/check integration and remove the
   trial configuration, leaving GitHub Actions and `benchmark-history` intact.
+  A shadow trial should use disposable result storage or read-only artifact
+  publication until the benchmark-history write path has been separately
+  verified with least privilege.
 
 The backlog outcome [Improve the development feedback loop](../backlog.md)
 remains open because the hosted trial and its evidence package do not yet

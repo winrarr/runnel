@@ -1,12 +1,12 @@
 # Hosted CI/CD evaluation: CircleCI Cloud against GitHub Actions
 
 - Status: desk evaluation complete; hosted trial not run
-- Last reviewed: 2026-09-03
+- Last reviewed: 2026-09-06
 - Scope: compare CircleCI Cloud with the current GitHub Actions workflow using
   Runnel's pull-request DAG and scheduled benchmark workloads
-- Primary evidence class: design/research
-- Secondary tags: tooling/CI
-- Baseline: `87db3b8d7c3bdb03b44778b795ca72e4efa2e0c2`
+- Primary evidence class: development-process/reliability
+- Secondary tags: tooling/CI, design/research
+- Baseline: `2acd807a925fdd664fa36128fec35c4116239a6d`
 
 This is a source-backed evaluation, not a hosted performance result. It records
 what can be established from the repository, observed GitHub runs, and current
@@ -16,10 +16,11 @@ executed.
 ## Conclusion
 
 CircleCI Cloud is a credible trial candidate for Runnel. Its workflows and
-`requires` dependencies can represent the existing independent pull-request
-checks and the `benchmark -> publish` history DAG. Its managed Linux VM
-executor has full Docker access, and its documented failed-job reruns, SSH
-debugging, and resource views could improve the failure-recovery experience.
+`requires` dependencies can represent the three required pull-request checks,
+the additional title check, and the `benchmark -> publish` history DAG. Its
+managed Linux VM executor has full Docker access, and its documented
+failed-job reruns, SSH debugging, and resource views could improve the
+failure-recovery experience.
 
 There is not enough evidence to call it materially better. The GitHub App
 integration explicitly does not trigger pipelines for forked pull requests,
@@ -36,13 +37,13 @@ trial produces equivalent-coverage measurements.
 
 ## Evidence boundary
 
-The branch was checked against the required baseline before this evaluation:
+The branch was checked against the required baseline before this review:
 
 - `git fetch origin main` returned `origin/main` at
-  `87db3b8d7c3bdb03b44778b795ca72e4efa2e0c2`.
+  `2acd807a925fdd664fa36128fec35c4116239a6d`.
 - The evaluation branch was clean and `HEAD` was exactly that revision.
-- The latest `ci.yml` run for that SHA was completed successfully:
-  [GitHub Actions run 33798263890](https://github.com/winrarr/runnel/actions/runs/33798263890).
+- The latest `ci.yml` run for that SHA completed successfully:
+  [GitHub Actions run 34043270435](https://github.com/winrarr/runnel/actions/runs/34043270435).
 - The repository is public. This matters to the platform cost comparison
   because both vendors publish different public/open-source allowances.
 
@@ -68,8 +69,10 @@ list](https://circleci.com/pricing/price-list/).
 
 ### Pull-request DAG
 
-The representative pull-request boundary is three independent checks. The
-first two are roots in `ci.yml`; the third is a root in a separate workflow.
+The repository has three required pull-request status contexts and one
+additional non-required workflow check. The first two required contexts are
+roots in `ci.yml`; the required audit and optional title check are roots in
+separate workflows.
 
 ```text
 pull_request
@@ -77,24 +80,35 @@ pull_request
   │     └── ubuntu-24.04, 15-minute timeout, `just verify`
   ├── CI / Integration and container smoke tests
   │     └── ubuntu-24.04, 15-minute timeout, Buildx image build, `just integration`
-  └── Security / Audit
-        └── ubuntu-24.04, pinned `cargo-audit` lockfile audit
+  ├── Security / Audit
+  │     └── ubuntu-24.04, pinned `cargo-audit` lockfile audit
+  └── Conventional Commits / Pull request title (informational)
 ```
 
 There are no `needs` edges between the two CI jobs, so verification and
-integration run concurrently when runners are available. The CI workflow
-uses a per-workflow/per-ref concurrency group with cancellation enabled. The
-security workflow has no corresponding concurrency declaration. This means a
-candidate must be checked both for independent job scheduling and for the
-behavior of rapid pushes to one pull-request branch.
+integration run concurrently when runners are available. The repository's
+current `main` ruleset requires the `Verify`, `Integration and container smoke
+tests`, and `audit` contexts; the Conventional Commits title check runs for
+pull requests but is not required by that ruleset. The push-only
+`Main commit subjects` check applies to commits entering `main`, not to the
+pull-request gate. A candidate must preserve both the required status surface
+and these source-control hygiene checks, while keeping their required versus
+informational distinction explicit.
 
-`just verify` covers formatting, Clippy, workspace tests including the real
-process cluster smoke test, documentation tests, ShellCheck, benchmark-script
-tests, and a workspace build. `just integration` covers the isolated process
-smoke test, Docker image setup, single-node container smoke, and three-node
-container smoke. Integration captures runner diagnostics and uploads them on
-failure; the current verify and security jobs do not upload equivalent runner
-snapshots.
+The CI workflow uses a per-workflow/per-ref concurrency group with
+cancellation enabled. The security and Conventional Commits workflows have
+no corresponding concurrency declaration. This means a candidate must be
+checked both for independent job scheduling and for the behavior of rapid
+pushes to one pull-request branch across workflows.
+
+`just verify` covers formatting, all-feature Clippy, workspace tests including
+the real process cluster smoke test, documentation tests, ShellCheck,
+benchmark-script tests, and a workspace build. It does not run the opt-in
+`just product-fit` workloads. `just integration` covers the isolated process
+smoke test, the Buildx-prepared `runnel:dev` image, single-node container
+smoke, and three-node container smoke. Integration captures runner diagnostics
+and uploads them on failure; the current verify, security, and title checks do
+not upload equivalent runner snapshots.
 
 ### Scheduled and manual DAGs that must remain covered
 
@@ -105,7 +119,8 @@ boundary because a CI/CD replacement must not silently lose them.
 | --- | --- | --- | --- |
 | `benchmarks.yml` | Daily schedule and manual dispatch | `benchmark`: three repetitions of single-node Runnel comparisons and three-node Runnel runs. Defaults are 10,000 single-node messages, 200 clustered messages, payloads 100/1024 bytes, 2 CPUs, 2 GB broker memory, cluster warmup 100, and concurrency 2. | Uploads raw/normalized/aggregate results, then `publish` downloads them and appends the generated history to `benchmark-history`. The `benchmark-history` concurrency group does not cancel in-progress runs. |
 | `benchmark-competitors.yml` | Weekly schedule and manual dispatch | `benchmark`: three repetitions of native Kafka/Redpanda/NATS comparisons and three-node replicated comparisons. Defaults are 10,000 messages, payloads 100/1024 bytes, 2 CPUs and 2 GB broker memory, plus 1 CPU and 512 MB client limits. | Uploads raw/normalized/aggregate results, then `publish` appends the separate competitor history to `benchmark-history`. It uses the same non-cancelling history concurrency group. |
-| `security.yml` | Pull requests, weekly schedule, and manual dispatch | Pinned `cargo-audit` plus a guard that fails if the currently ignored advisory becomes active in the feature graph. | No artifact is produced on success; the audit log is the primary output. |
+| `security.yml` | Pull requests, weekly schedule, and manual dispatch | Stable Rust toolchain, cached pinned `cargo-audit` 0.22.2, and a dependency audit of the lockfile. There is no current advisory-ignore guard in this workflow. | No artifact is produced on success; the audit log is the primary output. |
+| `conventional-commits.yml` | Pull requests and pushes to `main` | Pull-request title validation is informational; pushes validate new non-merge commit subjects. | No artifact is produced; the check output is the primary result. |
 
 The benchmark jobs have a 40-minute timeout and expose message, clustered
 message, and repetition inputs. The candidate must preserve those manual
@@ -122,11 +137,12 @@ job duration starts when the job begins executing.
 
 | Run | Workflow elapsed | Verify job | Integration job | Observation |
 | --- | ---: | ---: | ---: | --- |
-| [33798263890](https://github.com/winrarr/runnel/actions/runs/33798263890), baseline SHA | 3m51s | 3m11s | 3m47s | Integration image build was 1m44s; the `just integration` step was 1m37s. |
+| [33798263890](https://github.com/winrarr/runnel/actions/runs/33798263890), earlier sample | 3m51s | 3m11s | 3m47s | Integration image build was 1m44s; the `just integration` step was 1m37s. |
 | [33789947838](https://github.com/winrarr/runnel/actions/runs/33789947838) | 5m15s | 3m26s | 3m51s | Both jobs waited about 81 seconds before starting. |
 | [33786203382](https://github.com/winrarr/runnel/actions/runs/33786203382) | 4m54s | 2m37s | 3m58s | Both jobs waited about 55 seconds before starting. |
 | [33785348288](https://github.com/winrarr/runnel/actions/runs/33785348288) | 5m05s | 4m03s | 3m53s | Verify waited about 61 seconds; integration waited about 72 seconds. |
 | [33769610401](https://github.com/winrarr/runnel/actions/runs/33769610401) | 13m59s | 3m04s | 2m12s | Verify did not start until about 10m54s after workflow creation; queue time dominated the wall clock. |
+| [34043270435](https://github.com/winrarr/runnel/actions/runs/34043270435), current baseline SHA | 3m19s | 3m13s | 2m16s | Both jobs started within five seconds of workflow creation; the run completed successfully. |
 
 The baseline run is therefore roughly four minutes of runner execution on a
 successful warm-ish path, with observed workflow wall time from 3m51s to
@@ -137,9 +153,10 @@ trial must separate queue time, executor startup, cache restore, image build,
 test execution, and post-job upload time. No comparable CircleCI timestamps,
 cache hits, retries, artifacts, or contributor interactions are available.
 
-The latest baseline run was a `push` run, so it does not include the separate
-pull-request security job. A security timing comparison needs an actual PR
-event or an equivalent manual trial invocation.
+The current baseline run is a `push` run, so it does not include the separate
+pull-request security or title jobs. A security and status-surface timing
+comparison needs an actual PR event (or an equivalent manual trial invocation),
+and should record the push-only commit-subject check separately.
 
 ## CircleCI equivalence assessment
 
@@ -154,7 +171,7 @@ than inferred from CPU/RAM matching.
 | Capability | CircleCI mapping | Equivalence risk or expected difference |
 | --- | --- | --- |
 | PR triggers | GitHub App triggers support pull-request opened, synchronize, reopened, ready-for-review, and related events. | The official trigger documentation says forked pull requests never trigger GitHub App pipelines. The current GitHub `pull_request` trigger is therefore not equivalent until fork behavior and a safe alternative integration are validated. |
-| PR DAG | Define `verify`, `integration`, and `security_audit` as root jobs in a workflow, with no `requires` edges. CircleCI jobs run concurrently unless dependencies are declared. | Job checks may be grouped or named differently in GitHub. Keep the trial non-required and record exact check names before considering branch protection changes. |
+| PR DAG | Define `verify`, `integration`, `audit`, and the informational pull-request title check as independent roots, with no `requires` edges. CircleCI jobs run concurrently unless dependencies are declared. Preserve the push-only commit-subject check through the source-control workflow. | The required GitHub contexts are `Verify`, `Integration and container smoke tests`, and `audit`; the title check is currently informational. Candidate check names and required/informational status must be recorded before any branch-rule change. |
 | Benchmark DAG | Define one scheduled/manual workflow per history suite with a `benchmark` job and a `publish` job requiring it. CircleCI supports scheduled workflows and workflow dependencies. | `publish` must authenticate a write to `benchmark-history`; this is a new secret/permission path and must never be available to untrusted fork jobs. |
 | Rust toolchain and commands | Use the same pinned Rust toolchain, `just`, and repository commands in VM steps. | GitHub Actions currently supplies toolchain/install actions. CircleCI requires explicit installation or a pinned image step, adding configuration and maintenance surface. |
 | Docker integration | Use the CircleCI machine executor, which provides full Docker access and supports Ubuntu 24.04 images and Docker Layer Caching. | Docker Layer Caching is not the same as the current Buildx `type=gha` cache. Named Buildx builders are required for DLC reuse, and CircleCI documents that a cache saved at job teardown is generally unavailable to another job in the same workflow. |
@@ -300,7 +317,7 @@ Consequently, the following remain unknown:
 
 - CircleCI queue and wall-clock distributions for Runnel's exact jobs;
 - cold versus warm Cargo and Docker cache hit rates and restore/build times;
-- behavior of the three-check PR status surface, especially fork PRs;
+- behavior of the three-required-check plus title status surface, especially fork PRs;
 - artifact and benchmark-history publication under least-privilege credentials;
 - failure diagnostics, SSH access, retry behavior, and contributor task times;
 - actual credits, storage, and any plan-specific resource/concurrency limits for

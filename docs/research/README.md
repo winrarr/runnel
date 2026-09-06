@@ -44,6 +44,9 @@ for the same evidence labels and outcome/evidence gates.
 - [Message encoding and compression](message-encoding-and-compression.md)
   compares representation and compression choices, competitor behavior, and
   research findings relevant to Runnel's latency, throughput, and storage goals.
+- [Hosted CI/CD feedback-loop evaluation](ci-feedback-loop-evaluation.md)
+  compares a bounded CircleCI Cloud trial with the current GitHub Actions
+  checks, scheduled benchmark history, and rollback requirements.
 - [Raft follower recovery and replacement](raft-recovery-and-replacement.md)
   records the evidence and open design questions around crashed, stale, and
   empty replicas in the early clustered backend.
