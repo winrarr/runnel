@@ -1,7 +1,9 @@
 # Application-aware retry and dead-letter provenance
 
 - Status: exploratory design note; decision-ready for a scoped first slice; no runtime semantics are changed here
-- Date: 2026-09-04
+- Last reviewed: 2026-09-06
+- Baseline: `d5f033ec1db8ee7402e5b7a96ef2935f0a1325d6`
+- Reading guide: [design-note conventions](README.md)
 - Related debt: [TD-018](../tech-debt.md#td-018-retry-policy-and-dead-letter-provenance-are-coarse)
 - Related outcome: [Make retry policy application-aware](../backlog.md#make-retry-policy-application-aware)
 - Related decisions: [ADR 0014](../decisions/0014-local-retry-and-dead-letter-policy.md), [ADR 0015](../decisions/0015-clustered-shared-consumer-ownership.md), and [ADR 0016](../decisions/0016-clustered-retry-and-dead-letter-policy.md)
@@ -9,11 +11,16 @@
 
 This note proposes the application-facing retry and dead-letter contract for
 TD-018. It is a design input, not an accepted decision and not an API or
-storage-format change. It recommends a narrow first implementation slice, but
+storage-format change. It recommends a narrow first outcome boundary, but
 the full outcome remains unresolved because consumer lifecycle/versioning,
 clock behavior, provenance encoding, and cross-boundary movement still need
 explicit choices. An implementation should first turn the parts that change
 compatibility, recovery, or data lifecycle into a dated ADR.
+
+The current contract is authoritative in [the architecture note](../architecture.md)
+and the related ADRs listed above. The policy shapes, state transitions, and
+stage names below are illustrative mechanisms and outcome/evidence gates; they
+are not required API names, modules, or sequencing.
 
 ## Decision-ready recommendation (not an accepted decision)
 
@@ -664,37 +671,41 @@ The primary research points to the same boundary:
 | Full transaction across source, target, and acknowledgement | Strongest broker-side atomicity and simpler recovery reasoning. | A local cross-log transaction or cross-Raft-group coordinator needs prepare/commit state, timeout/recovery rules, format migration, and bounded resource policy. The current clustered same-group transition is sufficient for the first slice; local reconciliation is the smaller repair. |
 | Drop after the attempt limit | Gives the strongest disk/backlog bound. | Violates the current no-loss default and can turn a configuration mistake into silent data loss. Any future destructive policy needs a separate explicit decision. |
 
-## Staged implementation and verification gates
+## Outcome and evidence gates
 
-The stages below are sequencing guidance, not acceptance of runtime behavior.
-Every stage must preserve the current at-least-once wording and pass the
-class-specific gate in [testing.md](../testing.md).
+The gates below describe candidate outcomes and the evidence needed before a
+future runtime change is accepted. They are not an implementation task list or
+an accepted sequence. Every gate must preserve the current at-least-once
+wording and pass the class-specific policy in [testing.md](../testing.md).
 
-### First implementation slice: durable consumer-scoped attempt policy
+### Candidate boundary: durable consumer-scoped attempt policy
 
-This is the recommended first runtime slice for a future implementation PR.
-It is intentionally smaller than the full policy model above:
+This is the recommended first outcome boundary for a future implementation. It
+is intentionally smaller than the full policy model above, and an
+implementation may satisfy it with a different compatible mechanism:
 
-- Add one explicit create/configure/inspect contract for a durable consumer;
-  do not make policy-bearing poll requests authoritative.
-- Persist a versioned policy containing only bounded `ack_timeout`, optional
-  positive `max_attempts`, and the existing derived dead-letter action. Keep
-  the broker-wide settings as the legacy fallback for implicit consumers.
-- Apply `ack_timeout` as both the active lease and retry delay for this slice.
-  Do not add a second scheduler, explicit negative acknowledgement, or
-  backoff formula yet.
-- Place the policy and its version with local consumer checkpoint state and
-  with both ordinary and grouped clustered consumer state. A grouped member
-  must not override it, and a new leader must not recalculate it locally.
-- Pin the policy version at first assignment and preserve it through the
-  current attempt-limit/dead-letter transition. Updating a policy must not
-  silently change an in-flight record.
+- **Policy operation outcome:** one explicit create/configure/inspect contract
+  exists for a durable consumer; policy-bearing poll requests are not
+  authoritative.
+- **Durable state outcome:** a versioned policy contains only bounded
+  `ack_timeout`, optional positive `max_attempts`, and the existing derived
+  dead-letter action, with broker-wide settings retained as the legacy fallback
+  for implicit consumers.
+- **Lease outcome:** `ack_timeout` is both the active lease and retry delay for
+  this slice. A second scheduler, explicit negative acknowledgement, and
+  backoff formula remain outside the boundary.
+- **Placement outcome:** the policy and its version live with local consumer
+  checkpoint state and ordinary/grouped clustered consumer state. A grouped
+  member cannot override it, and a new leader cannot recalculate it locally.
+- **Versioning outcome:** the policy version is pinned at first assignment and
+  remains in force through the current attempt-limit/dead-letter transition.
+  Updating a policy does not silently change an in-flight record.
 
 The slice must define how an unacknowledged local assignment is recovered
 before claiming a durable delay. The safe options are to persist a bounded
 lease deadline with the assignment or to state explicitly that restart makes
 the volatile lease immediately eligible and begins the next policy interval
-from recovery. The implementation must choose one, test it, and keep the
+from recovery. A future implementation must choose one, test it, and keep the
 choice consistent with the clustered absolute-deadline model; this note does
 not silently choose between them.
 
@@ -729,10 +740,10 @@ Verifiable acceptance tests for this slice are:
    provenance or redrive behavior is inferred from these legacy tests.
 
 This slice is a design gate, not evidence that any of these tests currently
-exist. The subsequent stages add the missing schedule, provenance, and
+exist. The subsequent gates address the missing schedule, provenance, and
 redrive behavior only after this state/compatibility boundary is accepted.
 
-### Stage 0: freeze the semantic fixtures
+### Gate 0: freeze the semantic fixtures
 
 Define versioned policy and provenance fixtures before changing runtime code:
 
@@ -748,14 +759,15 @@ Define versioned policy and provenance fixtures before changing runtime code:
 Gate: reviewable contract fixtures and compatibility examples; no runtime or
 performance claim.
 
-### Stage 1: durable consumer-scoped policy
+### Gate 1: durable consumer-scoped policy
 
-This stage is the first implementation slice above. Keep the existing
-acknowledgement timeout as the retry delay and derived dead-letter behavior;
-do not add the later schedule, provenance, or redrive features here.
+This gate evaluates the candidate first slice above. The existing
+acknowledgement timeout remains the retry delay and derived dead-letter
+behavior; the later schedule, provenance, and redrive features remain outside
+this gate.
 
-Implement policy creation/inspection and durable selection for local and
-clustered consumers while keeping legacy fallback. Cover:
+Evidence must cover policy creation/inspection and durable selection for local
+and clustered consumers while keeping the legacy fallback:
 
 - independent policies for two consumers on one stream;
 - one policy shared by multiple grouped members;
@@ -767,9 +779,10 @@ Gate: local engine tests, clustered state-machine tests, real-server protocol
 fixtures for capability/compatibility behavior, and no change to existing
 payload-only dead-letter records.
 
-### Stage 2: durable schedule and poison handling
+### Gate 2: durable schedule and poison handling
 
-Add persistent retry deadlines and policy-selected backoff. Cover:
+Evidence must establish persistent retry deadlines and policy-selected
+backoff, covering:
 
 - fixed, exponential, capped, and deterministic jitter schedules;
 - timeout and explicit-retry attempt accounting;
@@ -785,10 +798,10 @@ not required for this design-only note, but an implementation changing the
 delivery hot path must assess and run the applicable benchmark or document a
 concrete targeted-coverage gap.
 
-### Stage 3: provenance and duplicate-safe automatic movement
+### Gate 3: provenance and duplicate-safe automatic movement
 
-Introduce a versioned metadata-capable durable record and populate the
-provenance object at the automatic move. Cover:
+Evidence must establish a versioned metadata-capable durable record and
+populate the provenance object at the automatic move, covering:
 
 - binary payload/key preservation and bounded metadata validation;
 - stable identity across local restart and incomplete/torn-tail recovery;
@@ -804,10 +817,10 @@ including ambiguous I/O results, plus real local-process and three-node
 protocol tests. No atomicity claim is allowed for a target in another durable
 group.
 
-### Stage 4: explicit dispositions and redrive
+### Gate 4: explicit dispositions and redrive
 
-Add the capability-gated explicit retry/dead-letter and redrive operations.
-Cover:
+Evidence must establish capability-gated explicit retry/dead-letter and
+redrive operations, covering:
 
 - idempotent repeated redrive with the same ID and explicit conflict on
   destination/content mismatch;
@@ -824,12 +837,13 @@ Gate: interoperability fixtures, real-server tests, cluster ownership tests,
 and documented rollback/upgrade behavior. A future cross-group implementation
 requires its own transaction or reconciliation ADR and failure matrix.
 
-### Stage 5: operational acceptance
+### Gate 5: operational acceptance
 
-Add metrics, inspection, alert guidance, and bounded resource tests for large
-pending-retry and dead-letter populations. Test that metric labels, logs,
-metadata, and scheduler memory remain bounded. Re-evaluate whether the
-materialized clustered representation is sufficient before claiming scale.
+Evidence must establish metrics, inspection, alert guidance, and bounded
+resource behavior for large pending-retry and dead-letter populations. It must
+show that metric labels, logs, metadata, and scheduler memory remain bounded,
+and re-evaluate whether the materialized clustered representation is
+sufficient before claiming scale.
 
 ## Unresolved risks and hypotheses
 

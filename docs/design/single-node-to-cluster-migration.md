@@ -1,13 +1,14 @@
 # Single-node to clustered migration boundary
 
 - Status: exploratory design note; not an accepted compatibility decision
-- Last reviewed: 2026-09-05
-- Baseline: `origin/main` `f6b1fb97bf097bfacff445fd2810f75bbc286a44`
+- Last reviewed: 2026-09-06
+- Baseline: `d5f033ec1db8ee7402e5b7a96ef2935f0a1325d6`
+- Reading guide: [design-note conventions](README.md)
 - Scope: backlog outcome [Make growth from one node to a cluster non-disruptive](../backlog.md#make-growth-from-one-node-to-a-cluster-non-disruptive) and [TD-004](../tech-debt.md#td-004-local-and-clustered-durable-state-have-no-supported-migration-path)
 
 ## Summary
 
-The first supportable local-to-cluster migration should be a side-by-side,
+The candidate first supportable local-to-cluster migration is a side-by-side,
 logical export/import into a fresh three-node clustered deployment. It should
 preserve logical stream offsets, record bytes, publish timestamps, ordering
 keys, producer request identities, consumer progress, and durable delivery
@@ -27,6 +28,13 @@ files must be read through the local compatibility reader and converted into
 cluster data-group state. Copying a local file into a clustered directory,
 republishing through the public API, or installing local files as an OpenRaft
 snapshot is not a supported migration.
+
+This note is an exploratory boundary, not a migration implementation plan or
+compatibility promise. Current engine and protocol behavior is authoritative in
+[architecture](../architecture.md), the current code/tests, and the ADRs in
+the references. The proposed generations, phases, schemas, and procedures are
+illustrative mechanisms; the staged section below records outcome/evidence
+gates that a different implementation may satisfy another way.
 
 ## Boundary at the recorded baseline
 
@@ -219,9 +227,10 @@ cause downtime, but it must not leave two writable deployments. If endpoint
 state is ambiguous, both deployments remain not-ready until the durable
 migration record and endpoint owner are reconciled.
 
-## Supported input and target contract
+## Candidate input and target boundary
 
-The first implementation should accept only a narrow, explicit matrix.
+The candidate first implementation would accept only a narrow, explicit
+matrix; this is not current migration support.
 
 ### Source
 
@@ -719,32 +728,40 @@ disconnect unless the source and target define a durable sequence and replay
 protocol. It may become useful for cross-cluster or disaster-recovery goals,
 not as the first one-node-to-cluster cutover.
 
-## Staged implementation plan
+## Outcome and evidence gates
 
-The design should become code in independently verifiable stages:
+The candidate boundary should be evaluated through independently verifiable
+gates, not treated as a prescribed code sequence. The details below name the
+outcomes and evidence required for a safe migration; implementation choices
+such as schema shape, chunk protocol, and phase storage remain open until an
+ADR accepts them.
 
-1. **Schema and preflight.** Define a versioned logical export/import schema,
-   source/target identity tuple, digest rules, compatibility matrix, and
-   read-only source scanner. Add fixtures for mixed local frame families,
+1. **Schema and preflight outcome.** Evidence establishes a versioned logical
+   export/import schema,
+   source/target identity tuple, digest rules, compatibility matrix, and a
+   read-only source scanner. Fixtures cover mixed local frame families,
    request IDs, out-of-order acknowledgements, attempts, malformed state,
    incomplete tails, invalid names, and unavailable history.
-2. **Fresh-target logical import.** Add an internal target data-group import
-   protocol with bounded, idempotent chunks, stream/consumer digests, explicit
-   offsets, request-ID mappings, and target-side validation. Keep imported
-   groups non-serving until complete. Add restart/resume tests without public
-   cutover.
-3. **Durable fence and activation.** Add migration ownership, writer epochs,
-   source drain behavior, explicit phase transitions, target metadata
-   activation, conservative readiness, endpoint-generation reporting, and
-   pre-activation abort. Add crash injection at every durable boundary.
-4. **Real-process migration.** Exercise a real local broker and three real
-   clustered broker processes with the public protocol before and after the
-   migration tool. Cover follower forwarding, leader change, target restart,
+2. **Fresh-target logical import outcome.** Evidence establishes an internal
+   target data-group import mechanism with bounded, idempotent chunks,
+   stream/consumer digests, explicit offsets, request-ID mappings, and
+   target-side validation. Imported groups remain non-serving until complete;
+   restart/resume is proven without public cutover.
+3. **Durable fence and activation outcome.** Evidence establishes migration
+   ownership, writer epochs, source drain behavior, explicit phase transitions,
+   target metadata activation, conservative readiness, endpoint-generation
+   reporting, and pre-activation abort, with crash coverage at each durable
+   boundary.
+4. **Real-process migration outcome.** Evidence exercises a real local broker
+   and three real clustered broker processes with the public protocol before
+   and after the migration tool. The fault matrix covers follower forwarding,
+   leader change, target restart,
    target replica recovery, source restart attempts, stale writer attempts,
    endpoint cutover, and cleanup.
-5. **Operational hardening.** Add bounded metrics, status output, disk/memory
-   reserve checks, throttling, cancellation, orphan cleanup, backup/recovery
-   documentation, and compatibility fixtures for future format versions.
+5. **Operational hardening outcome.** Evidence establishes bounded metrics,
+   status output, disk/memory reserve checks, throttling, cancellation, orphan
+   cleanup, backup/recovery documentation, and compatibility fixtures for
+   future format versions.
 6. **Online migration research, if needed.** Only after the fenced path is
    correct and its downtime/resource envelope is measured, design a separate
    live-tail or dual-write protocol and a new ADR. Do not expand the first
@@ -910,6 +927,7 @@ shortcuts.
 - [ADR 0007: snapshot-based replica recovery](../decisions/0007-snapshot-based-replica-recovery.md)
 - [ADR 0018: safe replica recovery boundary](../decisions/0018-safe-replica-recovery-boundary.md)
 - [ADR 0019: clustered storage identity](../decisions/0019-clustered-storage-identity.md)
+- [ADR 0023: independent retained storage and placement](../decisions/0023-independent-retained-storage-and-placement.md)
 - [ADR 0024: explicit offset replay](../decisions/0024-explicit-offset-replay-read.md)
 - [Raft follower recovery and replacement research](../research/raft-recovery-and-replacement.md)
 - [Testing and local operation](../testing.md)

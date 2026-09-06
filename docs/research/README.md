@@ -30,6 +30,8 @@ Use the documentation categories this way:
 Research notes should link to the design proposals and decisions they inform.
 Do not treat a research recommendation as a compatibility promise until an ADR
 accepts it and the relevant implementation and verification work is complete.
+Design proposals use the companion [design-note conventions](../design/README.md)
+for the same evidence labels and outcome/evidence gates.
 
 ## Current research
 

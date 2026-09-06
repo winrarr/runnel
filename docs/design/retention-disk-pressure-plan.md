@@ -1,15 +1,23 @@
-# Retention and disk-pressure implementation plan
+# Retention and disk-pressure design
 
-- Status: exploratory implementation plan
+- Status: exploratory design; implementation sequence is illustrative
+- Last reviewed: 2026-09-06
+- Baseline: `d5f033ec1db8ee7402e5b7a96ef2935f0a1325d6`
+- Reading guide: [design-note conventions](README.md)
 - Scope: safe retained-history policy, bounded cleanup, and durable-write admission
 - Related outcome: [Make retention and disk-pressure behavior safe](../backlog.md)
 - Related research: [Distributed architecture exploration](../research/distributed-architecture-options.md), [Raft follower recovery and replacement](../research/raft-recovery-and-replacement.md), and [Message encoding and compression study](../research/message-encoding-and-compression.md)
 
 This is a design proposal, not an accepted ADR. It turns the retention and
-disk-pressure backlog outcome into an implementation boundary while preserving
-the current stream, record, consumer, acknowledgement, replay, and ordering
-model. It does not change runtime code, the backlog, deployment files, or the
-current compatibility policy.
+disk-pressure backlog outcome into a candidate policy and evidence boundary
+while preserving the current stream, record, consumer, acknowledgement,
+replay, and ordering model. It does not change runtime code, the backlog,
+deployment files, or the current compatibility policy.
+
+The current technical boundaries are authoritative in [architecture](../architecture.md)
+and the accepted decisions linked from this note. Proposed policies, state
+shapes, and cleanup mechanisms are inferences or illustrative mechanisms; the
+stages below are outcome/evidence gates, not a prescribed module or API plan.
 
 ## Outcome and boundaries
 
@@ -490,109 +498,115 @@ normal replacement path, as recorded in [Raft recovery and replacement research]
 Nothing in the proposed column is a current guarantee or an authorization to
 change the runtime in this documentation-only change.
 
-## Implementation sequence
+## Outcome and evidence gates
 
-Each stage should leave the repository runnable and should stop if its exit
-evidence is incomplete.
+The following gates describe the outcomes and evidence needed before a future
+implementation is accepted. They are deliberately not a task list: an
+implementation may choose different storage, scheduling, or protocol
+mechanisms if it preserves the stated invariants and evidence boundary. Each
+gate should leave the repository runnable and should stop if its exit evidence
+is incomplete.
 
-### Stage 0: accept policy and measurement boundaries
+### Gate 0: accept policy and measurement boundaries
 
-- Review this plan with the encoding/segmentation work and resolve the
-  retention, replay, size-accounting, and unknown-outcome choices.
-- Record an ADR for the public policy, retention-floor semantics, capacity
+- Retention, replay, size-accounting, and unknown-outcome choices are
+  reconciled with the encoding/segmentation work.
+- An ADR records the public policy, retention-floor semantics, capacity
   accounting, and compatibility/version boundaries.
-- Define a test clock and capacity provider seam for deterministic unit tests,
-  while keeping real filesystem/process tests for actual failure behavior.
-- Capture current local and clustered startup, replay, cleanup (not present),
-  publish, poll, acknowledge, memory, and storage baselines.
+- Deterministic unit evidence has a test-clock and capacity-provider boundary,
+  while real filesystem/process tests cover actual failure behavior.
+- A baseline artifact captures local and clustered startup, replay, cleanup
+  (not present), publish, poll, acknowledgement, memory, and storage behavior.
 
 Exit evidence: accepted policy ADR, documented public errors/outcomes, and a
 baseline artifact whose workload and durability boundaries are explicit.
 
-### Stage 1: introduce segmented retained storage without deleting history
+### Gate 1: introduce segmented retained storage without deleting history
 
-- Add a versioned segment/manifest abstraction behind `runnel-core`; keep
-  current record readers and request identities readable.
-- Roll new appends at bounded size/time boundaries and retain old segments
+- A versioned segment/manifest abstraction exists behind `runnel-core`, while
+  current record readers and request identities remain readable.
+- New appends roll at bounded size/time boundaries and old segments remain
   read-only during migration.
-- Make startup recovery validate manifest generations, segment checksums,
-  offset continuity, and incomplete tails without loading all records.
-- Add a clustered retained-data abstraction distinct from the consensus log;
-  do not expose its implementation to `runnel-engine`.
+- Startup recovery validates manifest generations, segment checksums, offset
+  continuity, and incomplete tails without loading all records.
+- A clustered retained-data abstraction remains distinct from the consensus
+  log and is not exposed through `runnel-engine`.
 
 Exit evidence: mixed old/new read and restart tests, no history loss, bounded
 startup memory, and a recovery benchmark over history larger than the current
 tail index.
 
-### Stage 2: implement local logical retention and crash-safe cleanup
+### Gate 2: implement local logical retention and crash-safe cleanup
 
-- Persist retention policy and a monotonic retained floor per stream.
-- Implement time and size candidate selection with `protect` as the only first
-  safe policy if the `expire` semantics are not yet fully tested.
-- Rotate before deletion; publish manifests atomically; delete old segments in
-  bounded, restartable batches.
-- Add explicit errors for unavailable history and distinguish logical floor
-  advancement from physical bytes still awaiting deletion.
+- Retention policy and a monotonic retained floor are persisted per stream.
+- Time and size candidate selection uses `protect` as the first safe policy if
+  `expire` semantics are not yet fully tested.
+- Rotation precedes deletion; manifests publish atomically; old segments are
+  deleted in bounded, restartable batches.
+- Unavailable-history errors distinguish logical floor advancement from
+  physical bytes still awaiting deletion.
 
 Exit evidence: local time/size, lag, active-delivery, restart, interrupted
 cleanup, and no-silent-gap tests pass with real process coverage where a
 filesystem or socket boundary is involved.
 
-### Stage 3: add replay and consumer lifecycle semantics
+### Gate 3: add replay and consumer lifecycle semantics
 
-- Add a versioned replay operation or cursor generation without changing the
-  meaning of existing poll/ack requests.
-- Persist replay progress and fencing state at the selected durability point.
-- Implement protected replay pins, bounded session lifetime, explicit reset or
-  skip behavior, and `history_unavailable` boundaries.
-- Add opt-in `expire` only after tests prove that lagging and unacknowledged
-  work receive explicit outcomes and cannot acknowledge a later generation.
+- A versioned replay operation or cursor generation leaves existing poll/ack
+  semantics unchanged.
+- Replay progress and fencing state persist at the selected durability point.
+- Protected replay pins, bounded session lifetime, explicit reset/skip
+  behavior, and `history_unavailable` boundaries are defined.
+- Opt-in `expire` is considered only after tests prove explicit outcomes for
+  lagging/unacknowledged work and reject acknowledgements for later generations.
 
 Exit evidence: conformance tests cover local replay, normal delivery, grouped
 delivery, key ordering, concurrent acknowledgement, restart, and retention
 policy changes.
 
-### Stage 4: replicate retention facts and clean clustered data safely
+### Gate 4: replicate retention facts and clean clustered data safely
 
-- Add versioned retention policy and floor state to metadata/data-group state as
-  appropriate; carry leader-selected cutoffs in deterministic commands.
-- Make snapshot serialization include all retention and replay metadata needed
-  to interpret the retained state.
-- Let each replica clean locally only after the committed floor is applied;
-  report failed deletion without diverging logical eligibility.
-- Define quorum capacity behavior for a full follower, loss of quorum, leader
-  change during cleanup, and controlled future replacement.
+- Versioned retention policy and floor state live in the appropriate
+  metadata/data-group state, with leader-selected cutoffs carried in
+  deterministic commands.
+- Snapshot serialization includes the retention and replay metadata needed to
+  interpret retained state.
+- Replica cleanup occurs locally only after the committed floor is applied;
+  failed deletion is reported without diverging logical eligibility.
+- Quorum capacity behavior is explicit for a full follower, loss of quorum,
+  leader change during cleanup, and controlled future replacement.
 
 Exit evidence: three real broker processes demonstrate time/size retention,
 lag policy, follower/leader failure, snapshot recovery, interrupted cleanup,
 and no observation of an uncommitted or logically expired record.
 
-### Stage 5: add reserved-capacity admission and operator surfaces
+### Gate 5: add reserved-capacity admission and operator surfaces
 
-- Add capacity detection, configured limits, reserve validation, pressure
-  hysteresis, and bounded cleanup scheduling.
-- Keep connection/request/storage execution limits separate from disk reserve;
-  expose useful configuration and runtime status without unbounded queues.
-- Add topology-free configuration inspection, metrics, logs, and readiness
-  semantics. Preserve liveness and metrics availability at critical pressure.
-- Define versioned publish outcomes for confirmed rejection, retryable failure,
-  and unknown durable result; keep request identity resolution explicit.
+- Capacity detection, configured limits, reserve validation, pressure
+  hysteresis, and bounded cleanup scheduling are observable.
+- Connection/request/storage execution limits remain separate from disk reserve;
+  configuration and runtime status stay bounded.
+- Topology-free configuration inspection, metrics, logs, and readiness
+  semantics preserve liveness and metrics availability at critical pressure.
+- Versioned publish outcomes distinguish confirmed rejection, retryable failure,
+  and unknown durable result while keeping request identity resolution explicit.
 
 Exit evidence: real server tests cover low space, full disk, external capacity
 changes, stalled cleanup, acknowledgement under pressure, ambiguous publish,
 and recovery after capacity returns.
 
-### Stage 6: migration, hardening, and performance acceptance
+### Gate 6: migration, hardening, and performance acceptance
 
-- Document upgrade, downgrade, retention-policy transition, and local-to-
-  clustered migration boundaries before enabling finite retention by default.
-- Run the full failure and process-level matrix below, including fault
-  injection at every manifest and durable-write boundary.
-- Run the retention benchmark matrix under the repository's authoritative
-  benchmark policy and publish raw measurements and resource limits.
-- Record the accepted consequence and any deferred `expire`, replay, or
-  replacement behavior in ADRs; update implementation-facing docs only after
-  the runtime is verified.
+- Upgrade, downgrade, retention-policy transition, and local-to-clustered
+  migration boundaries are documented before finite retention is enabled by
+  default.
+- The full failure and process-level matrix below covers fault injection at
+  every manifest and durable-write boundary.
+- The retention benchmark matrix follows the repository's authoritative
+  benchmark policy and publishes raw measurements and resource limits.
+- ADRs record accepted consequences and deferred `expire`, replay, or
+  replacement behavior; implementation-facing docs change only after runtime
+  verification.
 
 Exit evidence: compatibility, failure, resource, and stable benchmark reports
 support a recommendation to enable the selected defaults.
@@ -939,6 +953,8 @@ exploratory records:
 - [ADR 0018: safe replica recovery boundary](../decisions/0018-safe-replica-recovery-boundary.md)
 - [ADR 0019: clustered storage identity](../decisions/0019-clustered-storage-identity.md)
 - [ADR 0020: stable optimization evidence](../decisions/0020-stable-optimization-evidence.md)
+- [ADR 0023: independent retained storage and placement](../decisions/0023-independent-retained-storage-and-placement.md)
+- [ADR 0024: explicit offset replay](../decisions/0024-explicit-offset-replay-read.md)
 - [Local engine storage and delivery implementation](../../crates/runnel-core/src/lib.rs)
 - [Clustered state-machine and group manager](../../crates/runnel-raft/src/lib.rs)
 - [Server admission and metrics](../../crates/runnel-server/src/main.rs)
