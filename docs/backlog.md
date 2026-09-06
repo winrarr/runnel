@@ -108,8 +108,10 @@ timeouts, cancellation-safe connection invalidation, explicit confirmed versus
 rejected/retryable/unknown outcomes, and stable-identity publish retry. Real
 server tests cover those boundaries, including an application-shaped
 publish/consume/ack flow that redelivers an unacknowledged binary message after
-restart. A version-negotiated compatibility contract and evidence from an
-intended external application remain open.
+restart. Protocol, client, and server-facing code now automatically check that
+their provisional v1 version range and UTF-8 text/base64 payload declarations
+remain aligned. A version-negotiated compatibility contract and evidence from
+an intended external application remain open.
 
 ## Make message processing complete
 
