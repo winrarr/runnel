@@ -1,7 +1,7 @@
 use std::collections::BTreeMap;
 use std::time::Duration;
 
-use runnel_engine::{AckResult, BrokerError, Offset, PollResult, ReplayMessage};
+use runnel_engine::{AckResult, BrokerError, ConsumerPolicy, Offset, PollResult, ReplayMessage};
 
 use super::NodeId;
 use super::group_manager::GroupManager;
@@ -45,6 +45,8 @@ impl<'a> ClientForwarder<'a> {
             | ForwardedOperation::Poll { stream, .. }
             | ForwardedOperation::Replay { stream, .. }
             | ForwardedOperation::Ack { stream, .. }
+            | ForwardedOperation::ConfigureConsumer { stream, .. }
+            | ForwardedOperation::InspectConsumer { stream, .. }
             | ForwardedOperation::PollGroup { stream, .. }
             | ForwardedOperation::AckGroup { stream, .. }
             | ForwardedOperation::InitializeDataStream { stream, .. } => Ok(self
@@ -189,6 +191,27 @@ impl<'a> ClientForwarder<'a> {
         }
     }
 
+    pub(super) async fn configure_consumer(
+        &self,
+        operation: ForwardedOperation,
+        leader_id: Option<NodeId>,
+    ) -> Result<ConsumerPolicy, BrokerError> {
+        match self.operation(operation, leader_id).await? {
+            ForwardedResponse::ConsumerPolicy(result) => result.map_err(forward_error_to_broker),
+            _ => Err(BrokerError::Cluster(
+                "leader returned the wrong consumer policy response".to_owned(),
+            )),
+        }
+    }
+
+    pub(super) async fn inspect_consumer(
+        &self,
+        operation: ForwardedOperation,
+        leader_id: Option<NodeId>,
+    ) -> Result<ConsumerPolicy, BrokerError> {
+        self.configure_consumer(operation, leader_id).await
+    }
+
     pub(super) async fn poll_group(
         &self,
         stream: String,
@@ -235,6 +258,7 @@ fn forwarded_leader(response: &ForwardedResponse) -> Option<Option<NodeId>> {
         | ForwardedResponse::Poll(Err(network::ForwardError::NotLeader { leader_id }))
         | ForwardedResponse::Replay(Err(network::ForwardError::NotLeader { leader_id }))
         | ForwardedResponse::Ack(Err(network::ForwardError::NotLeader { leader_id }))
+        | ForwardedResponse::ConsumerPolicy(Err(network::ForwardError::NotLeader { leader_id }))
         | ForwardedResponse::PollGroup(Err(network::ForwardError::NotLeader { leader_id }))
         | ForwardedResponse::AckGroup(Err(network::ForwardError::NotLeader { leader_id })) => {
             Some(*leader_id)

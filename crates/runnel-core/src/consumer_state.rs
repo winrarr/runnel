@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 
 #[cfg(feature = "instrumentation")]
 use runnel_engine::StageTimer;
-use runnel_engine::{BrokerError, Offset};
+use runnel_engine::{BrokerError, ConsumerPolicy, Offset};
 use serde::{Deserialize, Serialize};
 
 pub(super) const MAX_CONSUMER_STATE_JOURNAL_BYTES: u64 = 64 * 1024;
@@ -19,12 +19,26 @@ pub(super) struct ConsumerState {
     pub(super) acknowledged_offsets: BTreeSet<Offset>,
     #[serde(default)]
     pub(super) delivery_attempts: BTreeMap<Offset, u32>,
+    #[serde(default)]
+    pub(super) policy: Option<ConsumerPolicy>,
+    #[serde(default)]
+    pub(super) delivery_policies: BTreeMap<Offset, ConsumerPolicy>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
 pub(super) enum ConsumerStateEvent {
-    DeliveryAttempt { offset: Offset, attempt: u32 },
-    Acknowledge { offset: Offset },
+    DeliveryAttempt {
+        offset: Offset,
+        attempt: u32,
+        #[serde(default)]
+        policy: Option<ConsumerPolicy>,
+    },
+    Acknowledge {
+        offset: Offset,
+    },
+    PolicyConfigured {
+        policy: ConsumerPolicy,
+    },
 }
 
 impl ConsumerState {
@@ -33,10 +47,12 @@ impl ConsumerState {
             return;
         }
         self.delivery_attempts.remove(&offset);
+        self.delivery_policies.remove(&offset);
         if offset == self.committed_offset {
             self.committed_offset += 1;
             while self.acknowledged_offsets.remove(&self.committed_offset) {
                 self.delivery_attempts.remove(&self.committed_offset);
+                self.delivery_policies.remove(&self.committed_offset);
                 self.committed_offset += 1;
             }
         } else {
@@ -46,7 +62,11 @@ impl ConsumerState {
 
     fn apply_event(&mut self, event: ConsumerStateEvent) -> Result<(), BrokerError> {
         match event {
-            ConsumerStateEvent::DeliveryAttempt { offset, attempt } => {
+            ConsumerStateEvent::DeliveryAttempt {
+                offset,
+                attempt,
+                policy,
+            } => {
                 if attempt == 0 {
                     return Err(BrokerError::Io(io::Error::new(
                         io::ErrorKind::InvalidData,
@@ -58,12 +78,43 @@ impl ConsumerState {
                         .entry(offset)
                         .and_modify(|current| *current = (*current).max(attempt))
                         .or_insert(attempt);
+                    if let Some(policy) = policy {
+                        self.delivery_policies.entry(offset).or_insert(policy);
+                    }
                 }
             }
             ConsumerStateEvent::Acknowledge { offset } => self.acknowledge(offset),
+            ConsumerStateEvent::PolicyConfigured { policy } => {
+                validate_policy(&policy)?;
+                self.policy = Some(policy);
+            }
         }
         Ok(())
     }
+
+    pub(super) fn policy_for_offset(
+        &self,
+        offset: Offset,
+        legacy_policy: &ConsumerPolicy,
+    ) -> ConsumerPolicy {
+        if let Some(policy) = self.delivery_policies.get(&offset) {
+            return policy.clone();
+        }
+        if self.delivery_attempts.contains_key(&offset) {
+            return legacy_policy.clone();
+        }
+        self.policy.clone().unwrap_or_else(|| legacy_policy.clone())
+    }
+}
+
+fn validate_policy(policy: &ConsumerPolicy) -> Result<(), BrokerError> {
+    if policy.version == 0 || !policy.configured {
+        return Err(BrokerError::Io(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "persisted consumer policy must be configured with a positive version",
+        )));
+    }
+    runnel_engine::validate_consumer_policy(policy.ack_timeout_ms, policy.max_delivery_attempts)
 }
 
 pub(super) fn load_consumer_state(
@@ -82,6 +133,8 @@ pub(super) fn load_consumer_state(
             committed_offset: 0,
             acknowledged_offsets: BTreeSet::new(),
             delivery_attempts: BTreeMap::new(),
+            policy: None,
+            delivery_policies: BTreeMap::new(),
         }
     };
     replay_consumer_state_journal(root, stream, consumer, &mut state)?;
@@ -232,6 +285,8 @@ mod tests {
             committed_offset: 0,
             acknowledged_offsets: BTreeSet::new(),
             delivery_attempts: BTreeMap::new(),
+            policy: None,
+            delivery_policies: BTreeMap::new(),
         }
     }
 
@@ -240,6 +295,12 @@ mod tests {
         let mut state = state();
         state.delivery_attempts.insert(0, 2);
         state.delivery_attempts.insert(1, 1);
+        state
+            .delivery_policies
+            .insert(0, ConsumerPolicy::configured(1, 0, Some(2)));
+        state
+            .delivery_policies
+            .insert(1, ConsumerPolicy::configured(1, 0, Some(2)));
 
         state.acknowledge(1);
         assert_eq!(state.committed_offset, 0);
@@ -249,6 +310,7 @@ mod tests {
         assert_eq!(state.committed_offset, 2);
         assert!(state.acknowledged_offsets.is_empty());
         assert!(state.delivery_attempts.is_empty());
+        assert!(state.delivery_policies.is_empty());
     }
 
     #[test]
@@ -258,12 +320,14 @@ mod tests {
             .apply_event(ConsumerStateEvent::DeliveryAttempt {
                 offset: 0,
                 attempt: 3,
+                policy: None,
             })
             .unwrap();
         state
             .apply_event(ConsumerStateEvent::DeliveryAttempt {
                 offset: 0,
                 attempt: 2,
+                policy: None,
             })
             .unwrap();
         assert_eq!(state.delivery_attempts.get(&0), Some(&3));
@@ -271,6 +335,7 @@ mod tests {
         let error = state.apply_event(ConsumerStateEvent::DeliveryAttempt {
             offset: 1,
             attempt: 0,
+            policy: None,
         });
         assert!(
             matches!(error, Err(BrokerError::Io(error)) if error.kind() == io::ErrorKind::InvalidData)

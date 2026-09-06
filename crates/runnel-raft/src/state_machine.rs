@@ -1,7 +1,7 @@
 use std::collections::BTreeMap;
 
 use openraft::{BasicNode, LogId, StoredMembership};
-use runnel_engine::{Offset, ReplayMessage};
+use runnel_engine::{ConsumerPolicy, Offset, ReplayMessage, validate_consumer_policy};
 use serde::{Deserialize, Serialize};
 
 use super::NodeId;
@@ -37,6 +37,12 @@ pub enum Command {
         consumer: String,
         offset: Offset,
     },
+    ConfigureConsumer {
+        stream: String,
+        consumer: String,
+        ack_timeout_ms: u64,
+        max_delivery_attempts: Option<u32>,
+    },
     Replay {
         stream: String,
         consumer: String,
@@ -50,6 +56,10 @@ pub enum Command {
         lease_deadline_ms: u64,
         #[serde(default)]
         max_delivery_attempts: Option<u32>,
+        #[serde(default)]
+        legacy_ack_timeout_ms: Option<u64>,
+        #[serde(default)]
+        policy_version: Option<u64>,
     },
     AckGroup {
         stream: String,
@@ -76,6 +86,9 @@ pub enum CommandResponse {
         offset: Offset,
     },
     Acknowledged,
+    ConsumerPolicy {
+        policy: ConsumerPolicy,
+    },
     AlreadyAcknowledged,
     OutOfOrderAck {
         expected: Offset,
@@ -349,6 +362,45 @@ pub(super) fn apply_command(
             state.consumers.insert(key, offset + 1);
             CommandResponse::Acknowledged
         }
+        Command::ConfigureConsumer {
+            stream,
+            consumer,
+            ack_timeout_ms,
+            max_delivery_attempts,
+        } => {
+            if matches!(kind, GroupKind::Metadata)
+                || !state
+                    .streams
+                    .get(&stream)
+                    .is_some_and(StreamState::is_active)
+            {
+                return CommandResponse::StreamNotFound;
+            }
+            if validate_consumer_policy(ack_timeout_ms, max_delivery_attempts).is_err() {
+                return CommandResponse::Noop;
+            }
+            let key = (stream, consumer);
+            let state_entry = state.group_consumers.entry(key).or_default();
+            if let Some(current) = state_entry.policy.as_ref()
+                && current.ack_timeout_ms == ack_timeout_ms
+                && current.max_delivery_attempts == max_delivery_attempts
+            {
+                return CommandResponse::ConsumerPolicy {
+                    policy: current.clone(),
+                };
+            }
+            let version = state_entry
+                .policy
+                .as_ref()
+                .map(|policy| policy.version.saturating_add(1))
+                .unwrap_or(1);
+            if version == 0 {
+                return CommandResponse::Noop;
+            }
+            let policy = ConsumerPolicy::configured(version, ack_timeout_ms, max_delivery_attempts);
+            state_entry.policy = Some(policy.clone());
+            CommandResponse::ConsumerPolicy { policy }
+        }
         Command::Replay {
             stream,
             consumer: _,
@@ -361,6 +413,8 @@ pub(super) fn apply_command(
             now_ms,
             lease_deadline_ms,
             max_delivery_attempts,
+            legacy_ack_timeout_ms,
+            policy_version,
         } => delivery::apply_group_poll(
             state,
             delivery::GroupPollRequest {
@@ -370,6 +424,8 @@ pub(super) fn apply_command(
                 now_ms,
                 lease_deadline_ms,
                 max_delivery_attempts,
+                legacy_ack_timeout_ms,
+                policy_version,
             },
             log_id,
             kind,

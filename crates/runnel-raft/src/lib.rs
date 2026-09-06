@@ -218,6 +218,8 @@ mod tests {
                 now_ms,
                 lease_deadline_ms,
                 max_delivery_attempts,
+                legacy_ack_timeout_ms: None,
+                policy_version: None,
             },
             &data_group_kind(stream),
             log_id,
@@ -861,6 +863,8 @@ mod tests {
                         now_ms: 100,
                         lease_deadline_ms: 200,
                         max_delivery_attempts: None,
+                        legacy_ack_timeout_ms: None,
+                        policy_version: None,
                     }),
                 },
             ])
@@ -906,6 +910,8 @@ mod tests {
                     now_ms: 200,
                     lease_deadline_ms: 300,
                     max_delivery_attempts: None,
+                    legacy_ack_timeout_ms: None,
+                    policy_version: None,
                 }),
             }))
             .await
@@ -1425,6 +1431,82 @@ mod tests {
             PollResult::Empty
         );
         assert_eq!(reopened.health().await.unwrap().dead_letters, 1);
+    }
+
+    #[tokio::test]
+    async fn persistent_raft_consumer_policy_is_durable_and_pins_attempts() {
+        let directory = tempfile::tempdir().unwrap();
+        let peers = BTreeMap::from([(1, "127.0.0.1:0".to_owned())]);
+        let engine = PersistentEngine::open(
+            1,
+            "runnel-consumer-policy-test".to_owned(),
+            directory.path(),
+            peers.clone(),
+            true,
+        )
+        .await
+        .unwrap();
+        engine.create_stream("events").await.unwrap();
+        let configured = Engine::configure_consumer(&engine, "events", "workers", 0, Some(2))
+            .await
+            .unwrap();
+        assert_eq!(configured.version, 1);
+        assert_eq!(
+            Engine::inspect_consumer(&engine, "events", "workers")
+                .await
+                .unwrap(),
+            configured
+        );
+        engine
+            .publish("events", None, b"poison".to_vec(), None)
+            .await
+            .unwrap();
+        assert!(matches!(
+            engine
+                .poll_group("events", "workers", "member-a")
+                .await
+                .unwrap(),
+            PollResult::Message(Message {
+                delivery_attempt: Some(1),
+                ..
+            })
+        ));
+        Engine::configure_consumer(&engine, "events", "workers", 0, Some(1))
+            .await
+            .unwrap();
+        assert!(matches!(
+            engine
+                .poll_group("events", "workers", "member-b")
+                .await
+                .unwrap(),
+            PollResult::Message(Message {
+                delivery_attempt: Some(2),
+                ..
+            })
+        ));
+        assert_eq!(
+            engine
+                .poll_group("events", "workers", "member-c")
+                .await
+                .unwrap(),
+            PollResult::Empty
+        );
+        drop(engine);
+
+        let reopened = PersistentEngine::open(
+            1,
+            "runnel-consumer-policy-test".to_owned(),
+            directory.path(),
+            peers,
+            true,
+        )
+        .await
+        .unwrap();
+        let policy = Engine::inspect_consumer(&reopened, "events", "workers")
+            .await
+            .unwrap();
+        assert_eq!(policy.version, 2);
+        assert_eq!(policy.max_delivery_attempts, Some(1));
     }
 
     #[tokio::test]

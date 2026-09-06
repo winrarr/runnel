@@ -1,6 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet};
 
-use runnel_engine::{Message, Offset, PollResult};
+use runnel_engine::{ConsumerPolicy, Message, Offset, PollResult};
 use serde::{Deserialize, Serialize};
 
 use super::state_machine::{CommandResponse, GroupKind, SnapshotState, StoredMessage, StreamState};
@@ -25,6 +25,10 @@ pub(super) struct GroupConsumerState {
     #[serde(default)]
     pub(super) delivery_attempts: BTreeMap<Offset, u32>,
     #[serde(default)]
+    pub(super) policy: Option<ConsumerPolicy>,
+    #[serde(default)]
+    pub(super) delivery_policies: BTreeMap<Offset, ConsumerPolicy>,
+    #[serde(default)]
     pub(super) in_flight: BTreeMap<Offset, GroupDelivery>,
 }
 
@@ -35,6 +39,8 @@ pub(super) struct GroupPollRequest {
     pub(super) now_ms: u64,
     pub(super) lease_deadline_ms: u64,
     pub(super) max_delivery_attempts: Option<u32>,
+    pub(super) legacy_ack_timeout_ms: Option<u64>,
+    pub(super) policy_version: Option<u64>,
 }
 
 pub(super) struct GroupAckRequest {
@@ -62,6 +68,8 @@ pub(super) fn apply_group_poll(
         now_ms,
         lease_deadline_ms,
         max_delivery_attempts,
+        legacy_ack_timeout_ms,
+        policy_version,
     } = request;
     if !state
         .streams
@@ -163,7 +171,55 @@ pub(super) fn apply_group_poll(
             .get(&offset)
             .copied()
             .unwrap_or_default();
-        if max_delivery_attempts.is_some_and(|max| attempts >= max)
+        let legacy_policy = ConsumerPolicy::legacy(
+            legacy_ack_timeout_ms.unwrap_or_default(),
+            max_delivery_attempts,
+        );
+        let policy = state
+            .group_consumers
+            .get(&consumer_key)
+            .expect("group consumer state was initialized above")
+            .delivery_policies
+            .get(&offset)
+            .cloned()
+            .or_else(|| {
+                if attempts > 0 {
+                    Some(legacy_policy.clone())
+                } else {
+                    state
+                        .group_consumers
+                        .get(&consumer_key)
+                        .and_then(|state| state.policy.clone())
+                        .or_else(|| Some(legacy_policy.clone()))
+                }
+            })
+            .expect("legacy policy is always available");
+        let policy = if policy_version.is_some_and(|version| {
+            state
+                .group_consumers
+                .get(&consumer_key)
+                .and_then(|state| state.policy.as_ref())
+                .is_some_and(|current| current.version == version)
+        }) {
+            policy
+        } else if attempts == 0 {
+            state
+                .group_consumers
+                .get(&consumer_key)
+                .and_then(|state| state.policy.clone())
+                .unwrap_or(policy)
+        } else {
+            policy
+        };
+        let effective_deadline_ms = if policy_version != policy.configured.then_some(policy.version)
+        {
+            now_ms.saturating_add(policy.ack_timeout_ms)
+        } else {
+            lease_deadline_ms
+        };
+        if policy
+            .max_delivery_attempts
+            .is_some_and(|max| attempts >= max)
             && !is_dead_letter_stream(state, &stream)
         {
             let original = state
@@ -201,12 +257,16 @@ pub(super) fn apply_group_poll(
                 .entry(offset)
                 .and_modify(|attempt| *attempt = attempt.saturating_add(1))
                 .or_insert(1);
+            consumer_state
+                .delivery_policies
+                .entry(offset)
+                .or_insert_with(|| policy.clone());
             let delivery = GroupDelivery {
                 member: member.clone(),
                 key,
                 delivery_attempt: *delivery_attempt,
                 delivery_token: format!("raft-{log_id}"),
-                deadline_ms: lease_deadline_ms,
+                deadline_ms: effective_deadline_ms,
             };
             consumer_state.in_flight.insert(offset, delivery.clone());
             (*delivery_attempt, delivery)
@@ -314,12 +374,16 @@ pub(super) fn apply_group_ack(
 fn acknowledge_group_offset(consumer_state: &mut GroupConsumerState, offset: Offset) {
     consumer_state.in_flight.remove(&offset);
     consumer_state.delivery_attempts.remove(&offset);
+    consumer_state.delivery_policies.remove(&offset);
     if offset == consumer_state.committed_offset {
         consumer_state.committed_offset = consumer_state.committed_offset.saturating_add(1);
         while consumer_state
             .acknowledged_offsets
             .remove(&consumer_state.committed_offset)
         {
+            consumer_state
+                .delivery_policies
+                .remove(&consumer_state.committed_offset);
             consumer_state.committed_offset = consumer_state.committed_offset.saturating_add(1);
         }
     } else {

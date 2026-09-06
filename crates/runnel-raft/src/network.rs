@@ -5,7 +5,7 @@ use openraft::raft::{
 use serde::{Deserialize, Serialize};
 
 use crate::TypeConfig;
-use runnel_engine::{AckResult, Offset, PollResult, ReplayMessage};
+use runnel_engine::{AckResult, ConsumerPolicy, Offset, PollResult, ReplayMessage};
 
 mod framing;
 mod inbound;
@@ -72,6 +72,16 @@ pub(crate) enum ForwardedOperation {
         consumer: String,
         offset: Offset,
     },
+    ConfigureConsumer {
+        stream: String,
+        consumer: String,
+        ack_timeout_ms: u64,
+        max_delivery_attempts: Option<u32>,
+    },
+    InspectConsumer {
+        stream: String,
+        consumer: String,
+    },
     PollGroup {
         stream: String,
         consumer: String,
@@ -98,6 +108,7 @@ pub(crate) enum ForwardedResponse {
     Poll(Result<PollResult, ForwardError>),
     Replay(Result<ReplayMessage, ForwardError>),
     Ack(Result<AckResult, ForwardError>),
+    ConsumerPolicy(Result<ConsumerPolicy, ForwardError>),
     PollGroup(Result<PollResult, ForwardError>),
     AckGroup(Result<AckResult, ForwardError>),
     InitializeDataStream(Result<bool, ForwardError>),

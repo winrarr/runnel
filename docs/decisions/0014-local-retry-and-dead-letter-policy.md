@@ -19,7 +19,7 @@ The append-then-checkpoint order favors no loss. Stable move identity adds recon
 
 ## Consequences
 
-- retry configuration is currently broker-wide and has no exponential backoff, jitter, per-consumer override, or redrive operation;
+- broker-wide retry settings remain the legacy fallback; bounded per-consumer timeout and attempt overrides are defined by [ADR 0027](0027-consumer-scoped-retry-policy.md), while there is no exponential backoff, jitter, or redrive operation;
 - dead-letter streams preserve the original key and payload but do not yet include source consumer, source offset, or attempt provenance;
 - dead-letter streams are not recursively dead-lettered;
 - a dead-letter stream counts as a normal stream and can be consumed and acknowledged through the existing protocol;

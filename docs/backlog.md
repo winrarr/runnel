@@ -169,6 +169,13 @@ Goal: let applications choose documented retry, backoff, dead-letter, and recove
 
 Rationale: a single broker-wide attempt limit is a useful local default, but event fan-out, interactive work, and long-running jobs have different failure and recovery needs.
 
+Current progress: local and clustered engines now expose durable configure and
+inspect operations for bounded per-consumer acknowledgement timeouts and
+attempt limits. Policies use the broker-wide settings as a legacy fallback,
+pin on first delivery, survive restart and clustered state replay, and retain
+the existing derived dead-letter transition. Backoff, provenance, redrive, and
+richer terminal dispositions remain open.
+
 Constraints:
 
 - policy changes must not weaken at-least-once delivery or ordering guarantees;

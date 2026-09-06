@@ -8,8 +8,8 @@ use std::time::{Duration, Instant};
 #[cfg(feature = "instrumentation")]
 use runnel_engine::StageTimer;
 use runnel_engine::{
-    BrokerError, MAX_PUBLISH_BATCH_RECORDS, Offset, PollResult, PublishRecord,
-    PublishRecordOutcome, ReplayMessage,
+    BrokerError, ConsumerPolicy, MAX_PUBLISH_BATCH_RECORDS, Offset, PollResult, PublishRecord,
+    PublishRecordOutcome, ReplayMessage, validate_consumer_policy,
 };
 #[cfg(test)]
 use std::io;
@@ -213,6 +213,78 @@ impl Broker {
         self.poll_group(stream, consumer, consumer)
     }
 
+    pub fn configure_consumer(
+        &self,
+        stream: &str,
+        consumer: &str,
+        ack_timeout_ms: u64,
+        max_delivery_attempts: Option<u32>,
+    ) -> Result<ConsumerPolicy, BrokerError> {
+        validate_name("stream", stream)?;
+        validate_name("consumer", consumer)?;
+        validate_consumer_policy(ack_timeout_ms, max_delivery_attempts)?;
+        let stream_state = self.get_stream(stream)?;
+        let mut stream_state = self.lock_stream(&stream_state)?;
+        let root = self.inner.root.clone();
+        let mut consumer_state = stream_state
+            .delivery
+            .load_consumer_state_for_request(&root, stream, consumer)?;
+        if let Some(current) = consumer_state.policy.as_ref()
+            && current.ack_timeout_ms == ack_timeout_ms
+            && current.max_delivery_attempts == max_delivery_attempts
+        {
+            return Ok(current.clone());
+        }
+        let version = consumer_state
+            .policy
+            .as_ref()
+            .map(|policy| policy.version.saturating_add(1))
+            .unwrap_or(1);
+        if version == 0 {
+            return Err(BrokerError::Configuration(
+                "consumer policy version exhausted".to_owned(),
+            ));
+        }
+        let policy = ConsumerPolicy::configured(version, ack_timeout_ms, max_delivery_attempts);
+        persist_consumer_event(
+            &root,
+            stream,
+            consumer,
+            &consumer_state,
+            ConsumerStateEvent::PolicyConfigured {
+                policy: policy.clone(),
+            },
+        )?;
+        consumer_state.policy = Some(policy.clone());
+        consumer_state.stream = stream.to_owned();
+        consumer_state.consumer = consumer.to_owned();
+        stream_state
+            .delivery
+            .cache_consumer_state(consumer.to_owned(), consumer_state);
+        Ok(policy)
+    }
+
+    pub fn inspect_consumer(
+        &self,
+        stream: &str,
+        consumer: &str,
+    ) -> Result<ConsumerPolicy, BrokerError> {
+        validate_name("stream", stream)?;
+        validate_name("consumer", consumer)?;
+        let stream_state = self.get_stream(stream)?;
+        let mut stream_state = self.lock_stream(&stream_state)?;
+        let root = self.inner.root.clone();
+        let consumer_state = stream_state
+            .delivery
+            .load_consumer_state_for_request(&root, stream, consumer)?;
+        Ok(consumer_state.policy.clone().unwrap_or_else(|| {
+            ConsumerPolicy::legacy(
+                self.inner.ack_timeout.as_millis().min(u128::from(u64::MAX)) as u64,
+                self.inner.max_delivery_attempts,
+            )
+        }))
+    }
+
     /// Read one retained record without creating delivery state or changing
     /// the ordinary consumer checkpoint.
     pub fn replay(
@@ -257,6 +329,10 @@ impl Broker {
         let mut consumer_state = stream_state
             .delivery
             .load_consumer_state_for_request(&root, stream, consumer)?;
+        let legacy_policy = ConsumerPolicy::legacy(
+            self.inner.ack_timeout.as_millis().min(u128::from(u64::MAX)) as u64,
+            self.inner.max_delivery_attempts,
+        );
         loop {
             let candidate = stream_state.find_candidate(
                 consumer,
@@ -272,8 +348,8 @@ impl Broker {
                 .get(&candidate.offset)
                 .copied()
                 .unwrap_or(0);
-            if self
-                .inner
+            let policy = consumer_state.policy_for_offset(candidate.offset, &legacy_policy);
+            if policy
                 .max_delivery_attempts
                 .is_some_and(|max_attempts| attempts >= max_attempts)
                 && !self.is_dead_letter_stream(stream)?
@@ -305,18 +381,23 @@ impl Broker {
                 ConsumerStateEvent::DeliveryAttempt {
                     offset: candidate.offset,
                     attempt: delivery_attempt,
+                    policy: Some(policy.clone()),
                 },
             )?;
             consumer_state
                 .delivery_attempts
                 .insert(candidate.offset, delivery_attempt);
+            consumer_state
+                .delivery_policies
+                .entry(candidate.offset)
+                .or_insert_with(|| policy.clone());
             let delivery_token = self.inner.delivery_tokens.next();
             message.delivery_token = Some(delivery_token.clone());
             message.delivery_attempt = Some(delivery_attempt);
             if delivery_attempt > 1 {
                 self.inner.redeliveries.fetch_add(1, Ordering::Relaxed);
             }
-            let ack_timeout = self.inner.ack_timeout;
+            let ack_timeout = Duration::from_millis(policy.ack_timeout_ms);
             stream_state.delivery.insert(
                 consumer,
                 InFlight::new(

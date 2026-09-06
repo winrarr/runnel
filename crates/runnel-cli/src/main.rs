@@ -39,6 +39,17 @@ enum Command {
         consumer: String,
         offset: u64,
     },
+    ConfigureConsumer {
+        stream: String,
+        consumer: String,
+        ack_timeout_ms: u64,
+        #[arg(long)]
+        max_delivery_attempts: Option<u32>,
+    },
+    InspectConsumer {
+        stream: String,
+        consumer: String,
+    },
     Ack {
         stream: String,
         consumer: String,
@@ -105,6 +116,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             consumer,
             offset,
         },
+        Command::ConfigureConsumer {
+            stream,
+            consumer,
+            ack_timeout_ms,
+            max_delivery_attempts,
+        } => Request::ConfigureConsumer {
+            stream,
+            consumer,
+            ack_timeout_ms,
+            max_delivery_attempts,
+        },
+        Command::InspectConsumer { stream, consumer } => {
+            Request::InspectConsumer { stream, consumer }
+        }
         Command::Ack {
             stream,
             consumer,

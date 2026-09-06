@@ -102,10 +102,10 @@ This register records known implementation and documentation shortcomings. Produ
 
 ## TD-018: Retry policy and dead-letter provenance are coarse
 
-- Status: open
-- Impact: retry configuration is broker-wide, backoff is limited to the acknowledgement timeout, and dead-letter records preserve only the original key and payload. Applications cannot yet select policy per consumer or reliably identify the source offset and attempt history from the dead-letter record alone.
-- Context: the initial policy establishes durable attempt counting and usable local and clustered grouped-delivery dead-letter streams before the public consumer configuration model is finalized. Local handling now recognizes both suffix targets and hashed targets derived from known source streams. `maximum_length_dead_letter_target_does_not_recurse` covers the long-name target across reopen, and `user_stream_with_dead_letter_hash_prefix_still_dead_letters` protects ordinary user streams that merely share the prefix. This closes the earlier local recursion mismatch without providing richer retry policy or provenance.
-- Retirement condition: consumer-scoped policy, documented backoff and redrive behavior, and durable dead-letter provenance are available and covered by restart, retry, clustered ownership, and maximum-length derived-target tests. Derived dead-letter targets are identified consistently in both engines and do not recurse.
+- Status: partially addressed; consumer-scoped attempt policy is implemented, while richer retry and provenance remain open
+- Impact: applications can now select acknowledgement timeout and attempt limits per consumer, but backoff is still limited to that timeout and dead-letter records preserve only the original key and payload. Applications cannot yet identify the source offset and attempt history from the dead-letter record alone, redrive safely, or choose richer terminal dispositions.
+- Context: ADR 0027 adds durable configure/inspect operations, legacy broker-wide fallback, monotonic policy versions, and per-record policy pinning in local and clustered state. Focused tests cover per-consumer isolation, updates that do not change an in-flight record's budget, restart persistence, and existing derived-target dead-letter behavior. Local and clustered handling recognize suffix and hashed generated targets without recursive movement. Backoff, provenance, redrive, and explicit disposition semantics remain intentionally outside this first slice.
+- Retirement condition: documented backoff and redrive behavior, durable dead-letter provenance, and richer terminal dispositions are available and covered by restart, retry, clustered ownership, and maximum-length derived-target tests. Derived dead-letter targets are identified consistently in both engines and do not recurse.
 
 ## TD-019: Delivery bookkeeping synchronizes durable state per delivery
 

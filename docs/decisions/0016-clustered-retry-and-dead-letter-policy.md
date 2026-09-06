@@ -1,11 +1,11 @@
-# ADR 0016: Add broker-wide retry limits and dead-letter outcomes to clustered delivery
+# ADR 0016: Add retry limits and dead-letter outcomes to clustered delivery
 
 - Status: accepted
 - Date: 2026-08-20
 
 ## Decision
 
-The clustered engine uses the acknowledgement timeout as the retry delay and accepts the same broker-wide optional maximum-attempt setting as the local engine. An absent limit means unlimited redelivery; zero is invalid; an attempt number starts at one and increases only when an expired delivery is assigned again.
+The clustered engine uses the acknowledgement timeout as the retry delay and accepts the same broker-wide optional maximum-attempt setting as the local engine as a legacy fallback. An absent limit means unlimited redelivery; zero is invalid; an attempt number starts at one and increases only when an expired delivery is assigned again. Durable per-consumer timeout and attempt overrides, including policy pinning, are defined by [ADR 0027](0027-consumer-scoped-retry-policy.md).
 
 When a source delivery reaches the configured limit, the source consumer is advanced and the original key and payload are appended to a derived `<source-stream>.dead-letter` stream. Clustered grouped delivery commits both outcomes in the source stream's Raft data group, so a committed dead-letter transition cannot be separated from the source progress by a process crash or leader change. The derived stream is resolved to that source data group when it is addressed through the public protocol.
 
@@ -30,7 +30,7 @@ An atomic state-machine transition is possible because the first clustered layou
 ## Consequences
 
 - The setting must be consistent across nodes; the value is carried in the replicated poll command so state-machine application is deterministic for both delivery modes.
-- Retry backoff, jitter, consumer-scoped policies, redrive, and source offset/attempt provenance remain future work.
+- Retry backoff, jitter, redrive, and source offset/attempt provenance remain future work; the bounded consumer-scoped first slice is defined by ADR 0027.
 - The local engine retains its separate at-least-once append-then-checkpoint behavior and may expose a duplicate dead-letter record after a crash between those durable operations.
 - Derived dead-letter names and their data-group resolution are implementation boundaries, not public topology concepts.
 

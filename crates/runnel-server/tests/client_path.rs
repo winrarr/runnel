@@ -130,6 +130,53 @@ async fn typed_client_keeps_a_connection_and_preserves_binary_payloads() {
 }
 
 #[tokio::test]
+async fn typed_client_configures_consumer_retry_policy_and_dead_letters() {
+    let directory = TempDir::new().unwrap();
+    let server = RunningServer::start(directory.path(), &[]);
+    let mut client = Client::connect(server.broker_addr).await.unwrap();
+    client.create_stream("events").await.unwrap();
+    let policy = client
+        .configure_consumer("events", "worker", 0, Some(2))
+        .await
+        .unwrap();
+    assert!(policy.configured);
+    assert_eq!(policy.max_delivery_attempts, Some(2));
+    client.publish("events", "poison").await.unwrap();
+    assert_eq!(
+        client
+            .poll("events", "worker")
+            .await
+            .unwrap()
+            .unwrap()
+            .delivery_attempt,
+        Some(1)
+    );
+    tokio::time::sleep(Duration::from_millis(5)).await;
+    assert_eq!(
+        client
+            .poll("events", "worker")
+            .await
+            .unwrap()
+            .unwrap()
+            .delivery_attempt,
+        Some(2)
+    );
+    tokio::time::sleep(Duration::from_millis(5)).await;
+    assert!(client.poll("events", "worker").await.unwrap().is_none());
+    let inspected = client.inspect_consumer("events", "worker").await.unwrap();
+    assert_eq!(inspected.version, policy.version);
+    assert_eq!(
+        client
+            .poll("events.dead-letter", "inspector")
+            .await
+            .unwrap()
+            .unwrap()
+            .payload,
+        "poison"
+    );
+}
+
+#[tokio::test]
 async fn typed_client_accepts_a_large_binary_response_within_its_byte_bound() {
     let directory = TempDir::new().unwrap();
     let server = RunningServer::start(directory.path(), &["--max-request-bytes", "32768"]);

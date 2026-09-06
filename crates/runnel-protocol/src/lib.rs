@@ -197,6 +197,17 @@ pub enum Request {
         consumer: String,
         member: String,
     },
+    ConfigureConsumer {
+        stream: String,
+        consumer: String,
+        ack_timeout_ms: u64,
+        #[serde(default)]
+        max_delivery_attempts: Option<u32>,
+    },
+    InspectConsumer {
+        stream: String,
+        consumer: String,
+    },
     Ack {
         stream: String,
         consumer: String,
@@ -222,6 +233,8 @@ impl Request {
             | Self::Poll { .. }
             | Self::Replay { .. }
             | Self::PollGroup { .. }
+            | Self::ConfigureConsumer { .. }
+            | Self::InspectConsumer { .. }
             | Self::Ack { .. }
             | Self::AckGroup { .. }
             | Self::Health => None,
@@ -300,6 +313,14 @@ pub enum Response {
         offset: u64,
         already_acknowledged: bool,
     },
+    ConsumerPolicy {
+        stream: String,
+        consumer: String,
+        version: u64,
+        configured: bool,
+        ack_timeout_ms: u64,
+        max_delivery_attempts: Option<u32>,
+    },
     Health {
         status: String,
         streams: usize,
@@ -324,6 +345,7 @@ impl Response {
             | Self::PublishBatch { .. }
             | Self::Empty { .. }
             | Self::Acknowledged { .. }
+            | Self::ConsumerPolicy { .. }
             | Self::Health { .. }
             | Self::Error { .. } => None,
         }
