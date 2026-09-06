@@ -2,11 +2,12 @@
 
 - Status: exploratory design note; decision-ready for a scoped first slice; no runtime semantics are changed here
 - Last reviewed: 2026-09-06
-- Baseline: `3d87e9316a2d6255e5660535ee340e76f3ed679a`
+- Baseline: `ffe2bc9a90967e0088c7b972dc5da38abf53badc`
 - Reading guide: [design-note conventions](README.md)
 - Related debt: [TD-018](../tech-debt.md#td-018-retry-policy-and-dead-letter-provenance-are-coarse)
 - Related outcome: [Make retry policy application-aware](../backlog.md#make-retry-policy-application-aware)
 - Related decisions: [ADR 0014](../decisions/0014-local-retry-and-dead-letter-policy.md), [ADR 0015](../decisions/0015-clustered-shared-consumer-ownership.md), [ADR 0016](../decisions/0016-clustered-retry-and-dead-letter-policy.md), and [ADR 0026](../decisions/0026-semantic-engine-error-classification.md)
+- Related boundaries: [clustered outcomes](clustered-outcome-contract.md), [durability and delivery policy](durability-delivery-policy.md), and [delivery bookkeeping](td-019-delivery-bookkeeping.md)
 - Companion design: [Dead-letter recovery across durable boundaries](dead-letter-recovery.md)
 
 This note proposes the application-facing retry and dead-letter contract for
@@ -21,6 +22,14 @@ The current contract is authoritative in [the architecture note](../architecture
 and the related ADRs listed above. The policy shapes, state transitions, and
 stage names below are illustrative mechanisms and outcome/evidence gates; they
 are not required API names, modules, or sequencing.
+
+Retry is one policy axis among durable-write, delivery, retention, and overload
+policy. The [durability and delivery policy boundary](durability-delivery-policy.md)
+owns that separation; this note focuses on delivery attempts, terminal movement,
+and provenance. The [clustered outcome contract](clustered-outcome-contract.md)
+also separates a safe retry classification from evidence about how far an
+operation progressed. A transport error or a delivery token must not be used as
+an implicit policy or stage signal.
 
 ## Decision-ready recommendation (not an accepted decision)
 
@@ -106,13 +115,13 @@ The current behavior is a useful compatibility baseline:
 | --- | --- | --- |
 | Policy selection | `--ack-timeout-ms` and optional `--max-delivery-attempts` are broker-wide. Consumers are created implicitly by polling. | Add a durable policy for a named consumer; retain the broker-wide settings as the fallback for legacy consumers. |
 | Attempts | The first assignment is attempt 1. Repeating a poll while the delivery is still in flight does not increment it. An expired delivery is assigned again with a persisted, higher attempt. | Keep the count per source stream, consumer, and logical offset, not per transient member or connection. Persist the count before returning a new delivery or commit it in the cluster command. |
-| Delay | The acknowledgement timeout is both the active lease and the redelivery delay. Local active leases are volatile; clustered deadlines are absolute timestamps selected by the leader. | Separate the processing lease from the delay before the next attempt. Persist the selected retry deadline so restart and ownership transfer do not reset policy state. |
-| Local dead letter | `runnel-core` appends to `<source>.dead-letter`, then persists source progress. The existing internal move identity and strict same-content reconciliation prevent a completed move from appending a second target record during a retry. A target/source crash boundary remains at least once. | Preserve append-before-source-progress and the [dead-letter recovery](dead-letter-recovery.md) identity. Add bounded provenance to the derived record. |
-| Clustered dead letter | `runnel-raft` currently commits the derived record and source progress in one stream data-group state-machine transition. Group ownership, attempts, deadlines, and fencing state are replicated. | Replicate policy and retry schedule with the consumer state. Keep same-group atomic movement; require a separate transaction or reconciliation design before claiming atomicity across groups. |
+| Delay | The acknowledgement timeout is both the active lease and the redelivery delay. Local active leases are process-local `Instant` values; clustered deadlines are leader-sampled absolute timestamps, and each data group persists an observation floor that prevents backward expiry evaluation but not clock skew, forward jumps, or idle/no-command expiry. | Separate the processing lease from the delay before the next attempt. Persist the selected retry deadline so restart and ownership transfer do not reset policy state, while defining an explicit real-time error and no-quorum boundary. |
+| Local dead letter | `runnel-core` appends to `<source>.dead-letter`, then persists source progress. The internal move identity and strict same-content reconciliation can reuse a completed target append during retry or reopen. A target/source crash boundary remains at least once; active ownership and deadlines are not durable. | Preserve append-before-source-progress and the [dead-letter recovery](dead-letter-recovery.md) identity. Add bounded provenance to the derived record. |
+| Clustered dead letter | `runnel-raft` currently commits the original key/payload copy and source progress in one stream data-group state-machine transition. Group ownership, attempts, deadlines, the lease-clock floor, and fencing state are replicated, but the automatic clustered copy has no provenance-bearing move identity. | Replicate policy and retry schedule with the consumer state. Keep same-group atomic movement; require a separate transaction or reconciliation design before claiming atomicity across groups. |
 | Delivery API | The provisional protocol has `poll`, `poll_group`, `ack`, `ack_group`, an attempt number, and an opaque grouped-delivery token. It has no negative acknowledgement, consumer configuration, provenance field, or redrive operation. | Additive capability-gated operations and optional response metadata are required. Existing payloads and legacy dead-letter records must remain readable. |
-| Observability | Health exposes process-lifetime redelivery and dead-letter counters; `/metrics` exposes those counters and general request/storage metrics. | Add retry schedule, terminal reason, move, redrive, and blocked-target signals without unbounded stream/consumer label cardinality. |
+| Observability | Health exposes process-lifetime redelivery and dead-letter counters. `/metrics` additionally exposes request, traffic, admission, storage, uptime, health, and clustered snapshot activity, but no retry cause, schedule, provenance, or consumer catalogue. | Add retry schedule, terminal reason, move, redrive, and blocked-target signals without unbounded stream/consumer label cardinality. |
 
-The local attempt and move paths are visible in [`Broker::poll_group`](../../crates/runnel-core/src/broker.rs#L233), [`Broker::dead_letter_record`](../../crates/runnel-core/src/broker.rs#L505), and [`dead_letter_move_id`](../../crates/runnel-core/src/lib.rs#L198). The clustered state shape and grouped transition are visible in [`SnapshotState`](../../crates/runnel-raft/src/state_machine.rs#L182) and [`apply_group_poll`](../../crates/runnel-raft/src/delivery.rs#L49). The current public message has only `delivery_attempt` and no provenance object ([engine contract](../../crates/runnel-engine/src/lib.rs#L73), [protocol response](../../crates/runnel-protocol/src/lib.rs#L247)).
+The local attempt and move paths are visible in [`Broker::poll_group`](../../crates/runnel-core/src/broker.rs#L233), [`Broker::dead_letter_record`](../../crates/runnel-core/src/broker.rs#L505), [`dead_letter_move_id`](../../crates/runnel-core/src/lib.rs#L198), and the durable [`ConsumerState`](../../crates/runnel-core/src/consumer_state.rs#L13). Active ownership is maintained by the process-local [`DeliveryState`](../../crates/runnel-core/src/delivery_state.rs#L72), including a due-deadline index and a bounded 1,024-entry state cache. The clustered state shape and grouped transition are visible in [`SnapshotState`](../../crates/runnel-raft/src/state_machine.rs#L182), [`apply_group_poll`](../../crates/runnel-raft/src/delivery.rs#L49), and the persisted [lease-clock floor](../../crates/runnel-raft/src/delivery.rs#L330). The current public message has only `delivery_attempt` and no provenance object ([engine contract](../../crates/runnel-engine/src/lib.rs#L73), [protocol response](../../crates/runnel-protocol/src/lib.rs#L247)).
 
 At the engine boundary, [ADR 0026](../decisions/0026-semantic-engine-error-classification.md)
 now provides backend-independent `BrokerError::kind()` and
@@ -134,10 +143,14 @@ must preserve:
   [stable move identity](../../crates/runnel-core/src/lib.rs#L1037),
   [restart reconciliation](../../crates/runnel-core/src/lib.rs#L1083),
   [source-ack persistence recovery](../../crates/runnel-core/src/lib.rs#L1129), and
-  [content mismatch](../../crates/runnel-core/src/lib.rs#L1191)).
+  [content mismatch](../../crates/runnel-core/src/lib.rs#L1191)). Consumer-state
+  journal recovery also discards a partial tail and keeps the journal within
+  its 64 KiB compaction bound ([recovery](../../crates/runnel-core/src/lib.rs#L1264),
+  [bound](../../crates/runnel-core/src/lib.rs#L1314)).
 - Cluster tests cover the same broker-wide policy through restart, stale
   delivery fencing, leader/clock recovery, and a replicated derived
-  dead-letter transition ([lease/restart tests](../../crates/runnel-raft/src/lib.rs#L831),
+  dead-letter transition ([legacy consumer retry](../../crates/runnel-raft/src/lib.rs#L1129),
+  [lease/restart tests](../../crates/runnel-raft/src/lib.rs#L831),
   [cluster retry test](../../crates/runnel-raft/src/lib.rs#L1220), and
   [cluster dead-letter test](../../crates/runnel-raft/src/lib.rs#L1315)).
 - Real-server tests cover the provisional wire shape, restart recovery,
@@ -145,12 +158,16 @@ must preserve:
   response recovery ([local protocol](../../crates/runnel-server/tests/server_smoke.rs#L638),
   [restart recovery](../../crates/runnel-server/tests/server_smoke.rs#L729),
   [ambiguous recovery](../../crates/runnel-server/tests/server_smoke.rs#L821), and
-  [cluster process recovery](../../crates/runnel-server/tests/cluster_smoke.rs#L600)).
+  [cluster replica restart](../../crates/runnel-server/tests/cluster_smoke.rs#L600)).
+  A separate three-process failure test covers reassignment, attempt
+  incrementing, and stale-token rejection after a node failure
+  ([node-failure reassignment](../../crates/runnel-server/tests/cluster_smoke.rs#L911)).
 
-There is currently no test evidence for consumer creation/configuration,
-different policies on two consumers of one stream, policy-version pinning,
-durable retry deadlines, explicit failure dispositions, provenance, or
-redrive. The first slice's acceptance tests below are therefore future gates,
+There is currently no test evidence for consumer lifecycle/configuration or
+inspection, different policies on two consumers of one stream,
+policy-version pinning, durable retry deadlines, explicit failure
+dispositions, provenance, or redrive. The first slice's acceptance tests are
+therefore future gates,
 not claims about the current implementation.
 
 One adjacent implementation detail is relevant to the first slice's
@@ -225,6 +242,14 @@ carry an arbitrary policy that a follower or a new leader can interpret
 differently. In the cluster, policy state should be part of the replicated
 consumer state or a referenced replicated metadata record; process startup
 flags remain only a legacy fallback.
+
+The current local consumer state is created lazily and its in-memory cache is
+only a bounded fast path; there is no complete durable consumer catalogue.
+The compatibility ADR must therefore define whether configuring or inspecting
+a consumer creates durable metadata, how an absent consumer is represented,
+and how inspection behaves after cache eviction. A policy operation must not
+silently turn the existing unbounded-name workload into an unbounded resident
+catalogue.
 
 Policy updates need a version fence. A safe starting rule is that a policy
 version is pinned when a source record receives its first delivery. That
@@ -319,11 +344,13 @@ unbounded diagnostic text belongs in application logs or a separate bounded
 operator event, not in every retained message.
 
 The current local engine uses volatile `Instant` leases, and the cluster uses
-leader-selected absolute deadlines. A future durable schedule will need a
-conservative local wall-clock floor and the existing clustered clock-floor
-invariant so a backward clock step cannot make a retry earlier or indefinitely
-late. The exact timing error and failover behavior remain part of TD-020, so
-this note does not claim deadline precision across nodes.
+leader-selected absolute deadlines. The clustered state machine now persists
+an observation floor per data group: `effective_now` is the maximum of that
+floor and the command observation. This prevents backward evaluation after a
+restart or leader change, but forward jumps can still expire a delivery early,
+and no committed command means no lazy expiry. A future durable schedule will
+need an explicit real-time error and no-quorum policy; [TD-020](../tech-debt.md#td-020-clustered-delivery-leases-use-absolute-wall-clock-deadlines)
+records the current containment and its remaining clock assumptions.
 
 ### Poison handling and terminal outcomes
 
@@ -493,9 +520,10 @@ There are three identities with different scopes:
 Local movement remains append-before-checkpoint and reconciles by move ID, as
 described in the [companion recovery note](dead-letter-recovery.md). Clustered
 movement remains one replicated state transition while source and target share
-the same data group. In both engines, a same-ID key/payload or destination
-mismatch is an explicit corruption/conflict outcome, not a compatibility-style
-"already accepted" result.
+the same data group. A future provenance-bearing implementation in either
+engine must treat a same-ID key/payload or destination mismatch as an explicit
+corruption/conflict outcome, not a compatibility-style "already accepted"
+result; the current clustered automatic copy has no such move ID.
 
 ## Cluster ownership transfer
 
@@ -523,18 +551,30 @@ On leader or member transfer:
    consumed. The next leader may retry the operation. The client must treat a
    lost response as ambiguous until it observes state, not as proof of failure.
 
-The current cluster passes `max_delivery_attempts` in each grouped poll
-command and expects configuration consistency across nodes
-([clustered poll path](../../crates/runnel-raft/src/lib.rs#L1362)). The
-application-aware contract should replace that per-request configuration with
-replicated consumer policy state. A node that cannot interpret the policy
-version must not become leader for that state; mixed-version behavior and
-rollback belong in the compatibility ADR.
+The current cluster passes `max_delivery_attempts`, the leader's lease
+deadline, and the command's clock observation in each replicated poll command
+for both grouped and non-grouped delivery ([clustered poll path](../../crates/runnel-raft/src/engine.rs#L562),
+[grouped state-machine request](../../crates/runnel-raft/src/delivery.rs#L31)).
+The timeout and attempt limit remain process configuration and are not
+replicated policy state. The application-aware contract should replace that
+per-request configuration with replicated consumer policy state. A node that
+cannot interpret the policy version must not become leader for that state;
+mixed-version behavior and rollback belong in the compatibility ADR.
+
+The ownership rules above are a future contract, not a description of a
+durable retry scheduler. Today the clustered deadline and lease-clock floor
+are durable, but there is no separate `retry_not_before`, timer, or background
+reclaim command. Expiry is evaluated only when a valid grouped command is
+applied. The [lease-clock evidence](td-020-lease-clock-floor.md) therefore
+requires any future schedule to report its real-time error, no-quorum behavior,
+and resource work separately from the existing fencing tests.
 
 ## Ambiguous outcomes and client responsibilities
 
 The public contract should classify outcomes rather than silently retrying
-operations:
+operations. The table is a future contract: current v1 has no stable poll,
+retry, or redrive identity, and no inspection operation that resolves an
+unknown poll.
 
 | Operation/outcome | Possible durable state when the response is lost | Safe client behavior |
 | --- | --- | --- |
@@ -751,6 +791,10 @@ Verifiable acceptance tests for this slice are:
    key/payload preservation, no recursive dead-lettering, stale-token
    fencing, and the current local-versus-clustered movement boundaries. No
    provenance or redrive behavior is inferred from these legacy tests.
+6. Local policy inspection and polling remain correct after the bounded
+   consumer-state cache evicts the entry, and clustered policy inspection does
+   not count replica copies as separate logical consumers. The test must
+   exercise durable state rather than only a warm in-memory cache.
 
 This slice is a design gate, not evidence that any of these tests currently
 exist. The subsequent gates address the missing schedule, provenance, and
@@ -771,6 +815,30 @@ Define versioned policy and provenance fixtures before changing runtime code:
 
 Gate: reviewable contract fixtures and compatibility examples; no runtime or
 performance claim.
+
+### Measurement rule for recovery gates
+
+The repository has correctness fixtures and broad retained-history recovery
+probes, but it does not yet define a retry-policy recovery SLO. A future
+implementation PR must therefore publish its measurement envelope before
+running it rather than choosing a favorable threshold afterward. At minimum,
+the envelope should record:
+
+- local and clustered stream/consumer counts, retained message shape, pending
+  attempt count, and policy-state cardinality;
+- time and bytes for local journal replay and clustered checkpoint/journal or
+  snapshot recovery, with the exact failure point and whether a leader change
+  or cache eviction occurred; and
+- peak resident memory, bounded scheduler/index work, and any response or
+  admission latency while the retry state is recovered.
+
+The pass condition must include exact logical equality for payload, key,
+offset, attempts, acknowledgement state, fencing, terminal movement, and
+provenance where supported. Timing and resource limits must be selected in the
+compatibility or implementation ADR from representative workload evidence;
+this design note does not invent absolute limits. The existing [benchmark
+policy](../benchmarking.md) still applies when a runtime change affects a hot
+path, while design-only gate evidence remains semantic and reviewable.
 
 ### Gate 1: durable consumer-scoped policy
 
