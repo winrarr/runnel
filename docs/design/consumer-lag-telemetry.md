@@ -1,7 +1,14 @@
 # Consumer-lag telemetry design
 
-Status: proposal for TD-006; design-only, not an implementation or a runtime
-guarantee.
+- Status: exploratory design proposal; no implementation authorized
+- Last reviewed: 2026-09-06
+- Baseline inspected: `2acd807a925fdd664fa36128fec35c4116239a6d`
+- Evidence class: operability/observability correctness
+- Related debt: [TD-006](../tech-debt.md#td-006-operational-telemetry-remains-incomplete)
+- Scope: bounded logical consumer-lag observation for local and early clustered engines
+
+This is design-only, not an implementation or a runtime guarantee. Rust code
+and tests remain authoritative if this note becomes stale.
 
 This proposal adds consumer-lag visibility without making the health path scan
 retained history, without turning stream or consumer names into an unbounded
@@ -21,25 +28,9 @@ lag:
   The public protocol health response projects only stream count and storage
   bytes. Adding lag fields directly to either type would couple a future
   per-consumer view to the existing health contract.
-- The server's [`/metrics`](../../crates/runnel-server/src/main.rs) output uses fixed operation labels only. It already
-  reports aggregate request, traffic, publish, delivery, acknowledgement,
-  admission, storage, health, and clustered snapshot signals. Real-server
-  tests explicitly ensure that failed protocol requests do not create stream
-  or consumer labels.
-- Local [`runnel-core`](../../crates/runnel-core/src/lib.rs) keeps the complete append-only stream history on disk,
-  a bounded tail index and bounded sparse index, and a reconstructed
-  `next_offset`. Consumer
-  checkpoints are durable per `(stream, consumer)` and contain a contiguous
-  `committed_offset`, out-of-order acknowledged offsets, and delivery attempts.
-  Active deliveries are indexed per consumer, with expiry removed through a
-  deadline index. Consumer state files are created lazily; there is no
-  complete in-memory consumer catalogue.
-- Clustered [`runnel-raft`](../../crates/runnel-raft/src/lib.rs) state stores stream records, consumer progress, out-of-order
-  acknowledgements, attempts, leases, and grouped in-flight ownership in each
-  stream data group. `GroupManager::health` sums the currently materialized
-  groups on the local node after checking metadata leadership. It is not a
-  cross-node metrics aggregator, and replica copies must not be summed as
-  separate logical backlog.
+- The server's [`/metrics`](../../crates/runnel-server/src/observability.rs) output uses fixed operation labels only. It already reports aggregate request, traffic, publish, delivery, acknowledgement, admission, storage, health, and clustered snapshot signals. The clustered snapshot families are read separately from health and are emitted only when the snapshot-metrics call completes; neither path exposes consumer lag. Real-server tests explicitly ensure that failed protocol requests do not create stream or consumer labels.
+- Local [`runnel-core`](../../crates/runnel-core/src/broker.rs) keeps the complete append-only stream history on disk, a bounded tail index and bounded sparse index, and a reconstructed `next_offset`. Consumer checkpoints are durable per `(stream, consumer)` and contain a contiguous `committed_offset`, out-of-order acknowledged offsets, and delivery attempts. Active deliveries are indexed per consumer, with expiry removed through a deadline index. The in-memory consumer-state cache is bounded to 1,024 entries, but consumer state files are created lazily and there is no complete durable or in-memory consumer catalogue.
+- Clustered [`runnel-raft`](../../crates/runnel-raft/src/state_machine.rs) state stores stream records, consumer progress, out-of-order acknowledgements, attempts, leases, and grouped in-flight ownership in each stream data group. [`GroupManager::health`](../../crates/runnel-raft/src/group_manager.rs) sums the currently materialized groups on the local node after reading metadata health; it does not perform a leader-authoritative cross-node query or deduplicate replica copies. Replica copies must not be summed as separate logical backlog.
 - Local health obtains physical log-file lengths. Clustered state-machine
   health derives logical key-plus-payload bytes by iterating materialized
   messages. Neither definition is a consumer-lag byte definition, and the
@@ -315,15 +306,19 @@ zero after a timeout. A stale value is similarly omitted from the default
 numeric aggregate unless a separate, explicitly named last-known metric is
 accepted later.
 
-The existing one-second bounded engine health timeout applies to readiness and
-metrics. Lag collection must not lengthen it or make readiness depend on
-application backlog. `/health/ready` should continue to mean that the broker
-can serve its declared durable workload: a large lag, an expired consumer, or
-an unavailable optional lag observation does not by itself make the broker
-unready. An engine health timeout still makes readiness fail and should keep
-the current `runnel_health_check_failures_total` behavior. A lag query that
-times out should use its own bounded failure/unknown result, not turn the
-health response into a false healthy zero.
+The existing one-second timeout bounds the `engine.health()` portion of
+readiness and metrics. In the current `/metrics` path, clustered
+`snapshot_metrics()` collection runs after that health check and has no
+separate explicit deadline; this is existing snapshot-telemetry behavior, not
+a consumer-lag guarantee. A future lag collector must have its own bounded
+work/deadline policy and must not lengthen the health check or make readiness
+depend on application backlog. `/health/ready` should continue to mean that
+the broker can serve its declared durable workload: a large lag, an expired
+consumer, or an unavailable optional lag observation does not by itself make
+the broker unready. An engine health timeout still makes readiness fail and
+should keep the current `runnel_health_check_failures_total` behavior. A lag
+query that times out should use its own bounded failure/unknown result, not
+turn the health response into a false healthy zero.
 
 For predictable scrape latency, a future implementation should prefer an
 atomically published/cached summary for aggregate metrics. A named query may
@@ -452,8 +447,10 @@ following staged gates.
 - Tests assert that unknown, stale, truncated, and retention-expired values
   are not emitted as fresh zeroes; scrape availability, age, coverage, and
   failure counters remain visible.
-- Scraping during a stalled engine remains bounded by the existing health
-  timeout and preserves process/admission metrics. Readiness remains
+- Scraping during a stalled engine health check remains scrapeable within the
+  existing health deadline and preserves process/admission metrics. Any
+  clustered snapshot or lag collector must have an independently tested bound;
+  it must not be assumed to inherit the health timeout. Readiness remains
   independent of high or unknown application lag while still failing on the
   existing engine-health timeout.
 - Output bytes, concurrent lag work, snapshot item count, state reads, and
@@ -520,8 +517,10 @@ runtime change can be made safely:
   the current health path has no leader-authoritative source revision or
   cross-node deduplication. Treating that sum as a cluster lag metric would
   double- or triple-count logical backlog.
-- The server's metrics collector currently accepts only the aggregate
-  `HealthSnapshot`. Adding a lag field there would couple an optional,
+- The server's metrics collector currently accepts an optional aggregate
+  `HealthSnapshot` and, for clustered servers, a separately collected
+  `SnapshotMetricsSnapshot`. It has no optional consumer-lag capability.
+  Adding a lag field to `HealthSnapshot` would couple an optional,
   potentially unavailable telemetry capability to readiness and the existing
   protocol health model. Reusing `in_flight_deliveries` as lag would also be
   semantically incorrect because in-flight records are only one part of the
