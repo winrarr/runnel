@@ -449,7 +449,7 @@ planning records already cover the concrete adjacent issues: provisional JSON
 and limited payload compatibility (TD-003), one-file local stream storage
 (TD-002), storage-format compatibility (TD-007), incomplete end-to-end
 benchmark coverage (TD-011), peer transport strategy (TD-012), and the
-remaining module-ownership debts (TD-024/TD-025). No new concrete shortcut or
+remaining module-ownership debt (TD-025). No new concrete shortcut or
 retirement condition was found that is better represented by another
 `docs/tech-debt.md` entry, so that file is intentionally unchanged.
 

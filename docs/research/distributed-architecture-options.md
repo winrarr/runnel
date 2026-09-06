@@ -1,19 +1,35 @@
 # Distributed architecture exploration
 
 - Status: exploratory
-- Last reviewed: 2026-08-27
+- Last reviewed: 2026-09-06
+- Baseline: `d5f033ec1db8ee7402e5b7a96ef2935f0a1325d6`
+- Reading guide: [research-note conventions](README.md)
 
 This document records candidate architectures for Runnel's distributed future beyond the early static Multi-Raft backend. It remains exploratory and does not change the current implementation. The product backlog describes the desired outcomes; this document explores ways to reach them. [ADR 0004](../decisions/0004-multi-raft-first-distributed-engine.md) accepts Multi-Raft as the first distributed direction, while later architectural choices still require their own decisions.
 
-## Working recommendation
+## Accepted current direction and exploratory candidates
 
-Use Multi-Raft for the first three-node implementation, behind a narrow distributed-log engine boundary shared with the existing local engine. Multi-Raft offers a well-understood path to quorum durability, leader fencing, recovery, and membership changes, making it a useful correctness baseline.
+The accepted first distributed direction is Multi-Raft behind a narrow
+distributed-log engine boundary shared with the local engine, as recorded in
+[ADR 0004](../decisions/0004-multi-raft-first-distributed-engine.md). That
+direction is now implemented as the early static three-node backend. The ADR,
+current architecture, code, and tests are authoritative for that boundary;
+this research note does not replace or extend their guarantees.
 
 The reviewable implementation plan is recorded in [multi-raft-implementation-plan.md](../design/multi-raft-implementation-plan.md). ADR 0004 accepts its initial distributed direction and defaults; the plan and this note retain the unresolved implementation and alternative-engine questions.
 
 Do not model the boundary as a generic consensus strategy. The broker should depend on durable messaging semantics, not on terms, leaders, quorums, sequencers, or copysets. Those concepts differ across candidate architectures and belong inside an engine.
 
-Treat alternative engines as experiments until they pass the same conformance, failure, recovery, and benchmark suites. The strongest specialized end-state candidate is currently a sequenced-quorum engine with dynamic virtual ordering shards, epoch-fenced sequencers, batched sequence allocation, quorum/copyset replication, extent-based placement, and a small Raft-backed metadata plane. Chain replication is a first-class throughput-oriented candidate.
+Treat alternative engines as experiments until they pass the same conformance,
+failure, recovery, and benchmark suites. Under the one-region, three-node,
+strong-durability and keyed-ordering assumptions used by the scenario tables,
+sequenced quorum/copyset replication is a leading hypothesis for a future
+throughput-oriented design. Dynamic virtual ordering shards, epoch-fenced
+sequencers, batched sequence allocation, extent-based placement, and a small
+metadata plane are illustrative mechanisms, not an end-state ranking. Chain
+replication remains a first-class alternative for workloads that trade
+per-record latency for a deeply pipelined write path. No candidate has enough
+comparative implementation evidence to be called the strongest end state.
 
 ## Product invariants every engine must preserve
 
@@ -58,7 +74,7 @@ Candidate engines should be compared on evidence rather than familiarity:
 
 Each hidden ordering shard is a Raft group with one elected leader and a replica set. The leader assigns log order, replicates entries, and commits after quorum agreement. A separate Raft group may hold cluster metadata, or metadata may be represented through dedicated internal groups.
 
-Why it is the recommended first implementation:
+Why ADR 0004 selected it for the initial implementation:
 
 - ordering, replication, fencing, commit, and recovery are integrated in one established model;
 - three replicas naturally express one-failure quorum durability;
@@ -74,7 +90,9 @@ Costs and questions:
 - group reconfiguration and placement must be coordinated without exposing groups to clients;
 - consumer progress and producer deduplication state need deliberate placement rather than being pushed through one global metadata group.
 
-The first version should favor a small number of groups and explicit failure tests over premature automatic sharding.
+The accepted initial implementation favors a small number of groups and
+explicit failure tests over premature automatic sharding; that is a current
+scope constraint, not evidence that Multi-Raft is the eventual best engine.
 
 ### Sequencer with quorum and copyset replication
 
@@ -97,7 +115,12 @@ Costs and questions:
 - a global sequencer would become a bottleneck, so sequencing must be scoped to virtual ordering shards;
 - copyset width trades correlated-loss frequency against repair parallelism and failure blast radius.
 
-The specialized version worth prototyping combines dynamic virtual ordering shards, epoch-fenced sequencers, batched sequence allocation, extent-level placement, and a Raft-backed metadata plane. Raft would hold low-rate facts such as membership, ownership epochs, placement, and migrations; it would not carry each message.
+One specialized candidate to prototype combines dynamic virtual ordering
+shards, epoch-fenced sequencers, batched sequence allocation, extent-level
+placement, and a Raft-backed metadata plane. Raft would hold low-rate facts
+such as membership, ownership epochs, placement, and migrations; it would not
+carry each message. This combination is a hypothesis whose complexity and
+failure behavior still need comparative evidence.
 
 Sequence assignment and commitment must remain distinct. Batched allocation may reserve ranges, but consumers can only observe a contiguous released prefix or another precisely defined committed view. Producer request identities must allow an uncertain append to be resolved after recovery.
 
@@ -121,7 +144,10 @@ Costs and questions:
 - dynamic placement and repair must avoid draining the entire pipeline through one bottleneck;
 - consumer progress and metadata still need a separate durable coordination design.
 
-Chain replication should be measured with deep pipelines, large batches, slow replicas, chain repair, and sustained disk pressure. It may be an excellent selectable engine for throughput-oriented deployments even if it is not the default.
+Evidence for chain replication requires deep pipelines, large batches, slow
+replicas, chain repair, and sustained disk pressure. It may suit
+throughput-oriented deployments even if it is not the default, but that is an
+unverified workload hypothesis rather than a product recommendation.
 
 ### Primary/backup and asynchronous replication
 
@@ -161,7 +187,14 @@ Erasure coding and object storage can reduce the cost of old immutable data. The
 
 ## Scenario-oriented recommendations
 
-There is no architecture that is best solely because a workload is described as high-throughput or low-latency. The recommendation also depends on durability, ordering scope, workload skew, failure domains, retained history, and operational budget. The following entries identify the strongest candidates to implement and measure under stated assumptions.
+There is no architecture that is best solely because a workload is described as high-throughput or low-latency. The recommendation also depends on durability, ordering scope, workload skew, failure domains, retained history, and operational budget. The following entries identify candidates worth evaluating under stated assumptions.
+
+The labels in the tables are conditional hypotheses, not measured rankings or
+accepted implementation choices. They assume the workload, topology,
+durability, and ordering boundary stated below; a candidate is not preferred
+when those assumptions change. Before adopting any row, record comparable
+failure, recovery, resource, and tail-latency evidence and reconcile it with
+the current engine contract and relevant ADRs.
 
 Unless stated otherwise, the matrix assumes one datacenter or region, three nodes, tolerance of one node failure, durable local storage, at-least-once delivery, and FIFO only within a requested ordering domain.
 
@@ -233,7 +266,7 @@ Unless stated otherwise, the matrix assumes one datacenter or region, three node
 
 ### Tail-latency and predictability scenarios
 
-For consistently low p99 and p99.9 latency, protocol choice is only part of the answer. The strongest candidate combines bounded queues, admission control, single-owner state, CPU-aware scheduling, preallocated buffers, asynchronous durable I/O, small deadline-driven batches, and isolation between replication, repair, replay, and consumer work.
+For consistently low p99 and p99.9 latency, protocol choice is only part of the answer. A candidate worth testing combines bounded queues, admission control, single-owner state, CPU-aware scheduling, preallocated buffers, asynchronous durable I/O, small deadline-driven batches, and isolation between replication, repair, replay, and consumer work. No evidence yet establishes this combination as the strongest design.
 
 A thread-per-core model is promising for the specialized sequenced-quorum engine because it can eliminate shared hot locks and make ownership explicit. It remains a hypothesis until compared with a simpler asynchronous design under slow disks, repair traffic, CPU throttling, and container scheduling. The architecture should require single-owner and bounded-work properties without prematurely requiring one runtime library.
 
@@ -305,17 +338,36 @@ Protocol-specific state machines should also have deterministic simulation or mo
 
 Benchmark reports must identify the engine, durability guarantee, replica topology, message size, batch policy, storage medium, failure state, and whether data is merely assigned, locally persisted, quorum committed, or visible to consumers.
 
-## Suggested implementation sequence
+## Evaluation and decision gates
 
-1. Extract a narrow semantic engine boundary from the current local implementation while preserving its behavior and tests.
-2. Add the Multi-Raft engine for one hidden ordering shard per stream and make a three-node process-level test pass before depending on Kubernetes.
-3. Add failure injection, conformance tests, and comparable benchmarks around both engines.
-4. Prototype a sequenced-quorum engine with one fixed ordering shard and replica set; prove epoch fencing and recovery before dynamic placement.
-5. Prototype chain replication under the same contract and compare deep-batch throughput, latency, replica lag, and reconfiguration.
-6. Introduce dynamic virtual shards, extent placement, thread-per-core ownership, or alternate sequencing only when measurements identify the bottleneck they address.
-7. Decide whether alternative engines belong in one binary or separate engine-specific binaries after their runtime and dependency requirements are concrete.
+The following gates describe evidence dependencies, not a required code or
+module sequence. The first two describe the already-accepted baseline; later
+gates apply only if a future workload justifies evaluating another engine:
 
-This sequence is a recommendation for work beyond the accepted initial direction, not a replacement for an architecture decision. Each consequential selection should be captured in an ADR when made.
+1. **Semantic baseline:** preserve the narrow engine boundary, current local
+   behavior, and existing conformance tests while documenting the guarantees
+   that every candidate must match.
+2. **Initial clustered evidence:** retain the static Multi-Raft implementation
+   as the correctness and failure baseline, including three-node process tests,
+   before using Kubernetes or a specialized engine as evidence.
+3. **Comparable evaluation:** run the same failure, recovery, conformance, and
+   resource-bounded benchmark suite around the baseline and any candidate.
+4. **Sequenced-quorum gate:** a prototype must establish epoch fencing,
+   committed-prefix recovery, and bounded placement before dynamic virtual
+   ordering shards or extent placement are considered.
+5. **Chain-replication gate:** a prototype must establish safe reconfiguration
+   and compare deep-batch throughput, latency, replica lag, and repair under
+   the same durability contract.
+6. **Optimization gate:** introduce virtual shards, thread-per-core ownership,
+   alternate sequencing, or similar mechanisms only when measurements identify
+   the bottleneck they address and the added state remains bounded.
+7. **Packaging decision:** choose static composition or separate binaries only
+   after runtime and dependency requirements are concrete; record the
+   consequence in an ADR before calling an alternative production-ready.
+
+No gate makes an alternative engine compatible by itself. Each consequential
+selection still requires an ADR and explicit compatibility, rollback, and
+operational evidence.
 
 ## Open questions
 
@@ -332,6 +384,10 @@ This sequence is a recommendation for work beyond the accepted initial direction
 
 ## References
 
+- [Current architecture](../architecture.md)
+- [ADR 0004: first distributed engine](../decisions/0004-multi-raft-first-distributed-engine.md)
+- [ADR 0023: independent retained storage and placement](../decisions/0023-independent-retained-storage-and-placement.md)
+- [Benchmarking and evidence policy](../benchmarking.md)
 - [Raft consensus paper](https://raft.github.io/raft.pdf)
 - [Redpanda partition replication architecture](https://docs.redpanda.com/streaming/24.2/get-started/architecture/)
 - [LogDevice architecture](https://logdevice.io/docs/Concepts.html), [write path](https://logdevice.io/docs/Writepath.html), [replication](https://logdevice.io/docs/Replication.html), and [recovery](https://logdevice.io/docs/Recovery.html)

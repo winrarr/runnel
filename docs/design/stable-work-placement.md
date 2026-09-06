@@ -1,6 +1,9 @@
 # Stable internal work placement
 
-- Status: exploratory design proposal
+- Status: exploratory design proposal; no runtime implementation commitment
+- Last reviewed: 2026-09-06
+- Baseline: `d5f033ec1db8ee7402e5b7a96ef2935f0a1325d6`
+- Reading guide: [design-note conventions](README.md)
 - Scope: stable scheduling units for large shared-consumer pools
 - Related outcome: [Explore stable internal work placement](../backlog.md)
 - Related implementation debt: [TD-016](../tech-debt.md)
@@ -11,13 +14,23 @@ units. It does not change the runtime, public protocol, wire compatibility, or
 the current placement of streams and replicas. It is not an ADR and makes no
 performance claim about the current or proposed implementation.
 
-The recommended candidate for a future experiment is a fixed set of virtual
-lanes whose ownership is assigned cooperatively to active members. A record's
-ordering key maps to a lane, while the lane's owner is an internal scheduler
-fact. The current demand-driven scheduler remains the default until a focused
-comparison demonstrates a material benefit for a workload that matters to
-Runnel. Direct key-to-member ownership and offset ranges remain alternatives,
-not selected designs.
+Under the current one-region, topology-free contract, the leading candidate
+for a future experiment is a fixed set of virtual lanes whose ownership is
+assigned cooperatively to active members. A record's ordering key maps to a
+lane, while the lane's owner is an internal scheduler fact. This is a
+recommendation under explicit workload and failure assumptions, not a measured
+ranking or accepted direction. The current demand-driven scheduler remains the
+default until a focused comparison demonstrates a material benefit for a
+workload that matters to Runnel. Direct key-to-member ownership and offset
+ranges remain alternatives, not selected designs.
+
+Current placement and delivery constraints are authoritative in
+[ADR 0013](../decisions/0013-local-shared-consumer-delivery.md),
+[ADR 0015](../decisions/0015-clustered-shared-consumer-ownership.md),
+[ADR 0023](../decisions/0023-independent-retained-storage-and-placement.md),
+and [architecture](../architecture.md). Lane state, ownership transitions,
+and the experiment stages below are illustrative mechanisms and
+outcome/evidence gates; they are not public API or module prescriptions.
 
 ## Terminology and implementation boundary
 
@@ -371,27 +384,30 @@ The following are hypotheses to test, not expected results:
   current one-message public poll alone. Batch size, queue depth, and cache
   effects must be measured separately from ownership movement.
 
-## Narrow future implementation slice
+## Candidate experiment boundary
 
-The smallest useful implementation should be staged as follows:
+The smallest useful experiment can be evaluated in the following dependency
+order. This is not an implementation task list; each item names an outcome
+and the evidence needed before a later item is worth attempting:
 
-1. Add an internal scheduler model and focused instrumentation without
-   changing runtime behavior. Measure candidate scans, active keys, member
-   completion, and delivery latency in the current demand-driven path.
-2. Implement fixed virtual lanes in the local engine behind an opt-in internal
-   setting. Keep the current public grouped poll/ack operations, one delivery
-   per member, per-key exclusion, out-of-order acknowledgements, attempt
-   persistence, and token errors. Bound `L` and reject invalid configuration.
-3. Add a bounded member lifecycle and cooperative lane handoff. Persist or
-   journal placement epoch and owner generation before serving a new owner;
-   use the existing consumer delivery token to fence delayed work. Do not add a
-   per-key owner map or a public assignment response.
-4. Run local process restart and membership tests before adapting the design to
-   the clustered stream data group. Only then replicate placement transitions
-   and exercise leader, follower, and node failure with real broker processes.
-5. Consider per-member credits or a fetch batch only as a separate change. Its
-   partial-ack, timeout, memory, and crash semantics need their own focused
-   contract and must not be conflated with lane ownership.
+1. **Selector evidence:** focused instrumentation establishes candidate scans,
+   active keys, member completion, and delivery latency in the unchanged
+   demand-driven path without claiming a runtime benefit.
+2. **Local candidate evidence:** an opt-in fixed-lane experiment preserves the
+   public grouped poll/ack operations, one delivery per member, per-key
+   exclusion, out-of-order acknowledgements, attempt persistence, and token
+   errors, while bounding `L` and invalid configuration.
+3. **Handoff evidence:** a bounded member lifecycle and cooperative lane handoff
+   persist or journal placement epoch and owner generation before a new owner
+   serves work. The existing delivery token fences delayed work; no per-key
+   owner map or public assignment response is required by this gate.
+4. **Cluster evidence:** local restart and membership tests pass before the
+   placement transitions are represented in the clustered stream data group.
+   Three real broker processes then cover leader, follower, and node failure.
+5. **Separate batching contract:** per-member credits or fetch batches are a
+   separate experiment. Partial acknowledgement, timeout, memory, and crash
+   semantics must have their own contract rather than being conflated with
+   lane ownership.
 
 This slice does not select a lane count, membership timeout, weighting policy,
 or public member registration operation. Those values should be chosen from
@@ -423,7 +439,7 @@ run-scoped targeted workload to the existing harness or a separate documented
 benchmark; run it sequentially under the benchmark lock and retain raw
 results.
 
-### Staged measurement plan
+### Measurement gates
 
 The first runtime change should add counters to the demand-driven path before
 adding a lane policy. At minimum, record candidate records examined, candidate
@@ -554,6 +570,7 @@ remains an optimization hypothesis.
 - [Product backlog](../backlog.md)
 - [Local shared-consumer delivery, ADR 0013](../decisions/0013-local-shared-consumer-delivery.md)
 - [Clustered shared-consumer ownership, ADR 0015](../decisions/0015-clustered-shared-consumer-ownership.md)
+- [Independent retained storage and placement, ADR 0023](../decisions/0023-independent-retained-storage-and-placement.md)
 - [`StorageExecutor` and `StorageLane`](../../crates/runnel-core/src/lib.rs#L111-L413)
 - [`Broker::poll_group` and local acknowledgement](../../crates/runnel-core/src/lib.rs#L791-L981)
 - [`StreamLog::find_candidate` and local eligibility predicate](../../crates/runnel-core/src/lib.rs#L1591-L1625)
