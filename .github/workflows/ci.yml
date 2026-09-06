@@ -26,6 +26,8 @@ jobs:
       - uses: taiki-e/install-action@v2.87.2
         with:
           tool: just
+      # Product-fit reference workloads are opt-in because their manifest
+      # budgets are representative engineering envelopes, not CI SLOs.
       - run: just verify
 
   integration:

@@ -10,6 +10,25 @@ This is a real broker test, not a mock or an in-process shortcut. It builds the 
 
 Run it whenever changing storage, delivery, protocol, process startup, shutdown, or deployment behavior. CI invokes the same recipe.
 
+## Product-fit reference workloads
+
+Run the opt-in reference workload harness after building the broker:
+
+```text
+just product-fit
+just product-fit --workload background_work
+```
+
+The harness uses a real local broker and the public JSON-lines protocol. It
+loads the pre-registered manifest at
+`docs/research/product-fit-manifests/local-reference.json` and writes an
+immutable run package under `benchmark-results/product-fit/<run-id>/` (which is
+ignored by Git): manifest, request transcript, message ledger, restart-separated
+Prometheus snapshots, resource samples, latency distributions, budget checks,
+and broker logs. The command exits non-zero when an automated check fails.
+These are representative engineering budgets, not product SLOs; an intended
+user must still complete the worksheet in the product-fit validation note.
+
 ## Concurrent local workflows
 
 Use the isolation runner when more than one process-heavy workflow needs to run at once:
@@ -85,6 +104,7 @@ The Criterion suite includes durable publish, legacy publish/poll/ack, two-membe
 - `just verify` runs formatting, Clippy, default-feature Rust tests (including the real-process `cluster_smoke` test), ShellCheck, benchmark-script tests, and a workspace build.
 - `just integration` runs the isolated process smoke test, Docker image setup, single-node container benchmark-smoke, and three-node container benchmark-smoke steps. The clustered process recovery test is owned by `just verify`, so it is not run a second time here. A caller may provide `CARGO_TARGET_DIR` for the process smoke build; temporary process, data, image, and benchmark resources remain isolated. CI prebuilds one `runnel:dev` image with reusable Docker layers and reuses it for both container smoke workflows.
 - `just smoke` exercises the running process and CLI across a restart.
+- `just product-fit` runs the pre-registered local background-work and event/replay workloads and records an evidence package; it is intentionally opt-in and is not a CI gate.
 - `just cluster-test` starts three real Raft-backed broker processes and verifies quorum replication, grouped and non-grouped delivery through follower forwarding, reassignment after node failure, retry limits, dead-letter recovery, follower restart, leader election, post-failure recovery, and recovery metrics through the public protocol.
 - `just cluster-replacement-test` explicitly enables the test-only permissive recovery feature and runs the experimental empty replacement-node snapshot recovery and interrupted snapshot transfer checks.
 - `just bench-test` runs the benchmark normalization and dashboard tests.

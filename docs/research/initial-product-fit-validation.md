@@ -1,7 +1,7 @@
 # Initial product-fit validation
 
-- Status: repository validation recorded; product-fit claim remains unknown
-- Last reviewed: 2026-09-04
+- Status: repeatable repository harness recorded; product-fit claim remains unknown
+- Last reviewed: 2026-09-06
 - Scope: validate the audience, workloads, and product promise in
   [product-fit.md](../product-fit.md) against the current single-node and early
   three-node slices.
@@ -41,9 +41,35 @@ inventing measurements or choosing thresholds after seeing results:
 
 The numeric values are part of the signed-off workload manifest and must come
 from the intended application or an explicitly documented representative
-workload. This note deliberately contains no measured performance numbers.
+workload. The repository manifest at
+[`product-fit-manifests/local-reference.json`](product-fit-manifests/local-reference.json)
+is explicitly a representative engineering envelope. It keeps the automated
+run reproducible without turning host measurements into a product SLO.
 
-## Repository validation at the baseline
+## Repeatable repository workload harness
+
+[`scripts/product_fit.py`](../../scripts/product_fit.py) drives the two local
+reference workloads through real broker processes and the public JSON-lines
+protocol. It pre-registers workload shape and numeric budgets from the manifest,
+then records the exact revision and environment alongside raw request
+transcripts, a message ledger, restart-separated Prometheus snapshots, sampled
+RSS/CPU/storage data, latency distributions, readiness and process exits, and
+broker logs. The command exits non-zero when an automated budget or semantic
+assertion fails:
+
+```text
+just product-fit
+just product-fit --workload background_work
+```
+
+Each run writes an immutable package under the ignored
+`benchmark-results/product-fit/<run-id>/` directory. The package is repository
+evidence only: it does not replace the intended-user worksheet, and its
+representative budgets must not be presented as supported limits.
+
+## Repository validation history and current baseline
+
+### Historical semantic checks (2026-09-04)
 
 On 2026-09-04, three bounded checks were run from revision
 `3e114d68cb5dab989f33fb5bb5453b0f072fcbf1`. The worktree was clean before the

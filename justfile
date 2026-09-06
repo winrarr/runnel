@@ -37,6 +37,10 @@ run:
 smoke:
     ./scripts/smoke.sh
 
+product-fit *args:
+    cargo build --locked -p runnel-server
+    python3 scripts/product_fit.py {{args}}
+
 isolated workflow="test":
     python3 scripts/isolated.py {{workflow}}
 
