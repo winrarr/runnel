@@ -1,0 +1,53 @@
+{
+  "schema_version": 1,
+  "name": "local-reference-envelope",
+  "purpose": "A repeatable engineering envelope for the two initial product-fit workloads. These limits are pre-registered comparison budgets, not user-signed product SLOs.",
+  "registered_at": "2026-09-06",
+  "encoding": "utf-8",
+  "workloads": {
+    "background_work": {
+      "description": "Durable background jobs with two transient workers, an expired delivery, a dead-letter path, and restart recovery.",
+      "durability_mode": "local append-only durable log",
+      "stream": "fit.jobs",
+      "poison_stream": "fit.poison",
+      "restart_stream": "fit.restart",
+      "consumer": "fit.workers",
+      "consumer_concurrency": 2,
+      "retained_history": "all records for the duration of the run",
+      "failure_injection": ["acknowledgement timeout", "broker restart with unacknowledged work"],
+      "messages": 20,
+      "payload_bytes": 64,
+      "keys": ["customer-a", "customer-a", "customer-b", null],
+      "ack_timeout_ms": 100,
+      "max_delivery_attempts": 2,
+      "budgets": {
+        "publish_p95_ms": 250,
+        "publish_p99_ms": 1000,
+        "throughput_min_messages_per_second": 5,
+        "rss_peak_bytes": 536870912,
+        "disk_growth_bytes": 10485760,
+        "recovery_seconds": 5
+      }
+    },
+    "events_replay": {
+      "description": "Durable application events consumed independently by a projection and an audit reader, then replayed after restart.",
+      "durability_mode": "local append-only durable log",
+      "stream": "fit.events",
+      "consumer_concurrency": 2,
+      "retained_history": "all records for the duration of the run",
+      "failure_injection": ["broker restart with an audit consumer lagging"],
+      "messages": 20,
+      "payload_bytes": 128,
+      "before_restart_messages": 8,
+      "ack_timeout_ms": 1000,
+      "budgets": {
+        "publish_p95_ms": 250,
+        "publish_p99_ms": 1000,
+        "throughput_min_messages_per_second": 5,
+        "rss_peak_bytes": 536870912,
+        "disk_growth_bytes": 10485760,
+        "recovery_seconds": 5
+      }
+    }
+  }
+}

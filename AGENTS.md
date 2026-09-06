@@ -27,6 +27,7 @@ Runnel is a Rust message broker intended to offer durable streams, low operation
 - scripts/isolated.py: canonical isolated workflow runner for concurrent local tests and benchmarks.
 - scripts/benchmarks/normalize.py: strips raw tool output and adds provenance for durable benchmark history.
 - scripts/benchmarks/build_history.py: aggregates normalized benchmark runs into generated history data.
+- scripts/product_fit.py: repeatable local reference-workload harness that records product-fit evidence packages.
 - docs/benchmarks/: hand-authored static benchmark dashboard served by GitHub Pages.
 - scripts/benchmarks/README.md: benchmark scope, semantics, and comparison guidance.
 - docs/architecture.md: current data flow and boundaries.
@@ -129,6 +130,7 @@ Run these from the repository root:
 - just integration runs the separate isolated process smoke, Docker image setup, single-node container-smoke, and three-node container-smoke sequence used by the CI integration job; the `cluster_smoke` process recovery test is owned by `just verify` and is not duplicated here. Callers may provide `CARGO_TARGET_DIR` for the process smoke build, and CI prebuilds one `runnel:dev` image with reusable Docker layers for both container workflows.
 - just run starts a local broker with data in ./data.
 - just smoke starts a real broker and uses runnelctl to exercise publish, consume, acknowledgement, restart recovery, readiness, and metrics with temporary state.
+- just product-fit builds the broker and runs the pre-registered local background-work and event/replay workloads, writing an opt-in evidence package under benchmark-results/product-fit/.
 - just isolated runs the default workspace test with a unique Cargo target, temporary directory, and benchmark artifact directory; pass a supported workflow such as `just isolated cluster-test`, `just isolated cluster-replacement-test`, `just isolated bench-container-smoke`, or `just isolated bench-cluster-container-smoke` for concurrent work. An explicitly supplied `CARGO_TARGET_DIR` is for sequential workflows only.
 - just cluster-test starts three real broker processes, exercises quorum replication, follower restart, leader failure, and recovery through the public protocol.
 - just cluster-replacement-test runs the opt-in snapshot replacement experiment that depends on the test-only permissive recovery feature.

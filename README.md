@@ -67,6 +67,8 @@ Useful workflows:
 
     just run
     just smoke
+    just product-fit
+    just product-fit --workload background_work
     just isolated
     just isolated cluster-test
     just isolated cluster-replacement-test
@@ -110,7 +112,7 @@ for the format; GitHub Actions enforces it on pull requests and new commits to
 
 When multiple local processes, containers, or test suites need to run at the same time, use `just isolated <workflow>`. Each invocation gets its own Cargo target directory, temporary-file directory, benchmark artifact directory, and workflow-specific Docker resources. The supported workflows are listed by `python3 scripts/isolated.py --help`; failed runs retain their temporary state for diagnosis, while successful build state is removed and benchmark results remain under `benchmark-results/isolated/`. This is intentionally a named-workflow interface rather than a wrapper for arbitrary commands whose ports or external state are unknown.
 
-The test suite includes core persistence and recovery tests, wire-format round-trip tests, and a network-level test that starts the real broker process and verifies acknowledgement state across restart. `just smoke` is the canonical local end-to-end test: it starts the broker itself and uses `runnelctl` to publish, consume, acknowledge, restart, and verify recovery. See [docs/testing.md](docs/testing.md) for the interactive walkthrough and test layers.
+The test suite includes core persistence and recovery tests, wire-format round-trip tests, and a network-level test that starts the real broker process and verifies acknowledgement state across restart. `just smoke` is the canonical local end-to-end test: it starts the broker itself and uses `runnelctl` to publish, consume, acknowledge, restart, and verify recovery. `just product-fit` runs the two pre-registered local reference workloads through the public protocol and writes an evidence package under the ignored `benchmark-results/product-fit/` directory; use `--workload` to run only one. It is an opt-in evidence workflow, not a production SLO or CI gate. See [docs/testing.md](docs/testing.md) for the interactive walkthrough and test layers.
 
 Benchmark workflows and interpretation are documented in [docs/benchmarking.md](docs/benchmarking.md). See [scripts/benchmarks/README.md](scripts/benchmarks/README.md) for harness semantics and comparison limitations.
 
