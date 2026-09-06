@@ -2,8 +2,10 @@
 
 - Status: proposed design; not an accepted compatibility contract
 - Date: 2026-09-02
+- Last reviewed: 2026-09-06
+- Baseline: `2a917aeaf442a8970519206309852e12a20ca3c4`
 - Scope: public client/broker requests and responses
-- Related debt: TD-003 and [Make client interactions dependable and evolvable](../backlog.md#make-client-interactions-dependable-and-evolvable)
+- Related debt: TD-003, TD-023, and [Make client interactions dependable and evolvable](../backlog.md#make-client-interactions-dependable-and-evolvable)
 
 This note defines the smallest useful compatibility policy for the current
 wire and a direction for its next evolution. It records observed behavior and
@@ -78,6 +80,60 @@ client intentionally leaves retry policy to the caller.
 
 These facts describe the implementation at this baseline. They are not a
 claim that arbitrary v1 clients and future servers interoperate.
+
+### Current resource-admission boundary (TD-023)
+
+Resource admission and protocol compatibility are separate contracts. The
+server's [`ProtocolAdmission`](../../crates/runnel-server/src/protocol.rs)
+configuration protects this process from bounded classes of client pressure;
+the shared [`PROTOCOL_SUPPORT`](../../crates/runnel-protocol/src/lib.rs)
+constant only describes what the current source was built to understand. The
+listener does not send a preface or Hello, and it does not negotiate any of
+these values with a client.
+
+The resource boundary currently established by the server is:
+
+| Resource or stage | Observed guarantee | Deliberately not guaranteed |
+| --- | --- | --- |
+| TCP connections | `--max-connections` is enforced with a semaphore at accept time. An over-limit client receives a best-effort `connection_limit` error and is not assigned a connection task. | No authentication, per-client identity, fairness, or TLS boundary exists. The limit is process-local and is not advertised on the broker connection. |
+| Request frame | `--max-request-bytes` is validated between 1 and 64 MiB. The reader bounds retained frame bytes before JSON parsing; JSON and base64 representation bytes count toward the limit. Oversized frames receive `request_too_large` and close that connection. | No negotiated request or response size exists. The server does not promise that a client-side size setting matches its configured limit. |
+| Response frame | The client bounds response buffering with its local `max_response_bytes` setting and discards the connection when that bound is exceeded. | The server currently serializes a response before writing it and has no equivalent configured response-size or pre-allocation bound. Response size is not advertised or negotiated. |
+| In-flight work | `--max-in-flight-requests` is acquired only after a complete request parses and is held through engine handling, response serialization, and socket write. Saturated requests receive `request_saturated`; slow readers do not consume this permit, while slow writers intentionally do. | No queueing, priority, per-tenant quota, or admission guarantee exists for a particular operation. |
+| Request time | `--request-timeout-ms` bounds incomplete frame reads and request handling, with response-write expiry tracked separately. A timeout after request bytes were sent can still be an unknown operation outcome. | The timeout is not proof that the engine did not apply a mutation, and it is not a negotiated deadline or an end-to-end latency SLO. |
+| Shutdown | Idle and partial frame reads observe shutdown, and the listener drains accepted connection tasks within the server shutdown bound. | A client is not promised that an in-progress operation will be cancelled before the engine crosses its durability boundary. |
+
+The real-process [`admission` tests](../../crates/runnel-server/tests/admission.rs)
+cover configured-limit reporting, connection floods, bounded oversized frames,
+partial and slow reads, slow response writers, sustained in-flight saturation,
+recovery of health and durable traffic, and the corresponding low-cardinality
+metrics. They do not establish behavior under sustained filesystem pressure,
+host memory/CPU exhaustion, or a full multi-resource pressure matrix; those
+remain part of TD-023.
+
+The compatibility boundary at the same baseline is narrower:
+
+- The server, client, and wire crate declare the same provisional
+  `runnel-json-lines` v1 support and UTF-8/base64 payload forms. The server's
+  alignment test checks these declarations, but it is a source-level check.
+- A v1 connection starts sending JSON-lines immediately. There is no runtime
+  protocol-name check, version negotiation, capability discovery, negotiated
+  frame/response limit, or typed unsupported-version result.
+- The v1 error response contains a code and diagnostic message, not an
+  authoritative operation stage/outcome. The reusable client therefore keeps
+  conservative classifications: local validation and clearly pre-write
+  failures can be rejected/retried, while post-write timeout, EOF, and response
+  loss remain unknown.
+- The client can bound response buffering with `max_response_bytes`, but the
+  server does not advertise or enforce that client-local value as a connection
+  property. Reconnecting does not renegotiate it.
+
+Consequently, a v1 client and server sharing the same Rust declaration is not
+evidence of cross-release interoperability. An unknown operation currently
+fails through v1 request/response parsing; it is not a capability probe with a
+stable fallback contract. Future v2 work must keep these resource limits
+independent from a connection-scoped version/capability handshake, explicitly
+negotiate any limits that affect wire behavior, and add the real-server
+old/new, no-overlap, reconnect, and malformed-preface tests listed below.
 
 ## Proposed v2 compatibility policy
 
