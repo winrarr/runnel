@@ -1,11 +1,12 @@
 # Durable storage upgrade policy (proposal)
 
 - Status: exploratory design proposal; not an accepted compatibility decision
-- Last reviewed: 2026-09-03
-- Baseline: `5bed1e052fcf907d2ab8ce3aa22da961b38540f1`
+- Last reviewed: 2026-09-06
+- Baseline: `55b4714dcfb1343e11652d9e63323ad1b96c2451`
 - Scope: [Make durable storage upgrades safe](../backlog.md#make-durable-storage-upgrades-safe) and [TD-007](../tech-debt.md#td-007-storage-format-compatibility-is-not-yet-defined)
 - Detailed contract: [Safe durable storage upgrades](storage-upgrade-safety-plan.md)
 - Related boundary: [Single-node to clustered migration](single-node-to-cluster-migration.md)
+- Current evidence: [TD-007 storage compatibility evidence](td-007-storage-compatibility-evidence.md)
 
 ## Status and boundary
 
@@ -46,9 +47,13 @@ current code demonstrates.
 | Clustered state | Checkpoint and snapshot payloads accept the current version 2 and a narrow version-1 read-forward form. The Raft log and state-machine journal have separate version 1 formats and separate persistence boundaries. | Read-forward parsing does not prove mixed-version command, snapshot, peer, consumer, or producer-deduplication semantics. |
 | Peer and snapshot transfer | Peer frames are length-bounded JSON without a version handshake. OpenRaft snapshot chunks are bounded; the current receiver retries an interrupted transfer from byte zero. | Successful decoding is not a rolling-upgrade contract, and snapshot replacement is not a general format migration. |
 
-The clustered preflight evidence is in [runnel-raft](../../crates/runnel-raft/src/lib.rs)
-and its tests; local format and consumer behavior are in [runnel-core](../../crates/runnel-core/src/lib.rs)
-and [consumer_state.rs](../../crates/runnel-core/src/consumer_state.rs).
+For the precise distinction between existing-storage validation and
+empty-directory initialization, see the [TD-007 storage compatibility evidence
+note](td-007-storage-compatibility-evidence.md). The clustered preflight
+evidence is in [runnel-raft](../../crates/runnel-raft/src/lib.rs) and its
+tests; local format and consumer behavior are in
+[runnel-core](../../crates/runnel-core/src/lib.rs) and
+[consumer_state.rs](../../crates/runnel-core/src/consumer_state.rs).
 These links describe implementation evidence, not promises for future releases.
 
 ## Compatibility and downgrade policy

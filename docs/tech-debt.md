@@ -41,7 +41,7 @@ This register records known implementation and documentation shortcomings. Produ
 
 - Status: open
 - Impact: the current Raft/state-machine formats have version checks and limited legacy recovery, but the new metadata/data-group directory layout has no migration path from the earlier single-group clustered layout. Long-lived rolling upgrades and in-place layout changes are not supported.
-- Context: startup now performs read-only preflight validation for clustered logs, checkpoints, journals, snapshots, manifests, and legacy layouts and fails closed before opening or mutating unsupported state. This is a safety boundary, not a migration or downgrade path.
+- Context: startup now validates existing clustered logs, checkpoints, journals, snapshots, manifests, identities, and legacy layouts before opening groups and fails closed without mutating unsupported state. Empty-directory startup still intentionally creates the directory and `storage.json`; that initialization is not migration. The [TD-007 storage compatibility evidence note](design/td-007-storage-compatibility-evidence.md) records the exact read-forward fixtures, refusal tests, and gates that remain before a supported conversion or rolling upgrade. This is a safety boundary, not a migration or downgrade path.
 - Retirement condition: storage metadata has an explicit upgrade and downgrade policy, a safe migration path for supported layout changes, and compatibility tests before durable format changes are relied upon.
 
 ## TD-008: Distributed Raft backend is an early static-cluster implementation
