@@ -224,7 +224,11 @@ class RunningBroker:
             stderr=subprocess.STDOUT,
             text=True,
         )
-        self.wait_ready()
+        try:
+            self.wait_ready()
+        except Exception:
+            self.stop()
+            raise
 
     def wait_ready(self) -> float:
         started = time.perf_counter_ns()
@@ -663,6 +667,7 @@ def run_background_work(
     finally:
         sampler.close()
         broker.stop()
+        shutil.rmtree(data_dir, ignore_errors=True)
 
     summary = sampler.summary()
     metrics = metrics_report(before_metrics, pre_restart_metrics, after_metrics)
@@ -681,7 +686,6 @@ def run_background_work(
     result["_transcript"] = broker.transcript
     result["_ledger"] = ledger
     result["_resource_samples"] = sampler.samples
-    shutil.rmtree(data_dir, ignore_errors=True)
     return result
 
 
@@ -837,6 +841,7 @@ def run_events_replay(
     finally:
         sampler.close()
         broker.stop()
+        shutil.rmtree(data_dir, ignore_errors=True)
 
     summary = sampler.summary()
     metrics = metrics_report(before_metrics, pre_restart_metrics, after_metrics)
@@ -855,7 +860,6 @@ def run_events_replay(
     result["_transcript"] = broker.transcript
     result["_ledger"] = ledger
     result["_resource_samples"] = sampler.samples
-    shutil.rmtree(data_dir, ignore_errors=True)
     return result
 
 

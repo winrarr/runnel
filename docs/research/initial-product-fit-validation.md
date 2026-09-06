@@ -100,14 +100,14 @@ other checks. The commands above are validation workflows, not application
 benchmarks: they do not report latency distributions, sustained throughput,
 resident-memory samples, storage growth, or participant task times.
 
-### Claim and budget disposition
+### Combined claim and budget disposition
 
 | Criterion | Disposition from this run |
 | --- | --- |
-| `B_safety` and semantic delivery behavior | **Pass for exercised assertions:** confirmed messages remained available, acknowledged progress survived restart, shared members received distinct records, retry/dead-letter transitions completed, and stale delivery state was rejected or reported as already acknowledged where the scenario required it. Keyed ordering was not part of the smoke manifest; existing contract and engine tests cover that separate predicate. |
-| `B_p95`, `B_p99`, and `B_rate` | **Unknown:** no numeric application budget was registered and these checks do not collect end-to-end distributions or sustained-rate measurements. |
-| `B_rss`, in-flight, and `B_disk` | **Unknown:** the host was not resource-limited and these checks did not sample peak resident memory, in-flight work, logical/physical storage growth, or recovery headroom. |
-| `B_rto` and replay/recovery window | **Semantic recovery passed within the test harness bounds**, including restart and one-node failover/rejoin. A numeric workload recovery budget was not registered; the cluster harness allows up to 120 s for recovery requests, which is a test timeout rather than a product SLO. |
+| `B_safety` and semantic delivery behavior | **Pass for the harness assertions:** confirmed messages remained available, acknowledged progress survived restart, shared members received distinct records, retry/dead-letter transitions completed, independent consumers advanced separately, and stale delivery state was rejected. Concurrent keyed-overlap measurement remains open; existing contract and engine tests cover that predicate separately. |
+| `B_p95`, `B_p99`, and `B_rate` | **Pass for this representative run only:** both workloads stayed below the manifest's registered publish percentile and scenario-throughput budgets. These are engineering-envelope measurements, not application SLOs or a sustained-load claim. |
+| `B_rss`, in-flight, and `B_disk` | **Partial:** RSS and physical storage growth stayed below the registered ceilings, and in-flight metrics were captured in the Prometheus snapshots. The run was host-unconstrained and did not register or prove a bounded in-flight/lag envelope. |
+| `B_rto` and replay/recovery window | **Pass for the exercised local restart:** both workloads became ready in about 53 ms and recovered their expected state within the 5 s representative budget. This does not establish a cluster RTO or migration procedure. |
 | `B_onboard` and `B_recover` | **Unknown:** maintainers ran the commands; no intended-user onboarding or recovery exercise was performed, and no operator-effort times or help requests were recorded. |
 
 The three slices therefore provide current repository evidence for the
@@ -115,6 +115,28 @@ acceptance surface, but none meets the full product-fit acceptance criterion
 that requires numeric operating budgets and intended-user evidence. A green
 test is not evidence that an engineer understands consumer groups, replay,
 redelivery, stale acknowledgements, or cluster recovery.
+
+### Current reference workload run (2026-09-06)
+
+The new harness was run from revision
+`cc18ac6bf7d162a8ce4a76c3464ca20bc645ae4f` with
+`python3 scripts/product_fit.py --output-dir /tmp/runnel-product-fit-cc18ac6`.
+The host was Linux 7.0.0-31-generic on x86_64 with 20 logical CPUs; this was a
+native, unconstrained local process run. Both workloads completed with an
+automated `pass` against the representative manifest budgets:
+
+| Workload | Messages | Publish p95 / p99 | Scenario throughput | RSS peak | Storage growth | Restart-to-ready |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| Durable background work | 20 | 0.061 / 0.086 ms | 29.69 msg/s | 15.8 MiB | 4,809 B | 0.053 s |
+| Application events and replay | 20 | 0.638 / 0.642 ms | 120.32 msg/s | 15.5 MiB | 6,512 B | 0.053 s |
+
+The packages contained 74 and 103 protocol transcript entries respectively,
+message ledgers with 68 and 102 events, three readiness/metrics phases, raw
+resource samples, and per-workload broker logs. The harness exercised keyed
+fields, two-member grouped delivery, expiry/redelivery, stale-token rejection,
+dead-letter handling, independent consumers, replay, and restart recovery. It
+does not establish concurrent keyed-overlap absence, a sustained-rate envelope,
+or an operator-effort result; those remain separate evidence requirements.
 
 ### Evidence-supported operating point and explicit boundaries
 
@@ -384,15 +406,17 @@ These sources are used as reference points, not compatibility targets:
 
 ## Benchmark applicability and current conclusion
 
-This is a design/research change with no runtime path change. No benchmark is
-required for this note, and no latency, throughput, memory, storage, or product
-fit claim is made. Future representative end-to-end performance runs should
-follow [benchmarking.md](../benchmarking.md); synthetic broker results alone
-cannot satisfy the product-fit outcome.
+This is a design/research and tooling change with no broker runtime path
+change. The reference harness records latency, throughput, memory, storage, and
+restart measurements only against its pre-registered representative envelope;
+it is not an optimization benchmark or a product SLO. Future broader
+performance runs should follow [benchmarking.md](../benchmarking.md), and
+synthetic or local results alone cannot satisfy the product-fit outcome.
 
-Current conclusion: the three repository checks provide credible automated
-semantic evidence for the selected slices, but initial product fit remains
-`unknown` until intended-user exercises, pre-registered operating budgets,
-resource/fault coverage, and a documented single-node-to-cluster migration
-result are available. The backlog progress note records this partial result;
-the evidence does not warrant adoption claims or closure of the outcome.
+Current conclusion: the reference harness adds reproducible automated evidence
+for the two local workloads and passes its representative budgets, but initial
+product fit remains `unknown` until intended-user exercises, application-owned
+budgets, broader resource/fault coverage, and a documented
+single-node-to-cluster migration result are available. The backlog progress
+note records this partial result; the evidence does not warrant adoption claims
+or closure of the outcome.
