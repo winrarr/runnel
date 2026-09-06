@@ -25,6 +25,7 @@ def build_workload(args: argparse.Namespace) -> dict[str, Any]:
         "nodes": args.nodes,
         "ack_timeout_ms": args.ack_timeout_ms,
         "slow_consumer_delay_ms": args.slow_consumer_delay_ms,
+        "slow_consumer_timeout_seconds": args.slow_consumer_timeout_seconds,
         "batch_size": args.batch_size,
         "hot_ordering": {
             "hot_key_messages": args.hot_key_messages,

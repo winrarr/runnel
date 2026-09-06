@@ -30,6 +30,7 @@ from cluster_scenarios import (  # noqa: E402
     DEFAULT_HOT_ORDERING_TIMEOUT_SECONDS,
     DEFAULT_PUBLISH_BATCH_SIZE,
     DEFAULT_RETAINED_RECOVERY_MESSAGES,
+    DEFAULT_SLOW_CONSUMER_BACKPRESSURE_TIMEOUT_SECONDS,
     DEFAULT_SCENARIOS,
     HotOrderingObservation,
     MAX_HOT_KEY_PROCESSING_DELAY_MS,
@@ -38,6 +39,7 @@ from cluster_scenarios import (  # noqa: E402
     MAX_HOT_ORDERING_TIMEOUT_SECONDS,
     MAX_LEADER_FAILURE_TIMEOUT_SECONDS,
     MAX_PUBLISH_BATCH_SIZE,
+    MAX_SLOW_CONSUMER_BACKPRESSURE_TIMEOUT_SECONDS,
     MIN_RETAINED_RECOVERY_MESSAGES,
     _hot_ordering_metadata,
     batch_metric,
@@ -52,6 +54,7 @@ from cluster_scenarios import (  # noqa: E402
     run_publish_batch,
     run_retained_hot_path,
     run_retained_recovery,
+    run_slow_consumer_backpressure,
 )
 from common import BenchmarkError, metric, parse_nonnegative_int, percentile  # noqa: E402
 from profile import summarize_timing_logs  # noqa: E402
@@ -148,6 +151,7 @@ class ClusterBenchmarkTests(unittest.TestCase):
         self.assertEqual(result["schema_version"], 2)
         self.assertEqual(result["run_id"], "run-id")
         self.assertEqual(result["workload"]["retained_hot_path_messages"], 2048)
+        self.assertEqual(result["workload"]["slow_consumer_timeout_seconds"], 60.0)
         self.assertNotIn("retained_recovery_messages", result["workload"])
         self.assertEqual(result["backends"]["runnel-cluster"]["startup_seconds"], 2.0)
         self.assertEqual(
@@ -200,6 +204,7 @@ class ClusterBenchmarkTests(unittest.TestCase):
         self.assertNotIn("leader_failure_recovery", args.scenarios)
         self.assertNotIn("hot_ordering", args.scenarios)
         self.assertNotIn("retained_hot_path", args.scenarios)
+        self.assertNotIn("slow_consumer_backpressure", args.scenarios)
 
     def test_retained_hot_path_is_opt_in_and_accepts_retained_history(self) -> None:
         with patch.object(
@@ -970,6 +975,95 @@ class ClusterBenchmarkTests(unittest.TestCase):
         ):
             with self.assertRaises(SystemExit):
                 parse_args()
+
+    def test_slow_consumer_backpressure_options_are_opt_in_and_bounded(self) -> None:
+        with patch.object(
+            sys,
+            "argv",
+            [
+                "cluster.py",
+                "--scenarios",
+                "slow_consumer_backpressure",
+                "--slow-consumer-timeout-seconds",
+                "12.5",
+            ],
+        ):
+            args = parse_args()
+
+        self.assertEqual(args.scenarios, ["slow_consumer_backpressure"])
+        self.assertEqual(args.slow_consumer_timeout_seconds, 12.5)
+        self.assertEqual(
+            DEFAULT_SLOW_CONSUMER_BACKPRESSURE_TIMEOUT_SECONDS, 60.0
+        )
+        with patch.object(
+            sys,
+            "argv",
+            [
+                "cluster.py",
+                "--slow-consumer-timeout-seconds",
+                str(MAX_SLOW_CONSUMER_BACKPRESSURE_TIMEOUT_SECONDS + 1),
+            ],
+        ):
+            with self.assertRaises(SystemExit):
+                parse_args()
+
+    def test_slow_consumer_backpressure_verifies_duplicate_delivery_window(self) -> None:
+        state = {"next_offset": 0, "in_flight": None}
+
+        class FakeClient:
+            def request(self, request: dict[str, object]) -> tuple[dict[str, object], int]:
+                if request["op"] == "poll":
+                    if state["in_flight"] is None:
+                        state["in_flight"] = state["next_offset"]
+                    return {
+                        "type": "message",
+                        "offset": state["in_flight"],
+                        "payload": "payload",
+                        "delivery_attempt": 1,
+                    }, 100
+                if request["op"] == "ack":
+                    if request["offset"] != state["in_flight"]:
+                        raise AssertionError(f"unexpected acknowledgement: {request}")
+                    state["next_offset"] += 1
+                    state["in_flight"] = None
+                    return {"type": "acknowledged"}, 200
+                raise AssertionError(f"unexpected request: {request}")
+
+            def close(self) -> None:
+                return None
+
+        clients = [FakeClient() for _ in range(3)]
+        cluster = SimpleNamespace(
+            node_count=3,
+            stats=object(),
+            metrics=lambda: None,
+            client=lambda index, **_: clients[index],
+        )
+
+        def run_measurement(_stats: object, operation: object, **_: object) -> dict:
+            return operation()
+
+        with (
+            patch("cluster_scenarios.preload") as preload,
+            patch("cluster_scenarios.measure_scenario", side_effect=run_measurement),
+            patch("cluster_scenarios.time.sleep"),
+        ):
+            result = run_slow_consumer_backpressure(
+                cluster,
+                "events",
+                "payload",
+                messages=3,
+                processing_delay_ms=10,
+                timeout_seconds=1,
+            )
+
+        preload.assert_called_once_with(cluster, "events", "payload", 3)
+        backpressure = result["metadata"]["backpressure"]
+        self.assertEqual(backpressure["duplicate_polls"], 3)
+        self.assertEqual(backpressure["duplicate_matches"], 3)
+        self.assertEqual(backpressure["max_logical_in_flight_deliveries_observed"], 1)
+        self.assertTrue(backpressure["delivery_window_verified"])
+        self.assertFalse(backpressure["publisher_throttling_or_rejection_exercised"])
 
     def test_retained_recovery_messages_default_and_boundary_are_above_tail_index(self) -> None:
         with patch.object(sys, "argv", ["cluster.py"]):
