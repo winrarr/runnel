@@ -158,6 +158,55 @@ async fn typed_client_accepts_a_large_binary_response_within_its_byte_bound() {
     assert_eq!(message.payload, payload);
 }
 
+#[tokio::test]
+async fn typed_client_application_flow_recovers_after_broker_restart() {
+    let directory = TempDir::new().unwrap();
+    let server = RunningServer::start(directory.path(), &["--ack-timeout-ms", "50"]);
+    let mut client = Client::connect(server.broker_addr).await.unwrap();
+
+    client.create_stream("orders").await.unwrap();
+    let payload = vec![0, 1, 255, b'\n', 42];
+    let receipt = client
+        .publish_bytes_with_options(
+            "orders",
+            payload.clone(),
+            PublishOptions::default().with_request_id("order-1"),
+        )
+        .await
+        .unwrap();
+    let message = client
+        .poll_bytes("orders", "worker")
+        .await
+        .unwrap()
+        .expect("the application should receive its order");
+    assert_eq!(message.offset, receipt.offset);
+    assert_eq!(message.payload, payload);
+    drop(client);
+    drop(server);
+
+    let server = RunningServer::start(directory.path(), &["--ack-timeout-ms", "50"]);
+    let mut recovered = Client::connect(server.broker_addr).await.unwrap();
+    let redelivered = recovered
+        .poll_bytes("orders", "worker")
+        .await
+        .unwrap()
+        .expect("an unacknowledged order should be redelivered after restart");
+    assert_eq!(redelivered.offset, receipt.offset);
+    assert_eq!(redelivered.payload, payload);
+    assert_eq!(redelivered.delivery_attempt, Some(2));
+    recovered
+        .ack("orders", "worker", redelivered.offset)
+        .await
+        .unwrap();
+    assert!(
+        recovered
+            .poll_bytes("orders", "worker")
+            .await
+            .unwrap()
+            .is_none()
+    );
+}
+
 #[cfg(unix)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn typed_client_bounds_timeout_and_cancellation_before_reconnect() {
