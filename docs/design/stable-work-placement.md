@@ -2,7 +2,7 @@
 
 - Status: exploratory design proposal; no runtime implementation commitment
 - Last reviewed: 2026-09-06
-- Baseline: `d5f033ec1db8ee7402e5b7a96ef2935f0a1325d6`
+- Baseline: `3423f5c7e1612c915cd8fcb89b1e0639b17fd254`
 - Reading guide: [design-note conventions](README.md)
 - Scope: stable scheduling units for large shared-consumer pools
 - Related outcome: [Explore stable internal work placement](../backlog.md)
@@ -41,11 +41,11 @@ lane per stream, gives it FIFO execution ownership, and bounds its waiter queue;
 it serializes synchronous storage operations and does not assign records,
 ordering keys, or shared-consumer members. It is therefore an execution and
 backpressure mechanism, not an answer to TD-016. See [`StorageExecutor` and
-`StorageLane`](../../crates/runnel-core/src/lib.rs#L111-L413).
+`StorageLane`](../../crates/runnel-core/src/storage.rs#L15-L340).
 
 The shared-consumer scheduler is the grouped delivery path: local
-[`Broker::poll_group`](../../crates/runnel-core/src/lib.rs#L791-L909) and
-clustered [`apply_group_poll`](../../crates/runnel-raft/src/lib.rs#L1564-L1739).
+[`Broker::poll_group`](../../crates/runnel-core/src/broker.rs#L233-L335) and
+clustered [`apply_group_poll`](../../crates/runnel-raft/src/delivery.rs#L49-L224).
 The public operation still supplies only a stream, consumer, and transient
 member, and the response still contains a record, opaque delivery token, and
 attempt number. A placement lane, owner, generation, and ready queue must stay
@@ -60,7 +60,7 @@ that placement must preserve:
 
 | Area | Current behavior | Consequence for stable placement |
 | --- | --- | --- |
-| Public model | The engine and provisional protocol expose a stream, durable consumer, transient member, record, acknowledgement, opaque token, and attempt. They do not expose a partition, lane, node, or assignment. See [`Engine::poll_group`](../../crates/runnel-engine/src/lib.rs#L216-L227) and [`Request::PollGroup`/`AckGroup`](../../crates/runnel-protocol/src/lib.rs#L99-L126). | A future scheduler may add internal state, but no response or required client operation may expose its units or owners. |
+| Public model | The engine and provisional protocol expose a stream, durable consumer, transient member, record, acknowledgement, opaque token, and attempt. They do not expose a partition, lane, node, or assignment. See [`Engine::poll_group`](../../crates/runnel-engine/src/lib.rs#L322-L333) and [`Request::PollGroup`/`AckGroup`](../../crates/runnel-protocol/src/lib.rs#L195-L211). | A future scheduler may add internal state, but no response or required client operation may expose its units or owners. |
 | Selection | Both paths first return an existing unexpired delivery for the requesting member. They then select from records at or after the committed offset, skipping acknowledged offsets, all in-flight offsets, and a record whose key is already in flight for the consumer. The local warm path scans its bounded tail index and its cold path scans the log from a sparse checkpoint; the cluster scans the materialized message vector. | Stable routing must be an eligibility filter or indexed candidate path, not a second acknowledgement model. It must preserve the current empty, retry, and out-of-order acknowledgement meanings. |
 | Concurrency | The first slice allows one outstanding delivery per member: local state indexes one offset per member and clustered polls find the member's existing delivery before selecting another. Unrelated keys can progress concurrently across members; a key is not delivered concurrently within one shared consumer. | Placement cannot claim batching or higher parallelism while this limit remains. A first experiment must isolate routing effects before adding read-ahead or multi-delivery credits. |
 | Membership | A member is observed only through grouped poll and acknowledgement requests. There is no durable member registry, assignment map, explicit join protocol, or public graceful-leave operation. | Stable ownership needs an authoritative bounded member lease/lifecycle. The exact renewal, duplicate-identity, and graceful-leave behavior is unresolved and must not be smuggled into the public placement model. |
@@ -83,9 +83,9 @@ boundary:
    the tail, the implementation scans the log from the nearest sparse
    checkpoint. The selected record's payload is read from the log, the
    delivery-attempt event is synced, and only then is the volatile in-flight
-   entry returned. See [`StreamLog::find_candidate`](../../crates/runnel-core/src/lib.rs#L1591-L1625),
-   [`record_is_candidate`](../../crates/runnel-core/src/lib.rs#L2041-L2055), and
-   [`poll_group`](../../crates/runnel-core/src/lib.rs#L791-L909).
+   entry returned. See [`StreamLog::find_candidate`](../../crates/runnel-core/src/stream_log.rs#L520-L555),
+   [`record_is_candidate`](../../crates/runnel-core/src/stream_log.rs#L1041-L1055), and
+   [`poll_group`](../../crates/runnel-core/src/broker.rs#L233-L335).
 2. **Clustered committed delivery.** `apply_group_poll` runs as one committed
    state-machine command. It advances the replicated lease-clock floor,
    removes expired entries by iterating the consumer's in-flight map, returns
@@ -93,8 +93,8 @@ boundary:
    `StreamState::messages` from the committed offset until the same eligibility
    rule succeeds. It records the attempt and `GroupDelivery` in the replicated
    state; the token is derived from the assignment command's committed Raft
-   log identity. See [`GroupConsumerState`](../../crates/runnel-raft/src/lib.rs#L219-L237)
-   and [`apply_group_poll`](../../crates/runnel-raft/src/lib.rs#L1564-L1739).
+   log identity. See [`GroupConsumerState`](../../crates/runnel-raft/src/delivery.rs#L21-L29)
+   and [`apply_group_poll`](../../crates/runnel-raft/src/delivery.rs#L49-L224).
 3. **Acknowledgement boundary.** Local `ack_group` persists the acknowledgement
    event before updating the materialized checkpoint and removing in-flight
    state. It does not independently expire a deadline; an expired local
@@ -422,15 +422,23 @@ messages across four keys and four members, and 64 unacknowledged members; the
 setup is outside the measured loop and the grouped cases are sequential
 member turns. See the [shared-consumer Criterion cases](../../crates/runnel-core/benches/broker.rs#L172-L275).
 The cluster runner covers sequential two-member grouped delivery and a
-parallel grouped case, while its bounded slow-consumer case is a non-grouped
-single-member control. See the [cluster grouped cases](../../scripts/benchmarks/cluster.py#L956-L1056)
-and [slow-consumer control](../../scripts/benchmarks/cluster.py#L909-L953).
-These scenarios establish small uniform baselines, but they do not exercise
-stable ownership movement, hot-key concentration, concurrent membership churn,
-member capacity skew, grouped slow-member isolation, failure during handoff, or
-consume-side batching. The standard `bench-pr-local` comparison is aimed at
-the existing three-node workload and cannot establish this design question by
-itself.
+parallel grouped case. Its bounded slow-consumer control is non-grouped and
+single-member, while the opt-in `slow_consumer_backpressure` probe verifies the
+ordinary consumer's one-in-flight window by polling the same consumer from a
+second client before acknowledgement; neither probe exercises multiple grouped
+members with different processing speeds. See the [cluster grouped cases](../../scripts/benchmarks/cluster_scenarios.py#L693-L794),
+[slow-consumer control](../../scripts/benchmarks/cluster_scenarios.py#L510-L555),
+and [slow-consumer backpressure probe](../../scripts/benchmarks/cluster_scenarios.py#L557-L687).
+The opt-in `hot_ordering` probe now exercises a bounded mixed hot/cold keyed
+grouped workload with concurrent workers and verifies per-key delivery and
+completion order, but it does not exercise stable ownership movement. See the
+[hot-ordering probe](../../scripts/benchmarks/cluster_scenarios.py#L1060-L1222).
+Together these scenarios establish small uniform, hot-key, and ordinary
+slow-consumer baselines, but they do not exercise stable ownership movement,
+concurrent membership churn, member capacity skew, grouped slow-member
+isolation, failure during handoff, or consume-side batching. The standard
+`bench-pr-local` comparison is aimed at the existing three-node workload and
+cannot establish this design question by itself.
 
 No focused benchmark is feasible in this change because there is no runtime
 placement implementation to measure. Adding speculative benchmark code would
@@ -571,15 +579,16 @@ remains an optimization hypothesis.
 - [Local shared-consumer delivery, ADR 0013](../decisions/0013-local-shared-consumer-delivery.md)
 - [Clustered shared-consumer ownership, ADR 0015](../decisions/0015-clustered-shared-consumer-ownership.md)
 - [Independent retained storage and placement, ADR 0023](../decisions/0023-independent-retained-storage-and-placement.md)
-- [`StorageExecutor` and `StorageLane`](../../crates/runnel-core/src/lib.rs#L111-L413)
-- [`Broker::poll_group` and local acknowledgement](../../crates/runnel-core/src/lib.rs#L791-L981)
-- [`StreamLog::find_candidate` and local eligibility predicate](../../crates/runnel-core/src/lib.rs#L1591-L1625)
-- [`apply_group_poll` and clustered acknowledgement](../../crates/runnel-raft/src/lib.rs#L1564-L1827)
+- [`StorageExecutor` and `StorageLane`](../../crates/runnel-core/src/storage.rs#L15-L340)
+- [`Broker::poll_group` and local acknowledgement](../../crates/runnel-core/src/broker.rs#L233-L407)
+- [`StreamLog::find_candidate` and local eligibility predicate](../../crates/runnel-core/src/stream_log.rs#L520-L555)
+- [`apply_group_poll` and clustered acknowledgement](../../crates/runnel-raft/src/delivery.rs#L49-L312)
 - [Shared-consumer Criterion benchmarks](../../crates/runnel-core/benches/broker.rs#L172-L275)
-- [Clustered grouped benchmark scenarios](../../scripts/benchmarks/cluster.py#L956-L1056)
+- [Clustered grouped benchmark scenarios](../../scripts/benchmarks/cluster_scenarios.py#L693-L794)
 - [Reusable shared-delivery contract assertions](../../crates/runnel-test-support/src/lib.rs#L96-L324)
-- [Local grouped restart and expiry tests](../../crates/runnel-core/src/lib.rs#L3657-L3731)
-- [Clustered grouped restart and dead-letter tests](../../crates/runnel-raft/src/lib.rs#L4680-L4866)
+- [Local grouped restart and expiry tests](../../crates/runnel-core/src/lib.rs#L783-L870)
+- [Local grouped restart recovery test](../../crates/runnel-core/src/lib.rs#L1437-L1488)
+- [Clustered grouped restart and dead-letter tests](../../crates/runnel-raft/src/lib.rs#L1220-L1428)
 - [Clustered benchmark semantics](../../scripts/benchmarks/README.md)
 - [Benchmarking and evidence policy](../benchmarking.md)
 - [Kafka KIP-429: incremental cooperative rebalancing](https://cwiki.apache.org/confluence/display/KAFKA/KIP-429%3A%2BKafka%2BConsumer%2BIncremental%2BRebalance%2BProtocol)
