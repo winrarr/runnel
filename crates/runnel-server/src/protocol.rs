@@ -1,7 +1,7 @@
 use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 
-use runnel_protocol::Response;
+use runnel_protocol::{ProtocolSupport, Response};
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::net::TcpStream;
 use tokio::sync::watch;
@@ -9,6 +9,14 @@ use tokio::sync::watch;
 use crate::observability::ServerMetrics;
 
 const MAX_CONFIGURED_REQUEST_BYTES: usize = runnel_protocol::MAX_PUBLISH_BATCH_BYTES;
+
+/// Protocol compatibility declared by the server's current listener.
+///
+/// The provisional JSON-lines listener has no runtime handshake, so this is a
+/// source-level declaration rather than a negotiated connection property.
+pub(crate) const PROTOCOL_SUPPORT: ProtocolSupport = runnel_protocol::PROTOCOL_SUPPORT;
+
+const _: () = assert!(PROTOCOL_SUPPORT.versions.min <= PROTOCOL_SUPPORT.versions.max);
 
 const CONNECTION_REJECTION_WRITE_TIMEOUT: Duration = Duration::from_millis(10);
 
@@ -205,5 +213,25 @@ pub(crate) fn timeout_response() -> Response {
     Response::Error {
         code: "request_timeout".to_owned(),
         message: "request exceeded the configured timeout".to_owned(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::PROTOCOL_SUPPORT as SERVER_PROTOCOL_SUPPORT;
+    use runnel_client::PROTOCOL_SUPPORT as CLIENT_PROTOCOL_SUPPORT;
+    use runnel_protocol::{PROTOCOL_SUPPORT as WIRE_PROTOCOL_SUPPORT, PayloadEncoding};
+
+    #[test]
+    fn protocol_support_stays_aligned_across_wire_client_and_server() {
+        assert_eq!(SERVER_PROTOCOL_SUPPORT, WIRE_PROTOCOL_SUPPORT);
+        assert_eq!(CLIENT_PROTOCOL_SUPPORT, WIRE_PROTOCOL_SUPPORT);
+        assert_eq!(SERVER_PROTOCOL_SUPPORT.name, "runnel-json-lines");
+        assert_eq!(SERVER_PROTOCOL_SUPPORT.versions.min, 1);
+        assert_eq!(SERVER_PROTOCOL_SUPPORT.versions.max, 1);
+        assert_eq!(
+            SERVER_PROTOCOL_SUPPORT.payload_encodings,
+            &[PayloadEncoding::Utf8Text, PayloadEncoding::Base64]
+        );
     }
 }
