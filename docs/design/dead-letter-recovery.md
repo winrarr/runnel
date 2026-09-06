@@ -1,15 +1,24 @@
 # Dead-letter recovery across durable boundaries
 
-- Status: exploratory design note; local identity/reconciliation slice implemented, broader recovery evidence remains open
-- Date: 2026-09-01
-- Related debt: [TD-017](../tech-debt.md#td-017-dead-letter-movement-spans-separate-durable-records)
-- Related decisions: [ADR 0014](../decisions/0014-local-retry-and-dead-letter-policy.md) and [ADR 0016](../decisions/0016-clustered-retry-and-dead-letter-policy.md)
+- Status: exploratory design note; local move reconciliation is implemented, while broader failure-boundary and provenance evidence remains open
+- Last reviewed: 2026-09-06
+- Baseline: `fa51d9789b7ce5b284eda62903641597b02f96e0`
+- Reading guide: [design-note conventions](README.md)
+- Related debt: [TD-017](../tech-debt.md#td-017-dead-letter-movement-spans-separate-durable-records) and [TD-018](../tech-debt.md#td-018-retry-policy-and-dead-letter-provenance-are-coarse)
+- Related decisions: [ADR 0014](../decisions/0014-local-retry-and-dead-letter-policy.md), [ADR 0016](../decisions/0016-clustered-retry-and-dead-letter-policy.md), and [ADR 0026](../decisions/0026-semantic-engine-error-classification.md)
+- Related boundaries: [durability and delivery policy](durability-delivery-policy.md), [application-aware retry policy](application-aware-retry-policy.md), and [clustered outcomes](clustered-outcome-contract.md)
 
-This note investigates the failure boundary in which dead-letter movement updates a source consumer and a derived stream. It is a design input for further recovery work, not an acceptance of new protocol behavior. The local identity/reconciliation slice is now implemented; [ADR 0014](../decisions/0014-local-retry-and-dead-letter-policy.md) records current behavior and [TD-017](../tech-debt.md#td-017-dead-letter-movement-spans-separate-durable-records) separates its focused evidence from remaining failure-boundary work. The stages below are proposal context, not an instruction to repeat completed work.
+This note separates the observed local append/reconcile behavior from the
+clustered same-group transition and from future cross-group choices. It is a
+design input, not an acceptance of new protocol behavior. Rust code and tests
+at the named baseline remain authoritative; the implementation sketches and
+evidence gates below are not requirements to introduce a particular API,
+storage format, or transaction protocol.
 
-## Outcome and non-goals
+## Scope and non-goals
 
-The local reconciliation approach uses a stable dead-letter move identity:
+The current local slice uses a stable dead-letter move identity and retains
+the existing no-loss ordering:
 
 1. Keep the existing safety order: durably append the derived record before
    durably advancing the source consumer.
@@ -21,29 +30,41 @@ The local reconciliation approach uses a stable dead-letter move identity:
    rather than append another record.
 4. Advance the source only after the target append is known to be durable. If
    the target result is uncertain or cannot be reconciled, leave source
-   progress unchanged and return a storage failure; a later poll/recovery
-   attempt retries the same identity.
+   progress unchanged and return a backend failure with the conservative
+   `Unknown` outcome; a later poll/recovery attempt retries the same identity.
 
-The implementation reuses durable request-aware record identity, rebuilt from the stream log on open, for an internal move identity. This is not a new public request contract.
-The identity must be scoped to the target stream and must reject a same-ID
-key/payload mismatch as corruption or an explicit storage error. The current
-public publish request-ID behavior, which intentionally ignores mismatched
-payloads for compatibility, is not sufficient for this internal invariant.
+The local implementation reuses the durable request-aware record identity,
+rebuilt from the target stream log on open, for this internal move identity.
+This is not a new public request contract. A same-ID key/payload mismatch
+returns an explicit invalid-data storage error; the public publish request-ID
+behavior, which intentionally ignores mismatched payloads for compatibility,
+is not sufficient for this internal invariant.
 
-The full recovery goal is at most one durable derived record per move identity; current focused tests establish reuse after a completed target append, but do not close the remaining I/O failure and legacy-record gaps. It does not provide exactly-once delivery or exactly-once application processing: a dead-letter consumer can still be redelivered, and its external side effects remain the consumer’s responsibility.
+The current clustered implementation does not use this local move identity.
+It appends the derived record and advances source progress in one replicated
+state-machine transition while both logical streams remain in the source
+stream's data group. That co-location is an accepted property of the current
+static-cluster slice, not a general cross-group transaction guarantee.
 
-## Current behavior and crash boundary
+Neither engine exposes source provenance or a redrive operation. The recovery
+goal is at most one durable local derived record per move identity after
+reconciliation, not exactly-once delivery or exactly-once application
+processing. A dead-letter consumer can still be redelivered, and its external
+side effects remain the consumer's responsibility.
+
+## Observed local append and reconciliation behavior
 
 The local engine has two independent durable objects. In
-`runnel-core`, `poll_group` checks the attempt limit, `dead_letter_record`
-appends the original key and payload to `<source>.dead-letter`, and only then
-persists a source `Acknowledge` event. Stream appends call `sync_data`; source
-consumer events append to a bounded journal and call `sync_all` before the
-operation continues. Recovery reconstructs the source state from its
-checkpoint and journal and reconstructs target records by scanning the target
-stream log. See the [local engine](../../crates/runnel-core/src/lib.rs), in
-particular `poll_group`, `dead_letter_record`, and
-`persist_consumer_event`.
+[`Broker::poll_group`](../../crates/runnel-core/src/broker.rs#L233), an
+exhausted delivery calls [`Broker::dead_letter_record`](../../crates/runnel-core/src/broker.rs#L505),
+which reads the source record, appends its key and payload to the derived
+stream, and only then persists a source `Acknowledge` event. Stream appends
+call `sync_data`; source consumer events append to a bounded journal and call
+`sync_all` before the operation continues. Recovery reconstructs consumer
+state from its checkpoint and journal and rebuilds request-aware target
+identity by scanning complete target-log frames. The relevant persistence
+boundaries are [`StreamLog::append_with_move_id`](../../crates/runnel-core/src/stream_log.rs#L314)
+and [`persist_consumer_event`](../../crates/runnel-core/src/consumer_state.rs#L91).
 
 The resulting durable order is intentional:
 
@@ -60,112 +81,139 @@ source consumer event + sync_all
 source progress advances
 ```
 
+The internal move ID is currently a bounded, length-prefixed textual value:
+
+```text
+runnel-dlq/v1/<source-stream-length>:<source-stream>/<source-consumer-length>:<source-consumer>/<source-offset>
+```
+
+[`dead_letter_move_id`](../../crates/runnel-core/src/lib.rs#L198) derives it
+from the validated source stream, source consumer, and source offset. The ID
+is stored in an `RNL3` request-aware target frame and is looked up only within
+that target stream's in-memory request-ID index. The writer enforces the
+request-aware key, payload, and identity limits. On reopen, complete request-
+aware frames rebuild that index; an incomplete trailing frame is discarded,
+while a complete checksum or format failure is reported rather than silently
+treated as a successful move.
+
 The meaningful process-crash states are:
 
 | Crash point | Durable state after recovery | Current result |
 | --- | --- | --- |
-| Before the target append reaches its durable point | Source remains eligible. Depending on the filesystem outcome, the target may be absent, have a torn tail that recovery truncates, or appear complete despite an uncertain sync. | The operation may return an I/O error. Ambiguous write/sync recovery requires further fault-injection evidence; a complete-looking record alone is not a durability proof. |
-| After the target append is durable, before the source event is durable | Target contains the copied record and internal move identity; source progress has not advanced. | New moves reuse the same-content target record before advancing source progress. A pre-source-persistence failure followed by reopen is covered; failures within the underlying write/sync remain open in TD-017. |
+| Before the target append reaches its durable point | Source remains eligible. The target may be absent, have an incomplete trailing frame that recovery truncates, or appear complete despite an uncertain sync. | The operation can return an I/O error. Under [ADR 0026](../decisions/0026-semantic-engine-error-classification.md), a generic storage result is `Unknown`; a complete-looking record alone is not a durability proof. Target-write and sync fault injection remain open in [TD-017](../tech-debt.md#td-017-dead-letter-movement-spans-separate-durable-records). |
+| After the target append is durable, before the source event is durable | Target contains the copied record and internal move identity; source progress has not advanced. | A retry reuses the same-content target record before advancing source progress. The injected source-persistence failure and reopen path are covered; target-write/sync ambiguity and legacy records remain open in TD-017. |
 | After the source event is durable | Target contains the record and source progress advances during recovery. | No second move is required for that source consumer and offset. |
-| Target write or source event has an ambiguous I/O result | The result depends on which bytes and sync boundaries reached durable storage. | The source must not be advanced on an unknown target result; recovery must inspect or retry using the same move identity. |
+| Target write or source event has an ambiguous I/O result | The result depends on which bytes and sync boundaries reached durable storage. | The source must not be advanced on an unknown target result. A later source poll may reconcile the target using the same move ID; callers must use the engine's semantic outcome rather than blindly replaying an externally visible mutation. |
 
-The public dead-letter record exposes the original key and payload, without source offset, source consumer, or attempt-history provenance. New local records also persist an internal recovery identity that is not exposed as public provenance. Public provenance remains separate work tracked by TD-018.
+The local target append checks an existing move ID's key and payload before
+reusing it. The focused tests cover stable/scoped identity
+([identity](../../crates/runnel-core/src/lib.rs#L1037)), reuse after reopen
+([reopen](../../crates/runnel-core/src/lib.rs#L1083)), source-ack persistence
+failure ([source-ack failure](../../crates/runnel-core/src/lib.rs#L1129)), and
+same-ID content mismatch ([mismatch](../../crates/runnel-core/src/lib.rs#L1191)).
+The source-ack failure test exercises the case where the target append has
+completed and the source event fails; the next poll then reconciles the
+existing target record and persists source progress. This is a duplicate-safe
+local slice, not proof that every filesystem failure mode is safe.
+
+## Observed clustered same-group movement
 
 The clustered engine has a different boundary. A grouped `PollGroup` is one
-Raft command. In `apply_group_poll`, the original message is appended to the
-derived stream held in the same `SnapshotState` as the source consumer state,
-then the source offset is advanced before the command response is returned.
-The state-machine journal is persisted before applying the command and is
-replayed after a restart. The derived dead-letter stream is resolved back to
-the source data group when addressed by the protocol. See the
-[clustered engine](../../crates/runnel-raft/src/lib.rs), in particular
-`StateMachineStore::apply`, `apply_group_poll`, and
-`data_group_for_stream`.
+Raft command. In [`apply_group_poll`](../../crates/runnel-raft/src/delivery.rs#L49),
+the original message is appended to the derived stream held in the same
+`SnapshotState` as the source consumer state, then source progress is
+advanced before the command response is returned. The state-machine journal
+is persisted before applying the command and replayed after a restart through
+[`StateMachineStore::apply`](../../crates/runnel-raft/src/state_machine_store.rs#L743).
+The derived stream is resolved back to the source data group by
+[`data_group_for_stream`](../../crates/runnel-raft/src/group_manager.rs#L338)
+when it is addressed through the public protocol.
 
 Consequently, the current clustered path has one replicated logical transition
 for source progress plus the derived record. A committed transition is not
 split by a process crash or leader change under the data-group durability
-guarantee. This is stronger than the local path, but it still does not make a
-dead-letter consumer’s processing exactly once. If a future layout puts the
-derived stream in a separate Raft data group, the cross-group problem returns;
-the current clustered behavior must not be generalized to that layout without
-a transaction or reconciliation design.
+guarantee, and a replayed state-machine journal entry restores the same
+transition rather than applying an independent local target write. This is
+stronger than the local path, but it is still only broker-side movement and
+does not make a dead-letter consumer's processing exactly once. The clustered
+transition has no move-ID or source provenance field, so its duplicate-safety
+comes from source progress and replicated command application, not from a
+cross-stream identity index.
 
-## Recommended smallest direction
+The current evidence covers unit and persistent-engine retry/dead-letter
+behavior, plus real three-process reassignment and dead-letter recovery in
+[`cluster_smoke`](../../crates/runnel-server/tests/cluster_smoke.rs#L911).
+It does not establish a transaction across independent data groups. If a
+future placement policy puts the derived stream in another group, the
+cross-group problem returns and the current same-group claim must not be
+generalized without a separately accepted transaction or reconciliation
+design.
 
-Use a deterministic, internal `move_id` for the local derived append. A
-conceptual identity is:
+## Current provenance and redrive boundary
 
-```text
-runnel-dlq/v1/<source-stream>/<source-consumer>/<source-offset>
-```
+Both engines currently expose only the copied key and payload as dead-letter
+content (along with the target's ordinary offset, timestamp, and delivery
+metadata). They do not expose the source stream incarnation, source consumer,
+source offset, attempt history, policy version, terminal reason, or a move
+identity through the public message/protocol model. Local `RNL3` frames carry
+the internal move ID for reconciliation, but it is not public provenance;
+clustered `StoredMessage` values carry no equivalent move ID. Existing
+dead-letter records therefore cannot be retroactively enriched with reliable
+origin metadata.
 
-The encoding must be bounded and unambiguous; it must not be a filesystem path
-or a public topology identifier. It may use a length-prefixed or hashed
-representation if the validated names would exceed the storage identity
-limit. The target stream remains the normal derived stream selected by the
-existing name rule.
+There is also no broker redrive operation. An application can consume a
+dead-letter stream and publish a new record, but that is a new operation with
+new offset and retry state; it is not an atomic source-to-target move and
+cannot preserve provenance by inference. Provenance, explicit terminal
+outcomes, and redrive remain the separate application-aware policy work in
+[TD-018](../tech-debt.md#td-018-retry-policy-and-dead-letter-provenance-are-coarse).
 
-The local operation should then behave as follows:
+## Future cross-group recovery choices
 
-1. Read the source record and derive the move ID from the source identity.
-2. Append the copied key and payload to the target using a durable
-   move-ID-aware append. If the target already has that move ID with the same
-   content, treat it as the successful result of the earlier attempt. If the
-   content differs, stop with an explicit corruption/storage error.
-3. Only after the target append or idempotent lookup has reached its durable
-   point, persist the source acknowledgement event. Preserve the current
-   checkpoint-before-journal-truncation ordering as well.
-4. If the process dies between steps 2 and 3, the next source poll performs
-   step 2 with the same move ID, observes the existing target record, and
-   persists the source acknowledgement without appending another target
-   record.
+The current clustered same-group transition is the accepted first layout. No
+cross-group transaction or reconciliation design has been accepted. If
+placement or named dead-letter targets later put source progress and the
+derived record in different durable groups, the implementation must choose a
+new boundary rather than inherit the current claim of atomicity.
 
-This is lazy reconciliation: no background scanner is required for the
-correctness property, because an unadvanced source remains a candidate for
-the same move. A later implementation may add a durable pending marker if
-operators need progress without another source poll, but a pending marker
-alone is not sufficient; the target append still needs a stable deduplication
-identity. If the target stream is unavailable, the source remains unadvanced
-and the pending work continues to represent at-least-once delivery.
-
-The existing request-aware stream frames are a plausible storage primitive for
-the target identity because they retain the identity in the record and
-rebuild an ID-to-offset index on restart. That primitive must be checked for
-all supported durable formats, journal truncation, retention, and malformed
-record recovery before it is reused. An equivalent dedicated move index is
-acceptable if it has the same durable lookup and recovery properties.
-
-The semantic contract for both engines should remain:
+The outcome boundary to preserve across any future choice is:
 
 - a source record is not considered dead-lettered until a durable target
-  record for its move identity exists;
+  record for its stable operation identity exists;
 - source progress never advances past a move whose target outcome is unknown;
 - retries may occur after crashes and uncertain responses;
 - a given source-consumer/offset move has one logical target record after
   reconciliation, while distinct source consumers retain distinct moves; and
 - consumers of the dead-letter stream remain at least once.
 
-## Alternatives considered
+These are outcome and evidence requirements, not a required command shape or
+storage layout. A future design also needs to define how provenance and
+redrive interact with an uncertain move, and how pending work is bounded when
+the target group is unavailable.
 
-| Alternative | Benefit | Cost or reason not selected as the smallest direction |
+### Candidate mechanisms and trade-offs
+
+| Alternative | Benefit | Cost or unresolved concern |
 | --- | --- | --- |
-| Keep append-then-checkpoint without an identity | Minimal code and preserves the append-before-progress order. | This was the original local behavior; legacy records remain opaque. New moves now use reconciliation identity, while TD-017 retains the broader recovery gaps. |
-| Full local two-phase commit across source state and target log | Can make target visibility and source advancement one all-or-none transaction. | Requires a transaction coordinator or shared commit log, prepare/commit markers, recovery of prepared work, locking/order rules across two stream files, and format/version migration. It is not justified as the smallest first repair. |
-| Durable source outbox or pending-move journal plus a relay | Makes the intent to move recoverable even if the process stops before sending to the target and can provide operator-visible backlog. | Adds another durable state machine and relay lifecycle. Without target move-ID deduplication, a crash after target append still duplicates. It is a possible follow-on if lazy reconciliation is operationally insufficient. |
-| Put the local derived record in the source log or a single combined transaction log | Gives one physical durability boundary, similar to the current clustered state machine. | Changes local stream layout, target offsets, retention, recovery, and the separation between source and derived streams. It would also make a local storage choice dictate the future engine contract. |
-| Use a saga/compensating delete | Breaks the move into local transactions without a coordinator. | A compensation after a visible target append can itself be lost or race with a dead-letter consumer. It favors eventual cleanup, not a simple no-loss and duplicate-safe invariant. |
-| Add a cross-group distributed transaction to clustered delivery | Preserves atomicity if source and target groups are split later. | Requires a replicated coordinator and participant protocol, transaction timeout/recovery rules, and client visibility/isolation semantics. Keep the current same-data-group atomic transition while the layout remains unchanged. |
+| Preserve same-group placement | Retains the current single replicated transition and avoids a cross-group protocol. | Constrains placement, named targets, balancing, and independent scaling. It is the current accepted boundary, not a general solution. |
+| Stable identity plus reconciliation | Lets independently durable groups retry an uncertain move without creating a second logical target record. | Requires durable identity/provenance, target lookup, retention fences, bounded pending work, and explicit handling for target unavailability; source and target are still not one atomic commit. |
+| Durable source outbox or pending-move journal plus a relay | Makes the intent recoverable even if the process stops before sending to the target and can provide operator-visible backlog. | Adds another durable state machine and relay lifecycle. Without target identity reconciliation, a crash after target append still duplicates; with it, eventual completion and cleanup semantics remain to be specified. |
+| Coordinator-driven cross-group transaction | Can make source progress and target visibility one all-or-none replicated operation. | Requires coordinator and participant state, prepare/commit records, timeout and recovery rules, fencing, and client visibility for in-doubt work. It also expands the public compatibility surface. |
+| Combined physical transaction log | Gives source and target one durability boundary without a distributed coordinator. | Changes local/clustered layout, target offsets, retention, recovery, and the separation between source and derived streams; it makes one storage choice dictate the engine contract. |
+| Saga or compensating delete | Breaks the move into local transactions without a coordinator. | A compensation after a visible target append can itself be lost or race with a dead-letter consumer. It favors eventual cleanup, not a simple no-loss and duplicate-safe invariant. |
+| Keep append-then-checkpoint without an identity | Preserves the original local behavior with minimal code. | The duplicate window remains and legacy records stay opaque. This is only a compatibility baseline, not a candidate for a stronger cross-group guarantee. |
 
-The recommendation follows two established patterns. Apache Kafka’s
-transaction design combines produced records and consumed offsets in an
-atomic unit, uses a persistent transaction log, and requires a stable
-transaction identity to recover unfinished work; it also explicitly limits
-the guarantee to the transactional broker/consumer boundary rather than
-arbitrary external processing ([KIP-98: Exactly Once Delivery and
+### Reference evidence
+
+Apache Kafka's transaction design combines produced records and consumed
+offsets in an atomic unit, uses a persistent transaction log, and requires a
+stable transaction identity to recover unfinished work. It also explicitly
+limits the guarantee to the transactional broker/consumer boundary rather
+than arbitrary external processing ([KIP-98: Exactly Once Delivery and
 Transactional Messaging](https://cwiki.apache.org/confluence/display/KAFKA/KIP-98+-+Exactly+Once+Delivery+and+Transactional+Messaging)).
-That is a useful reference for the full-transaction alternative, but adopting
-it locally would be a much larger storage and protocol change.
+This is evidence for the coordinator-driven alternative, not a requirement
+for Runnel's local implementation; adopting it would be a substantially
+larger storage and protocol change.
 
 RabbitMQ documents the opposite side of the trade-off. Ordinary dead-letter
 exchange republishing removes a message without publisher confirms and can
@@ -174,9 +222,10 @@ dead-lettering retains the source until the target confirms, but retries can
 produce duplicates and retained pending messages consume source resources
 ([Dead Letter Exchanges](https://www.rabbitmq.com/docs/next/dlx), [Quorum
 Queues: at-least-once dead-lettering](https://www.rabbitmq.com/docs/quorum-queues)).
-Runnel should retain the no-loss ordering and add a bounded identity-based
-retry, while making target-unavailable pressure and pending work observable in
-a future implementation.
+The comparison makes the trade-off explicit: retaining source progress until
+the target is confirmed protects against loss, while retries can duplicate
+records and pending work consumes source resources. Any future Runnel design
+needs an explicit bound and observability model for that pressure.
 
 The primary research points in the same direction. Garcia-Molina and Salem’s
 original Sagas paper models a long operation as interleaved local transactions
@@ -190,36 +239,43 @@ Distributed Transactions](https://ics.uci.edu/~cs223/papers/cidr07p15.pdf)).
 That supports a stable move identity and reconciliation, but does not prove
 exactly-once processing for Runnel or any external consumer.
 
-## Acceptance and verification gates for implementation
+## Remaining evidence gates
 
-The future implementation should not be accepted until all of these are
-demonstrated:
+The implemented local slice has focused identity, restart, source-ack failure,
+and mismatch coverage. The gates below apply before claiming a broader
+duplicate-free local guarantee or any cross-group atomicity; they are not a
+retroactive implementation checklist:
 
-1. **Durable identity:** a move ID is stable across retries and process
-   restarts, distinct for independent source consumers, bounded by the chosen
-   storage format, and never exposed as a filesystem path.
-2. **No-loss ordering:** fault injection at every target-write and source-event
-   sync boundary shows that source progress never advances without a durable
-   target record. An uncertain target result leaves source progress eligible
-   for retry.
-3. **Duplicate-safe recovery:** restart after a successful target append and
-   before source-event persistence, then repeat the move. The target contains
-   one record for the move ID, with the original key and payload, and source
-   progress advances exactly once.
-4. **Corruption handling:** a same-ID target record with different content,
-   malformed identity, torn frame, or an unavailable target produces an
-   explicit storage/corruption outcome and does not advance source progress.
-5. **Recovery bounds:** recovery and reconciliation use bounded indexes or
-   journals, do not scan unrelated streams without a documented bound, and
-   preserve the existing checkpoint/journal truncation guarantees.
-6. **Real process coverage:** a local broker process restart test exercises the
-   crash window through the public protocol. The existing three-node cluster
-   tests continue to verify atomic clustered dead-letter movement, restart,
-   leader change, and follower recovery.
+1. **Target durability faults:** fault injection at target writes and
+   `sync_data` boundaries shows that source progress never advances without a
+   durable target record. An uncertain target result leaves source progress
+   eligible for retry and is classified conservatively under [ADR 0026](../decisions/0026-semantic-engine-error-classification.md).
+2. **Duplicate-safe local recovery:** restart after a successful target append
+   and before source-event persistence, then repeat the move. The target has
+   one record for the move ID with the original key and payload, and source
+   progress advances once. The existing injected source-persistence test is a
+   focused slice; exact process-crash timing remains open.
+3. **Corruption and format handling:** a same-ID target record with different
+   content, malformed or torn target data, an unsupported durable format, or
+   an unavailable target produces an explicit storage/corruption outcome and
+   does not advance source progress. Legacy target records without an identity
+   must remain readable without being falsely reconciled.
+4. **Recovery and retention bounds:** identity lookup and reconciliation use
+   bounded or explicitly accounted-for indexes/journals, do not scan unrelated
+   streams without a documented bound, and retain move evidence until source
+   progress no longer depends on it.
+5. **Real-process local coverage:** a broker-process test exercises the
+   target/source crash window through the public protocol, not only response
+   loss after the whole poll has committed. Existing restart and ambiguous
+   response tests remain useful but do not establish that exact window.
+6. **Cluster same-group coverage:** the existing three-node tests continue to
+   verify committed same-group dead-letter movement, restart, leader change,
+   follower recovery, and stale-delivery fencing. The result must be described
+   as same-data-group atomicity, not general cross-group atomicity.
 7. **Future split-group coverage:** if the target ever moves to another
-   durable group, add tests for participant failure, coordinator/retry
-   recovery, duplicate commands, and ambiguous client outcomes before calling
-   the operation atomic.
+   durable group, add participant failure, coordinator/retry recovery,
+   duplicate-command, retention, and ambiguous-client-outcome tests before
+   calling the operation atomic.
 8. **Semantic wording:** tests and protocol documentation say at-least-once
    for source-to-target and target-consumer delivery. Exactly-once is not
    claimed unless a later decision proves the complete boundary, including
@@ -227,10 +283,10 @@ demonstrated:
 
 ## Hypotheses and unresolved risks
 
-- **Hypothesis:** the existing request-aware target record and rebuilt ID index
-  can provide the required local deduplication without a second pending-move
-  journal. This needs fault-injected tests, especially around partial writes
-  and journal/checkpoint compaction.
+- The current request-aware target record and rebuilt ID index provide the
+  focused local deduplication slice without a second pending-move journal.
+  Whether that remains sufficient through partial writes, journal/checkpoint
+  compaction, retention, and future format changes is still unverified.
 - **Hypothesis:** lazy reconciliation on the next source poll is sufficient
   for correctness. A background reconciler may be needed for operational
   visibility or to make progress when no consumer polls, but it must not
@@ -239,9 +295,10 @@ demonstrated:
   evidence while the source move is still unacknowledged. This is a direct
   coupling to the retention work and must be made a durable fence, not a
   best-effort scan.
-- The current local and clustered records do not preserve source provenance.
-  Adding provenance later must preserve the internal identity and distinguish
-  intentionally separate moves by independent consumers.
+- Adding provenance later must preserve the local internal identity and
+  distinguish intentionally separate moves by independent consumers. It must
+  also define how old records with no provenance are represented rather than
+  inferring origin from target offsets.
 - A target append can be durable while its response is lost, and filesystem
   durability can differ from process-crash behavior. The tests must model
   returned I/O errors, process termination, incomplete frames, and restart;
@@ -250,3 +307,7 @@ demonstrated:
   in a future deployment, even an ordered pair of sync calls has no common
   durability boundary. The identity/reconciliation protocol remains useful,
   but full atomicity would require a different accepted design.
+- A future named target or placement change can split the current clustered
+  data-group boundary. Co-location, reconciliation, an outbox, and a
+  coordinator transaction have different failure, retention, and client
+  outcome semantics; none is accepted yet.
