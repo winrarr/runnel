@@ -2,7 +2,7 @@
 
 - Status: implemented bounded slice; TD-020 remains open
 - Last reviewed: 2026-09-06
-- Baseline: `3d87e9316a2d6255e5660535ee340e76f3ed679a`
+- Baseline: `b9c796d3ebb87b6d71dccc87751524294684b430` (`origin/main` at review)
 
 This note records the current containment for clustered delivery leases. It is
 an unsettled design note, not an ADR or a claim that the clustered backend has
@@ -18,16 +18,25 @@ leader samples its local `SystemTime` as non-negative milliseconds since the
 Unix epoch. A grouped poll carries that observation and an absolute deadline
 formed by adding the leader's local acknowledgement timeout. A grouped
 acknowledgement carries an observation but does not rewrite the existing
-deadline. See the [leader operation construction](../../crates/runnel-raft/src/engine.rs)
+deadline. The state machine trusts the command's submitted absolute deadline;
+it does not recompute or validate that deadline against a replicated timeout.
+See the [leader operation construction](../../crates/runnel-raft/src/engine.rs)
 and [data-group delivery state machine](../../crates/runnel-raft/src/delivery.rs).
 
 The floor is held independently in each stream data group's state machine. It
-is advanced only when a valid grouped poll or grouped acknowledgement for that
-group is applied; ordinary publish, replay, non-grouped poll/ack, metadata
-operations, and commands for another stream do not advance it. The production
-group manager opens one state machine per data group. Some unit fixtures put
-multiple streams in one in-memory state object to exercise evaluator logic;
-that is not a cross-stream production behavior.
+is advanced when a `PollGroup` or `AckGroup` command passes the metadata and
+active-stream checks and is applied. This includes the public compatibility
+paths: `poll` delegates to `poll_group` with the consumer as its member, and
+`ack` delegates to `ack_group` with the consumer as its member and an empty
+delivery token. Consequently, a compatibility poll or acknowledgement also
+observes the local clock and can expire in-flight grouped deliveries. An
+active-stream acknowledgement advances the floor before checking its offset,
+member, or token, so stale, already-acknowledged, and not-in-flight results can
+still record a larger observation. Publish, replay, stream metadata, metadata
+group commands, and commands rejected for a missing or inactive stream do not
+advance it. The production group manager opens one state machine per data
+group. Some unit fixtures put multiple streams in one in-memory state object to
+exercise evaluator logic; that is not a cross-stream production behavior.
 
 For an applied grouped command, expiry uses the greatest observation committed
 so far in that data group:
@@ -67,9 +76,10 @@ The current implementation supports the following narrow properties:
   current writers emit version 2. This is read-forward behavior for tested
   artifacts, not a rolling-upgrade guarantee.
 - Expiry is demand-driven. There is no timer or background command that
-  advances the floor or reclaims a delivery. If no leader can commit a grouped
-  poll or acknowledgement, an otherwise expired delivery remains in replicated
-  in-flight state until a later valid command can evaluate it.
+  advances the floor or reclaims a delivery. If no leader can commit a poll or
+  acknowledgement (grouped or compatibility), an otherwise expired delivery
+  remains in replicated in-flight state until a later applicable command can
+  evaluate it.
 
 These are safety and state-transition properties, not a bound on redelivery
 delay, a service-level objective, or a guarantee about elapsed wall-clock time.
@@ -188,7 +198,10 @@ stale-token fencing; no-command expiry; journal restart and leader change; and
 snapshot round-trip. The [three-process clustered tests](../../crates/runnel-server/tests/cluster_smoke.rs)
 cover real follower restart, leader/process failure, reassignment, durable
 attempts, and stale-token rejection. They use the host clock and do not inject
-skew or jumps.
+skew or jumps. There is no focused assertion of the public compatibility
+aliases' effect on the floor, nor of floor advancement for each invalid
+active-stream acknowledgement result, although both follow from the shared
+`AckGroup`/`PollGroup` implementation.
 
 The unit fixture that advances the floor through a second stream is useful for
 state-machine arithmetic but is not evidence that one stream advances another
