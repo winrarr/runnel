@@ -502,6 +502,49 @@ membership, retention state, resource limits, and source revision in every
 artifact. These measurements can establish cost or regression boundaries;
 they do not permit a claim that telemetry improves broker performance.
 
+## Implementation feasibility review
+
+An inspection of the current telemetry and engine boundaries at the 2026-09-06
+TD-006 baseline confirms that the Stage 0 contract is still required before a
+runtime change can be made safely:
+
+- `runnel-core::Broker::health` can inspect each stream under its stream lock
+  and report currently tracked in-flight deliveries, but the stream tail is
+  not part of the current health snapshot and consumer state is loaded lazily
+  from per-consumer files. There is no complete durable consumer catalogue or
+  bounded summary from which a broker-wide aggregate could be computed.
+  Walking `consumers/` during `/metrics` would make scrape work and latency
+  depend on unbounded state-file churn.
+- `runnel-raft::GroupManager::health` sums materialized data groups on the
+  local node. The same logical stream can be present on multiple replicas, and
+  the current health path has no leader-authoritative source revision or
+  cross-node deduplication. Treating that sum as a cluster lag metric would
+  double- or triple-count logical backlog.
+- The server's metrics collector currently accepts only the aggregate
+  `HealthSnapshot`. Adding a lag field there would couple an optional,
+  potentially unavailable telemetry capability to readiness and the existing
+  protocol health model. Reusing `in_flight_deliveries` as lag would also be
+  semantically incorrect because in-flight records are only one part of the
+  durable cursor distance.
+
+The following implementation shortcuts were considered and rejected for this
+stage: scrape-time filesystem enumeration, process-local maps of observed
+consumers, a numeric zero when the catalogue is incomplete, and a new field on
+`HealthSnapshot`. Each either produces a false caught-up result after restart,
+has no bounded cardinality/work guarantee, or changes an established health
+contract without defining freshness and unknown outcomes.
+
+The exact next contract is therefore unchanged from the staged plan above:
+first accept the definitions and unknown/expired semantics in an ADR, then add
+an optional bounded telemetry capability with a default `unknown` result. The
+capability needs an explicit complete-summary or allowlist policy for fixed
+aggregate metrics, and a separate authenticated/versioned identity-selected
+operation for exact inspection. Its clustered implementation must carry a
+leader-authoritative revision (or explicitly stale status) and deduplicate by
+logical stream/data-group identity. Until those decisions and bounds are
+accepted, this proposal remains the appropriate evidence artifact and no
+numeric consumer-lag family should be emitted.
+
 ## Recommendation
 
 Accept this file as the TD-006 consumer-lag design proposal, keep TD-006 open,
