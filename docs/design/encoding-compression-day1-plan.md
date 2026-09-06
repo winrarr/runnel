@@ -1,8 +1,8 @@
 # Encoding and compression implementation plan
 
 - Status: exploratory implementation plan; not an accepted compatibility decision
-- Last reviewed: 2026-09-04
-- Baseline inspected: `6c666cd1a2d3e41c35d230a3156e57180a0f94fd`
+- Last reviewed: 2026-09-06
+- Baseline inspected: `4b9bba44dd15354248f7157ea903caa6b3fcaabc`
 - Evidence class: design/research
 - Related research: [Message encoding and compression study](../research/message-encoding-and-compression.md)
 - Scope: the first bounded implementation slice for the message-encoding and
@@ -36,7 +36,7 @@ request must not cause a replica to persist a representation it cannot decode.
 
 | Area | Current behavior relevant to this plan |
 |---|---|
-| Public protocol | UTF-8 JSON lines. Text uses `payload`; arbitrary bytes use explicit padded-base64 request/response variants. There is no binary handshake or negotiated codec. |
+| Public protocol | UTF-8 JSON lines. Text uses `payload`; arbitrary bytes use explicit padded-base64 request/response variants. The protocol crate, reusable client, and server share a source-level `runnel-json-lines` v1 support declaration, but there is no runtime handshake or negotiated codec. |
 | Local stream log | One `.log` file per stream. `RNL1` is legacy raw and unchecksummed. `RNL2` is version 1, checksummed, uncompressed, and opt-in through the core API. `RNL3` is version 1, checksummed, and adds request identity without compression metadata. The reader dispatches by magic and truncates an incomplete final suffix. |
 | Peer transport | Big-endian `u32` length prefix around JSON, 64 MiB body limit, persistent/pool connections, and no preface or capability negotiation. The same outer frame carries control RPCs, forwarding, and snapshot chunks. |
 | Clustered persistence | Raft log, state-machine journal, checkpoints, and snapshots are separate JSON formats and recovery paths. They are not part of the first retained-message codec experiment. |

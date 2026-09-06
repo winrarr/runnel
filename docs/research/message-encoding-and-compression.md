@@ -1,8 +1,8 @@
 # Message encoding and compression study
 
 - Status: research-backed exploratory study; not an accepted compatibility decision
-- Last reviewed: 2026-09-04
-- Baseline inspected: `6c666cd1a2d3e41c35d230a3156e57180a0f94fd`
+- Last reviewed: 2026-09-06
+- Baseline inspected: `4b9bba44dd15354248f7157ea903caa6b3fcaabc`
 - Evidence class: research/design
 - Scope: public request/response payloads, retained message records, and the
   clustered peer transport
@@ -63,21 +63,21 @@ The labels below keep observed behavior separate from design intent:
 The source of truth for current behavior is Rust code and tests, not this
 proposal. The relevant boundaries are the [provisional protocol types](../../crates/runnel-protocol/src/lib.rs),
 [server framing and response serialization](../../crates/runnel-server/src/protocol.rs),
-[request dispatch](../../crates/runnel-server/src/main.rs),
-[local stream log](../../crates/runnel-core/src/lib.rs),
+[request dispatch](../../crates/runnel-server/src/dispatch.rs),
+[local stream log](../../crates/runnel-core/src/stream_log.rs),
 [peer frame codec](../../crates/runnel-raft/src/network/framing.rs), and
 [state-machine journal](../../crates/runnel-raft/src/state_machine_journal.rs).
 
 | Boundary | Observed current behavior | What is still not established |
 |---|---|---|
-| Public client protocol | Serde-tagged JSON requests and responses are exchanged as one line per request. Incoming request bytes must be UTF-8. The configured request-frame limit is bounded above by 64 MiB and includes the JSON/base64 representation, not just decoded payload bytes. | No public binary protocol, version negotiation, compatibility range, or stable wire schema exists. A base64 request can consume substantially more wire space than its logical payload. |
+| Public client protocol | Serde-tagged JSON requests and responses are exchanged as one line per request. Incoming request bytes must be UTF-8. The protocol crate, reusable client, and server expose the same source-level `runnel-json-lines` v1 support declaration, but the listener does not advertise or negotiate it at runtime. The configured request-frame limit is bounded above by 64 MiB and includes the JSON/base64 representation, not just decoded payload bytes. | No public binary protocol, runtime version negotiation, compatibility range, or stable wire schema exists. A base64 request can consume substantially more wire space than its logical payload. |
 | Public payloads | `Publish` accepts a UTF-8 `String`. `PublishBytes` and `PublishBatch` carry `BinaryPayload`, which is standard padded base64 in JSON and decodes to `Vec<u8>`. Responses choose the readable UTF-8 variant or an explicit base64 variant without changing logical bytes. | The current JSON path is a development representation, not a compact binary contract. The optional ordering key remains an application-visible UTF-8 string; changing key semantics to arbitrary bytes would be a separate decision. |
 | Legacy local records | `RNL1` is a 28-byte little-endian header containing magic, offset, timestamp, key length, and payload length, followed by UTF-8 key bytes and raw payload bytes. It has no checksum, compression identifier, or format-version field. | A complete `RNL1` record does not provide corruption detection. Its lengths are bounded by file availability and integer arithmetic, but not by the versioned storage limits. |
 | Versioned local records | `RNL2` version 1 is a 44-byte little-endian frame with flags, header length, stored/logical body lengths, offset, timestamp, key length, encoding `bytes`, compression `none`, reserved fields, and CRC-32C. Its reader rejects compressed records and requires the exact 44-byte header. | The versioned fields are an experimental boundary, not an evolvable contract: there is no accepted field-width/reserved-bit policy, segment generation, migration selector, or rolling-writer gate. |
 | Request-aware local records | `RNL3` version 1 is a 48-byte little-endian frame with request-ID length and CRC-32C. It is used for public request identities and local dead-letter move identities. | `RNL3` has no encoding or compression identifiers. A future compressed request-aware record needs an explicit compatible version/family; reusing reserved bytes without a decision would make request deduplication and recovery ambiguous. |
 | Local recovery | `StreamLog::open` scans complete frames, dispatches by magic, and truncates an incomplete suffix. A complete unsupported magic, invalid key encoding, impossible versioned field, or checksum mismatch fails recovery. Normal server startup uses `RNL1`; `VersionedV1` is an explicit core configuration/test path. | The one-file layout can contain different recognized frame families, but there is no cross-release mixed-writer guarantee, generation manifest, writer fence, or conversion/rollback procedure. Current read-forward behavior is useful evidence, not a release compatibility promise. |
 | Peer transport | Peer requests and responses use a persistent or pooled TCP connection with a big-endian `u32` body length and JSON body. The frame cap is 64 MiB. `PeerRequest` covers Raft RPCs, forwarding, and data-group setup; snapshot chunks travel through the same outer framing. | There is no connection preface, version/capability handshake, codec negotiation, application checksum, or rule preventing a new writer from sending a body an older peer cannot interpret. JSON serialization of byte vectors also adds representation overhead. |
-| Clustered persistence | The Raft log, state-machine journal, checkpoints, and snapshots have separate JSON formats and version/recovery rules. The journal uses a little-endian `u32` length plus JSON and truncates a partial final record; checkpoints and snapshots use atomic JSON writes. | A retained-message encoding decision does not establish consensus, journal, or snapshot compatibility. Those artifacts need independent migration gates and failure tests. |
+| Clustered persistence | The Raft log, state-machine journal, checkpoints, and snapshots have separate JSON formats and version/recovery rules. The journal uses a little-endian `u32` length plus JSON, caps each record at 64 MiB, reads the journal file during recovery, and truncates a partial final record; checkpoints and snapshots use atomic JSON writes. | A retained-message encoding decision does not establish consensus, journal, or snapshot compatibility. Journal recovery still has whole-file buffering and those artifacts need independent migration gates and failure tests. |
 
 The local engine preserves the important semantic boundary: payloads are
 `Vec<u8>` internally, offsets are logical record positions, and consumer
