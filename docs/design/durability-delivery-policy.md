@@ -2,7 +2,7 @@
 
 - Status: exploratory design note; not an accepted policy or compatibility decision
 - Last reviewed: 2026-09-06
-- Baseline: `2a917aeaf442a8970519206309852e12a20ca3c4`
+- Baseline: `163f6dd459e4af23b0521110406bca7861e4104f`
 - Scope: separate durable-write, delivery, retention, and overload policy choices
 - Related debt: [TD-005](../tech-debt.md#td-005-durability-and-delivery-policies-are-hard-coded), [TD-018](../tech-debt.md#td-018-retry-policy-and-dead-letter-provenance-are-coarse), and [TD-023](../tech-debt.md#td-023-external-protocol-admission-remains-incomplete)
 - Related outcomes: [make message processing complete](../backlog.md#make-message-processing-complete), [make retained data operationally scalable](../backlog.md#make-retained-data-operationally-scalable), and [make clustered durability and outcomes explicit](../backlog.md#make-clustered-durability-and-outcomes-explicit)
@@ -19,10 +19,10 @@ deliberately conservative defaults, but they are not one configurable feature:
    when bounded resources are exhausted.
 
 These policies interact, but one must not silently stand in for another. In
-particular, a retry limit is not a retention policy, a bounded request queue is
-not a disk budget, and a successful local `sync_data` call is not quorum
-durability. The note is an evidence map and a set of design boundaries. It
-does not add runtime configuration, protocol fields, or an ADR.
+particular, a retry limit is not a retention policy, bounded protocol
+admission is not a disk budget, and a successful local `sync_data` call is not
+quorum durability. The note is an evidence map and a set of design
+boundaries. It does not add runtime configuration, protocol fields, or an ADR.
 
 ## Observed baseline
 
@@ -31,12 +31,12 @@ code and tests remain authoritative if this note becomes stale.
 
 | Policy axis | Local engine | Clustered engine | What is not established |
 | --- | --- | --- | --- |
-| Durable publish | A stream append writes the complete frame and calls `File::sync_data` before the operation returns success. Request-aware appends use the same durable write point. | A publish is a replicated `client_write`; the persisted Raft log uses an atomic, fully synced replacement and the state-machine journal is synced before applying committed entries. | No user-selectable durability mode, hardware/filesystem failure model, or public stage-aware outcome contract. |
+| Durable publish | A stream append writes the complete frame and calls `File::sync_data` before the operation returns success. Request-aware appends use the same durable write point. A publish batch preserves ordered per-record outcomes and does not imply batch atomicity. | A publish is a replicated `client_write`; the persisted Raft log uses an atomic, fully synced replacement and the state-machine journal is synced before applying committed entries. A successful mutation is returned from the applied leader result; followers may apply it later. | No user-selectable durability mode, hardware/filesystem failure model, or public stage-aware outcome contract. |
 | Durable acknowledgement | Consumer events append to a bounded JSON-lines journal and call `sync_all` before the in-memory checkpoint advances. Checkpoint compaction is an atomic replacement. | Acknowledgements are replicated state-machine commands. The state-machine journal is synced before the applied state is exposed through the command response. | No configurable acknowledgement durability or measured guarantee across storage devices. |
 | Processing lease | The broker-wide `ack_timeout` is both the active in-flight lease and the redelivery delay. Active leases are volatile and restart can redeliver an unacknowledged record. | The broker-wide timeout becomes a leader-selected absolute deadline in the replicated command. Ownership, attempts, and fencing state are replicated; clock quality and configuration consistency remain assumptions. | No independent retry backoff, durable retry schedule, or final clock/fencing policy. |
 | Retry and terminal handling | Delivery attempts are persisted before returning a message. An optional broker-wide `max_delivery_attempts` moves an exhausted record to a derived dead-letter stream before source progress advances. The two local writes are at-least-once, with a documented duplicate caveat. | The same broker-wide limit is carried in the poll command. Source progress and the derived dead-letter record commit in one stream data-group transition. | No consumer-scoped policy, explicit failure disposition, provenance, or redrive operation. |
 | Retention and replay | All committed stream history is retained; there is no automatic time/size deletion. The first replay operation reads one offset without changing ordinary consumer progress. | Retained messages remain in materialized stream state and the same bounded replay intent is handled through the data-group leader. | No retention floor, replay session, expiry policy, or disk-pressure admission policy. |
-| Overload and backpressure | The storage executor has fixed bounded execution, global queue, and per-stream lane limits. Exhaustion returns an I/O `WouldBlock` error. | Network and consensus paths have their own bounded behavior; there is no unified retained-storage or cluster-capacity policy. | No public distinction between queue saturation, disk pressure, retryable failure, and an operation whose response was lost after a possible commit. |
+| Overload and backpressure | The server bounds connections, request-frame bytes, in-flight request/response work, and request duration, rejecting connection or request saturation rather than queueing protocol work. The storage executor has fixed bounded execution admission and per-stream FIFO lanes; exhaustion returns an I/O `WouldBlock` error. | Consensus and peer forwarding use bounded per-peer connection pools and fallback permits with a reserved control lane and request TTLs; these are transport bounds, not a cluster-wide capacity policy. | No public distinction between queue saturation, disk pressure, retryable failure, and an operation whose response was lost after a possible commit. |
 
 The implementation evidence for these observations is concentrated in the
 [local append path](../../crates/runnel-core/src/stream_log.rs),
@@ -46,14 +46,35 @@ The implementation evidence for these observations is concentrated in the
 [clustered publish and delivery calls](../../crates/runnel-raft/src/engine.rs),
 [clustered state-machine journal](../../crates/runnel-raft/src/state_machine_store.rs),
 and [clustered log persistence](../../crates/runnel-raft/src/log_store.rs).
+Protocol admission and peer-transport bounds are covered by the
+[server admission tests](../../crates/runnel-server/tests/admission.rs),
+[storage executor tests](../../crates/runnel-core/src/storage.rs), and
+[peer transport tests](../../crates/runnel-raft/src/network/outbound.rs).
+
+At the engine boundary, [ADR 0026](../decisions/0026-semantic-engine-error-classification.md)
+accepts `BrokerError::kind()` and `BrokerError::outcome()` as the stable
+semantic failure boundary: a successful result is confirmed, while failures
+are classified as rejected, retryable, or unknown. Generic storage, state, and
+cluster failures remain unknown because the engine cannot prove that a durable
+mutation did not cross its boundary. The provisional server retains its v1
+error codes and does not expose operation stages; the reusable client
+conservatively treats post-write timeout, disconnect, and response-loss cases
+as unknown and does not automatically replay them. This classification is
+accepted source-level behavior, not a selectable durability policy.
 
 The accepted semantic boundaries are recorded in [ADR 0004](../decisions/0004-multi-raft-first-distributed-engine.md),
 [ADR 0014](../decisions/0014-local-retry-and-dead-letter-policy.md),
-[ADR 0015](../decisions/0015-clustered-shared-consumer-ownership.md), and
-[ADR 0016](../decisions/0016-clustered-retry-and-dead-letter-policy.md).
+[ADR 0015](../decisions/0015-clustered-shared-consumer-ownership.md),
+[ADR 0016](../decisions/0016-clustered-retry-and-dead-letter-policy.md),
+[ADR 0018](../decisions/0018-safe-replica-recovery-boundary.md), and
+[ADR 0019](../decisions/0019-clustered-storage-identity.md).
 The focused tests include the [local restart acknowledgement contract](../../crates/runnel-core/tests/engine_contract.rs),
 [local delivery and dead-letter tests](../../crates/runnel-core/src/broker.rs),
 and [clustered delivery recovery tests](../../crates/runnel-raft/src/lib.rs).
+Real-process protocol coverage includes [client outcome and stable-identity
+retry tests](../../crates/runnel-server/tests/client_retry.rs), [local server
+restart and dead-letter tests](../../crates/runnel-server/tests/server_smoke.rs),
+and [three-process cluster failure tests](../../crates/runnel-server/tests/cluster_smoke.rs).
 
 ## Design boundaries
 
@@ -111,10 +132,14 @@ adding retention fields to a retry or delivery policy.
 
 ### Overload policy
 
-Current bounded request and storage queues are useful safety mechanisms, but
-they only bound work already admitted to the process. They do not reserve
-filesystem capacity, account for snapshot or cleanup workspace, or by
-themselves define whether a timed-out publish may have committed.
+Current protocol admission and storage queues are useful safety mechanisms, but
+they are separate ingress and execution bounds rather than one overload
+policy. Protocol saturation is rejected before request execution; storage
+work may wait within bounded executor/lane capacity and then return
+`WouldBlock`. Neither path reserves filesystem capacity, accounts for snapshot
+or cleanup workspace, or by itself defines whether a timed-out publish may
+have committed. Cluster peer-pool limits similarly protect transport control
+traffic but do not establish a cluster-wide retained-storage budget.
 
 A future overload policy should make the following states distinguishable in
 the operational and client surfaces:
@@ -143,13 +168,21 @@ operation:
    transition at each relevant boundary.
 3. Cluster tests cover leader change, follower restart, and response loss when
    the policy is replicated or leader-authorized.
-4. Resource tests measure queue depth, retained bytes, retry state, latency,
-   and recovery work under a bounded workload. A benchmark must name the
-   durability mode, message shape, topology, and failure state as required by
-   [the benchmark policy](../benchmarking.md).
-5. Inspection and metrics expose the selected policy, its version or
-   generation, and enough counters to distinguish protected, delayed,
-   exhausted, rejected, and unknown work without unbounded labels.
+4. Resource and failure tests measure protocol admission (connections, frame
+   bytes, in-flight work, timeouts, slow readers/writers), storage executor
+   and per-stream queue bounds under stalls, retained bytes, retry state,
+   latency, and recovery work under bounded workloads. Peer contention tests
+   must preserve the reserved control lane. A benchmark must name the
+   durability mode, message shape, topology, resource limits, and failure
+   state as required by [the benchmark policy](../benchmarking.md); a
+   correctness or reliability change need not claim a performance result.
+5. Once a policy is exposed, inspection and metrics expose its effective
+   selection, version or generation, and enough counters to distinguish
+   protected, delayed, exhausted, rejected, and unknown work without
+   unbounded labels. Current metrics expose admission limits and rejection or
+   timeout counters, storage bytes, in-flight deliveries, redeliveries,
+   dead letters, and clustered snapshot activity, but do not yet expose a
+   policy version or stage-aware outcome.
 6. An ADR records compatibility, migration, and rollback consequences before
    the policy becomes a supported public guarantee.
 
@@ -196,3 +229,4 @@ records are sufficient; no new debt item is warranted by this review.
 - [ADR 0004: first distributed engine](../decisions/0004-multi-raft-first-distributed-engine.md)
 - [ADR 0014: local retry and dead-letter policy](../decisions/0014-local-retry-and-dead-letter-policy.md)
 - [ADR 0016: clustered retry and dead-letter policy](../decisions/0016-clustered-retry-and-dead-letter-policy.md)
+- [ADR 0026: semantic engine error classification](../decisions/0026-semantic-engine-error-classification.md)
