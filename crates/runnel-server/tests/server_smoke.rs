@@ -2,6 +2,7 @@ use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
+use std::sync::mpsc;
 use std::thread::sleep;
 use std::time::{Duration, Instant};
 
@@ -817,6 +818,108 @@ fn network_protocol_recovers_dead_letter_without_source_redelivery_after_restart
 }
 
 #[test]
+fn network_protocol_reconciles_dead_letter_after_ambiguous_poll_and_restart() {
+    let directory = TempDir::new().unwrap();
+    let server = RunningServer::start_with_args(
+        directory.path(),
+        &["--ack-timeout-ms", "10", "--max-delivery-attempts", "1"],
+    );
+
+    assert!(matches!(
+        request(
+            server.broker_addr,
+            Request::Publish {
+                stream: "events".to_owned(),
+                key: Some("order-1".to_owned()),
+                payload: "poison".to_owned(),
+                request_id: None,
+            },
+        ),
+        Response::Published { offset: 0, .. }
+    ));
+    assert!(matches!(
+        request(
+            server.broker_addr,
+            Request::Poll {
+                stream: "events".to_owned(),
+                consumer: "worker".to_owned(),
+            },
+        ),
+        Response::Message {
+            offset: 0,
+            delivery_attempt: Some(1),
+            ..
+        }
+    ));
+    sleep(Duration::from_millis(20));
+
+    let broker_response = request_through_dropping_proxy(
+        server.broker_addr,
+        Request::Poll {
+            stream: "events".to_owned(),
+            consumer: "worker".to_owned(),
+        },
+    );
+    assert!(matches!(broker_response, Response::Empty { .. }));
+    server.stop();
+
+    let server = RunningServer::start_with_args(
+        directory.path(),
+        &["--ack-timeout-ms", "10", "--max-delivery-attempts", "1"],
+    );
+    assert!(matches!(
+        request(
+            server.broker_addr,
+            Request::Poll {
+                stream: "events".to_owned(),
+                consumer: "worker".to_owned(),
+            },
+        ),
+        Response::Empty { .. }
+    ));
+    assert!(matches!(
+        request(
+            server.broker_addr,
+            Request::Poll {
+                stream: "events.dead-letter".to_owned(),
+                consumer: "inspector".to_owned(),
+            },
+        ),
+        Response::Message {
+            offset: 0,
+            key: Some(key),
+            payload,
+            delivery_attempt: Some(1),
+            ..
+        } if key == "order-1" && payload == "poison"
+    ));
+    assert!(matches!(
+        request(
+            server.broker_addr,
+            Request::Ack {
+                stream: "events.dead-letter".to_owned(),
+                consumer: "inspector".to_owned(),
+                offset: 0,
+            },
+        ),
+        Response::Acknowledged {
+            already_acknowledged: false,
+            ..
+        }
+    ));
+    assert!(matches!(
+        request(
+            server.broker_addr,
+            Request::Poll {
+                stream: "events.dead-letter".to_owned(),
+                consumer: "inspector".to_owned(),
+            },
+        ),
+        Response::Empty { .. }
+    ));
+}
+
+#[test]
 fn network_protocol_reassigns_group_delivery_after_restart() {
     let directory = TempDir::new().unwrap();
     let server = RunningServer::start(directory.path());
@@ -1067,6 +1170,62 @@ fn request_line(address: SocketAddr, encoded: &str) -> Response {
     let mut response = String::new();
     BufReader::new(stream).read_line(&mut response).unwrap();
     serde_json::from_str(&response).unwrap()
+}
+
+fn request_through_dropping_proxy(address: SocketAddr, request: Request) -> Response {
+    let listener = TcpListener::bind(("127.0.0.1", 0)).expect("proxy should bind");
+    let proxy_addr = listener
+        .local_addr()
+        .expect("proxy address should be available");
+    let (response_sender, response_receiver) = mpsc::channel();
+    let proxy = std::thread::spawn(move || {
+        let (client, _) = listener.accept().expect("proxy should accept a client");
+        let mut request_line = String::new();
+        BufReader::new(
+            client
+                .try_clone()
+                .expect("proxy should clone the client connection"),
+        )
+        .read_line(&mut request_line)
+        .expect("proxy should read the client request");
+
+        let mut broker = TcpStream::connect(address).expect("proxy should reach the broker");
+        broker
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .expect("proxy read timeout should be set");
+        broker
+            .write_all(request_line.as_bytes())
+            .expect("proxy should forward the request");
+        let mut response = String::new();
+        BufReader::new(broker)
+            .read_line(&mut response)
+            .expect("proxy should read the broker response");
+        response_sender
+            .send(response)
+            .expect("test should receive the broker response");
+        drop(client);
+    });
+
+    let encoded = serde_json::to_string(&request).expect("request should serialize");
+    let mut client = TcpStream::connect(proxy_addr).expect("client should reach the proxy");
+    client
+        .set_read_timeout(Some(Duration::from_secs(2)))
+        .expect("client read timeout should be set");
+    writeln!(client, "{encoded}").expect("client should write the request");
+    let mut response = String::new();
+    assert_eq!(
+        BufReader::new(client)
+            .read_line(&mut response)
+            .expect("client should observe the dropped response"),
+        0,
+        "proxy should close the client connection without forwarding the response"
+    );
+
+    let response = response_receiver
+        .recv_timeout(Duration::from_secs(2))
+        .expect("proxy should observe a broker response");
+    proxy.join().expect("proxy should finish cleanly");
+    serde_json::from_str(&response).expect("broker response should be valid JSON")
 }
 
 fn free_addr() -> SocketAddr {
