@@ -89,9 +89,31 @@ class MatrixBenchmarkTests(unittest.TestCase):
         self.assertIn("40", command)
         self.assertIn("--slow-consumer-delay-ms", command)
         self.assertIn("25", command)
+        self.assertIn("--slow-consumer-timeout-seconds", command)
+        self.assertIn("60.0", command)
         self.assertIn("--output", command)
         self.assertIn("/tmp/matrix/result.json", command)
         self.assertIn("--log-dir", command)
+
+    def test_slow_consumer_backpressure_expands_delay_values(self) -> None:
+        args = self.parse(
+            "--scenarios",
+            "slow_consumer_backpressure",
+            "--payload-sizes",
+            "100",
+            "--slow-consumer-delays-ms",
+            "0,10",
+        )
+
+        cases = matrix.matrix_cases(args)
+
+        self.assertEqual(len(cases), 2)
+        self.assertEqual(
+            {case["slow_consumer_delay_ms"] for case in cases}, {0, 10}
+        )
+        self.assertEqual(
+            {case["scenario"] for case in cases}, {"slow_consumer_backpressure"}
+        )
 
     def test_retained_hot_path_expands_each_retained_history_value(self) -> None:
         args = self.parse(

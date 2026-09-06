@@ -34,12 +34,14 @@ from cluster import (  # noqa: E402
     DEFAULT_PUBLISH_BATCH_SIZE,
     DEFAULT_RETAINED_RECOVERY_MESSAGES,
     DEFAULT_SLOW_CONSUMER_DELAY_MS,
+    DEFAULT_SLOW_CONSUMER_BACKPRESSURE_TIMEOUT_SECONDS,
     DEFAULT_WARMUP,
     MAX_LEADER_FAILURE_TIMEOUT_SECONDS,
     MAX_PEER_FORWARDING_CONCURRENCY,
     MAX_PEER_FORWARDING_TIMEOUT_SECONDS,
     MAX_PEER_RESPONSE_DELAY_MS,
     MAX_PUBLISH_BATCH_SIZE,
+    MAX_SLOW_CONSUMER_BACKPRESSURE_TIMEOUT_SECONDS,
     parse_nonnegative_int,
     parse_positive_float,
     parse_scenarios,
@@ -135,6 +137,12 @@ def parse_args() -> argparse.Namespace:
         default=DEFAULT_SLOW_CONSUMER_DELAYS_MS,
     )
     parser.add_argument(
+        "--slow-consumer-timeout-seconds",
+        type=parse_positive_float,
+        default=DEFAULT_SLOW_CONSUMER_BACKPRESSURE_TIMEOUT_SECONDS,
+        help="bounded wall-clock budget for the opt-in slow-consumer backpressure probe",
+    )
+    parser.add_argument(
         "--retained-message-values",
         type=lambda value: parse_integer_values(
             value, minimum=1_025, label="retained message values"
@@ -215,6 +223,14 @@ def parse_args() -> argparse.Namespace:
         parser.error("ack timeout must be positive")
     if any(delay >= args.ack_timeout_ms for delay in args.slow_consumer_delays_ms):
         parser.error("slow consumer delays must be shorter than the acknowledgement timeout")
+    if (
+        args.slow_consumer_timeout_seconds
+        > MAX_SLOW_CONSUMER_BACKPRESSURE_TIMEOUT_SECONDS
+    ):
+        parser.error(
+            "slow consumer timeout exceeds the bounded maximum of "
+            f"{MAX_SLOW_CONSUMER_BACKPRESSURE_TIMEOUT_SECONDS:g} seconds"
+        )
     if args.batch_size <= 0 or args.batch_size > MAX_PUBLISH_BATCH_SIZE:
         parser.error(
             f"batch size must be between 1 and {MAX_PUBLISH_BATCH_SIZE} records"
@@ -278,7 +294,7 @@ def matrix_cases(args: argparse.Namespace) -> list[dict[str, Any]]:
         )
         delay_values = (
             args.slow_consumer_delays_ms
-            if scenario == "slow_consumer"
+            if scenario in {"slow_consumer", "slow_consumer_backpressure"}
             else args.slow_consumer_delays_ms[:1]
         )
         retained_values = (
@@ -354,6 +370,8 @@ def case_command(
             str(args.ack_timeout_ms),
             "--slow-consumer-delay-ms",
             str(case["slow_consumer_delay_ms"]),
+            "--slow-consumer-timeout-seconds",
+            str(args.slow_consumer_timeout_seconds),
             "--batch-size",
             str(case["batch_size"]),
             "--retained-messages",
@@ -542,6 +560,7 @@ def run_matrix(
         "payload_sizes_bytes": args.payload_sizes,
         "concurrency_values": args.concurrency_values,
         "slow_consumer_delay_values_ms": args.slow_consumer_delays_ms,
+        "slow_consumer_timeout_seconds": args.slow_consumer_timeout_seconds,
         "retained_message_values": args.retained_message_values,
         "batch_size_values": args.batch_size_values,
         "runtimes": args.runtimes,

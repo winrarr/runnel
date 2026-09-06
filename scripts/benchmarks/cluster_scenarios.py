@@ -34,6 +34,7 @@ if TYPE_CHECKING:
 
 
 DEFAULT_SLOW_CONSUMER_DELAY_MS = 10
+DEFAULT_SLOW_CONSUMER_BACKPRESSURE_TIMEOUT_SECONDS = 60.0
 DEFAULT_PUBLISH_BATCH_SIZE = 32
 MAX_PUBLISH_BATCH_SIZE = 1_024
 HOT_ORDERING_HOT_KEY = "hot-key"
@@ -56,6 +57,7 @@ DEFAULT_PEER_FORWARDING_TIMEOUT_SECONDS = 60.0
 MAX_PEER_FORWARDING_CONCURRENCY = 128
 MAX_PEER_RESPONSE_DELAY_MS = 2_000
 MAX_PEER_FORWARDING_TIMEOUT_SECONDS = 300.0
+MAX_SLOW_CONSUMER_BACKPRESSURE_TIMEOUT_SECONDS = 300.0
 PEER_FORWARDING_INGRESS_NODE_INDEX = 1
 DEFAULT_LEADER_FAILURE_TIMEOUT_SECONDS = 60.0
 MAX_LEADER_FAILURE_TIMEOUT_SECONDS = 300.0
@@ -70,6 +72,7 @@ DEFAULT_SCENARIOS = (
 )
 SCENARIO_NAMES = (
     *DEFAULT_SCENARIOS,
+    "slow_consumer_backpressure",
     "retained_hot_path",
     "peer_forwarding",
     "publish_batch",
@@ -549,6 +552,142 @@ def run_slow_consumer(
             return result
 
         return measure_scenario(cluster.stats, operation, metrics=cluster.metrics)
+
+
+def run_slow_consumer_backpressure(
+    cluster: Cluster,
+    stream: str,
+    payload: str,
+    messages: int,
+    processing_delay_ms: int,
+    timeout_seconds: float,
+) -> dict[str, Any]:
+    """Probe the bounded delivery window while a consumer processes slowly.
+
+    The probe preloads a finite backlog, polls one record, and tries a second
+    poll for the same consumer before acknowledging the first record. The
+    second poll must return the same in-flight record, which makes the current
+    delivery-window semantics explicit without claiming publisher throttling
+    or a server-side rejection policy.
+    """
+    preload(cluster, stream, payload, messages)
+    client_timeout = min(DEFAULT_TIMEOUT_SECONDS, timeout_seconds)
+    clients = [
+        cluster.client(index, timeout_seconds=client_timeout)
+        for index in range(cluster.node_count)
+    ]
+    try:
+        def operation() -> dict[str, Any]:
+            request_latencies: list[int] = []
+            duplicate_poll_latencies: list[int] = []
+            duplicate_polls = 0
+            duplicate_matches = 0
+            started = time.perf_counter_ns()
+            deadline = time.monotonic() + timeout_seconds
+            for offset in range(messages):
+                if time.monotonic() >= deadline:
+                    raise BenchmarkError(
+                        "slow-consumer backpressure probe exceeded its bounded runtime"
+                    )
+                client = clients[offset % len(clients)]
+                probe_client = clients[(offset + 1) % len(clients)]
+                response, poll_elapsed = poll(
+                    client, stream, "slow-consumer-backpressure", offset
+                )
+                duplicate_response, duplicate_elapsed = poll(
+                    probe_client, stream, "slow-consumer-backpressure", offset
+                )
+                duplicate_polls += 1
+                duplicate_poll_latencies.append(duplicate_elapsed)
+                if duplicate_response.get("offset") != offset:
+                    raise BenchmarkError(
+                        "slow-consumer backpressure probe returned a different record "
+                        f"before acknowledgement: {duplicate_response}"
+                    )
+                if duplicate_response.get("delivery_attempt") != response.get(
+                    "delivery_attempt"
+                ):
+                    raise BenchmarkError(
+                        "slow-consumer backpressure probe changed delivery attempt "
+                        f"before acknowledgement: {response} then {duplicate_response}"
+                    )
+                duplicate_matches += 1
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise BenchmarkError(
+                        "slow-consumer backpressure probe exceeded its bounded runtime "
+                        "before acknowledgement"
+                    )
+                time.sleep(min(processing_delay_ms / 1_000, remaining))
+                if time.monotonic() >= deadline:
+                    raise BenchmarkError(
+                        "slow-consumer backpressure probe exceeded its bounded runtime "
+                        "during processing"
+                    )
+                ack_elapsed = acknowledge(
+                    client, stream, "slow-consumer-backpressure", offset
+                )
+                request_latencies.append(poll_elapsed + ack_elapsed)
+                if response.get("payload") != payload:
+                    raise BenchmarkError(
+                        "slow-consumer backpressure probe received an unexpected "
+                        f"payload at offset {offset}"
+                    )
+            result = metric(
+                "cluster_slow_consumer_backpressure",
+                request_latencies,
+                time.perf_counter_ns() - started,
+                message_size=len(payload),
+                metadata={
+                    "nodes": cluster.node_count,
+                    "processing_delay_ms": processing_delay_ms,
+                    "preloaded_messages": messages,
+                    "publish_setup_excluded": True,
+                    "bounded_runtime_seconds": timeout_seconds,
+                    "redelivery_expected": False,
+                    "latency_scope": (
+                        "primary_poll_and_ack_request_time excludes processing delay "
+                        "and duplicate probe"
+                    ),
+                    "throughput_scope": (
+                        "finite backlog drain includes processing delay and duplicate "
+                        "poll probe"
+                    ),
+                    "backpressure": {
+                        "semantics": (
+                            "one in-flight delivery per ordinary consumer; a second pull "
+                            "before acknowledgement returns that same delivery"
+                        ),
+                        "duplicate_polls": duplicate_polls,
+                        "duplicate_matches": duplicate_matches,
+                        "max_logical_in_flight_deliveries_observed": 1,
+                        "delivery_window_verified": (
+                            duplicate_matches == duplicate_polls == messages
+                        ),
+                        "publisher_throttling_or_rejection_exercised": False,
+                        "broker_policy_claim": (
+                            "no configurable publisher backpressure or rejection policy "
+                            "is inferred from this probe"
+                        ),
+                        "duplicate_poll_latency_microseconds": {
+                            "p50": percentile(duplicate_poll_latencies, 50) / 1_000,
+                            "p99": percentile(duplicate_poll_latencies, 99) / 1_000,
+                            "p999": percentile(duplicate_poll_latencies, 99.9) / 1_000,
+                            "max": max(duplicate_poll_latencies) / 1_000,
+                        },
+                    },
+                    "resource_measurement": (
+                        "scenario resource_samples cover the finite slow-consumer drain, "
+                        "including the configured processing delay and duplicate polls"
+                    ),
+                },
+            )
+            return result
+
+        return measure_scenario(cluster.stats, operation, metrics=cluster.metrics)
+    finally:
+        for client in clients:
+            client.close()
 
 
 def run_grouped_consume_ack(

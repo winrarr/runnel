@@ -33,6 +33,7 @@ from cluster_scenarios import (
     DEFAULT_RETAINED_RECOVERY_MESSAGES,
     DEFAULT_SCENARIOS,
     DEFAULT_SLOW_CONSUMER_DELAY_MS,
+    DEFAULT_SLOW_CONSUMER_BACKPRESSURE_TIMEOUT_SECONDS,
     MAX_HOT_KEY_PROCESSING_DELAY_MS,
     MAX_HOT_ORDERING_CONCURRENCY,
     MAX_HOT_ORDERING_MESSAGES,
@@ -42,6 +43,7 @@ from cluster_scenarios import (
     MAX_PEER_FORWARDING_TIMEOUT_SECONDS,
     MAX_PEER_RESPONSE_DELAY_MS,
     MAX_PUBLISH_BATCH_SIZE,
+    MAX_SLOW_CONSUMER_BACKPRESSURE_TIMEOUT_SECONDS,
     MIN_RETAINED_RECOVERY_MESSAGES,
     parse_retained_messages,
     parse_scenarios,
@@ -58,6 +60,7 @@ from cluster_scenarios import (
     run_retained_hot_path,
     run_retained_recovery,
     run_slow_consumer,
+    run_slow_consumer_backpressure,
 )
 from common import (
     DEFAULT_TIMEOUT_SECONDS,
@@ -114,7 +117,8 @@ def parse_args() -> argparse.Namespace:
         help=(
             "comma-separated scenarios to run (default: existing clustered workload; "
             "add retained_hot_path, peer_forwarding, publish_batch, hot_ordering, "
-            "leader_failure_recovery, or follower_failure_recovery explicitly for "
+            "slow_consumer_backpressure, leader_failure_recovery, or "
+            "follower_failure_recovery explicitly for "
             "focused probes)"
         ),
     )
@@ -124,6 +128,14 @@ def parse_args() -> argparse.Namespace:
         type=parse_nonnegative_int,
         default=DEFAULT_SLOW_CONSUMER_DELAY_MS,
         help="fixed processing delay before each slow-consumer acknowledgement",
+    )
+    parser.add_argument(
+        "--slow-consumer-timeout-seconds",
+        type=parse_positive_float,
+        default=DEFAULT_SLOW_CONSUMER_BACKPRESSURE_TIMEOUT_SECONDS,
+        help=(
+            "bounded wall-clock budget for the opt-in slow-consumer backpressure probe"
+        ),
     )
     parser.add_argument(
         "--batch-size",
@@ -288,6 +300,14 @@ def parse_args() -> argparse.Namespace:
         parser.error("ack timeout must be positive")
     if args.slow_consumer_delay_ms >= args.ack_timeout_ms:
         parser.error("slow consumer delay must be shorter than the acknowledgement timeout")
+    if (
+        args.slow_consumer_timeout_seconds
+        > MAX_SLOW_CONSUMER_BACKPRESSURE_TIMEOUT_SECONDS
+    ):
+        parser.error(
+            "slow consumer timeout exceeds the bounded maximum of "
+            f"{MAX_SLOW_CONSUMER_BACKPRESSURE_TIMEOUT_SECONDS:g} seconds"
+        )
     return args
 
 
@@ -347,6 +367,17 @@ def run_scenarios(
                     payload,
                     args.messages,
                     args.slow_consumer_delay_ms,
+                )
+            )
+        if "slow_consumer_backpressure" in selected_scenarios:
+            scenarios.append(
+                run_slow_consumer_backpressure(
+                    cluster,
+                    f"cluster_{run_id}_slow_consumer_backpressure_{size}",
+                    payload,
+                    args.messages,
+                    args.slow_consumer_delay_ms,
+                    args.slow_consumer_timeout_seconds,
                 )
             )
         if "grouped_consume_ack" in selected_scenarios:
