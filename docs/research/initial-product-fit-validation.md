@@ -119,16 +119,16 @@ redelivery, stale acknowledgements, or cluster recovery.
 ### Current reference workload run (2026-09-06)
 
 The new harness was run from revision
-`cc18ac6bf7d162a8ce4a76c3464ca20bc645ae4f` with
-`python3 scripts/product_fit.py --output-dir /tmp/runnel-product-fit-cc18ac6`.
+`554fd37e97b9d65baccb97a00f04630f2436b83b` with
+`just product-fit --output-dir benchmark-results/product-fit/20260906-554fd37`.
 The host was Linux 7.0.0-31-generic on x86_64 with 20 logical CPUs; this was a
 native, unconstrained local process run. Both workloads completed with an
 automated `pass` against the representative manifest budgets:
 
 | Workload | Messages | Publish p95 / p99 | Scenario throughput | RSS peak | Storage growth | Restart-to-ready |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: |
-| Durable background work | 20 | 0.061 / 0.086 ms | 29.69 msg/s | 15.8 MiB | 4,809 B | 0.053 s |
-| Application events and replay | 20 | 0.638 / 0.642 ms | 120.32 msg/s | 15.5 MiB | 6,512 B | 0.053 s |
+| Durable background work | 20 | 0.135 / 0.159 ms | 29.34 msg/s | 14.9 MiB | 4,735 B | 0.054 s |
+| Application events and replay | 20 | 0.631 / 0.658 ms | 126.37 msg/s | 14.0 MiB | 5,862 B | 0.053 s |
 
 The packages contained 74 and 103 protocol transcript entries respectively,
 message ledgers with 68 and 102 events, three readiness/metrics phases, raw
