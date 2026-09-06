@@ -5,10 +5,14 @@ coverage has one owner and independent work can run concurrently:
 
 ```mermaid
 flowchart LR
-    commit[Pull request or main push]
+    commit[Pull request]
+    push[Main push]
 
     commit --> verify
     commit --> image
+    commit --> audit
+    push --> verify
+    push --> image
 
     subgraph V[Verify]
         verify[just verify]
@@ -22,14 +26,22 @@ flowchart LR
         single --> clustered[Three-node container smoke]
     end
 
+    subgraph S[Security]
+        audit[dependency audit]
+    end
+
     cluster --> gate[Required CI gate]
     clustered --> gate
+    audit --> gate
 ```
 
-`Verify` and `Integration` have no data dependency, so GitHub Actions runs
-them on separate runners. The pull request is mergeable only when both required
-jobs pass. `cluster_smoke` is included once through `just verify`; the
-integration job does not invoke it again.
+`Verify`, `Integration`, and `audit` have no data dependency, so GitHub Actions
+runs them on separate runners when capacity is available. The `main` ruleset
+requires the `Verify`, `Integration and container smoke tests`, and `audit`
+contexts. The Conventional Commits pull-request title check is an additional
+informational workflow check; its push-side commit-subject check applies only
+when commits enter `main`. `cluster_smoke` is included once through `just
+verify`; the integration job does not invoke it again.
 
 The integration job sets `CARGO_TARGET_DIR=target` at the job level, before
 `Swatinem/rust-cache` runs. The action's default workspace mapping is `. -> target`,
@@ -50,6 +62,7 @@ building an isolated image when no integration image marker is present.
 | --- | --- | --- |
 | Verify | formatting, Clippy, workspace tests, docs, ShellCheck, benchmark-script tests, workspace build, and `cluster_smoke` | container lifecycle checks |
 | Integration | process smoke, prebuilt-image validation, single-node container smoke, and three-node container smoke | `cluster_smoke` |
+| Security | pinned `cargo-audit` dependency audit | build, runtime, and container checks |
 
 The integration stages remain sequential within their job because they use the
 same prepared image and because deterministic failure localization is more
@@ -59,12 +72,12 @@ container checks compete on one runner.
 
 ## Supporting workflow DAGs
 
-The other automation remains separate from the required PR execution path:
+Informational source-control checks and scheduled automation remain separate
+from the required PR execution path:
 
 ```mermaid
 flowchart LR
     pr[Pull request] --> title[Conventional PR title]
-    pr --> security[Dependency audit]
     push[Main push] --> subjects[Conventional main subjects]
 
     schedule[Schedule or manual dispatch] --> runnel_bench[Runnel benchmark job]

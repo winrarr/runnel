@@ -60,8 +60,9 @@ Current status: the desk evaluation is recorded in
 [ci-feedback-loop-evaluation.md](research/ci-feedback-loop-evaluation.md) and
 [ADR 0025](decisions/0025-retain-github-actions-pending-hosted-ci-trial.md).
 The outcome remains open: no hosted CircleCI trial was run in this environment,
-so wall-clock, variability, cache, contributor, diagnostics, status-check, and
-cost evidence remain to be collected before acceptance.
+so CircleCI-versus-GitHub comparative wall-clock, variability, cache,
+contributor, diagnostics, status-check, and cost evidence remain to be
+collected before acceptance.
 
 ## Make client interactions dependable and evolvable
 
