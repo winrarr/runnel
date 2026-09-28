@@ -718,9 +718,9 @@ Acceptance criteria:
 
 Goal: keep the latency and resource cost of durable clustered commits predictable as the unpurged Raft log grows.
 
-Rationale: the current log store serializes and atomically rewrites the retained Raft entry map during log persistence. This may make append work depend on the number and size of entries since the last purge, but the effect has not yet been measured under Runnel workloads.
+Rationale: the current log store serializes and atomically rewrites the retained Raft entry map during log persistence. This can make append work depend on the number and size of entries since the last purge. An isolated measurement now confirms local rewrite-byte and latency growth for larger entries, but does not establish the end-to-end effect under clustered workloads.
 
-Current progress: the behavior is recorded as [TD-026](tech-debt.md#td-026-raft-log-persistence-rewrites-retained-entries) and in the [systems performance research](research/systems-performance-research.md#replicated-logs-and-payload-movement-inspect-cross-layer-writes-before-redesigning-locks). The clustered benchmark matrix does not yet report Raft-log bytes rewritten per commit across retained-log lengths and purge cycles.
+Current progress: the [isolated TD-026 persistence baseline](research/td-026-log-store-persistence-baseline.md) exercises the real `LogStore` append-flush and committed-index persistence paths. At 4,096 retained entries, a 1 KiB single-entry append/commit pair took 75.8 ms median and rewrote 35.2 MB of serialized Raft-log JSON, versus 32.6 ms and 8.8 KiB with no retained entries. The current cluster requests snapshots after 32 new log entries and keeps four, but the measurement did not execute snapshots or purge; its 36-entry and higher points are synthetic no-purge states. The clustered benchmark matrix still needs live Raft-log counts and per-path bytes, throughput, tail latency, and recovery measurements across actual snapshot/purge cycles. See [TD-026](tech-debt.md#td-026-raft-log-persistence-rewrites-retained-entries) and the [systems performance research](research/systems-performance-research.md#replicated-logs-and-payload-movement-inspect-cross-layer-writes-before-redesigning-locks).
 
 Constraints:
 
