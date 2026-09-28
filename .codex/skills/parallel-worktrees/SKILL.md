@@ -87,21 +87,20 @@ evidence.
 
 ## Worker instructions
 
-Tell each worker to:
+Before editing, explicitly instruct every worker to read the repository root
+`AGENTS.md`, this skill, and [WORKER.md](WORKER.md). Pass this requirement to
+any nested worker only when nested delegation is authorized.
 
-- read the repository root `AGENTS.md` and this skill before editing; if spawning nested workers, pass the same requirement through; stay inside the assigned worktree and write scope; do not revert unrelated work;
-- follow the single-source refactoring and planning-record policy in `AGENTS.md`, including within-domain refactors, cross-boundary tech debt, and handoff reporting;
-- for non-trivial architectural changes, follow `AGENTS.md`'s requirement to compare relevant competitor or reference designs and primary research, and include the sources, differences, alternatives, hypotheses, and unresolved risks in the handoff;
-- classify the work by one primary evidence class and optional secondary tags, follow the applicable gate in [docs/testing.md](../../../docs/testing.md), and do not use a classification to waive global safety, baseline, CI, pull-request, or cleanup requirements;
-- use the repository's canonical `just` commands and existing benchmark harnesses;
-- apply the backlog and tech-debt update requirements in `AGENTS.md`, and include the resulting update or explicit no-update rationale in the handoff;
-- record the exact revision, workload, resource limits, isolation settings, and commands;
-- for performance-sensitive work, follow the benchmark policy above, run the applicable benchmark before claiming an improvement, and report the exact workload, resources, repetitions, stability thresholds, and result; treat inconclusive evidence as unfinished;
-- distinguish a confirmed improvement from noise, a blocked run, and an inconclusive result;
-- report changed files, expected effects and non-effects, correctness and crash-recovery considerations, evidence, coverage gaps, and an evidence-based recommendation to merge, revise, rerun, or defer. Include blocked or inconclusive results rather than omitting them;
-- report the recorded baseline revision and whether the branch was refreshed;
-- commit the result on its task branch, push it, and open exactly one pull request for the task. Use a draft PR for incomplete or blocked work, and include the documented handoff in the PR body;
-- do not merge the PR or enable auto-merge. The worker may provide a provisional disposition, but the orchestrator owns the independent review, final merge recommendation, merge, and rolling-pool lifecycle.
+Each assignment must state its goal, acceptance criteria, owned paths, baseline
+revision, task-to-worktree mapping, expected evidence class, resource and
+isolation constraints, and coordination boundaries. Require the worker's
+pre-edit identity report and prohibit reverting unrelated work.
+
+Use [WORKER.md](WORKER.md) as the single worker-facing checklist for
+implementation, testing and end-to-end assessment, evidence, planning and
+refactor assessment, pull requests, and handoff. Keep global engineering
+policy in `AGENTS.md` and coordinator lifecycle policy in this skill; do not
+create conflicting copies.
 
 When coordinating delegated work, the orchestrator must collect each worker's
 expected effects and non-effects, evidence and coverage gaps, recommendation,

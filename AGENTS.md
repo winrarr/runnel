@@ -43,7 +43,7 @@ Runnel is a Rust message broker intended to offer durable streams, low operation
 - justfile: canonical Linux development command interface.
 - scripts/smoke.sh: repeatable broker/CLI/restart smoke test.
 - scripts/verify.sh: compatibility wrapper around just verify.
-- .codex/skills/parallel-worktrees/SKILL.md: repository workflow for delegated work, coordinated refactors, isolated tests, and benchmark resource separation.
+- .codex/skills/parallel-worktrees/SKILL.md and WORKER.md: repository workflow for delegated work, worker verification and pull request handoffs, coordinated refactors, isolated tests, and benchmark resource separation.
 
 ## Sources of truth and boundaries
 
