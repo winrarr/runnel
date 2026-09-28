@@ -1,8 +1,8 @@
 # TD-020 bounded lease-clock floor
 
 - Status: implemented bounded slice; TD-020 remains open
-- Last reviewed: 2026-09-06
-- Baseline: `b9c796d3ebb87b6d71dccc87751524294684b430` (`origin/main` at review)
+- Last reviewed: 2026-09-28
+- Baseline: `ec5f40418b81ddcc78b94da887af6866b4b03d39` (`origin/main` at review)
 
 This note records the current containment for clustered delivery leases. It is
 an unsettled design note, not an ADR or a claim that the clustered backend has
@@ -195,21 +195,29 @@ The focused state-machine tests cover future, equal, and past deadlines;
 forward jumps and a fixed successor offset; backward observations and the
 persisted floor; deadlines behind the floor; acknowledgement-time expiry and
 stale-token fencing; no-command expiry; journal restart and leader change; and
-snapshot round-trip. The [three-process clustered tests](../../crates/runnel-server/tests/cluster_smoke.rs)
+snapshot round-trip. The state-machine-store test
+`legacy_snapshot_defaults_lease_floor_and_applied_commands_advance_it`
+installs a version-1 snapshot with no `lease_clock_ms`, observes the default
+floor of zero, applies a grouped poll that advances it, and then applies a
+stale-member acknowledgement on the still-active stream. That rejected ack
+advances the floor before member validation while retaining the valid in-flight
+delivery; reopening the store replays the commands and retains both the floor
+and delivery. This covers a concrete invalid-ack outcome through the
+`RaftStateMachine` apply seam. It does not cover every invalid acknowledgement
+outcome. The [three-process clustered tests](../../crates/runnel-server/tests/cluster_smoke.rs)
 cover real follower restart, leader/process failure, reassignment, durable
 attempts, and stale-token rejection. They use the host clock and do not inject
-skew or jumps. There is no focused assertion of the public compatibility
-aliases' effect on the floor, nor of floor advancement for each invalid
-active-stream acknowledgement result, although both follow from the shared
-`AckGroup`/`PollGroup` implementation.
+skew or jumps. No focused assertion exercises the public compatibility
+`poll`/`ack` aliases' effect on the floor; their behavior is inferred from the
+shared `PollGroup`/`AckGroup` construction path, not established by this test.
 
 The unit fixture that advances the floor through a second stream is useful for
 state-machine arithmetic but is not evidence that one stream advances another
-stream's floor. There is also no focused assertion that a version-1 artifact
-with an omitted floor restores zero and then rebuilds the floor through a later
-command, no mixed-timeout cluster test, no clock-health telemetry, and no
-measurement of real-time redelivery error under controlled clock skew or
-process suspension.
+stream's floor. The new legacy-snapshot test establishes the omitted-floor
+default and subsequent command advancement for snapshots; it does not establish
+the same sequence for a legacy version-1 checkpoint. There is no mixed-timeout
+cluster test, no clock-health telemetry, and no measurement of real-time
+redelivery error under controlled clock skew or process suspension.
 
 No performance benchmark applies to the current floor slice: it changes lease
 bookkeeping and persistence semantics without changing the intended hot-path
