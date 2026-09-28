@@ -6,6 +6,7 @@
 - Scope: clustered data-group retained messages, materialized state, journal replay, and resource growth
 - Related debt: [TD-010](../tech-debt.md#td-010-clustered-state-materializes-complete-retained-history)
 - Related outcome: [Make retained-state growth independent of the hot path](../backlog.md#make-retained-state-growth-independent-of-the-hot-path)
+- Related research: [Systems performance research for Runnel](../research/systems-performance-research.md)
 - Separate concern: [TD-009](../tech-debt.md#td-009-snapshots-rewrite-the-complete-materialized-group-state) owns the cost and crash contract of full snapshot creation and installation
 
 This note records what the clustered state machine currently materializes, where
@@ -214,11 +215,16 @@ comparison against the current state machine. At minimum, vary:
 Each case should report median and observed range for publish and delivery
 latency, restart-to-ready and first-replay time, replay throughput, peak/RSS
 memory, CPU, journal/checkpoint/snapshot bytes, total on-disk bytes, and bytes
-read or parsed during recovery. If practical, add instrumentation for
-allocation/copy counts and apply-batch sizes; otherwise state that they are
-not directly observed. Keep each scenario's setup outside the measured
-interval when the question is hot-path behavior, and keep full recovery work
-inside the recovery interval when the question is retained-state growth.
+read or parsed during recovery. Also separate bytes and sync counts for the
+Raft log, state-machine journal, retained-log rewrites, and snapshots so a
+single total does not hide repeated payload persistence across layers. If
+practical, add instrumentation for allocation/copy counts and apply-batch
+sizes; otherwise state that they are not directly observed. Keep each
+scenario's setup outside the measured interval when the question is hot-path
+behavior, and keep full recovery work inside the recovery interval when the
+question is retained-state growth. The [systems performance research](../research/systems-performance-research.md#replicated-logs-and-payload-movement-inspect-cross-layer-writes-before-redesigning-locks)
+reviews cross-layer logging work while noting that shared payload references
+would require a new recovery protocol.
 
 The result is inconclusive if it changes durability, payload shape, topology,
 or measured work between candidates, or if host noise exceeds the project's

@@ -56,3 +56,7 @@ for the same evidence labels and outcome/evidence gates.
 - [TD-013 native competitor benchmark semantics](td-013-native-competitor-semantics.md)
   records the current native-tool boundaries and a future common workload
   envelope without treating the comparison as a ranking.
+- [Systems performance research for Runnel](systems-performance-research.md)
+  connects established and recent systems research on durable batching,
+  queueing, replicated-log writes, cache lines, and I/O to Runnel's current
+  implementation and evidence gates.

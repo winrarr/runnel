@@ -5,6 +5,7 @@
 - Baseline: `ff987fe19b28c3a3640615d742d4ea7c5df8824c` (`origin/main` at review)
 - Related debt: [TD-019](../tech-debt.md#td-019-delivery-bookkeeping-synchronizes-durable-state-per-delivery)
 - Related policy boundary: [Durability and delivery policy](durability-delivery-policy.md)
+- Related research: [Systems performance research for Runnel](../research/systems-performance-research.md)
 - Related decisions: [ADR 0013](../decisions/0013-local-shared-consumer-delivery.md), [ADR 0014](../decisions/0014-local-retry-and-dead-letter-policy.md), [ADR 0015](../decisions/0015-clustered-shared-consumer-ownership.md), [ADR 0016](../decisions/0016-clustered-retry-and-dead-letter-policy.md), and [ADR 0026](../decisions/0026-semantic-engine-error-classification.md)
 
 This note records the current durability boundary for delivery bookkeeping and
@@ -164,8 +165,10 @@ compaction from ordinary events, or filesystem behavior.
 The following evidence is still missing:
 
 - repeated, resource-scoped comparisons of per-event sync versus a bounded
-  batching candidate, with the batch size, maximum wait, and durability mode
-  recorded in the result;
+  batching candidate, with the batch size, maximum wait, offered-load model
+  (closed-loop or open-loop, including rate-shift scenarios), and durability mode recorded in the
+  result. These arrival models can favor different batching policies, as
+  discussed in the [systems performance research](../research/systems-performance-research.md#durable-batching-amortize-barriers-without-moving-the-success-boundary);
 - separate poll, acknowledgement, and end-to-end latency distributions,
   including p99 and p99.9, under one, two, four, and eight workers and both
   independent and shared consumers;

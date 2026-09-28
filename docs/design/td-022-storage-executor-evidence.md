@@ -7,6 +7,7 @@
 - Related debt: [TD-022](../tech-debt.md#td-022-local-durable-io-has-bounded-async-isolation-but-incomplete-evidence)
 - Related outcome: [Make concurrent broker work scale predictably](../backlog.md#make-concurrent-broker-work-scale-predictably)
 - Related policy: [Durability and delivery policy boundary](durability-delivery-policy.md)
+- Related research: [Systems performance research for Runnel](../research/systems-performance-research.md)
 
 This note records what the local async boundary currently guarantees, what it
 costs, and which evidence is still needed before changing executor sizing,
@@ -250,7 +251,9 @@ baseline has evidence for all of the following:
 
 - A resource-scoped comparison names the exact baseline revision, filesystem,
   CPU and memory limits, payload/key mix, stream count, worker count, operation
-  mix, durability mode, and repetition/stability policy.
+  mix, offered-load model (closed-loop or open-loop, including rate-shift
+  scenarios), durability mode, and repetition/stability policy. The arrival model matters when
+  evaluating batching and queue wait, not just executor capacity.
 - It reports throughput plus p50, p99, and p99.9 latency where meaningful,
   separately for queue/lane/lock/I/O work when instrumentation supports that
   split. Results must retain observed ranges and call noisy or mismatched runs

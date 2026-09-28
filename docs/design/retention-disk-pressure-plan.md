@@ -6,7 +6,10 @@
 - Reading guide: [design-note conventions](README.md)
 - Scope: safe retained-history policy, bounded cleanup, and durable-write admission
 - Related outcome: [Make retention and disk-pressure behavior safe](../backlog.md#make-retention-and-disk-pressure-behavior-safe)
-- Related research: [Distributed architecture exploration](../research/distributed-architecture-options.md), [Raft follower recovery and replacement](../research/raft-recovery-and-replacement.md), and [Message encoding and compression study](../research/message-encoding-and-compression.md)
+- Related research: [Distributed architecture exploration](../research/distributed-architecture-options.md),
+  [Raft follower recovery and replacement](../research/raft-recovery-and-replacement.md),
+  [Message encoding and compression study](../research/message-encoding-and-compression.md),
+  and [Systems performance research for Runnel](../research/systems-performance-research.md)
 - Related design evidence: [Durability and delivery policy](durability-delivery-policy.md), [clustered durability and outcomes](clustered-outcome-contract.md), and [dead-letter recovery](dead-letter-recovery.md)
 
 This is a design proposal, not an accepted ADR. It turns the retention and
