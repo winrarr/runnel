@@ -1008,4 +1008,110 @@ mod tests {
         let message = &state.state.streams["events"].messages[0];
         assert_eq!(message.payload, b"first");
     }
+
+    #[tokio::test]
+    async fn legacy_snapshot_defaults_lease_floor_and_applied_commands_advance_it() {
+        let directory = tempfile::tempdir().unwrap();
+        let state_directory = directory.path().join("state-machine");
+        let kind = GroupKind::Data {
+            stream: "events".to_owned(),
+            stream_id: "stream/events".to_owned(),
+            group_id: "group/events/data".to_owned(),
+        };
+        let store = Arc::new(StateMachineStore::open(&state_directory, kind.clone()).unwrap());
+        let legacy_snapshot_value = serde_json::json!({
+            "version": 1,
+            "streams": {
+                "events": [{
+                    "key": null,
+                    "payload": [108, 101, 103, 97, 99, 121],
+                    "published_at_ms": 1
+                }]
+            },
+            "consumers": []
+        });
+        assert_eq!(legacy_snapshot_value["version"], 1);
+        assert!(legacy_snapshot_value.get("lease_clock_ms").is_none());
+        let legacy_snapshot = serde_json::to_vec(&legacy_snapshot_value).unwrap();
+        let snapshot_meta = snapshot_meta(1, "legacy-lease-floor");
+
+        let mut state_machine = store.clone();
+        state_machine
+            .install_snapshot(
+                &snapshot_meta,
+                Box::new(Cursor::new(legacy_snapshot.clone())),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(store.state.read().await.state.lease_clock_ms, 0);
+
+        let poll_responses = state_machine
+            .apply(std::iter::once(Entry {
+                log_id: LogId {
+                    leader_id: openraft::CommittedLeaderId::new(1, 1),
+                    index: 2,
+                },
+                payload: EntryPayload::Normal(crate::Command::PollGroup {
+                    stream: "events".to_owned(),
+                    consumer: "workers".to_owned(),
+                    member: "member-a".to_owned(),
+                    now_ms: 125,
+                    lease_deadline_ms: 250,
+                    max_delivery_attempts: None,
+                    legacy_ack_timeout_ms: None,
+                    policy_version: None,
+                }),
+            }))
+            .await
+            .unwrap();
+        let delivery_token = match &poll_responses[0] {
+            CommandResponse::GroupPoll {
+                result: PollResult::Message(message),
+            } => message
+                .delivery_token
+                .clone()
+                .expect("poll should create a lease"),
+            response => panic!("unexpected poll response: {response:?}"),
+        };
+        assert_eq!(store.state.read().await.state.lease_clock_ms, 125);
+
+        let stale_ack = state_machine
+            .apply(std::iter::once(Entry {
+                log_id: LogId {
+                    leader_id: openraft::CommittedLeaderId::new(1, 1),
+                    index: 3,
+                },
+                payload: EntryPayload::Normal(crate::Command::AckGroup {
+                    stream: "events".to_owned(),
+                    consumer: "workers".to_owned(),
+                    member: "member-b".to_owned(),
+                    offset: 0,
+                    delivery_token,
+                    now_ms: 175,
+                }),
+            }))
+            .await
+            .unwrap();
+        assert_eq!(
+            stale_ack,
+            vec![CommandResponse::GroupStaleDelivery {
+                consumer: "workers".to_owned(),
+                offset: 0,
+            }]
+        );
+        assert_eq!(store.state.read().await.state.lease_clock_ms, 175);
+
+        drop(state_machine);
+        drop(store);
+        let recovered = StateMachineStore::open(&state_directory, kind).unwrap();
+        let state = recovered.state.read().await;
+        assert_eq!(state.state.lease_clock_ms, 175);
+        let delivery = state.state.group_consumers[&("events".to_owned(), "workers".to_owned())]
+            .in_flight
+            .get(&0)
+            .expect("stale member acknowledgement must leave the live lease intact");
+        assert_eq!(delivery.member, "member-a");
+        assert_eq!(delivery.deadline_ms, 250);
+    }
 }
