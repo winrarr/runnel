@@ -1,8 +1,10 @@
 # Consumer-lag telemetry design
 
-- Status: exploratory design proposal; no implementation authorized
-- Last reviewed: 2026-09-06
-- Baseline inspected: `2acd807a925fdd664fa36128fec35c4116239a6d`
+- Status: semantic contract accepted by
+  [ADR 0028](../decisions/0028-consumer-lag-observation-semantics.md); runtime
+  design remains exploratory
+- Last reviewed: 2026-09-28
+- Baseline inspected: `3ba927d37d36b914fc0772a983d6c257044e6f16`
 - Evidence class: operability/observability correctness
 - Related debt: [TD-006](../tech-debt.md#td-006-operational-telemetry-remains-incomplete)
 - Scope: bounded logical consumer-lag observation for local and early clustered engines
@@ -10,13 +12,12 @@
 This is design-only, not an implementation or a runtime guarantee. Rust code
 and tests remain authoritative if this note becomes stale.
 
-This proposal adds consumer-lag visibility without making the health path scan
-retained history, without turning stream or consumer names into an unbounded
-Prometheus dimension, and without treating a replicated copy as another
-logical consumer. The first implementation should expose a fixed-cardinality
-aggregate in `/metrics` and an exact, bounded, identity-selected diagnostic
-operation. It should keep `HealthSnapshot` and the existing health response
-unchanged.
+The accepted contract defines logical cursor lag and its unavailable states
+without authorizing a runtime API, engine capability, or metric family. Any
+future implementation must keep scrape and diagnostic work bounded, avoid
+caller-controlled Prometheus labels, and count a replicated consumer once.
+`HealthSnapshot` and the existing health response remain separate from this
+optional telemetry.
 
 ## Current baseline
 
@@ -29,8 +30,8 @@ lag:
   bytes. Adding lag fields directly to either type would couple a future
   per-consumer view to the existing health contract.
 - The server's [`/metrics`](../../crates/runnel-server/src/observability.rs) output uses fixed operation labels only. It already reports aggregate request, traffic, publish, delivery, acknowledgement, admission, storage, health, and clustered snapshot signals. The clustered snapshot families are read separately from health and are emitted only when the snapshot-metrics call completes; neither path exposes consumer lag. Real-server tests explicitly ensure that failed protocol requests do not create stream or consumer labels.
-- Local [`runnel-core`](../../crates/runnel-core/src/broker.rs) keeps the complete append-only stream history on disk, a bounded tail index and bounded sparse index, and a reconstructed `next_offset`. Consumer checkpoints are durable per `(stream, consumer)` and contain a contiguous `committed_offset`, out-of-order acknowledged offsets, and delivery attempts. Active deliveries are indexed per consumer, with expiry removed through a deadline index. The in-memory consumer-state cache is bounded to 1,024 entries, but consumer state files are created lazily and there is no complete durable or in-memory consumer catalogue.
-- Clustered [`runnel-raft`](../../crates/runnel-raft/src/state_machine.rs) state stores stream records, consumer progress, out-of-order acknowledgements, attempts, leases, and grouped in-flight ownership in each stream data group. [`GroupManager::health`](../../crates/runnel-raft/src/group_manager.rs) sums the currently materialized groups on the local node after reading metadata health; it does not perform a leader-authoritative cross-node query or deduplicate replica copies. Replica copies must not be summed as separate logical backlog.
+- Local [`runnel-core`](../../crates/runnel-core/src/broker.rs) keeps the complete append-only stream history on disk, a bounded tail index and bounded sparse index, and a reconstructed `next_offset`. Consumer checkpoints are durable per `(stream, consumer)` and contain a contiguous `committed_offset`, out-of-order acknowledged offsets, and delivery attempts. Active deliveries are indexed per consumer, with expiry removed through a deadline index. The in-memory consumer-state cache is bounded to 1,024 entries, but consumer state files are created lazily and there is no complete durable or in-memory consumer catalogue. The journal is limited to 64 KiB, but checkpoint files and their out-of-order-acknowledgement maps have no corresponding size bound; a cold read therefore is not yet bounded by the cache limit.
+- Clustered [`runnel-raft`](../../crates/runnel-raft/src/state_machine.rs) state stores stream records, consumer progress, out-of-order acknowledgements, attempts, leases, and grouped in-flight ownership in each stream data group. [`GroupManager::health`](../../crates/runnel-raft/src/group_manager.rs) sums materialized groups on the local node after reading metadata health; it does not perform a leader-authoritative cross-node query or deduplicate replica copies. The current consumer-policy inspection routes to the stream's current leader but returns no applied source revision. Replica copies must not be summed as separate logical backlog.
 - Local health obtains physical log-file lengths. Clustered state-machine
   health derives logical key-plus-payload bytes by iterating materialized
   messages. Neither definition is a consumer-lag byte definition, and the
@@ -41,13 +42,22 @@ lag:
 
 [`TD-006`](../tech-debt.md#td-006-operational-telemetry-remains-incomplete) remains open because the current signals cannot explain consumer lag,
 retained or reclaimable storage, queue saturation, replication progress, or
-resource pressure. This document proposes one bounded slice of that outcome;
-it does not retire the debt item.
+resource pressure. This document defines one accepted semantic slice of that
+outcome; it does not retire the debt item or authorize runtime behavior.
+
+## Accepted semantics and open runtime design
+
+[ADR 0028](../decisions/0028-consumer-lag-observation-semantics.md) accepts
+the meaning of cursor lag, the distinction between lag and in-flight work, and
+the rule that unavailable or incomplete data is never represented as zero.
+It does not accept an engine method, aggregate, protocol operation, metrics
+family, source-freshness promise, or consumer-coverage promise. Those require
+the implementation gates below.
 
 ## Semantics
 
-Lag must identify which notion of progress it measures. The proposed snapshot
-uses the following values for one logical `(stream, consumer)`:
+Lag must identify which notion of progress it measures. The accepted model uses
+the following values for one logical `(stream, consumer)`:
 
 | Symbol or field | Meaning | Unit and source |
 | --- | --- | --- |
@@ -62,14 +72,14 @@ uses the following values for one logical `(stream, consumer)`:
 | `oldest_unacknowledged_age_seconds` | `0` when `C = H`; otherwise current wall-clock time minus the published timestamp of offset `C`, when `C < H` and that record is retained | Seconds; a sampled age, not durable elapsed time |
 | `cursor_lag_bytes` | Logical key-plus-payload bytes for offsets `[C, H)` | Bytes; requires cumulative byte metadata and is not the physical file size |
 
-The initial operator-facing name should be `cursor_lag_records` (exported as
-`runnel_consumer_lag_records` for a defined aggregate). Calling `H - C` an
-"unacknowledged count" would be wrong for grouped consumers because
-out-of-order acknowledgements are allowed. The separate `unacknowledged_records`
-field can be added only when the implementation proves that its retained-range
-accounting is complete.
+The selected diagnostic field is `cursor_lag_records`; a future aggregate may
+use `runnel_consumer_lag_records` only when its declared consumer scope is
+complete. Calling `H - C` an "unacknowledged count" would be wrong for grouped
+consumers because out-of-order acknowledgements are allowed. The separate
+`unacknowledged_records` field can be added only when the implementation proves
+that its retained-range accounting is complete.
 
-The following rules are part of the proposal:
+The following rules are part of the accepted contract:
 
 1. `H` is a durable/committed head, never an assigned but uncommitted offset.
    A cluster follower may not report its local physical tail as fresh lag.
@@ -136,19 +146,20 @@ Record lag can be computed from `H` and `C`. Age and bytes need more care:
 
 ## Collection and aggregation model
 
-Lag should be a separate, optional engine telemetry capability rather than an
-extension of `HealthSnapshot`. Conceptually it returns a bounded
+If introduced, lag should be a separate, optional engine telemetry capability
+rather than an extension of `HealthSnapshot`. It would return a bounded
 `ConsumerLagSnapshot` with an observation timestamp, source revision, coverage
-status, and either aggregate values or one explicitly selected consumer. A
-default capability result is `unknown`; an engine that cannot provide lag must
-not be forced to fabricate zeroes.
+status, and either aggregate values or one explicitly selected consumer. An
+unsupported or incomplete source must yield `unknown`; it must not fabricate
+zeroes. This capability shape is an implementation option, not part of ADR
+0028.
 
 ### Exact selected-consumer observation
 
-The first exact interface should accept one validated stream and consumer
-identity and return at most one bounded record. It should read the stream head
-and consumer state from one consistent stream/data-group revision. The result
-can include:
+A candidate exact diagnostic would accept one validated stream and consumer
+identity and return at most one fixed-shape record. It would read the stream
+head and consumer state from one consistent stream/data-group revision. The
+result could include:
 
 ```text
 stream, consumer
@@ -164,35 +175,46 @@ oldest_unacknowledged_published_at_ms (when indexed)
 status = fresh | stale | unknown | retention_expired
 ```
 
-The exact transport and authorization boundary are not part of this design.
-If exposed through a future administrative operation, it must be authenticated
-and capability/version gated; the current unauthenticated HTTP surface must
-not gain a consumer-name inspection endpoint by implication. The operation is
-intentionally identity-selected so its work and response size are bounded.
+The exact transport and authorization boundary remain undecided. An
+identity-selected request limits the identity count and response shape, but it
+does not by itself bound bytes read from local state: checkpoint files are not
+currently size-limited, even though consumer-state journals are limited to
+64 KiB. A future implementation must cap read/parsing work or maintain a small
+bounded summary, and must define its authentication, compatibility, deadline,
+concurrency, and response-byte limits. Current network surfaces are
+unauthenticated; no new inspection endpoint is implied.
+
+A missing checkpoint is not proof that a named durable consumer exists or is
+caught up. Until the implementation can distinguish a known consumer from an
+arbitrary valid name, that selected observation is `unknown` with no numeric
+lag; it must not create state or synthesize a caught-up value.
 
 ### Local engine
 
-Under the stream lock, the local engine already has or can derive `H`, `C`,
-out-of-order acknowledgement count, and active in-flight count without reading
-payloads. A named observation should use that state and a bounded metadata
-lookup for the oldest pending record. It must not enumerate every log record
-on a metrics scrape.
+Under the stream lock, the local engine has or can derive `H`, `C`, and active
+in-flight count without reading stream payloads. Out-of-order acknowledgements
+are stored as a set. A named observation must not enumerate log records, and a
+cold state-file read must be capped or replaced by a bounded summary before it
+can be called bounded. Looking up an old message timestamp is a separate
+indexed-metadata operation and is not available from the current tail/sparse
+indexes with a guaranteed bounded cost.
 
 The current local state files are authoritative but are discovered lazily and
-there is no complete consumer catalogue. Exact broker-wide aggregates require
-one of these explicit choices before implementation:
+there is no complete consumer catalogue. Broker-wide aggregates therefore
+cannot be complete using current code. A future aggregate requires one of
+these choices:
 
 - add a durable per-stream consumer catalogue/summary with a validated
   configured maximum and a bounded recovery path; or
-- define aggregate coverage as only a bounded configured/allow-listed set and
-  report `coverage_complete = 0` when other durable consumers may exist.
+- define a bounded configured scope and report coverage for that scope; it
+  must not call the result broker-wide or claim complete coverage while other
+  durable consumers may exist.
 
-This proposal selects the second choice for the first safe slice: exact named
-inspection plus fixed-cardinality aggregates only when the engine has a
-complete, bounded summary. It does not authorize a `read_dir` walk or a full
-state-file scan during `/metrics`. Introducing a broker-wide maximum consumer
-count remains an unresolved product decision because current consumer names
-are implicitly created and have no delete operation.
+Neither choice is accepted yet. An active-state cache is not a catalogue; a
+directory walk or full checkpoint scan during `/metrics` is not an acceptable
+substitute. A maximum would affect implicit consumer creation, and the current
+protocol has no consumer-delete operation. A configured scope is useful only
+if it can be observed without labels or per-identity unbounded work.
 
 If a summary is later added, maintain it from durable state transitions and
 rebuild it once at startup from bounded metadata. A partial or failed rebuild
@@ -208,7 +230,8 @@ query should:
 
 1. resolve the stream through the metadata group;
 2. obtain a committed, leader-authoritative view from that stream's data group
-   or a clearly marked cached view with its applied revision;
+   with an applied source revision, or a clearly marked cached view with that
+   revision and `stale` status;
 3. aggregate at most once per logical stream/data-group identity; and
 4. return per-group `unknown` if leadership, initialization, snapshot
    installation, or the bounded query fails.
@@ -217,11 +240,11 @@ query should:
 broker health signal but must not become a cross-node lag reducer: summing the
 same stream's RF=3 state from three node scrapes would triple the logical lag.
 The preferred cluster metric path is a leader-authoritative logical aggregate
-served from any node through a bounded forward/query. If that is not yet
-available, document `/metrics` as node-local and require dashboards to select
-one source; never sum replica scrapes. A follower's stale value may be used
-only with `stale` status and a source revision, never as a fresh committed
-cluster result.
+served from any node through a bounded forward/query. If that is not available,
+do not emit a cluster-wide aggregate. A node-local metric must say that it is
+node-local, and dashboards must select one source rather than summing replica
+scrapes. A follower's cached value may be used only with `stale` status and a
+source revision, never as a fresh committed cluster result.
 
 The metadata group must not be mistaken for a consumer-bearing stream group.
 The implementation should deduplicate by stable stream/data-group identity and
@@ -230,21 +253,21 @@ replica copies as additional consumer lag.
 
 ## Metrics and cardinality
 
-The default `/metrics` surface should add only fixed-cardinality aggregate
-families. Suggested names are deliberately explicit about aggregation and
-units:
+If a future `/metrics` implementation can produce a complete, fresh logical
+aggregate, it should add only fixed-cardinality families. The suggested names
+are explicit about aggregation and units:
 
 | Metric | Type | Definition |
 | --- | --- | --- |
 | `runnel_consumer_lag_records` | Gauge | Sum of `cursor_lag_records` over all covered logical consumers; omit when coverage is incomplete |
 | `runnel_consumer_lag_max_records` | Gauge | Maximum `cursor_lag_records` over covered consumers; omit when coverage is incomplete |
-| `runnel_consumer_lag_oldest_age_seconds` | Gauge | Maximum known oldest-unacknowledged age; omit when no complete age sample exists |
+| `runnel_consumer_lag_oldest_unacknowledged_timestamp_seconds` | Gauge | Oldest known pending record timestamp; omit when no complete timestamp sample exists |
 | `runnel_consumer_lag_consumer_count` | Gauge | Number of logical consumers included in the snapshot |
 | `runnel_consumer_lag_coverage_complete` | Gauge | `1` when all consumers in the declared scope were observed; `0` for partial/truncated coverage |
 | `runnel_consumer_lag_unknown_consumers` | Gauge | Known consumers whose source/status is unknown in this snapshot |
 | `runnel_consumer_lag_expired_consumers` | Gauge | Known consumers behind the retained floor |
 | `runnel_consumer_lag_snapshot_available` | Gauge | `1` only when the aggregate snapshot is fresh and complete; otherwise `0` |
-| `runnel_consumer_lag_snapshot_age_seconds` | Gauge | Age of the last attempted snapshot, when an observation timestamp exists |
+| `runnel_consumer_lag_snapshot_timestamp_seconds` | Gauge | Unix timestamp of the last completed snapshot |
 | `runnel_consumer_lag_snapshot_failures_total` | Counter | Bounded lag snapshot attempts that failed or timed out |
 
 `coverage_complete` describes identity coverage, not freshness: it is `1`
@@ -259,12 +282,12 @@ not physical stream backlog, retained bytes, or a safe autoscaling signal by
 itself. Alerting should combine it with consumer count, oldest age, publish
 and acknowledgement rates, and the existing in-flight/admission signals.
 
-No metric in the first slice should have `stream`, `consumer`, `member`,
+No default metric should have `stream`, `consumer`, `member`,
 `offset`, `key`, payload, request ID, or delivery token labels. The current
 server convention already avoids caller-controlled stream and consumer
 labels. Prometheus recommends minimal labels and warns that user or resource
-identities can create unbounded time-series cardinality; this proposal keeps
-that boundary even though per-consumer lag is useful.
+identities can create unbounded time-series cardinality; future default metrics
+must keep that boundary even though per-consumer lag is useful.
 
 If future operations need identity-labelled metrics, require a static,
 validated operator allowlist with an explicit maximum series budget. Do not
@@ -276,15 +299,21 @@ series eviction/configuration changes. Until then, selected-consumer
 diagnostics are the identity-bearing surface.
 
 The collector must not allocate one task, timer, metric child, or payload copy
-per consumer or record. It should use maintained counters/indexes and a
-bounded snapshot buffer. Configuration must bound the number of selected
-observations, aggregate work, serialized bytes, and concurrent lag requests.
-Exceeding a bound is `truncated`/`unknown` and increments a fixed counter; it
-must not block publish, poll, acknowledgement, shutdown, or ordinary health.
+per consumer or record. A selected query may accept at most one validated
+`(stream, consumer)` identity and return one fixed-shape record. Its source
+read must have explicit byte, parse-work, concurrency, and deadline limits; a
+response-size limit alone is insufficient. A future aggregate must have hard
+limits for consumer identities covered, groups visited, source bytes read,
+exposition bytes, concurrent work, and deadline. The exact numeric ceilings
+remain open until the source representation and representative workloads are
+measured. Exceeding any bound is `truncated` or `unknown`, never a partial
+broker-wide value; it must not block publish, poll, acknowledgement, shutdown,
+or ordinary health.
 
 ## Freshness, unknown state, and health interaction
 
-The following status meanings are proposed:
+The following status meanings are accepted; freshness budgets and source
+mechanisms remain open runtime decisions:
 
 - `fresh`: the selected source revision and all values required by the metric
   were read within the configured observation deadline.
@@ -329,7 +358,7 @@ can distinguish service health from telemetry freshness.
 
 ## Compatibility and non-effects
 
-This proposal is additive and intentionally does not change current behavior:
+The accepted semantics do not change current behavior:
 
 - Do not add fields to `HealthSnapshot`, the existing protocol `Health`
   response, or `Message`. Existing health fixtures and clients remain valid.
@@ -338,9 +367,9 @@ This proposal is additive and intentionally does not change current behavior:
   metrics, and snapshot metrics. Consumer lag is not a reinterpretation of any
   existing gauge.
 - Do not expose physical log paths, Raft groups, replica placement, sparse
-  indexes, or offsets as new ordinary client concepts. A selected diagnostic
-  operation is an authenticated operational surface with explicit versioning,
-  not a replacement for the provisional messaging protocol.
+  indexes, or offsets as new ordinary client concepts. Any selected diagnostic
+  operation needs an explicitly accepted administrative and compatibility
+  boundary; it is not part of the provisional messaging contract by default.
 - Do not change delivery, acknowledgement, expiry, fencing, ordering, replay,
   dead-letter, retention, or durability semantics. Lag observes those state
   transitions; it must not advance a consumer or pin/delete history merely to
@@ -362,10 +391,10 @@ their partition, subscription, or monitoring models.
 
 | Reference | Useful precedent | Difference that matters to Runnel |
 | --- | --- | --- |
-| [Apache Kafka consumer metrics](https://kafka.apache.org/41/generated/consumer_metrics.html) | Exposes `records-lag` per topic/partition and `records-lag-max`; the documentation distinguishes current consumer position from committed offset. | Kafka has explicit partitions and consumer-side assignment. Runnel has one logical stream with independent cursors and transient shared-consumer members, so `H - C` and group in-flight state need names that do not imply a partition or member metric. |
-| [NATS JetStream `ConsumerInfo`](https://nats-io.github.io/nats.js/jetstream/types/ConsumerInfo.html) and [pull-consumer guidance](https://docs.nats.io/learn/jetstream/pull-consumers) | Separates pending messages, acknowledgement-pending messages, delivered sequence, acknowledgement floor, redelivery count, and waiting pulls. | The separation supports Runnel's distinction between cursor lag, out-of-order acknowledgements, and in-flight work. NATS's server-managed consumer info is not a reason to scan Runnel's retained file or to expose member identity as a metric label. |
-| [Google Cloud Pub/Sub monitoring](https://docs.cloud.google.com/pubsub/docs/monitoring) | Uses unacknowledged count and oldest-unacknowledged age as complementary backlog signals, and documents that backlog samples can have gaps/delay. | Runnel can provide exact committed offset distance for a selected source, but must make its own one-second health deadline, retention floor, and cluster revision explicit rather than hiding them behind a managed service's sampling model. |
-| [Prometheus instrumentation guidance](https://prometheus.io/docs/practices/instrumentation/) and [metric naming/cardinality guidance](https://prometheus.io/docs/practices/naming/) | Treats current state as gauges, recommends timestamps for elapsed age, and warns against high-cardinality identity labels. | Runnel's current fixed-label metrics convention and untrusted validated names favor aggregate gauges plus an identity-selected diagnostic operation; dynamic per-consumer series are not a safe default. |
+| [Apache Kafka 4.3 consumer metrics](https://kafka.apache.org/43/operations/monitoring/) | `records-lag` and `records-lag-max` are consumer-side metrics based on the current offset, explicitly not the committed offset. | Runnel's durable server-side checkpoint is the progress source, and `H - C` is intentionally about committed progress. Kafka's topic/partition/client dimensions and fetch position do not map to one Runnel stream with transient shared-consumer members. |
+| [NATS JetStream Consumer Info](https://docs.nats.io/reference/jetstream/api/consumer/info) | Server-side `ConsumerInfo` separates the last delivered sequence, highest contiguous acknowledged `ack_floor`, `num_ack_pending`, and `num_pending`. | The field separation supports reporting progress and outstanding work as different quantities. JetStream's delivery policies, filters, and pending semantics differ; its API does not imply that Runnel can enumerate consumers or read each state within a bound. |
+| [Google Cloud Pub/Sub monitoring](https://docs.cloud.google.com/pubsub/docs/monitoring) | Recommends viewing unacknowledged count with oldest-unacknowledged age, and documents that backlog samples can have gaps for several minutes. | Complementary count and age can explain different failure shapes, but Runnel must expose its own observation timestamp and unknown/stale state. Its committed cursor distance is not Pub/Sub's unacknowledged count. |
+| [Prometheus instrumentation guidance](https://prometheus.io/docs/practices/instrumentation/) and [metric naming/cardinality guidance](https://prometheus.io/docs/practices/naming/) | Current state belongs in gauges; every label set consumes resources, and high-cardinality identities should be avoided. For elapsed time, export the event's Unix timestamp and derive age in queries. | Keep default metrics label-free with no stream, consumer, member, key, offset, or token values. Export snapshot and record timestamps rather than maintaining time-since gauges. Identity-selected diagnostics are a separate bounded interface, not per-consumer series. |
 
 ## Hypotheses and unresolved risks
 
@@ -390,23 +419,24 @@ claims about the current runtime:
 
 Unresolved decisions before implementation are:
 
-1. Whether to introduce a maximum number of durable consumer states or accept
-   incomplete broker-wide aggregates when the current unbounded implicit
-   consumer model exceeds the telemetry budget.
-2. Whether the first aggregate is a complete durable summary, a configured
-   allowlist, or only fixed broker-wide health/coverage signals plus exact
-   selected inspection.
-3. The source-revision and forwarding protocol for a leader-authoritative
-   cluster query, including behavior while a stream data group is being
-   materialized or a replacement snapshot is installing.
-4. Whether age and logical byte lag belong in the first release or require the
-   segmented storage/retention work to provide bounded timestamp and prefix
-   indexes.
-5. The authenticated administrative transport and capability/version contract
-   for identity-selected inspection. No unauthenticated endpoint is implied.
-6. How a future replay session and retention policy contribute pins and
-   `retention_expired` status without pretending that physical cleanup is
-   instantaneous.
+1. How to distinguish a known durable consumer from an arbitrary valid name,
+   and how to cap cold checkpoint bytes and parsing work without changing
+   ordinary consumer recovery behavior.
+2. Whether to add a bounded durable consumer catalogue/summary or support a
+   deliberately limited configured scope. A partial scope must not be called
+   the broker-wide total; adding a consumer maximum also changes implicit
+   consumer creation semantics.
+3. The source revision and read protocol for a committed leader-authoritative
+   cluster query, including behavior during stream-group creation, leader
+   change, and snapshot installation.
+4. Whether metrics are a single logical cluster aggregate or explicitly
+   node-local observations, and how scrapers avoid summing replica copies.
+5. The administrative transport, authorization, compatibility/version
+   behavior, request deadline, concurrency budget, and response-byte limit for
+   identity-selected inspection. No unauthenticated endpoint is implied.
+6. Whether age and logical byte lag belong in a later release after bounded
+   timestamp/byte indexes exist, and how a future replay session and retention
+   policy contribute pins and `retention_expired` status.
 
 ## Test and acceptance gates
 
@@ -415,13 +445,16 @@ behavior or performance claim is made, so implementation benchmarks are not a
 gate for this document. The future implementation should satisfy the
 following staged gates.
 
-### Stage 0 — accept the contract
+### Stage 0 — close the implementation contract
 
-- Record the definitions of `H`, `F`, `C`, `A`, `I`, status, source revision,
-  coverage, and units in an accepted decision record before changing the
-  engine contract or storage format.
-- Select the durable-consumer catalogue/summary policy, metric names, bounds,
-  authorization, and compatibility/version behavior.
+- Choose the known-consumer rule, complete catalogue or configured scope,
+  local state read/parse byte cap, and hard limits for identities, group
+  queries, output bytes, concurrency, and deadline.
+- Define how a cluster result proves its applied source revision and whether
+  each scrape is logical cluster-wide or explicitly node-local.
+- Decide the authorized identity-selected transport and its compatibility,
+  authentication, response-size, and timeout behavior. Do not rely on the
+  existing unauthenticated HTTP endpoint for consumer inspection.
 - Establish a fake clock and deterministic source-revision seam for unit
   tests, while retaining real filesystem/process tests for failure behavior.
 
@@ -434,8 +467,12 @@ following staged gates.
   any persisted head/byte metadata recovery. A crash between durable message
   append, delivery-attempt persistence, and acknowledgement must not produce
   a false caught-up result.
+- A query for an identity with no durable state returns `unknown` and does not
+  create or persist a consumer checkpoint.
 - A cold consumer does not trigger an unbounded log scan from a health or
-  metrics request. Missing timestamp/byte index data is explicitly unknown.
+  metrics request; an oversized state checkpoint returns `unknown` within the
+  configured read/parse bound. Missing timestamp/byte index data is explicitly
+  unknown.
 - Retention tests cover `F = 0`, `protect`, `expire` with `C < F`, unavailable
   history, acknowledged-history replay, and the separation of physical bytes
   from logical lag bytes.
@@ -453,8 +490,9 @@ following staged gates.
   it must not be assumed to inherit the health timeout. Readiness remains
   independent of high or unknown application lag while still failing on the
   existing engine-health timeout.
-- Output bytes, concurrent lag work, snapshot item count, state reads, and
-  any configured identity allowlist are bounded under consumer/name churn.
+- Output bytes, concurrent lag work, consumer/group count, state reads, and
+  any configured scope are bounded under consumer/name churn. Incomplete
+  coverage never produces a broker-wide numeric aggregate.
 
 ### Stage 3 — clustered aggregation
 
@@ -473,7 +511,7 @@ following staged gates.
 - Indexed timestamps and cumulative logical byte totals are validated across
   legacy/current formats, restart, retention cleanup, and cluster snapshot
   installation before those fields become deployment-grade metrics.
-- The authenticated selected-consumer operation enforces name validation,
+- Any selected-consumer operation enforces name validation, authorization,
   deadline, response-size, and result-cardinality limits and documents every
   `fresh`/`stale`/`unknown`/`retention_expired` outcome.
 
@@ -501,53 +539,43 @@ they do not permit a claim that telemetry improves broker performance.
 
 ## Implementation feasibility review
 
-An inspection of the current telemetry and engine boundaries at the 2026-09-06
-TD-006 baseline confirms that the Stage 0 contract is still required before a
-runtime change can be made safely:
+The baseline confirms that record cursor distance is the smallest useful
+candidate, but the current code cannot yet promise bounded, fresh observations:
 
-- `runnel-core::Broker::health` can inspect each stream under its stream lock
-  and report currently tracked in-flight deliveries, but the stream tail is
-  not part of the current health snapshot and consumer state is loaded lazily
-  from per-consumer files. There is no complete durable consumer catalogue or
-  bounded summary from which a broker-wide aggregate could be computed.
-  Walking `consumers/` during `/metrics` would make scrape work and latency
-  depend on unbounded state-file churn.
-- `runnel-raft::GroupManager::health` sums materialized data groups on the
-  local node. The same logical stream can be present on multiple replicas, and
-  the current health path has no leader-authoritative source revision or
-  cross-node deduplication. Treating that sum as a cluster lag metric would
-  double- or triple-count logical backlog.
-- The server's metrics collector currently accepts an optional aggregate
-  `HealthSnapshot` and, for clustered servers, a separately collected
-  `SnapshotMetricsSnapshot`. It has no optional consumer-lag capability.
-  Adding a lag field to `HealthSnapshot` would couple an optional,
-  potentially unavailable telemetry capability to readiness and the existing
-  protocol health model. Reusing `in_flight_deliveries` as lag would also be
-  semantically incorrect because in-flight records are only one part of the
-  durable cursor distance.
+- Local `Broker::inspect_consumer` validates one identity and loads that
+  consumer's durable state under its stream lock. Its checkpoint can be
+  unbounded in bytes because the acknowledgement set is persisted in the
+  checkpoint; the 64 KiB journal cap does not cap checkpoint parsing. The
+  1,024-entry cache bounds cached identities, not on-disk checkpoint size or
+  the complete consumer catalogue. `/metrics` must not enumerate the
+  consumer-state directory or treat that cache as complete.
+- Clustered policy inspection routes to the current data-group leader, but
+  returns no applied source revision. Cluster health iterates materialized
+  groups on each local node, and the same logical stream is replicated to each
+  voter. These paths do not establish a fresh cross-node aggregate; replica
+  values must never be summed as distinct consumers.
+- The server metrics collector has a one-second bound for `engine.health()`.
+  Its existing clustered snapshot-metrics query happens after that check and
+  has no independent explicit deadline. New lag collection must carry its own
+  bound and remain optional to readiness. `HealthSnapshot` and the protocol
+  health response are not appropriate places for an optional consumer query.
 
-The following implementation shortcuts were considered and rejected for this
-stage: scrape-time filesystem enumeration, process-local maps of observed
-consumers, a numeric zero when the catalogue is incomplete, and a new field on
-`HealthSnapshot`. Each either produces a false caught-up result after restart,
-has no bounded cardinality/work guarantee, or changes an established health
-contract without defining freshness and unknown outcomes.
-
-The exact next contract is therefore unchanged from the staged plan above:
-first accept the definitions and unknown/expired semantics in an ADR, then add
-an optional bounded telemetry capability with a default `unknown` result. The
-capability needs an explicit complete-summary or allowlist policy for fixed
-aggregate metrics, and a separate authenticated/versioned identity-selected
-operation for exact inspection. Its clustered implementation must carry a
-leader-authoritative revision (or explicitly stale status) and deduplicate by
-logical stream/data-group identity. Until those decisions and bounds are
-accepted, this proposal remains the appropriate evidence artifact and no
-numeric consumer-lag family should be emitted.
+The smallest useful runtime candidate is an exact, identity-selected
+`cursor_lag_records` diagnostic for one `(stream, consumer)`. It avoids
+consumer enumeration and user-controlled metric labels, but it is not approved
+for implementation yet: local state reads need a byte/parse-work bound, the
+cluster result needs a leader-applied revision, and the exposure/compatibility
+boundary needs a decision. Fixed-cardinality broker-wide metrics are a later
+slice because they additionally need a complete bounded consumer catalogue or
+an explicitly limited scope; current code provides neither. A process-local
+cache, partial scan, `H - C` value represented as unacknowledged count, or
+fresh-looking zero on missing state would violate the accepted contract.
 
 ## Recommendation
 
-Accept this file as the TD-006 consumer-lag design proposal, keep TD-006 open,
-and resolve the consumer-catalogue, retention, byte/age index, cluster-source,
-and administrative-transport decisions before implementation. Implement the
-record-based exact selected observation and fixed-cardinality aggregate only
-after the Stage 0 contract and Stage 1/2 evidence gates are approved.
+Accept ADR 0028's semantic rules only and keep TD-006 open. Defer the first
+runtime slice until a follow-up decision establishes bounded local state reads,
+cluster source revisions and deduplication, and the administrative exposure
+contract. Keep bytes and age out of that first slice until indexed source
+metadata exists. No current engine capability, aggregate, API, or freshness or
+coverage promise follows from this design update.
