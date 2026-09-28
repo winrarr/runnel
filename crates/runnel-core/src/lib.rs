@@ -1511,6 +1511,65 @@ mod tests {
     }
 
     #[test]
+    fn acknowledgement_journal_open_failure_preserves_progress_across_restart() {
+        let directory = tempdir().unwrap();
+        let journal_path = directory.path().join("consumers/events/worker.json.tmp");
+        let saved_journal_path = directory.path().join("consumers/events/worker.json.saved");
+        let broker = Broker::open(directory.path(), BrokerConfig::default()).unwrap();
+        broker
+            .publish("events", Some("order-1".to_owned()), b"payload".to_vec())
+            .unwrap();
+        assert!(matches!(
+            broker.poll("events", "worker").unwrap(),
+            PollResult::Message(Message {
+                offset: 0,
+                delivery_attempt: Some(1),
+                ..
+            })
+        ));
+
+        // Replacing the journal with a directory makes opening it for append fail
+        // deterministically, after the delivery attempt itself is durable.
+        fs::rename(&journal_path, &saved_journal_path).unwrap();
+        fs::create_dir(&journal_path).unwrap();
+        let acknowledgement = broker.ack("events", "worker", 0);
+        fs::remove_dir(&journal_path).unwrap();
+        fs::rename(&saved_journal_path, &journal_path).unwrap();
+
+        assert!(matches!(
+            acknowledgement,
+            Err(BrokerError::Io(error)) if error.kind() == io::ErrorKind::IsADirectory
+        ));
+        assert!(matches!(
+            broker.poll("events", "worker").unwrap(),
+            PollResult::Message(Message {
+                offset: 0,
+                delivery_attempt: Some(1),
+                ..
+            })
+        ));
+        drop(broker);
+
+        let broker = Broker::open(directory.path(), BrokerConfig::default()).unwrap();
+        assert!(matches!(
+            broker.poll("events", "worker").unwrap(),
+            PollResult::Message(Message {
+                offset: 0,
+                delivery_attempt: Some(2),
+                ..
+            })
+        ));
+        assert_eq!(
+            broker.ack("events", "worker", 0).unwrap(),
+            AckResult::Acknowledged
+        );
+        drop(broker);
+
+        let broker = Broker::open(directory.path(), BrokerConfig::default()).unwrap();
+        assert_eq!(broker.poll("events", "worker").unwrap(), PollResult::Empty);
+    }
+
+    #[test]
     fn consumer_delivery_journal_recovers_committed_events_and_discards_partial_tail() {
         let directory = tempdir().unwrap();
         let journal_path = directory.path().join("consumers/events/worker.json.tmp");
