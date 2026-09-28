@@ -8,7 +8,7 @@ use criterion::{
     BatchSize, BenchmarkGroup, BenchmarkId, Criterion, Throughput, criterion_group, criterion_main,
 };
 use runnel_core::{Broker, BrokerConfig, PollResult};
-use runnel_engine::{Engine, PublishRecord};
+use runnel_engine::{Engine, MAX_PUBLISH_BATCH_RECORDS, PublishRecord};
 use std::sync::{Arc, Barrier};
 use std::thread;
 use tempfile::TempDir;
@@ -21,6 +21,9 @@ const RECOVERY_PAYLOAD: &[u8] = &[b'r'; 100];
 const RECOVERY_RETAINED_MESSAGE_COUNTS: &[u64] = &[100, 1_000, 5_000, 20_000];
 const BOUNDED_INDEX_RETAINED_MESSAGE_COUNTS: &[u64] = &[65_537, 131_072];
 const BOUNDED_INDEX_COLD_OFFSET: u64 = 1_024;
+const SHARED_TAIL_HISTORY_MESSAGE_COUNT: u64 = 2_048;
+const SHARED_TAIL_START_OFFSET: u64 = 1_900;
+const SHARED_TAIL_POLL_COUNT: u64 = 100;
 const SHARED_UNACKED_MEMBER_COUNT: u64 = 64;
 const PUBLISH_BATCH_RECORD_COUNT: u64 = 32;
 
@@ -275,6 +278,49 @@ fn shared_consumer_many_in_flight(c: &mut Criterion) {
     group.finish();
 }
 
+// Keep 2,048 retained messages so the 1,024-record cache is full, then poll from offset
+// 1,900. Each measured batch searches the shared-consumer tail and acknowledges 100 records.
+fn shared_consumer_tail_candidate_lookup(c: &mut Criterion) {
+    let mut group = configured_group(c, "shared_consumer_tail_candidate_lookup", 10);
+    group.warm_up_time(Duration::from_secs(1));
+    group.measurement_time(Duration::from_secs(3));
+    group.throughput(Throughput::ElementsAndBytes {
+        elements: SHARED_TAIL_POLL_COUNT,
+        bytes: SHARED_TAIL_POLL_COUNT * PAYLOAD.len() as u64,
+    });
+    group.bench_function(
+        "2048_retained_messages_100_polls_from_offset_1900",
+        |benchmark| {
+            benchmark.iter_batched(
+                || {
+                    let directory = prepare_shared_tail_candidate_history();
+                    let broker = Broker::open(directory.path(), BrokerConfig::default()).unwrap();
+                    (directory, broker)
+                },
+                |(_directory, broker)| {
+                    for expected_offset in
+                        SHARED_TAIL_START_OFFSET..SHARED_TAIL_START_OFFSET + SHARED_TAIL_POLL_COUNT
+                    {
+                        let (offset, token) = grouped_delivery(
+                            broker
+                                .poll_group("recovery", "workers", "member-a")
+                                .unwrap(),
+                        );
+                        assert_eq!(offset, expected_offset);
+                        black_box(
+                            broker
+                                .ack_group("recovery", "workers", "member-a", offset, &token)
+                                .unwrap(),
+                        );
+                    }
+                },
+                BatchSize::SmallInput,
+            );
+        },
+    );
+    group.finish();
+}
+
 fn publish_concurrently(broker: &Broker, streams: &[String]) {
     let worker_count = streams.len();
     let start = Arc::new(Barrier::new(worker_count));
@@ -372,13 +418,13 @@ fn concurrent_publish_independent_streams(c: &mut Criterion) {
     group.finish();
 }
 
-fn write_consumer_checkpoint(directory: &TempDir, committed_offset: u64) {
+fn write_consumer_checkpoint(directory: &TempDir, consumer: &str, committed_offset: u64) {
     let consumer_directory = directory.path().join("consumers/recovery");
     fs::create_dir_all(&consumer_directory).unwrap();
     fs::write(
-        consumer_directory.join("cold.json"),
+        consumer_directory.join(format!("{consumer}.json")),
         format!(
-            "{{\"stream\":\"recovery\",\"consumer\":\"cold\",\
+            "{{\"stream\":\"recovery\",\"consumer\":\"{consumer}\",\
              \"committed_offset\":{committed_offset},\
              \"acknowledged_offsets\":[],\"delivery_attempts\":{{}}}}"
         ),
@@ -391,8 +437,33 @@ fn prepare_retained_history(messages: u64, committed_offset: Option<u64>) -> Tem
     let broker = Broker::open(directory.path(), BrokerConfig::default()).unwrap();
     publish_messages(&broker, "recovery", messages, RECOVERY_PAYLOAD);
     if let Some(offset) = committed_offset {
-        write_consumer_checkpoint(&directory, offset);
+        write_consumer_checkpoint(&directory, "cold", offset);
     }
+    directory
+}
+
+fn prepare_shared_tail_candidate_history() -> TempDir {
+    let directory = TempDir::new().unwrap();
+    let broker = Broker::open(directory.path(), BrokerConfig::default()).unwrap();
+    let mut batch_start = 0;
+    while batch_start < SHARED_TAIL_HISTORY_MESSAGE_COUNT {
+        let batch_count =
+            (SHARED_TAIL_HISTORY_MESSAGE_COUNT - batch_start).min(MAX_PUBLISH_BATCH_RECORDS as u64);
+        let records = (0..batch_count)
+            .map(|_| PublishRecord {
+                key: None,
+                payload: PAYLOAD.to_vec(),
+                request_id: None,
+            })
+            .collect();
+        let outcomes = broker.publish_batch("recovery", records).unwrap();
+        for (index, outcome) in outcomes.into_iter().enumerate() {
+            assert_eq!(outcome.unwrap(), batch_start + index as u64);
+        }
+        batch_start += batch_count;
+    }
+    drop(broker);
+    write_consumer_checkpoint(&directory, "workers", SHARED_TAIL_START_OFFSET);
     directory
 }
 
@@ -536,6 +607,7 @@ criterion_group!(
     shared_consumer_poll_ack,
     shared_consumer_keyed_poll_ack,
     shared_consumer_many_in_flight,
+    shared_consumer_tail_candidate_lookup,
     concurrent_publish_same_stream,
     concurrent_publish_independent_streams,
     reopen_recovery_retained_messages,
