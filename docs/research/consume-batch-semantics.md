@@ -222,10 +222,12 @@ assertions should preserve topology-free semantics where practical.
 
 ## Disposition and gaps
 
-- **Backlog:** no edit is needed. The existing batching outcome already names
-  per-record outcomes, partial failures, ordering, bounded count/bytes/time,
-  restart and leader-change tests, and latency/resource evidence. Consume
-  batching remains unfinished.
+- **Backlog:** consume batching remains unfinished under the existing outcome,
+  which already names per-record outcomes, partial failures, ordering, bounded
+  count/bytes/time, restart and leader-change tests, and latency/resource
+  evidence. The shared-consumer acceptance criteria now also require the local
+  and clustered engines to select and test the same ack result after lease
+  expiry but before reassignment.
 - **Near-term vs deferred:** a design note or ADR proposal is reasonable
   near-term work because the outcome is already committed to product fit and
   both engines expose the relevant delivery and durability boundaries. Runtime
@@ -238,14 +240,13 @@ assertions should preserve topology-free semantics where practical.
   memory, lease expiries, or queueing. The current benchmarks do not quantify
   that tradeoff.
 - **Refactor/planning assessment:** protocol, client, engine, local, clustered,
-  tests, and existing ADRs were inspected. No safe scoped code refactor applies
-  to this documentation-only research change. The one-outstanding-per-member
-  rule is a contract constraint for future design, not an untracked refactor;
-  the existing backlog item already captures local/cluster conformance and
-  consume semantics broadly. This task explicitly excludes shared tracker
-  edits; the newly observed lease-deadline boundary should be dispositioned by
-  the coordinator before batch implementation, rather than silently treated
-  as settled by this note.
+  tests, and existing ADRs were inspected. No safe scoped code refactor or
+  separate tech-debt item applies to this documentation-only research change.
+  The one-outstanding-per-member rule is a contract constraint for future
+  design, not a refactor. The confirmed local/cluster ack difference is recorded
+  as an unresolved semantic question and a verifiable criterion in the existing
+  shared-consumer backlog; it is not labeled a bug before the policy is
+  selected.
 - **Unresolved evidence:** no workload has established whether network round
   trips, per-record local sync, consensus round trips, JSON/base64 work, or
   client-side processing dominates; no batch size or ack model is selected.

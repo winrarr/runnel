@@ -159,6 +159,7 @@ Acceptance criteria:
 - multiple members of one consumer receive disjoint available work during normal operation;
 - different consumer names continue to receive independent copies of the stream;
 - a message whose delivery expires can be processed by another member, while its previous acknowledgement is rejected as stale;
+- the contract specifies whether lease expiry alone or reassignment fences a delivery, and local/clustered conformance tests assert the same acknowledgement result after the lease deadline but before any replacement poll;
 - messages with the same requested ordering key are not concurrently delivered to different members;
 - durable progress, replay, retry, and dead-letter behavior remain correct after restart and membership changes;
 - local and clustered engines share conformance tests for these outcomes.
