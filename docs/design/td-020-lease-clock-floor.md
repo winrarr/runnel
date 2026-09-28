@@ -2,7 +2,7 @@
 
 - Status: implemented bounded slice; TD-020 remains open
 - Last reviewed: 2026-09-28
-- Baseline: `ec5f40418b81ddcc78b94da887af6866b4b03d39` (`origin/main` at review)
+- Baseline: `529061029c98c02bc1c2a06f7547fc90fc959042` (`origin/main` at review)
 
 This note records the current containment for clustered delivery leases. It is
 an unsettled design note, not an ADR or a claim that the clustered backend has
@@ -213,11 +213,18 @@ shared `PollGroup`/`AckGroup` construction path, not established by this test.
 
 The unit fixture that advances the floor through a second stream is useful for
 state-machine arithmetic but is not evidence that one stream advances another
-stream's floor. The new legacy-snapshot test establishes the omitted-floor
-default and subsequent command advancement for snapshots; it does not establish
-the same sequence for a legacy version-1 checkpoint. There is no mixed-timeout
-cluster test, no clock-health telemetry, and no measurement of real-time
-redelivery error under controlled clock skew or process suspension.
+stream's floor. The complementary
+`legacy_checkpoint_defaults_lease_floor_and_group_poll_survives_replay` test
+writes a version-1 checkpoint without `lease_clock_ms`, observes the default
+floor of zero, applies a grouped poll at 125 ms, then reopens the store and
+verifies journal replay preserves both the floor and the member's in-flight
+delivery through its 250 ms deadline. Together with the legacy-snapshot test,
+this establishes omitted-floor recovery and subsequent command advancement
+for both persisted state-machine entry paths. It does not establish compatibility
+with an older binary writing current artifacts or cover every acknowledgement
+outcome. There is no mixed-timeout cluster test, no clock-health telemetry, and
+no measurement of real-time redelivery error under controlled clock skew or
+process suspension.
 
 No performance benchmark applies to the current floor slice: it changes lease
 bookkeeping and persistence semantics without changing the intended hot-path

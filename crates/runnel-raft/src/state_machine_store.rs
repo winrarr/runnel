@@ -1114,4 +1114,101 @@ mod tests {
         assert_eq!(delivery.member, "member-a");
         assert_eq!(delivery.deadline_ms, 250);
     }
+
+    #[tokio::test]
+    async fn legacy_checkpoint_defaults_lease_floor_and_group_poll_survives_replay() {
+        let directory = tempfile::tempdir().unwrap();
+        let state_directory = directory.path().join("state-machine");
+        fs::create_dir_all(&state_directory).unwrap();
+        let kind = GroupKind::Data {
+            stream: "events".to_owned(),
+            stream_id: "stream/events".to_owned(),
+            group_id: "group/events/data".to_owned(),
+        };
+        let checkpoint_log_id = LogId {
+            leader_id: openraft::CommittedLeaderId::new(1, 1),
+            index: 1,
+        };
+        let legacy_checkpoint = serde_json::json!({
+            "version": 1,
+            "last_applied_log": serde_json::to_value(checkpoint_log_id).unwrap(),
+            "last_membership": serde_json::to_value(
+                StoredMembership::<NodeId, BasicNode>::default()
+            )
+            .unwrap(),
+            "streams": {
+                "events": [{
+                    "key": null,
+                    "payload": [108, 101, 103, 97, 99, 121],
+                    "published_at_ms": 1
+                }]
+            },
+            "consumers": []
+        });
+        assert_eq!(legacy_checkpoint["version"], 1);
+        assert!(legacy_checkpoint.get("lease_clock_ms").is_none());
+        fs::write(
+            state_directory.join("state-machine.json"),
+            serde_json::to_vec(&legacy_checkpoint).unwrap(),
+        )
+        .unwrap();
+
+        let store = Arc::new(StateMachineStore::open(&state_directory, kind.clone()).unwrap());
+        {
+            let state = store.state.read().await;
+            assert_eq!(state.last_applied_log, Some(checkpoint_log_id));
+            assert_eq!(state.state.lease_clock_ms, 0);
+            assert_eq!(state.state.streams["events"].messages[0].payload, b"legacy");
+        }
+
+        let log_id = LogId {
+            leader_id: openraft::CommittedLeaderId::new(1, 1),
+            index: 2,
+        };
+        let mut state_machine = store.clone();
+        let responses = state_machine
+            .apply(std::iter::once(Entry {
+                log_id,
+                payload: EntryPayload::Normal(crate::Command::PollGroup {
+                    stream: "events".to_owned(),
+                    consumer: "workers".to_owned(),
+                    member: "member-a".to_owned(),
+                    now_ms: 125,
+                    lease_deadline_ms: 250,
+                    max_delivery_attempts: None,
+                    legacy_ack_timeout_ms: None,
+                    policy_version: None,
+                }),
+            }))
+            .await
+            .unwrap();
+        let delivery_token = match &responses[0] {
+            CommandResponse::GroupPoll {
+                result: PollResult::Message(message),
+            } => message
+                .delivery_token
+                .clone()
+                .expect("poll should create a lease"),
+            response => panic!("unexpected poll response: {response:?}"),
+        };
+        {
+            let state = store.state.read().await;
+            assert_eq!(state.state.lease_clock_ms, 125);
+            assert_eq!(state.last_applied_log, Some(log_id));
+        }
+
+        drop(state_machine);
+        drop(store);
+        let recovered = StateMachineStore::open(&state_directory, kind).unwrap();
+        let state = recovered.state.read().await;
+        assert_eq!(state.state.lease_clock_ms, 125);
+        assert_eq!(state.last_applied_log, Some(log_id));
+        let delivery = state.state.group_consumers[&("events".to_owned(), "workers".to_owned())]
+            .in_flight
+            .get(&0)
+            .expect("journal replay must retain the grouped poll lease");
+        assert_eq!(delivery.member, "member-a");
+        assert_eq!(delivery.deadline_ms, 250);
+        assert_eq!(delivery.delivery_token, delivery_token);
+    }
 }
