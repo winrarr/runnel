@@ -10,6 +10,10 @@
   [storage compatibility evidence](../design/td-007-storage-compatibility-evidence.md),
   [clustered outcome contract](../design/clustered-outcome-contract.md), and
   [distributed architecture exploration](distributed-architecture-options.md)
+- Related research: [Systems performance research for Runnel](systems-performance-research.md)
+  adds current code observations about repeated batch serialization and
+  clustered payload copies; treat those as hypotheses to measure alongside
+  the encoding and allocation matrix below.
 
 This document records the evidence and hypotheses behind the backlog outcome
 [Make message encoding and compression evolvable](../backlog.md#make-message-encoding-and-compression-evolvable).

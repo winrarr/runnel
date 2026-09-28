@@ -714,6 +714,27 @@ Acceptance criteria:
 - a repeatable profiling workflow can produce actionable per-process hot-path evidence for clustered workloads;
 - the baseline can be rerun to compare future distributed engines without changing the public workload model.
 
+### Keep clustered commit cost predictable as consensus history grows
+
+Goal: keep the latency and resource cost of durable clustered commits predictable as the unpurged Raft log grows.
+
+Rationale: the current log store serializes and atomically rewrites the retained Raft entry map during log persistence. This may make append work depend on the number and size of entries since the last purge, but the effect has not yet been measured under Runnel workloads.
+
+Current progress: the behavior is recorded as [TD-026](tech-debt.md#td-026-raft-log-persistence-rewrites-retained-entries) and in the [systems performance research](research/systems-performance-research.md#replicated-logs-and-payload-movement-inspect-cross-layer-writes-before-redesigning-locks). The clustered benchmark matrix does not yet report Raft-log bytes rewritten per commit across retained-log lengths and purge cycles.
+
+Constraints:
+
+- preserve Raft append, vote, commit, truncation, purge, and snapshot-recovery guarantees;
+- keep consensus history separate from retained broker-message history;
+- compare the current path and any candidate with the same topology, workload, resource limits, and durability semantics.
+
+Acceptance criteria:
+
+- clustered benchmarks vary retained Raft-log length, appended batch size, payload size, and purge/snapshot cycle;
+- results separate Raft-log serialization and physical bytes written from state-machine journal and snapshot work, and report throughput, p50/p99/p99.9 latency, CPU, and recovery cost;
+- measurements establish whether append cost grows with the unpurged log and define the supported workload bound or justify a bounded-cost candidate;
+- any selected change preserves acknowledged outcomes and passes truncation, purge, restart, follower-recovery, and snapshot compatibility tests.
+
 ### Make cross-broker benchmark comparisons reproducible
 
 Goal: rerun representative Runnel and competing-broker workloads under controlled, documented conditions and compare their results over time.
