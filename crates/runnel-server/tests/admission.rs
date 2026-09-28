@@ -907,6 +907,375 @@ fn sustained_storage_pressure_is_bounded_observable_and_recovers() {
 
 #[cfg(unix)]
 #[test]
+fn global_storage_admission_is_bounded_observable_and_recovers() {
+    const EXECUTION_CAPACITY: usize = 32;
+    const QUEUE_CAPACITY: usize = 32;
+    const CANDIDATE_REQUESTS: usize = QUEUE_CAPACITY * 2;
+    const ADMISSION_CAPACITY: usize = EXECUTION_CAPACITY + QUEUE_CAPACITY;
+
+    let directory = TempDir::new().unwrap();
+    let server = RunningServer::start(
+        directory.path(),
+        &[
+            "--max-connections",
+            "128",
+            "--max-in-flight-requests",
+            "128",
+            "--request-timeout-ms",
+            "30000",
+        ],
+    );
+    let mut fifos = StoragePressureFifos::default();
+    let mut clients = StoragePressureClients::default();
+
+    let blocked_streams = (0..EXECUTION_CAPACITY)
+        .map(|index| format!("global-blocked-{index}"))
+        .collect::<Vec<_>>();
+    let candidate_streams = (0..CANDIDATE_REQUESTS)
+        .map(|index| format!("global-candidate-{index}"))
+        .collect::<Vec<_>>();
+    let overflow_stream = "global-overflow-probe".to_owned();
+    let all_poll_streams = blocked_streams
+        .iter()
+        .chain(&candidate_streams)
+        .cloned()
+        .collect::<Vec<_>>();
+
+    for stream in all_poll_streams
+        .iter()
+        .chain(std::iter::once(&overflow_stream))
+    {
+        assert!(matches!(
+            request(
+                server.broker_addr,
+                Request::CreateStream {
+                    stream: stream.clone(),
+                },
+            ),
+            Response::StreamCreated { .. }
+        ));
+    }
+    for stream in &blocked_streams {
+        fifos.create(
+            &directory
+                .path()
+                .join("consumers")
+                .join(stream)
+                .join("blocked.json.tmp"),
+        );
+    }
+
+    let metrics_before = http_metrics(server.http_addr);
+    let request_failures_before = labeled_metric_value(
+        &metrics_before,
+        "runnel_broker_request_failures_total",
+        "operation=\"poll\"",
+    );
+    let request_timeouts_before =
+        metric_value(&metrics_before, "runnel_broker_request_timeouts_total");
+    let scrape_failures_before =
+        metric_value(&metrics_before, "runnel_metrics_scrape_failures_total");
+    let (blocked_response_sender, blocked_response_receiver) = mpsc::channel();
+
+    for (index, stream) in blocked_streams.iter().cloned().enumerate() {
+        let (start_sender, start_receiver) = mpsc::channel();
+        let response_sender = blocked_response_sender.clone();
+        let address = server.broker_addr;
+        clients.push(
+            start_sender,
+            std::thread::spawn(move || {
+                start_receiver
+                    .recv()
+                    .expect("blocked poll should be released together");
+                let started = Instant::now();
+                let response = try_request(
+                    address,
+                    Request::Poll {
+                        stream,
+                        consumer: "blocked".to_owned(),
+                    },
+                    Duration::from_secs(35),
+                );
+                let _ = response_sender.send((index, started.elapsed(), response));
+                index
+            }),
+        );
+    }
+    clients.start();
+
+    // Opening one writer for each FIFO confirms the matching server-side read
+    // has started. Keeping these descriptors open holds all execution slots
+    // without involving a shared stream lane.
+    let mut blocked_writers = Vec::with_capacity(EXECUTION_CAPACITY);
+    for fifo in &fifos.paths {
+        blocked_writers.push(
+            fs::OpenOptions::new()
+                .write(true)
+                .open(fifo)
+                .expect("FIFO writer should pair with the server's blocked state read"),
+        );
+    }
+
+    let (candidate_response_sender, candidate_response_receiver) = mpsc::channel();
+    let (candidate_sent_sender, candidate_sent_receiver) = mpsc::channel();
+    for (index, stream) in candidate_streams.iter().cloned().enumerate() {
+        let (start_sender, start_receiver) = mpsc::channel();
+        let response_sender = candidate_response_sender.clone();
+        let sent_sender = candidate_sent_sender.clone();
+        let address = server.broker_addr;
+        let request_index = EXECUTION_CAPACITY + index;
+        clients.push(
+            start_sender,
+            std::thread::spawn(move || {
+                start_receiver
+                    .recv()
+                    .expect("queued poll should be released together");
+                let response = try_request_after_send(
+                    address,
+                    Request::Poll {
+                        stream,
+                        consumer: "queued".to_owned(),
+                    },
+                    Duration::from_secs(35),
+                    sent_sender,
+                    request_index,
+                );
+                let _ = response_sender.send((request_index, response));
+                request_index
+            }),
+        );
+    }
+    drop(blocked_response_sender);
+    drop(candidate_response_sender);
+    drop(candidate_sent_sender);
+    clients.start();
+
+    let mut sent_candidate_requests = vec![false; CANDIDATE_REQUESTS];
+    for _ in 0..CANDIDATE_REQUESTS {
+        let index = candidate_sent_receiver
+            .recv_timeout(Duration::from_secs(5))
+            .expect("every distinct-stream candidate request should be sent");
+        assert!(index >= EXECUTION_CAPACITY);
+        let candidate_index = index - EXECUTION_CAPACITY;
+        assert!(candidate_index < CANDIDATE_REQUESTS);
+        assert!(
+            !sent_candidate_requests[candidate_index],
+            "candidate poll {candidate_index} should be sent once"
+        );
+        sent_candidate_requests[candidate_index] = true;
+    }
+    assert!(sent_candidate_requests.into_iter().all(|sent| sent));
+
+    let mut rejected_candidates = vec![false; CANDIDATE_REQUESTS];
+    for _ in 0..QUEUE_CAPACITY {
+        let (index, response) = candidate_response_receiver
+            .recv_timeout(Duration::from_secs(5))
+            .expect("the full global admission bound should reject excess candidate polls");
+        assert!(index >= EXECUTION_CAPACITY);
+        let candidate_index = index - EXECUTION_CAPACITY;
+        assert!(candidate_index < CANDIDATE_REQUESTS);
+        assert!(!rejected_candidates[candidate_index]);
+        let (response, elapsed) = response.unwrap_or_else(|error| {
+            panic!("candidate poll {candidate_index} should receive a protocol response: {error}")
+        });
+        assert!(
+            elapsed < Duration::from_secs(1),
+            "global admission rejection should be prompt: {elapsed:?}"
+        );
+        assert!(
+            matches!(&response, Response::Error { code, message }
+            if code.as_str() == "storage_error"
+                && message.contains("storage execution queue is full")),
+            "excess candidate poll should report global storage admission, got {response:?}"
+        );
+        rejected_candidates[candidate_index] = true;
+    }
+
+    let started = Instant::now();
+    let overflow = try_request(
+        server.broker_addr,
+        Request::Poll {
+            stream: overflow_stream,
+            consumer: "overflow".to_owned(),
+        },
+        Duration::from_secs(2),
+    )
+    .expect("global storage saturation should return a protocol response");
+    assert!(
+        started.elapsed() < Duration::from_secs(1),
+        "global storage admission should reject excess work promptly"
+    );
+    match overflow {
+        Response::Error { code, message } => {
+            assert_eq!(code, "storage_error");
+            assert!(
+                message.contains("storage execution queue is full"),
+                "the rejection should identify global storage admission: {message}"
+            );
+        }
+        response => panic!("expected global storage admission rejection, got {response:?}"),
+    }
+
+    let started = Instant::now();
+    assert!(matches!(
+        try_request(server.broker_addr, Request::Health, Duration::from_secs(2)),
+        Ok(Response::Error { code, message })
+            if code == "storage_error" && message.contains("storage execution queue is full")
+    ));
+    assert!(
+        started.elapsed() < Duration::from_secs(1),
+        "protocol health should fail promptly while global storage admission is full"
+    );
+
+    let started = Instant::now();
+    let readiness = http_ready(server.http_addr);
+    assert!(readiness.starts_with("HTTP/1.1 503"));
+    assert!(
+        started.elapsed() < Duration::from_secs(1),
+        "readiness should report unavailable engine health without waiting for a storage slot"
+    );
+    let started = Instant::now();
+    assert!(http_liveness(server.http_addr).starts_with("HTTP/1.1 200"));
+    assert!(
+        started.elapsed() < Duration::from_secs(1),
+        "process liveness should remain available under global storage saturation"
+    );
+    let started = Instant::now();
+    let metrics_response = http_metrics_response(server.http_addr);
+    assert!(metrics_response.starts_with("HTTP/1.1 200"));
+    assert!(
+        started.elapsed() < Duration::from_secs(1),
+        "the metrics fallback should remain scrapeable under global storage saturation"
+    );
+    let saturated_metrics = response_body(&metrics_response);
+    assert_eq!(
+        metric_value(saturated_metrics, "runnel_active_requests"),
+        ADMISSION_CAPACITY as u64,
+        "the 32 blocked and 32 queued operations should occupy global admission"
+    );
+    assert_eq!(
+        metric_value(saturated_metrics, "runnel_engine_health_available"),
+        0
+    );
+    assert!(has_metric(saturated_metrics, "runnel_active_connections"));
+    assert!(has_metric(
+        saturated_metrics,
+        "runnel_process_uptime_seconds"
+    ));
+    assert!(!has_metric(saturated_metrics, "runnel_streams"));
+    assert!(
+        metric_value(saturated_metrics, "runnel_metrics_scrape_failures_total")
+            > scrape_failures_before
+    );
+    assert!(
+        labeled_metric_value(
+            saturated_metrics,
+            "runnel_broker_request_failures_total",
+            "operation=\"poll\"",
+        ) > request_failures_before
+    );
+    assert_eq!(
+        metric_value(saturated_metrics, "runnel_broker_request_timeouts_total"),
+        request_timeouts_before,
+        "storage admission rejection should not be counted as a request timeout"
+    );
+
+    drop(blocked_writers);
+    let completed = clients.join();
+    assert_eq!(completed.len(), EXECUTION_CAPACITY + CANDIDATE_REQUESTS);
+    for result in completed {
+        result.expect("admitted global-pressure poll should finish after FIFO release");
+    }
+    let mut seen_blocked = vec![false; EXECUTION_CAPACITY];
+    let mut seen_candidates = [false; CANDIDATE_REQUESTS];
+    let blocked_responses = blocked_response_receiver.try_iter().collect::<Vec<_>>();
+    let candidate_responses = candidate_response_receiver.try_iter().collect::<Vec<_>>();
+    let responses = blocked_responses
+        .into_iter()
+        .chain(candidate_responses.into_iter().map(|(index, result)| {
+            let result = result.map(|(response, _)| response);
+            (index, Duration::ZERO, result)
+        }))
+        .collect::<Vec<_>>();
+    assert_eq!(responses.len(), ADMISSION_CAPACITY);
+    for (index, _elapsed, response) in responses {
+        let response = response.unwrap_or_else(|error| {
+            panic!("admitted poll {index} should receive a protocol response: {error}")
+        });
+        if index < EXECUTION_CAPACITY {
+            assert!(
+                !seen_blocked[index],
+                "blocked poll {index} should respond once"
+            );
+            seen_blocked[index] = true;
+        } else {
+            let candidate_index = index - EXECUTION_CAPACITY;
+            assert!(
+                !rejected_candidates[candidate_index],
+                "rejected candidate poll {index} must not complete after release"
+            );
+            assert!(
+                !seen_candidates[candidate_index],
+                "candidate poll {index} should respond exactly once"
+            );
+            seen_candidates[candidate_index] = true;
+        }
+        let expected_consumer = if index < EXECUTION_CAPACITY {
+            "blocked"
+        } else {
+            "queued"
+        };
+        assert!(
+            matches!(&response, Response::Empty { stream, consumer }
+                if stream.as_str() == all_poll_streams[index]
+                    && consumer.as_str() == expected_consumer),
+            "admitted poll {index} should complete after release, got {response:?}"
+        );
+    }
+    assert!(seen_blocked.into_iter().all(|received| received));
+    for (index, rejected) in rejected_candidates.into_iter().enumerate() {
+        assert_eq!(seen_candidates[index], !rejected);
+    }
+    fifos.remove_all();
+    wait_for_metric_at_most(server.http_addr, "runnel_active_requests", 0);
+
+    let recovered_metrics = http_metrics(server.http_addr);
+    assert_eq!(
+        metric_value(&recovered_metrics, "runnel_engine_health_available"),
+        1
+    );
+    assert!(http_ready(server.http_addr).starts_with("HTTP/1.1 200"));
+    assert!(http_liveness(server.http_addr).starts_with("HTTP/1.1 200"));
+    assert!(matches!(
+        request(
+            server.broker_addr,
+            Request::Publish {
+                stream: candidate_streams[0].clone(),
+                key: None,
+                payload: "global-admission-recovered".to_owned(),
+                request_id: None,
+            },
+        ),
+        Response::Published { offset: 0, .. }
+    ));
+    assert!(matches!(
+        request(
+            server.broker_addr,
+            Request::Poll {
+                stream: candidate_streams[0].clone(),
+                consumer: "recovery-reader".to_owned(),
+            },
+        ),
+        Response::Message { payload, .. } if payload == "global-admission-recovered"
+    ));
+    assert!(matches!(
+        request(server.broker_addr, Request::Health),
+        Response::Health { .. }
+    ));
+}
+
+#[cfg(unix)]
+#[test]
 fn served_persistent_connection_drains_promptly_on_shutdown() {
     let directory = TempDir::new().unwrap();
     let mut server = RunningServer::start(
@@ -1520,6 +1889,36 @@ fn try_request(
         return Err("server closed the connection without a response".to_owned());
     }
     serde_json::from_str(&response).map_err(|error| error.to_string())
+}
+
+#[cfg(unix)]
+fn try_request_after_send(
+    address: SocketAddr,
+    request: Request,
+    read_timeout: Duration,
+    sent_sender: Sender<usize>,
+    index: usize,
+) -> Result<(Response, Duration), String> {
+    let mut stream = TcpStream::connect(address).map_err(|error| error.to_string())?;
+    stream
+        .set_read_timeout(Some(read_timeout))
+        .map_err(|error| error.to_string())?;
+    let encoded = serde_json::to_vec(&request).map_err(|error| error.to_string())?;
+    stream
+        .write_all(&encoded)
+        .map_err(|error| error.to_string())?;
+    stream.write_all(b"\n").map_err(|error| error.to_string())?;
+    sent_sender.send(index).map_err(|error| error.to_string())?;
+    let started = Instant::now();
+    let mut response = String::new();
+    BufReader::new(&mut stream)
+        .read_line(&mut response)
+        .map_err(|error| error.to_string())?;
+    if response.is_empty() {
+        return Err("server closed the connection without a response".to_owned());
+    }
+    let response = serde_json::from_str(&response).map_err(|error| error.to_string())?;
+    Ok((response, started.elapsed()))
 }
 
 fn request(address: SocketAddr, request: Request) -> Response {
