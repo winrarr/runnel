@@ -4,6 +4,10 @@ use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
+#[cfg(unix)]
+use std::sync::mpsc::{self, Sender};
+#[cfg(unix)]
+use std::thread::JoinHandle;
 use std::thread::sleep;
 use std::time::{Duration, Instant};
 
@@ -30,12 +34,18 @@ impl RunningServer {
             &http_addr.to_string(),
         ]);
         command.args(extra_args);
-        let child = command
+        let mut child = command
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .spawn()
             .expect("runnel server should start");
-        wait_for_http(http_addr);
+        if let Err(error) = wait_for_http(http_addr) {
+            // `Child` does not kill or reap itself when dropped before the
+            // RunningServer guard is constructed.
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("{error}");
+        }
         Self {
             child,
             broker_addr,
@@ -612,6 +622,291 @@ fn sustained_in_flight_pressure_reports_metrics_and_recovers() {
 
 #[cfg(unix)]
 #[test]
+fn sustained_storage_pressure_is_bounded_observable_and_recovers() {
+    const STREAM_QUEUE_CAPACITY: usize = 32;
+    const WAITING_REQUESTS: usize = STREAM_QUEUE_CAPACITY + 1;
+
+    let directory = TempDir::new().unwrap();
+    let fifo = directory
+        .path()
+        .join("consumers/storage-pressure/blocked.json.tmp");
+    let mut fifos = StoragePressureFifos::default();
+    let mut clients = StoragePressureClients::default();
+    let server = RunningServer::start(
+        directory.path(),
+        &[
+            "--max-connections",
+            "64",
+            "--max-in-flight-requests",
+            "64",
+            "--request-timeout-ms",
+            "15000",
+        ],
+    );
+
+    assert!(matches!(
+        request(
+            server.broker_addr,
+            Request::CreateStream {
+                stream: "storage-pressure".to_owned(),
+            },
+        ),
+        Response::StreamCreated { .. }
+    ));
+    assert!(matches!(
+        request(
+            server.broker_addr,
+            Request::Publish {
+                stream: "storage-pressure".to_owned(),
+                key: None,
+                payload: "storage pressure probe".to_owned(),
+                request_id: None,
+            },
+        ),
+        Response::Published { offset: 0, .. }
+    ));
+    assert!(matches!(
+        request(
+            server.broker_addr,
+            Request::CreateStream {
+                stream: "storage-pressure-unrelated".to_owned(),
+            },
+        ),
+        Response::StreamCreated { .. }
+    ));
+    fifos.create(&fifo);
+
+    let metrics_before = http_metrics(server.http_addr);
+    let poll_failures_before = labeled_metric_value(
+        &metrics_before,
+        "runnel_broker_request_failures_total",
+        "operation=\"poll\"",
+    );
+    let request_timeouts_before =
+        metric_value(&metrics_before, "runnel_broker_request_timeouts_total");
+    let (response_sender, response_receiver) = mpsc::channel();
+
+    let blocked_address = server.broker_addr;
+    let blocked_response_sender = response_sender.clone();
+    clients.push_started(std::thread::spawn(move || {
+        let response = try_request(
+            blocked_address,
+            Request::Poll {
+                stream: "storage-pressure".to_owned(),
+                consumer: "blocked".to_owned(),
+            },
+            Duration::from_secs(20),
+        );
+        let _ = blocked_response_sender.send((usize::MAX, response));
+        usize::MAX
+    }));
+    let blocker_writer = fs::OpenOptions::new()
+        .write(true)
+        .open(&fifo)
+        .expect("test writer should pair with the blocked journal reader");
+    wait_for_metric_at_least(server.http_addr, "runnel_active_requests", 1);
+
+    for index in 0..WAITING_REQUESTS {
+        let (start_sender, start_receiver) = mpsc::channel();
+        let response_sender = response_sender.clone();
+        let address = server.broker_addr;
+        clients.push(
+            start_sender,
+            std::thread::spawn(move || {
+                start_receiver
+                    .recv()
+                    .expect("pressure clients should be released together");
+                let response = try_request(
+                    address,
+                    Request::Poll {
+                        stream: "storage-pressure".to_owned(),
+                        consumer: format!("queued-{index}"),
+                    },
+                    Duration::from_secs(20),
+                );
+                let _ = response_sender.send((index, response));
+                index
+            }),
+        );
+    }
+    drop(response_sender);
+    clients.start();
+
+    let (rejected_index, rejected_response) = response_receiver
+        .recv_timeout(Duration::from_secs(3))
+        .expect("the full per-stream storage queue should reject excess work");
+    let rejected_response = rejected_response.unwrap_or_else(|error| {
+        panic!("overflow client should receive a protocol response: {error}")
+    });
+    match rejected_response {
+        Response::Error { code, message } => {
+            assert_eq!(code, "storage_error");
+            assert!(
+                message.contains("storage stream queue is full"),
+                "storage admission rejection should explain the full queue: {message}"
+            );
+        }
+        response => panic!("expected explicit storage overload response, got {response:?}"),
+    }
+
+    let saturation_metrics = wait_for_metric_at_least(
+        server.http_addr,
+        "runnel_active_requests",
+        (STREAM_QUEUE_CAPACITY + 1) as u64,
+    );
+    assert_eq!(
+        metric_value(&saturation_metrics, "runnel_active_requests"),
+        (STREAM_QUEUE_CAPACITY + 1) as u64,
+        "one active storage operation and the bounded stream waiter queue should remain active"
+    );
+    // Health dispatch skips stream-lane admission, but Broker::health inspects
+    // each stream under its mutex. The blocked poll holds this stream mutex
+    // while reading the FIFO, so health times out even though the queued lane
+    // requests have not acquired global execution permits.
+    assert_eq!(
+        metric_value(&saturation_metrics, "runnel_engine_health_available"),
+        0,
+        "health should time out while inspecting the stream locked by the blocked poll"
+    );
+    assert!(
+        metric_value(&saturation_metrics, "runnel_metrics_scrape_failures_total")
+            > metric_value(&metrics_before, "runnel_metrics_scrape_failures_total"),
+        "metrics should count the bounded health timeout while remaining scrapeable"
+    );
+    assert_eq!(
+        metric_value(&saturation_metrics, "runnel_broker_request_timeouts_total"),
+        request_timeouts_before,
+        "storage queue pressure should reject promptly instead of timing out"
+    );
+
+    let started = Instant::now();
+    let readiness = http_ready(server.http_addr);
+    assert!(readiness.starts_with("HTTP/1.1 503"));
+    assert!(
+        started.elapsed() < Duration::from_secs(2),
+        "readiness should report the lock-blocked health check within its deadline"
+    );
+    let started = Instant::now();
+    assert!(http_liveness(server.http_addr).starts_with("HTTP/1.1 200"));
+    assert!(
+        started.elapsed() < Duration::from_secs(2),
+        "process liveness should remain available while engine health is lock-blocked"
+    );
+    let started = Instant::now();
+    let scrape = http_metrics_response(server.http_addr);
+    assert!(scrape.starts_with("HTTP/1.1 200"));
+    assert!(
+        started.elapsed() < Duration::from_secs(2),
+        "metrics should remain scrapeable while one stream queue is full"
+    );
+    assert_eq!(
+        metric_value(response_body(&scrape), "runnel_engine_health_available"),
+        0
+    );
+    assert!(matches!(
+        request(
+            server.broker_addr,
+            Request::Publish {
+                stream: "storage-pressure-unrelated".to_owned(),
+                key: None,
+                payload: "unrelated-durable-traffic".to_owned(),
+                request_id: None,
+            },
+        ),
+        Response::Published { offset: 0, .. }
+    ));
+
+    let mut retry_connection = TcpStream::connect(server.broker_addr).unwrap();
+    retry_connection
+        .set_read_timeout(Some(Duration::from_secs(2)))
+        .unwrap();
+    for attempt in 0..24 {
+        let started = Instant::now();
+        assert!(matches!(
+            send_on_connection(
+                &mut retry_connection,
+                Request::Poll {
+                    stream: "storage-pressure".to_owned(),
+                    consumer: format!("retry-{attempt}"),
+                },
+            ),
+            Response::Error { code, message }
+                if code == "storage_error" && message.contains("storage stream queue is full")
+        ));
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "repeated pressure requests should be rejected promptly"
+        );
+    }
+
+    let metrics = http_metrics(server.http_addr);
+    assert!(
+        labeled_metric_value(
+            &metrics,
+            "runnel_broker_request_failures_total",
+            "operation=\"poll\"",
+        ) >= poll_failures_before + 25,
+        "metrics should count the initial and repeated storage-pressure poll failures"
+    );
+
+    drop(blocker_writer);
+    release_fifo_write_stall(&fifo);
+    let pressure_indices = clients.join();
+    assert_eq!(pressure_indices.len(), WAITING_REQUESTS + 1);
+    for result in pressure_indices {
+        result.expect("pressure client thread should finish");
+    }
+    let pressure_responses = response_receiver.try_iter().collect::<Vec<_>>();
+    assert_eq!(pressure_responses.len(), WAITING_REQUESTS);
+    for (index, response) in pressure_responses {
+        let response = response.unwrap_or_else(|error| {
+            panic!("pressure request {index} should receive a protocol response: {error}")
+        });
+        if index == usize::MAX {
+            assert!(
+                matches!(&response, Response::Error { code, .. } if code == "storage_error"),
+                "the FIFO-stalled storage operation should report its storage failure: {response:?}"
+            );
+            continue;
+        }
+        if index == rejected_index {
+            continue;
+        }
+        assert!(
+            matches!(&response, Response::Message { payload, .. } if payload == "storage pressure probe"),
+            "queued poll {index} should resume after FIFO release: {response:?}"
+        );
+    }
+    fifos.remove_all();
+    wait_for_metric_at_most(server.http_addr, "runnel_active_requests", 0);
+
+    assert!(matches!(
+        request(
+            server.broker_addr,
+            Request::Poll {
+                stream: "storage-pressure-unrelated".to_owned(),
+                consumer: "recovery-reader".to_owned(),
+            },
+        ),
+        Response::Message { payload, .. } if payload == "unrelated-durable-traffic"
+    ));
+    assert!(matches!(
+        request(server.broker_addr, Request::Health),
+        Response::Health { .. }
+    ));
+    let recovered_metrics = http_metrics(server.http_addr);
+    assert_eq!(
+        metric_value(&recovered_metrics, "runnel_engine_health_available"),
+        1
+    );
+    assert_eq!(
+        metric_value(&recovered_metrics, "runnel_active_requests"),
+        0
+    );
+}
+
+#[cfg(unix)]
+#[test]
 fn served_persistent_connection_drains_promptly_on_shutdown() {
     let directory = TempDir::new().unwrap();
     let mut server = RunningServer::start(
@@ -1040,6 +1335,79 @@ fn storage_stall_shutdown_is_bounded_and_restart_recovers() {
     wait_for_server_exit(&mut recovered, "recovered server did not shut down cleanly");
 }
 
+#[cfg(unix)]
+#[derive(Default)]
+struct StoragePressureFifos {
+    paths: Vec<PathBuf>,
+}
+
+#[cfg(unix)]
+impl StoragePressureFifos {
+    fn create(&mut self, path: &Path) {
+        fs::create_dir_all(path.parent().expect("FIFO path should have a parent"))
+            .expect("consumer directory should be created");
+        self.paths.push(path.to_owned());
+        create_fifo(path);
+    }
+
+    fn remove_all(&mut self) {
+        for path in self.paths.drain(..) {
+            fs::remove_file(&path).unwrap_or_else(|error| {
+                panic!("failed to remove FIFO {}: {error}", path.display())
+            });
+        }
+    }
+}
+
+#[cfg(unix)]
+impl Drop for StoragePressureFifos {
+    fn drop(&mut self) {
+        for path in &self.paths {
+            let _ = fs::remove_file(path);
+        }
+    }
+}
+
+#[cfg(unix)]
+#[derive(Default)]
+struct StoragePressureClients {
+    start_senders: Vec<Sender<()>>,
+    workers: Vec<JoinHandle<usize>>,
+}
+
+#[cfg(unix)]
+impl StoragePressureClients {
+    fn push(&mut self, start_sender: Sender<()>, worker: JoinHandle<usize>) {
+        self.start_senders.push(start_sender);
+        self.workers.push(worker);
+    }
+
+    fn push_started(&mut self, worker: JoinHandle<usize>) {
+        self.workers.push(worker);
+    }
+
+    fn start(&mut self) {
+        for sender in self.start_senders.drain(..) {
+            let _ = sender.send(());
+        }
+    }
+
+    fn join(&mut self) -> Vec<std::thread::Result<usize>> {
+        self.start();
+        self.workers.drain(..).map(JoinHandle::join).collect()
+    }
+}
+
+#[cfg(unix)]
+impl Drop for StoragePressureClients {
+    fn drop(&mut self) {
+        self.start();
+        for worker in self.workers.drain(..) {
+            let _ = worker.join();
+        }
+    }
+}
+
 fn server_binary() -> PathBuf {
     if let Some(binary) = std::env::var_os("CARGO_BIN_EXE_runnel") {
         return PathBuf::from(binary);
@@ -1090,6 +1458,18 @@ fn release_fifo_stall(path: &Path) {
 }
 
 #[cfg(unix)]
+fn release_fifo_write_stall(path: &Path) {
+    let mut fifo_reader = fs::OpenOptions::new()
+        .read(true)
+        .open(path)
+        .expect("opening the FIFO reader should release the stalled storage writer");
+    let mut discarded = Vec::new();
+    fifo_reader
+        .read_to_end(&mut discarded)
+        .expect("the stalled storage writer should close after recovery");
+}
+
+#[cfg(unix)]
 fn send_sigterm(child: &Child) {
     let pid = child.id().to_string();
     let status = Command::new("kill")
@@ -1115,6 +1495,31 @@ fn wait_for_server_exit(server: &mut RunningServer, description: &str) -> Durati
 
 fn decode_response(encoded: &str) -> Response {
     serde_json::from_str(encoded).expect("response should be valid JSON")
+}
+
+#[cfg(unix)]
+fn try_request(
+    address: SocketAddr,
+    request: Request,
+    read_timeout: Duration,
+) -> Result<Response, String> {
+    let mut stream = TcpStream::connect(address).map_err(|error| error.to_string())?;
+    stream
+        .set_read_timeout(Some(read_timeout))
+        .map_err(|error| error.to_string())?;
+    let encoded = serde_json::to_vec(&request).map_err(|error| error.to_string())?;
+    stream
+        .write_all(&encoded)
+        .map_err(|error| error.to_string())?;
+    stream.write_all(b"\n").map_err(|error| error.to_string())?;
+    let mut response = String::new();
+    BufReader::new(&mut stream)
+        .read_line(&mut response)
+        .map_err(|error| error.to_string())?;
+    if response.is_empty() {
+        return Err("server closed the connection without a response".to_owned());
+    }
+    serde_json::from_str(&response).map_err(|error| error.to_string())
 }
 
 fn request(address: SocketAddr, request: Request) -> Response {
@@ -1187,10 +1592,37 @@ fn http_ready(address: SocketAddr) -> String {
     response
 }
 
+#[cfg(unix)]
+fn http_liveness(address: SocketAddr) -> String {
+    let mut stream =
+        TcpStream::connect(address).expect("liveness endpoint should accept connections");
+    stream
+        .set_read_timeout(Some(Duration::from_secs(2)))
+        .expect("liveness read timeout should be set");
+    stream
+        .write_all(b"GET /health/live HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+        .expect("liveness request should be writable");
+    let mut response = String::new();
+    stream
+        .read_to_string(&mut response)
+        .expect("liveness response should be readable");
+    response
+}
+
 fn metric_value(metrics: &str, name: &str) -> u64 {
     metrics
         .lines()
         .find_map(|line| line.strip_prefix(&format!("{name} ")))
+        .and_then(|value| value.parse().ok())
+        .unwrap_or_default()
+}
+
+#[cfg(unix)]
+fn labeled_metric_value(metrics: &str, name: &str, labels: &str) -> u64 {
+    let prefix = format!("{name}{{{labels}}} ");
+    metrics
+        .lines()
+        .find_map(|line| line.strip_prefix(&prefix))
         .and_then(|value| value.parse().ok())
         .unwrap_or_default()
 }
@@ -1245,7 +1677,7 @@ fn wait_for_metric_at_most(address: SocketAddr, name: &str, expected: u64) -> St
     }
 }
 
-fn wait_for_http(address: SocketAddr) {
+fn wait_for_http(address: SocketAddr) -> Result<(), &'static str> {
     let deadline = Instant::now() + Duration::from_secs(5);
     while Instant::now() < deadline {
         if let Ok(mut stream) = TcpStream::connect(address) {
@@ -1259,10 +1691,10 @@ fn wait_for_http(address: SocketAddr) {
                 .unwrap();
             let mut response = String::new();
             if BufReader::new(stream).read_line(&mut response).is_ok() && response.contains("200") {
-                return;
+                return Ok(());
             }
         }
         sleep(Duration::from_millis(25));
     }
-    panic!("runnel HTTP endpoint did not become ready");
+    Err("runnel HTTP endpoint did not become ready")
 }
