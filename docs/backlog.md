@@ -461,6 +461,13 @@ Goal: let an application move its retained streams and durable consumer progress
 
 Rationale: the promise of a credible path from one node to a distributed system is incomplete if only source compatibility exists and operators must invent a risky data migration.
 
+Current progress: no supported local-to-cluster migration exists. Local stream
+logs and consumer state use durable representations that the clustered engine
+cannot import. Clustered identity checks reject unsupported or ambiguous
+layouts instead of converting them. The [migration boundary design](design/single-node-to-cluster-migration.md)
+explores a candidate side-by-side logical export/import. The [storage upgrade safety plan](design/storage-upgrade-safety-plan.md)
+records related validation, fencing, rollback, and interruption requirements.
+
 Constraints:
 
 - migration must preserve documented offsets, ordering, replay eligibility, producer retry identity, and consumer progress;

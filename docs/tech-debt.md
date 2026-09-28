@@ -16,13 +16,6 @@ This register records known implementation and documentation shortcomings. Produ
 - Context: JSON makes the first vertical slice inspectable and easy to exercise from shell tools. The reusable client and server listener now expose the same explicit provisional `runnel-json-lines` v1 support declaration as the protocol crate. A server unit check compares the three declarations' version range and UTF-8 text/base64 payload encodings, while exhaustive wire fixtures check each payload-bearing request and response shape. This is source-level metadata only: the current server does not advertise or negotiate it, and cross-version interoperability and upgrade/recovery behavior remain untested.
 - Retirement condition: a versioned protocol preserves binary payloads, explicit outcome classes, compatibility policy, and interoperability tests.
 
-## TD-004: Local and clustered durable state have no supported migration path
-
-- Status: open
-- Impact: applications can keep the same public messaging intent when selecting the clustered engine, but retained local records, consumer progress, delivery attempts, and producer retry identity cannot be moved through a supported cutover. Growth from one node to three currently requires starting with empty clustered state or inventing an operational migration.
-- Context: local checkpoints and stream logs remain appropriate for the single-node engine, while clustered consumer ownership is already replicated and fenced inside each stream data group. Their durable representations were developed as separate vertical slices.
-- Retirement condition: the growth-from-one-node backlog outcome provides a versioned, validated, interruptible migration with explicit writer fencing, rollback boundaries, and end-to-end delivery tests.
-
 ## TD-005: Durability and delivery policies are hard-coded
 
 - Status: open
