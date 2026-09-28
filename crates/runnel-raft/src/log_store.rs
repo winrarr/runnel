@@ -378,7 +378,10 @@ fn atomic_write(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use openraft::storage::RaftLogStorageExt;
     use openraft::{CommittedLeaderId, Entry, EntryPayload};
+    use std::io::Write;
+    use std::time::Instant;
 
     fn blank_entry(index: u64, term: u64) -> Entry<crate::TypeConfig> {
         Entry {
@@ -388,6 +391,157 @@ mod tests {
             },
             payload: EntryPayload::Blank,
         }
+    }
+
+    fn publish_entry(index: u64, payload_bytes: usize) -> Entry<crate::TypeConfig> {
+        Entry {
+            log_id: LogId {
+                leader_id: CommittedLeaderId::new(1, 1),
+                index,
+            },
+            payload: EntryPayload::Normal(crate::Command::Publish {
+                stream: "td026-log-persistence".to_owned(),
+                key: None,
+                payload: vec![b'x'; payload_bytes],
+                published_at_ms: 1,
+                request_id: None,
+            }),
+        }
+    }
+
+    fn benchmark_dimension(name: &str, default: &[usize]) -> Vec<usize> {
+        let Ok(value) = std::env::var(name) else {
+            return default.to_vec();
+        };
+        let values = value
+            .split(',')
+            .map(|item| {
+                item.parse::<usize>()
+                    .expect("benchmark dimension must be an integer")
+            })
+            .collect::<Vec<_>>();
+        assert!(!values.is_empty(), "benchmark dimension cannot be empty");
+        values
+    }
+
+    fn benchmark_count(name: &str, default: usize) -> usize {
+        std::env::var(name)
+            .map(|value| value.parse().expect("benchmark count must be an integer"))
+            .unwrap_or(default)
+    }
+
+    #[tokio::test]
+    #[ignore = "manual TD-026 persistence evidence; requires an explicit ext4 output directory"]
+    async fn measure_retained_log_append_persistence_cost() {
+        let output_dir = std::env::var_os("RUNNEL_TD026_OUTPUT_DIR")
+            .map(PathBuf::from)
+            .expect(
+                "set RUNNEL_TD026_OUTPUT_DIR to a run-scoped directory on persistent local storage",
+            );
+        fs::create_dir_all(&output_dir).unwrap();
+
+        let retained_lengths =
+            benchmark_dimension("RUNNEL_TD026_RETAINED", &[0, 4, 32, 36, 256, 1024, 4096]);
+        let batch_sizes = benchmark_dimension("RUNNEL_TD026_BATCHES", &[1, 8, 32]);
+        let payload_sizes = benchmark_dimension("RUNNEL_TD026_PAYLOADS", &[100, 1024]);
+        let warmups = benchmark_count("RUNNEL_TD026_WARMUPS", 2);
+        let samples = benchmark_count("RUNNEL_TD026_SAMPLES", 20);
+        assert!(
+            batch_sizes.iter().all(|size| *size > 0),
+            "benchmark batch sizes must be positive"
+        );
+        assert!(
+            payload_sizes.iter().all(|size| *size > 0),
+            "benchmark payload sizes must be positive"
+        );
+        assert!(
+            samples > 0,
+            "benchmark requires at least one measured sample"
+        );
+
+        let result_path = output_dir.join("samples.csv");
+        let mut results = fs::File::create(&result_path).unwrap();
+        writeln!(
+            results,
+            "operation,retained_log_entries,payload_bytes,batch_entries,sample,serialized_file_bytes,elapsed_ns"
+        )
+        .unwrap();
+
+        for retained in retained_lengths {
+            for payload_bytes in &payload_sizes {
+                let log = (0..retained)
+                    .map(|index| (index as u64, publish_entry(index as u64, *payload_bytes)))
+                    .collect::<BTreeMap<_, _>>();
+                let committed = retained
+                    .checked_sub(1)
+                    .map(|index| log[&(index as u64)].get_log_id().to_owned());
+                let seed_bytes = serde_json::to_vec(&PersistedLog {
+                    version: FORMAT_VERSION,
+                    last_purged_log_id: None,
+                    log,
+                    committed,
+                    vote: None,
+                })
+                .unwrap();
+
+                for batch_size in &batch_sizes {
+                    let scenario_dir = output_dir.join(format!(
+                        "retained-{retained}-payload-{payload_bytes}-batch-{batch_size}"
+                    ));
+                    fs::create_dir_all(&scenario_dir).unwrap();
+                    let log_path = scenario_dir.join("raft-log.json");
+
+                    for sample in 0..(warmups + samples) {
+                        // Recreate the same retained history outside the timed interval so each
+                        // observation measures an append/commit persistence pair at a fixed
+                        // pre-append log length.
+                        fs::write(&log_path, &seed_bytes).unwrap();
+                        let mut store = LogStore::<crate::TypeConfig>::open(&log_path).unwrap();
+                        let entries = (0..*batch_size)
+                            .map(|offset| {
+                                publish_entry(retained as u64 + offset as u64, *payload_bytes)
+                            })
+                            .collect::<Vec<_>>();
+
+                        let started = Instant::now();
+                        store.blocking_append(entries).await.unwrap();
+                        let append_elapsed_ns = started.elapsed().as_nanos();
+                        let expected_last = retained as u64 + *batch_size as u64 - 1;
+                        let last_log_id = store.get_log_state().await.unwrap().last_log_id.unwrap();
+                        assert_eq!(last_log_id.index, expected_last);
+                        let append_file_bytes = fs::metadata(&log_path).unwrap().len();
+
+                        // Preserve OpenRaft's durable order: only persist the committed index
+                        // after the append callback confirms the log rewrite has completed.
+                        let started = Instant::now();
+                        store.save_committed(Some(last_log_id)).await.unwrap();
+                        let committed_elapsed_ns = started.elapsed().as_nanos();
+                        let committed_file_bytes = fs::metadata(&log_path).unwrap().len();
+                        assert_eq!(store.read_committed().await.unwrap(), Some(last_log_id));
+
+                        if sample >= warmups {
+                            writeln!(
+                                results,
+                                "append,{retained},{payload_bytes},{batch_size},{},{append_file_bytes},{append_elapsed_ns}",
+                                sample - warmups
+                            )
+                            .unwrap();
+                            writeln!(
+                                results,
+                                "save_committed,{retained},{payload_bytes},{batch_size},{},{committed_file_bytes},{committed_elapsed_ns}",
+                                sample - warmups
+                            )
+                            .unwrap();
+                        }
+                    }
+
+                    fs::remove_dir_all(scenario_dir).unwrap();
+                }
+            }
+        }
+
+        results.sync_all().unwrap();
+        println!("TD-026 raw samples: {}", result_path.display());
     }
 
     fn write_persisted_log(
