@@ -42,6 +42,8 @@ pub(super) struct BrokerState {
     pub(super) storage_executor: Arc<StorageExecutor>,
     #[cfg(test)]
     pub(super) fail_next_dead_letter_ack_persist: AtomicBool,
+    #[cfg(test)]
+    pub(super) fail_next_dead_letter_ack_sync: AtomicBool,
 }
 
 pub(super) struct StreamState {
@@ -114,6 +116,8 @@ impl BrokerState {
             storage_executor: Arc::new(StorageExecutor::new()),
             #[cfg(test)]
             fail_next_dead_letter_ack_persist: AtomicBool::new(false),
+            #[cfg(test)]
+            fail_next_dead_letter_ack_sync: AtomicBool::new(false),
         })
     }
 }
@@ -621,6 +625,21 @@ impl Broker {
             )));
         }
 
+        #[cfg(test)]
+        if self
+            .inner
+            .fail_next_dead_letter_ack_sync
+            .swap(false, Ordering::AcqRel)
+        {
+            return super::consumer_state::persist_consumer_event_with_sync_failure(
+                root,
+                stream,
+                consumer,
+                current_state,
+                ConsumerStateEvent::Acknowledge { offset },
+            );
+        }
+
         persist_consumer_event(
             root,
             stream,
@@ -634,6 +653,13 @@ impl Broker {
     pub(super) fn fail_next_dead_letter_ack_persist(&self) {
         self.inner
             .fail_next_dead_letter_ack_persist
+            .store(true, Ordering::Release);
+    }
+
+    #[cfg(test)]
+    pub(super) fn fail_next_dead_letter_ack_sync(&self) {
+        self.inner
+            .fail_next_dead_letter_ack_sync
             .store(true, Ordering::Release);
     }
 }

@@ -35,6 +35,13 @@ struct RequestAwareLimits {
     max_body_len: u32,
 }
 
+#[cfg(test)]
+#[derive(Debug, Clone, Copy)]
+pub(super) enum DeadLetterMoveWriteFailure {
+    PartialFrame,
+    CompleteFrameBeforeSync,
+}
+
 fn request_aware_limits(durable_format: DurableFormat) -> RequestAwareLimits {
     match durable_format {
         // Keep the legacy no-request-id writer and reader unchanged. Request-aware frames have
@@ -59,6 +66,8 @@ pub(super) struct StreamLog {
     sparse_index: SparseIndex,
     request_ids: HashMap<String, Offset>,
     next_offset: Offset,
+    #[cfg(test)]
+    dead_letter_move_write_failure: Option<DeadLetterMoveWriteFailure>,
 }
 
 impl StreamLog {
@@ -75,6 +84,8 @@ impl StreamLog {
             sparse_index: SparseIndex::new(),
             request_ids: HashMap::new(),
             next_offset: 0,
+            #[cfg(test)]
+            dead_letter_move_write_failure: None,
         })
     }
 
@@ -115,11 +126,18 @@ impl StreamLog {
             sparse_index,
             request_ids,
             next_offset,
+            #[cfg(test)]
+            dead_letter_move_write_failure: None,
         })
     }
 
     pub(super) fn request_offset(&self, request_id: &str) -> Option<Offset> {
         self.request_ids.get(request_id).copied()
+    }
+
+    #[cfg(test)]
+    pub(super) fn fail_next_dead_letter_move_write(&mut self, failure: DeadLetterMoveWriteFailure) {
+        self.dead_letter_move_write_failure = Some(failure);
     }
 
     #[cfg(test)]
@@ -308,7 +326,7 @@ impl StreamLog {
         payload: Vec<u8>,
         request_id: String,
     ) -> Result<Offset, BrokerError> {
-        self.append_with_request_id_sync(key, payload, request_id, true)
+        self.append_with_request_id_sync(key, payload, request_id, true, false)
     }
 
     pub(super) fn append_with_move_id(
@@ -329,7 +347,7 @@ impl StreamLog {
 
         // Move identities are internal request-aware records. Unlike public request IDs, their
         // key and payload are part of the identity invariant and are checked on every retry.
-        self.append_with_request_id(key, payload, move_id)
+        self.append_with_request_id_sync(key, payload, move_id, true, true)
     }
 
     fn append_with_request_id_sync(
@@ -338,6 +356,7 @@ impl StreamLog {
         payload: Vec<u8>,
         request_id: String,
         sync: bool,
+        dead_letter_move: bool,
     ) -> Result<Offset, BrokerError> {
         let limits = request_aware_limits(self.durable_format);
         let key_bytes = key.as_deref().unwrap_or_default().as_bytes();
@@ -393,10 +412,34 @@ impl StreamLog {
         let checksum = request_id_checksum(&header, key_bytes, request_id_bytes, &payload);
         header[44..48].copy_from_slice(&checksum.to_le_bytes());
 
+        #[cfg(test)]
+        let move_write_failure = if dead_letter_move {
+            self.dead_letter_move_write_failure.take()
+        } else {
+            None
+        };
+        #[cfg(not(test))]
+        let _ = dead_letter_move;
+        #[cfg(test)]
+        if matches!(
+            move_write_failure,
+            Some(DeadLetterMoveWriteFailure::PartialFrame)
+        ) {
+            self.file.write_all(&header[..REQUEST_ID_HEADER_LEN / 2])?;
+            return Err(injected_dead_letter_write_failure());
+        }
+
         self.file.write_all(&header)?;
         self.file.write_all(key_bytes)?;
         self.file.write_all(request_id_bytes)?;
         self.file.write_all(&payload)?;
+        #[cfg(test)]
+        if matches!(
+            move_write_failure,
+            Some(DeadLetterMoveWriteFailure::CompleteFrameBeforeSync)
+        ) {
+            return Err(injected_dead_letter_write_failure());
+        }
         if sync {
             self.file.sync_data()?;
         }
@@ -445,7 +488,7 @@ impl StreamLog {
 
             let outcome = match request_id {
                 Some(request_id) => {
-                    self.append_with_request_id_sync(key, payload, request_id, false)
+                    self.append_with_request_id_sync(key, payload, request_id, false, false)
                 }
                 None => self.append_with_sync(key, payload, false),
             };
@@ -973,6 +1016,14 @@ fn read_request_id_record(
 
 fn invalid_record_data(message: &'static str) -> BrokerError {
     BrokerError::Io(io::Error::new(io::ErrorKind::InvalidData, message))
+}
+
+#[cfg(test)]
+fn injected_dead_letter_write_failure() -> BrokerError {
+    BrokerError::Io(io::Error::new(
+        io::ErrorKind::Interrupted,
+        "injected dead-letter target write failure",
+    ))
 }
 
 const CRC32C_TABLE: [u32; 256] = crc32c_table();

@@ -148,6 +148,35 @@ pub(super) fn persist_consumer_event(
     current_state: &ConsumerState,
     event: ConsumerStateEvent,
 ) -> Result<(), BrokerError> {
+    persist_consumer_event_with_sync(root, stream, consumer, current_state, event, |file| {
+        file.sync_all()
+    })
+}
+
+#[cfg(test)]
+pub(super) fn persist_consumer_event_with_sync_failure(
+    root: &Path,
+    stream: &str,
+    consumer: &str,
+    current_state: &ConsumerState,
+    event: ConsumerStateEvent,
+) -> Result<(), BrokerError> {
+    persist_consumer_event_with_sync(root, stream, consumer, current_state, event, |_| {
+        Err(io::Error::new(
+            io::ErrorKind::Interrupted,
+            "injected consumer event sync failure",
+        ))
+    })
+}
+
+fn persist_consumer_event_with_sync(
+    root: &Path,
+    stream: &str,
+    consumer: &str,
+    current_state: &ConsumerState,
+    event: ConsumerStateEvent,
+    sync: impl FnOnce(&fs::File) -> io::Result<()>,
+) -> Result<(), BrokerError> {
     #[cfg(feature = "instrumentation")]
     let _stage_timer = StageTimer::new("core.consumer_state_persist");
     let path = consumer_state_journal_path(root, stream, consumer);
@@ -179,7 +208,7 @@ pub(super) fn persist_consumer_event(
     fs::create_dir_all(parent)?;
     let mut file = OpenOptions::new().create(true).append(true).open(path)?;
     file.write_all(&encoded)?;
-    file.sync_all()?;
+    sync(&file)?;
     Ok(())
 }
 

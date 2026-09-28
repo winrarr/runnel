@@ -1283,6 +1283,161 @@ mod tests {
     }
 
     #[test]
+    fn dead_letter_move_recovers_after_partial_target_write_and_restart() {
+        let directory = tempdir().unwrap();
+        let config = BrokerConfig {
+            ack_timeout: Duration::ZERO,
+            max_delivery_attempts: Some(1),
+        };
+        let move_id = dead_letter_move_id("events", "worker", 0).unwrap();
+        let broker = Broker::open(directory.path(), config.clone()).unwrap();
+        broker
+            .publish("events", Some("order-1".to_owned()), b"poison".to_vec())
+            .unwrap();
+        assert!(matches!(
+            broker.poll("events", "worker").unwrap(),
+            PollResult::Message(Message {
+                offset: 0,
+                delivery_attempt: Some(1),
+                ..
+            })
+        ));
+        fail_next_dead_letter_target_write(
+            &broker,
+            stream_log::DeadLetterMoveWriteFailure::PartialFrame,
+        );
+
+        assert!(matches!(
+            broker.poll("events", "worker"),
+            Err(BrokerError::Io(error)) if error.kind() == io::ErrorKind::Interrupted
+        ));
+        let source_state = load_consumer_state(directory.path(), "events", "worker").unwrap();
+        assert_eq!(source_state.committed_offset, 0);
+        assert_eq!(source_state.delivery_attempts.get(&0), Some(&1));
+        drop(broker);
+
+        let broker = Broker::open(directory.path(), config.clone()).unwrap();
+        assert_eq!(broker.poll("events", "worker").unwrap(), PollResult::Empty);
+        assert_dead_letter_move(&broker, &move_id);
+        drop(broker);
+
+        let broker = Broker::open(directory.path(), config).unwrap();
+        assert_eq!(broker.poll("events", "worker").unwrap(), PollResult::Empty);
+        assert_dead_letter_move(&broker, &move_id);
+    }
+
+    #[test]
+    fn dead_letter_move_reconciles_complete_target_write_reported_as_failure() {
+        let directory = tempdir().unwrap();
+        let config = BrokerConfig {
+            ack_timeout: Duration::ZERO,
+            max_delivery_attempts: Some(1),
+        };
+        let move_id = dead_letter_move_id("events", "worker", 0).unwrap();
+        let broker = Broker::open(directory.path(), config.clone()).unwrap();
+        broker
+            .publish("events", Some("order-1".to_owned()), b"poison".to_vec())
+            .unwrap();
+        assert!(matches!(
+            broker.poll("events", "worker").unwrap(),
+            PollResult::Message(Message {
+                offset: 0,
+                delivery_attempt: Some(1),
+                ..
+            })
+        ));
+        fail_next_dead_letter_target_write(
+            &broker,
+            stream_log::DeadLetterMoveWriteFailure::CompleteFrameBeforeSync,
+        );
+
+        assert!(matches!(
+            broker.poll("events", "worker"),
+            Err(BrokerError::Io(error)) if error.kind() == io::ErrorKind::Interrupted
+        ));
+        let source_state = load_consumer_state(directory.path(), "events", "worker").unwrap();
+        assert_eq!(source_state.committed_offset, 0);
+        assert_eq!(source_state.delivery_attempts.get(&0), Some(&1));
+        drop(broker);
+
+        let broker = Broker::open(directory.path(), config.clone()).unwrap();
+        assert_eq!(broker.poll("events", "worker").unwrap(), PollResult::Empty);
+        assert_dead_letter_move(&broker, &move_id);
+        drop(broker);
+
+        let broker = Broker::open(directory.path(), config).unwrap();
+        assert_eq!(broker.poll("events", "worker").unwrap(), PollResult::Empty);
+        assert_dead_letter_move(&broker, &move_id);
+    }
+
+    #[test]
+    fn dead_letter_move_retries_after_source_event_sync_failure_and_restart() {
+        let directory = tempdir().unwrap();
+        let config = BrokerConfig {
+            ack_timeout: Duration::ZERO,
+            max_delivery_attempts: Some(1),
+        };
+        let move_id = dead_letter_move_id("events", "worker", 0).unwrap();
+        let broker = Broker::open(directory.path(), config.clone()).unwrap();
+        broker
+            .publish("events", Some("order-1".to_owned()), b"poison".to_vec())
+            .unwrap();
+        assert!(matches!(
+            broker.poll("events", "worker").unwrap(),
+            PollResult::Message(Message {
+                offset: 0,
+                delivery_attempt: Some(1),
+                ..
+            })
+        ));
+        broker.fail_next_dead_letter_ack_sync();
+
+        assert!(matches!(
+            broker.poll("events", "worker"),
+            Err(BrokerError::Io(error)) if error.kind() == io::ErrorKind::Interrupted
+        ));
+        let target = broker.get_stream("events.dead-letter").unwrap();
+        let target = broker.lock_stream(&target).unwrap();
+        assert_eq!(target.log.next_offset(), 1);
+        drop(target);
+        drop(broker);
+
+        let broker = Broker::open(directory.path(), config.clone()).unwrap();
+        assert_eq!(broker.poll("events", "worker").unwrap(), PollResult::Empty);
+        let source_state = load_consumer_state(directory.path(), "events", "worker").unwrap();
+        assert_eq!(source_state.committed_offset, 1);
+        assert_dead_letter_move(&broker, &move_id);
+        drop(broker);
+
+        let broker = Broker::open(directory.path(), config).unwrap();
+        assert_eq!(broker.poll("events", "worker").unwrap(), PollResult::Empty);
+        assert_dead_letter_move(&broker, &move_id);
+    }
+
+    fn fail_next_dead_letter_target_write(
+        broker: &Broker,
+        failure: stream_log::DeadLetterMoveWriteFailure,
+    ) {
+        broker.create_stream("events.dead-letter").unwrap();
+        let target = broker.get_stream("events.dead-letter").unwrap();
+        broker
+            .lock_stream(&target)
+            .unwrap()
+            .log
+            .fail_next_dead_letter_move_write(failure);
+    }
+
+    fn assert_dead_letter_move(broker: &Broker, move_id: &str) {
+        let target = broker.get_stream("events.dead-letter").unwrap();
+        let mut target = broker.lock_stream(&target).unwrap();
+        assert_eq!(target.log.next_offset(), 1);
+        assert_eq!(target.log.request_offset(move_id), Some(0));
+        let message = target.log.read_message("events.dead-letter", 0).unwrap();
+        assert_eq!(message.key.as_deref(), Some("order-1"));
+        assert_eq!(message.payload, b"poison");
+    }
+
+    #[test]
     fn dead_letter_move_content_mismatch_is_storage_error_without_acknowledgement() {
         for (key, payload) in [
             (Some("wrong-key".to_owned()), b"poison".to_vec()),
