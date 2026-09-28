@@ -2,7 +2,7 @@
 
 - Status: exploratory research; no timing policy is accepted
 - Last reviewed: 2026-09-28
-- Repository baseline: `a5a228e59c2caa19c1a6520cde6a6abdd9e90196`
+- Repository baseline: `6ef4fc2ec2122d00806ac9d71a6cf783c5ac8574`
 - Scope: compare the current clustered grouped-delivery expiry model with practical alternatives, focusing on clock changes, failover, recovery, redelivery, and stale-delivery fencing.
 - Related records: [TD-020](../tech-debt.md#td-020-clustered-delivery-leases-use-absolute-wall-clock-deadlines), [ADR 0015](../decisions/0015-clustered-shared-consumer-ownership.md), [the shared-consumer delivery backlog item](../backlog.md#make-shared-consumer-delivery-dependable).
 
