@@ -570,12 +570,14 @@ impl StreamLog {
             return Ok(None);
         };
         if committed_offset >= first_indexed_offset {
-            return Ok(self
-                .records
-                .iter()
-                .filter(|record| record.offset >= committed_offset)
-                .find(|record| record_is_candidate(record, acknowledged_offsets, in_flight))
-                .cloned());
+            let mut index = self.tail_start_index(committed_offset);
+            while let Some(record) = self.records.get(index) {
+                if record_is_candidate(record, acknowledged_offsets, in_flight) {
+                    return Ok(Some(record.clone()));
+                }
+                index += 1;
+            }
+            return Ok(None);
         }
 
         // A consumer that has fallen behind the bounded tail index still has the same replay
@@ -596,6 +598,21 @@ impl StreamLog {
             }
         }
         Ok(None)
+    }
+
+    fn tail_start_index(&self, offset: Offset) -> usize {
+        // Appends and recovery preserve offset order, and tail eviction only removes the front.
+        let mut low = 0;
+        let mut high = self.records.len();
+        while low < high {
+            let middle = low + (high - low) / 2;
+            if self.records[middle].offset < offset {
+                low = middle + 1;
+            } else {
+                high = middle;
+            }
+        }
+        low
     }
 
     pub(super) fn find_record(&mut self, offset: Offset) -> Result<RecordIndex, BrokerError> {
@@ -1174,6 +1191,55 @@ mod tests {
         assert_eq!(
             index.start_for(Offset::MAX),
             MAX_SPARSE_INDEX_ENTRIES as Offset * SPARSE_INDEX_STRIDE * 10
+        );
+    }
+
+    #[test]
+    fn tail_candidate_lookup_starts_at_committed_offset_after_cache_wrap() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("events.log");
+        let mut log = StreamLog::create(&path, DurableFormat::Rnl1).unwrap();
+        for offset in 0..(MAX_IN_MEMORY_RECORDS as Offset + 5) {
+            assert_eq!(
+                log.append_with_sync(Some(format!("key-{offset}")), vec![0], false)
+                    .unwrap(),
+                offset
+            );
+        }
+
+        // Offsets below the bounded cache still use the sparse-checkpoint disk scan.
+        let no_acknowledgements = BTreeSet::new();
+        assert_eq!(
+            log.find_candidate(0, &no_acknowledgements, None)
+                .unwrap()
+                .unwrap()
+                .offset,
+            0
+        );
+
+        // The circular tail cache remains ordered by offset after evicting its oldest records.
+        assert_eq!(log.tail_start_index(5), 0);
+        assert_eq!(log.tail_start_index(6), 1);
+        assert_eq!(log.tail_start_index(1028), MAX_IN_MEMORY_RECORDS - 1);
+        assert_eq!(log.tail_start_index(1029), MAX_IN_MEMORY_RECORDS);
+
+        let acknowledged_offsets = BTreeSet::from([1000]);
+        let in_flight_offsets = HashSet::from([1001]);
+        let in_flight_keys = HashSet::from(["key-1002".to_owned()]);
+        let candidate = log
+            .find_candidate(
+                1000,
+                &acknowledged_offsets,
+                Some((&in_flight_offsets, &in_flight_keys)),
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(candidate.offset, 1003);
+
+        assert!(
+            log.find_candidate(1029, &no_acknowledgements, None)
+                .unwrap()
+                .is_none()
         );
     }
 }
