@@ -4,7 +4,7 @@
 - Last reviewed: 2026-09-06
 - Baseline: `8e7857221870a205553c94fa88df45a0dda1c991`
 - Reading guide: [design-note conventions](README.md)
-- Scope: backlog outcome [Make growth from one node to a cluster non-disruptive](../backlog.md#make-growth-from-one-node-to-a-cluster-non-disruptive) and [TD-004](../tech-debt.md#td-004-local-and-clustered-durable-state-have-no-supported-migration-path)
+- Scope: backlog outcome [Make growth from one node to a cluster non-disruptive](../backlog.md#make-growth-from-one-node-to-a-cluster-non-disruptive)
 
 ## Summary
 
@@ -46,7 +46,7 @@ boundary; it does not turn the current engine into a migration service.
 | Observed local behavior | The local broker selects one durable writer format at startup, scans known `RNL1`, `RNL2`, and `RNL3` frame magics, truncates an incomplete trailing frame during normal recovery, and persists consumer checkpoints/journal events. Active delivery members, tokens, and `Instant` deadlines are process memory. See [`BrokerState::open`](../../crates/runnel-core/src/broker.rs), [`StreamLog::open`](../../crates/runnel-core/src/stream_log.rs), and the recovery tests in [`runnel-core`](../../crates/runnel-core/src/lib.rs). | A converter can preserve logical records and durable consumer state only after a normal source recovery boundary. It cannot copy volatile delivery ownership. |
 | Observed clustered behavior | The clustered engine selects the Raft backend at process startup. Startup validates clustered storage identity and persisted artifacts before opening groups; stream creation reconciles metadata `Creating`/`Active` state with one data group per stream and the configured peer set. The current layout uses `storage.json`, `groups/metadata`, and `groups/data/<hex-stream>` with an identity-bearing `group.json`. See [`PersistentEngine::open_with_config`](../../crates/runnel-raft/src/engine.rs), [`GroupManager`](../../crates/runnel-raft/src/group_manager.rs), [`StateMachineStore`](../../crates/runnel-raft/src/state_machine_store.rs), and [`SnapshotState`](../../crates/runnel-raft/src/state_machine.rs). The detailed current artifact/version evidence is in the [TD-007 compatibility note](td-007-storage-compatibility-evidence.md) and [TD-009 snapshot note](td-009-snapshot-evidence.md). | A fresh target can be populated only through a future logical import path. The existing public `Publish`, `CreateStream`, and snapshot-recovery paths are not a local-to-cluster interchange format. |
 | Observed absence | There is no migration command, import/export schema, durable migration phase, writer-fence epoch, endpoint-generation owner, or migration-specific status/metric in the current code. The engine now exposes backend-independent failure kind and safe attempt-outcome classification, but the provisional server still emits its existing error codes and has no migration or stage-aware outcome vocabulary. Existing clustered identity checks intentionally reject ambiguous state; they do not convert it. Current snapshot and peer metrics describe recovery activity only. The current tests cover local recovery and clustered restart/failure, not cross-engine migration. | Any phase, fence, activation, rollback, or migration-status behavior below is proposed work and must not be described as current support. |
-| Proposed first supported slice | Side-by-side logical export/import into an empty target using the configured static voter set (the initial supported shape is three nodes), with a source fence for the final boundary, validation before serving, external endpoint cutover, and source retention until the recovery window ends. | This is the narrow retirement shape for TD-004. It preserves the application messaging model, not zero downtime or automatic downgrade. |
+| Proposed first supported slice | Side-by-side logical export/import into an empty target using the configured static voter set (the initial supported shape is three nodes), with a source fence for the final boundary, validation before serving, external endpoint cutover, and source retention until the recovery window ends. | This is the proposed first supported slice for the backlog outcome. It preserves the application messaging model, not zero downtime or automatic downgrade. |
 
 The current evidence is useful but deliberately weaker than migration evidence.
 Local tests cover request-ID recovery, mixed legacy/versioned frame replay,
@@ -941,11 +941,11 @@ source-backed compatibility analysis, then satisfy the contract/migration gate
 with schema fixtures, interruption/restart tests, real-process cutover tests,
 and explicit rollback outcomes before an ADR or backlog retirement is proposed.
 
-The note does not edit the backlog, technical-debt register, ADRs, protocol, or
-runtime code. No additional tech-debt item is warranted: the work is directly
-scoped to TD-004, while online migration, dynamic placement, and segmented
-storage remain named unresolved boundaries rather than new implementation
-shortcuts.
+The note does not accept a durable compatibility promise or an ADR. The
+missing supported migration path is tracked as a product outcome in the
+backlog; this note explores a candidate bounded slice. Online migration,
+dynamic placement, and segmented storage remain separate unresolved
+boundaries, and no additional tech-debt item is warranted for them here.
 
 ## References
 
@@ -953,7 +953,6 @@ shortcuts.
 
 - [Current architecture](../architecture.md)
 - [Growth-from-one-node backlog outcome](../backlog.md#make-growth-from-one-node-to-a-cluster-non-disruptive)
-- [TD-004](../tech-debt.md#td-004-local-and-clustered-durable-state-have-no-supported-migration-path)
 - [Safe durable storage upgrades](storage-upgrade-safety-plan.md)
 - [Durable storage upgrade policy](storage-upgrade-policy.md)
 - [TD-007 storage compatibility evidence](td-007-storage-compatibility-evidence.md)
