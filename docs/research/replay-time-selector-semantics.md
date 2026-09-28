@@ -64,7 +64,7 @@ are evidence for design tradeoffs, not a Runnel compatibility target.
   0024. Its documentation also leaves tie and missing-history behavior to
   implementation details, illustrating why Runnel should state those cases
   itself.
-- [Spanner's OSDI paper](https://www.usenix.org/system/files/osdi12_proceedings.pdf)
+- [Spanner's OSDI paper](https://research.google.com/archive/spanner-osdi2012.pdf)
   represents `TrueTime` as an interval with bounded uncertainty and explains
   that ordinary time APIs do not expose such uncertainty. This is a useful
   limit on what a timestamp can prove: Runnel's scalar millisecond field does
