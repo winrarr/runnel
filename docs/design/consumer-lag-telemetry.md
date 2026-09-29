@@ -3,9 +3,9 @@
 - Status: semantic contract accepted by
   [ADR 0028](../decisions/0028-consumer-lag-observation-semantics.md); runtime
   design remains exploratory
-- Last reviewed: 2026-09-28
-- Baseline inspected: `3ba927d37d36b914fc0772a983d6c257044e6f16`
-- Evidence class: operability/observability correctness
+- Last reviewed: 2026-09-29
+- Baseline inspected: `41cbd2db88984dbed1bc7103fbaaf2164ad8f9dd` (exact `ci.yml` run #36605951827 passed)
+- Evidence class: design/research; secondary: operational telemetry
 - Related debt: [TD-006](../tech-debt.md#td-006-operational-telemetry-remains-incomplete)
 - Scope: bounded logical consumer-lag observation for local and early clustered engines
 
@@ -21,24 +21,76 @@ optional telemetry.
 
 ## Current baseline
 
-The current implementation establishes useful boundaries but does not expose
-lag:
+The inspected baseline still has no consumer-lag API or metric family. Its
+current signals establish adjacent state, but do not report `H - C` or a
+complete consumer scope:
 
-- [`runnel_engine::HealthSnapshot`](../../crates/runnel-engine/src/lib.rs) contains only broker-wide `streams`,
-  `storage_bytes`, `in_flight_deliveries`, `redeliveries`, and `dead_letters`.
-  The public protocol health response projects only stream count and storage
-  bytes. Adding lag fields directly to either type would couple a future
-  per-consumer view to the existing health contract.
-- The server's [`/metrics`](../../crates/runnel-server/src/observability.rs) output uses fixed operation labels only. It already reports aggregate request, traffic, publish, delivery, acknowledgement, admission, storage, health, and clustered snapshot signals. The clustered snapshot families are read separately from health and are emitted only when the snapshot-metrics call completes; neither path exposes consumer lag. Real-server tests explicitly ensure that failed protocol requests do not create stream or consumer labels.
-- Local [`runnel-core`](../../crates/runnel-core/src/broker.rs) keeps the complete append-only stream history on disk, a bounded tail index and bounded sparse index, and a reconstructed `next_offset`. Consumer checkpoints are durable per `(stream, consumer)` and contain a contiguous `committed_offset`, out-of-order acknowledged offsets, and delivery attempts. Active deliveries are indexed per consumer, with expiry removed through a deadline index. The in-memory consumer-state cache is bounded to 1,024 entries, but consumer state files are created lazily and there is no complete durable or in-memory consumer catalogue. The journal is limited to 64 KiB, but checkpoint files and their out-of-order-acknowledgement maps have no corresponding size bound; a cold read therefore is not yet bounded by the cache limit.
-- Clustered [`runnel-raft`](../../crates/runnel-raft/src/state_machine.rs) state stores stream records, consumer progress, out-of-order acknowledgements, attempts, leases, and grouped in-flight ownership in each stream data group. [`GroupManager::health`](../../crates/runnel-raft/src/group_manager.rs) sums materialized groups on the local node after reading metadata health; it does not perform a leader-authoritative cross-node query or deduplicate replica copies. The current consumer-policy inspection routes to the stream's current leader but returns no applied source revision. Replica copies must not be summed as separate logical backlog.
-- Local health obtains physical log-file lengths. Clustered state-machine
-  health derives logical key-plus-payload bytes by iterating materialized
-  messages. Neither definition is a consumer-lag byte definition, and the
-  existing `runnel_storage_bytes` meaning must not silently change.
-- Current retention is unlimited and the replay boundary is offset-based.
-  The [retention design](retention-disk-pressure-plan.md) proposes a future logical retained floor and
-  `protect`/`expire` behavior, but those are not current guarantees.
+- [`runnel_engine::HealthSnapshot`](../../crates/runnel-engine/src/lib.rs#L178)
+  contains broker-wide stream count, storage bytes, in-flight deliveries,
+  redelivery count, and dead-letter count. The protocol health response
+  exposes only stream count and storage bytes. The engine's
+  [`inspect_consumer`](../../crates/runnel-engine/src/lib.rs#L397) contract
+  returns a `ConsumerPolicy`; local
+  [`Broker::inspect_consumer`](../../crates/runnel-core/src/broker.rs#L271)
+  reads retry policy, not consumer progress. `ConsumerPolicy.version` is not
+  an applied Raft log revision. Neither operation is a consumer-lag source.
+- The server's [`/metrics` handler](../../crates/runnel-server/src/observability.rs#L344)
+  exports fixed operation labels and aggregate request, traffic, publish,
+  delivery, acknowledgement, admission, storage, health, redelivery,
+  dead-letter, and clustered snapshot signals. In particular,
+  `runnel_in_flight_deliveries` is the health snapshot's current tracked
+  delivery count. It is not cursor lag, ready work, or the server's separate
+  in-flight request count. The [health response](../../crates/runnel-server/src/observability.rs#L305)
+  remains separate. Cluster snapshot counters are collected after the bounded
+  health call; that second query has no independent explicit deadline.
+- Local [`Broker::health`](../../crates/runnel-core/src/broker.rs#L497)
+  sums stream-log file lengths and the transient delivery index while holding
+  each stream lock. The local in-flight index is process memory and is rebuilt
+  empty after restart; expired entries leave it when a later poll or
+  acknowledgement runs, not through a background expiry worker. The durable
+  checkpoint separately stores the contiguous `committed_offset`,
+  out-of-order acknowledgements, delivery attempts, configured policy, and
+  policies pinned to offsets. Consumer state is loaded lazily, with no complete
+  durable consumer catalogue. The cache limit of 1,024 entries does not bound
+  checkpoint file size or identify all consumers. Only the append journal has
+  a 64 KiB cap; checkpoint files and their acknowledgement sets have no
+  equivalent bound. Local redelivery and dead-letter totals are process
+  atomics initialized at open; clustered totals come from replicated
+  state-machine state, so restart behavior differs by engine.
+- Clustered [`GroupManager::health`](../../crates/runnel-raft/src/group_manager.rs#L608)
+  sums materialized groups on the current node. A data-group health snapshot
+  derives `storage_bytes` by iterating retained messages and summing logical
+  key-plus-payload bytes, and counts its applied in-flight lease state. This
+  is not a leader-authoritative cross-node lag query and does not deduplicate
+  replica copies across node scrapes. Clustered policy inspection uses the
+  stream's current leader, but returns no applied source revision. A local
+  stream-log file length and clustered logical payload-byte sum are different
+  storage measurements; neither defines consumer-lag bytes, and
+  `runnel_storage_bytes` must not be repurposed as such.
+- Retention remains unlimited (`F = 0`) and replay is an explicit-offset,
+  read-only operation. The [retention design](retention-disk-pressure-plan.md)
+  describes proposed `protect`/`expire` behavior; those are not current
+  guarantees.
+
+The existing evidence is about durable progress, leases, and scrape behavior,
+not about lag computation. These exact tests show the current boundaries:
+
+| Evidence | What it establishes | What it does not establish |
+| --- | --- | --- |
+| [`grouped_consumers_share_records_and_allow_out_of_order_acknowledgements`](../../crates/runnel-core/src/lib.rs#L714) and [`acknowledged_group_progress_and_retry_state_survive_restart`](../../crates/runnel-core/src/lib.rs#L1747) | Local shared-group acknowledgements can be out of order; acknowledged progress and unacknowledged delivery survive restart. | A lag value, catalogue completeness, or bounded telemetry read. |
+| [`acknowledged_consumer_state_cache_is_bounded`](../../crates/runnel-core/src/lib.rs#L307), [`consumer_delivery_journal_stays_within_its_checkpoint_bound`](../../crates/runnel-core/src/lib.rs#L1624), and [`oversized_consumer_delivery_journal_is_rejected_on_recovery`](../../crates/runnel-core/src/lib.rs#L1664) | The in-memory cache and journal have explicit limits, and an oversized journal is rejected. | A bound on checkpoint bytes: the test covers the journal, not the checkpoint file or its out-of-order acknowledgement set. |
+| [`health_reports_in_flight_deliveries_until_acknowledged`](../../crates/runnel-core/src/lib.rs#L757) and [the clustered counterpart](../../crates/runnel-raft/src/lib.rs#L1550) | The health snapshot's in-flight count changes across delivery and acknowledgement in local and single-node state-machine tests. | Durable cursor lag or a fresh, deduplicated three-node aggregate. |
+| [`metrics_report_messages_returned_by_polls`](../../crates/runnel-server/tests/server_smoke.rs#L347) | A real server process exposes the aggregate in-flight delivery gauge and delivery/ack counters across publish, poll, and ack. | Consumer identity, cursor distance, or a lag family. |
+| [`metrics_report_protocol_failures_without_stream_labels`](../../crates/runnel-server/tests/server_smoke.rs#L519) | Request metrics use fixed operation labels and do not expose caller stream or consumer names on this real-server path. | Complete coverage or lag-series behavior; the current endpoint has no per-consumer series. |
+| [`storage_stall_is_bounded_and_durable_traffic_continues`](../../crates/runnel-server/tests/admission.rs#L1562) and [`sustained_in_flight_pressure_reports_metrics_and_recovers`](../../crates/runnel-server/tests/admission.rs#L666) | Real-process tests cover scrape fallback during a stalled engine health call and report request-admission pressure and recovery. | A bound for optional lag collection or for the separate clustered snapshot-metrics call. |
+| [`grouped_lease_has_no_lazy_expiry_without_a_committed_command`](../../crates/runnel-raft/src/lib.rs#L762) | Clustered lease expiry follows committed state transitions rather than a background read-time cleanup. | Fresh lease counts during inactivity or a lag freshness policy. |
+
+There is no current lag-specific test. Existing local and clustered tests can
+support a future semantic implementation, but the selected-observation,
+unknown-state, scrape-bound, freshness, coverage, and three-node
+replica-deduplication cases remain unimplemented. Existing
+`runnel_in_flight_deliveries` must therefore be described as tracked delivery
+state only, not as a consumer-lag proxy.
 
 [`TD-006`](../tech-debt.md#td-006-operational-telemetry-remains-incomplete) remains open because the current signals cannot explain consumer lag,
 retained or reclaimable storage, queue saturation, replication progress, or
@@ -191,13 +243,16 @@ lag; it must not create state or synthesize a caught-up value.
 
 ### Local engine
 
-Under the stream lock, the local engine has or can derive `H`, `C`, and active
-in-flight count without reading stream payloads. Out-of-order acknowledgements
-are stored as a set. A named observation must not enumerate log records, and a
-cold state-file read must be capped or replaced by a bounded summary before it
-can be called bounded. Looking up an old message timestamp is a separate
-indexed-metadata operation and is not available from the current tail/sparse
-indexes with a guaranteed bounded cost.
+The recovered local stream log exposes its exclusive `next_offset` as `H`;
+the consumer checkpoint stores `C` and out-of-order `A`, while the active
+delivery index supplies a current process-local count. The existing
+`inspect_consumer` path returns retry settings and is not a progress query.
+There is no current telemetry operation that reads these values together. A
+future named observation must not enumerate log records, and a cold checkpoint
+read must be capped or replaced by a bounded summary before it can be called
+bounded. Looking up an old message timestamp is a separate indexed-metadata
+operation and is not available from the current tail/sparse indexes with a
+guaranteed bounded cost.
 
 The current local state files are authoritative but are discovered lazily and
 there is no complete consumer catalogue. Broker-wide aggregates therefore
@@ -543,22 +598,33 @@ The baseline confirms that record cursor distance is the smallest useful
 candidate, but the current code cannot yet promise bounded, fresh observations:
 
 - Local `Broker::inspect_consumer` validates one identity and loads that
-  consumer's durable state under its stream lock. Its checkpoint can be
-  unbounded in bytes because the acknowledgement set is persisted in the
-  checkpoint; the 64 KiB journal cap does not cap checkpoint parsing. The
+  consumer's durable state under its stream lock, but returns only retry
+  policy. A missing checkpoint is treated as the legacy policy fallback, so
+  this path cannot establish that a durable consumer exists or report `C`.
+  The checkpoint can be unbounded in bytes because the acknowledgement set is
+  persisted there; the 64 KiB journal cap does not cap checkpoint parsing. The
   1,024-entry cache bounds cached identities, not on-disk checkpoint size or
   the complete consumer catalogue. `/metrics` must not enumerate the
   consumer-state directory or treat that cache as complete.
 - Clustered policy inspection routes to the current data-group leader, but
-  returns no applied source revision. Cluster health iterates materialized
-  groups on each local node, and the same logical stream is replicated to each
-  voter. These paths do not establish a fresh cross-node aggregate; replica
-  values must never be summed as distinct consumers.
+  returns policy version rather than the applied Raft source revision needed
+  to establish freshness for a cursor observation. Cluster health iterates
+  materialized groups on each local node, and the same logical stream is
+  replicated to each voter. These paths do not establish a fresh cross-node
+  aggregate; replica values must never be summed as distinct consumers.
 - The server metrics collector has a one-second bound for `engine.health()`.
   Its existing clustered snapshot-metrics query happens after that check and
   has no independent explicit deadline. New lag collection must carry its own
   bound and remain optional to readiness. `HealthSnapshot` and the protocol
   health response are not appropriate places for an optional consumer query.
+
+No current unit, real-server, cluster-process, or benchmark case asserts a
+consumer-lag value or its freshness and coverage. Existing benchmarks include
+poll/ack workloads and can record deltas for current server metrics, but they
+do not measure lag collection, scrape latency under a complete consumer scope,
+or the added cost of maintaining a lag summary. The concrete workload and
+measurements required before a runtime performance claim are listed under
+[Benchmark applicability](#benchmark-applicability).
 
 The smallest useful runtime candidate is an exact, identity-selected
 `cursor_lag_records` diagnostic for one `(stream, consumer)`. It avoids
