@@ -88,8 +88,9 @@ evidence.
 ## Worker instructions
 
 Before editing, explicitly instruct every worker to read the repository root
-`AGENTS.md`, this skill, and [WORKER.md](WORKER.md). Pass this requirement to
-any nested worker only when nested delegation is authorized.
+`AGENTS.md`, this skill, and [WORKER.md](WORKER.md). Workers must not create
+nested workers unless the coordinator explicitly authorizes nested delegation.
+When authorized, give each nested worker the same reading requirement.
 
 Each assignment must state its goal, acceptance criteria, owned paths, baseline
 revision, task-to-worktree mapping, expected evidence class, resource and
