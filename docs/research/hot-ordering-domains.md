@@ -120,16 +120,18 @@ The committed schema-v2 result copies preserve the measurements, workload, prove
 | 2 | [run 2](artifacts/hot-ordering-baseline-2026-09-29/run-2.json), 155,560 B | [node logs](artifacts/hot-ordering-baseline-2026-09-29/run-2-logs/), 855 B | 100 B and 1 KiB |
 | 3 | [run 3](artifacts/hot-ordering-baseline-2026-09-29/run-3.json), 155,569 B | [node logs](artifacts/hot-ordering-baseline-2026-09-29/run-3-logs/), 855 B | 100 B and 1 KiB |
 
-**Per-run performance and progress** (poll-plus-ack latency values are milliseconds):
+**Per-run performance and progress:** overall poll-plus-ack percentiles are milliseconds.
 
-| Payload | Run | Total throughput (msg/s) | All-key p50 / p99 | Hot-key p50 / p99 | Hot drain (ms) | Hot backlog at first / last cold completion | Cold completed before hot drain | Ordering invariant |
+| Payload | Run | Total throughput (msg/s) | Overall poll+ack p50 / p99 / p99.9 (ms) | Hot-key p50 / p99 (ms) | Hot drain (ms) | Hot backlog at first / last cold completion | Cold completed before hot drain | Ordering invariant |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- |
-| 100 B | 1 | 206.45 | 1.546 / 10.656 | 1.691 / 11.060 | 462.379 | 64 / 62 | 32 of 32; 4 of 4 keys | pass |
-| 100 B | 2 | 205.46 | 1.680 / 19.218 | 1.734 / 20.596 | 465.317 | 64 / 62 | 32 of 32; 4 of 4 keys | pass |
-| 100 B | 3 | 191.12 | 1.627 / 16.424 | 1.979 / 18.026 | 497.530 | 64 / 62 | 32 of 32; 4 of 4 keys | pass |
-| 1 KiB | 1 | 191.86 | 1.448 / 21.611 | 1.520 / 22.972 | 499.194 | 64 / 62 | 32 of 32; 4 of 4 keys | pass |
-| 1 KiB | 2 | 178.17 | 1.774 / 31.422 | 1.695 / 33.207 | 536.688 | 64 / 62 | 32 of 32; 4 of 4 keys | pass |
-| 1 KiB | 3 | 178.10 | 2.033 / 31.494 | 1.825 / 32.690 | 537.308 | 64 / 61 | 32 of 32; 4 of 4 keys | pass |
+| 100 B | 1 | 206.45 | 1.546 / 10.656 / 11.736 | 1.691 / 11.060 | 462.379 | 64 / 62 | 32 of 32; 4 of 4 keys | pass |
+| 100 B | 2 | 205.46 | 1.680 / 19.218 / 22.898 | 1.734 / 20.596 | 465.317 | 64 / 62 | 32 of 32; 4 of 4 keys | pass |
+| 100 B | 3 | 191.12 | 1.627 / 16.424 / 20.705 | 1.979 / 18.026 | 497.530 | 64 / 62 | 32 of 32; 4 of 4 keys | pass |
+| 1 KiB | 1 | 191.86 | 1.448 / 21.611 / 25.248 | 1.520 / 22.972 | 499.194 | 64 / 62 | 32 of 32; 4 of 4 keys | pass |
+| 1 KiB | 2 | 178.17 | 1.774 / 31.422 / 36.191 | 1.695 / 33.207 | 536.688 | 64 / 62 | 32 of 32; 4 of 4 keys | pass |
+| 1 KiB | 3 | 178.10 | 2.033 / 31.494 / 34.689 | 1.825 / 32.690 | 537.308 | 64 / 61 | 32 of 32; 4 of 4 keys | pass |
+
+The overall p99.9 values come from the runner's `scenarios[].latency_microseconds.p999` over 96 poll-plus-ack samples per case. This quantile is especially coarse and unstable with 96 samples and only three repetitions; it is descriptive and has no probe-specific stability threshold. The per-key metadata reports p99 only, so no per-key p99.9 is inferred or reported.
 
 **Per-run cold-key latency and completion spread:** latency ranges are the four cold keys' per-key poll-plus-ack percentiles. Each cold key has only eight samples. First/last spread is the difference between cold keys' first/last acknowledgement-completion times.
 
@@ -153,7 +155,7 @@ The committed schema-v2 result copies preserve the measurements, workload, prove
 | 1 KiB | 2 | 1.00 | 49.73 / 50.45 | 3.767 / 4.198 |
 | 1 KiB | 3 | 1.03 | 48.66 / 50.37 | 3.929 / 3.941 |
 
-Across the three repetitions, the 100 B case had median throughput **205.46 msg/s** (observed range 191.12–206.45), combined p50/p99 request latency **1.627 / 16.424 ms** (p50 range 1.546–1.680; p99 range 10.656–19.218), and hot-key drain time **465.317 ms** (462.379–497.530). The 1 KiB case had median throughput **178.17 msg/s** (178.10–191.86), combined p50/p99 **1.774 / 31.422 ms** (p50 range 1.448–2.033; p99 range 21.611–31.494), and hot-key drain time **536.688 ms** (499.194–537.308). The hot backlog peaked at 64 in every case and remained 64 at the first cold completion; it was 62 at the last cold completion in five cases and 61 in one. All 32 cold records across all four cold keys completed before the hot backlog drained in all six cases.
+Across the three repetitions, the 100 B case had median throughput **205.46 msg/s** (observed range 191.12–206.45), combined p50/p99 request latency **1.627 / 16.424 ms** (p50 range 1.546–1.680; p99 range 10.656–19.218), overall p99.9 **20.705 ms** (11.736–22.898), and hot-key drain time **465.317 ms** (462.379–497.530). The 1 KiB case had median throughput **178.17 msg/s** (178.10–191.86), combined p50/p99 **1.774 / 31.422 ms** (p50 range 1.448–2.033; p99 range 21.611–31.494), overall p99.9 **34.689 ms** (25.248–36.191), and hot-key drain time **536.688 ms** (499.194–537.308). The hot backlog peaked at 64 in every case and remained 64 at the first cold completion; it was 62 at the last cold completion in five cases and 61 in one. All 32 cold records across all four cold keys completed before the hot backlog drained in all six cases.
 
 Hot-key request p50/p99 medians (observed range) were 1.734 ms (1.691–1.979) / 18.026 ms (11.060–20.596) for 100 B, and 1.695 ms (1.520–1.825) / 32.690 ms (22.972–33.207) for 1 KiB. Per-key cold request p50 ranged from 0.845–1.657 ms for 100 B and 1.238–2.868 ms for 1 KiB across the four keys and three repetitions; corresponding per-key p99 values ranged from 1.480–2.858 ms and 1.748–6.286 ms. The first-completion spread across cold keys had median/range 1.821 ms (0.987–1.880) for 100 B and 2.113 ms (1.164–2.267) for 1 KiB. Last-completion spread was 0.852 ms (0.645–0.964) and 1.782 ms (1.119–1.787), respectively.
 
