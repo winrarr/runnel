@@ -1178,7 +1178,7 @@ mod tests {
     fn dead_letter_move_reconciles_target_after_restart() {
         let directory = tempdir().unwrap();
         let config = BrokerConfig {
-            ack_timeout: Duration::ZERO,
+            ack_timeout: Duration::from_secs(60),
             max_delivery_attempts: Some(1),
         };
         {

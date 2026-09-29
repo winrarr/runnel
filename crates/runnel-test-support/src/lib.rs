@@ -352,6 +352,17 @@ pub async fn assert_expired_delivery_is_fenced(engine: &dyn Engine, expiration: 
             .await,
     );
     tokio::time::sleep(expiration).await;
+
+    assert!(matches!(
+        engine
+            .ack_group("contract.expiry", "workers", "member-a", offset, &old_token,)
+            .await,
+        Err(BrokerError::StaleDelivery {
+            ref consumer,
+            offset: stale_offset,
+        }) if consumer == "workers" && stale_offset == offset
+    ));
+
     let (redelivered_offset, new_token) = grouped_message(
         engine
             .poll_group("contract.expiry", "workers", "member-b")

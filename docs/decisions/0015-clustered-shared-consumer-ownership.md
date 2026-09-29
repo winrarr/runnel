@@ -9,9 +9,9 @@ The initial clustered shared-consumer implementation keeps a consumer's committe
 
 Grouped poll and acknowledgement requests are authoritative writes handled by the elected data-group leader. A client connected to another node is forwarded to that leader through the existing internal peer protocol. The public protocol continues to expose only stream, consumer, member, record, acknowledgement, and delivery-token concepts.
 
-Each new assignment receives a token derived from the committed Raft log identity of the assignment command. Acknowledgement requires the member and token that currently own the delivery. When a lease has expired, the next grouped poll may assign the record again with a new token and incremented attempt number. The old acknowledgement is rejected as stale.
+Each new assignment receives a token derived from the committed Raft log identity of the assignment command. Acknowledgement requires the member and token that currently own the delivery. A grouped acknowledgement command that observes the lease deadline rejects the old token as stale even if no replacement assignment has committed. A later grouped poll may assign the record again with a new token and incremented attempt number. Expiry is demand-driven: no background timer changes ownership, and no command means no new lease-time observation. The replicated lease-time observation remains based on the leader's command sample and the persisted per-group floor described below.
 
-Lease deadlines are absolute millisecond timestamps selected by the leader and included in the replicated command. This makes state-machine application deterministic across replicas and provides a simple restart and leader-failover baseline. The configured acknowledgement timeout is expected to be consistent across nodes; a final lease and fencing model remains future work.
+Lease deadlines are absolute millisecond timestamps selected by the leader and included in the replicated command. This makes state-machine application deterministic across replicas and provides a simple restart and leader-failover baseline. The configured acknowledgement timeout is expected to be consistent across nodes; a broader clock model and timing error bounds remain future work.
 
 The broker-wide maximum attempt setting remains the legacy fallback for clustered grouped delivery. A durable per-consumer policy may override it as described by [ADR 0027](0027-consumer-scoped-retry-policy.md). When the selected limit is reached, the source consumer's progress and a derived `.dead-letter` record are committed in the same stream data group. The derived stream is resolved back to that data group when addressed through the public protocol, and dead-letter streams are not recursively dead-lettered.
 
@@ -26,7 +26,7 @@ The design deliberately keeps the first scheduler demand-driven and bounded: one
 - An acknowledgement accepted by the data-group leader is replicated under that group's Raft durability guarantee before the client receives success.
 - A message is delivered at least once unless the configured clustered grouped-delivery attempt limit moves it to the derived dead-letter stream.
 - A member may receive the same delivery again before acknowledgement, but a member's active lease is returned consistently until it expires.
-- Expired or superseded delivery tokens cannot acknowledge a later assignment.
+- An acknowledgement that observes an expired lease is rejected as stale, whether or not reassignment has occurred; a superseded token also cannot acknowledge a later assignment.
 - Records with the same key are not assigned concurrently within one shared consumer, while unrelated keys may progress concurrently.
 - A process or leader failure may cause redelivery after the lease boundary; the system does not claim exactly-once processing.
 - A message reaching the configured clustered attempt limit is not delivered again to the source consumer and is available through its derived dead-letter stream.
@@ -35,7 +35,7 @@ The design deliberately keeps the first scheduler demand-driven and bounded: one
 
 - The clustered backend now implements the reusable shared-delivery contract and process-level failure tests.
 - Consumer delivery state increases the replicated and snapshot state for each stream; the current materialized representation is not the long-term large-stream design.
-- Clustered backoff, richer dead-letter provenance, and final fencing semantics are not enabled by this decision. Consumer policy selection is defined by ADR 0027.
+- Clustered backoff and richer dead-letter provenance remain unfinished. This decision defines broker acknowledgement fencing at lease expiry; the broader clock model, timing error bounds, and fencing of external side effects remain unresolved. Consumer policy selection is defined by ADR 0027.
 - Lease behavior depends on a consistent wall-clock configuration across nodes. The command carries the leader's chosen deadline, but clock quality and configuration drift remain operational concerns.
 - A future scheduler may replace the scan and one-delivery-per-member policy behind the same engine contract, subject to benchmarks and the ordering and fencing invariants.
 

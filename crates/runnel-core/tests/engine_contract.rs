@@ -318,3 +318,51 @@ async fn local_grouped_delivery_survives_restart_and_member_replacement() {
         AckResult::Acknowledged
     );
 }
+
+#[tokio::test]
+async fn expired_group_ack_does_not_advance_progress_before_restart() {
+    let directory = tempdir().unwrap();
+    let config = BrokerConfig {
+        ack_timeout: std::time::Duration::from_millis(100),
+        max_delivery_attempts: None,
+    };
+    let broker = Broker::open(directory.path(), config.clone()).unwrap();
+    broker
+        .publish("jobs", None, b"recover-expired-ack".to_vec())
+        .unwrap();
+    let (offset, old_token) = match broker.poll_group("jobs", "workers", "member-a").unwrap() {
+        PollResult::Message(message) => (
+            message.offset,
+            message
+                .delivery_token
+                .expect("grouped delivery has a token"),
+        ),
+        PollResult::Empty => panic!("expected grouped delivery"),
+    };
+
+    tokio::time::sleep(config.ack_timeout + std::time::Duration::from_millis(100)).await;
+    assert!(matches!(
+        broker.ack_group("jobs", "workers", "member-a", offset, &old_token),
+        Err(BrokerError::StaleDelivery { .. })
+    ));
+    drop(broker);
+
+    let reopened = Broker::open(directory.path(), config).unwrap();
+    let (new_token, attempt) = match reopened.poll_group("jobs", "workers", "member-b").unwrap() {
+        PollResult::Message(message) => (
+            message
+                .delivery_token
+                .expect("grouped delivery has a token"),
+            message.delivery_attempt,
+        ),
+        PollResult::Empty => panic!("expected expired delivery after restart"),
+    };
+    assert_ne!(new_token, old_token);
+    assert_eq!(attempt, Some(2));
+    assert_eq!(
+        reopened
+            .ack_group("jobs", "workers", "member-b", offset, &new_token)
+            .unwrap(),
+        AckResult::Acknowledged
+    );
+}
