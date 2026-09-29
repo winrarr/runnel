@@ -69,17 +69,22 @@ concurrent process-level test or benchmark unique resources, including:
 
 Shared Cargo registries are normally acceptable as caches, but shared target directories, generated benchmark files, and mutable broker data are not. Do not use a shared `benchmark-results/` path for concurrent writers.
 
+Keep at most two assigned work items in flight whose acceptance or merge recommendation requires benchmark evidence. Count work whose performance claim or plausible material performance effect needs measurement; keep its slot occupied while required benchmark evidence or benchmark-related revisions remain outstanding. Do not count correctness or safety work when no material performance effect is expected and no performance claim is made. For that work, use the applicable focused tests and end-to-end verification instead. Fill other pool slots with independent work that does not need benchmark evidence when available. Change this cap only at the user's explicit direction.
+
 Parallel runs are suitable for exploratory correctness checks and rough optimization feedback. Host CPU scheduling, disk bandwidth, page cache, and kernel socket resources are still shared, so do not treat concurrent results as authoritative latency or throughput comparisons unless CPU and storage resources are explicitly isolated. Schedule authoritative comparisons sequentially otherwise.
 
 For any task that can affect throughput, latency, CPU, memory, batching,
 I/O, or scheduling, follow [docs/benchmarking.md](../../../docs/benchmarking.md)
 and determine whether the standard benchmark meaningfully covers the PR's
-changes. Require the assignee to run the canonical local benchmark before an
-improvement claim. If the standard benchmark does not meaningfully cover the
-PR, evaluate whether a focused targeted benchmark would be relevant and
-feasible with reasonable effort and controlled resources; when it is, require
-it before recommending that an optimization PR merge. Require authoritative
-comparisons to use `just bench-pr-local` after committing and, if inconclusive,
+changes. If the change has no material performance effect expected and makes
+no performance claim, use the applicable correctness, safety, and
+end-to-end checks without requiring a benchmark. Otherwise, require the
+assignee to run the canonical local benchmark before an improvement claim. If
+the standard benchmark does not meaningfully cover the PR, evaluate whether a
+focused targeted benchmark would be relevant and feasible with reasonable
+effort and controlled resources; when it is, require it before recommending
+that an optimization PR merge. Require authoritative comparisons to use
+`just bench-pr-local` after committing and, if inconclusive,
 `just bench-pr-local-until-stable` to retry complete comparisons. Treat a
 one-pair command such as `just bench-pr-local-quick` as diagnostic only. Never
 treat a hosted PR benchmark or concurrent task measurement as proof of a
