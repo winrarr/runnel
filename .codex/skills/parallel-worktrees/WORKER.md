@@ -21,23 +21,38 @@ changes the work; otherwise state a safe assumption and proceed.
 - Check `git status` and inspect the current code, tests, decisions, and nearby
   design or planning records. Treat backlog and tech-debt text as guidance to
   validate, not as accepted APIs or behavior.
-- Keep edits inside the assigned worktree and scope, including any same-change
-  planning-record updates required by `AGENTS.md`. Do not discard, rewrite, or
-  stage unrelated work. Coordinate before other scope expansion or changes to
-  shared contracts, dependencies, generated files, or integration behavior.
+- Keep edits inside the assigned worktree. Include same-change planning-record
+  updates required by `AGENTS.md`. Do not discard, rewrite, or stage unrelated
+  work. If a better solution crosses your assigned scope, another worker's
+  ownership, or a shared boundary, send the coordinator a proposal with its
+  goal, rationale, affected scope, expected effects and non-effects, evidence,
+  risks, and recommendation. Do not silently shrink the design or edit across
+  the boundary. If you and the coordinator agree the change is best, update
+  task ownership and the integration plan, then proceed. If either of you is
+  unsure, the coordinator escalates the scope decision to the user before the
+  boundary changes.
 - Identify the primary evidence class, applicable gate in
   [`docs/testing.md`](../../../docs/testing.md), relevant acceptance criteria,
   and verification commands before implementation.
 
 ## Implementation and verification
 
-- Inspect the touched code and its immediate surroundings. Make safe,
-  appropriately scoped refactors; record broader concrete debt and update
-  backlog or tech-debt outcomes as required by `AGENTS.md`. State why no update
-  is warranted when inspection finds no concrete follow-up.
+- Inspect the touched code and its immediate surroundings. Aim for the clean,
+  maintainable, performant design that best advances the assignment; do not
+  keep a needed change artificially small or preserve unused compatibility
+  solely to avoid churn. Unless an active consumer or accepted policy requires
+  backward compatibility, prefer a deliberate breaking change over obsolete
+  compatibility paths. When the better design needs a cohesive refactor across
+  owned areas or shared boundaries, use the proposal and agreement process
+  above rather than shrinking the solution. Assess material risks with
+  proportionate evidence, and follow the refactor and planning-record policy in
+  `AGENTS.md`, including its no-update rationale.
 - For non-trivial changes to semantics, storage, replication, ordering,
   recovery, or operational safety, compare relevant reference designs and
   primary research before implementation, following `AGENTS.md`.
+- Keep accepted decisions and current architecture documentation aligned when
+  the change alters them; update the affected ADR or architecture document as
+  appropriate rather than changing records that do not describe the new state.
 - Use focused tests for changed behavior and the canonical `just` commands.
   Add crash/recovery coverage before changing persistence, acknowledgement, or
   redelivery behavior. Keep network behavior covered by tests that start the
@@ -51,9 +66,11 @@ changes the work; otherwise state a safe assumption and proceed.
   one when in scope or report the concrete gap and why it remains.
 - For documentation-only work, state why runtime tests do not apply and run
   applicable document checks, such as `git diff --check`.
-- If a check fails, inspect its output and diagnose the cause before rerunning.
+- If a check or PR workflow fails, inspect its logs and assess whether the
+  cause is the change, a test or workflow defect, or the environment. Fix
+  relevant issues and rerun the affected checks; do not rerun blindly.
   Distinguish a confirmed fix from a transient failure, inconclusive run, or
-  unresolved failure; report the commands and each relevant result.
+  unresolved blocker, and report the commands and results.
 - Use `just isolated <workflow>` for supported process-heavy tests or
   benchmarks run concurrently. Give other concurrent workflows unique
   processes, ports, data, output paths, and build targets as required by
@@ -68,10 +85,17 @@ changes the work; otherwise state a safe assumption and proceed.
 
 - Before committing, inspect the complete diff, run `git diff --check`, and
   stage only files in the agreed scope, including required planning-record
-  updates. Use a Conventional Commit on the assigned branch.
-- Push the branch and open exactly one pull request for the assignment. Use a
-  draft PR for incomplete or blocked work. Do not merge the PR or enable
-  auto-merge; the coordinator owns review and integration.
+  updates. Use a Conventional Commit for both the commit and PR title.
+- Push the branch and open exactly one pull request for the assignment. Keep
+  it as a draft while implementation or verification is in progress. Monitor
+  its workflows, assess and address failures, and update the PR title and
+  description to reflect the current work and evidence as they change; the PR
+  description does not need a revision history. Mark it ready and hand it to
+  the coordinator only when you consider the assignment complete and the PR
+  ready for independent review. If a blocker prevents readiness, keep the PR
+  in draft and send the coordinator a progress update with the evidence and
+  blocker. Do not merge the PR or enable auto-merge; the coordinator owns
+  review and integration.
 - Include a concise handoff in the PR description with:
   - goal, changed files, expected effects, and non-effects;
   - primary evidence class and any secondary evidence tags;
@@ -84,10 +108,10 @@ changes the work; otherwise state a safe assumption and proceed.
   - refactor and backlog/tech-debt assessment, including any updates or an
     explicit no-update rationale;
   - a recommendation to merge, revise, rerun, or defer, with reasons.
-- Tell the coordinator the PR URL, branch and worktree, check status, and final
-  head revision and recommendation. Verify required PR checks, including the
-  relevant end-to-end job, against that exact head; report pending checks as
-  pending and inspect failure logs before recommending a rerun. Report blocked
-  or inconclusive work as such. Keep the worktree and branch available for
-  review and requested revisions; do not remove them or stop nested workers
-  until the coordinator closes the work.
+- At handoff, tell the coordinator the PR URL, branch and worktree, check
+  status, final head revision, and recommendation. Verify required PR checks,
+  including the relevant end-to-end job, against that exact head. The
+  coordinator is the reviewer and will send any requested revisions directly;
+  do not wait for review comments. Keep the worktree and branch available
+  until the coordinator closes the work, and do not stop authorized nested
+  workers before then.

@@ -97,6 +97,13 @@ revision, task-to-worktree mapping, expected evidence class, resource and
 isolation constraints, and coordination boundaries. Require the worker's
 pre-edit identity report and prohibit reverting unrelated work.
 
+Workers may propose a better solution that crosses their assignment or another
+worker's ownership boundary. Ask for its goal, rationale, affected scope,
+expected effects and non-effects, evidence, risks, and recommendation. If the
+worker and coordinator agree it is the best solution, update the assignment,
+ownership mapping, and integration plan before proceeding. If either is unsure,
+escalate the scope decision to the user before changing the boundary.
+
 Use [WORKER.md](WORKER.md) as the single worker-facing checklist for
 implementation, testing and end-to-end assessment, evidence, planning and
 refactor assessment, pull requests, and handoff. Keep global engineering
