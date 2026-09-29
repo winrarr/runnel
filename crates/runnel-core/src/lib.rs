@@ -44,7 +44,7 @@ pub use runnel_engine::{
 
 /// Selects the durable record format used for new appends.
 ///
-/// Readers accept both the legacy `RNL1` format and versioned `RNL2` frames.
+/// Readers accept legacy `RNL1`, versioned `RNL2`, and request-aware `RNL3` frames.
 /// The versioned format is deliberately opt-in until its compatibility policy
 /// is accepted for normal broker deployments.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
