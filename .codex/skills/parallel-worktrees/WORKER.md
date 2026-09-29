@@ -21,9 +21,10 @@ changes the work; otherwise state a safe assumption and proceed.
 - Check `git status` and inspect the current code, tests, decisions, and nearby
   design or planning records. Treat backlog and tech-debt text as guidance to
   validate, not as accepted APIs or behavior.
-- Keep edits inside the assigned worktree and scope. Do not discard, rewrite,
-  or stage unrelated work. Coordinate before changing shared contracts,
-  dependencies, generated files, or integration behavior.
+- Keep edits inside the assigned worktree and scope, including any same-change
+  planning-record updates required by `AGENTS.md`. Do not discard, rewrite, or
+  stage unrelated work. Coordinate before other scope expansion or changes to
+  shared contracts, dependencies, generated files, or integration behavior.
 - Identify the primary evidence class, applicable gate in
   [`docs/testing.md`](../../../docs/testing.md), relevant acceptance criteria,
   and verification commands before implementation.
@@ -66,7 +67,8 @@ changes the work; otherwise state a safe assumption and proceed.
 ## Pull request and handoff
 
 - Before committing, inspect the complete diff, run `git diff --check`, and
-  stage only assigned files. Use a Conventional Commit on the assigned branch.
+  stage only files in the agreed scope, including required planning-record
+  updates. Use a Conventional Commit on the assigned branch.
 - Push the branch and open exactly one pull request for the assignment. Use a
   draft PR for incomplete or blocked work. Do not merge the PR or enable
   auto-merge; the coordinator owns review and integration.
