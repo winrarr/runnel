@@ -65,8 +65,8 @@ consume batches use the same limits or durability behavior. See the
 | Boundary | Observed behavior | Batch implication |
 |---|---|---|
 | Local ordinary poll | `Broker::poll` delegates to grouped delivery with the consumer name as its member. The poll holds the stream lock, selects one candidate, persists the delivery attempt before returning it, and records one in-flight delivery for that member. Repeating the poll returns that member's same active message. | Returning several messages to one member requires an intentional change to its one-outstanding-delivery rule, or a different client/member model. A vector of messages cannot be assumed to be only a serialization change. |
-| Local shared delivery | The delivery index tracks in-flight offsets, members, deadlines, and keys. A same-key candidate is blocked while its key is in flight. Ack persistence precedes progress mutation and successful response; acknowledgements can advance out of order. Active leases are in-memory and restart can cause redelivery. `ack_group` does not expire entries or compare the deadline before accepting an ack; the local stale-ack test checks after another poll has already expired and reassigned the record. | Each batched delivery needs a separately fenced receipt and bounded lease state. Same-key records cannot be concurrently processed without weakening the current scoped-order guarantee. The deadline-before-reassignment case needs a cross-engine decision and test. |
-| Clustered delivery | One grouped poll submits a `PollGroup` Raft write and carries the leader-selected absolute lease deadline. One grouped ack submits an `AckGroup` write. The replicated state keeps in-flight deliveries, attempts, policy, and out-of-order ack state; tokens fence reassignment. `apply_group_ack` observes the replicated lease clock and removes expired entries before checking the token; a unit test checks rejection at the deadline even before a replacement poll. | One batch command could reduce protocol and consensus operations per record, but changes the replicated state transition and error surface. A commit/response timeout can make all or part of the assigned set uncertain. Decide whether local ack should also reject a still-current token after its deadline, or whether clustered behavior should preserve it until reassignment. |
+| Local shared delivery | The delivery index tracks in-flight offsets, members, deadlines, and keys. A same-key candidate is blocked while its key is in flight. Ack persistence precedes progress mutation and successful response; acknowledgements can advance out of order. Active leases are in-memory and restart can cause redelivery. `Broker::ack_group` expires overdue entries before looking up the requested delivery, so a token-bearing ack after expiry returns `StaleDelivery` even before a replacement poll. The reusable engine assertion covers that ordering; the local unit test also checks the old token after reassignment. | Each batched delivery needs a separately fenced receipt and bounded lease state. Same-key records cannot be concurrently processed without weakening the current scoped-order guarantee. The single-record deadline-before-reassignment result is already aligned across engines; batch-specific partial outcomes still need definition and tests. |
+| Clustered delivery | One grouped poll submits a `PollGroup` Raft write and carries the leader-selected absolute lease deadline. One grouped ack submits an `AckGroup` write. The replicated state keeps in-flight deliveries, attempts, policy, and out-of-order ack state; tokens fence reassignment. `apply_group_ack` observes the replicated lease clock and removes expired entries before checking the token, so the old token is rejected as stale even before a replacement poll. The reusable engine assertion covers this, and a state-machine unit test also checks the deadline and backward-clock floor. | One batch command could reduce protocol and consensus operations per record, but changes the replicated state transition and error surface. A commit/response timeout can make all or part of the assigned set uncertain. Batch acknowledgement still needs explicit per-item results and retry behavior. |
 | Progress | Local and clustered consumers track a contiguous committed offset plus out-of-order acknowledged offsets. Grouped acks identify member, offset, and delivery token. The compatibility ordinary ack omits the token. | Prefix acknowledgement is not equivalent to Runnel's existing per-record acknowledgement, especially for shared work that can complete out of order. The ordinary tokenless path also needs an explicit decision if batched deliveries are independently reassigned. |
 | Size and timing | The wire listener has a configurable request-frame limit capped at 64 MiB. The typed client has a configurable response-buffer bound, with a 65 MiB default. Consume currently returns one record; it has no batch count, aggregate response-byte, or collection-wait policy. | Future delivery bounds must apply to encoded response bytes as well as record count and decoded payload bytes. A maximum wait adds queueing latency and must fit within request and lease timeouts. |
 
@@ -178,17 +178,27 @@ out-of-order progress, and partial batch behavior. A single batch response
 must not imply a stronger all-record durability guarantee than the engine
 actually provides.
 
-One existing boundary deserves resolution before a batch ack contract is
-accepted: when the ack request arrives after its lease deadline but before a
-new poll reassigns that record, the local engine can accept the old receipt,
-while the clustered state machine expires it and rejects the ack. The local
-test `expired_group_delivery_rejects_stale_acknowledgement` polls a replacement
-member before testing the old token; the clustered test
-`grouped_ack_preserves_backward_clock_safety_and_fences_expired_tokens` checks
-the expired token directly. This is an observed code/test coverage difference,
-not a claim about which rule is preferable. The batch design's partial failure
-matrix must include this case. See [local delivery tests](../../crates/runnel-core/src/lib.rs)
-and [cluster delivery tests](../../crates/runnel-raft/src/lib.rs).
+The pre-reassignment expiry case now has matching single-record behavior in
+both engines. Local `Broker::ack_group` expires overdue state before looking up
+the supplied token; clustered `apply_group_ack` observes the replicated lease
+clock and removes expired state before token validation. In either engine, a
+token-bearing grouped ack that first observes the expired lease returns
+`StaleDelivery` without requiring a replacement poll. The reusable
+`assert_expired_delivery_is_fenced` sleeps through the deadline, immediately
+acks the old token and expects that stale result, then polls a replacement and
+checks that its new token succeeds while the old token remains stale. The
+assertion runs in the [local engine contract test](../../crates/runnel-core/tests/engine_contract.rs)
+and [persistent clustered test](../../crates/runnel-raft/src/lib.rs). The local
+unit test `expired_group_delivery_rejects_stale_acknowledgement` only checks
+the old token after a replacement poll; the cluster unit test
+`grouped_ack_preserves_backward_clock_safety_and_fences_expired_tokens` also
+checks rejection at the exact deadline and preservation of the lease-clock
+floor after a backward time sample. The former local-unit-test ordering is not
+evidence of a current engine difference. For batching, the remaining question
+is how a vector reports one expired receipt alongside other valid receipts,
+not which single-record rule the engines use. See [local delivery tests](../../crates/runnel-core/src/lib.rs),
+[shared engine assertion](../../crates/runnel-test-support/src/lib.rs), and
+[cluster delivery tests](../../crates/runnel-raft/src/lib.rs).
 
 ## Evidence needed before selecting an implementation
 
@@ -210,24 +220,28 @@ three-node workloads separately; do not use overlapping host measurements as
 authoritative latency evidence. The backlog's full tradeoff matrix remains the
 acceptance gate.
 
-Correctness coverage should include empty/partial batches, count and byte
-limits, one record at the maximum supported payload, response loss after
-assignment, retry of the same receive identity, disconnect during response,
-ack vector with a stale token among valid tokens, response loss after ack,
-restart, leader change, lease expiry while later batch entries wait, member
-replacement, acknowledgement just after lease expiry but before reassignment,
-same-key records, and out-of-order ack across different keys.
+The existing reusable engine assertion already covers a single-record grouped
+ack immediately after lease expiry and before any replacement poll for both
+the local and clustered engines. Batch-specific correctness coverage should
+include empty/partial batches, count and byte limits, one record at the maximum
+supported payload, response loss after assignment, retry of the same receive
+identity, disconnect during response, an ack vector with an expired or
+reassigned token among valid tokens and an explicit result for each item,
+response loss after ack, restart, leader change, lease expiry while later batch
+entries wait, member replacement, same-key records, and out-of-order ack
+across different keys.
 Network and failure tests should start real broker processes. Reusable engine
 assertions should preserve topology-free semantics where practical.
 
 ## Disposition and gaps
 
 - **Backlog:** consume batching remains unfinished under the existing outcome,
-  which already names per-record outcomes, partial failures, ordering, bounded
+  which names per-record outcomes, partial failures, ordering, bounded
   count/bytes/time, restart and leader-change tests, and latency/resource
-  evidence. The shared-consumer acceptance criteria now also require the local
-  and clustered engines to select and test the same ack result after lease
-  expiry but before reassignment.
+  evidence. The existing shared-consumer acceptance criterion for matching
+  local and clustered ack results after expiry but before reassignment is now
+  covered by the reusable engine assertion; vector outcomes and the other
+  batch-specific cases remain open.
 - **Near-term vs deferred:** a design note or ADR proposal is reasonable
   near-term work because the outcome is already committed to product fit and
   both engines expose the relevant delivery and durability boundaries. Runtime
@@ -239,14 +253,15 @@ assertions should preserve topology-free semantics where practical.
   Batching may improve small-message throughput while increasing tail latency,
   memory, lease expiries, or queueing. The current benchmarks do not quantify
   that tradeoff.
-- **Refactor/planning assessment:** protocol, client, engine, local, clustered,
-  tests, and existing ADRs were inspected. No safe scoped code refactor or
-  separate tech-debt item applies to this documentation-only research change.
-  The one-outstanding-per-member rule is a contract constraint for future
-  design, not a refactor. The confirmed local/cluster ack difference is recorded
-  as an unresolved semantic question and a verifiable criterion in the existing
-  shared-consumer backlog; it is not labeled a bug before the policy is
-  selected.
+- **Refactor/planning assessment:** the local and clustered acknowledgement
+  implementations, reusable engine assertion, focused tests, ADRs 0013 and
+  0015, and shared-consumer backlog criterion were inspected. No code refactor
+  is warranted: both implementations already follow their accepted expiry
+  decisions, and this change corrects the research record. No backlog, debt, or
+  ADR update is needed: the existing backlog criterion already records this
+  expected result and the test evidence now covers it; the broader batch
+  outcome and its unresolved batch-specific rules remain open. No separate
+  actionable refactor or tech-debt item was identified.
 - **Unresolved evidence:** no workload has established whether network round
   trips, per-record local sync, consensus round trips, JSON/base64 work, or
   client-side processing dominates; no batch size or ack model is selected.
