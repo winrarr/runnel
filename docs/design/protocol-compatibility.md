@@ -498,15 +498,14 @@ migration analysis only and do not grant a support promise. Keep fixtures
 language-neutral so future clients can consume supported protocol releases:
 
 - canonical request and response fixtures should cover every current tag and
-  exact field names, including omitted optional fields. The canonical request
-  fixture currently omits both consumer-policy request tags; a separate
-  [wire test](../../crates/runnel-protocol/tests/wire.rs) checks the exact
-  `configure_consumer` request JSON and round-trips a `consumer_policy`
-  response, while the [real-process typed
-  client test](../../crates/runnel-server/tests/client_path.rs) exercises both
-  `configure_consumer` and `inspect_consumer` against a local broker. The
-  current Rust wire suite is therefore not a complete canonical fixture set,
-  even though the inspect path has local real-server coverage;
+  exact field names, including omitted optional fields. The canonical v1
+  request fixtures now include both `configure_consumer` and
+  `inspect_consumer`, with serializer and deserializer assertions. An omitted
+  `max_delivery_attempts` input defaults to `None` and serializes as `null`
+  under the current Rust Serde behavior. The [real-process typed client
+  test](../../crates/runnel-server/tests/client_path.rs) also exercises both
+  operations against a local broker. This closes the Rust canonical request
+  fixture gap; it does not provide cross-language interoperability evidence.
 - fixtures cover reordered JSON members, because object order is not semantic,
   and reject duplicate-member fixtures rather than assigning them meaning;
 - request fixtures reject unknown fields on struct-bearing variants, reject
