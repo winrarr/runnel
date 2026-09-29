@@ -1,0 +1,866 @@
+Running as unit: runnel-matrix-329790-1.scope; invocation ID: e8ac151379bb46509e396b4f15057405
+   Compiling proc-macro2 v1.0.107
+   Compiling quote v1.0.47
+   Compiling unicode-ident v1.0.24
+   Compiling libc v0.2.189
+   Compiling syn v3.0.3
+   Compiling syn v2.0.119
+   Compiling pin-project-lite v0.2.17
+   Compiling serde_core v1.0.229
+   Compiling itoa v1.0.18
+   Compiling autocfg v1.5.1
+   Compiling bytes v1.12.1
+   Compiling futures-core v0.3.34
+   Compiling serde v1.0.229
+   Compiling serde_derive v1.0.229
+   Compiling once_cell v1.21.4
+   Compiling futures-sink v0.3.34
+   Compiling memchr v2.8.3
+   Compiling futures-channel v0.3.34
+   Compiling tracing-core v0.1.36
+   Compiling errno v0.3.14
+   Compiling log v0.4.33
+   Compiling signal-hook-registry v1.4.8
+   Compiling tracing-attributes v0.1.31
+   Compiling tokio-macros v2.7.2
+   Compiling mio v1.2.2
+   Compiling socket2 v0.6.5
+   Compiling cfg-if v1.0.4
+   Compiling tokio v1.53.1
+   Compiling tracing v0.1.44
+   Compiling num-traits v0.2.19
+   Compiling futures-macro v0.3.34
+   Compiling futures-task v0.3.34
+   Compiling zmij v1.0.23
+   Compiling slab v0.4.12
+   Compiling zerocopy v0.8.56
+   Compiling futures-io v0.3.34
+   Compiling futures-util v0.3.34
+   Compiling http v1.5.0
+   Compiling utf8parse v0.2.2
+   Compiling serde_json v1.0.151
+   Compiling anstyle-parse v1.0.0
+   Compiling http-body v1.1.0
+   Compiling getrandom v0.2.17
+   Compiling rust_decimal v1.43.0
+   Compiling thiserror v2.0.20
+   Compiling httparse v1.10.1
+   Compiling colorchoice v1.0.5
+   Compiling anstyle v1.0.14
+   Compiling is_terminal_polyfill v1.70.2
+   Compiling anstyle-query v1.1.5
+   Compiling anstream v1.0.0
+   Compiling ppv-lite86 v0.2.21
+   Compiling rand_core v0.6.4
+   Compiling pin-project-internal v1.1.13
+   Compiling thiserror-impl v2.0.20
+   Compiling thiserror v1.0.69
+   Compiling smallvec v1.15.2
+   Compiling unicode-xid v0.2.6
+   Compiling tower-service v0.3.3
+   Compiling clap_lex v1.1.0
+   Compiling arrayvec v0.7.8
+   Compiling strsim v0.11.1
+   Compiling heck v0.5.0
+   Compiling iana-time-zone v0.1.65
+   Compiling chrono v0.4.45
+   Compiling clap_derive v4.6.4
+   Compiling clap_builder v4.6.6
+   Compiling derive_more-impl v1.0.0
+   Compiling pin-project v1.1.13
+   Compiling rand_chacha v0.3.1
+   Compiling futures-executor v0.3.34
+   Compiling anyerror v0.1.13
+   Compiling thiserror-impl v1.0.69
+   Compiling semver v1.0.28
+   Compiling percent-encoding v2.3.2
+   Compiling utf8-width v0.1.9
+   Compiling regex-syntax v0.8.11
+   Compiling httpdate v1.0.3
+   Compiling atomic-waker v1.1.2
+   Compiling tower-layer v0.3.3
+   Compiling sync_wrapper v1.0.2
+   Compiling hyper v1.11.0
+   Compiling regex-automata v0.4.18
+   Compiling byte-unit v5.2.5
+   Compiling form_urlencoded v1.2.2
+   Compiling openraft-macros v0.9.25
+   Compiling validit v0.2.6
+   Compiling futures v0.3.34
+   Compiling rand v0.8.7
+   Compiling tracing-futures v0.2.5
+   Compiling runnel-engine v0.1.0 (<WORKTREE>/crates/runnel-engine)
+   Compiling derive_more v1.0.0
+   Compiling clap v4.6.6
+   Compiling http-body-util v0.1.5
+   Compiling lazy_static v1.5.0
+   Compiling ryu v1.0.23
+   Compiling mime v0.3.17
+   Compiling maplit v1.0.2
+   Compiling openraft v0.9.25
+   Compiling axum-core v0.5.6
+   Compiling serde_urlencoded v0.7.1
+   Compiling sharded-slab v0.1.7
+   Compiling matchers v0.2.0
+   Compiling hyper-util v0.1.20
+   Compiling tower v0.5.3
+   Compiling thread_local v1.1.10
+   Compiling tracing-log v0.2.0
+   Compiling serde_path_to_error v0.1.20
+   Compiling nu-ansi-term v0.50.3
+   Compiling base64 v0.23.1
+   Compiling matchit v0.8.4
+   Compiling axum v0.8.9
+   Compiling runnel-protocol v0.1.0 (<WORKTREE>/crates/runnel-protocol)
+   Compiling tracing-subscriber v0.3.23
+   Compiling runnel-raft v0.1.0 (<WORKTREE>/crates/runnel-raft)
+   Compiling runnel-core v0.1.0 (<WORKTREE>/crates/runnel-core)
+   Compiling runnel-server v0.1.0 (<WORKTREE>/crates/runnel-server)
+    Finished `release` profile [optimized] target(s) in 1m 13s
+{
+  "schema_version": 2,
+  "run_id": "20260929152925942028",
+  "started_at": "2026-09-29T15:29:25.942028+00:00",
+  "command": [
+    "<WORKTREE>/scripts/benchmarks/cluster.py",
+    "--build",
+    "--binary",
+    "$CARGO_TARGET_DIR/release/runnel",
+    "--runtime",
+    "process",
+    "--image",
+    "runnel:bench",
+    "--cpus",
+    "2",
+    "--memory",
+    "2g",
+    "--messages",
+    "1000",
+    "--warmup",
+    "50",
+    "--nodes",
+    "3",
+    "--concurrency",
+    "2",
+    "--scenarios",
+    "slow_consumer_backpressure",
+    "--ack-timeout-ms",
+    "30000",
+    "--slow-consumer-delay-ms",
+    "10",
+    "--slow-consumer-timeout-seconds",
+    "60.0",
+    "--batch-size",
+    "32",
+    "--retained-messages",
+    "2048",
+    "--peer-forwarding-concurrency",
+    "2",
+    "--peer-response-delay-ms",
+    "0",
+    "--peer-forwarding-timeout-seconds",
+    "60.0",
+    "--leader-failure-timeout-seconds",
+    "60.0",
+    "--payload-sizes",
+    "100",
+    "--output",
+    "docs/research/artifacts/slow-consumer-baseline-2026-09-29/cases/case-001-slow-consumer-backpressure-process-payload-100-c2-delay-10-retained-2048-r1/result.json",
+    "--log-dir",
+    "docs/research/artifacts/slow-consumer-baseline-2026-09-29/cases/case-001-slow-consumer-backpressure-process-payload-100-c2-delay-10-retained-2048-r1/broker-logs"
+  ],
+  "source": {
+    "repository": "local",
+    "revision": "93573fae6f8c9244704d34add167540fc46b31c6",
+    "ref": "local",
+    "event": "local",
+    "workflow": "local",
+    "run_id": null,
+    "run_url": null,
+    "profile": "local"
+  },
+  "environment": {
+    "host": "rkth-precision5570",
+    "platform": "Linux-7.0.0-34-generic-x86_64-with-glibc2.43",
+    "processor": "",
+    "python": "3.14.4",
+    "cpus": 20
+  },
+  "benchmark_suite": "cluster",
+  "comparison_mode": "cluster-baseline",
+  "resource_limits": {
+    "processes": "systemd user scope; benchmark client and broker nodes",
+    "cpu": "2",
+    "memory": "2G"
+  },
+  "workload": {
+    "messages": 1000,
+    "warmup": 50,
+    "concurrency": 2,
+    "scenarios": [
+      "slow_consumer_backpressure"
+    ],
+    "nodes": 3,
+    "ack_timeout_ms": 30000,
+    "slow_consumer_delay_ms": 10,
+    "slow_consumer_timeout_seconds": 60.0,
+    "batch_size": 32,
+    "hot_ordering": {
+      "hot_key_messages": 64,
+      "cold_key_count": 4,
+      "cold_messages_per_key": 8,
+      "concurrency": 4,
+      "hot_key_processing_delay_ms": 5,
+      "timeout_seconds": 60.0,
+      "max_records": 4096
+    },
+    "peer_forwarding_concurrency": 2,
+    "peer_response_delay_ms": 0,
+    "peer_forwarding_timeout_seconds": 60.0,
+    "leader_failure_timeout_seconds": 60.0,
+    "payload_sizes_bytes": [
+      100
+    ],
+    "runtime": "process",
+    "protocol": "line-delimited JSON with UTF-8 string payloads",
+    "protocol_version": "provisional-line-json-v1",
+    "payload_encoding": "utf-8",
+    "compression": "none",
+    "durability": "committed by the current three-node Raft quorum and local durable state"
+  },
+  "backends": {
+    "runnel-cluster": {
+      "image": "$CARGO_TARGET_DIR/release/runnel",
+      "image_id": null,
+      "runtime": "process",
+      "acknowledgement": "durable quorum commit",
+      "replication": "3-node static Multi-Raft",
+      "measurement_boundary": "public line-delimited JSON protocol",
+      "measurement_client": "scripts/benchmarks/cluster.py",
+      "client_image": "host Python runtime",
+      "peer_response_proxy": {
+        "enabled": false,
+        "response_delay_ms": 0
+      },
+      "startup_seconds": 0.007288111,
+      "resource_samples": {
+        "samples": 155,
+        "memory_bytes_avg": 54096268.38709678,
+        "memory_bytes_max": 55615488.0,
+        "storage_bytes_avg": 4175711.6,
+        "storage_bytes_max": 6154082.0,
+        "per_node": {
+          "1": {
+            "samples": 155,
+            "memory_bytes_avg": 18533448.670967743,
+            "memory_bytes_max": 19021824.0,
+            "storage_bytes_avg": 1352838.6967741936,
+            "storage_bytes_max": 1446518.0,
+            "cpu_seconds": 4.06
+          },
+          "2": {
+            "samples": 155,
+            "memory_bytes_avg": 17502181.57419355,
+            "memory_bytes_max": 18026496.0,
+            "storage_bytes_avg": 1412057.793548387,
+            "storage_bytes_max": 2364022.0,
+            "cpu_seconds": 3.08
+          },
+          "3": {
+            "samples": 155,
+            "memory_bytes_avg": 18060638.141935483,
+            "memory_bytes_max": 18567168.0,
+            "storage_bytes_avg": 1410815.1096774193,
+            "storage_bytes_max": 2343542.0,
+            "cpu_seconds": 3.07
+          }
+        }
+      },
+      "scenarios": [
+        {
+          "scenario_id": "cluster_slow_consumer_backpressure:100",
+          "operation": "cluster_slow_consumer_backpressure",
+          "messages": 1000,
+          "message_size_bytes": 100,
+          "elapsed_seconds": 14.774823299,
+          "elapsed_milliseconds": 14774.823299,
+          "throughput_messages_per_second": 67.68270454156178,
+          "throughput_megabytes_per_second": 0.006768270454156178,
+          "latency_sample_count": 1000,
+          "latency_microseconds": {
+            "p50": 3180.8575,
+            "p99": 4453.86085,
+            "p999": 4687.082457000047,
+            "max": 5205.021
+          },
+          "metadata": {
+            "nodes": 3,
+            "processing_delay_ms": 10,
+            "preloaded_messages": 1000,
+            "publish_setup_excluded": true,
+            "bounded_runtime_seconds": 60.0,
+            "redelivery_expected": false,
+            "latency_scope": "primary_poll_and_ack_request_time excludes processing delay and duplicate probe",
+            "throughput_scope": "finite backlog drain includes processing delay and duplicate poll probe",
+            "backpressure": {
+              "semantics": "one in-flight delivery per ordinary consumer; a second pull before acknowledgement returns that same delivery",
+              "duplicate_polls": 1000,
+              "duplicate_matches": 1000,
+              "max_logical_in_flight_deliveries_observed": 1,
+              "delivery_window_verified": true,
+              "publisher_throttling_or_rejection_exercised": false,
+              "broker_policy_claim": "no configurable publisher backpressure or rejection policy is inferred from this probe",
+              "duplicate_poll_latency_microseconds": {
+                "p50": 1223.0485,
+                "p99": 1794.9231599999998,
+                "p999": 2036.5509610000026,
+                "max": 2066.482
+              }
+            },
+            "resource_measurement": "scenario resource_samples cover the finite slow-consumer drain, including the configured processing delay and duplicate polls"
+          },
+          "resource_samples": {
+            "samples": 147,
+            "memory_bytes_avg": 54722671.45578232,
+            "memory_bytes_max": 55615488.0,
+            "storage_bytes_avg": 4374238.333333333,
+            "storage_bytes_max": 6154082.0,
+            "cpu_seconds": 9.04,
+            "elapsed_seconds": 14.776453786,
+            "per_node": {
+              "1": {
+                "samples": 148,
+                "memory_bytes_avg": 18742908.54054054,
+                "memory_bytes_max": 19021824.0,
+                "storage_bytes_avg": 1416784.6283783785,
+                "storage_bytes_max": 1446518.0,
+                "cpu_seconds": 3.5999999999999996
+              },
+              "2": {
+                "samples": 148,
+                "memory_bytes_avg": 17701030.054054055,
+                "memory_bytes_max": 18026496.0,
+                "storage_bytes_avg": 1478804.6283783785,
+                "storage_bytes_max": 2364022.0,
+                "cpu_seconds": 2.73
+              },
+              "3": {
+                "samples": 148,
+                "memory_bytes_avg": 18262624.864864863,
+                "memory_bytes_max": 18567168.0,
+                "storage_bytes_avg": 1477503.1689189188,
+                "storage_bytes_max": 2343542.0,
+                "cpu_seconds": 2.71
+              }
+            }
+          },
+          "server_metrics": {
+            "available": true,
+            "source": "GET /metrics",
+            "delta": {
+              "node_1.runnel_acknowledgements_total": 334.0,
+              "node_1.runnel_active_connections": 0.0,
+              "node_1.runnel_active_requests": 0.0,
+              "node_1.runnel_broker_connection_errors_total": 0.0,
+              "node_1.runnel_broker_connections_accepted_total": 0.0,
+              "node_1.runnel_broker_connections_closed_total": 0.0,
+              "node_1.runnel_broker_connections_rejected_total": 0.0,
+              "node_1.runnel_broker_max_connections": 0.0,
+              "node_1.runnel_broker_max_in_flight_requests": 0.0,
+              "node_1.runnel_broker_max_request_bytes": 0.0,
+              "node_1.runnel_broker_request_bytes_total": 129095.0,
+              "node_1.runnel_broker_request_duration_seconds_bucket{operation=\"ack\",le=\"+Inf\"}": 334.0,
+              "node_1.runnel_broker_request_duration_seconds_bucket{operation=\"ack\",le=\"0.0001\"}": 0.0,
+              "node_1.runnel_broker_request_duration_seconds_bucket{operation=\"ack\",le=\"0.001\"}": 95.0,
+              "node_1.runnel_broker_request_duration_seconds_bucket{operation=\"ack\",le=\"0.01\"}": 334.0,
+              "node_1.runnel_broker_request_duration_seconds_bucket{operation=\"ack\",le=\"0.1\"}": 334.0,
+              "node_1.runnel_broker_request_duration_seconds_bucket{operation=\"ack\",le=\"1\"}": 334.0,
+              "node_1.runnel_broker_request_duration_seconds_bucket{operation=\"ack\",le=\"10\"}": 334.0,
+              "node_1.runnel_broker_request_duration_seconds_bucket{operation=\"ack_group\",le=\"+Inf\"}": 0.0,
+              "node_1.runnel_broker_request_duration_seconds_bucket{operation=\"ack_group\",le=\"0.0001\"}": 0.0,
+              "node_1.runnel_broker_request_duration_seconds_bucket{operation=\"ack_group\",le=\"0.001\"}": 0.0,
+              "node_1.runnel_broker_request_duration_seconds_bucket{operation=\"ack_group\",le=\"0.01\"}": 0.0,
+              "node_1.runnel_broker_request_duration_seconds_bucket{operation=\"ack_group\",le=\"0.1\"}": 0.0,
+              "node_1.runnel_broker_request_duration_seconds_bucket{operation=\"ack_group\",le=\"1\"}": 0.0,
+              "node_1.runnel_broker_request_duration_seconds_bucket{operation=\"ack_group\",le=\"10\"}": 0.0,
+              "node_1.runnel_broker_request_duration_seconds_bucket{operation=\"configure_consumer\",le=\"+Inf\"}": 0.0,
+              "node_1.runnel_broker_request_duration_seconds_bucket{operation=\"configure_consumer\",le=\"0.0001\"}": 0.0,
+              "node_1.runnel_broker_request_duration_seconds_bucket{operation=\"configure_consumer\",le=\"0.001\"}": 0.0,
+              "node_1.runnel_broker_request_duration_seconds_bucket{operation=\"configure_consumer\",le=\"0.01\"}": 0.0,
+              "node_1.runnel_broker_request_duration_seconds_bucket{operation=\"configure_consumer\",le=\"0.1\"}": 0.0,
+              "node_1.runnel_broker_request_duration_seconds_bucket{operation=\"configure_consumer\",le=\"1\"}": 0.0,
+              "node_1.runnel_broker_request_duration_seconds_bucket{operation=\"configure_consumer\",le=\"10\"}": 0.0,
+              "node_1.runnel_broker_request_duration_seconds_bucket{operation=\"create_stream\",le=\"+Inf\"}": 0.0,
+              "node_1.runnel_broker_request_duration_seconds_bucket{operation=\"create_stream\",le=\"0.0001\"}": 0.0,
+              "node_1.runnel_broker_request_duration_seconds_bucket{operation=\"create_stream\",le=\"0.001\"}": 0.0,
+              "node_1.runnel_broker_request_duration_seconds_bucket{operation=\"create_stream\",le=\"0.01\"}": 0.0,
+              "node_1.runnel_broker_request_duration_seconds_bucket{operation=\"create_stream\",le=\"0.1\"}": 0.0,
+              "node_1.runnel_broker_request_duration_seconds_bucket{operation=\"create_stream\",le=\"1\"}": 0.0,
+              "node_1.runnel_broker_request_duration_seconds_bucket{operation=\"create_stream\",le=\"10\"}": 0.0,
+              "node_1.runnel_broker_request_duration_seconds_bucket{operation=\"health\",le=\"+Inf\"}": 0.0,
+              "node_1.runnel_broker_request_duration_seconds_bucket{operation=\"health\",le=\"0.0001\"}": 0.0,
+              "node_1.runnel_broker_request_duration_seconds_bucket{operation=\"health\",le=\"0.001\"}": 0.0,
+              "node_1.runnel_broker_request_duration_seconds_bucket{operation=\"health\",le=\"0.01\"}": 0.0,
+              "node_1.runnel_broker_request_duration_seconds_bucket{operation=\"health\",le=\"0.1\"}": 0.0,
+              "node_1.runnel_broker_request_duration_seconds_bucket{operation=\"health\",le=\"1\"}": 0.0,
+              "node_1.runnel_broker_request_duration_seconds_bucket{operation=\"health\",le=\"10\"}": 0.0,
+              "node_1.runnel_broker_request_duration_seconds_bucket{operation=\"inspect_consumer\",le=\"+Inf\"}": 0.0,
+              "node_1.runnel_broker_request_duration_seconds_bucket{operation=\"inspect_consumer\",le=\"0.0001\"}": 0.0,
+              "node_1.runnel_broker_request_duration_seconds_bucket{operation=\"inspect_consumer\",le=\"0.001\"}": 0.0,
+              "node_1.runnel_broker_request_duration_seconds_bucket{operation=\"inspect_consumer\",le=\"0.01\"}": 0.0,
+              "node_1.runnel_broker_request_duration_seconds_bucket{operation=\"inspect_consumer\",le=\"0.1\"}": 0.0,
+              "node_1.runnel_broker_request_duration_seconds_bucket{operation=\"inspect_consumer\",le=\"1\"}": 0.0,
+              "node_1.runnel_broker_request_duration_seconds_bucket{operation=\"inspect_consumer\",le=\"10\"}": 0.0,
+              "node_1.runnel_broker_request_duration_seconds_bucket{operation=\"invalid_request\",le=\"+Inf\"}": 0.0,
+              "node_1.runnel_broker_request_duration_seconds_bucket{operation=\"invalid_request\",le=\"0.0001\"}": 0.0,
+              "node_1.runnel_broker_request_duration_seconds_bucket{operation=\"invalid_request\",le=\"0.001\"}": 0.0,
+              "node_1.runnel_broker_request_duration_seconds_bucket{operation=\"invalid_request\",le=\"0.01\"}": 0.0,
+              "node_1.runnel_broker_request_duration_seconds_bucket{operation=\"invalid_request\",le=\"0.1\"}": 0.0,
+              "node_1.runnel_broker_request_duration_seconds_bucket{operation=\"invalid_request\",le=\"1\"}": 0.0,
+              "node_1.runnel_broker_request_duration_seconds_bucket{operation=\"invalid_request\",le=\"10\"}": 0.0,
+              "node_1.runnel_broker_request_duration_seconds_bucket{operation=\"poll\",le=\"+Inf\"}": 667.0,
+              "node_1.runnel_broker_request_duration_seconds_bucket{operation=\"poll\",le=\"0.0001\"}": 0.0,
+              "node_1.runnel_broker_request_duration_seconds_bucket{operation=\"poll\",le=\"0.001\"}": 484.0,
+              "node_1.runnel_broker_request_duration_seconds_bucket{operation=\"poll\",le=\"0.01\"}": 667.0,
+              "node_1.runnel_broker_request_duration_seconds_bucket{operation=\"poll\",le=\"0.1\"}": 667.0,
+              "node_1.runnel_broker_request_duration_seconds_bucket{operation=\"poll\",le=\"1\"}": 667.0,
+              "node_1.runnel_broker_request_duration_seconds_bucket{operation=\"poll\",le=\"10\"}": 667.0,
+              "node_1.runnel_broker_request_duration_seconds_bucket{operation=\"poll_group\",le=\"+Inf\"}": 0.0,
+              "node_1.runnel_broker_request_duration_seconds_bucket{operation=\"poll_group\",le=\"0.0001\"}": 0.0,
+              "node_1.runnel_broker_request_duration_seconds_bucket{operation=\"poll_group\",le=\"0.001\"}": 0.0,
+              "node_1.runnel_broker_request_duration_seconds_bucket{operation=\"poll_group\",le=\"0.01\"}": 0.0,
+              "node_1.runnel_broker_request_duration_seconds_bucket{operation=\"poll_group\",le=\"0.1\"}": 0.0,
+              "node_1.runnel_broker_request_duration_seconds_bucket{operation=\"poll_group\",le=\"1\"}": 0.0,
+              "node_1.runnel_broker_request_duration_seconds_bucket{operation=\"poll_group\",le=\"10\"}": 0.0,
+              "node_1.runnel_broker_request_duration_seconds_bucket{operation=\"publish\",le=\"+Inf\"}": 0.0,
+              "node_1.runnel_broker_request_duration_seconds_bucket{operation=\"publish\",le=\"0.0001\"}": 0.0,
+              "node_1.runnel_broker_request_duration_seconds_bucket{operation=\"publish\",le=\"0.001\"}": 0.0,
+              "node_1.runnel_broker_request_duration_seconds_bucket{operation=\"publish\",le=\"0.01\"}": 0.0,
+              "node_1.runnel_broker_request_duration_seconds_bucket{operation=\"publish\",le=\"0.1\"}": 0.0,
+              "node_1.runnel_broker_request_duration_seconds_bucket{operation=\"publish\",le=\"1\"}": 0.0,
+              "node_1.runnel_broker_request_duration_seconds_bucket{operation=\"publish\",le=\"10\"}": 0.0,
+              "node_1.runnel_broker_request_duration_seconds_bucket{operation=\"replay\",le=\"+Inf\"}": 0.0,
+              "node_1.runnel_broker_request_duration_seconds_bucket{operation=\"replay\",le=\"0.0001\"}": 0.0,
+              "node_1.runnel_broker_request_duration_seconds_bucket{operation=\"replay\",le=\"0.001\"}": 0.0,
+              "node_1.runnel_broker_request_duration_seconds_bucket{operation=\"replay\",le=\"0.01\"}": 0.0,
+              "node_1.runnel_broker_request_duration_seconds_bucket{operation=\"replay\",le=\"0.1\"}": 0.0,
+              "node_1.runnel_broker_request_duration_seconds_bucket{operation=\"replay\",le=\"1\"}": 0.0,
+              "node_1.runnel_broker_request_duration_seconds_bucket{operation=\"replay\",le=\"10\"}": 0.0,
+              "node_1.runnel_broker_request_duration_seconds_count{operation=\"ack\"}": 334.0,
+              "node_1.runnel_broker_request_duration_seconds_count{operation=\"ack_group\"}": 0.0,
+              "node_1.runnel_broker_request_duration_seconds_count{operation=\"configure_consumer\"}": 0.0,
+              "node_1.runnel_broker_request_duration_seconds_count{operation=\"create_stream\"}": 0.0,
+              "node_1.runnel_broker_request_duration_seconds_count{operation=\"health\"}": 0.0,
+              "node_1.runnel_broker_request_duration_seconds_count{operation=\"inspect_consumer\"}": 0.0,
+              "node_1.runnel_broker_request_duration_seconds_count{operation=\"invalid_request\"}": 0.0,
+              "node_1.runnel_broker_request_duration_seconds_count{operation=\"poll\"}": 667.0,
+              "node_1.runnel_broker_request_duration_seconds_count{operation=\"poll_group\"}": 0.0,
+              "node_1.runnel_broker_request_duration_seconds_count{operation=\"publish\"}": 0.0,
+              "node_1.runnel_broker_request_duration_seconds_count{operation=\"replay\"}": 0.0,
+              "node_1.runnel_broker_request_duration_seconds_sum{operation=\"ack\"}": 0.364351,
+              "node_1.runnel_broker_request_duration_seconds_sum{operation=\"ack_group\"}": 0.0,
+              "node_1.runnel_broker_request_duration_seconds_sum{operation=\"configure_consumer\"}": 0.0,
+              "node_1.runnel_broker_request_duration_seconds_sum{operation=\"create_stream\"}": 0.0,
+              "node_1.runnel_broker_request_duration_seconds_sum{operation=\"health\"}": 0.0,
+              "node_1.runnel_broker_request_duration_seconds_sum{operation=\"inspect_consumer\"}": 0.0,
+              "node_1.runnel_broker_request_duration_seconds_sum{operation=\"invalid_request\"}": 0.0,
+              "node_1.runnel_broker_request_duration_seconds_sum{operation=\"poll\"}": 0.575634,
+              "node_1.runnel_broker_request_duration_seconds_sum{operation=\"poll_group\"}": 0.0,
+              "node_1.runnel_broker_request_duration_seconds_sum{operation=\"publish\"}": 0.0,
+              "node_1.runnel_broker_request_duration_seconds_sum{operation=\"replay\"}": 0.0,
+              "node_1.runnel_broker_request_failures_total{operation=\"ack\"}": 0.0,
+              "node_1.runnel_broker_request_failures_total{operation=\"ack_group\"}": 0.0,
+              "node_1.runnel_broker_request_failures_total{operation=\"configure_consumer\"}": 0.0,
+              "node_1.runnel_broker_request_failures_total{operation=\"create_stream\"}": 0.0,
+              "node_1.runnel_broker_request_failures_total{operation=\"health\"}": 0.0,
+              "node_1.runnel_broker_request_failures_total{operation=\"inspect_consumer\"}": 0.0,
+              "node_1.runnel_broker_request_failures_total{operation=\"invalid_request\"}": 0.0,
+              "node_1.runnel_broker_request_failures_total{operation=\"poll\"}": 0.0,
+              "node_1.runnel_broker_request_failures_total{operation=\"poll_group\"}": 0.0,
+              "node_1.runnel_broker_request_failures_total{operation=\"publish\"}": 0.0,
+              "node_1.runnel_broker_request_failures_total{operation=\"replay\"}": 0.0,
+              "node_1.runnel_broker_request_saturation_total": 0.0,
+              "node_1.runnel_broker_request_size_rejections_total": 0.0,
+              "node_1.runnel_broker_request_timeout_seconds": 0.0,
+              "node_1.runnel_broker_request_timeouts_total": 0.0,
+              "node_1.runnel_broker_requests_rejected_total": 0.0,
+              "node_1.runnel_broker_requests_total{operation=\"ack\"}": 334.0,
+              "node_1.runnel_broker_requests_total{operation=\"ack_group\"}": 0.0,
+              "node_1.runnel_broker_requests_total{operation=\"configure_consumer\"}": 0.0,
+              "node_1.runnel_broker_requests_total{operation=\"create_stream\"}": 0.0,
+              "node_1.runnel_broker_requests_total{operation=\"health\"}": 0.0,
+              "node_1.runnel_broker_requests_total{operation=\"inspect_consumer\"}": 0.0,
+              "node_1.runnel_broker_requests_total{operation=\"invalid_request\"}": 0.0,
+              "node_1.runnel_broker_requests_total{operation=\"poll\"}": 667.0,
+              "node_1.runnel_broker_requests_total{operation=\"poll_group\"}": 0.0,
+              "node_1.runnel_broker_requests_total{operation=\"publish\"}": 0.0,
+              "node_1.runnel_broker_requests_total{operation=\"replay\"}": 0.0,
+              "node_1.runnel_broker_response_bytes_total": 272446.0,
+              "node_1.runnel_broker_response_write_timeouts_total": 0.0,
+              "node_1.runnel_dead_letters_total": 0.0,
+              "node_1.runnel_delivered_bytes_total": 66700.0,
+              "node_1.runnel_deliveries_total": 667.0,
+              "node_1.runnel_engine_health_available": 0.0,
+              "node_1.runnel_health_check_failures_total": 0.0,
+              "node_1.runnel_in_flight_deliveries": 0.0,
+              "node_1.runnel_metrics_scrape_failures_total": 0.0,
+              "node_1.runnel_metrics_scrapes_total": 1.0,
+              "node_1.runnel_process_uptime_seconds": 14.781218,
+              "node_1.runnel_published_bytes_total": 0.0,
+              "node_1.runnel_publishes_total": 0.0,
+              "node_1.runnel_redeliveries_total": 0.0,
+              "node_1.runnel_snapshot_build_failures_total": 0.0,
+              "node_1.runnel_snapshot_builds_completed_total": 94.0,
+              "node_1.runnel_snapshot_builds_started_total": 94.0,
+              "node_1.runnel_snapshot_install_bytes_total": 0.0,
+              "node_1.runnel_snapshot_install_failures_total": 0.0,
+              "node_1.runnel_snapshot_installs_completed_total": 0.0,
+              "node_1.runnel_snapshot_installs_in_progress": 0.0,
+              "node_1.runnel_snapshot_installs_started_total": 0.0,
+              "node_1.runnel_snapshot_transfer_bytes_received_total": 0.0,
+              "node_1.runnel_snapshot_transfer_chunks_received_total": 0.0,
+              "node_1.runnel_snapshot_transfer_final_chunks_received_total": 0.0,
+              "node_1.runnel_storage_bytes": 0.0,
+              "node_1.runnel_stream_creations_total": 0.0,
+              "node_1.runnel_streams": 0.0,
+              "node_2.runnel_acknowledgements_total": 333.0,
+              "node_2.runnel_active_connections": 0.0,
+              "node_2.runnel_active_requests": 0.0,
+              "node_2.runnel_broker_connection_errors_total": 0.0,
+              "node_2.runnel_broker_connections_accepted_total": 0.0,
+              "node_2.runnel_broker_connections_closed_total": 0.0,
+              "node_2.runnel_broker_connections_rejected_total": 0.0,
+              "node_2.runnel_broker_max_connections": 0.0,
+              "node_2.runnel_broker_max_in_flight_requests": 0.0,
+              "node_2.runnel_broker_max_request_bytes": 0.0,
+              "node_2.runnel_broker_request_bytes_total": 128960.0,
+              "node_2.runnel_broker_request_duration_seconds_bucket{operation=\"ack\",le=\"+Inf\"}": 333.0,
+              "node_2.runnel_broker_request_duration_seconds_bucket{operation=\"ack\",le=\"0.0001\"}": 0.0,
+              "node_2.runnel_broker_request_duration_seconds_bucket{operation=\"ack\",le=\"0.001\"}": 30.0,
+              "node_2.runnel_broker_request_duration_seconds_bucket{operation=\"ack\",le=\"0.01\"}": 333.0,
+              "node_2.runnel_broker_request_duration_seconds_bucket{operation=\"ack\",le=\"0.1\"}": 333.0,
+              "node_2.runnel_broker_request_duration_seconds_bucket{operation=\"ack\",le=\"1\"}": 333.0,
+              "node_2.runnel_broker_request_duration_seconds_bucket{operation=\"ack\",le=\"10\"}": 333.0,
+              "node_2.runnel_broker_request_duration_seconds_bucket{operation=\"ack_group\",le=\"+Inf\"}": 0.0,
+              "node_2.runnel_broker_request_duration_seconds_bucket{operation=\"ack_group\",le=\"0.0001\"}": 0.0,
+              "node_2.runnel_broker_request_duration_seconds_bucket{operation=\"ack_group\",le=\"0.001\"}": 0.0,
+              "node_2.runnel_broker_request_duration_seconds_bucket{operation=\"ack_group\",le=\"0.01\"}": 0.0,
+              "node_2.runnel_broker_request_duration_seconds_bucket{operation=\"ack_group\",le=\"0.1\"}": 0.0,
+              "node_2.runnel_broker_request_duration_seconds_bucket{operation=\"ack_group\",le=\"1\"}": 0.0,
+              "node_2.runnel_broker_request_duration_seconds_bucket{operation=\"ack_group\",le=\"10\"}": 0.0,
+              "node_2.runnel_broker_request_duration_seconds_bucket{operation=\"configure_consumer\",le=\"+Inf\"}": 0.0,
+              "node_2.runnel_broker_request_duration_seconds_bucket{operation=\"configure_consumer\",le=\"0.0001\"}": 0.0,
+              "node_2.runnel_broker_request_duration_seconds_bucket{operation=\"configure_consumer\",le=\"0.001\"}": 0.0,
+              "node_2.runnel_broker_request_duration_seconds_bucket{operation=\"configure_consumer\",le=\"0.01\"}": 0.0,
+              "node_2.runnel_broker_request_duration_seconds_bucket{operation=\"configure_consumer\",le=\"0.1\"}": 0.0,
+              "node_2.runnel_broker_request_duration_seconds_bucket{operation=\"configure_consumer\",le=\"1\"}": 0.0,
+              "node_2.runnel_broker_request_duration_seconds_bucket{operation=\"configure_consumer\",le=\"10\"}": 0.0,
+              "node_2.runnel_broker_request_duration_seconds_bucket{operation=\"create_stream\",le=\"+Inf\"}": 0.0,
+              "node_2.runnel_broker_request_duration_seconds_bucket{operation=\"create_stream\",le=\"0.0001\"}": 0.0,
+              "node_2.runnel_broker_request_duration_seconds_bucket{operation=\"create_stream\",le=\"0.001\"}": 0.0,
+              "node_2.runnel_broker_request_duration_seconds_bucket{operation=\"create_stream\",le=\"0.01\"}": 0.0,
+              "node_2.runnel_broker_request_duration_seconds_bucket{operation=\"create_stream\",le=\"0.1\"}": 0.0,
+              "node_2.runnel_broker_request_duration_seconds_bucket{operation=\"create_stream\",le=\"1\"}": 0.0,
+              "node_2.runnel_broker_request_duration_seconds_bucket{operation=\"create_stream\",le=\"10\"}": 0.0,
+              "node_2.runnel_broker_request_duration_seconds_bucket{operation=\"health\",le=\"+Inf\"}": 0.0,
+              "node_2.runnel_broker_request_duration_seconds_bucket{operation=\"health\",le=\"0.0001\"}": 0.0,
+              "node_2.runnel_broker_request_duration_seconds_bucket{operation=\"health\",le=\"0.001\"}": 0.0,
+              "node_2.runnel_broker_request_duration_seconds_bucket{operation=\"health\",le=\"0.01\"}": 0.0,
+              "node_2.runnel_broker_request_duration_seconds_bucket{operation=\"health\",le=\"0.1\"}": 0.0,
+              "node_2.runnel_broker_request_duration_seconds_bucket{operation=\"health\",le=\"1\"}": 0.0,
+              "node_2.runnel_broker_request_duration_seconds_bucket{operation=\"health\",le=\"10\"}": 0.0,
+              "node_2.runnel_broker_request_duration_seconds_bucket{operation=\"inspect_consumer\",le=\"+Inf\"}": 0.0,
+              "node_2.runnel_broker_request_duration_seconds_bucket{operation=\"inspect_consumer\",le=\"0.0001\"}": 0.0,
+              "node_2.runnel_broker_request_duration_seconds_bucket{operation=\"inspect_consumer\",le=\"0.001\"}": 0.0,
+              "node_2.runnel_broker_request_duration_seconds_bucket{operation=\"inspect_consumer\",le=\"0.01\"}": 0.0,
+              "node_2.runnel_broker_request_duration_seconds_bucket{operation=\"inspect_consumer\",le=\"0.1\"}": 0.0,
+              "node_2.runnel_broker_request_duration_seconds_bucket{operation=\"inspect_consumer\",le=\"1\"}": 0.0,
+              "node_2.runnel_broker_request_duration_seconds_bucket{operation=\"inspect_consumer\",le=\"10\"}": 0.0,
+              "node_2.runnel_broker_request_duration_seconds_bucket{operation=\"invalid_request\",le=\"+Inf\"}": 0.0,
+              "node_2.runnel_broker_request_duration_seconds_bucket{operation=\"invalid_request\",le=\"0.0001\"}": 0.0,
+              "node_2.runnel_broker_request_duration_seconds_bucket{operation=\"invalid_request\",le=\"0.001\"}": 0.0,
+              "node_2.runnel_broker_request_duration_seconds_bucket{operation=\"invalid_request\",le=\"0.01\"}": 0.0,
+              "node_2.runnel_broker_request_duration_seconds_bucket{operation=\"invalid_request\",le=\"0.1\"}": 0.0,
+              "node_2.runnel_broker_request_duration_seconds_bucket{operation=\"invalid_request\",le=\"1\"}": 0.0,
+              "node_2.runnel_broker_request_duration_seconds_bucket{operation=\"invalid_request\",le=\"10\"}": 0.0,
+              "node_2.runnel_broker_request_duration_seconds_bucket{operation=\"poll\",le=\"+Inf\"}": 667.0,
+              "node_2.runnel_broker_request_duration_seconds_bucket{operation=\"poll\",le=\"0.0001\"}": 0.0,
+              "node_2.runnel_broker_request_duration_seconds_bucket{operation=\"poll\",le=\"0.001\"}": 179.0,
+              "node_2.runnel_broker_request_duration_seconds_bucket{operation=\"poll\",le=\"0.01\"}": 667.0,
+              "node_2.runnel_broker_request_duration_seconds_bucket{operation=\"poll\",le=\"0.1\"}": 667.0,
+              "node_2.runnel_broker_request_duration_seconds_bucket{operation=\"poll\",le=\"1\"}": 667.0,
+              "node_2.runnel_broker_request_duration_seconds_bucket{operation=\"poll\",le=\"10\"}": 667.0,
+              "node_2.runnel_broker_request_duration_seconds_bucket{operation=\"poll_group\",le=\"+Inf\"}": 0.0,
+              "node_2.runnel_broker_request_duration_seconds_bucket{operation=\"poll_group\",le=\"0.0001\"}": 0.0,
+              "node_2.runnel_broker_request_duration_seconds_bucket{operation=\"poll_group\",le=\"0.001\"}": 0.0,
+              "node_2.runnel_broker_request_duration_seconds_bucket{operation=\"poll_group\",le=\"0.01\"}": 0.0,
+              "node_2.runnel_broker_request_duration_seconds_bucket{operation=\"poll_group\",le=\"0.1\"}": 0.0,
+              "node_2.runnel_broker_request_duration_seconds_bucket{operation=\"poll_group\",le=\"1\"}": 0.0,
+              "node_2.runnel_broker_request_duration_seconds_bucket{operation=\"poll_group\",le=\"10\"}": 0.0,
+              "node_2.runnel_broker_request_duration_seconds_bucket{operation=\"publish\",le=\"+Inf\"}": 0.0,
+              "node_2.runnel_broker_request_duration_seconds_bucket{operation=\"publish\",le=\"0.0001\"}": 0.0,
+              "node_2.runnel_broker_request_duration_seconds_bucket{operation=\"publish\",le=\"0.001\"}": 0.0,
+              "node_2.runnel_broker_request_duration_seconds_bucket{operation=\"publish\",le=\"0.01\"}": 0.0,
+              "node_2.runnel_broker_request_duration_seconds_bucket{operation=\"publish\",le=\"0.1\"}": 0.0,
+              "node_2.runnel_broker_request_duration_seconds_bucket{operation=\"publish\",le=\"1\"}": 0.0,
+              "node_2.runnel_broker_request_duration_seconds_bucket{operation=\"publish\",le=\"10\"}": 0.0,
+              "node_2.runnel_broker_request_duration_seconds_bucket{operation=\"replay\",le=\"+Inf\"}": 0.0,
+              "node_2.runnel_broker_request_duration_seconds_bucket{operation=\"replay\",le=\"0.0001\"}": 0.0,
+              "node_2.runnel_broker_request_duration_seconds_bucket{operation=\"replay\",le=\"0.001\"}": 0.0,
+              "node_2.runnel_broker_request_duration_seconds_bucket{operation=\"replay\",le=\"0.01\"}": 0.0,
+              "node_2.runnel_broker_request_duration_seconds_bucket{operation=\"replay\",le=\"0.1\"}": 0.0,
+              "node_2.runnel_broker_request_duration_seconds_bucket{operation=\"replay\",le=\"1\"}": 0.0,
+              "node_2.runnel_broker_request_duration_seconds_bucket{operation=\"replay\",le=\"10\"}": 0.0,
+              "node_2.runnel_broker_request_duration_seconds_count{operation=\"ack\"}": 333.0,
+              "node_2.runnel_broker_request_duration_seconds_count{operation=\"ack_group\"}": 0.0,
+              "node_2.runnel_broker_request_duration_seconds_count{operation=\"configure_consumer\"}": 0.0,
+              "node_2.runnel_broker_request_duration_seconds_count{operation=\"create_stream\"}": 0.0,
+              "node_2.runnel_broker_request_duration_seconds_count{operation=\"health\"}": 0.0,
+              "node_2.runnel_broker_request_duration_seconds_count{operation=\"inspect_consumer\"}": 0.0,
+              "node_2.runnel_broker_request_duration_seconds_count{operation=\"invalid_request\"}": 0.0,
+              "node_2.runnel_broker_request_duration_seconds_count{operation=\"poll\"}": 667.0,
+              "node_2.runnel_broker_request_duration_seconds_count{operation=\"poll_group\"}": 0.0,
+              "node_2.runnel_broker_request_duration_seconds_count{operation=\"publish\"}": 0.0,
+              "node_2.runnel_broker_request_duration_seconds_count{operation=\"replay\"}": 0.0,
+              "node_2.runnel_broker_request_duration_seconds_sum{operation=\"ack\"}": 0.501938,
+              "node_2.runnel_broker_request_duration_seconds_sum{operation=\"ack_group\"}": 0.0,
+              "node_2.runnel_broker_request_duration_seconds_sum{operation=\"configure_consumer\"}": 0.0,
+              "node_2.runnel_broker_request_duration_seconds_sum{operation=\"create_stream\"}": 0.0,
+              "node_2.runnel_broker_request_duration_seconds_sum{operation=\"health\"}": 0.0,
+              "node_2.runnel_broker_request_duration_seconds_sum{operation=\"inspect_consumer\"}": 0.0,
+              "node_2.runnel_broker_request_duration_seconds_sum{operation=\"invalid_request\"}": 0.0,
+              "node_2.runnel_broker_request_duration_seconds_sum{operation=\"poll\"}": 0.759577,
+              "node_2.runnel_broker_request_duration_seconds_sum{operation=\"poll_group\"}": 0.0,
+              "node_2.runnel_broker_request_duration_seconds_sum{operation=\"publish\"}": 0.0,
+              "node_2.runnel_broker_request_duration_seconds_sum{operation=\"replay\"}": 0.0,
+              "node_2.runnel_broker_request_failures_total{operation=\"ack\"}": 0.0,
+              "node_2.runnel_broker_request_failures_total{operation=\"ack_group\"}": 0.0,
+              "node_2.runnel_broker_request_failures_total{operation=\"configure_consumer\"}": 0.0,
+              "node_2.runnel_broker_request_failures_total{operation=\"create_stream\"}": 0.0,
+              "node_2.runnel_broker_request_failures_total{operation=\"health\"}": 0.0,
+              "node_2.runnel_broker_request_failures_total{operation=\"inspect_consumer\"}": 0.0,
+              "node_2.runnel_broker_request_failures_total{operation=\"invalid_request\"}": 0.0,
+              "node_2.runnel_broker_request_failures_total{operation=\"poll\"}": 0.0,
+              "node_2.runnel_broker_request_failures_total{operation=\"poll_group\"}": 0.0,
+              "node_2.runnel_broker_request_failures_total{operation=\"publish\"}": 0.0,
+              "node_2.runnel_broker_request_failures_total{operation=\"replay\"}": 0.0,
+              "node_2.runnel_broker_request_saturation_total": 0.0,
+              "node_2.runnel_broker_request_size_rejections_total": 0.0,
+              "node_2.runnel_broker_request_timeout_seconds": 0.0,
+              "node_2.runnel_broker_request_timeouts_total": 0.0,
+              "node_2.runnel_broker_requests_rejected_total": 0.0,
+              "node_2.runnel_broker_requests_total{operation=\"ack\"}": 333.0,
+              "node_2.runnel_broker_requests_total{operation=\"ack_group\"}": 0.0,
+              "node_2.runnel_broker_requests_total{operation=\"configure_consumer\"}": 0.0,
+              "node_2.runnel_broker_requests_total{operation=\"create_stream\"}": 0.0,
+              "node_2.runnel_broker_requests_total{operation=\"health\"}": 0.0,
+              "node_2.runnel_broker_requests_total{operation=\"inspect_consumer\"}": 0.0,
+              "node_2.runnel_broker_requests_total{operation=\"invalid_request\"}": 0.0,
+              "node_2.runnel_broker_requests_total{operation=\"poll\"}": 667.0,
+              "node_2.runnel_broker_requests_total{operation=\"poll_group\"}": 0.0,
+              "node_2.runnel_broker_requests_total{operation=\"publish\"}": 0.0,
+              "node_2.runnel_broker_requests_total{operation=\"replay\"}": 0.0,
+              "node_2.runnel_broker_response_bytes_total": 272271.0,
+              "node_2.runnel_broker_response_write_timeouts_total": 0.0,
+              "node_2.runnel_dead_letters_total": 0.0,
+              "node_2.runnel_delivered_bytes_total": 66700.0,
+              "node_2.runnel_deliveries_total": 667.0,
+              "node_2.runnel_engine_health_available": 0.0,
+              "node_2.runnel_health_check_failures_total": 0.0,
+              "node_2.runnel_in_flight_deliveries": 0.0,
+              "node_2.runnel_metrics_scrape_failures_total": 0.0,
+              "node_2.runnel_metrics_scrapes_total": 1.0,
+              "node_2.runnel_process_uptime_seconds": 14.781872,
+              "node_2.runnel_published_bytes_total": 0.0,
+              "node_2.runnel_publishes_total": 0.0,
+              "node_2.runnel_redeliveries_total": 0.0,
+              "node_2.runnel_snapshot_build_failures_total": 0.0,
+              "node_2.runnel_snapshot_builds_completed_total": 95.0,
+              "node_2.runnel_snapshot_builds_started_total": 94.0,
+              "node_2.runnel_snapshot_install_bytes_total": 0.0,
+              "node_2.runnel_snapshot_install_failures_total": 0.0,
+              "node_2.runnel_snapshot_installs_completed_total": 0.0,
+              "node_2.runnel_snapshot_installs_in_progress": 0.0,
+              "node_2.runnel_snapshot_installs_started_total": 0.0,
+              "node_2.runnel_snapshot_transfer_bytes_received_total": 0.0,
+              "node_2.runnel_snapshot_transfer_chunks_received_total": 0.0,
+              "node_2.runnel_snapshot_transfer_final_chunks_received_total": 0.0,
+              "node_2.runnel_storage_bytes": 0.0,
+              "node_2.runnel_stream_creations_total": 0.0,
+              "node_2.runnel_streams": 0.0,
+              "node_3.runnel_acknowledgements_total": 333.0,
+              "node_3.runnel_active_connections": 0.0,
+              "node_3.runnel_active_requests": 0.0,
+              "node_3.runnel_broker_connection_errors_total": 0.0,
+              "node_3.runnel_broker_connections_accepted_total": 0.0,
+              "node_3.runnel_broker_connections_closed_total": 0.0,
+              "node_3.runnel_broker_connections_rejected_total": 0.0,
+              "node_3.runnel_broker_max_connections": 0.0,
+              "node_3.runnel_broker_max_in_flight_requests": 0.0,
+              "node_3.runnel_broker_max_request_bytes": 0.0,
+              "node_3.runnel_broker_request_bytes_total": 128835.0,
+              "node_3.runnel_broker_request_duration_seconds_bucket{operation=\"ack\",le=\"+Inf\"}": 333.0,
+              "node_3.runnel_broker_request_duration_seconds_bucket{operation=\"ack\",le=\"0.0001\"}": 0.0,
+              "node_3.runnel_broker_request_duration_seconds_bucket{operation=\"ack\",le=\"0.001\"}": 29.0,
+              "node_3.runnel_broker_request_duration_seconds_bucket{operation=\"ack\",le=\"0.01\"}": 333.0,
+              "node_3.runnel_broker_request_duration_seconds_bucket{operation=\"ack\",le=\"0.1\"}": 333.0,
+              "node_3.runnel_broker_request_duration_seconds_bucket{operation=\"ack\",le=\"1\"}": 333.0,
+              "node_3.runnel_broker_request_duration_seconds_bucket{operation=\"ack\",le=\"10\"}": 333.0,
+              "node_3.runnel_broker_request_duration_seconds_bucket{operation=\"ack_group\",le=\"+Inf\"}": 0.0,
+              "node_3.runnel_broker_request_duration_seconds_bucket{operation=\"ack_group\",le=\"0.0001\"}": 0.0,
+              "node_3.runnel_broker_request_duration_seconds_bucket{operation=\"ack_group\",le=\"0.001\"}": 0.0,
+              "node_3.runnel_broker_request_duration_seconds_bucket{operation=\"ack_group\",le=\"0.01\"}": 0.0,
+              "node_3.runnel_broker_request_duration_seconds_bucket{operation=\"ack_group\",le=\"0.1\"}": 0.0,
+              "node_3.runnel_broker_request_duration_seconds_bucket{operation=\"ack_group\",le=\"1\"}": 0.0,
+              "node_3.runnel_broker_request_duration_seconds_bucket{operation=\"ack_group\",le=\"10\"}": 0.0,
+              "node_3.runnel_broker_request_duration_seconds_bucket{operation=\"configure_consumer\",le=\"+Inf\"}": 0.0,
+              "node_3.runnel_broker_request_duration_seconds_bucket{operation=\"configure_consumer\",le=\"0.0001\"}": 0.0,
+              "node_3.runnel_broker_request_duration_seconds_bucket{operation=\"configure_consumer\",le=\"0.001\"}": 0.0,
+              "node_3.runnel_broker_request_duration_seconds_bucket{operation=\"configure_consumer\",le=\"0.01\"}": 0.0,
+              "node_3.runnel_broker_request_duration_seconds_bucket{operation=\"configure_consumer\",le=\"0.1\"}": 0.0,
+              "node_3.runnel_broker_request_duration_seconds_bucket{operation=\"configure_consumer\",le=\"1\"}": 0.0,
+              "node_3.runnel_broker_request_duration_seconds_bucket{operation=\"configure_consumer\",le=\"10\"}": 0.0,
+              "node_3.runnel_broker_request_duration_seconds_bucket{operation=\"create_stream\",le=\"+Inf\"}": 0.0,
+              "node_3.runnel_broker_request_duration_seconds_bucket{operation=\"create_stream\",le=\"0.0001\"}": 0.0,
+              "node_3.runnel_broker_request_duration_seconds_bucket{operation=\"create_stream\",le=\"0.001\"}": 0.0,
+              "node_3.runnel_broker_request_duration_seconds_bucket{operation=\"create_stream\",le=\"0.01\"}": 0.0,
+              "node_3.runnel_broker_request_duration_seconds_bucket{operation=\"create_stream\",le=\"0.1\"}": 0.0,
+              "node_3.runnel_broker_request_duration_seconds_bucket{operation=\"create_stream\",le=\"1\"}": 0.0,
+              "node_3.runnel_broker_request_duration_seconds_bucket{operation=\"create_stream\",le=\"10\"}": 0.0,
+              "node_3.runnel_broker_request_duration_seconds_bucket{operation=\"health\",le=\"+Inf\"}": 0.0,
+              "node_3.runnel_broker_request_duration_seconds_bucket{operation=\"health\",le=\"0.0001\"}": 0.0,
+              "node_3.runnel_broker_request_duration_seconds_bucket{operation=\"health\",le=\"0.001\"}": 0.0,
+              "node_3.runnel_broker_request_duration_seconds_bucket{operation=\"health\",le=\"0.01\"}": 0.0,
+              "node_3.runnel_broker_request_duration_seconds_bucket{operation=\"health\",le=\"0.1\"}": 0.0,
+              "node_3.runnel_broker_request_duration_seconds_bucket{operation=\"health\",le=\"1\"}": 0.0,
+              "node_3.runnel_broker_request_duration_seconds_bucket{operation=\"health\",le=\"10\"}": 0.0,
+              "node_3.runnel_broker_request_duration_seconds_bucket{operation=\"inspect_consumer\",le=\"+Inf\"}": 0.0,
+              "node_3.runnel_broker_request_duration_seconds_bucket{operation=\"inspect_consumer\",le=\"0.0001\"}": 0.0,
+              "node_3.runnel_broker_request_duration_seconds_bucket{operation=\"inspect_consumer\",le=\"0.001\"}": 0.0,
+              "node_3.runnel_broker_request_duration_seconds_bucket{operation=\"inspect_consumer\",le=\"0.01\"}": 0.0,
+              "node_3.runnel_broker_request_duration_seconds_bucket{operation=\"inspect_consumer\",le=\"0.1\"}": 0.0,
+              "node_3.runnel_broker_request_duration_seconds_bucket{operation=\"inspect_consumer\",le=\"1\"}": 0.0,
+              "node_3.runnel_broker_request_duration_seconds_bucket{operation=\"inspect_consumer\",le=\"10\"}": 0.0,
+              "node_3.runnel_broker_request_duration_seconds_bucket{operation=\"invalid_request\",le=\"+Inf\"}": 0.0,
+              "node_3.runnel_broker_request_duration_seconds_bucket{operation=\"invalid_request\",le=\"0.0001\"}": 0.0,
+              "node_3.runnel_broker_request_duration_seconds_bucket{operation=\"invalid_request\",le=\"0.001\"}": 0.0,
+              "node_3.runnel_broker_request_duration_seconds_bucket{operation=\"invalid_request\",le=\"0.01\"}": 0.0,
+              "node_3.runnel_broker_request_duration_seconds_bucket{operation=\"invalid_request\",le=\"0.1\"}": 0.0,
+              "node_3.runnel_broker_request_duration_seconds_bucket{operation=\"invalid_request\",le=\"1\"}": 0.0,
+              "node_3.runnel_broker_request_duration_seconds_bucket{operation=\"invalid_request\",le=\"10\"}": 0.0,
+              "node_3.runnel_broker_request_duration_seconds_bucket{operation=\"poll\",le=\"+Inf\"}": 666.0,
+              "node_3.runnel_broker_request_duration_seconds_bucket{operation=\"poll\",le=\"0.0001\"}": 0.0,
+              "node_3.runnel_broker_request_duration_seconds_bucket{operation=\"poll\",le=\"0.001\"}": 165.0,
+              "node_3.runnel_broker_request_duration_seconds_bucket{operation=\"poll\",le=\"0.01\"}": 666.0,
+              "node_3.runnel_broker_request_duration_seconds_bucket{operation=\"poll\",le=\"0.1\"}": 666.0,
+              "node_3.runnel_broker_request_duration_seconds_bucket{operation=\"poll\",le=\"1\"}": 666.0,
+              "node_3.runnel_broker_request_duration_seconds_bucket{operation=\"poll\",le=\"10\"}": 666.0,
+              "node_3.runnel_broker_request_duration_seconds_bucket{operation=\"poll_group\",le=\"+Inf\"}": 0.0,
+              "node_3.runnel_broker_request_duration_seconds_bucket{operation=\"poll_group\",le=\"0.0001\"}": 0.0,
+              "node_3.runnel_broker_request_duration_seconds_bucket{operation=\"poll_group\",le=\"0.001\"}": 0.0,
+              "node_3.runnel_broker_request_duration_seconds_bucket{operation=\"poll_group\",le=\"0.01\"}": 0.0,
+              "node_3.runnel_broker_request_duration_seconds_bucket{operation=\"poll_group\",le=\"0.1\"}": 0.0,
+              "node_3.runnel_broker_request_duration_seconds_bucket{operation=\"poll_group\",le=\"1\"}": 0.0,
+              "node_3.runnel_broker_request_duration_seconds_bucket{operation=\"poll_group\",le=\"10\"}": 0.0,
+              "node_3.runnel_broker_request_duration_seconds_bucket{operation=\"publish\",le=\"+Inf\"}": 0.0,
+              "node_3.runnel_broker_request_duration_seconds_bucket{operation=\"publish\",le=\"0.0001\"}": 0.0,
+              "node_3.runnel_broker_request_duration_seconds_bucket{operation=\"publish\",le=\"0.001\"}": 0.0,
+              "node_3.runnel_broker_request_duration_seconds_bucket{operation=\"publish\",le=\"0.01\"}": 0.0,
+              "node_3.runnel_broker_request_duration_seconds_bucket{operation=\"publish\",le=\"0.1\"}": 0.0,
+              "node_3.runnel_broker_request_duration_seconds_bucket{operation=\"publish\",le=\"1\"}": 0.0,
+              "node_3.runnel_broker_request_duration_seconds_bucket{operation=\"publish\",le=\"10\"}": 0.0,
+              "node_3.runnel_broker_request_duration_seconds_bucket{operation=\"replay\",le=\"+Inf\"}": 0.0,
+              "node_3.runnel_broker_request_duration_seconds_bucket{operation=\"replay\",le=\"0.0001\"}": 0.0,
+              "node_3.runnel_broker_request_duration_seconds_bucket{operation=\"replay\",le=\"0.001\"}": 0.0,
+              "node_3.runnel_broker_request_duration_seconds_bucket{operation=\"replay\",le=\"0.01\"}": 0.0,
+              "node_3.runnel_broker_request_duration_seconds_bucket{operation=\"replay\",le=\"0.1\"}": 0.0,
+              "node_3.runnel_broker_request_duration_seconds_bucket{operation=\"replay\",le=\"1\"}": 0.0,
+              "node_3.runnel_broker_request_duration_seconds_bucket{operation=\"replay\",le=\"10\"}": 0.0,
+              "node_3.runnel_broker_request_duration_seconds_count{operation=\"ack\"}": 333.0,
+              "node_3.runnel_broker_request_duration_seconds_count{operation=\"ack_group\"}": 0.0,
+              "node_3.runnel_broker_request_duration_seconds_count{operation=\"configure_consumer\"}": 0.0,
+              "node_3.runnel_broker_request_duration_seconds_count{operation=\"create_stream\"}": 0.0,
+              "node_3.runnel_broker_request_duration_seconds_count{operation=\"health\"}": 0.0,
+              "node_3.runnel_broker_request_duration_seconds_count{operation=\"inspect_consumer\"}": 0.0,
+              "node_3.runnel_broker_request_duration_seconds_count{operation=\"invalid_request\"}": 0.0,
+              "node_3.runnel_broker_request_duration_seconds_count{operation=\"poll\"}": 666.0,
+              "node_3.runnel_broker_request_duration_seconds_count{operation=\"poll_group\"}": 0.0,
+              "node_3.runnel_broker_request_duration_seconds_count{operation=\"publish\"}": 0.0,
+              "node_3.runnel_broker_request_duration_seconds_count{operation=\"replay\"}": 0.0,
+              "node_3.runnel_broker_request_duration_seconds_sum{operation=\"ack\"}": 0.49334,
+              "node_3.runnel_broker_request_duration_seconds_sum{operation=\"ack_group\"}": 0.0,
+              "node_3.runnel_broker_request_duration_seconds_sum{operation=\"configure_consumer\"}": 0.0,
+              "node_3.runnel_broker_request_duration_seconds_sum{operation=\"create_stream\"}": 0.0,
+              "node_3.runnel_broker_request_duration_seconds_sum{operation=\"health\"}": 0.0,
+              "node_3.runnel_broker_request_duration_seconds_sum{operation=\"inspect_consumer\"}": 0.0,
+              "node_3.runnel_broker_request_duration_seconds_sum{operation=\"invalid_request\"}": 0.0,
+              "node_3.runnel_broker_request_duration_seconds_sum{operation=\"poll\"}": 0.773959,
+              "node_3.runnel_broker_request_duration_seconds_sum{operation=\"poll_group\"}": 0.0,
+              "node_3.runnel_broker_request_duration_seconds_sum{operation=\"publish\"}": 0.0,
+              "node_3.runnel_broker_request_duration_seconds_sum{operation=\"replay\"}": 0.0,
+              "node_3.runnel_broker_request_failures_total{operation=\"ack\"}": 0.0,
+              "node_3.runnel_broker_request_failures_total{operation=\"ack_group\"}": 0.0,
+              "node_3.runnel_broker_request_failures_total{operation=\"configure_consumer\"}": 0.0,
+              "node_3.runnel_broker_request_failures_total{operation=\"create_stream\"}": 0.0,
+              "node_3.runnel_broker_request_failures_total{operation=\"health\"}": 0.0,
+              "node_3.runnel_broker_request_failures_total{operation=\"inspect_consumer\"}": 0.0,
+              "node_3.runnel_broker_request_failures_total{operation=\"invalid_request\"}": 0.0,
+              "node_3.runnel_broker_request_failures_total{operation=\"poll\"}": 0.0,
+              "node_3.runnel_broker_request_failures_total{operation=\"poll_group\"}": 0.0,
+              "node_3.runnel_broker_request_failures_total{operation=\"publish\"}": 0.0,
+              "node_3.runnel_broker_request_failures_total{operation=\"replay\"}": 0.0,
+              "node_3.runnel_broker_request_saturation_total": 0.0,
+              "node_3.runnel_broker_request_size_rejections_total": 0.0,
+              "node_3.runnel_broker_request_timeout_seconds": 0.0,
+              "node_3.runnel_broker_request_timeouts_total": 0.0,
+              "node_3.runnel_broker_requests_rejected_total": 0.0,
+              "node_3.runnel_broker_requests_total{operation=\"ack\"}": 333.0,
+              "node_3.runnel_broker_requests_total{operation=\"ack_group\"}": 0.0,
+              "node_3.runnel_broker_requests_total{operation=\"configure_consumer\"}": 0.0,
+              "node_3.runnel_broker_requests_total{operation=\"create_stream\"}": 0.0,
+              "node_3.runnel_broker_requests_total{operation=\"health\"}": 0.0,
+              "node_3.runnel_broker_requests_total{operation=\"inspect_consumer\"}": 0.0,
+              "node_3.runnel_broker_requests_total{operation=\"invalid_request\"}": 0.0,
+              "node_3.runnel_broker_requests_total{operation=\"poll\"}": 666.0,
+              "node_3.runnel_broker_requests_total{operation=\"poll_group\"}": 0.0,
+              "node_3.runnel_broker_requests_total{operation=\"publish\"}": 0.0,
+              "node_3.runnel_broker_requests_total{operation=\"replay\"}": 0.0,
+              "node_3.runnel_broker_response_bytes_total": 271953.0,
+              "node_3.runnel_broker_response_write_timeouts_total": 0.0,
+              "node_3.runnel_dead_letters_total": 0.0,
+              "node_3.runnel_delivered_bytes_total": 66600.0,
+              "node_3.runnel_deliveries_total": 666.0,
+              "node_3.runnel_engine_health_available": 0.0,
+              "node_3.runnel_health_check_failures_total": 0.0,
+              "node_3.runnel_in_flight_deliveries": 0.0,
+              "node_3.runnel_metrics_scrape_failures_total": 0.0,
+              "node_3.runnel_metrics_scrapes_total": 1.0,
+              "node_3.runnel_process_uptime_seconds": 14.782399,
+              "node_3.runnel_published_bytes_total": 0.0,
+              "node_3.runnel_publishes_total": 0.0,
+              "node_3.runnel_redeliveries_total": 0.0,
+              "node_3.runnel_snapshot_build_failures_total": 0.0,
+              "node_3.runnel_snapshot_builds_completed_total": 95.0,
+              "node_3.runnel_snapshot_builds_started_total": 94.0,
+              "node_3.runnel_snapshot_install_bytes_total": 0.0,
+              "node_3.runnel_snapshot_install_failures_total": 0.0,
+              "node_3.runnel_snapshot_installs_completed_total": 0.0,
+              "node_3.runnel_snapshot_installs_in_progress": 0.0,
+              "node_3.runnel_snapshot_installs_started_total": 0.0,
+              "node_3.runnel_snapshot_transfer_bytes_received_total": 0.0,
+              "node_3.runnel_snapshot_transfer_chunks_received_total": 0.0,
+              "node_3.runnel_snapshot_transfer_final_chunks_received_total": 0.0,
+              "node_3.runnel_storage_bytes": 0.0,
+              "node_3.runnel_stream_creations_total": 0.0,
+              "node_3.runnel_streams": 0.0
+            }
+          }
+        }
+      ]
+    }
+  },
+  "status": "complete",
+  "generated_at": "2026-09-29T15:29:41.389530+00:00",
+  "finished_at": "2026-09-29T15:29:41.389530+00:00"
+}
+results written to docs/research/artifacts/slow-consumer-baseline-2026-09-29/cases/case-001-slow-consumer-backpressure-process-payload-100-c2-delay-10-retained-2048-r1/result.json
