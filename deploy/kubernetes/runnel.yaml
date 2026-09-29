@@ -1,8 +1,8 @@
 # Development-only static-cluster manifest. This file intentionally does not
-# provide a PodDisruptionBudget, topology spread, backup policy, ServiceMonitor,
-# TLS/authentication, storage-capacity policy, or supported rolling upgrade.
-# See README.md for the readiness, liveness, persistence, disruption,
-# control-plane, resource, metrics, and compatibility assumptions.
+# provide topology spread, backup policy, ServiceMonitor, TLS/authentication,
+# storage-capacity policy, or a supported rolling upgrade. See README.md for
+# the readiness, liveness, persistence, disruption, control-plane, resource,
+# metrics, and compatibility assumptions.
 apiVersion: v1
 kind: Service
 metadata:
@@ -41,6 +41,18 @@ spec:
       port: 7000
       targetPort: peer
 ---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: runnel
+spec:
+  # Retain two of the three static pods by Ready count for Eviction API
+  # requests; readiness is not a Raft quorum health check.
+  minAvailable: 2
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: runnel
+---
 apiVersion: apps/v1
 kind: StatefulSet
 metadata:
@@ -61,8 +73,8 @@ spec:
       labels:
         app.kubernetes.io/name: runnel
     spec:
-      # There is no disruption budget, anti-affinity, or topology spread in
-      # this development manifest; keep voluntary disruption to one member.
+      # The PDB protects API-mediated evictions, but there is no anti-affinity
+      # or topology spread constraint in this development manifest.
       terminationGracePeriodSeconds: 30
       securityContext:
         runAsNonRoot: true

@@ -658,7 +658,7 @@ Goal: provide the health, security, observability, persistence, and upgrade beha
 
 Rationale: a cluster that is correct only during normal traffic is not a dependable deployment.
 
-Current progress: clustered snapshot lifecycle, peer transport, forwarding, storage, health, and in-flight delivery signals are now visible through existing diagnostics and metrics. Leadership, replication progress, resource pressure, security, upgrade, and deployment-level operational behavior remain incomplete.
+Current progress: clustered snapshot lifecycle, peer transport, forwarding, storage, health, and in-flight delivery signals are now visible through existing diagnostics and metrics. The illustrative three-node Kubernetes deployment now has a two-Ready-pod disruption budget for voluntary Eviction API requests, aligned with the static cluster's two-member quorum requirement; Ready status does not itself prove quorum health, and the budget does not cover direct deletion or controller updates and cannot prevent involuntary failures. Leadership, replication progress, resource pressure, security, upgrade, and broader deployment-level operational behavior remain incomplete.
 
 Constraints:
 

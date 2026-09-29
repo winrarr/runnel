@@ -84,13 +84,34 @@ snapshot, and other storage overhead.
 ## Disruption and shutdown
 
 `podManagementPolicy: Parallel` allows the three static members to start
-without waiting for ordinal order. It does not provide quorum protection. The
-manifest has no `PodDisruptionBudget`, pod anti-affinity, or topology spread
-constraint, so voluntary disruption can remove multiple members and multiple
-pods may share one worker node. Keep at least two members available and
-disrupt one member at a time when testing this deployment. Involuntary worker,
-zone, storage, or network failures are outside the guarantees of this
-manifest.
+without waiting for ordinal order. The `runnel` PodDisruptionBudget selects the
+same `app.kubernetes.io/name: runnel` label as the StatefulSet and sets
+`minAvailable: 2`. The stable `policy/v1` API used here is available in
+Kubernetes 1.21 and newer. When all three pods are Ready, the budget permits
+one healthy member to be voluntarily evicted while two Ready members remain;
+further healthy evictions are blocked until availability recovers. Check
+`kubectl get pdb runnel` and confirm one disruption is allowed before starting
+a node drain. If fewer than two pods are Ready, the budget does not allow
+another healthy member to be evicted.
+
+Kubernetes counts Pod `Ready` conditions for a disruption budget. Here,
+readiness means that Raft metadata is initialized and has an elected leader;
+it does not confirm that every data group can make progress, that replication
+is caught up, or that two Ready members necessarily form a functioning quorum.
+The budget therefore limits planned evictions based on the deployment's
+readiness signal, but does not itself prove Runnel quorum health.
+
+A PodDisruptionBudget is enforced for voluntary requests through the Kubernetes
+Eviction API, such as a node drain. Direct deletion of a pod or its owning
+workload, as well as workload-controller rolling updates, can bypass the
+budget. Changing the StatefulSet replica count or the broker's static peer
+list is unsupported; the PDB does not make a membership change safe. A
+not-Ready member may also block a drain while the budget is already below its
+minimum under Kubernetes' default unhealthy-pod eviction behavior. The
+manifest has no pod anti-affinity or topology spread constraint, so multiple
+pods may share one worker node. Involuntary worker, zone, storage, or network
+failures cannot be prevented by the budget and are outside this manifest's
+guarantees. These limits follow the [Kubernetes disruption budget behavior](https://kubernetes.io/docs/concepts/workloads/pods/disruptions/).
 
 On `SIGTERM` or `SIGINT`, Runnel marks readiness false, stops accepting new
 broker connections, and drains existing broker and HTTP work for up to 25
@@ -140,7 +161,9 @@ Use an immutable tag or digest when an image identity matters, and explicitly
 delete or restart only one pod at a time after confirming that at least two
 members remain available. `OnDelete` does not make mixed binary versions
 compatible: a crash or reschedule after the template changes can start a new
-version while other pods still run the old one.
+version while other pods still run the old one. PodDisruptionBudgets do not
+constrain workload-controller rolling updates, so the PDB is not an upgrade
+safety mechanism.
 
 There is no supported rolling-upgrade, downgrade, or rollback procedure for
 this deployment. Clustered storage layout and peer/protocol compatibility are
