@@ -3,10 +3,10 @@
 - Status: proposed design; not an accepted compatibility contract
 - Date: 2026-09-02
 - Last reviewed: 2026-09-29
-- Baseline reviewed: `3d2f2a6a68ef978ed43a0735159f26db332483d9`
+- Baseline reviewed: `9c173ac295bb32cb55336255baa825959ac34d4d`
 - Scope: public client/broker requests and responses
 - Related debt: TD-003, TD-018, TD-023, TD-025, and [Make client interactions dependable and evolvable](../backlog.md#make-client-interactions-dependable-and-evolvable)
-- Related evidence: [clustered outcome contract](clustered-outcome-contract.md), [application-aware retry policy](application-aware-retry-policy.md), [durability and delivery policy](durability-delivery-policy.md), [message encoding and compression research](../research/message-encoding-and-compression.md), [ADR 0022](../decisions/0022-provisional-binary-payloads.md), [ADR 0024](../decisions/0024-explicit-offset-replay-read.md), and [ADR 0026](../decisions/0026-semantic-engine-error-classification.md)
+- Related evidence: [clustered outcome contract](clustered-outcome-contract.md), [application-aware retry policy](application-aware-retry-policy.md), [durability and delivery policy](durability-delivery-policy.md), [message encoding and compression research](../research/message-encoding-and-compression.md), [ADR 0022](../decisions/0022-provisional-binary-payloads.md), [ADR 0024](../decisions/0024-explicit-offset-replay-read.md), [ADR 0026](../decisions/0026-semantic-engine-error-classification.md), and [ADR 0027](../decisions/0027-consumer-scoped-retry-policy.md)
 
 This note records the current wire boundary and recommends a path to a
 versioned client/broker contract. Observations are tied to the baseline above;
@@ -55,6 +55,30 @@ automatically. The current operation surface is:
 | --- | --- | --- |
 | Request | `create_stream`, `publish`, `publish_bytes`, `publish_batch`, `poll`, `replay`, `poll_group`, `configure_consumer`, `inspect_consumer`, `ack`, `ack_group`, `health` | UTF-8 names, keys, and consumer/member identities; text `payload`; explicit `payload_base64`; optional publish or per-record `request_id`; ordered batch outcomes; inclusive replay `offset`; durable consumer-policy settings |
 | Response | `stream_created`, `published`, `publish_batch`, `message`, `message_bytes`, `replay_message`, `replay_message_bytes`, `empty`, `acknowledged`, `consumer_policy`, `health`, `error` | offsets, text or binary payload, optional group delivery fields for normal delivery, replay without delivery state, acknowledgement and consumer-policy state, current error `code` and diagnostic `message` |
+
+The consumer-policy operations are part of the current source-level v1
+inventory, following [ADR 0027](../decisions/0027-consumer-scoped-retry-policy.md):
+`configure_consumer` takes a stream, consumer, acknowledgement timeout, and
+optional maximum delivery-attempt count; `inspect_consumer` takes the stream
+and consumer. Both return `consumer_policy` with a policy `version`, a
+`configured` flag, the effective acknowledgement timeout, and the optional
+attempt limit. The policy version is a consumer-state version, not a wire
+protocol version. Unconfigured consumers report broker-wide fallback settings
+with version zero and `configured: false`; explicit policies start at version
+one, same-value configuration is idempotent, and changed values advance the
+version. Both engines persist explicit policies. A configured timeout may be
+zero through seven days; a present attempt limit must be positive. Within an
+explicit policy, `max_delivery_attempts: null` (or an omitted input field)
+means no per-consumer attempt ceiling; broker-wide fallback applies only while
+the consumer has no configured policy.
+
+These operations were added to the provisional v1 enum without runtime
+capability discovery. A client and server that both declare v1 therefore do
+not thereby prove that an older v1 server implements `configure_consumer` or
+`inspect_consumer`; an unrecognized operation is currently a generic
+`invalid_request` parsing failure, not a stable unsupported-capability result.
+The declaration and current operation inventory describe this source tree,
+not an older-release compatibility guarantee.
 
 The current wire rules are deliberately narrow:
 
@@ -126,8 +150,9 @@ The resource boundary currently established by the server is:
 | Resource or stage | Observed guarantee | Deliberately not guaranteed |
 | --- | --- | --- |
 | TCP connections | `--max-connections` is enforced with a semaphore at accept time. An over-limit client receives a best-effort `connection_limit` error and is not assigned a connection task. | No authentication, per-client identity, fairness, or TLS boundary exists. The limit is process-local and is not advertised on the broker connection. |
-| Request frame | `--max-request-bytes` is validated between 1 and 64 MiB. The reader bounds retained frame bytes before JSON parsing; JSON and base64 representation bytes count toward the limit. Oversized frames receive `request_too_large` and close that connection. | No negotiated request or response size exists. The server does not promise that a client-side size setting matches its configured limit. |
-| Response frame | The client bounds response buffering with its local `max_response_bytes` setting and discards the connection when that bound is exceeded. | The server currently serializes a response before writing it and has no equivalent configured response-size or pre-allocation bound. Response size is not advertised or negotiated. |
+| Request frame | `--max-request-bytes` defaults to 1 MiB and is validated between 1 byte and 64 MiB. The reader bounds the JSON-line body before parsing, retaining at most the configured body limit plus its LF terminator; JSON syntax and base64 representation bytes count toward the body limit. Oversized frames receive `request_too_large` and close that connection. | No negotiated request or response size exists. The server does not promise that a client-side size setting matches its configured limit. The reusable client has no general request-size setting and does not preflight ordinary publishes against the server's configured bound. |
+| Publish batch | The typed client rejects an empty batch, more than 1,024 records, or a serialized JSON body above 64 MiB before sending. The server rejects empty or over-1,024-record batches after parsing; its general request-frame limit, capped at 64 MiB, bounds the encoded JSON/base64 body. | The server has no separate batch-byte check beyond its request-frame bound, and raw `Request` callers do not receive the typed client's batch preflight. A complete response preserves per-record order but does not promise atomicity. |
+| Response frame | The client bounds response buffering with its local `max_response_bytes` setting, defaulting to 65 MiB including the optional line terminator, and discards the connection when that bound is exceeded. | The server currently serializes a complete response before writing it and has no equivalent configured response-size or pre-allocation bound. Response size is not advertised or negotiated. |
 | In-flight work | `--max-in-flight-requests` is acquired only after a complete request parses and is held through engine handling, response serialization, and socket write. Saturated requests receive `request_saturated`; slow readers do not consume this permit, while slow writers intentionally do. | No queueing, priority, per-tenant quota, or admission guarantee exists for a particular operation. |
 | Request time | `--request-timeout-ms` bounds incomplete frame reads and request handling, with response-write expiry tracked separately. A timeout after request bytes were sent can still be an unknown operation outcome. | The timeout is not proof that the engine did not apply a mutation, and it is not a negotiated deadline or an end-to-end latency SLO. |
 | Shutdown | Idle and partial frame reads observe shutdown, and the listener drains accepted connection tasks within the server shutdown bound. | A client is not promised that an in-progress operation will be cancelled before the engine crosses its durability boundary. |
@@ -162,11 +187,12 @@ The compatibility boundary at the same baseline is narrower:
   server does not advertise or enforce that client-local value as a connection
   property. Reconnecting does not renegotiate it.
 
-The current wire bounds are asymmetric: the server's configurable request-frame
-limit is 1 through 64 MiB (including JSON/base64 representation), publish
-batches are additionally limited to 1,024 records and 64 MiB of encoded
-request bytes, and the client defaults its response buffer to 65 MiB. The
-server serializes a response before writing and has no corresponding
+The current wire bounds are asymmetric: the server defaults to a 1 MiB
+request-body bound and permits a configured maximum of 64 MiB; typed batch
+publishes additionally enforce 1,024 records and a 64 MiB serialized JSON
+body. The batch byte ceiling is also the server's maximum general request
+body, rather than a second batch-only server check. The client defaults its
+response buffer to 65 MiB, while the server serializes responses without a
 configured response-frame ceiling. Connection count, in-flight work, and
 request-timeout settings are local admission controls, not capabilities the
 listener advertises. A negotiated design should expose only limits the client
@@ -472,9 +498,15 @@ migration analysis only and do not grant a support promise. Keep fixtures
 language-neutral so future clients can consume supported protocol releases:
 
 - canonical request and response fixtures should cover every current tag and
-  exact field names, including omitted optional fields. The current Rust suite
-  does not explicitly exercise the `inspect_consumer` request variant, so it
-  is not yet exhaustive even within this language;
+  exact field names, including omitted optional fields. The canonical request
+  fixture currently omits both consumer-policy request tags; a separate
+  [wire test](../../crates/runnel-protocol/tests/wire.rs) checks the exact
+  `configure_consumer` request JSON and round-trips a `consumer_policy`
+  response, while the [real-process typed
+  client test](../../crates/runnel-server/tests/client_path.rs) exercises both
+  `configure_consumer` and `inspect_consumer` against a local broker. The
+  current Rust wire suite is therefore not a complete canonical fixture set,
+  even though the inspect path has local real-server coverage;
 - fixtures cover reordered JSON members, because object order is not semantic,
   and reject duplicate-member fixtures rather than assigning them meaning;
 - request fixtures reject unknown fields on struct-bearing variants, reject
