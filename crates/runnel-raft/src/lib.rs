@@ -1034,6 +1034,23 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn persistent_raft_implements_consumer_policy_idempotency_contract() {
+        let directory = tempfile::tempdir().unwrap();
+        let peers = BTreeMap::from([(1, "127.0.0.1:0".to_owned())]);
+        let engine = PersistentEngine::open(
+            1,
+            "runnel-persistent-policy-contract-test".to_owned(),
+            directory.path(),
+            peers,
+            true,
+        )
+        .await
+        .unwrap();
+
+        runnel_test_support::assert_consumer_policy_idempotency_contract(&engine).await;
+    }
+
+    #[tokio::test]
     async fn persistent_raft_uses_semantic_error_classification() {
         let directory = tempfile::tempdir().unwrap();
         let peers = BTreeMap::from([(1, "127.0.0.1:0".to_owned())]);

@@ -252,6 +252,47 @@ pub async fn assert_independent_consumers_contract(engine: &dyn Engine) {
     ));
 }
 
+pub async fn assert_consumer_policy_idempotency_contract(engine: &dyn Engine) {
+    assert!(engine.create_stream("contract.policy").await.unwrap());
+
+    let configured = engine
+        .configure_consumer("contract.policy", "worker", 500, Some(2))
+        .await
+        .unwrap();
+    assert_eq!(configured.version, 1);
+    assert!(configured.configured);
+    assert_eq!(configured.ack_timeout_ms, 500);
+    assert_eq!(configured.max_delivery_attempts, Some(2));
+
+    let repeated = engine
+        .configure_consumer("contract.policy", "worker", 500, Some(2))
+        .await
+        .unwrap();
+    assert_eq!(repeated, configured);
+    assert_eq!(
+        engine
+            .inspect_consumer("contract.policy", "worker")
+            .await
+            .unwrap(),
+        configured
+    );
+
+    let updated = engine
+        .configure_consumer("contract.policy", "worker", 501, Some(2))
+        .await
+        .unwrap();
+    assert_eq!(updated.version, configured.version + 1);
+    assert_eq!(updated.ack_timeout_ms, 501);
+    assert_eq!(updated.max_delivery_attempts, Some(2));
+    assert_eq!(
+        engine
+            .inspect_consumer("contract.policy", "worker")
+            .await
+            .unwrap(),
+        updated
+    );
+}
+
 pub async fn assert_key_ordering_contract(engine: &dyn Engine) {
     assert!(engine.create_stream("contract.keys").await.unwrap());
     for (key, payload) in [
