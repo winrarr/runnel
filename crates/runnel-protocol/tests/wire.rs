@@ -129,21 +129,7 @@ fn payload_encoding_is_explicit_for_every_payload_wire_shape() {
 }
 
 #[test]
-fn consumer_policy_requests_and_responses_round_trip() {
-    let request = Request::ConfigureConsumer {
-        stream: "events".to_owned(),
-        consumer: "worker".to_owned(),
-        ack_timeout_ms: 250,
-        max_delivery_attempts: Some(3),
-    };
-    let encoded = serde_json::to_string(&request).unwrap();
-    assert_eq!(
-        encoded,
-        r#"{"op":"configure_consumer","stream":"events","consumer":"worker","ack_timeout_ms":250,"max_delivery_attempts":3}"#
-    );
-    let decoded: Request = serde_json::from_str(&encoded).unwrap();
-    assert!(matches!(decoded, Request::ConfigureConsumer { .. }));
-
+fn consumer_policy_response_round_trips() {
     let response = Response::ConsumerPolicy {
         stream: "events".to_owned(),
         consumer: "worker".to_owned(),
@@ -538,6 +524,34 @@ fn current_request_fixtures_pin_v1_tags_and_fields() {
             }),
         ),
         (
+            "configure_consumer",
+            Request::ConfigureConsumer {
+                stream: "events".to_owned(),
+                consumer: "worker".to_owned(),
+                ack_timeout_ms: 250,
+                max_delivery_attempts: Some(3),
+            },
+            serde_json::json!({
+                "op": "configure_consumer",
+                "stream": "events",
+                "consumer": "worker",
+                "ack_timeout_ms": 250,
+                "max_delivery_attempts": 3
+            }),
+        ),
+        (
+            "inspect_consumer",
+            Request::InspectConsumer {
+                stream: "events".to_owned(),
+                consumer: "worker".to_owned(),
+            },
+            serde_json::json!({
+                "op": "inspect_consumer",
+                "stream": "events",
+                "consumer": "worker"
+            }),
+        ),
+        (
             "ack",
             Request::Ack {
                 stream: "events".to_owned(),
@@ -578,6 +592,56 @@ fn current_request_fixtures_pin_v1_tags_and_fields() {
             "v1 request fixture changed: {name}"
         );
     }
+}
+
+#[test]
+fn consumer_policy_request_fixtures_pin_serialization_and_deserialization() {
+    let fixtures = [
+        (
+            "configure_consumer",
+            Request::ConfigureConsumer {
+                stream: "events".to_owned(),
+                consumer: "worker".to_owned(),
+                ack_timeout_ms: 250,
+                max_delivery_attempts: Some(3),
+            },
+            r#"{"op":"configure_consumer","stream":"events","consumer":"worker","ack_timeout_ms":250,"max_delivery_attempts":3}"#,
+        ),
+        (
+            "inspect_consumer",
+            Request::InspectConsumer {
+                stream: "events".to_owned(),
+                consumer: "worker".to_owned(),
+            },
+            r#"{"op":"inspect_consumer","stream":"events","consumer":"worker"}"#,
+        ),
+    ];
+
+    for (name, request, fixture) in fixtures {
+        assert_eq!(
+            serde_json::to_string(&request).unwrap(),
+            fixture,
+            "v1 request serialization changed: {name}"
+        );
+
+        let decoded: Request = serde_json::from_str(fixture).unwrap_or_else(|error| {
+            panic!("v1 request fixture failed to decode ({name}): {error}")
+        });
+        assert_eq!(
+            serde_json::to_string(&decoded).unwrap(),
+            fixture,
+            "v1 request deserialization changed: {name}"
+        );
+    }
+
+    let omitted_optional_field: Request = serde_json::from_str(
+        r#"{"op":"configure_consumer","stream":"events","consumer":"worker","ack_timeout_ms":250}"#,
+    )
+    .unwrap();
+    assert_eq!(
+        serde_json::to_string(&omitted_optional_field).unwrap(),
+        r#"{"op":"configure_consumer","stream":"events","consumer":"worker","ack_timeout_ms":250,"max_delivery_attempts":null}"#
+    );
 }
 
 #[test]
