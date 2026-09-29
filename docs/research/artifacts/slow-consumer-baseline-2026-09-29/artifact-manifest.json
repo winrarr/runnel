@@ -1,0 +1,263 @@
+{
+  "normalization": {
+    "raw_target_prefix": "$CARGO_TARGET_DIR",
+    "raw_temporary_prefix": "$TMPDIR",
+    "raw_cases_prefix": "docs/research/artifacts/slow-consumer-baseline-2026-09-29/cases",
+    "raw_matrix_path": "docs/research/artifacts/slow-consumer-baseline-2026-09-29/matrix.json",
+    "worktree_prefix": "<WORKTREE>",
+    "verification": "reversing only these replacements reproduced each raw runner artifact byte-for-byte"
+  },
+  "raw_artifact_file_count": 31,
+  "raw_total_bytes": 1054108,
+  "committed_total_bytes": 1050883,
+  "files": [
+    {
+      "path": "cases/case-001-slow-consumer-backpressure-process-payload-100-c2-delay-10-retained-2048-r1/broker-logs/node-1.log",
+      "raw_bytes": 330,
+      "raw_sha256": "31afc2280dd9697f1a481065a0be1b548238edadf5518bd44739115cd3fa5c53",
+      "committed_bytes": 288,
+      "committed_sha256": "405b8ef309f282e461e3cf69a540810c9386fc2940f2d3ff808062340eff065f",
+      "path_strings_normalized": true
+    },
+    {
+      "path": "cases/case-001-slow-consumer-backpressure-process-payload-100-c2-delay-10-retained-2048-r1/broker-logs/node-2.log",
+      "raw_bytes": 330,
+      "raw_sha256": "d1e7a957980c2c46fb051f2fbebf0206a9a37ac8e79781cfc6bbb7efece27fe7",
+      "committed_bytes": 288,
+      "committed_sha256": "a2ef997943ef40e78d74b1e1025960673068cd6152b5aeeea2f0e85a5e131777",
+      "path_strings_normalized": true
+    },
+    {
+      "path": "cases/case-001-slow-consumer-backpressure-process-payload-100-c2-delay-10-retained-2048-r1/broker-logs/node-3.log",
+      "raw_bytes": 330,
+      "raw_sha256": "87731791fef031040f24ae67bd668066c0615f3403e678bc4dbb4f6a27c98f24",
+      "committed_bytes": 288,
+      "committed_sha256": "b7b5cac6468c0382be05948d91545313dd3b0bd8c7c833f70cdc9df7f88ce1e5",
+      "path_strings_normalized": true
+    },
+    {
+      "path": "cases/case-001-slow-consumer-backpressure-process-payload-100-c2-delay-10-retained-2048-r1/result.json",
+      "raw_bytes": 55313,
+      "raw_sha256": "91bfb29d07ab7bb421cf231fc67d0065ad381f44eb180f1e90b3151a183d8fb7",
+      "committed_bytes": 55204,
+      "committed_sha256": "7ef1b48f963d6e18aa9c7f3f99accc1b46fb509fa5700855b9e2e064b54d4c67",
+      "path_strings_normalized": true
+    },
+    {
+      "path": "cases/case-001-slow-consumer-backpressure-process-payload-100-c2-delay-10-retained-2048-r1/runner.log",
+      "raw_bytes": 59804,
+      "raw_sha256": "33ccc14a7f1c571be5689374bb086e979baf18bd481d23aea5e742ef52c133b6",
+      "committed_bytes": 59392,
+      "committed_sha256": "32584c0db4ecefb6c8dbe859f5a21116662c36169e16b00acb842ff6bb1b756d",
+      "path_strings_normalized": true
+    },
+    {
+      "path": "cases/case-002-slow-consumer-backpressure-process-payload-100-c2-delay-10-retained-2048-r2/broker-logs/node-1.log",
+      "raw_bytes": 330,
+      "raw_sha256": "40cf6c422c883fdef5f91903f87e58b24a5523d61116b613d01a7c89dcecc45f",
+      "committed_bytes": 288,
+      "committed_sha256": "8b9bea7c1f7872617c42645fb70fb81a9cf9bf62714c3db7757aa39038f8afd5",
+      "path_strings_normalized": true
+    },
+    {
+      "path": "cases/case-002-slow-consumer-backpressure-process-payload-100-c2-delay-10-retained-2048-r2/broker-logs/node-2.log",
+      "raw_bytes": 330,
+      "raw_sha256": "545ec258ccdad7a879df333792b97fee38f6369273ed6bd468564bc322f5bab4",
+      "committed_bytes": 288,
+      "committed_sha256": "0536c3349dcac8d11b184e4eb6c7d575189c0eee818a1201b63d9d1f176d58aa",
+      "path_strings_normalized": true
+    },
+    {
+      "path": "cases/case-002-slow-consumer-backpressure-process-payload-100-c2-delay-10-retained-2048-r2/broker-logs/node-3.log",
+      "raw_bytes": 330,
+      "raw_sha256": "3812dab2cb84bf28a787b0f63606165e3c225c3ff4ec6adb3ee334b1ebcb03d1",
+      "committed_bytes": 288,
+      "committed_sha256": "7ab3fa34847eaa14058c1d2680d94232a029a52ca2cabb7aefd90aaa40045ff6",
+      "path_strings_normalized": true
+    },
+    {
+      "path": "cases/case-002-slow-consumer-backpressure-process-payload-100-c2-delay-10-retained-2048-r2/result.json",
+      "raw_bytes": 55318,
+      "raw_sha256": "66c8ee37c079d1e99ab76ce55c2d5d6b1cb4f1bfed109be9a2713fad4d3ca565",
+      "committed_bytes": 55209,
+      "committed_sha256": "97733e618dfb293bb5e896760adc0e60be11528c72ad449a3c39b019bba2be56",
+      "path_strings_normalized": true
+    },
+    {
+      "path": "cases/case-002-slow-consumer-backpressure-process-payload-100-c2-delay-10-retained-2048-r2/runner.log",
+      "raw_bytes": 55581,
+      "raw_sha256": "8aa5214809b55c584c63521b7fb7bfa8d27cc85b3bb6acf55d313e186e84d44a",
+      "committed_bytes": 55484,
+      "committed_sha256": "d503270eb32059d72b405794320722d260bd47cb80166aea186e3a92eea15019",
+      "path_strings_normalized": true
+    },
+    {
+      "path": "cases/case-003-slow-consumer-backpressure-process-payload-100-c2-delay-10-retained-2048-r3/broker-logs/node-1.log",
+      "raw_bytes": 330,
+      "raw_sha256": "23d746afd90cd391dd46d8b5a135850618dafed8776d9f574844e4d88e4801b1",
+      "committed_bytes": 288,
+      "committed_sha256": "729fdaaa15233b48c28fd0c2da9f40ddca453743c09a9eae22dbae608c7c1c07",
+      "path_strings_normalized": true
+    },
+    {
+      "path": "cases/case-003-slow-consumer-backpressure-process-payload-100-c2-delay-10-retained-2048-r3/broker-logs/node-2.log",
+      "raw_bytes": 330,
+      "raw_sha256": "807f91f17e23341e58618141e9ce2f54693d47928571122ab169928990510943",
+      "committed_bytes": 288,
+      "committed_sha256": "de540f943af705134d2e906a7275b8ef456982c34385bf1b69460173dbef63b8",
+      "path_strings_normalized": true
+    },
+    {
+      "path": "cases/case-003-slow-consumer-backpressure-process-payload-100-c2-delay-10-retained-2048-r3/broker-logs/node-3.log",
+      "raw_bytes": 330,
+      "raw_sha256": "e4a78eb3f754364bd82ef2a9116ea90ebb5861f7818c3f08f6a60ca621b43ff9",
+      "committed_bytes": 288,
+      "committed_sha256": "fc6eaf51426c5a6db0bea647318ce0b17632fe373ed22189a8593c89322bc11c",
+      "path_strings_normalized": true
+    },
+    {
+      "path": "cases/case-003-slow-consumer-backpressure-process-payload-100-c2-delay-10-retained-2048-r3/result.json",
+      "raw_bytes": 55317,
+      "raw_sha256": "7564ad4cca66c6ae7e45eb565537ede1f9fc1fb16eaf76ab0efc02f601512ced",
+      "committed_bytes": 55208,
+      "committed_sha256": "971faa59e80d37fb447aad4bd131fdf5edb90a958a1bb81cb503013c1576ba57",
+      "path_strings_normalized": true
+    },
+    {
+      "path": "cases/case-003-slow-consumer-backpressure-process-payload-100-c2-delay-10-retained-2048-r3/runner.log",
+      "raw_bytes": 55580,
+      "raw_sha256": "a22e95990d629afa8d56e07f3456f0f305171f72ba25fb12faabc0b51c36dde6",
+      "committed_bytes": 55483,
+      "committed_sha256": "63ddbf054d083f41d70ffb02fb6048976083cb10228931fe2b35975780d79303",
+      "path_strings_normalized": true
+    },
+    {
+      "path": "cases/case-004-slow-consumer-backpressure-process-payload-1024-c2-delay-10-retained-2048-r1/broker-logs/node-1.log",
+      "raw_bytes": 1509,
+      "raw_sha256": "ea9a3a7525c04e6b2c3445a6b822eefa9da0d9b10b66b0fd65832fa5b7fd44e8",
+      "committed_bytes": 1467,
+      "committed_sha256": "fcdb9f2050edd530f3be6ea35682d330c8a58a424d67ddfb5d869d3c9b73a18c",
+      "path_strings_normalized": true
+    },
+    {
+      "path": "cases/case-004-slow-consumer-backpressure-process-payload-1024-c2-delay-10-retained-2048-r1/broker-logs/node-2.log",
+      "raw_bytes": 330,
+      "raw_sha256": "e2ec7507683c1b735de2db1cc7366969a3e96da948622dcb3a13b88b75806346",
+      "committed_bytes": 288,
+      "committed_sha256": "a5238d7e6627540f33ca67b65cd501d0f082e03c5bcf54d62f24ce7f0ca77771",
+      "path_strings_normalized": true
+    },
+    {
+      "path": "cases/case-004-slow-consumer-backpressure-process-payload-1024-c2-delay-10-retained-2048-r1/broker-logs/node-3.log",
+      "raw_bytes": 330,
+      "raw_sha256": "be52b313d43d77bf760a9db4c63d8f3af97a4444bcece06046fa78b89eda878a",
+      "committed_bytes": 288,
+      "committed_sha256": "3193390a248a659995cc1c2af2afac9e6a2b0ec0acb6c85cd5b212eabd77766a",
+      "path_strings_normalized": true
+    },
+    {
+      "path": "cases/case-004-slow-consumer-backpressure-process-payload-1024-c2-delay-10-retained-2048-r1/result.json",
+      "raw_bytes": 55308,
+      "raw_sha256": "bc331295a0ed58b615069d45c00169ed4d7b784d8eaf4407b66a400eb89a51c3",
+      "committed_bytes": 55199,
+      "committed_sha256": "c021a75db188f7985938c37e973655586a9a771cac451c1f6eb9c27fc9e8d20c",
+      "path_strings_normalized": true
+    },
+    {
+      "path": "cases/case-004-slow-consumer-backpressure-process-payload-1024-c2-delay-10-retained-2048-r1/runner.log",
+      "raw_bytes": 55572,
+      "raw_sha256": "041db54248d481f5c5b981704f20f4c37ccb6a6a40c68190c85d2cda39b24922",
+      "committed_bytes": 55475,
+      "committed_sha256": "c7ece928a93425bc91eaaa9175fa45c76d7ffc977ec2f6bb7a562e3cd80a7075",
+      "path_strings_normalized": true
+    },
+    {
+      "path": "cases/case-005-slow-consumer-backpressure-process-payload-1024-c2-delay-10-retained-2048-r2/broker-logs/node-1.log",
+      "raw_bytes": 330,
+      "raw_sha256": "3d94c822ea0afc88a9fffbf4d51a0ad32fe7e1106e73c3c14b8d6c0a5892d4eb",
+      "committed_bytes": 288,
+      "committed_sha256": "7470c9da53218a3d75763c62f2525f9777bba9a79bcd09c8ac4ad1465ca4b12f",
+      "path_strings_normalized": true
+    },
+    {
+      "path": "cases/case-005-slow-consumer-backpressure-process-payload-1024-c2-delay-10-retained-2048-r2/broker-logs/node-2.log",
+      "raw_bytes": 330,
+      "raw_sha256": "034bb8d61762beb9a198e770fb98324b86d07be338a137b399982d37327f2f53",
+      "committed_bytes": 288,
+      "committed_sha256": "923d6e8a50faf58069f26ee280d9664034e7982635fab05a21d8713b1198c7e7",
+      "path_strings_normalized": true
+    },
+    {
+      "path": "cases/case-005-slow-consumer-backpressure-process-payload-1024-c2-delay-10-retained-2048-r2/broker-logs/node-3.log",
+      "raw_bytes": 330,
+      "raw_sha256": "43a4446387f9c59d62753f82ec6ba251a3485e4d56b1b3ad774cfcdbf7449be2",
+      "committed_bytes": 288,
+      "committed_sha256": "15d19bc97deaa5be8d183be1992ce79f22870adb74af3e56f196b90c97f4432c",
+      "path_strings_normalized": true
+    },
+    {
+      "path": "cases/case-005-slow-consumer-backpressure-process-payload-1024-c2-delay-10-retained-2048-r2/result.json",
+      "raw_bytes": 55347,
+      "raw_sha256": "33e5224355941a248fc0914f00cc837e02e8bf950245482033d3aff65e805682",
+      "committed_bytes": 55238,
+      "committed_sha256": "6810b3302170b9d85df87f70d03635fd2b724aad51331ce9126d4843d27f86bd",
+      "path_strings_normalized": true
+    },
+    {
+      "path": "cases/case-005-slow-consumer-backpressure-process-payload-1024-c2-delay-10-retained-2048-r2/runner.log",
+      "raw_bytes": 55611,
+      "raw_sha256": "10b3e2e0265088b719c40fa48d1f09c53a676761303a0eb7ae9d9f6d05525269",
+      "committed_bytes": 55514,
+      "committed_sha256": "ff6123cba555b1145b7495abc9cb86f16de2b70b21d42822fc89241eb6168bcf",
+      "path_strings_normalized": true
+    },
+    {
+      "path": "cases/case-006-slow-consumer-backpressure-process-payload-1024-c2-delay-10-retained-2048-r3/broker-logs/node-1.log",
+      "raw_bytes": 330,
+      "raw_sha256": "fffd5365945e16876c43ca6d3e642a7e3ad6d0ac3aa03c17eae2c7ca7703a264",
+      "committed_bytes": 288,
+      "committed_sha256": "1c6e2d6dcf15c85fc2d2ead14892b673a4ab34b98df21ef971d20e31808f34f3",
+      "path_strings_normalized": true
+    },
+    {
+      "path": "cases/case-006-slow-consumer-backpressure-process-payload-1024-c2-delay-10-retained-2048-r3/broker-logs/node-2.log",
+      "raw_bytes": 330,
+      "raw_sha256": "258de9b2ee57e1ee2af541e7721a092734860546f30bdfec3ef5b05d685b3e16",
+      "committed_bytes": 288,
+      "committed_sha256": "05b90b36e0b4fb170ff35596bfb3c2bba845b09dec30c4b4d798baae88c9d4da",
+      "path_strings_normalized": true
+    },
+    {
+      "path": "cases/case-006-slow-consumer-backpressure-process-payload-1024-c2-delay-10-retained-2048-r3/broker-logs/node-3.log",
+      "raw_bytes": 330,
+      "raw_sha256": "93118b9be92bddbbb5ed8bd94e50df49628adf2741b5068ab8c074deacbcfc92",
+      "committed_bytes": 288,
+      "committed_sha256": "00ef0ada81500375001a556cb2075953592001fa1184afa4cd20a37213599468",
+      "path_strings_normalized": true
+    },
+    {
+      "path": "cases/case-006-slow-consumer-backpressure-process-payload-1024-c2-delay-10-retained-2048-r3/result.json",
+      "raw_bytes": 55374,
+      "raw_sha256": "6b90c371438f19cfc21a1cf893a68dedca407ba28f78666b074525b699a7c5cf",
+      "committed_bytes": 55265,
+      "committed_sha256": "879fa1971a929627151c678a0320b2f4de2f4591e3de1f7f8b5e4a2a3fded104",
+      "path_strings_normalized": true
+    },
+    {
+      "path": "cases/case-006-slow-consumer-backpressure-process-payload-1024-c2-delay-10-retained-2048-r3/runner.log",
+      "raw_bytes": 55638,
+      "raw_sha256": "8f38be79673739b7e8acc8bf75725e9e0fc5e6734e4f1ff3f96a6b4aaf3ab323",
+      "committed_bytes": 55541,
+      "committed_sha256": "513a84b286c1f07bf7c9241392a2d526fe65bce1f1bd820d8c38cb29b3857742",
+      "path_strings_normalized": true
+    },
+    {
+      "path": "matrix.json",
+      "raw_bytes": 377226,
+      "raw_sha256": "90c96fe249be1cbeda900e4c9fa9a6ae21921028ac3fba99fa06731e4dc24096",
+      "committed_bytes": 376308,
+      "committed_sha256": "fb23c293a3791a0cd0b7797ca84385d68b1df0edc158c217bc9518abc63d2327",
+      "path_strings_normalized": true
+    }
+  ]
+}

@@ -1,0 +1,11 @@
+2026-09-29T15:30:12.380430Z  INFO runnel::bootstrap: runnel started broker=127.0.0.1:46227 http=127.0.0.1:50023 data_dir="$TMPDIR/runnel-cluster-bench-0rgft3ys/node-1" engine=Raft
+2026-09-29T15:30:12.385045Z ERROR runnel::observability: readiness check failed error=cluster error: cluster has no elected leader
+2026-09-29T15:30:12.436617Z ERROR runnel::observability: readiness check failed error=cluster error: cluster has no elected leader
+2026-09-29T15:30:12.488681Z ERROR runnel::observability: readiness check failed error=cluster error: cluster has no elected leader
+2026-09-29T15:30:12.540589Z ERROR runnel::observability: readiness check failed error=cluster error: cluster has no elected leader
+2026-09-29T15:30:12.592902Z ERROR runnel::observability: readiness check failed error=cluster error: cluster has no elected leader
+2026-09-29T15:30:12.645065Z ERROR runnel::observability: readiness check failed error=cluster error: cluster has no elected leader
+2026-09-29T15:30:12.697276Z ERROR runnel::observability: readiness check failed error=cluster error: cluster has no elected leader
+2026-09-29T15:30:12.749595Z ERROR runnel::observability: readiness check failed error=cluster error: cluster has no elected leader
+2026-09-29T15:30:12.802040Z ERROR runnel::observability: readiness check failed error=cluster error: cluster has no elected leader
+2026-09-29T15:30:28.794510Z  INFO runnel::lifecycle: runnel shutting down reason="shutdown signal received"
