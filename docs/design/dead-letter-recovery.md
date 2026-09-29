@@ -1,8 +1,8 @@
 # Dead-letter recovery across durable boundaries
 
-- Status: exploratory design note; local reconciliation is tested across injected file states, while physical durability, the accepted ID namespace contract, and provenance evidence remain open
+- Status: exploratory design note; local reconciliation and the conflicting public-ID wire outcome are tested, while physical durability, same-content reuse, the accepted ID identity contract, and provenance evidence remain open
 - Last reviewed: 2026-09-29
-- Baseline: `eaf93da579a86db01ceb452a2514d426934f4775`
+- Baseline: `b29dd2ce0ef27816b117b59d807cf0d26071c6fa`
 - Reading guide: [design-note conventions](README.md)
 - Related debt: [TD-017](../tech-debt.md#td-017-dead-letter-movement-spans-separate-durable-records), [TD-018](../tech-debt.md#td-018-retry-policy-and-dead-letter-provenance-are-coarse), and [TD-029](../tech-debt.md#td-029-public-request-ids-can-collide-with-local-dead-letter-move-ids)
 - Related decisions: [ADR 0014](../decisions/0014-local-retry-and-dead-letter-policy.md), [ADR 0016](../decisions/0016-clustered-retry-and-dead-letter-policy.md), [ADR 0026](../decisions/0026-semantic-engine-error-classification.md), and [ADR 0027](../decisions/0027-consumer-scoped-retry-policy.md)
@@ -43,7 +43,7 @@ the same per-target-stream request-ID index, and the internal value is
 predictable and within the public ID length limit. A public publish using that
 exact ID could therefore collide with a later move. The key/payload mismatch
 case is reproduced by
-[`dead_letter_move_content_mismatch_is_storage_error_without_acknowledgement`](../../crates/runnel-core/src/lib.rs#L1442): a public publish path reserves the exact move ID with different content, and the later move returns an invalid-data error again after reopen instead of advancing source progress. This is an at-least-once-safe outcome, but the source delivery can remain blocked until the target conflict is resolved. The matching-content case and the same interaction through the wire protocol are untested; the accepted identity contract remains open in TD-029.
+[`dead_letter_move_content_mismatch_is_storage_error_without_acknowledgement`](../../crates/runnel-core/src/lib.rs#L1442): a public publish path reserves the exact move ID with different content, and the later move returns an invalid-data error again after reopen instead of advancing source progress. The real-server test [`network_protocol_preserves_public_record_on_dead_letter_move_id_collision_after_restart`](../../crates/runnel-server/tests/server_smoke.rs) now verifies the same mismatch through the wire path: the poll response is classified as `storage_error`, the conflicting public target record remains unchanged, and polling the source after restart still returns the error rather than showing advanced progress. This at-least-once-safe outcome can leave the source delivery blocked until the target conflict is resolved. Same-content reuse remains untested, and the accepted identity contract remains open in TD-029.
 
 The current clustered implementation does not use this local move identity.
 It appends the derived record and advances source progress in one replicated
@@ -119,6 +119,7 @@ The relevant local recovery states and current evidence are:
 | Target append succeeds before the source acknowledgement event is written | Target contains the copied record and move ID; source progress remains eligible. | `dead_letter_move_reconciles_target_after_restart` creates this state directly, then reopen/poll reconciles it. `dead_letter_move_reconciles_after_source_ack_persistence_failure_and_restart` exercises the same order through a failed source-event append. |
 | The complete source acknowledgement event is written but its sync returns an error | The test filesystem retains the event for reopen; source progress replays and the target remains single. | `dead_letter_move_retries_after_source_event_sync_failure_and_restart` injects the sync error after writing the journal event, drops and reopens the broker, and checks progress and the one target record. It is not a real sync failure or power-loss test. |
 | The public poll response is lost after a completed move | The server has completed the source transition and the response is unavailable to the client; after restart the source poll is empty and the target record is consumable once in the tested case. | `network_protocol_reconciles_dead_letter_after_ambiguous_poll_and_restart` covers this real-server journey. It does not kill the server between target sync and source-event persistence. |
+| A public target record reserves a local move ID with mismatching content | The source poll returns a `storage_error`; after restart, retry returns the same classification and source progress has not advanced. The public target record remains at its original offset with its original content. | `network_protocol_preserves_public_record_on_dead_letter_move_id_collision_after_restart` covers this conflict through the real server process and protocol. Same-content reuse and the accepted identity contract remain open. |
 
 The local target append checks an existing move ID's key and payload before
 reusing it. Core tests cover stable/scoped/bounded identities
@@ -132,7 +133,8 @@ failure and injected file states ([source persistence](../../crates/runnel-core/
 same-ID content mismatch ([mismatch](../../crates/runnel-core/src/lib.rs#L1442)).
 Real-server tests cover movement after the attempt limit and restart recovery
 ([restart](../../crates/runnel-server/tests/server_smoke.rs#L729)) plus a lost
-poll response and restart ([ambiguous response](../../crates/runnel-server/tests/server_smoke.rs#L821)).
+poll response and restart ([ambiguous response](../../crates/runnel-server/tests/server_smoke.rs#L821)), and a conflicting public target ID through restart and retry
+([ID collision](../../crates/runnel-server/tests/server_smoke.rs)).
 Together these tests support reconciliation for the injected and process-level
 states named above; they do not prove behavior under actual filesystem or
 device failures, power loss, or a process kill at the exact inter-log boundary.
@@ -301,12 +303,12 @@ tests; they are not a retroactive implementation checklist:
    bounded or explicitly accounted-for indexes/journals, do not scan unrelated
    streams without a documented bound, and retain move evidence until source
    progress no longer depends on it.
-5. **Identity namespace contract:** define the accepted outcome when a public
-   publish ID equals a computed local move ID and verify it through the public
-   wire path. A core test already proves that conflicting key/payload content
-   fails reconciliation and leaves source progress unadvanced after reopen;
-   same-content reuse and the protocol path remain untested. The intended
-   contract and those coverage gaps are recorded in [TD-029](../tech-debt.md#td-029-public-request-ids-can-collide-with-local-dead-letter-move-ids).
+5. **Identity contract:** define the accepted outcome when a public publish ID
+   equals a computed local move ID. A core test and a real-server wire test
+   prove that conflicting content fails reconciliation, preserves the public
+   target record, and leaves source progress unadvanced across reopen/retry;
+   the wire response is `storage_error`. Same-content reuse and the accepted
+   identity contract remain open and are recorded in [TD-029](../tech-debt.md#td-029-public-request-ids-can-collide-with-local-dead-letter-move-ids).
 6. **Cluster same-group coverage:** retain real-process tests for committed
    same-group movement through reassignment and policy transfer. Describe the
    result as same-data-group atomicity, not general cross-group atomicity.
@@ -326,9 +328,10 @@ tests; they are not a retroactive implementation checklist:
   Tests cover partial frame recovery, a complete frame before sync, and a
   source-event sync error on the current test filesystem. Behavior under real
   device errors or power loss, retention, and future format changes remains
-  unverified. The index shares the public request-ID namespace; a core test
-  demonstrates that a conflicting ID blocks source progress across reopen.
-  TD-029 tracks the missing wire-path and same-content contract evidence.
+  unverified. The index shares the public request-ID namespace; core and
+  real-server tests demonstrate that a conflicting ID blocks source progress
+  across reopen/retry and preserves the public target record. TD-029 tracks
+  the missing same-content evidence and the unresolved identity contract.
 - **Hypothesis:** lazy reconciliation on the next source poll is sufficient
   for correctness. A background reconciler may be needed for operational
   visibility or to make progress when no consumer polls, but it must not
