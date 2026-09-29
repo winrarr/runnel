@@ -7,6 +7,7 @@
 - Primary evidence class: development-process/reliability
 - Secondary tags: tooling/CI, design/research
 - Initial desk-evaluation baseline: `2acd807a925fdd664fa36128fec35c4116239a6d`
+- Current evidence refresh baseline: `8234964a2ed94c007153d19204f8bd86d605549c`
 
 This is a source-backed evaluation, not a hosted performance result. It records
 what can be established from the repository, observed GitHub runs, and current
@@ -22,8 +23,12 @@ managed Linux VM executor has full Docker access, and its documented
 failed-job reruns, SSH debugging, and resource views could improve the
 failure-recovery experience.
 
-There is not enough evidence to call it materially better. The GitHub App
-integration explicitly does not trigger pipelines for forked pull requests,
+There is not enough evidence to call it materially better. Since the earlier
+review, two pull requests had a failing first `Verify` attempt followed by a
+passing rerun on the same head. Those observations add examples for failure
+triage, but they do not establish either failure's cause, a failure rate, or a
+provider advantage. The GitHub App integration explicitly does not trigger
+pipelines for forked pull requests,
 which is a direct coverage risk for the current `pull_request` workflows.
 CircleCI also requires a second VCS/checks integration, a new configuration and
 credential path for `benchmark-history`, explicit cache configuration, and a
@@ -37,7 +42,7 @@ trial produces equivalent-coverage measurements.
 
 ## Evidence boundary
 
-The branch was checked against the required baseline before this review:
+The original desk evaluation recorded this initial baseline:
 
 - `git fetch origin main` returned `origin/main` at
   `2acd807a925fdd664fa36128fec35c4116239a6d`.
@@ -46,6 +51,14 @@ The branch was checked against the required baseline before this review:
   [GitHub Actions run 34043270435](https://github.com/winrarr/runnel/actions/runs/34043270435).
 - The repository is public. This matters to the platform cost comparison
   because both vendors publish different public/open-source allowances.
+
+This refresh uses baseline `8234964a2ed94c007153d19204f8bd86d605549c`. The
+assigned worktree was clean at that exact revision. GitHub Actions run
+[36594267809](https://github.com/winrarr/runnel/actions/runs/36594267809)
+completed successfully at 2026-09-29 16:01:40 UTC with that exact `headSha`.
+It is a `push` run, so it anchors the current `ci.yml` jobs but does not include
+the separate pull-request Security or Conventional Commits workflows. The
+pull-request observations below cover those event paths separately.
 
 Repository evidence comes from `.github/workflows/ci.yml`,
 `.github/workflows/security.yml`, `.github/workflows/benchmarks.yml`,
@@ -65,7 +78,15 @@ and CircleCI's [workflow orchestration](https://circleci.com/docs/guides/orchest
 [pricing](https://circleci.com/pricing/), and [the current price
 list](https://circleci.com/pricing/price-list/).
 
-## Current GitHub Actions topology
+## Current GitHub Actions topology at the refresh baseline
+
+At `8234964a2ed94c007153d19204f8bd86d605549c`, `ci.yml` runs on pushes to
+`main` and on pull requests. Its `Verify` and `Integration and container smoke
+tests` jobs are independent roots on `ubuntu-24.04`, each with a 15-minute
+timeout; the workflow cancels an earlier run for the same workflow and ref.
+The required pull-request `audit` context and informational pull-request title
+check remain independent roots in the Security and Conventional Commits
+workflows. The baseline push run above exercised only the two `ci.yml` jobs.
 
 ### Pull-request DAG
 
@@ -142,18 +163,18 @@ job duration starts when the job begins executing.
 | [33786203382](https://github.com/winrarr/runnel/actions/runs/33786203382) | 4m54s | 2m37s | 3m58s | Both jobs waited about 55 seconds before starting. |
 | [33785348288](https://github.com/winrarr/runnel/actions/runs/33785348288) | 5m05s | 4m03s | 3m53s | Verify waited about 61 seconds; integration waited about 72 seconds. |
 | [33769610401](https://github.com/winrarr/runnel/actions/runs/33769610401) | 13m59s | 3m04s | 2m12s | Verify did not start until about 10m54s after workflow creation; queue time dominated the wall clock. |
-| [34043270435](https://github.com/winrarr/runnel/actions/runs/34043270435), current baseline SHA | 3m19s | 3m13s | 2m16s | Both jobs started within five seconds of workflow creation; the run completed successfully. |
+| [34043270435](https://github.com/winrarr/runnel/actions/runs/34043270435), initial desk-evaluation baseline SHA | 3m19s | 3m13s | 2m16s | Both jobs started within five seconds of workflow creation; the run completed successfully. |
 
-The baseline run is therefore roughly four minutes of runner execution on a
-successful warm-ish path, with observed workflow wall time from 3m51s to
-13m59s in this small sample. The sample spans different commits, runner
+The baseline run in this original sample is therefore roughly four minutes of
+runner execution on a successful warm-ish path. Workflow wall time ranged from
+3m51s to 13m59s in this small sample. The sample spans different commits, runner
 availability, and unrecorded cache state, so it does not establish a GitHub
 performance distribution or a provider advantage. It does establish that a
 trial must separate queue time, executor startup, cache restore, image build,
 test execution, and post-job upload time. No comparable CircleCI timestamps,
 cache hits, retries, artifacts, or contributor interactions are available.
 
-The current baseline run is a `push` run, so it does not include the separate
+That initial baseline run is a `push` run, so it does not include the separate
 pull-request security or title jobs. A security and status-surface timing
 comparison needs an actual PR event (or an equivalent manual trial invocation),
 and should record the push-only commit-subject check separately.
@@ -221,6 +242,100 @@ that component. The sample does not change the evaluation: GitHub Actions
 remains the current baseline, and the required hosted CircleCI trial is still
 needed to compare providers, cache behavior, variability, diagnostics, and
 contributor experience under equivalent workloads.
+
+## Recent GitHub Actions evidence (2026-09-29)
+
+The following PR CI runs and the current baseline run were read from GitHub's
+workflow and job records. Timestamps are UTC. Workflow elapsed is run creation
+to completion; job elapsed is `started_at` to `completed_at`; command-step
+elapsed uses the named `just` step timestamps. Queue/startup interval is the
+workflow creation-to-job-start interval and does not isolate runner
+provisioning.
+
+The latest-head PR runs for [#314](https://github.com/winrarr/runnel/pull/314)
+through [#319](https://github.com/winrarr/runnel/pull/319) all passed:
+
+| PR / CI run (head) | Workflow elapsed | Verify job / `just verify` | Integration job / image build / `just integration` |
+| --- | ---: | ---: | ---: |
+| [#314](https://github.com/winrarr/runnel/pull/314) · [36582901542](https://github.com/winrarr/runnel/actions/runs/36582901542) (`d608a31`) | 3:04 | [109455465042](https://github.com/winrarr/runnel/actions/runs/36582901542/job/109455465042) · 3:00 / 2:43 | [109455465123](https://github.com/winrarr/runnel/actions/runs/36582901542/job/109455465123) · 2:24 / 0:10 / 1:36 |
+| [#315](https://github.com/winrarr/runnel/pull/315) · [36583750740](https://github.com/winrarr/runnel/actions/runs/36583750740) (`278724a`) | 3:07 | [109458443748](https://github.com/winrarr/runnel/actions/runs/36583750740/job/109458443748) · 3:04 / 2:47 | [109458443609](https://github.com/winrarr/runnel/actions/runs/36583750740/job/109458443609) · 2:30 / 0:20 / 1:37 |
+| [#316](https://github.com/winrarr/runnel/pull/316) · [36587488584](https://github.com/winrarr/runnel/actions/runs/36587488584) (`d89c8d1`) | 3:14 | [109471578565](https://github.com/winrarr/runnel/actions/runs/36587488584/job/109471578565) · 3:10 / 2:46 | [109471578069](https://github.com/winrarr/runnel/actions/runs/36587488584/job/109471578069) · 2:27 / 0:10 / 1:37 |
+| [#317](https://github.com/winrarr/runnel/pull/317) · [36590942018](https://github.com/winrarr/runnel/actions/runs/36590942018) (`f5ff684`) | 3:13 | [109483540748](https://github.com/winrarr/runnel/actions/runs/36590942018/job/109483540748) · 3:10 / 2:43 | [109483541520](https://github.com/winrarr/runnel/actions/runs/36590942018/job/109483541520) · 2:17 / 0:07 / 1:37 |
+| [#318](https://github.com/winrarr/runnel/pull/318) · [36589892497](https://github.com/winrarr/runnel/actions/runs/36589892497) (`30dc980`) | 3:35 | [109479935480](https://github.com/winrarr/runnel/actions/runs/36589892497/job/109479935480) · 3:32 / 3:07 | [109479934785](https://github.com/winrarr/runnel/actions/runs/36589892497/job/109479934785) · 2:06 / 0:05 / 1:37 |
+| [#319](https://github.com/winrarr/runnel/pull/319) · [36593723692](https://github.com/winrarr/runnel/actions/runs/36593723692) (`996ca33`) | 2:49 | [109493130778](https://github.com/winrarr/runnel/actions/runs/36593723692/job/109493130778) · 2:46 / 2:28 | [109493131062](https://github.com/winrarr/runnel/actions/runs/36593723692/job/109493131062) · 2:13 / 0:05 / 1:38 |
+
+For these six latest-head samples, Verify and Integration began 2–4 seconds
+after workflow creation and ran concurrently. The table separates total job
+time from the command itself: Verify jobs took 2:46–3:32 while `just verify`
+took 2:28–3:07; Integration jobs took 2:06–2:30 while `just integration`
+took 1:36–1:38. These are a small, uncontrolled sample across different PR
+heads and cache states, not a latency distribution or provider comparison.
+
+PR #319 merged at 2026-09-29 15:58:27 UTC, producing the refresh baseline
+`8234964a2ed94c007153d19204f8bd86d605549c`. The main push run
+[36594267809](https://github.com/winrarr/runnel/actions/runs/36594267809)
+started at 15:58:29 UTC and completed at 16:01:40 UTC (3:11 workflow elapsed).
+Its jobs started concurrently at 15:58:32 UTC:
+
+| Job | GitHub job record | Job interval and elapsed | Named command/build step |
+| --- | --- | --- | --- |
+| Verify | [109495003994](https://github.com/winrarr/runnel/actions/runs/36594267809/job/109495003994) | 15:58:32–16:01:39 (3:07) | `just verify`: 15:58:46–16:01:38 (2:52) |
+| Integration and container smoke tests | [109495004348](https://github.com/winrarr/runnel/actions/runs/36594267809/job/109495004348) | 15:58:32–16:00:46 (2:14) | Image build: 15:58:59–15:59:05 (0:06); `just integration`: 15:59:05–16:00:42 (1:37) |
+
+The API-derived Verify job interval is 3:07; the `just verify` step interval is
+2:52. These are separate measures. The workflow's 3:11 wall time includes its
+three-second start interval and completion after the later job.
+
+### First-attempt Verify failures and same-head reruns
+
+Two later PRs recorded a first-attempt Verify failure and one passing rerun on
+the same head. The job and step intervals below are the timestamps GitHub
+reports; the two attempts share one run ID each.
+
+- **[#320](https://github.com/winrarr/runnel/pull/320), head
+  `0a41afd1628ceb213d1c06b5766d7a1c7eb26063`:** [CI run 36593402467,
+  attempt 1](https://github.com/winrarr/runnel/actions/runs/36593402467/attempts/1)
+  had Verify job [109492031160](https://github.com/winrarr/runnel/actions/runs/36593402467/job/109492031160)
+  run 15:51:41–15:59:14 UTC (7:33); its `just verify` step ran
+  15:52:02–15:59:11 (7:09). The `three_process_cluster_replicates_and_recovers_after_failures`
+  test ended after 265.35 seconds with a metrics-readiness deadline and
+  `Resource temporarily unavailable (os error 11)`. The integration job passed
+  on this attempt. [Attempt 2 of the same run](https://github.com/winrarr/runnel/actions/runs/36593402467/attempts/2)
+  passed on the unchanged head: Verify job
+  [109495548144](https://github.com/winrarr/runnel/actions/runs/36593402467/job/109495548144)
+  ran 15:59:48–16:04:28 (4:40); `just verify` ran 16:00:08–16:04:25 (4:17).
+
+- **[#321](https://github.com/winrarr/runnel/pull/321), head
+  `994d16db6c026222e4f4b951c2cab59b123dbfb3`:** [CI run 36594248552,
+  attempt 1](https://github.com/winrarr/runnel/actions/runs/36594248552/attempts/1)
+  had Verify job [109494937311](https://github.com/winrarr/runnel/actions/runs/36594248552/job/109494937311)
+  run 15:58:24–16:00:54 UTC (2:30); `just verify` ran 15:58:43–16:00:50
+  (2:07). The `partial_request_times_out_and_unrelated_health_recovers` test
+  failed after its five-second subprocess HTTP-readiness wait with the generic
+  message `runnel HTTP endpoint did not become ready`. At this head the helper
+  redirects child stdout and stderr to null, kills and reaps the child after a
+  readiness failure without reporting the child's exit status, then returns
+  only that generic message, so the log does not identify why readiness
+  failed. This diagnostic gap is tracked in
+  [TD-027](../tech-debt.md#td-027-real-server-test-startup-failures-lose-child-diagnostics).
+  [Attempt 2 of the same run](https://github.com/winrarr/runnel/actions/runs/36594248552/attempts/2)
+  passed on the unchanged head: Verify job
+  [109496727793](https://github.com/winrarr/runnel/actions/runs/36594248552/job/109496727793)
+  ran 16:02:32–16:05:42 (3:10); `just verify` ran 16:02:52–16:05:38 (2:46).
+
+The separate checks also passed on the initial PR events: #320 Security/Audit
+run [36593402432](https://github.com/winrarr/runnel/actions/runs/36593402432)
+completed at 15:51:52 UTC and title run
+[36593402769](https://github.com/winrarr/runnel/actions/runs/36593402769)
+completed at 15:51:47; #321 Security/Audit run
+[36594248498](https://github.com/winrarr/runnel/actions/runs/36594248498)
+completed at 15:58:39 and title run
+[36594248454](https://github.com/winrarr/runnel/actions/runs/36594248454)
+completed at 15:58:27. These workflows are separate from CI elapsed. Both
+same-head retries passed once, but that does not establish that either test is
+flaky, explain either failure, or estimate failure frequency. Retain the
+first-attempt outcomes and retry intervals in future comparisons. This small
+sample does not change the evaluation or establish a provider advantage.
 
 ## CircleCI equivalence assessment
 
