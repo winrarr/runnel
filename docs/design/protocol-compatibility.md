@@ -2,37 +2,46 @@
 
 - Status: proposed design; not an accepted compatibility contract
 - Date: 2026-09-02
-- Last reviewed: 2026-09-06
-- Baseline: `8a35c83c239bfeacac9e071d71e0cbafca47f23a`
+- Last reviewed: 2026-09-29
+- Baseline reviewed: `3d2f2a6a68ef978ed43a0735159f26db332483d9`
 - Scope: public client/broker requests and responses
 - Related debt: TD-003, TD-018, TD-023, TD-025, and [Make client interactions dependable and evolvable](../backlog.md#make-client-interactions-dependable-and-evolvable)
 - Related evidence: [clustered outcome contract](clustered-outcome-contract.md), [application-aware retry policy](application-aware-retry-policy.md), [durability and delivery policy](durability-delivery-policy.md), [message encoding and compression research](../research/message-encoding-and-compression.md), [ADR 0022](../decisions/0022-provisional-binary-payloads.md), [ADR 0024](../decisions/0024-explicit-offset-replay-read.md), and [ADR 0026](../decisions/0026-semantic-engine-error-classification.md)
 
-This note defines the smallest useful compatibility policy for the current
-wire and a direction for its next evolution. It records observed behavior and
-proposals separately. Nothing here closes TD-003: the versioned runtime,
-interoperability matrix, and upgrade/recovery evidence are still required. ADR
-0026 closes the engine-level portion of TD-025, but stage-aware outcomes remain
-outside the provisional wire.
+This note records the current wire boundary and recommends a path to a
+versioned client/broker contract. Observations are tied to the baseline above;
+the proposed behavior is not an accepted compatibility contract. The crate's
+v1 support constants are source metadata only. Nothing here closes TD-003:
+runtime negotiation, interoperability, and upgrade/recovery evidence are still
+required. ADR 0026 closes the engine-level portion of TD-025, but stage-aware
+outcomes remain outside the provisional wire.
 
 ## Policy summary
 
-Keep the existing line-delimited JSON mode as provisional `v1`. It has no
-negotiated version and no promise that an old client can consume every future
-operation. Preserve its existing text and explicit binary forms while clients
-and servers are being made dependable.
+Treat the existing line-delimited JSON mode as the provisional `v1`
+implementation label, not a cross-release compatibility promise. Its current
+support declaration is not sent over a connection. Continuing to accept v1
+during a migration is an option to evaluate, not a commitment to support it
+indefinitely.
 
-For the next protocol, use a connection-scoped, versioned, length-delimited
-envelope. Select it with an unambiguous connection preface and a Hello exchange
-that advertises protocol versions, capabilities, payload encodings, and frame
-limits. Do not switch framing or downgrade after application data has been
-exchanged. The exact preface, schema codec, and field layout require a later
-ADR and implementation tests.
+For the first actually negotiated protocol, prefer a connection-scoped Hello
+that selects one protocol version and its required capabilities before any
+application request. The proposed v2 transport uses an unambiguous preface and
+bounded length-delimited frames. Keep the first version request/response
+sequential, matching the current persistent-client behavior; add correlation
+IDs only if multiplexed or out-of-order requests are deliberately introduced.
+The exact preface, schema codec, transition mode, and field layout require an
+ADR and real-server tests before implementation.
 
 The logical message remains an opaque payload, an optional UTF-8 key, a broker
 offset, and delivery metadata. Wire encoding, compression, and durable storage
 are separate choices. A new wire representation must not alter acknowledgement,
 redelivery, ordering, durability, or the meaning of an offset.
+
+The rollout must not treat protocol negotiation as evidence that clustered
+peer RPCs or on-disk formats are compatible. Those are independent contracts.
+The source-backed reference comparison and recommendation are in
+[Reference designs and alternatives](#reference-designs-and-alternatives).
 
 ## Current v1: observed boundary
 
@@ -44,8 +53,8 @@ automatically. The current operation surface is:
 
 | Direction | Tags | Compatibility-relevant fields |
 | --- | --- | --- |
-| Request | `create_stream`, `publish`, `publish_bytes`, `publish_batch`, `poll`, `replay`, `poll_group`, `ack`, `ack_group`, `health` | UTF-8 names, keys, and consumer/member identities; text `payload`; explicit `payload_base64`; optional publish `request_id`; batch records and ordered outcomes; inclusive replay `offset` |
-| Response | `stream_created`, `published`, `publish_batch`, `message`, `message_bytes`, `replay_message`, `replay_message_bytes`, `empty`, `acknowledged`, `health`, `error` | offsets, text or binary payload, optional group delivery fields for normal delivery, replay without delivery state, acknowledgement state, stable error `code` and human-readable `message` |
+| Request | `create_stream`, `publish`, `publish_bytes`, `publish_batch`, `poll`, `replay`, `poll_group`, `configure_consumer`, `inspect_consumer`, `ack`, `ack_group`, `health` | UTF-8 names, keys, and consumer/member identities; text `payload`; explicit `payload_base64`; optional publish or per-record `request_id`; ordered batch outcomes; inclusive replay `offset`; durable consumer-policy settings |
+| Response | `stream_created`, `published`, `publish_batch`, `message`, `message_bytes`, `replay_message`, `replay_message_bytes`, `empty`, `acknowledged`, `consumer_policy`, `health`, `error` | offsets, text or binary payload, optional group delivery fields for normal delivery, replay without delivery state, acknowledgement and consumer-policy state, current error `code` and diagnostic `message` |
 
 The current wire rules are deliberately narrow:
 
@@ -81,6 +90,13 @@ The current wire rules are deliberately narrow:
   engines scope it per stream and return the original offset when it is reused,
   even if the retry's key or payload differs; there is no producer namespace,
   request fingerprint, or retention window in the current v1 contract.
+- A TCP connection can remain open for multiple requests, but the server
+  handles requests serially and the reusable Rust client waits for each
+  response before sending its next request. There is no v1 pipelining,
+  multiplexing, or response-correlation field; response order supplies the
+  association. The client discards a connection after transport/read failure,
+  response-size overflow, or an unexpected typed response and callers reconnect
+  explicitly.
 
 The current [server retry test](../../crates/runnel-server/tests/client_retry.rs)
 demonstrates the important outcome boundary: after a response is lost, the
@@ -134,20 +150,37 @@ The compatibility boundary at the same baseline is narrower:
   frame/response limit, or typed unsupported-version result.
 - The v1 error response contains a code and diagnostic message, not an
   authoritative operation stage/outcome. The reusable client therefore keeps
-  conservative classifications: local validation and clearly pre-write
-  failures can be rejected/retried, while post-write timeout, EOF, and response
-  loss remain unknown.
+  client-local classifications: `connection_limit`, `request_saturated`, and
+  `stream_not_ready` are retryable; `request_timeout`, `storage_error`,
+  `consumer_state_error`, `internal_error`, `cluster_error`, and
+  `corrupt_record` are unknown; other broker error codes are rejected. Local
+  encoding/validation failures are rejected, connection-establishment failures
+  are retryable, and transport failures once a request may be writing are
+  unknown. These categories are not carried by the v1 wire and are not a
+  cross-language promise.
 - The client can bound response buffering with `max_response_bytes`, but the
   server does not advertise or enforce that client-local value as a connection
   property. Reconnecting does not renegotiate it.
+
+The current wire bounds are asymmetric: the server's configurable request-frame
+limit is 1 through 64 MiB (including JSON/base64 representation), publish
+batches are additionally limited to 1,024 records and 64 MiB of encoded
+request bytes, and the client defaults its response buffer to 65 MiB. The
+server serializes a response before writing and has no corresponding
+configured response-frame ceiling. Connection count, in-flight work, and
+request-timeout settings are local admission controls, not capabilities the
+listener advertises. A negotiated design should expose only limits the client
+must obey, with separate client-to-server and server-to-client encoded-frame
+bounds and explicit batch limits; an advertised timeout or capacity must not
+imply that resources are reserved for a request.
 
 Consequently, a v1 client and server sharing the same Rust declaration is not
 evidence of cross-release interoperability. An unknown operation currently
 fails through v1 request/response parsing; it is not a capability probe with a
 stable fallback contract. Future v2 work must keep these resource limits
-independent from a connection-scoped version/capability handshake, explicitly
-negotiate any limits that affect wire behavior, and add the real-server
-old/new, no-overlap, reconnect, and malformed-preface tests listed below.
+independent from a connection-scoped version/capability handshake and add the
+real-server old/new, no-overlap, reconnect, and malformed-preface tests listed
+below.
 
 The accepted [engine error classification](../decisions/0026-semantic-engine-error-classification.md)
 is deliberately narrower than a future wire outcome contract. `BrokerError::kind()`
@@ -163,38 +196,85 @@ client.
 
 ### Version and framing
 
-The v1 listener remains available while v2 is introduced. A v2 connection
-starts with a reserved, unambiguous preface and then exchanges `Hello` messages
-before application requests. Hello negotiates a mutually supported protocol
-major/minor range and capabilities such as binary payloads, publish batches,
-maximum frame and batch bytes, and supported compression. The server rejects
-no-overlap with a typed unsupported-version result and closes or drains the
-connection; it must not guess a format from malformed bytes.
+The first negotiated release should select one protocol major before any
+application request. A bounded preface identifies the wire family and keeps
+the server from guessing a codec from arbitrary bytes; a small `Hello` then
+exchanges supported major/minor ranges and the capabilities each side needs.
+The server selects one common version, reports the selected capability set and
+wire limits, or returns an explicit `unsupported_version` or
+`unsupported_capability` refusal and closes the connection. The client must
+validate that the selection is within its offer. A minor version may add only
+documented compatible behavior; use a new major or operation version when
+existing field or operation meaning changes. Do not negotiate each operation
+separately until independent API version ranges solve a real compatibility
+problem.
 
-V2 frames are length-delimited and bounded before allocation. Each application
-frame carries an opaque `correlation_id`; the response repeats it. This is
-needed for matching responses if v2 later permits concurrent in-flight
-requests. It is distinct from the application operation identity used to
-resolve an ambiguous mutation. V1 `request_id` is publish-only; v2 may define a
-generic `operation_id` or another name, but must not silently broaden the v1
-field's scope. A retry may use a new correlation ID and must reuse the same
-stable operation identity when deduplication or resolution is requested.
+V2 frames should be length-delimited and bounded before allocation. The Hello
+itself must also have a small fixed upper bound. Negotiate separate encoded
+frame limits in each direction, plus operation-specific limits such as maximum
+batch records/bytes and supported payload encodings. Keep application payload
+size distinct from encoded frame size, especially if base64 or compression is
+used. Advertise only limits the client must obey; admission capacity,
+connection-count, and timeout settings do not reserve resources and are not
+connection capabilities. Compression remains opt-in and must have bounded
+decoded size and work before it is accepted.
 
-Negotiation is connection-scoped. A reconnect performs Hello again because
-the peer may have been upgraded or rolled back. A v2 connection never changes
-frame format midstream, and a v1 client never sends a v2 operation merely
-because a server understands it.
+The current Rust client keeps one TCP connection open and sends one request
+then waits for one response. Preserve that ordered sequential exchange in the
+first negotiated release. Response order already identifies the request, so a
+`correlation_id` adds no value until pipelining, out-of-order completion, or
+multiplexing is intentionally supported. If that capability is later added,
+use an opaque per-attempt correlation ID and echo it in responses. It remains
+separate from an application operation identity: a retry may use a new
+correlation ID but must reuse the same stable identity when the broker supports
+deduplication or outcome lookup. V1 `request_id` is publish-only; do not
+silently broaden its scope.
 
-This direction follows two useful reference patterns. [Kafka's protocol
-guide](https://kafka.apache.org/42/design/protocol/) versions each API, has a
-client select the highest mutually supported version, returns the response
-shape for the requested version, and repeats discovery after reconnect. [NATS's
-client protocol](https://docs.nats.io/reference/protocols/client) keeps a
-simple text protocol but sends an initial `INFO` with protocol capabilities and
-limits, then uses explicit byte counts for message payloads. Runnel needs the
-first pattern for schema evolution and the second pattern's inspectable
-capability/limit boundary; its v1 JSON mode already exists and cannot gain a
-handshake without changing current clients.
+Negotiation is connection-scoped. Every reconnect performs Hello again because
+the peer may have been upgraded, rolled back, or may enforce different limits.
+A v2 connection never changes framing midstream. Do not silently downgrade
+after an application request; a client may use v1 only through an explicit
+mode or a separately specified, pre-request legacy-detection rule.
+
+### Transition alternatives
+
+Three transition shapes remain possible:
+
+| Alternative | Benefit | Cost and risk |
+| --- | --- | --- |
+| Replace provisional v1 at a documented development break | No dual parser or indefinite legacy promise; consistent with the fact that v1 has no compatibility guarantee. | Existing separately upgraded clients and broker processes stop interoperating until both are updated. |
+| Dispatch v1 and v2 on the current listener using a reserved v2 preface | Keeps one configured endpoint and allows a bounded server-first migration. | A v1-only server cannot return a typed negotiation refusal; clients need a narrowly defined legacy detection or explicit v1 mode. The dispatcher and fixtures must prove the preface cannot be interpreted as a v1 application request. |
+| Add a separate v2 listener | Makes protocol selection explicit and avoids first-byte dispatch ambiguity. | Adds listener configuration, ports, deployment wiring, health/admission policy, and client configuration during the transition. |
+
+Because the repository states no v1 backward-compatibility commitment and has
+no published external client matrix, do not keep a dual listener merely to
+preserve an assumed promise. Prefer a deliberate protocol replacement unless
+an actual independently deployed client needs overlap. If overlap is required,
+use same-listener dispatch for one measured migration window; keep v1 and v2
+feature sets separate and make v1 use explicit. Never infer that a listener
+transition also upgrades peer RPC or durable storage.
+
+### Reference designs and alternatives
+
+These primary protocol documents were reviewed on 2026-09-29. They show
+patterns to compare, not compatibility guarantees Runnel can inherit.
+
+| Reference | Relevant behavior | Application to Runnel |
+| --- | --- | --- |
+| [Apache Kafka protocol guide](https://kafka.apache.org/43/design/protocol/) | Each request identifies an API key and version; `ApiVersions` discovers broker ranges; clients choose a common version, receive the schema for that request version, and rediscover after reconnect. A no-overlap result is explicit. | Adopt discoverable supported ranges, exact selected wire versions, an explicit no-overlap refusal, and reconnect discovery. Kafka versions requests per API because its API surface and broker routing need it; Runnel should start with one connection-scoped version and add per-operation ranges only when independently evolving operations justify the larger test matrix. |
+| [NATS client protocol](https://docs.nats.io/reference/protocols/client) | The server sends an initial JSON `INFO` containing feature flags, protocol level, and `max_payload`; later `INFO` may update connection-visible topology. `PUB` and `HPUB` carry byte counts before opaque payload bytes. | Adopt inspectable capability/limit discovery and count payloads in bytes. NATS is not mutual version negotiation: its server-first capability message and asynchronous topology updates solve different needs. Runnel currently has no client handshake or topology discovery, so these should not be implied by copying the `INFO` shape. |
+| [Protocol Buffers v3 evolution guidance](https://protobuf.dev/programming-guides/proto3/) | Additive fields can be wire-safe when old readers ignore them; binary parsers preserve unknown fields, but conversions through JSON or field-by-field copying can drop them. Unknown enum representation varies by language, and field numbers must not be reused. | If a tagged binary schema is selected, reserve removed tags, define presence/defaults, keep unknown values observable, and test each supported generated client. Protobuf guidance concerns schema evolution, not transport negotiation, outcome semantics, or the choice of Runnel's frame format. |
+
+The existing base64 JSON bridge is easiest to inspect and use from shell
+clients, but expands opaque bytes and charges the expanded representation
+against the request bound. A tagged binary envelope can represent bytes without
+base64 and gives generated clients a formal schema, while increasing schema,
+tooling, and unknown-field behavior commitments. CBOR can represent bytes with
+less schema-generation overhead, but still needs an independently documented
+evolution policy. The [encoding research](../research/message-encoding-and-compression.md)
+contains the broader measurements and tradeoffs; this proposal does not select
+Protobuf, CBOR, or a custom codec. The protocol and logical payload contract
+can be specified before that codec choice is made.
 
 ### Compatible changes
 
@@ -250,10 +330,13 @@ explicitly optional extension mechanism; capability negotiation must prevent
 silent loss of required behavior.
 
 Unknown operation/discriminator values are never treated as a known operation.
-Return an explicit unsupported result and keep the connection usable only if
-the framing/parser state is known to be intact. A malformed preface or an
-invalid frame may not have enough structure for a typed response and may need
-to close the connection instead.
+For a well-formed v2 envelope, return a stable `unsupported_operation` result;
+keep the connection usable only if the frame boundary and parser state remain
+known. Unsupported protocol versions or required capabilities are preflight
+refusals: no application operation has been attempted, so they need no
+operation outcome. A malformed preface, impossible frame length, or truncated
+frame may not have enough structure for a typed response and should close the
+connection.
 
 V2 enum fields should use an open representation or preserve the raw value.
 An unknown value must be surfaced as unknown, not silently mapped to a
@@ -262,8 +345,28 @@ decision, reject it as unsupported. This follows the [Protocol Buffers
 evolution guidance](https://protobuf.dev/programming-guides/proto3/), which
 documents additive fields, unknown-field preservation, reserved field numbers,
 and the fact that unrecognized enum values may be represented differently by
-generated languages. If Protocol Buffers is selected, never reuse removed field
-numbers and use an explicit zero/unspecified enum value.
+generated languages. If Protobuf is selected, never reuse removed field
+numbers, use an explicit zero/unspecified enum value, and make the client API
+preserve an unrecognized value rather than selecting a semantic default.
+
+### Negotiation refusal and operation errors
+
+Keep connection negotiation errors separate from errors for an attempted
+operation. A version or required-capability refusal happens before application
+traffic and closes the connection; a well-formed unsupported operation can be
+rejected while keeping the connection only when its framing remains
+synchronized. Invalid framing and oversized frames close the connection because
+the next frame boundary cannot safely be assumed. These are candidate v2
+semantics, not current v1 responses.
+
+For an application error, v2 should carry both a stable machine-readable code
+and an explicit outcome class. `Rejected` and `Retryable` are valid only when
+the broker can establish that the operation did not apply. A timeout after a
+request may have crossed the durability boundary is `Unknown`, even if the
+server knows which stage timed out. Report a stage only when it is authoritative
+and useful to clients. The code explains the reason; the outcome class explains
+safe retry behavior. Clients should not derive retry safety from a growing list
+of error codes.
 
 ### Binary payloads
 
@@ -291,62 +394,87 @@ V2 should make these concepts explicit:
 
 | Concept | Meaning | Retry rule |
 | --- | --- | --- |
-| `correlation_id` | Matches one response to one wire attempt | New value is valid on a retry; never implies deduplication |
-| `operation_id` | Future stable application identity for one operation intent across retries and forwarding | Reuse exactly when resolving an unknown operation; a mismatch must be an explicit error |
+| `correlation_id` | Optional future field that matches one response to one wire attempt if multiplexing is added | New value is valid on a retry; never implies deduplication |
+| Candidate `operation_id` | A stable application identity only for operations with designed durable deduplication or outcome lookup | If supported, reuse exactly to resolve an unknown operation; a mismatch must be an explicit error |
 | v1 `request_id` | Current publish-only identity, scoped per stream and without a stored fingerprint | Reuse resolves the stored offset today; v2 must not assume this behavior is sufficient for generic operations |
 | confirmed | The broker returned the operation's success result | Do not replay unless the application intentionally requests another message |
 | rejected | The broker definitely did not apply the operation | Fix the request or policy before retrying |
 | retryable | The broker definitely did not apply it and a new connection/attempt is safe | Retry with the same intent; preserve request identity when applicable |
 | unknown | The broker may have applied it | Reconnect and resolve by request identity or inspect state; do not blindly resend |
 
-V2 error responses should carry an explicit outcome class in addition to a
-stable machine-readable code and diagnostic message. This avoids forcing each
-client implementation to infer retry safety from an ever-growing code list.
-The class should describe the attempt outcome, not pretend to be stage
-evidence; a separate stage field is useful only if the broker can establish it
-authoritatively. The server must never label an operation retryable when it may
-have crossed the durability or application boundary. Publish batches must
-retain one outcome per record and must not imply atomicity unless a separately
-negotiated operation provides it.
+Do not add a generic `operation_id` until its storage and lifecycle semantics
+are designed. The current `request_id` is publish-only, per-stream, persists
+with the record, and does not fingerprint key or payload; reusing it with
+different content returns the earlier offset. A generic identity would need a
+namespace, retention/lifetime bound, collision and content-mismatch behavior,
+forwarding scope, and crash-recovery contract for each supported operation.
+Where no durable deduplication or lookup exists, return `Unknown` and direct
+the caller to inspect state or apply its own reconciliation; an ID field alone
+does not make retry safe. Batch results must retain one outcome per record and
+must not imply batch atomicity unless a separately designed operation provides
+it.
 
-The reference point is [Kafka's producer design](https://kafka.apache.org/42/design/design/):
-it distinguishes a network error after a publish from a definitely failed
-operation and provides idempotent producer sequencing so retries do not create
-duplicates. Runnel's current v1 request identity is deliberately smaller and
-application-provided, so the future contract must document the generic
-identity's scope, lifetime, collision behavior, fingerprint, and whether it
-applies to single publishes and batch records independently.
+The reference point is [Kafka's producer design](https://kafka.apache.org/43/design/design/):
+it distinguishes uncertain publish attempts from definitely failed requests
+and provides producer sequencing for idempotent retries. That mechanism has
+broker-side producer state and sequencing semantics Runnel does not have.
+Borrow the explicit outcome distinction, not the assumption that adding a
+generic ID field creates idempotence.
 
 ### Upgrade and rollback
 
-The supported rollout shape should be server-first and additive:
+There is no observed independently deployed client population or published v1
+support matrix yet. Thus a server-first rollout is a conditional migration
+plan, not a current support commitment. If separate client and broker releases
+need overlap, use this staged path:
 
-1. Deploy a server that still accepts v1 and also supports a v2 negotiation
-   path, without making v2 the default for existing clients.
-2. Deploy clients that can negotiate v2 but retain v1 fallback and preserve
-   explicit outcome handling.
-3. Enable v2 features only after capability and restart/unknown-outcome checks
-   pass for the intended client population.
-4. Retire v1 only in a separately announced breaking release after usage is
-   measurable and a migration window exists.
+1. Publish the exact v1/v2 support matrix and decide whether a bounded dual
+   listener is needed. If replacing v1, coordinate broker and Rust-client
+   rollout at a documented breaking boundary.
+2. Where overlap is needed, upgrade every broker node to a server that accepts
+   v1 and v2 before v2 is enabled in clients. Keep new clients in explicit v1
+   mode during a mixed-node upgrade; a per-node Hello does not prove every
+   cluster node can handle a v2-only capability.
+3. Upgrade the supported Rust client and CLI to negotiate v2. Enable v2 only
+   after old/new fixtures, real-server restart and unknown-outcome checks, and
+   a release-specific client population check pass. Keep v1 use explicit while
+   the migration window is open; do not retry a failed v2 handshake as v1 on
+   timeout, EOF, or malformed data.
+4. Remove v1 only at a separately documented breaking boundary after actual
+   usage and migration needs are known. If there is no deployed v1 population,
+   do not add an indefinite deprecation window by assumption.
 
-Rollback to an older server is safe only while clients can use v1 and no
-v2-only operation or required semantic has been enabled. Once v2 frames or
-v2-only semantics are in flight, drain or fence those clients before rollback;
-do not downgrade mid-connection. A wire upgrade also does not automatically
-migrate retained storage, journals, snapshots, consumer state, or engine
-selection; those boundaries need their own version and rollback policy. The
-single-node-to-cluster migration design is a separate logical data-movement
-problem, not a protocol-version fallback.
+| Client and server | Required behavior during an explicitly supported transition |
+| --- | --- |
+| v1 client to v1-only server | Current provisional wire behavior only; no cross-release promise is established. |
+| v1 client to dual v1/v2 server | Use the v1 path and v1 schemas; do not infer support for v2 operations from the server process being newer. |
+| v2-required client to v1-only server | Fail before application traffic. A v1-only listener may answer a v2 preface with generic `invalid_request` or close it; the v2 client must treat this as failed negotiation, not a broker operation outcome. |
+| v2 client to v2 server with overlap | Use the exact selected version and capability subset. A required capability with no overlap is a typed preflight refusal; optional unsupported behavior needs an explicit safe fallback. |
+| mixed-version cluster nodes | Keep v2-only operations disabled until every node that can accept or forward them supports the required behavior. External protocol agreement does not imply peer-protocol or storage compatibility. |
+
+An explicit client-configured v1 mode can serve as a temporary fallback if the
+operation is representable without losing semantics. Automatic fallback is
+only safe before application requests and requires a defined legacy-detection
+response; never infer compatibility from a timeout, EOF, or arbitrary parse
+error. Rollback to an older server is safe only when v2-only operations and
+required semantics have not been used and every participant understands the
+written state. Drain/fence v2 connections before a rollback and renegotiate on
+reconnect. A wire downgrade does not migrate retained storage, journals,
+snapshots, consumer state, or engine selection. The single-node-to-cluster
+migration is a separate logical data-movement problem.
 
 ## Compatibility fixtures and enforcement
 
-The current [wire test suite](../../crates/runnel-protocol/tests/wire.rs) pins
-the v1 boundary with source-level fixtures. It should remain small and
-language-neutral:
+The current [wire test suite](../../crates/runnel-protocol/tests/wire.rs)
+exercises Rust serialization/deserialization behavior; it is not a
+cross-language golden-fixture suite. v1 fixtures pin observed behavior for
+migration analysis only and do not grant a support promise. Keep fixtures
+language-neutral so future clients can consume supported protocol releases:
 
-- canonical request and response fixtures cover every current tag and exact
-  field names, including omitted optional fields;
+- canonical request and response fixtures should cover every current tag and
+  exact field names, including omitted optional fields. The current Rust suite
+  does not explicitly exercise the `inspect_consumer` request variant, so it
+  is not yet exhaustive even within this language;
 - fixtures cover reordered JSON members, because object order is not semantic,
   and reject duplicate-member fixtures rather than assigning them meaning;
 - request fixtures reject unknown fields on struct-bearing variants, reject
@@ -364,11 +492,16 @@ language-neutral:
 
 When v2 exists, add the following before calling it compatible:
 
-- golden v1 and v2 frames decoded by every supported client language;
+- golden frames for each protocol release still in its support window decoded
+  by every supported client language; include v1 only if a bounded v1
+  transition is actually selected;
 - a bidirectional old-client/new-server and new-client/old-server matrix for
-  every operation and capability boundary;
+  every supported transition mode, operation, and capability boundary,
+  including the v1-only-server refusal path and proof that no application
+  request was sent before negotiation completed;
 - real-server tests for negotiation, no-overlap, malformed prefaces, bounded
-  frames, reconnect renegotiation, and response correlation;
+  frames, reconnect renegotiation, response ordering, and typed refusal;
+  add response-correlation tests only if a multiplexing capability is accepted;
 - injected disconnect, timeout, cancellation, and lost-response tests at
   before-write, after-write, after-apply, and after-response points, checking
   confirmed/rejected/retryable/unknown classifications and request-ID replay;
@@ -386,15 +519,50 @@ and the clustered outcome tests establish only the engine-level classification.
 Implementing the negotiation boundary, then adding the real-server matrix
 above, is a follow-up required to retire TD-003.
 
+The current [real-server retry test](../../crates/runnel-server/tests/client_retry.rs)
+proves that a lost publish response is classified as `Unknown` and that the
+same v1 `request_id` can resolve it without appending a duplicate. It does not
+prove generic operation-ID behavior, cross-version negotiation, or that a v1
+error code carries a backend-independent apply stage. Retain that distinction
+in fixture names and compatibility reports.
+
 ## Unresolved decisions
 
-- Should v2 share the current listener with first-byte dispatch, or use a
-  separate listener during the migration window?
-- Is the preface plus Hello exchange preferable to a JSON Hello line, given
-  that v2 needs bounded binary frames and must not be confused with v1?
-- Should v2 version ranges be per operation, per connection, or both?
+- What exact preface and bounded Hello encoding identify the protocol, and is a
+  temporary same-listener v1 dispatcher needed for an actual deployed-client
+  population?
+- Should a later protocol introduce per-operation version ranges, or remain
+  connection-scoped if operation capabilities are sufficient?
 - Should the schema codec be Protocol Buffers, CBOR, or another bounded format?
-- What exact outcome vocabulary, error codes, request-ID scope/retention, and
-  batch-resolution operation are needed for non-publish requests?
-- What client/server support matrix and deprecation window are sufficient to
-  make rollback operationally safe?
+- What exact outcome vocabulary and machine-readable negotiation/error codes
+  make refusals distinct from operation failures across client languages?
+- What identity, retention, mismatch, and resolution contract is justified for
+  operations beyond publish, including per-record batch retries?
+- What resource limits are safe to renegotiate only on reconnect, and which
+  would ever need an in-band update?
+- Which external client languages and deployment patterns justify a published
+  support matrix and a v1 deprecation window?
+
+## Disposition and near-term implementability
+
+The compatibility finding is actionable soon, but implementation should follow
+an accepted ADR rather than adopting this proposal by implication. The existing
+protocol crate, persistent Rust client, listener, and real-process test harness
+provide a bounded starting point for a first negotiated Rust client/server
+slice: one version selection per connection, explicit capability and directional
+frame limits, sequential requests, typed preflight refusal, and an outcome
+class on operation errors. The project has not chosen a maintained non-Rust
+client language, so cross-language fixtures should be required before claiming
+interoperability but need not block the initial Rust runtime experiment.
+
+Keep codec selection, generic operation deduplication, compression,
+multiplexing, and indefinite v1 support outside that first slice until their
+user need and lifecycle costs are established. Before coding, decide the exact
+handshake bytes, compatibility/replace strategy, stable error model, and how
+v1 is detected or selected; then record the accepted consequence in an ADR and
+build old/new client-server fixtures plus real-server negotiation, reconnect,
+refusal, and ambiguous-outcome coverage. The existing client/backlog outcome
+and TD-003 already track runtime compatibility and interoperability; this
+research update does not warrant a duplicate backlog or tech-debt item. Update
+those records when implementation changes their current progress or retirement
+criteria.
