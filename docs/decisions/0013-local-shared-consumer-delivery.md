@@ -7,7 +7,7 @@
 
 The first shared-consumer implementation will live in `runnel-core` behind the topology-free engine contract. A named consumer owns durable progress, and multiple transient members can request work from that consumer. Different consumer names remain independent fan-out consumers.
 
-Grouped deliveries use opaque delivery tokens. Acknowledgements may complete out of order, and records with the same requested key are not delivered concurrently within one consumer. Expired deliveries can be assigned again, while acknowledgements from the previous delivery are rejected. The first slice keeps one outstanding delivery per member and uses the existing local persistence model.
+Grouped deliveries use opaque delivery tokens. Acknowledgements may complete out of order, and records with the same requested key are not delivered concurrently within one consumer. When an acknowledgement operation observes that its delivery lease has expired, it rejects that token as stale even if no replacement assignment has occurred. Expiry is demand-driven: no background timer changes ownership, and a later poll or acknowledgement observes the deadline. The first slice keeps one outstanding delivery per member and uses the existing local persistence model.
 
 The public development protocol adds explicit grouped poll and acknowledgement operations. The legacy poll and acknowledgement operations remain supported for the existing single-member behavior.
 
@@ -26,7 +26,7 @@ The clustered implementation was intentionally deferred while the local conforma
 - Local applications can share work between members without configuring partitions or worker assignments.
 - Grouped acknowledgements require a delivery token; this is an intentional development-protocol boundary for stale-delivery safety.
 - The first local dispatcher scans the in-memory record index and limits each member to one outstanding delivery. This is a correctness baseline, not the target performance architecture.
-- Grouped progress is durable, but active delivery leases are reconstructible volatile state and may redeliver after restart.
+- Grouped progress is durable, but active delivery leases are reconstructible volatile state and may redeliver after restart. A rejected acknowledgement does not advance progress; the delivery attempt remains available for redelivery.
 - Batching, cross-engine retry policy, dead-letter handling, and final clustered lease policy remain unfinished.
 - Stable virtual-shard or key-affine ownership is an exploratory optimization and must be benchmarked against this demand-driven baseline before adoption.
 

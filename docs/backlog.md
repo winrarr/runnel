@@ -144,7 +144,7 @@ Goal: let multiple worker instances share one durable consumer while preserving 
 
 Rationale: small applications need a single durable worker without extra coordination, while growing applications should be able to add workers without learning about partitions or triggering application-managed rebalancing.
 
-Current progress: local and clustered grouped delivery now cover durable attempts, out-of-order acknowledgements, expiry, stale-delivery fencing, bounded expiry lookup, and an initial real-process failure/rejoin path that preserves an acknowledged delivery and keeps its old token from committing again. The shared engine also reports currently tracked in-flight deliveries. Broader restart, failover, replay, retry-policy, dead-letter, and scalable ownership behavior remain incomplete.
+Current progress: local and clustered grouped delivery now cover durable attempts, out-of-order acknowledgements, expiry, stale-delivery fencing, bounded expiry lookup, and real-process restart/failure paths. Lease expiry fences an acknowledgement when that operation observes the deadline, even if no replacement poll has assigned the record; expiry remains demand-driven, with no background timer. The shared engine also reports currently tracked in-flight deliveries. Broader failover, replay, retry-policy, dead-letter, and scalable ownership behavior remain incomplete.
 
 Constraints:
 
@@ -158,8 +158,8 @@ Acceptance criteria:
 
 - multiple members of one consumer receive disjoint available work during normal operation;
 - different consumer names continue to receive independent copies of the stream;
-- a message whose delivery expires can be processed by another member, while its previous acknowledgement is rejected as stale;
-- the contract specifies whether lease expiry alone or reassignment fences a delivery, and local/clustered conformance tests assert the same acknowledgement result after the lease deadline but before any replacement poll;
+- a message whose delivery expires can be processed by another member, while an acknowledgement that observes an expired lease is rejected as stale even before reassignment;
+- local and clustered conformance tests assert the same acknowledgement result after the lease deadline but before any replacement poll;
 - messages with the same requested ordering key are not concurrently delivered to different members;
 - durable progress, replay, retry, and dead-letter behavior remain correct after restart and membership changes;
 - local and clustered engines share conformance tests for these outcomes.

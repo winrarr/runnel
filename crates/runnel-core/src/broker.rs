@@ -448,6 +448,8 @@ impl Broker {
         let mut consumer_state = stream_state
             .delivery
             .load_consumer_state_for_request(&root, stream, consumer)?;
+        // An acknowledgement observes lease expiry even before reassignment.
+        stream_state.delivery.expire(Instant::now());
         if offset < consumer_state.committed_offset {
             return Ok(AckResult::AlreadyAcknowledged);
         }

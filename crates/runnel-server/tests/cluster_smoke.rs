@@ -24,9 +24,9 @@ const RECOVERY_REQUEST_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(5);
 const REPLICATION_OBSERVER: &str = "replication-observer";
 #[cfg(feature = "test-replacement-recovery")]
 const SNAPSHOT_INTERRUPTION_ATTEMPTS: usize = 3;
-// This scenario checks stale-token fencing before acknowledging the current
-// delivery. A longer lease keeps a loaded CI runner from expiring the current
-// token while the intentionally stale acknowledgement is being committed.
+// This scenario checks expiry and stale-token fencing before acknowledging the
+// current delivery. A longer lease keeps a loaded CI runner from expiring the
+// current token while the intentionally stale acknowledgements are committed.
 const REASSIGN_ACK_TIMEOUT_MS: u64 = 5_000;
 
 struct RunningNode {
@@ -807,6 +807,23 @@ fn three_process_cluster_preserves_group_delivery_through_replica_restart() {
         Response::Acknowledged { .. }
     ));
     sleep(Duration::from_millis(REASSIGN_ACK_TIMEOUT_MS + 100));
+
+    // The expired token is fenced by an acknowledgement command even though
+    // no replacement poll has assigned the record yet.
+    assert!(matches!(
+        wait_for_response_at(
+            nodes[replica].broker_addr,
+            || Request::AckGroup {
+                stream: "restart-jobs".to_owned(),
+                consumer: "workers".to_owned(),
+                member: "member-a".to_owned(),
+                offset: 0,
+                delivery_token: first_token.clone(),
+            },
+            |response| matches!(response, Response::Error { code, .. } if code == "stale_delivery"),
+        ),
+        Response::Error { .. }
+    ));
 
     let redelivered = wait_for_response_at(
         nodes[replica].broker_addr,

@@ -1276,9 +1276,15 @@ mod tests {
             PollResult::Empty => panic!("expected grouped delivery"),
         };
         assert_eq!(old_attempt, 1);
+        tokio::time::sleep(ack_timeout + Duration::from_millis(100)).await;
+        assert!(matches!(
+            engine
+                .ack_group("jobs", "workers", "member-a", 0, &old_token)
+                .await,
+            Err(BrokerError::StaleDelivery { .. })
+        ));
         drop(engine);
 
-        tokio::time::sleep(ack_timeout + Duration::from_millis(100)).await;
         let reopened = PersistentEngine::open_with_ack_timeout(
             1,
             "runnel-group-restart-test".to_owned(),
