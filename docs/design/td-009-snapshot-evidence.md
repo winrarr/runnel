@@ -1,42 +1,50 @@
 # TD-009: Clustered snapshot scalability and compatibility evidence
 
 - Status: exploratory evidence note; no implementation authorized
-- Last reviewed: 2026-09-06
-- Baseline: `49a5b53dbdff000dfcf3899d1aa8eb1be79cd6c4`
+- Last reviewed: 2026-09-29
+- Baseline: `9547662ca63c98fb5d971618ecc2a49ed555d2ad`
 - Scope: OpenRaft state-machine snapshot creation, transfer, installation,
   recovery, and the path toward incremental or streaming snapshots
 - Related debt: [TD-009](../tech-debt.md)
 - Related outcomes: [Make retained-state growth independent of the hot path](../backlog.md), [Make missing-replica replacement safe](../backlog.md), and [Make durable storage upgrades safe](../backlog.md)
-- Related decisions: [ADR 0007](../decisions/0007-snapshot-based-replica-recovery.md) and [ADR 0023](../decisions/0023-independent-retained-storage-and-placement.md)
+- Related decisions: [ADR 0007](../decisions/0007-snapshot-based-replica-recovery.md), [ADR 0018](../decisions/0018-safe-replica-recovery-boundary.md), and [ADR 0023](../decisions/0023-independent-retained-storage-and-placement.md)
+- Related evidence: [TD-007 storage compatibility](td-007-storage-compatibility-evidence.md), [TD-010 retained-state materialization](td-010-retained-state-evidence.md), and [TD-026 clustered log and snapshot observations](../research/td-026-log-store-persistence-baseline.md)
 
 This note records what the current clustered backend proves and what it does
-not prove about snapshot cost. It is not an accepted storage design, a public
-snapshot API, or an implementation plan. A future incremental, manifest, or
-streaming representation needs a new accepted decision after the evidence
-gates below pass.
+not prove about snapshot cost and compatibility. It is not an implementation
+plan, a public snapshot API, or authorization to change the format. [ADR
+0023](../decisions/0023-independent-retained-storage-and-placement.md) accepts
+the architectural outcome that replicated snapshots should not require copying
+all retained payloads; this note does not choose a representation, transfer
+protocol, or migration procedure. Those details remain exploratory until their
+evidence gates pass and the affected compatibility decisions are explicit.
 
 ## Question and current conclusion
 
-The current snapshot is a correct first recovery primitive, but it is not a
-scalable retained-history representation. Every successful build serializes
-the complete materialized state of one Raft group. Every successful install
-receives and validates a complete snapshot before replacing the group state.
-The consensus log becomes bounded after compaction, but retained message bytes
-remain in the state-machine snapshot and in the in-memory message vectors.
+The current snapshot is a tested first recovery primitive, but it is not a
+scalable retained-history representation or a supported replica-replacement
+workflow. Every successful build serializes the complete materialized state of
+one Raft group. Every successful install receives and validates a complete
+snapshot before replacing the group state. The consensus log becomes bounded
+after compaction, but retained message bytes remain in the state-machine
+snapshot and in the in-memory message vectors.
 
 The immediate conclusion is therefore two-sided:
 
-- correctness and compatibility boundaries are sufficiently explicit to keep
-  the current implementation as a baseline; and
-- no current benchmark justifies treating the 32-entry snapshot threshold,
+- focused tests establish recovery slices and narrow version-1 read-forward
+  behavior, but do not prove mixed-release operation, full cross-artifact
+  consistency, or safety at every crash point; and
+- current measurements expose snapshot-file growth during one live clustered
+  workload, but do not justify treating the 32-entry snapshot threshold,
   64 KiB transfer chunk, or JSON representation as production tuning for
   large retained streams.
 
-The likely direction is a versioned snapshot manifest whose immutable retained
-data can be transferred or referenced in bounded extents, with replicated
-semantic state kept separate from physical payload movement. That is a
-conditional hypothesis, not a commitment to a particular segment, index,
-checksum, or storage library.
+One candidate consistent with the accepted architectural boundary is a
+versioned snapshot manifest whose immutable retained data can be transferred
+or referenced in bounded extents, with replicated semantic state kept separate
+from physical payload movement. The manifest format, extent identity, checks,
+and transfer procedure are unselected hypotheses, not an implementation
+commitment.
 
 ## Observed implementation boundary
 
@@ -47,31 +55,58 @@ the group directory:
 | --- | --- | --- |
 | `raft-log.json` | Version-1 JSON Raft log with committed, vote, purge, and retained entries | Consensus history; may be purged after a snapshot. It is not retained broker history. |
 | `state-machine/state-machine.json` | Version-2 JSON checkpoint containing applied log, membership, and materialized state; version 1 is read forward in memory | Full checkpoint fallback and restart recovery. |
-| `state-machine/state-machine.log` | Length-prefixed JSON apply journal, record version 1, with a 64 MiB record limit | Durable apply record replayed after the selected checkpoint or snapshot. Only an incomplete final frame is truncated. |
-| `state-machine/snapshot.json` | OpenRaft `SnapshotMeta` plus a JSON snapshot payload | Current snapshot cache and persisted recovery image. Atomic replacement makes the file boundary durable. |
+| `state-machine/state-machine.log` | Length-prefixed JSON apply journal, record version 1, with a 64 MiB per-record limit | Durable apply record replayed after the selected checkpoint or snapshot. Only an incomplete final frame is truncated. |
+| `state-machine/snapshot.json` | JSON `StoredSnapshot` wrapper containing OpenRaft `SnapshotMeta` and a JSON snapshot payload | Current snapshot cache and persisted recovery image. The atomic replacement syncs the file and parent directory. |
 
-The snapshot payload is version 2 on write and accepts version 1 (including an
-omitted legacy version) on read. Its materialized body includes:
+On [`StateMachineStore::open`](../../crates/runnel-raft/src/state_machine_store.rs#L387-L435), recovery loads the checkpoint, validates and selects the snapshot only when its applied log boundary is newer, then reads the journal and replays entries strictly after the selected boundary. Journal reading materializes its contents before replay; only a partial final frame is truncated, while a complete malformed or unsupported record fails startup. Cluster identity, group manifest, and persisted-artifact preflight are owned by the surrounding clustered storage layer. The [TD-007 evidence note](td-007-storage-compatibility-evidence.md) records that preflight validates artifact shapes and identities but does not prove mixed-release compatibility or every cross-file boundary.
+
+The checkpoint and snapshot payload are version 2 on write and accept version
+1 on read; an omitted snapshot version defaults to version 1. Missing legacy
+fields such as grouped-consumer state and the lease-clock floor receive their
+declared defaults. The version-2 snapshot materialized body includes:
 
 - stream IDs, group IDs, lifecycle state, and every retained message's
   timestamp, key, and opaque payload;
 - ordinary consumer checkpoints and grouped-consumer state, including
-  in-flight ownership, attempts, and delivery tokens;
+  out-of-order acknowledgements, in-flight member/token/deadline, delivery
+  attempts, configured consumer policy, and the policy pinned to an in-flight
+  offset;
 - the replicated lease-clock floor;
 - producer request-ID deduplication offsets; and
 - redelivery and dead-letter counters.
 
 OpenRaft metadata separately carries the last applied log ID, membership, and
 snapshot ID. The snapshot payload does not carry the applied boundary by
-itself; the metadata and payload must be treated as one image.
+itself; the metadata and payload must be treated as one image. The outer image
+does not bind itself to a cluster, node, or data-group identity. Cluster
+identity and stream/group mapping live in surrounding storage metadata and
+group manifests; compatibility preflight validates persisted artifacts, but
+payload parsing alone does not prove cross-artifact agreement. See the
+[TD-007 compatibility evidence](td-007-storage-compatibility-evidence.md).
+
+The exact reader boundary is narrow rather than a release guarantee: version
+checks accept only 1 and 2, and current writers emit version 2. Top-level
+checkpoint/snapshot envelopes and several stream/consumer wrappers reject
+unknown fields, while nested retained-message and grouped-delivery structs do
+not uniformly declare that restriction. Legacy stream arrays are mapped to
+generated stream/group identity and active lifecycle in memory. Snapshot
+payload validation checks JSON shape and version; it does not attach a
+checksum or bind payload contents to the outer group/cluster identity. Peer
+group resolution and startup storage checks provide that surrounding context,
+but parsing a snapshot alone does not prove those identities agree. The
+version-1 journal has no read-forward path. No mixed-version writer, rolling
+upgrade, or downgrade matrix is established.
+
+Sources: [`PersistedSnapshotState`, stream adapters, and snapshot wrapper](../../crates/runnel-raft/src/state_machine_store.rs#L34-L250), [`GroupConsumerState`](../../crates/runnel-raft/src/delivery.rs#L12-L33), and [format validation](../../crates/runnel-raft/src/state_machine_store.rs#L316-L358).
 
 ### Build path
 
-`StateMachineStore::build_snapshot` holds a read lock while it serializes a
-borrowed view of the complete `SnapshotState` into one `Vec<u8>`. Borrowed
-views avoid cloning each `StoredMessage` before encoding, but they do not make
-the operation incremental: serialization, allocation, and traversal are all
-proportional to the complete materialized state.
+[`StateMachineStore::build_snapshot`](../../crates/runnel-raft/src/state_machine_store.rs#L711-L750)
+holds a read lock while it serializes a borrowed view of the complete
+`SnapshotState` into one `Vec<u8>`. Borrowed views avoid cloning each
+`StoredMessage` before encoding, but they do not make the operation
+incremental: serialization, allocation, and traversal are all proportional to
+the complete materialized state.
 
 The encoded bytes are then cloned into the cached `StoredSnapshot`, written
 through an atomic temporary-file-and-rename operation, and retained as the
@@ -79,55 +114,71 @@ OpenRaft snapshot stream. The persisted wrapper is JSON, so its `Vec<u8>` data
 is encoded as a JSON array rather than as a raw file. This creates additional
 serialization and storage overhead beyond the snapshot payload itself.
 Journal compaction then reads the journal and rewrites the suffix after the
-snapshot boundary. A build failure before the cache update does not publish a
-new current snapshot, but the cost already spent encoding or writing is not
-recoverable work.
+snapshot boundary. The snapshot file is durably replaced before journal
+compaction and before the in-memory current-snapshot cache changes. Therefore,
+a compaction error can leave a valid newer `snapshot.json` on disk while the
+running cache remains old; startup may select that durable snapshot by its
+applied-log boundary. A failed build does not publish a new runtime cache, but
+it does not imply that no newer snapshot file was written.
 
 ### Install path
 
-The current receiver starts with an empty in-memory cursor. OpenRaft assembles
-the transfer, then `StateMachineStore::install_snapshot` owns the complete
-byte vector, validates the version and JSON payload, converts it to a complete
-`SnapshotState`, and holds the state write lock while it:
+[`begin_receiving_snapshot`](../../crates/runnel-raft/src/state_machine_store.rs#L804-L808)
+returns an empty `Cursor<Vec<u8>>`, so OpenRaft's receiver accumulates the
+complete transfer in memory. Then
+[`StateMachineStore::install_snapshot`](../../crates/runnel-raft/src/state_machine_store.rs#L810-L875)
+owns the complete byte vector, validates the version and JSON payload,
+materializes a complete `SnapshotState`, and holds the state write lock while it:
 
 1. atomically persists `snapshot.json`;
 2. atomically persists the complete `state-machine.json` checkpoint;
 3. compacts the apply journal; and
 4. replaces in-memory state and publishes the current-snapshot cache.
 
-State and the current snapshot cache remain unchanged until all durable steps
-succeed. A rejected payload does not mutate state, and the focused persistence
-failure test preserves the previous image. More generally, a failure after an
-earlier atomic write can leave a newer durable snapshot for restart recovery,
-so the accepted crash contract is “previous valid image or complete newer
-image,” not “every failed install leaves every file untouched.” The trade-off
-is that install latency and temporary memory/workspace demand scale with the
-complete snapshot, and ordinary group operations wait behind the install's
-state write lock.
+In-memory state and the current-snapshot cache remain unchanged until all
+durable steps succeed. A rejected payload does not mutate state, and a focused
+test makes the first snapshot write fail while preserving the previous image.
+That test does not inject failure after each later stage. More generally, a
+failure after an earlier atomic write can leave a newer durable snapshot or
+checkpoint for restart recovery, so tests do not establish “every failed
+install leaves every file untouched.” Install latency and temporary
+memory/workspace demand scale with the complete snapshot, and ordinary group
+operations wait behind the state write lock.
 
 ### Transfer and cadence
 
-The current OpenRaft configuration uses:
+The current OpenRaft configuration in
+[`group_manager.rs`](../../crates/runnel-raft/src/group_manager.rs#L23-L31)
+uses:
 
 - automatic snapshots after 32 committed log entries;
 - 4 log entries retained after a snapshot;
 - a replication-lag threshold of 64 entries; and
 - a maximum snapshot chunk size of 64 KiB.
 
-Peer frames have a 64 MiB limit. Snapshot chunks are carried over the
-group-addressed framed peer protocol. A real-process replacement test uses a
-256 KiB payload to force multiple chunks, kills the receiver during three
-non-final transfer attempts, and verifies recovery after a final retry. The
-receiver retries from byte zero rather than persisting partial transfer state.
-The metrics expose build/install failures, installed bytes, chunks, final
-chunks, received bytes, and installs in progress, but not build duration,
-peak memory, transfer duration, retry waste, or retained-state size.
+Peer frames have a 64 MiB limit in
+[`network/framing.rs`](../../crates/runnel-raft/src/network/framing.rs#L9-L44).
+Snapshot chunks are carried over the group-addressed framed peer protocol. The
+feature-gated real-process replacement experiment in
+[`cluster_smoke.rs`](../../crates/runnel-server/tests/cluster_smoke.rs#L1244-L1398)
+uses a 256 KiB payload to force multiple chunks, kills the receiver during
+three non-final transfer attempts, and verifies recovery after a final retry.
+The receiver retries from byte zero rather than persisting partial transfer
+state. Per-process aggregate metrics expose build/install counts and failures,
+installed bytes, chunks, final chunks, received bytes, and installs in
+progress, but not build/install duration, peak memory, lock wait, transfer
+duration, retry waste, or retained-state size. The replacement test is
+experimental: [ADR 0018](../decisions/0018-safe-replica-recovery-boundary.md)
+keeps permissive empty-replica recovery out of the default binary and does not
+make erasing a replica directory with the same voter identity supported.
 
-The 32-entry cadence bounds consensus-log growth; it does not bound snapshot
-size or retained-history growth. A busy group with large messages can produce
-a large snapshot after only 32 entries, while a quiet group may retain a
-larger log interval before another snapshot. Cadence and chunk size are
-therefore operational defaults, not evidence-backed SLO settings.
+The 32-entry cadence is intended to bound consensus-log growth while snapshot
+and purge progress normally; it does not establish a hard bound if that
+progress is delayed or fails, and it does not bound snapshot size or
+retained-history growth. A busy group with large messages can produce a large
+snapshot after only 32 entries, while a quiet group may retain a larger log
+interval before another snapshot. Cadence and chunk size are therefore
+operational defaults, not evidence-backed SLO settings.
 
 ## Recovery and compatibility invariants
 
@@ -142,12 +193,15 @@ The current tests establish these properties:
 3. **Invalid snapshots fail closed.** Invalid JSON, unsupported payload
    versions, and malformed persisted snapshots are rejected before serving
    state or creating a new journal.
-4. **Installation is replacement-safe.** Validation or durable-write failure
-   leaves the previous in-memory state and current snapshot available; a
-   restart recovers the previous valid state.
+4. **Checked install failures preserve the serving image.** Invalid payload
+   validation and a failure on the first snapshot-file write leave the prior
+   in-memory state and current-snapshot cache available. The persistence
+   fixture reopens the previous valid image. Later-write and abrupt-crash
+   boundaries are not covered by that test.
 5. **Legacy read-forward is narrow.** Version-1 snapshot payloads and legacy
    stream arrays are converted in memory to current stream identity/lifecycle
-   state. Current writers emit version 2. This is not a mixed-version writer
+   state; missing grouped-delivery and lease-clock fields use defaults.
+   Current writers emit version 2. This is not a mixed-version writer
    contract or a downgrade guarantee.
 6. **Consensus compaction is separate from broker retention.** Purging
    `raft-log.json` does not remove messages from the materialized snapshot.
@@ -161,10 +215,34 @@ The current tests establish these properties:
    cluster.
 
 These properties do not establish a checksum or digest for snapshot payloads,
-streaming validation, bounded decompression/decoding memory, partial snapshot
-resume, crash injection at every atomic-write boundary, cross-release mixed
-writers, or a supported empty-replica replacement lifecycle. The replacement
-experiment remains test-only under [ADR 0018](../decisions/0018-safe-replica-recovery-boundary.md).
+streaming validation, bounded decoding memory, partial snapshot resume, crash
+injection at every atomic-write boundary, cross-release mixed writers, or a
+supported empty-replica replacement lifecycle. The replacement experiment
+remains test-only under [ADR 0018](../decisions/0018-safe-replica-recovery-boundary.md).
+
+### Existing test coverage
+
+The direct state-machine tests are in
+[`runnel-raft/src/lib.rs`](../../crates/runnel-raft/src/lib.rs) and
+[`state_machine_store.rs`](../../crates/runnel-raft/src/state_machine_store.rs):
+
+| Test | Evidence provided | Not established |
+| --- | --- | --- |
+| `snapshots_bound_consensus_history_and_recover_state` | Builds after 40 publishes, checks the remaining journal is strictly after the snapshot log boundary, reopens, and reads the earliest retained record. | A maximum retained-state size, bounded build latency, or every log/snapshot/purge interleaving. |
+| `retained_history_survives_snapshot_install_and_reopen` | Builds and installs a 256-message image, reopens both stores, and checks first/last payloads. | Large-stream scaling, full state equality across every field, or process failure during install. |
+| `rejected_snapshot_install_preserves_existing_state` | Invalid transfer bytes are rejected without changing the current polled state; install-failure counters return to an idle gauge. | Filesystem or process failures after persistence begins. |
+| `failed_snapshot_persistence_keeps_previous_state_and_recovers_checkpoint` | Forces the initial `snapshot.json` write to fail, checks the previous in-memory snapshot/state, then reopens the previous checkpoint. | Failure after the snapshot write, checkpoint write, journal compaction, or cache publication. |
+| `legacy_snapshot_format_recovers_metadata_messages_and_progress` and `legacy_snapshot_defaults_lease_floor_and_applied_commands_advance_it` | Exercise version-1 legacy stream arrays, consumer offset, absent lease-clock default, and current replay after read-forward. | Mixed-version writers, old/new binary interoperability, or downgrade. |
+| `grouped_lease_clock_floor_survives_snapshot_recovery_and_backward_time` and related grouped-delivery state-machine tests | Round-trip the current payload while checking lease-clock floor, in-flight delivery, attempts, and token fencing. | Snapshot filesystem install/recovery of every grouped-policy transition or crash timing. |
+| `unsupported_snapshot_version_is_rejected_without_creating_journal` and `invalid_persisted_snapshot_is_rejected_before_startup` | Unsupported or malformed persisted snapshot data fails startup; the unsupported-version test also checks that no state-machine journal is created. | Identity/boundary agreement across otherwise parseable checkpoint, snapshot, journal, and Raft-log files. |
+
+The only real-process multi-chunk interruption coverage is
+`replacement_node_recovers_after_repeated_snapshot_interruptions` in
+[`cluster_smoke.rs`](../../crates/runnel-server/tests/cluster_smoke.rs). It is
+compiled only with `test-replacement-recovery` and run via
+`just cluster-replacement-test`; the default `just verify`/required CI path
+does not make it a production replacement guarantee. Regular cluster restart
+coverage exercises preserved storage, not empty-voter replacement.
 
 ## Known cost model and evidence gaps
 
@@ -174,10 +252,30 @@ current operations have the following qualitative shape:
 
 | Operation | Current work and temporary state | Evidence currently available |
 | --- | --- | --- |
-| Build | Traverse and JSON-encode `O(B + S)` materialized state while holding a read lock; retain an encoded copy for the snapshot cache; write a second JSON wrapper; then read/rewrite the journal suffix | Correctness tests and snapshot counters only; no controlled build latency, peak-memory, or bytes-written measurement. |
+| Build | Traverse and JSON-encode `O(B + S)` materialized state while holding a read lock; retain an encoded copy for the snapshot cache; write a second JSON wrapper; then read/rewrite the journal suffix | The [TD-026 live cluster sample](../research/td-026-log-store-persistence-baseline.md) observes snapshot file-size deltas and completed build counts during two single runs; no build-duration, lock-wait, or snapshot-attributed peak-memory measurement. |
 | Transfer | Send the complete encoded snapshot in chunks; the current receiver assembles the complete transfer in an in-memory cursor, and retrying starts at byte zero | Real-process multi-chunk and repeated-interruption test; no retry-waste or concurrent-transfer resource matrix. |
-| Install | Decode and materialize the complete state, then write a complete snapshot and checkpoint and compact journal while holding the state write lock | Failure-preservation tests and 256-message install/reopen test; no install latency, workspace, lock-wait, or large-payload matrix. |
-| Reopen | Read/validate the checkpoint and snapshot, choose the newer applied boundary, read the full journal, and replay entries after that boundary | Focused restart/recovery tests; no snapshot-size versus cold-start benchmark or memory profile. |
+| Install | Decode and materialize the complete state, then write a complete snapshot and checkpoint and compact journal while holding the state write lock | Failure-preservation tests and 256-message install/reopen test; no real-process incoming-install latency, temporary workspace, lock-wait, or large-payload matrix. |
+| Reopen | Read/validate the checkpoint and snapshot, choose the newer applied boundary, read the full journal, and replay entries after that boundary | TD-026 reports restart readiness and acknowledgement of offset 0 after a snapshot/purge cycle in two single runs; no snapshot-size matrix, controlled cold-start distribution, or recovery memory profile. |
+
+### Current measured evidence
+
+The [TD-026 live clustered sample](../research/td-026-log-store-persistence-baseline.md)
+provides an end-to-end observation of snapshot/purge activity, not an isolated
+snapshot benchmark. On code revision
+`49652a19cbd11fe68f79c602df3522a42dfaceba`, it ran one 256-publish, three-node
+durable-quorum workload for each of 100-byte and 1-KiB payloads under a 2-CPU,
+2-GiB scope. Both runs observed eight snapshot builds and purge advances, then
+restarted node 3 and read/acknowledged offset 0. The reported per-node snapshot
+file-size deltas were 354,752 B and 3,160,025 B; restart-ready durations were
+53.3 ms and 108.2 ms. The observer accounted for 16.9% and 32.3% of the
+measured workload interval. These are single descriptive runs, not a size
+matrix or snapshot-build/install timing distribution.
+
+The separate isolated `LogStore` persistence experiment in that same TD-026
+note does not construct a `StateMachineStore`, build snapshots, or purge. Its
+Raft-log rewrite timings must not be attributed to snapshot work. The live
+sample improves file-growth and restart context, but neither experiment
+isolates snapshot serialization, transfer, install, or lock contention.
 
 The exact peak memory multiplier depends on allocator capacity, JSON shape,
 OpenRaft buffering, and payload distribution, so it should be measured rather
@@ -191,7 +289,9 @@ No current result should be interpreted as proving that snapshots improve
 hot-path performance. Snapshot builds take a read lock during encoding;
 installs take a write lock across multiple durable operations; and the
 consensus-log benefit can coexist with growing state-machine memory and
-recovery work.
+recovery work. The available live measurements observe these paths alongside
+publish and restart work and do not attribute their costs to an individual
+snapshot operation.
 
 ## Candidate future directions
 
@@ -203,7 +303,7 @@ These are outcome-level alternatives, not implementation instructions:
 | Versioned metadata snapshot plus immutable data extents | Lets recovery transfer a small semantic image and only the missing payload extents; opens independent retention and validation units | Requires extent identity, checksums, manifest generations, cleanup fencing, and agreement between replicated logical floors and physical data. |
 | Incremental snapshots/deltas | Avoids rewriting unchanged state between snapshots | Delta chains need bounded depth, compaction, base identity, ordering, crash recovery, and a rule for a missing/corrupt ancestor. |
 | Streaming snapshot encode/validate/install | Bounds encoder and receiver buffers and permits progress metrics while bytes move | Streaming cannot by itself avoid rewriting all retained bytes; atomic serving still needs a complete validated image or an equivalent durable cutover. |
-| External or remote snapshot storage | Can reduce local replacement transfer pressure and support larger histories | Adds availability, credentials, consistency, garbage collection, and cross-node failure modes; not appropriate as the first response to unmeasured local cost. |
+| External or remote snapshot storage | Can reduce local replacement transfer pressure and support larger histories | Adds availability, credentials, consistency, garbage collection, and cross-node failure modes; there is not yet evidence that it addresses the measured bottleneck. |
 
 The highest-value next experiment is a controlled comparison of the current
 complete snapshot against one bounded candidate representation, using the same
@@ -269,17 +369,20 @@ gates are satisfied:
 
 ## Refactor and planning assessment
 
-No safe runtime refactor is included in this evidence-only change. The current
-`StateMachineStore` and OpenRaft adapter boundaries are clear enough to measure
-the complete-snapshot baseline, while introducing a snapshot abstraction or a
-manifest type now would create a second compatibility surface without evidence
-that it solves a current product constraint.
+No safe runtime refactor is included in this evidence-only change. The source
+audit found no distinct low-risk refactor to record: the unmeasured snapshot
+costs and crash cases already appear in TD-009's retirement gates. Introducing
+a snapshot abstraction or manifest type now would add a compatibility surface
+without evidence that it solves a demonstrated bottleneck.
 
-The existing TD-009 entry remains the focused implementation debt. TD-010
-continues to track the broader retained-state materialization problem, and
-TD-007 tracks storage compatibility/migration; neither should be duplicated by
-this note. A future implementation change should update those records together
-with its accepted ADR and benchmark artifact.
+No separate backlog, tech-debt, or ADR update is warranted. TD-009 remains the
+focused implementation debt; TD-010 covers retained-state materialization;
+TD-007 covers storage compatibility and migration. The new TD-026 observation
+adds file-growth and restart context but does not meet TD-009's retirement
+criteria or create a new intended outcome. ADR 0023 already accepts the
+high-level retained-data boundary; this note only clarifies evidence and leaves
+format and migration choices open. A future implementation should update the
+existing records and accepted decision as its scope requires.
 
 ## References
 
