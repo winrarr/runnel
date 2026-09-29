@@ -2,9 +2,9 @@
 
 Status: scoped implementation note
 
-Reviewed: 2026-09-06
+Reviewed: 2026-09-29
 
-Baseline: `origin/main` `ff987fe19b28c3a3640615d742d4ea7c5df8824c`
+Baseline: `origin/main` `49652a19cbd11fe68f79c602df3522a42dfaceba`
 
 Scope: compatibility peer-connection ownership and OpenRaft network-client
 lifecycle in the early static clustered backend.
@@ -17,10 +17,11 @@ and the [current architecture boundary](../architecture.md).
 ## Primary/reference findings
 
 - [OpenRaft's `RaftNetworkFactory` documentation](https://docs.rs/openraft/0.9.25/openraft/network/trait.RaftNetworkFactory.html) defines `new_client` as a lazy client constructor for a target node. It does not require the factory to establish a socket, which leaves shared connection ownership to the application network implementation.
-- [OpenRaft's `RaftNetwork` documentation](https://docs.rs/openraft/0.9.25/openraft/network/trait.RaftNetwork.html) makes the RPC methods mutable and its default full-snapshot path sends each chunk through repeated `install_snapshot` calls. Runnel's adapter consequently keeps a mutable `TcpConnection` with one retained stream per replication target and group; that client-level serialization is not a multiplexing guarantee for the whole broker.
+- [OpenRaft's `RaftNetwork` documentation](https://docs.rs/openraft/0.9.25/openraft/network/trait.RaftNetwork.html) makes the RPC methods mutable and its default full-snapshot path sends each chunk through repeated `install_snapshot` calls. Runnel's adapter consequently keeps a mutable `TcpConnection` with one retained stream per OpenRaft network client; that client-level serialization is not a multiplexing guarantee for the whole broker.
 - [OpenRaft's network implementation guidance](https://docs.rs/openraft/0.9.25/openraft/docs/getting_started/index.html#implement-raftnetworkfactory) describes the factory as the owner of network instances for replication targets and reiterates that connection establishment belongs to the later RPC path.
+- The pinned OpenRaft 0.9.25 [confirm-leader heartbeat](https://github.com/databendlabs/openraft/blob/v0.9.25/openraft/src/core/raft_core.rs#L334-L355) and [vote](https://github.com/databendlabs/openraft/blob/v0.9.25/openraft/src/core/raft_core.rs#L1068-L1074) paths construct fresh network clients. Starting a replication stream creates separate clients for log replication and snapshot transfer ([stream setup](https://github.com/databendlabs/openraft/blob/v0.9.25/openraft/src/core/raft_core.rs#L815-L827)). The replication loop sends both non-empty append requests and its empty AppendEntries heartbeats through the replication client ([append path](https://github.com/databendlabs/openraft/blob/v0.9.25/openraft/src/replication/mod.rs#L439-L457)); the snapshot task uses only the snapshot client through `full_snapshot` ([snapshot path](https://github.com/databendlabs/openraft/blob/v0.9.25/openraft/src/replication/mod.rs#L780-L797)). Thus replication heartbeats can share a `TcpConnection` with log append requests, but snapshot chunks use a separate client and stream.
 
-These references support an owner shared by lazy clients without requiring a public protocol change. They do not establish that a shared multiplexed stream is safe or beneficial for Runnel's snapshot and control traffic.
+These references support an owner shared by lazy clients without requiring a public protocol change. They do not establish that a shared multiplexed stream is safe or beneficial for Runnel's persistent replication streams.
 
 ## Current observed behavior
 
@@ -39,15 +40,17 @@ These references support an owner shared by lazy clients without requiring a pub
   checkout; failed or timed-out requests do not return their sockets to a pool,
   and there is no background idle reaper.
 - `TcpNetwork::new_client` prefers a non-empty address supplied by OpenRaft's
-  `BasicNode` and otherwise uses the configured peer map. OpenRaft clients are
-  mutable and issue one framed request followed by one response on their
-  retained stream. The inbound handler spawns one task per accepted socket but
-  processes each socket serially. While a client has no retained stream,
-  heartbeats and votes use the compatibility pool; non-heartbeat append entries
-  and snapshot chunks establish/use the retaining client stream, after which
-  that client also carries its heartbeats and votes. The reserved compatibility
-  control permit therefore does not isolate a snapshot from traffic sharing the
-  same persistent OpenRaft client.
+  `BasicNode` and otherwise uses the configured peer map. `TcpConnection` retains
+  one framed request/response stream after a non-heartbeat append or snapshot
+  RPC. OpenRaft 0.9.25's replication loop uses its retained client for both
+  non-empty append requests and empty AppendEntries heartbeats; confirm-leader
+  heartbeats and votes use fresh clients and the compatibility pool's reserved
+  lane. Snapshot transfer uses a distinct client and stream. The inbound handler
+  spawns one task per accepted socket and processes each socket serially. A
+  replication RPC can occupy its client's serialized call path, but no current
+  evidence shows that moving replication heartbeats to another connection would
+  improve heartbeat latency. Snapshot and replication work can also contend for
+  the remote process's CPU, Raft state, or storage.
 - Peer frames use a big-endian `u32` length prefix, JSON payloads, and a 64 MiB
   body limit. Snapshot chunks are bounded to 64 KiB by the current OpenRaft
   configuration, but the outer protocol has no version preface, capability
@@ -72,12 +75,12 @@ and the [opt-in forwarding benchmark](../../scripts/benchmarks/README.md).
 ## Scoped implementation choice
 
 This slice gives each `GroupManager` one `PeerTransport`. Forwarding, data-group
-setup, bounded fallback permits, and the stateless first control requests from
-Raft clients use that owner; each `TcpConnection` still owns any retained direct
-stream for its group and target. Dropping the manager's transport drops its
-idle compatibility-pool sockets and rejects later requests. The existing
-per-peer connection cap, manager-global fallback cap, control reservation, idle
-expiry, timeout behavior, and failed-connection replacement remain unchanged.
+setup, and stateless control calls use its bounded compatibility pools; each
+long-lived OpenRaft replication and snapshot client still owns its direct stream
+for its group and target. Dropping the manager's transport drops its idle
+compatibility-pool sockets and rejects later requests. The existing per-peer
+connection cap, manager-global fallback cap, control reservation, idle expiry,
+timeout behavior, and failed-connection replacement remain unchanged.
 
 The change deliberately does not pool the persistent per-group Raft streams. That avoids introducing cross-group head-of-line blocking or changing the ordering and failure behavior of OpenRaft's mutable network client. It also does not add a wire version, multiplexing, background reaper, dynamic membership, or snapshot resume semantics.
 
@@ -99,16 +102,20 @@ The change deliberately does not pool the persistent per-group Raft streams. Tha
   round-trip p50/p99/p99.9 and resource samples, but it does not isolate pool
   wait from quorum processing, compare against an alternate connection
   strategy, or exercise snapshot/control interference.
-- Snapshots remain serial per OpenRaft network client and can still occupy that
-  client's persistent stream. No current evidence establishes whether this
-  affects heartbeat latency in the actual OpenRaft scheduler; a focused
-  snapshot-plus-control fault/latency benchmark using the real peer listener is
-  still needed.
+- Snapshot chunks are serial on their dedicated OpenRaft snapshot client and do
+  not share the transport stream used by that group's log replication and
+  replication-loop heartbeats. A real-process snapshot-plus-control probe may
+  still be useful to measure shared CPU, Raft-state, or storage contention, but
+  transport-level snapshot/control isolation is not justified by the current
+  evidence. The replication client's append/heartbeat serialization remains a
+  separate hypothesis without measured impact or a demonstrated safe way to
+  issue those operations concurrently.
 - Pool capacity, fallback behavior, and idle expiry are still fixed policy
-  values. Their p99/p99.9 behavior under group density, delayed responses,
-  snapshot transfer, peer replacement, and overflow-address fairness remains
-  open, and no authoritative transport-strategy performance comparison exists
-  yet.
+  values. Their p99/p99.9 behavior under group density, delayed forwarding
+  responses, peer replacement, and overflow-address fairness remains open. The
+  forwarding probe covers one stream and does not measure the number of retained
+  per-group replication streams; no authoritative transport-strategy
+  performance comparison exists yet.
 - Timeout behavior does not prove remote cancellation: a timed-out forwarding
   or Raft request may continue consuming peer and state-machine capacity after
   the caller has abandoned its connection. The interaction between that work,
@@ -118,3 +125,15 @@ The change deliberately does not pool the persistent per-group Raft streams. Tha
   encryption. Any future pooling or multiplexing design must preserve the
   current bounded-resource guarantees while defining how a peer is authorized,
   how protocol versions are negotiated, and how a stale connection is fenced.
+
+## Updated disposition
+
+The source review corrects the snapshot/control contention hypothesis but does
+not retire TD-012. The current `peer_forwarding` workload can measure forwarding
+saturation and follower round-trip latency for one stream; it cannot
+characterize persistent replication connection growth across many streams or
+compare a different transport strategy. Keep the runtime and ADRs unchanged
+until a bounded candidate has a workload that exercises its target dimension
+and a controlled comparison. Connection-density and tail-latency measurements
+remain the next evidence needed; do not claim an optimization from the existing
+pool tests or forwarding baseline alone.
