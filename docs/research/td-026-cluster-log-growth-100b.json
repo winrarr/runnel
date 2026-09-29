@@ -1,0 +1,3471 @@
+{
+  "schema_version": 2,
+  "run_id": "20260929124859229798",
+  "started_at": "2026-09-29T12:48:59.229798+00:00",
+  "command": [
+    "scripts/benchmarks/cluster.py",
+    "--binary",
+    "/tmp/runnel-td026-cluster-growth-target/release/runnel",
+    "--scenarios",
+    "raft_log_growth",
+    "--raft-log-growth-messages",
+    "256",
+    "--raft-log-growth-observation-every",
+    "8",
+    "--raft-log-growth-cycle-timeout-seconds",
+    "30",
+    "--payload-sizes",
+    "100",
+    "--output",
+    "/tmp/runnel-td026-cluster-run-cadence8-100/result.json",
+    "--log-dir",
+    "/tmp/runnel-td026-cluster-run-cadence8-100/logs"
+  ],
+  "source": {
+    "repository": "local",
+    "revision": "49652a19cbd11fe68f79c602df3522a42dfaceba",
+    "ref": "local",
+    "event": "local",
+    "workflow": "local",
+    "run_id": null,
+    "run_url": null,
+    "profile": "local"
+  },
+  "environment": {
+    "host": "rkth-precision5570",
+    "platform": "Linux-7.0.0-34-generic-x86_64-with-glibc2.43",
+    "processor": "",
+    "python": "3.14.4",
+    "cpus": 20
+  },
+  "benchmark_suite": "cluster",
+  "comparison_mode": "cluster-baseline",
+  "resource_limits": {
+    "processes": "systemd user scope; benchmark client and broker nodes",
+    "cpu": "200%",
+    "memory": "2G"
+  },
+  "workload": {
+    "messages": 1000,
+    "warmup": 50,
+    "concurrency": 2,
+    "scenarios": [
+      "raft_log_growth"
+    ],
+    "nodes": 3,
+    "ack_timeout_ms": 30000,
+    "slow_consumer_delay_ms": 10,
+    "slow_consumer_timeout_seconds": 60.0,
+    "batch_size": 32,
+    "hot_ordering": {
+      "hot_key_messages": 64,
+      "cold_key_count": 4,
+      "cold_messages_per_key": 8,
+      "concurrency": 4,
+      "hot_key_processing_delay_ms": 5,
+      "timeout_seconds": 60.0,
+      "max_records": 4096
+    },
+    "peer_forwarding_concurrency": 8,
+    "peer_response_delay_ms": 0,
+    "peer_forwarding_timeout_seconds": 60.0,
+    "leader_failure_timeout_seconds": 60.0,
+    "payload_sizes_bytes": [
+      100
+    ],
+    "runtime": "process",
+    "protocol": "line-delimited JSON with UTF-8 string payloads",
+    "protocol_version": "provisional-line-json-v1",
+    "payload_encoding": "utf-8",
+    "compression": "none",
+    "durability": "committed by the current three-node Raft quorum and local durable state",
+    "raft_log_growth": {
+      "measured_messages": 256,
+      "minimum_messages": 64,
+      "maximum_messages": 4096,
+      "maximum_logical_payload_bytes": 16777216,
+      "observation_every_publishes": 8,
+      "cycle_timeout_seconds": 30.0,
+      "minimum_cycle_timeout_seconds": 1.0,
+      "maximum_cycle_timeout_seconds": 300.0,
+      "setup_messages_excluded": 1,
+      "message_history_source": "public protocol; first setup publish is offset 0",
+      "consensus_history_source": "per-node data-group raft-log.json"
+    }
+  },
+  "backends": {
+    "runnel-cluster": {
+      "image": "/tmp/runnel-td026-cluster-growth-target/release/runnel",
+      "image_id": null,
+      "runtime": "process",
+      "acknowledgement": "durable quorum commit",
+      "replication": "3-node static Multi-Raft",
+      "measurement_boundary": "public line-delimited JSON protocol",
+      "measurement_client": "scripts/benchmarks/cluster.py",
+      "client_image": "host Python runtime",
+      "peer_response_proxy": {
+        "enabled": false,
+        "response_delay_ms": 0
+      },
+      "startup_seconds": 0.481014887,
+      "resource_samples": {
+        "samples": 8,
+        "memory_bytes_avg": 32305152.0,
+        "memory_bytes_max": 35880960.0,
+        "storage_bytes_avg": 552994.375,
+        "storage_bytes_max": 1096532.0,
+        "per_node": {
+          "1": {
+            "samples": 8,
+            "memory_bytes_avg": 11644928.0,
+            "memory_bytes_max": 12476416.0,
+            "storage_bytes_avg": 184335.875,
+            "storage_bytes_max": 365960.0,
+            "cpu_seconds": 0.2
+          },
+          "2": {
+            "samples": 8,
+            "memory_bytes_avg": 11082240.0,
+            "memory_bytes_max": 11845632.0,
+            "storage_bytes_avg": 184413.5,
+            "storage_bytes_max": 365960.0,
+            "cpu_seconds": 0.14
+          },
+          "3": {
+            "samples": 8,
+            "memory_bytes_avg": 9577984.0,
+            "memory_bytes_max": 11628544.0,
+            "storage_bytes_avg": 184245.0,
+            "storage_bytes_max": 364612.0,
+            "cpu_seconds": 0.0
+          }
+        }
+      },
+      "scenarios": [
+        {
+          "scenario_id": "cluster_raft_log_growth:100",
+          "operation": "cluster_raft_log_growth",
+          "messages": 256,
+          "message_size_bytes": 100,
+          "elapsed_seconds": 0.273841764,
+          "elapsed_milliseconds": 273.841764,
+          "throughput_messages_per_second": 934.8464465778128,
+          "throughput_megabytes_per_second": 0.09348464465778128,
+          "latency_sample_count": 256,
+          "latency_microseconds": {
+            "p50": 809.5465,
+            "p99": 1357.6254499999998,
+            "p999": 5427.9384400000245,
+            "max": 6800.734
+          },
+          "metadata": {
+            "measured_publishes": 256,
+            "setup_messages_excluded": 1,
+            "observation_every_publishes": 8,
+            "observer_io_seconds": 0.046309724,
+            "observer_io_fraction_of_measured_interval": 0.16911125360702833,
+            "observed_state_samples": 32,
+            "consensus_history_source": "per-node data-group raft-log.json",
+            "broker_message_history_is_not_inferred_from_raft_entry_count": true,
+            "path_size_semantics": "persisted file sizes and net footprint deltas; not bytes written",
+            "observations": [
+              {
+                "phase": "publish",
+                "message_index": 8,
+                "elapsed_milliseconds": 7.362747,
+                "per_node": {
+                  "node_1": {
+                    "node_id": 1,
+                    "group_id": "636c75737465725f32303236303932393132343835393232393739385f726166745f6c6f675f67726f7774685f313030",
+                    "paths": {
+                      "raft_log": {
+                        "file_bytes": 6447,
+                        "retained_log_entries": 12,
+                        "first_log_index": 0,
+                        "last_log_index": 11,
+                        "last_purged_log_index": null,
+                        "committed_log_index": 11
+                      },
+                      "state_machine_journal": {
+                        "file_bytes": 6409
+                      },
+                      "state_machine_checkpoint": {
+                        "file_bytes": 0
+                      },
+                      "snapshot": {
+                        "file_bytes": 0
+                      }
+                    }
+                  },
+                  "node_2": {
+                    "node_id": 2,
+                    "group_id": "636c75737465725f32303236303932393132343835393232393739385f726166745f6c6f675f67726f7774685f313030",
+                    "paths": {
+                      "raft_log": {
+                        "file_bytes": 6447,
+                        "retained_log_entries": 12,
+                        "first_log_index": 0,
+                        "last_log_index": 11,
+                        "last_purged_log_index": null,
+                        "committed_log_index": 11
+                      },
+                      "state_machine_journal": {
+                        "file_bytes": 6409
+                      },
+                      "state_machine_checkpoint": {
+                        "file_bytes": 0
+                      },
+                      "snapshot": {
+                        "file_bytes": 0
+                      }
+                    }
+                  },
+                  "node_3": {
+                    "node_id": 3,
+                    "group_id": "636c75737465725f32303236303932393132343835393232393739385f726166745f6c6f675f67726f7774685f313030",
+                    "paths": {
+                      "raft_log": {
+                        "file_bytes": 6447,
+                        "retained_log_entries": 12,
+                        "first_log_index": 0,
+                        "last_log_index": 11,
+                        "last_purged_log_index": null,
+                        "committed_log_index": 11
+                      },
+                      "state_machine_journal": {
+                        "file_bytes": 6409
+                      },
+                      "state_machine_checkpoint": {
+                        "file_bytes": 0
+                      },
+                      "snapshot": {
+                        "file_bytes": 0
+                      }
+                    }
+                  }
+                }
+              },
+              {
+                "phase": "publish",
+                "message_index": 16,
+                "elapsed_milliseconds": 15.002651,
+                "per_node": {
+                  "node_1": {
+                    "node_id": 1,
+                    "group_id": "636c75737465725f32303236303932393132343835393232393739385f726166745f6c6f675f67726f7774685f313030",
+                    "paths": {
+                      "raft_log": {
+                        "file_bytes": 11503,
+                        "retained_log_entries": 20,
+                        "first_log_index": 0,
+                        "last_log_index": 19,
+                        "last_purged_log_index": null,
+                        "committed_log_index": 19
+                      },
+                      "state_machine_journal": {
+                        "file_bytes": 11545
+                      },
+                      "state_machine_checkpoint": {
+                        "file_bytes": 0
+                      },
+                      "snapshot": {
+                        "file_bytes": 0
+                      }
+                    }
+                  },
+                  "node_2": {
+                    "node_id": 2,
+                    "group_id": "636c75737465725f32303236303932393132343835393232393739385f726166745f6c6f675f67726f7774685f313030",
+                    "paths": {
+                      "raft_log": {
+                        "file_bytes": 11503,
+                        "retained_log_entries": 20,
+                        "first_log_index": 0,
+                        "last_log_index": 19,
+                        "last_purged_log_index": null,
+                        "committed_log_index": 19
+                      },
+                      "state_machine_journal": {
+                        "file_bytes": 11545
+                      },
+                      "state_machine_checkpoint": {
+                        "file_bytes": 0
+                      },
+                      "snapshot": {
+                        "file_bytes": 0
+                      }
+                    }
+                  },
+                  "node_3": {
+                    "node_id": 3,
+                    "group_id": "636c75737465725f32303236303932393132343835393232393739385f726166745f6c6f675f67726f7774685f313030",
+                    "paths": {
+                      "raft_log": {
+                        "file_bytes": 11503,
+                        "retained_log_entries": 20,
+                        "first_log_index": 0,
+                        "last_log_index": 19,
+                        "last_purged_log_index": null,
+                        "committed_log_index": 19
+                      },
+                      "state_machine_journal": {
+                        "file_bytes": 11545
+                      },
+                      "state_machine_checkpoint": {
+                        "file_bytes": 0
+                      },
+                      "snapshot": {
+                        "file_bytes": 0
+                      }
+                    }
+                  }
+                }
+              },
+              {
+                "phase": "publish",
+                "message_index": 24,
+                "elapsed_milliseconds": 24.080776,
+                "per_node": {
+                  "node_1": {
+                    "node_id": 1,
+                    "group_id": "636c75737465725f32303236303932393132343835393232393739385f726166745f6c6f675f67726f7774685f313030",
+                    "paths": {
+                      "raft_log": {
+                        "file_bytes": 16559,
+                        "retained_log_entries": 28,
+                        "first_log_index": 0,
+                        "last_log_index": 27,
+                        "last_purged_log_index": null,
+                        "committed_log_index": 27
+                      },
+                      "state_machine_journal": {
+                        "file_bytes": 16681
+                      },
+                      "state_machine_checkpoint": {
+                        "file_bytes": 0
+                      },
+                      "snapshot": {
+                        "file_bytes": 0
+                      }
+                    }
+                  },
+                  "node_2": {
+                    "node_id": 2,
+                    "group_id": "636c75737465725f32303236303932393132343835393232393739385f726166745f6c6f675f67726f7774685f313030",
+                    "paths": {
+                      "raft_log": {
+                        "file_bytes": 16559,
+                        "retained_log_entries": 28,
+                        "first_log_index": 0,
+                        "last_log_index": 27,
+                        "last_purged_log_index": null,
+                        "committed_log_index": 27
+                      },
+                      "state_machine_journal": {
+                        "file_bytes": 16681
+                      },
+                      "state_machine_checkpoint": {
+                        "file_bytes": 0
+                      },
+                      "snapshot": {
+                        "file_bytes": 0
+                      }
+                    }
+                  },
+                  "node_3": {
+                    "node_id": 3,
+                    "group_id": "636c75737465725f32303236303932393132343835393232393739385f726166745f6c6f675f67726f7774685f313030",
+                    "paths": {
+                      "raft_log": {
+                        "file_bytes": 16559,
+                        "retained_log_entries": 28,
+                        "first_log_index": 0,
+                        "last_log_index": 27,
+                        "last_purged_log_index": null,
+                        "committed_log_index": 27
+                      },
+                      "state_machine_journal": {
+                        "file_bytes": 16681
+                      },
+                      "state_machine_checkpoint": {
+                        "file_bytes": 0
+                      },
+                      "snapshot": {
+                        "file_bytes": 0
+                      }
+                    }
+                  }
+                }
+              },
+              {
+                "phase": "publish",
+                "message_index": 32,
+                "elapsed_milliseconds": 33.228526,
+                "per_node": {
+                  "node_1": {
+                    "node_id": 1,
+                    "group_id": "636c75737465725f32303236303932393132343835393232393739385f726166745f6c6f675f67726f7774685f313030",
+                    "paths": {
+                      "raft_log": {
+                        "file_bytes": 5267,
+                        "retained_log_entries": 8,
+                        "first_log_index": 28,
+                        "last_log_index": 35,
+                        "last_purged_log_index": 27,
+                        "committed_log_index": 35
+                      },
+                      "state_machine_journal": {
+                        "file_bytes": 2568
+                      },
+                      "state_machine_checkpoint": {
+                        "file_bytes": 0
+                      },
+                      "snapshot": {
+                        "file_bytes": 42047
+                      }
+                    }
+                  },
+                  "node_2": {
+                    "node_id": 2,
+                    "group_id": "636c75737465725f32303236303932393132343835393232393739385f726166745f6c6f675f67726f7774685f313030",
+                    "paths": {
+                      "raft_log": {
+                        "file_bytes": 5267,
+                        "retained_log_entries": 8,
+                        "first_log_index": 28,
+                        "last_log_index": 35,
+                        "last_purged_log_index": 27,
+                        "committed_log_index": 35
+                      },
+                      "state_machine_journal": {
+                        "file_bytes": 2568
+                      },
+                      "state_machine_checkpoint": {
+                        "file_bytes": 0
+                      },
+                      "snapshot": {
+                        "file_bytes": 42047
+                      }
+                    }
+                  },
+                  "node_3": {
+                    "node_id": 3,
+                    "group_id": "636c75737465725f32303236303932393132343835393232393739385f726166745f6c6f675f67726f7774685f313030",
+                    "paths": {
+                      "raft_log": {
+                        "file_bytes": 5267,
+                        "retained_log_entries": 8,
+                        "first_log_index": 28,
+                        "last_log_index": 35,
+                        "last_purged_log_index": 27,
+                        "committed_log_index": 35
+                      },
+                      "state_machine_journal": {
+                        "file_bytes": 2568
+                      },
+                      "state_machine_checkpoint": {
+                        "file_bytes": 0
+                      },
+                      "snapshot": {
+                        "file_bytes": 42047
+                      }
+                    }
+                  }
+                }
+              },
+              {
+                "phase": "publish",
+                "message_index": 40,
+                "elapsed_milliseconds": 41.788054,
+                "per_node": {
+                  "node_1": {
+                    "node_id": 1,
+                    "group_id": "636c75737465725f32303236303932393132343835393232393739385f726166745f6c6f675f67726f7774685f313030",
+                    "paths": {
+                      "raft_log": {
+                        "file_bytes": 10323,
+                        "retained_log_entries": 16,
+                        "first_log_index": 28,
+                        "last_log_index": 43,
+                        "last_purged_log_index": 27,
+                        "committed_log_index": 43
+                      },
+                      "state_machine_journal": {
+                        "file_bytes": 7704
+                      },
+                      "state_machine_checkpoint": {
+                        "file_bytes": 0
+                      },
+                      "snapshot": {
+                        "file_bytes": 42047
+                      }
+                    }
+                  },
+                  "node_2": {
+                    "node_id": 2,
+                    "group_id": "636c75737465725f32303236303932393132343835393232393739385f726166745f6c6f675f67726f7774685f313030",
+                    "paths": {
+                      "raft_log": {
+                        "file_bytes": 10323,
+                        "retained_log_entries": 16,
+                        "first_log_index": 28,
+                        "last_log_index": 43,
+                        "last_purged_log_index": 27,
+                        "committed_log_index": 43
+                      },
+                      "state_machine_journal": {
+                        "file_bytes": 7704
+                      },
+                      "state_machine_checkpoint": {
+                        "file_bytes": 0
+                      },
+                      "snapshot": {
+                        "file_bytes": 42047
+                      }
+                    }
+                  },
+                  "node_3": {
+                    "node_id": 3,
+                    "group_id": "636c75737465725f32303236303932393132343835393232393739385f726166745f6c6f675f67726f7774685f313030",
+                    "paths": {
+                      "raft_log": {
+                        "file_bytes": 10323,
+                        "retained_log_entries": 16,
+                        "first_log_index": 28,
+                        "last_log_index": 43,
+                        "last_purged_log_index": 27,
+                        "committed_log_index": 43
+                      },
+                      "state_machine_journal": {
+                        "file_bytes": 7704
+                      },
+                      "state_machine_checkpoint": {
+                        "file_bytes": 0
+                      },
+                      "snapshot": {
+                        "file_bytes": 42047
+                      }
+                    }
+                  }
+                }
+              },
+              {
+                "phase": "publish",
+                "message_index": 48,
+                "elapsed_milliseconds": 50.692871,
+                "per_node": {
+                  "node_1": {
+                    "node_id": 1,
+                    "group_id": "636c75737465725f32303236303932393132343835393232393739385f726166745f6c6f675f67726f7774685f313030",
+                    "paths": {
+                      "raft_log": {
+                        "file_bytes": 15379,
+                        "retained_log_entries": 24,
+                        "first_log_index": 28,
+                        "last_log_index": 51,
+                        "last_purged_log_index": 27,
+                        "committed_log_index": 51
+                      },
+                      "state_machine_journal": {
+                        "file_bytes": 12840
+                      },
+                      "state_machine_checkpoint": {
+                        "file_bytes": 0
+                      },
+                      "snapshot": {
+                        "file_bytes": 42047
+                      }
+                    }
+                  },
+                  "node_2": {
+                    "node_id": 2,
+                    "group_id": "636c75737465725f32303236303932393132343835393232393739385f726166745f6c6f675f67726f7774685f313030",
+                    "paths": {
+                      "raft_log": {
+                        "file_bytes": 15379,
+                        "retained_log_entries": 24,
+                        "first_log_index": 28,
+                        "last_log_index": 51,
+                        "last_purged_log_index": 27,
+                        "committed_log_index": 51
+                      },
+                      "state_machine_journal": {
+                        "file_bytes": 12840
+                      },
+                      "state_machine_checkpoint": {
+                        "file_bytes": 0
+                      },
+                      "snapshot": {
+                        "file_bytes": 42047
+                      }
+                    }
+                  },
+                  "node_3": {
+                    "node_id": 3,
+                    "group_id": "636c75737465725f32303236303932393132343835393232393739385f726166745f6c6f675f67726f7774685f313030",
+                    "paths": {
+                      "raft_log": {
+                        "file_bytes": 15379,
+                        "retained_log_entries": 24,
+                        "first_log_index": 28,
+                        "last_log_index": 51,
+                        "last_purged_log_index": 27,
+                        "committed_log_index": 51
+                      },
+                      "state_machine_journal": {
+                        "file_bytes": 12840
+                      },
+                      "state_machine_checkpoint": {
+                        "file_bytes": 0
+                      },
+                      "snapshot": {
+                        "file_bytes": 42047
+                      }
+                    }
+                  }
+                }
+              },
+              {
+                "phase": "publish",
+                "message_index": 56,
+                "elapsed_milliseconds": 56.740194,
+                "per_node": {
+                  "node_1": {
+                    "node_id": 1,
+                    "group_id": "636c75737465725f32303236303932393132343835393232393739385f726166745f6c6f675f67726f7774685f313030",
+                    "paths": {
+                      "raft_log": {
+                        "file_bytes": 20435,
+                        "retained_log_entries": 32,
+                        "first_log_index": 28,
+                        "last_log_index": 59,
+                        "last_purged_log_index": 27,
+                        "committed_log_index": 59
+                      },
+                      "state_machine_journal": {
+                        "file_bytes": 17976
+                      },
+                      "state_machine_checkpoint": {
+                        "file_bytes": 0
+                      },
+                      "snapshot": {
+                        "file_bytes": 42047
+                      }
+                    }
+                  },
+                  "node_2": {
+                    "node_id": 2,
+                    "group_id": "636c75737465725f32303236303932393132343835393232393739385f726166745f6c6f675f67726f7774685f313030",
+                    "paths": {
+                      "raft_log": {
+                        "file_bytes": 20435,
+                        "retained_log_entries": 32,
+                        "first_log_index": 28,
+                        "last_log_index": 59,
+                        "last_purged_log_index": 27,
+                        "committed_log_index": 59
+                      },
+                      "state_machine_journal": {
+                        "file_bytes": 17976
+                      },
+                      "state_machine_checkpoint": {
+                        "file_bytes": 0
+                      },
+                      "snapshot": {
+                        "file_bytes": 42047
+                      }
+                    }
+                  },
+                  "node_3": {
+                    "node_id": 3,
+                    "group_id": "636c75737465725f32303236303932393132343835393232393739385f726166745f6c6f675f67726f7774685f313030",
+                    "paths": {
+                      "raft_log": {
+                        "file_bytes": 20435,
+                        "retained_log_entries": 32,
+                        "first_log_index": 28,
+                        "last_log_index": 59,
+                        "last_purged_log_index": 27,
+                        "committed_log_index": 59
+                      },
+                      "state_machine_journal": {
+                        "file_bytes": 17976
+                      },
+                      "state_machine_checkpoint": {
+                        "file_bytes": 0
+                      },
+                      "snapshot": {
+                        "file_bytes": 42047
+                      }
+                    }
+                  }
+                }
+              },
+              {
+                "phase": "publish",
+                "message_index": 64,
+                "elapsed_milliseconds": 61.944158,
+                "per_node": {
+                  "node_1": {
+                    "node_id": 1,
+                    "group_id": "636c75737465725f32303236303932393132343835393232393739385f726166745f6c6f675f67726f7774685f313030",
+                    "paths": {
+                      "raft_log": {
+                        "file_bytes": 5267,
+                        "retained_log_entries": 8,
+                        "first_log_index": 60,
+                        "last_log_index": 67,
+                        "last_purged_log_index": 59,
+                        "committed_log_index": 67
+                      },
+                      "state_machine_journal": {
+                        "file_bytes": 2568
+                      },
+                      "state_machine_checkpoint": {
+                        "file_bytes": 0
+                      },
+                      "snapshot": {
+                        "file_bytes": 86719
+                      }
+                    }
+                  },
+                  "node_2": {
+                    "node_id": 2,
+                    "group_id": "636c75737465725f32303236303932393132343835393232393739385f726166745f6c6f675f67726f7774685f313030",
+                    "paths": {
+                      "raft_log": {
+                        "file_bytes": 5267,
+                        "retained_log_entries": 8,
+                        "first_log_index": 60,
+                        "last_log_index": 67,
+                        "last_purged_log_index": 59,
+                        "committed_log_index": 67
+                      },
+                      "state_machine_journal": {
+                        "file_bytes": 2568
+                      },
+                      "state_machine_checkpoint": {
+                        "file_bytes": 0
+                      },
+                      "snapshot": {
+                        "file_bytes": 86719
+                      }
+                    }
+                  },
+                  "node_3": {
+                    "node_id": 3,
+                    "group_id": "636c75737465725f32303236303932393132343835393232393739385f726166745f6c6f675f67726f7774685f313030",
+                    "paths": {
+                      "raft_log": {
+                        "file_bytes": 5267,
+                        "retained_log_entries": 8,
+                        "first_log_index": 60,
+                        "last_log_index": 67,
+                        "last_purged_log_index": 59,
+                        "committed_log_index": 67
+                      },
+                      "state_machine_journal": {
+                        "file_bytes": 2568
+                      },
+                      "state_machine_checkpoint": {
+                        "file_bytes": 0
+                      },
+                      "snapshot": {
+                        "file_bytes": 86719
+                      }
+                    }
+                  }
+                }
+              },
+              {
+                "phase": "publish",
+                "message_index": 72,
+                "elapsed_milliseconds": 69.427293,
+                "per_node": {
+                  "node_1": {
+                    "node_id": 1,
+                    "group_id": "636c75737465725f32303236303932393132343835393232393739385f726166745f6c6f675f67726f7774685f313030",
+                    "paths": {
+                      "raft_log": {
+                        "file_bytes": 10323,
+                        "retained_log_entries": 16,
+                        "first_log_index": 60,
+                        "last_log_index": 75,
+                        "last_purged_log_index": 59,
+                        "committed_log_index": 75
+                      },
+                      "state_machine_journal": {
+                        "file_bytes": 7704
+                      },
+                      "state_machine_checkpoint": {
+                        "file_bytes": 0
+                      },
+                      "snapshot": {
+                        "file_bytes": 86719
+                      }
+                    }
+                  },
+                  "node_2": {
+                    "node_id": 2,
+                    "group_id": "636c75737465725f32303236303932393132343835393232393739385f726166745f6c6f675f67726f7774685f313030",
+                    "paths": {
+                      "raft_log": {
+                        "file_bytes": 10323,
+                        "retained_log_entries": 16,
+                        "first_log_index": 60,
+                        "last_log_index": 75,
+                        "last_purged_log_index": 59,
+                        "committed_log_index": 75
+                      },
+                      "state_machine_journal": {
+                        "file_bytes": 7704
+                      },
+                      "state_machine_checkpoint": {
+                        "file_bytes": 0
+                      },
+                      "snapshot": {
+                        "file_bytes": 86719
+                      }
+                    }
+                  },
+                  "node_3": {
+                    "node_id": 3,
+                    "group_id": "636c75737465725f32303236303932393132343835393232393739385f726166745f6c6f675f67726f7774685f313030",
+                    "paths": {
+                      "raft_log": {
+                        "file_bytes": 10323,
+                        "retained_log_entries": 16,
+                        "first_log_index": 60,
+                        "last_log_index": 75,
+                        "last_purged_log_index": 59,
+                        "committed_log_index": 75
+                      },
+                      "state_machine_journal": {
+                        "file_bytes": 7704
+                      },
+                      "state_machine_checkpoint": {
+                        "file_bytes": 0
+                      },
+                      "snapshot": {
+                        "file_bytes": 86719
+                      }
+                    }
+                  }
+                }
+              },
+              {
+                "phase": "publish",
+                "message_index": 80,
+                "elapsed_milliseconds": 76.638146,
+                "per_node": {
+                  "node_1": {
+                    "node_id": 1,
+                    "group_id": "636c75737465725f32303236303932393132343835393232393739385f726166745f6c6f675f67726f7774685f313030",
+                    "paths": {
+                      "raft_log": {
+                        "file_bytes": 15379,
+                        "retained_log_entries": 24,
+                        "first_log_index": 60,
+                        "last_log_index": 83,
+                        "last_purged_log_index": 59,
+                        "committed_log_index": 83
+                      },
+                      "state_machine_journal": {
+                        "file_bytes": 12840
+                      },
+                      "state_machine_checkpoint": {
+                        "file_bytes": 0
+                      },
+                      "snapshot": {
+                        "file_bytes": 86719
+                      }
+                    }
+                  },
+                  "node_2": {
+                    "node_id": 2,
+                    "group_id": "636c75737465725f32303236303932393132343835393232393739385f726166745f6c6f675f67726f7774685f313030",
+                    "paths": {
+                      "raft_log": {
+                        "file_bytes": 15379,
+                        "retained_log_entries": 24,
+                        "first_log_index": 60,
+                        "last_log_index": 83,
+                        "last_purged_log_index": 59,
+                        "committed_log_index": 83
+                      },
+                      "state_machine_journal": {
+                        "file_bytes": 12840
+                      },
+                      "state_machine_checkpoint": {
+                        "file_bytes": 0
+                      },
+                      "snapshot": {
+                        "file_bytes": 86719
+                      }
+                    }
+                  },
+                  "node_3": {
+                    "node_id": 3,
+                    "group_id": "636c75737465725f32303236303932393132343835393232393739385f726166745f6c6f675f67726f7774685f313030",
+                    "paths": {
+                      "raft_log": {
+                        "file_bytes": 15379,
+                        "retained_log_entries": 24,
+                        "first_log_index": 60,
+                        "last_log_index": 83,
+                        "last_purged_log_index": 59,
+                        "committed_log_index": 83
+                      },
+                      "state_machine_journal": {
+                        "file_bytes": 12840
+                      },
+                      "state_machine_checkpoint": {
+                        "file_bytes": 0
+                      },
+                      "snapshot": {
+                        "file_bytes": 86719
+                      }
+                    }
+                  }
+                }
+              },
+              {
+                "phase": "publish",
+                "message_index": 88,
+                "elapsed_milliseconds": 88.282258,
+                "per_node": {
+                  "node_1": {
+                    "node_id": 1,
+                    "group_id": "636c75737465725f32303236303932393132343835393232393739385f726166745f6c6f675f67726f7774685f313030",
+                    "paths": {
+                      "raft_log": {
+                        "file_bytes": 20435,
+                        "retained_log_entries": 32,
+                        "first_log_index": 60,
+                        "last_log_index": 91,
+                        "last_purged_log_index": 59,
+                        "committed_log_index": 91
+                      },
+                      "state_machine_journal": {
+                        "file_bytes": 17976
+                      },
+                      "state_machine_checkpoint": {
+                        "file_bytes": 0
+                      },
+                      "snapshot": {
+                        "file_bytes": 86719
+                      }
+                    }
+                  },
+                  "node_2": {
+                    "node_id": 2,
+                    "group_id": "636c75737465725f32303236303932393132343835393232393739385f726166745f6c6f675f67726f7774685f313030",
+                    "paths": {
+                      "raft_log": {
+                        "file_bytes": 20435,
+                        "retained_log_entries": 32,
+                        "first_log_index": 60,
+                        "last_log_index": 91,
+                        "last_purged_log_index": 59,
+                        "committed_log_index": 91
+                      },
+                      "state_machine_journal": {
+                        "file_bytes": 17976
+                      },
+                      "state_machine_checkpoint": {
+                        "file_bytes": 0
+                      },
+                      "snapshot": {
+                        "file_bytes": 86719
+                      }
+                    }
+                  },
+                  "node_3": {
+                    "node_id": 3,
+                    "group_id": "636c75737465725f32303236303932393132343835393232393739385f726166745f6c6f675f67726f7774685f313030",
+                    "paths": {
+                      "raft_log": {
+                        "file_bytes": 20435,
+                        "retained_log_entries": 32,
+                        "first_log_index": 60,
+                        "last_log_index": 91,
+                        "last_purged_log_index": 59,
+                        "committed_log_index": 91
+                      },
+                      "state_machine_journal": {
+                        "file_bytes": 17976
+                      },
+                      "state_machine_checkpoint": {
+                        "file_bytes": 0
+                      },
+                      "snapshot": {
+                        "file_bytes": 86719
+                      }
+                    }
+                  }
+                }
+              },
+              {
+                "phase": "publish",
+                "message_index": 96,
+                "elapsed_milliseconds": 97.829203,
+                "per_node": {
+                  "node_1": {
+                    "node_id": 1,
+                    "group_id": "636c75737465725f32303236303932393132343835393232393739385f726166745f6c6f675f67726f7774685f313030",
+                    "paths": {
+                      "raft_log": {
+                        "file_bytes": 5267,
+                        "retained_log_entries": 8,
+                        "first_log_index": 92,
+                        "last_log_index": 99,
+                        "last_purged_log_index": 91,
+                        "committed_log_index": 99
+                      },
+                      "state_machine_journal": {
+                        "file_bytes": 2568
+                      },
+                      "state_machine_checkpoint": {
+                        "file_bytes": 0
+                      },
+                      "snapshot": {
+                        "file_bytes": 131391
+                      }
+                    }
+                  },
+                  "node_2": {
+                    "node_id": 2,
+                    "group_id": "636c75737465725f32303236303932393132343835393232393739385f726166745f6c6f675f67726f7774685f313030",
+                    "paths": {
+                      "raft_log": {
+                        "file_bytes": 5267,
+                        "retained_log_entries": 8,
+                        "first_log_index": 92,
+                        "last_log_index": 99,
+                        "last_purged_log_index": 91,
+                        "committed_log_index": 99
+                      },
+                      "state_machine_journal": {
+                        "file_bytes": 2568
+                      },
+                      "state_machine_checkpoint": {
+                        "file_bytes": 0
+                      },
+                      "snapshot": {
+                        "file_bytes": 131391
+                      }
+                    }
+                  },
+                  "node_3": {
+                    "node_id": 3,
+                    "group_id": "636c75737465725f32303236303932393132343835393232393739385f726166745f6c6f675f67726f7774685f313030",
+                    "paths": {
+                      "raft_log": {
+                        "file_bytes": 5267,
+                        "retained_log_entries": 8,
+                        "first_log_index": 92,
+                        "last_log_index": 99,
+                        "last_purged_log_index": 91,
+                        "committed_log_index": 99
+                      },
+                      "state_machine_journal": {
+                        "file_bytes": 2568
+                      },
+                      "state_machine_checkpoint": {
+                        "file_bytes": 0
+                      },
+                      "snapshot": {
+                        "file_bytes": 131391
+                      }
+                    }
+                  }
+                }
+              },
+              {
+                "phase": "publish",
+                "message_index": 104,
+                "elapsed_milliseconds": 102.847976,
+                "per_node": {
+                  "node_1": {
+                    "node_id": 1,
+                    "group_id": "636c75737465725f32303236303932393132343835393232393739385f726166745f6c6f675f67726f7774685f313030",
+                    "paths": {
+                      "raft_log": {
+                        "file_bytes": 10340,
+                        "retained_log_entries": 16,
+                        "first_log_index": 92,
+                        "last_log_index": 107,
+                        "last_purged_log_index": 91,
+                        "committed_log_index": 107
+                      },
+                      "state_machine_journal": {
+                        "file_bytes": 7712
+                      },
+                      "state_machine_checkpoint": {
+                        "file_bytes": 0
+                      },
+                      "snapshot": {
+                        "file_bytes": 131391
+                      }
+                    }
+                  },
+                  "node_2": {
+                    "node_id": 2,
+                    "group_id": "636c75737465725f32303236303932393132343835393232393739385f726166745f6c6f675f67726f7774685f313030",
+                    "paths": {
+                      "raft_log": {
+                        "file_bytes": 10340,
+                        "retained_log_entries": 16,
+                        "first_log_index": 92,
+                        "last_log_index": 107,
+                        "last_purged_log_index": 91,
+                        "committed_log_index": 107
+                      },
+                      "state_machine_journal": {
+                        "file_bytes": 7712
+                      },
+                      "state_machine_checkpoint": {
+                        "file_bytes": 0
+                      },
+                      "snapshot": {
+                        "file_bytes": 131391
+                      }
+                    }
+                  },
+                  "node_3": {
+                    "node_id": 3,
+                    "group_id": "636c75737465725f32303236303932393132343835393232393739385f726166745f6c6f675f67726f7774685f313030",
+                    "paths": {
+                      "raft_log": {
+                        "file_bytes": 10340,
+                        "retained_log_entries": 16,
+                        "first_log_index": 92,
+                        "last_log_index": 107,
+                        "last_purged_log_index": 91,
+                        "committed_log_index": 107
+                      },
+                      "state_machine_journal": {
+                        "file_bytes": 7712
+                      },
+                      "state_machine_checkpoint": {
+                        "file_bytes": 0
+                      },
+                      "snapshot": {
+                        "file_bytes": 131391
+                      }
+                    }
+                  }
+                }
+              },
+              {
+                "phase": "publish",
+                "message_index": 112,
+                "elapsed_milliseconds": 109.700257,
+                "per_node": {
+                  "node_1": {
+                    "node_id": 1,
+                    "group_id": "636c75737465725f32303236303932393132343835393232393739385f726166745f6c6f675f67726f7774685f313030",
+                    "paths": {
+                      "raft_log": {
+                        "file_bytes": 15412,
+                        "retained_log_entries": 24,
+                        "first_log_index": 92,
+                        "last_log_index": 115,
+                        "last_purged_log_index": 91,
+                        "committed_log_index": 115
+                      },
+                      "state_machine_journal": {
+                        "file_bytes": 12856
+                      },
+                      "state_machine_checkpoint": {
+                        "file_bytes": 0
+                      },
+                      "snapshot": {
+                        "file_bytes": 131391
+                      }
+                    }
+                  },
+                  "node_2": {
+                    "node_id": 2,
+                    "group_id": "636c75737465725f32303236303932393132343835393232393739385f726166745f6c6f675f67726f7774685f313030",
+                    "paths": {
+                      "raft_log": {
+                        "file_bytes": 15412,
+                        "retained_log_entries": 24,
+                        "first_log_index": 92,
+                        "last_log_index": 115,
+                        "last_purged_log_index": 91,
+                        "committed_log_index": 115
+                      },
+                      "state_machine_journal": {
+                        "file_bytes": 12856
+                      },
+                      "state_machine_checkpoint": {
+                        "file_bytes": 0
+                      },
+                      "snapshot": {
+                        "file_bytes": 131391
+                      }
+                    }
+                  },
+                  "node_3": {
+                    "node_id": 3,
+                    "group_id": "636c75737465725f32303236303932393132343835393232393739385f726166745f6c6f675f67726f7774685f313030",
+                    "paths": {
+                      "raft_log": {
+                        "file_bytes": 15412,
+                        "retained_log_entries": 24,
+                        "first_log_index": 92,
+                        "last_log_index": 115,
+                        "last_purged_log_index": 91,
+                        "committed_log_index": 115
+                      },
+                      "state_machine_journal": {
+                        "file_bytes": 12856
+                      },
+                      "state_machine_checkpoint": {
+                        "file_bytes": 0
+                      },
+                      "snapshot": {
+                        "file_bytes": 131391
+                      }
+                    }
+                  }
+                }
+              },
+              {
+                "phase": "publish",
+                "message_index": 120,
+                "elapsed_milliseconds": 118.967112,
+                "per_node": {
+                  "node_1": {
+                    "node_id": 1,
+                    "group_id": "636c75737465725f32303236303932393132343835393232393739385f726166745f6c6f675f67726f7774685f313030",
+                    "paths": {
+                      "raft_log": {
+                        "file_bytes": 20484,
+                        "retained_log_entries": 32,
+                        "first_log_index": 92,
+                        "last_log_index": 123,
+                        "last_purged_log_index": 91,
+                        "committed_log_index": 123
+                      },
+                      "state_machine_journal": {
+                        "file_bytes": 18000
+                      },
+                      "state_machine_checkpoint": {
+                        "file_bytes": 0
+                      },
+                      "snapshot": {
+                        "file_bytes": 131391
+                      }
+                    }
+                  },
+                  "node_2": {
+                    "node_id": 2,
+                    "group_id": "636c75737465725f32303236303932393132343835393232393739385f726166745f6c6f675f67726f7774685f313030",
+                    "paths": {
+                      "raft_log": {
+                        "file_bytes": 20484,
+                        "retained_log_entries": 32,
+                        "first_log_index": 92,
+                        "last_log_index": 123,
+                        "last_purged_log_index": 91,
+                        "committed_log_index": 123
+                      },
+                      "state_machine_journal": {
+                        "file_bytes": 18000
+                      },
+                      "state_machine_checkpoint": {
+                        "file_bytes": 0
+                      },
+                      "snapshot": {
+                        "file_bytes": 131391
+                      }
+                    }
+                  },
+                  "node_3": {
+                    "node_id": 3,
+                    "group_id": "636c75737465725f32303236303932393132343835393232393739385f726166745f6c6f675f67726f7774685f313030",
+                    "paths": {
+                      "raft_log": {
+                        "file_bytes": 20484,
+                        "retained_log_entries": 32,
+                        "first_log_index": 92,
+                        "last_log_index": 123,
+                        "last_purged_log_index": 91,
+                        "committed_log_index": 123
+                      },
+                      "state_machine_journal": {
+                        "file_bytes": 18000
+                      },
+                      "state_machine_checkpoint": {
+                        "file_bytes": 0
+                      },
+                      "snapshot": {
+                        "file_bytes": 131391
+                      }
+                    }
+                  }
+                }
+              },
+              {
+                "phase": "publish",
+                "message_index": 128,
+                "elapsed_milliseconds": 127.371574,
+                "per_node": {
+                  "node_1": {
+                    "node_id": 1,
+                    "group_id": "636c75737465725f32303236303932393132343835393232393739385f726166745f6c6f675f67726f7774685f313030",
+                    "paths": {
+                      "raft_log": {
+                        "file_bytes": 5285,
+                        "retained_log_entries": 8,
+                        "first_log_index": 124,
+                        "last_log_index": 131,
+                        "last_purged_log_index": 123,
+                        "committed_log_index": 131
+                      },
+                      "state_machine_journal": {
+                        "file_bytes": 2572
+                      },
+                      "state_machine_checkpoint": {
+                        "file_bytes": 0
+                      },
+                      "snapshot": {
+                        "file_bytes": 176064
+                      }
+                    }
+                  },
+                  "node_2": {
+                    "node_id": 2,
+                    "group_id": "636c75737465725f32303236303932393132343835393232393739385f726166745f6c6f675f67726f7774685f313030",
+                    "paths": {
+                      "raft_log": {
+                        "file_bytes": 5285,
+                        "retained_log_entries": 8,
+                        "first_log_index": 124,
+                        "last_log_index": 131,
+                        "last_purged_log_index": 123,
+                        "committed_log_index": 131
+                      },
+                      "state_machine_journal": {
+                        "file_bytes": 2572
+                      },
+                      "state_machine_checkpoint": {
+                        "file_bytes": 0
+                      },
+                      "snapshot": {
+                        "file_bytes": 176064
+                      }
+                    }
+                  },
+                  "node_3": {
+                    "node_id": 3,
+                    "group_id": "636c75737465725f32303236303932393132343835393232393739385f726166745f6c6f675f67726f7774685f313030",
+                    "paths": {
+                      "raft_log": {
+                        "file_bytes": 5285,
+                        "retained_log_entries": 8,
+                        "first_log_index": 124,
+                        "last_log_index": 131,
+                        "last_purged_log_index": 123,
+                        "committed_log_index": 131
+                      },
+                      "state_machine_journal": {
+                        "file_bytes": 2572
+                      },
+                      "state_machine_checkpoint": {
+                        "file_bytes": 0
+                      },
+                      "snapshot": {
+                        "file_bytes": 176064
+                      }
+                    }
+                  }
+                }
+              },
+              {
+                "phase": "publish",
+                "message_index": 136,
+                "elapsed_milliseconds": 134.001421,
+                "per_node": {
+                  "node_1": {
+                    "node_id": 1,
+                    "group_id": "636c75737465725f32303236303932393132343835393232393739385f726166745f6c6f675f67726f7774685f313030",
+                    "paths": {
+                      "raft_log": {
+                        "file_bytes": 10357,
+                        "retained_log_entries": 16,
+                        "first_log_index": 124,
+                        "last_log_index": 139,
+                        "last_purged_log_index": 123,
+                        "committed_log_index": 139
+                      },
+                      "state_machine_journal": {
+                        "file_bytes": 7716
+                      },
+                      "state_machine_checkpoint": {
+                        "file_bytes": 0
+                      },
+                      "snapshot": {
+                        "file_bytes": 176064
+                      }
+                    }
+                  },
+                  "node_2": {
+                    "node_id": 2,
+                    "group_id": "636c75737465725f32303236303932393132343835393232393739385f726166745f6c6f675f67726f7774685f313030",
+                    "paths": {
+                      "raft_log": {
+                        "file_bytes": 10357,
+                        "retained_log_entries": 16,
+                        "first_log_index": 124,
+                        "last_log_index": 139,
+                        "last_purged_log_index": 123,
+                        "committed_log_index": 139
+                      },
+                      "state_machine_journal": {
+                        "file_bytes": 7716
+                      },
+                      "state_machine_checkpoint": {
+                        "file_bytes": 0
+                      },
+                      "snapshot": {
+                        "file_bytes": 176064
+                      }
+                    }
+                  },
+                  "node_3": {
+                    "node_id": 3,
+                    "group_id": "636c75737465725f32303236303932393132343835393232393739385f726166745f6c6f675f67726f7774685f313030",
+                    "paths": {
+                      "raft_log": {
+                        "file_bytes": 10357,
+                        "retained_log_entries": 16,
+                        "first_log_index": 124,
+                        "last_log_index": 139,
+                        "last_purged_log_index": 123,
+                        "committed_log_index": 139
+                      },
+                      "state_machine_journal": {
+                        "file_bytes": 7716
+                      },
+                      "state_machine_checkpoint": {
+                        "file_bytes": 0
+                      },
+                      "snapshot": {
+                        "file_bytes": 176064
+                      }
+                    }
+                  }
+                }
+              },
+              {
+                "phase": "publish",
+                "message_index": 144,
+                "elapsed_milliseconds": 142.076566,
+                "per_node": {
+                  "node_1": {
+                    "node_id": 1,
+                    "group_id": "636c75737465725f32303236303932393132343835393232393739385f726166745f6c6f675f67726f7774685f313030",
+                    "paths": {
+                      "raft_log": {
+                        "file_bytes": 15429,
+                        "retained_log_entries": 24,
+                        "first_log_index": 124,
+                        "last_log_index": 147,
+                        "last_purged_log_index": 123,
+                        "committed_log_index": 147
+                      },
+                      "state_machine_journal": {
+                        "file_bytes": 12860
+                      },
+                      "state_machine_checkpoint": {
+                        "file_bytes": 0
+                      },
+                      "snapshot": {
+                        "file_bytes": 176064
+                      }
+                    }
+                  },
+                  "node_2": {
+                    "node_id": 2,
+                    "group_id": "636c75737465725f32303236303932393132343835393232393739385f726166745f6c6f675f67726f7774685f313030",
+                    "paths": {
+                      "raft_log": {
+                        "file_bytes": 15429,
+                        "retained_log_entries": 24,
+                        "first_log_index": 124,
+                        "last_log_index": 147,
+                        "last_purged_log_index": 123,
+                        "committed_log_index": 147
+                      },
+                      "state_machine_journal": {
+                        "file_bytes": 12860
+                      },
+                      "state_machine_checkpoint": {
+                        "file_bytes": 0
+                      },
+                      "snapshot": {
+                        "file_bytes": 176064
+                      }
+                    }
+                  },
+                  "node_3": {
+                    "node_id": 3,
+                    "group_id": "636c75737465725f32303236303932393132343835393232393739385f726166745f6c6f675f67726f7774685f313030",
+                    "paths": {
+                      "raft_log": {
+                        "file_bytes": 15429,
+                        "retained_log_entries": 24,
+                        "first_log_index": 124,
+                        "last_log_index": 147,
+                        "last_purged_log_index": 123,
+                        "committed_log_index": 147
+                      },
+                      "state_machine_journal": {
+                        "file_bytes": 12860
+                      },
+                      "state_machine_checkpoint": {
+                        "file_bytes": 0
+                      },
+                      "snapshot": {
+                        "file_bytes": 176064
+                      }
+                    }
+                  }
+                }
+              },
+              {
+                "phase": "publish",
+                "message_index": 152,
+                "elapsed_milliseconds": 153.541045,
+                "per_node": {
+                  "node_1": {
+                    "node_id": 1,
+                    "group_id": "636c75737465725f32303236303932393132343835393232393739385f726166745f6c6f675f67726f7774685f313030",
+                    "paths": {
+                      "raft_log": {
+                        "file_bytes": 20501,
+                        "retained_log_entries": 32,
+                        "first_log_index": 124,
+                        "last_log_index": 155,
+                        "last_purged_log_index": 123,
+                        "committed_log_index": 155
+                      },
+                      "state_machine_journal": {
+                        "file_bytes": 18004
+                      },
+                      "state_machine_checkpoint": {
+                        "file_bytes": 0
+                      },
+                      "snapshot": {
+                        "file_bytes": 176064
+                      }
+                    }
+                  },
+                  "node_2": {
+                    "node_id": 2,
+                    "group_id": "636c75737465725f32303236303932393132343835393232393739385f726166745f6c6f675f67726f7774685f313030",
+                    "paths": {
+                      "raft_log": {
+                        "file_bytes": 20501,
+                        "retained_log_entries": 32,
+                        "first_log_index": 124,
+                        "last_log_index": 155,
+                        "last_purged_log_index": 123,
+                        "committed_log_index": 155
+                      },
+                      "state_machine_journal": {
+                        "file_bytes": 18004
+                      },
+                      "state_machine_checkpoint": {
+                        "file_bytes": 0
+                      },
+                      "snapshot": {
+                        "file_bytes": 176064
+                      }
+                    }
+                  },
+                  "node_3": {
+                    "node_id": 3,
+                    "group_id": "636c75737465725f32303236303932393132343835393232393739385f726166745f6c6f675f67726f7774685f313030",
+                    "paths": {
+                      "raft_log": {
+                        "file_bytes": 20501,
+                        "retained_log_entries": 32,
+                        "first_log_index": 124,
+                        "last_log_index": 155,
+                        "last_purged_log_index": 123,
+                        "committed_log_index": 155
+                      },
+                      "state_machine_journal": {
+                        "file_bytes": 18004
+                      },
+                      "state_machine_checkpoint": {
+                        "file_bytes": 0
+                      },
+                      "snapshot": {
+                        "file_bytes": 176064
+                      }
+                    }
+                  }
+                }
+              },
+              {
+                "phase": "publish",
+                "message_index": 160,
+                "elapsed_milliseconds": 161.00328,
+                "per_node": {
+                  "node_1": {
+                    "node_id": 1,
+                    "group_id": "636c75737465725f32303236303932393132343835393232393739385f726166745f6c6f675f67726f7774685f313030",
+                    "paths": {
+                      "raft_log": {
+                        "file_bytes": 5285,
+                        "retained_log_entries": 8,
+                        "first_log_index": 156,
+                        "last_log_index": 163,
+                        "last_purged_log_index": 155,
+                        "committed_log_index": 163
+                      },
+                      "state_machine_journal": {
+                        "file_bytes": 2572
+                      },
+                      "state_machine_checkpoint": {
+                        "file_bytes": 0
+                      },
+                      "snapshot": {
+                        "file_bytes": 220736
+                      }
+                    }
+                  },
+                  "node_2": {
+                    "node_id": 2,
+                    "group_id": "636c75737465725f32303236303932393132343835393232393739385f726166745f6c6f675f67726f7774685f313030",
+                    "paths": {
+                      "raft_log": {
+                        "file_bytes": 5285,
+                        "retained_log_entries": 8,
+                        "first_log_index": 156,
+                        "last_log_index": 163,
+                        "last_purged_log_index": 155,
+                        "committed_log_index": 163
+                      },
+                      "state_machine_journal": {
+                        "file_bytes": 2572
+                      },
+                      "state_machine_checkpoint": {
+                        "file_bytes": 0
+                      },
+                      "snapshot": {
+                        "file_bytes": 220736
+                      }
+                    }
+                  },
+                  "node_3": {
+                    "node_id": 3,
+                    "group_id": "636c75737465725f32303236303932393132343835393232393739385f726166745f6c6f675f67726f7774685f313030",
+                    "paths": {
+                      "raft_log": {
+                        "file_bytes": 5285,
+                        "retained_log_entries": 8,
+                        "first_log_index": 156,
+                        "last_log_index": 163,
+                        "last_purged_log_index": 155,
+                        "committed_log_index": 163
+                      },
+                      "state_machine_journal": {
+                        "file_bytes": 2572
+                      },
+                      "state_machine_checkpoint": {
+                        "file_bytes": 0
+                      },
+                      "snapshot": {
+                        "file_bytes": 220736
+                      }
+                    }
+                  }
+                }
+              },
+              {
+                "phase": "publish",
+                "message_index": 168,
+                "elapsed_milliseconds": 169.823265,
+                "per_node": {
+                  "node_1": {
+                    "node_id": 1,
+                    "group_id": "636c75737465725f32303236303932393132343835393232393739385f726166745f6c6f675f67726f7774685f313030",
+                    "paths": {
+                      "raft_log": {
+                        "file_bytes": 10357,
+                        "retained_log_entries": 16,
+                        "first_log_index": 156,
+                        "last_log_index": 171,
+                        "last_purged_log_index": 155,
+                        "committed_log_index": 171
+                      },
+                      "state_machine_journal": {
+                        "file_bytes": 7716
+                      },
+                      "state_machine_checkpoint": {
+                        "file_bytes": 0
+                      },
+                      "snapshot": {
+                        "file_bytes": 220736
+                      }
+                    }
+                  },
+                  "node_2": {
+                    "node_id": 2,
+                    "group_id": "636c75737465725f32303236303932393132343835393232393739385f726166745f6c6f675f67726f7774685f313030",
+                    "paths": {
+                      "raft_log": {
+                        "file_bytes": 10357,
+                        "retained_log_entries": 16,
+                        "first_log_index": 156,
+                        "last_log_index": 171,
+                        "last_purged_log_index": 155,
+                        "committed_log_index": 171
+                      },
+                      "state_machine_journal": {
+                        "file_bytes": 7716
+                      },
+                      "state_machine_checkpoint": {
+                        "file_bytes": 0
+                      },
+                      "snapshot": {
+                        "file_bytes": 220736
+                      }
+                    }
+                  },
+                  "node_3": {
+                    "node_id": 3,
+                    "group_id": "636c75737465725f32303236303932393132343835393232393739385f726166745f6c6f675f67726f7774685f313030",
+                    "paths": {
+                      "raft_log": {
+                        "file_bytes": 10357,
+                        "retained_log_entries": 16,
+                        "first_log_index": 156,
+                        "last_log_index": 171,
+                        "last_purged_log_index": 155,
+                        "committed_log_index": 171
+                      },
+                      "state_machine_journal": {
+                        "file_bytes": 7716
+                      },
+                      "state_machine_checkpoint": {
+                        "file_bytes": 0
+                      },
+                      "snapshot": {
+                        "file_bytes": 220736
+                      }
+                    }
+                  }
+                }
+              },
+              {
+                "phase": "publish",
+                "message_index": 176,
+                "elapsed_milliseconds": 178.404412,
+                "per_node": {
+                  "node_1": {
+                    "node_id": 1,
+                    "group_id": "636c75737465725f32303236303932393132343835393232393739385f726166745f6c6f675f67726f7774685f313030",
+                    "paths": {
+                      "raft_log": {
+                        "file_bytes": 15429,
+                        "retained_log_entries": 24,
+                        "first_log_index": 156,
+                        "last_log_index": 179,
+                        "last_purged_log_index": 155,
+                        "committed_log_index": 179
+                      },
+                      "state_machine_journal": {
+                        "file_bytes": 12860
+                      },
+                      "state_machine_checkpoint": {
+                        "file_bytes": 0
+                      },
+                      "snapshot": {
+                        "file_bytes": 220736
+                      }
+                    }
+                  },
+                  "node_2": {
+                    "node_id": 2,
+                    "group_id": "636c75737465725f32303236303932393132343835393232393739385f726166745f6c6f675f67726f7774685f313030",
+                    "paths": {
+                      "raft_log": {
+                        "file_bytes": 15429,
+                        "retained_log_entries": 24,
+                        "first_log_index": 156,
+                        "last_log_index": 179,
+                        "last_purged_log_index": 155,
+                        "committed_log_index": 179
+                      },
+                      "state_machine_journal": {
+                        "file_bytes": 12860
+                      },
+                      "state_machine_checkpoint": {
+                        "file_bytes": 0
+                      },
+                      "snapshot": {
+                        "file_bytes": 220736
+                      }
+                    }
+                  },
+                  "node_3": {
+                    "node_id": 3,
+                    "group_id": "636c75737465725f32303236303932393132343835393232393739385f726166745f6c6f675f67726f7774685f313030",
+                    "paths": {
+                      "raft_log": {
+                        "file_bytes": 15429,
+                        "retained_log_entries": 24,
+                        "first_log_index": 156,
+                        "last_log_index": 179,
+                        "last_purged_log_index": 155,
+                        "committed_log_index": 179
+                      },
+                      "state_machine_journal": {
+                        "file_bytes": 12860
+                      },
+                      "state_machine_checkpoint": {
+                        "file_bytes": 0
+                      },
+                      "snapshot": {
+                        "file_bytes": 220736
+                      }
+                    }
+                  }
+                }
+              },
+              {
+                "phase": "publish",
+                "message_index": 184,
+                "elapsed_milliseconds": 188.681515,
+                "per_node": {
+                  "node_1": {
+                    "node_id": 1,
+                    "group_id": "636c75737465725f32303236303932393132343835393232393739385f726166745f6c6f675f67726f7774685f313030",
+                    "paths": {
+                      "raft_log": {
+                        "file_bytes": 20501,
+                        "retained_log_entries": 32,
+                        "first_log_index": 156,
+                        "last_log_index": 187,
+                        "last_purged_log_index": 155,
+                        "committed_log_index": 187
+                      },
+                      "state_machine_journal": {
+                        "file_bytes": 18004
+                      },
+                      "state_machine_checkpoint": {
+                        "file_bytes": 0
+                      },
+                      "snapshot": {
+                        "file_bytes": 220736
+                      }
+                    }
+                  },
+                  "node_2": {
+                    "node_id": 2,
+                    "group_id": "636c75737465725f32303236303932393132343835393232393739385f726166745f6c6f675f67726f7774685f313030",
+                    "paths": {
+                      "raft_log": {
+                        "file_bytes": 20501,
+                        "retained_log_entries": 32,
+                        "first_log_index": 156,
+                        "last_log_index": 187,
+                        "last_purged_log_index": 155,
+                        "committed_log_index": 187
+                      },
+                      "state_machine_journal": {
+                        "file_bytes": 18004
+                      },
+                      "state_machine_checkpoint": {
+                        "file_bytes": 0
+                      },
+                      "snapshot": {
+                        "file_bytes": 220736
+                      }
+                    }
+                  },
+                  "node_3": {
+                    "node_id": 3,
+                    "group_id": "636c75737465725f32303236303932393132343835393232393739385f726166745f6c6f675f67726f7774685f313030",
+                    "paths": {
+                      "raft_log": {
+                        "file_bytes": 20501,
+                        "retained_log_entries": 32,
+                        "first_log_index": 156,
+                        "last_log_index": 187,
+                        "last_purged_log_index": 155,
+                        "committed_log_index": 187
+                      },
+                      "state_machine_journal": {
+                        "file_bytes": 18004
+                      },
+                      "state_machine_checkpoint": {
+                        "file_bytes": 0
+                      },
+                      "snapshot": {
+                        "file_bytes": 220736
+                      }
+                    }
+                  }
+                }
+              },
+              {
+                "phase": "publish",
+                "message_index": 192,
+                "elapsed_milliseconds": 197.818953,
+                "per_node": {
+                  "node_1": {
+                    "node_id": 1,
+                    "group_id": "636c75737465725f32303236303932393132343835393232393739385f726166745f6c6f675f67726f7774685f313030",
+                    "paths": {
+                      "raft_log": {
+                        "file_bytes": 5285,
+                        "retained_log_entries": 8,
+                        "first_log_index": 188,
+                        "last_log_index": 195,
+                        "last_purged_log_index": 187,
+                        "committed_log_index": 195
+                      },
+                      "state_machine_journal": {
+                        "file_bytes": 2572
+                      },
+                      "state_machine_checkpoint": {
+                        "file_bytes": 0
+                      },
+                      "snapshot": {
+                        "file_bytes": 265408
+                      }
+                    }
+                  },
+                  "node_2": {
+                    "node_id": 2,
+                    "group_id": "636c75737465725f32303236303932393132343835393232393739385f726166745f6c6f675f67726f7774685f313030",
+                    "paths": {
+                      "raft_log": {
+                        "file_bytes": 5285,
+                        "retained_log_entries": 8,
+                        "first_log_index": 188,
+                        "last_log_index": 195,
+                        "last_purged_log_index": 187,
+                        "committed_log_index": 195
+                      },
+                      "state_machine_journal": {
+                        "file_bytes": 2572
+                      },
+                      "state_machine_checkpoint": {
+                        "file_bytes": 0
+                      },
+                      "snapshot": {
+                        "file_bytes": 265408
+                      }
+                    }
+                  },
+                  "node_3": {
+                    "node_id": 3,
+                    "group_id": "636c75737465725f32303236303932393132343835393232393739385f726166745f6c6f675f67726f7774685f313030",
+                    "paths": {
+                      "raft_log": {
+                        "file_bytes": 5285,
+                        "retained_log_entries": 8,
+                        "first_log_index": 188,
+                        "last_log_index": 195,
+                        "last_purged_log_index": 187,
+                        "committed_log_index": 195
+                      },
+                      "state_machine_journal": {
+                        "file_bytes": 2572
+                      },
+                      "state_machine_checkpoint": {
+                        "file_bytes": 0
+                      },
+                      "snapshot": {
+                        "file_bytes": 265408
+                      }
+                    }
+                  }
+                }
+              },
+              {
+                "phase": "publish",
+                "message_index": 200,
+                "elapsed_milliseconds": 206.296804,
+                "per_node": {
+                  "node_1": {
+                    "node_id": 1,
+                    "group_id": "636c75737465725f32303236303932393132343835393232393739385f726166745f6c6f675f67726f7774685f313030",
+                    "paths": {
+                      "raft_log": {
+                        "file_bytes": 10357,
+                        "retained_log_entries": 16,
+                        "first_log_index": 188,
+                        "last_log_index": 203,
+                        "last_purged_log_index": 187,
+                        "committed_log_index": 203
+                      },
+                      "state_machine_journal": {
+                        "file_bytes": 7716
+                      },
+                      "state_machine_checkpoint": {
+                        "file_bytes": 0
+                      },
+                      "snapshot": {
+                        "file_bytes": 265408
+                      }
+                    }
+                  },
+                  "node_2": {
+                    "node_id": 2,
+                    "group_id": "636c75737465725f32303236303932393132343835393232393739385f726166745f6c6f675f67726f7774685f313030",
+                    "paths": {
+                      "raft_log": {
+                        "file_bytes": 10357,
+                        "retained_log_entries": 16,
+                        "first_log_index": 188,
+                        "last_log_index": 203,
+                        "last_purged_log_index": 187,
+                        "committed_log_index": 203
+                      },
+                      "state_machine_journal": {
+                        "file_bytes": 7716
+                      },
+                      "state_machine_checkpoint": {
+                        "file_bytes": 0
+                      },
+                      "snapshot": {
+                        "file_bytes": 265408
+                      }
+                    }
+                  },
+                  "node_3": {
+                    "node_id": 3,
+                    "group_id": "636c75737465725f32303236303932393132343835393232393739385f726166745f6c6f675f67726f7774685f313030",
+                    "paths": {
+                      "raft_log": {
+                        "file_bytes": 10357,
+                        "retained_log_entries": 16,
+                        "first_log_index": 188,
+                        "last_log_index": 203,
+                        "last_purged_log_index": 187,
+                        "committed_log_index": 203
+                      },
+                      "state_machine_journal": {
+                        "file_bytes": 7716
+                      },
+                      "state_machine_checkpoint": {
+                        "file_bytes": 0
+                      },
+                      "snapshot": {
+                        "file_bytes": 265408
+                      }
+                    }
+                  }
+                }
+              },
+              {
+                "phase": "publish",
+                "message_index": 208,
+                "elapsed_milliseconds": 215.536637,
+                "per_node": {
+                  "node_1": {
+                    "node_id": 1,
+                    "group_id": "636c75737465725f32303236303932393132343835393232393739385f726166745f6c6f675f67726f7774685f313030",
+                    "paths": {
+                      "raft_log": {
+                        "file_bytes": 15429,
+                        "retained_log_entries": 24,
+                        "first_log_index": 188,
+                        "last_log_index": 211,
+                        "last_purged_log_index": 187,
+                        "committed_log_index": 211
+                      },
+                      "state_machine_journal": {
+                        "file_bytes": 12860
+                      },
+                      "state_machine_checkpoint": {
+                        "file_bytes": 0
+                      },
+                      "snapshot": {
+                        "file_bytes": 265408
+                      }
+                    }
+                  },
+                  "node_2": {
+                    "node_id": 2,
+                    "group_id": "636c75737465725f32303236303932393132343835393232393739385f726166745f6c6f675f67726f7774685f313030",
+                    "paths": {
+                      "raft_log": {
+                        "file_bytes": 15429,
+                        "retained_log_entries": 24,
+                        "first_log_index": 188,
+                        "last_log_index": 211,
+                        "last_purged_log_index": 187,
+                        "committed_log_index": 211
+                      },
+                      "state_machine_journal": {
+                        "file_bytes": 12860
+                      },
+                      "state_machine_checkpoint": {
+                        "file_bytes": 0
+                      },
+                      "snapshot": {
+                        "file_bytes": 265408
+                      }
+                    }
+                  },
+                  "node_3": {
+                    "node_id": 3,
+                    "group_id": "636c75737465725f32303236303932393132343835393232393739385f726166745f6c6f675f67726f7774685f313030",
+                    "paths": {
+                      "raft_log": {
+                        "file_bytes": 15429,
+                        "retained_log_entries": 24,
+                        "first_log_index": 188,
+                        "last_log_index": 211,
+                        "last_purged_log_index": 187,
+                        "committed_log_index": 211
+                      },
+                      "state_machine_journal": {
+                        "file_bytes": 12860
+                      },
+                      "state_machine_checkpoint": {
+                        "file_bytes": 0
+                      },
+                      "snapshot": {
+                        "file_bytes": 265408
+                      }
+                    }
+                  }
+                }
+              },
+              {
+                "phase": "publish",
+                "message_index": 216,
+                "elapsed_milliseconds": 224.636857,
+                "per_node": {
+                  "node_1": {
+                    "node_id": 1,
+                    "group_id": "636c75737465725f32303236303932393132343835393232393739385f726166745f6c6f675f67726f7774685f313030",
+                    "paths": {
+                      "raft_log": {
+                        "file_bytes": 20501,
+                        "retained_log_entries": 32,
+                        "first_log_index": 188,
+                        "last_log_index": 219,
+                        "last_purged_log_index": 187,
+                        "committed_log_index": 219
+                      },
+                      "state_machine_journal": {
+                        "file_bytes": 18004
+                      },
+                      "state_machine_checkpoint": {
+                        "file_bytes": 0
+                      },
+                      "snapshot": {
+                        "file_bytes": 265408
+                      }
+                    }
+                  },
+                  "node_2": {
+                    "node_id": 2,
+                    "group_id": "636c75737465725f32303236303932393132343835393232393739385f726166745f6c6f675f67726f7774685f313030",
+                    "paths": {
+                      "raft_log": {
+                        "file_bytes": 20501,
+                        "retained_log_entries": 32,
+                        "first_log_index": 188,
+                        "last_log_index": 219,
+                        "last_purged_log_index": 187,
+                        "committed_log_index": 219
+                      },
+                      "state_machine_journal": {
+                        "file_bytes": 18004
+                      },
+                      "state_machine_checkpoint": {
+                        "file_bytes": 0
+                      },
+                      "snapshot": {
+                        "file_bytes": 265408
+                      }
+                    }
+                  },
+                  "node_3": {
+                    "node_id": 3,
+                    "group_id": "636c75737465725f32303236303932393132343835393232393739385f726166745f6c6f675f67726f7774685f313030",
+                    "paths": {
+                      "raft_log": {
+                        "file_bytes": 20501,
+                        "retained_log_entries": 32,
+                        "first_log_index": 188,
+                        "last_log_index": 219,
+                        "last_purged_log_index": 187,
+                        "committed_log_index": 219
+                      },
+                      "state_machine_journal": {
+                        "file_bytes": 18004
+                      },
+                      "state_machine_checkpoint": {
+                        "file_bytes": 0
+                      },
+                      "snapshot": {
+                        "file_bytes": 265408
+                      }
+                    }
+                  }
+                }
+              },
+              {
+                "phase": "publish",
+                "message_index": 224,
+                "elapsed_milliseconds": 232.459831,
+                "per_node": {
+                  "node_1": {
+                    "node_id": 1,
+                    "group_id": "636c75737465725f32303236303932393132343835393232393739385f726166745f6c6f675f67726f7774685f313030",
+                    "paths": {
+                      "raft_log": {
+                        "file_bytes": 5285,
+                        "retained_log_entries": 8,
+                        "first_log_index": 220,
+                        "last_log_index": 227,
+                        "last_purged_log_index": 219,
+                        "committed_log_index": 227
+                      },
+                      "state_machine_journal": {
+                        "file_bytes": 2572
+                      },
+                      "state_machine_checkpoint": {
+                        "file_bytes": 0
+                      },
+                      "snapshot": {
+                        "file_bytes": 310080
+                      }
+                    }
+                  },
+                  "node_2": {
+                    "node_id": 2,
+                    "group_id": "636c75737465725f32303236303932393132343835393232393739385f726166745f6c6f675f67726f7774685f313030",
+                    "paths": {
+                      "raft_log": {
+                        "file_bytes": 4651,
+                        "retained_log_entries": 7,
+                        "first_log_index": 220,
+                        "last_log_index": 226,
+                        "last_purged_log_index": 219,
+                        "committed_log_index": 226
+                      },
+                      "state_machine_journal": {
+                        "file_bytes": 1929
+                      },
+                      "state_machine_checkpoint": {
+                        "file_bytes": 0
+                      },
+                      "snapshot": {
+                        "file_bytes": 310080
+                      }
+                    }
+                  },
+                  "node_3": {
+                    "node_id": 3,
+                    "group_id": "636c75737465725f32303236303932393132343835393232393739385f726166745f6c6f675f67726f7774685f313030",
+                    "paths": {
+                      "raft_log": {
+                        "file_bytes": 5285,
+                        "retained_log_entries": 8,
+                        "first_log_index": 220,
+                        "last_log_index": 227,
+                        "last_purged_log_index": 219,
+                        "committed_log_index": 227
+                      },
+                      "state_machine_journal": {
+                        "file_bytes": 2572
+                      },
+                      "state_machine_checkpoint": {
+                        "file_bytes": 0
+                      },
+                      "snapshot": {
+                        "file_bytes": 310080
+                      }
+                    }
+                  }
+                }
+              },
+              {
+                "phase": "publish",
+                "message_index": 232,
+                "elapsed_milliseconds": 238.591828,
+                "per_node": {
+                  "node_1": {
+                    "node_id": 1,
+                    "group_id": "636c75737465725f32303236303932393132343835393232393739385f726166745f6c6f675f67726f7774685f313030",
+                    "paths": {
+                      "raft_log": {
+                        "file_bytes": 10357,
+                        "retained_log_entries": 16,
+                        "first_log_index": 220,
+                        "last_log_index": 235,
+                        "last_purged_log_index": 219,
+                        "committed_log_index": 235
+                      },
+                      "state_machine_journal": {
+                        "file_bytes": 7716
+                      },
+                      "state_machine_checkpoint": {
+                        "file_bytes": 0
+                      },
+                      "snapshot": {
+                        "file_bytes": 310080
+                      }
+                    }
+                  },
+                  "node_2": {
+                    "node_id": 2,
+                    "group_id": "636c75737465725f32303236303932393132343835393232393739385f726166745f6c6f675f67726f7774685f313030",
+                    "paths": {
+                      "raft_log": {
+                        "file_bytes": 10357,
+                        "retained_log_entries": 16,
+                        "first_log_index": 220,
+                        "last_log_index": 235,
+                        "last_purged_log_index": 219,
+                        "committed_log_index": 235
+                      },
+                      "state_machine_journal": {
+                        "file_bytes": 7716
+                      },
+                      "state_machine_checkpoint": {
+                        "file_bytes": 0
+                      },
+                      "snapshot": {
+                        "file_bytes": 310080
+                      }
+                    }
+                  },
+                  "node_3": {
+                    "node_id": 3,
+                    "group_id": "636c75737465725f32303236303932393132343835393232393739385f726166745f6c6f675f67726f7774685f313030",
+                    "paths": {
+                      "raft_log": {
+                        "file_bytes": 10357,
+                        "retained_log_entries": 16,
+                        "first_log_index": 220,
+                        "last_log_index": 235,
+                        "last_purged_log_index": 219,
+                        "committed_log_index": 235
+                      },
+                      "state_machine_journal": {
+                        "file_bytes": 7716
+                      },
+                      "state_machine_checkpoint": {
+                        "file_bytes": 0
+                      },
+                      "snapshot": {
+                        "file_bytes": 310080
+                      }
+                    }
+                  }
+                }
+              },
+              {
+                "phase": "publish",
+                "message_index": 240,
+                "elapsed_milliseconds": 253.950548,
+                "per_node": {
+                  "node_1": {
+                    "node_id": 1,
+                    "group_id": "636c75737465725f32303236303932393132343835393232393739385f726166745f6c6f675f67726f7774685f313030",
+                    "paths": {
+                      "raft_log": {
+                        "file_bytes": 15429,
+                        "retained_log_entries": 24,
+                        "first_log_index": 220,
+                        "last_log_index": 243,
+                        "last_purged_log_index": 219,
+                        "committed_log_index": 243
+                      },
+                      "state_machine_journal": {
+                        "file_bytes": 12860
+                      },
+                      "state_machine_checkpoint": {
+                        "file_bytes": 0
+                      },
+                      "snapshot": {
+                        "file_bytes": 310080
+                      }
+                    }
+                  },
+                  "node_2": {
+                    "node_id": 2,
+                    "group_id": "636c75737465725f32303236303932393132343835393232393739385f726166745f6c6f675f67726f7774685f313030",
+                    "paths": {
+                      "raft_log": {
+                        "file_bytes": 15429,
+                        "retained_log_entries": 24,
+                        "first_log_index": 220,
+                        "last_log_index": 243,
+                        "last_purged_log_index": 219,
+                        "committed_log_index": 243
+                      },
+                      "state_machine_journal": {
+                        "file_bytes": 12860
+                      },
+                      "state_machine_checkpoint": {
+                        "file_bytes": 0
+                      },
+                      "snapshot": {
+                        "file_bytes": 310080
+                      }
+                    }
+                  },
+                  "node_3": {
+                    "node_id": 3,
+                    "group_id": "636c75737465725f32303236303932393132343835393232393739385f726166745f6c6f675f67726f7774685f313030",
+                    "paths": {
+                      "raft_log": {
+                        "file_bytes": 15429,
+                        "retained_log_entries": 24,
+                        "first_log_index": 220,
+                        "last_log_index": 243,
+                        "last_purged_log_index": 219,
+                        "committed_log_index": 243
+                      },
+                      "state_machine_journal": {
+                        "file_bytes": 12860
+                      },
+                      "state_machine_checkpoint": {
+                        "file_bytes": 0
+                      },
+                      "snapshot": {
+                        "file_bytes": 310080
+                      }
+                    }
+                  }
+                }
+              },
+              {
+                "phase": "publish",
+                "message_index": 248,
+                "elapsed_milliseconds": 264.134606,
+                "per_node": {
+                  "node_1": {
+                    "node_id": 1,
+                    "group_id": "636c75737465725f32303236303932393132343835393232393739385f726166745f6c6f675f67726f7774685f313030",
+                    "paths": {
+                      "raft_log": {
+                        "file_bytes": 20501,
+                        "retained_log_entries": 32,
+                        "first_log_index": 220,
+                        "last_log_index": 251,
+                        "last_purged_log_index": 219,
+                        "committed_log_index": 251
+                      },
+                      "state_machine_journal": {
+                        "file_bytes": 18004
+                      },
+                      "state_machine_checkpoint": {
+                        "file_bytes": 0
+                      },
+                      "snapshot": {
+                        "file_bytes": 310080
+                      }
+                    }
+                  },
+                  "node_2": {
+                    "node_id": 2,
+                    "group_id": "636c75737465725f32303236303932393132343835393232393739385f726166745f6c6f675f67726f7774685f313030",
+                    "paths": {
+                      "raft_log": {
+                        "file_bytes": 20501,
+                        "retained_log_entries": 32,
+                        "first_log_index": 220,
+                        "last_log_index": 251,
+                        "last_purged_log_index": 219,
+                        "committed_log_index": 251
+                      },
+                      "state_machine_journal": {
+                        "file_bytes": 18004
+                      },
+                      "state_machine_checkpoint": {
+                        "file_bytes": 0
+                      },
+                      "snapshot": {
+                        "file_bytes": 310080
+                      }
+                    }
+                  },
+                  "node_3": {
+                    "node_id": 3,
+                    "group_id": "636c75737465725f32303236303932393132343835393232393739385f726166745f6c6f675f67726f7774685f313030",
+                    "paths": {
+                      "raft_log": {
+                        "file_bytes": 20501,
+                        "retained_log_entries": 32,
+                        "first_log_index": 220,
+                        "last_log_index": 251,
+                        "last_purged_log_index": 219,
+                        "committed_log_index": 251
+                      },
+                      "state_machine_journal": {
+                        "file_bytes": 18004
+                      },
+                      "state_machine_checkpoint": {
+                        "file_bytes": 0
+                      },
+                      "snapshot": {
+                        "file_bytes": 310080
+                      }
+                    }
+                  }
+                }
+              },
+              {
+                "phase": "publish",
+                "message_index": 256,
+                "elapsed_milliseconds": 273.770003,
+                "per_node": {
+                  "node_1": {
+                    "node_id": 1,
+                    "group_id": "636c75737465725f32303236303932393132343835393232393739385f726166745f6c6f675f67726f7774685f313030",
+                    "paths": {
+                      "raft_log": {
+                        "file_bytes": 5285,
+                        "retained_log_entries": 8,
+                        "first_log_index": 252,
+                        "last_log_index": 259,
+                        "last_purged_log_index": 251,
+                        "committed_log_index": 259
+                      },
+                      "state_machine_journal": {
+                        "file_bytes": 2572
+                      },
+                      "state_machine_checkpoint": {
+                        "file_bytes": 0
+                      },
+                      "snapshot": {
+                        "file_bytes": 354752
+                      }
+                    }
+                  },
+                  "node_2": {
+                    "node_id": 2,
+                    "group_id": "636c75737465725f32303236303932393132343835393232393739385f726166745f6c6f675f67726f7774685f313030",
+                    "paths": {
+                      "raft_log": {
+                        "file_bytes": 5285,
+                        "retained_log_entries": 8,
+                        "first_log_index": 252,
+                        "last_log_index": 259,
+                        "last_purged_log_index": 251,
+                        "committed_log_index": 259
+                      },
+                      "state_machine_journal": {
+                        "file_bytes": 2572
+                      },
+                      "state_machine_checkpoint": {
+                        "file_bytes": 0
+                      },
+                      "snapshot": {
+                        "file_bytes": 354752
+                      }
+                    }
+                  },
+                  "node_3": {
+                    "node_id": 3,
+                    "group_id": "636c75737465725f32303236303932393132343835393232393739385f726166745f6c6f675f67726f7774685f313030",
+                    "paths": {
+                      "raft_log": {
+                        "file_bytes": 5285,
+                        "retained_log_entries": 8,
+                        "first_log_index": 252,
+                        "last_log_index": 259,
+                        "last_purged_log_index": 251,
+                        "committed_log_index": 259
+                      },
+                      "state_machine_journal": {
+                        "file_bytes": 2572
+                      },
+                      "state_machine_checkpoint": {
+                        "file_bytes": 0
+                      },
+                      "snapshot": {
+                        "file_bytes": 354752
+                      }
+                    }
+                  }
+                }
+              },
+              {
+                "phase": "snapshot_purge_complete",
+                "message_index": 256,
+                "elapsed_milliseconds": null,
+                "per_node": {
+                  "node_1": {
+                    "node_id": 1,
+                    "group_id": "636c75737465725f32303236303932393132343835393232393739385f726166745f6c6f675f67726f7774685f313030",
+                    "paths": {
+                      "raft_log": {
+                        "file_bytes": 5285,
+                        "retained_log_entries": 8,
+                        "first_log_index": 252,
+                        "last_log_index": 259,
+                        "last_purged_log_index": 251,
+                        "committed_log_index": 259
+                      },
+                      "state_machine_journal": {
+                        "file_bytes": 2572
+                      },
+                      "state_machine_checkpoint": {
+                        "file_bytes": 0
+                      },
+                      "snapshot": {
+                        "file_bytes": 354752
+                      }
+                    }
+                  },
+                  "node_2": {
+                    "node_id": 2,
+                    "group_id": "636c75737465725f32303236303932393132343835393232393739385f726166745f6c6f675f67726f7774685f313030",
+                    "paths": {
+                      "raft_log": {
+                        "file_bytes": 5285,
+                        "retained_log_entries": 8,
+                        "first_log_index": 252,
+                        "last_log_index": 259,
+                        "last_purged_log_index": 251,
+                        "committed_log_index": 259
+                      },
+                      "state_machine_journal": {
+                        "file_bytes": 2572
+                      },
+                      "state_machine_checkpoint": {
+                        "file_bytes": 0
+                      },
+                      "snapshot": {
+                        "file_bytes": 354752
+                      }
+                    }
+                  },
+                  "node_3": {
+                    "node_id": 3,
+                    "group_id": "636c75737465725f32303236303932393132343835393232393739385f726166745f6c6f675f67726f7774685f313030",
+                    "paths": {
+                      "raft_log": {
+                        "file_bytes": 5285,
+                        "retained_log_entries": 8,
+                        "first_log_index": 252,
+                        "last_log_index": 259,
+                        "last_purged_log_index": 251,
+                        "committed_log_index": 259
+                      },
+                      "state_machine_journal": {
+                        "file_bytes": 2572
+                      },
+                      "state_machine_checkpoint": {
+                        "file_bytes": 0
+                      },
+                      "snapshot": {
+                        "file_bytes": 354752
+                      }
+                    }
+                  }
+                }
+              }
+            ],
+            "per_node": {
+              "node_1": {
+                "initial": {
+                  "node_id": 1,
+                  "group_id": "636c75737465725f32303236303932393132343835393232393739385f726166745f6c6f675f67726f7774685f313030",
+                  "paths": {
+                    "raft_log": {
+                      "file_bytes": 1402,
+                      "retained_log_entries": 4,
+                      "first_log_index": 0,
+                      "last_log_index": 3,
+                      "last_purged_log_index": null,
+                      "committed_log_index": 3
+                    },
+                    "state_machine_journal": {
+                      "file_bytes": 1279
+                    },
+                    "state_machine_checkpoint": {
+                      "file_bytes": 0
+                    },
+                    "snapshot": {
+                      "file_bytes": 0
+                    }
+                  }
+                },
+                "final": {
+                  "node_id": 1,
+                  "group_id": "636c75737465725f32303236303932393132343835393232393739385f726166745f6c6f675f67726f7774685f313030",
+                  "paths": {
+                    "raft_log": {
+                      "file_bytes": 5285,
+                      "retained_log_entries": 8,
+                      "first_log_index": 252,
+                      "last_log_index": 259,
+                      "last_purged_log_index": 251,
+                      "committed_log_index": 259
+                    },
+                    "state_machine_journal": {
+                      "file_bytes": 2572
+                    },
+                    "state_machine_checkpoint": {
+                      "file_bytes": 0
+                    },
+                    "snapshot": {
+                      "file_bytes": 354752
+                    }
+                  }
+                },
+                "peak_observed_retained_log_entries": 32,
+                "observed_purge_index_transitions": 8,
+                "snapshot_builds_completed_delta": 8,
+                "net_file_size_delta_bytes": {
+                  "raft_log": 3883,
+                  "state_machine_journal": 1293,
+                  "state_machine_checkpoint": 0,
+                  "snapshot": 354752
+                }
+              },
+              "node_2": {
+                "initial": {
+                  "node_id": 2,
+                  "group_id": "636c75737465725f32303236303932393132343835393232393739385f726166745f6c6f675f67726f7774685f313030",
+                  "paths": {
+                    "raft_log": {
+                      "file_bytes": 1402,
+                      "retained_log_entries": 4,
+                      "first_log_index": 0,
+                      "last_log_index": 3,
+                      "last_purged_log_index": null,
+                      "committed_log_index": 3
+                    },
+                    "state_machine_journal": {
+                      "file_bytes": 1279
+                    },
+                    "state_machine_checkpoint": {
+                      "file_bytes": 0
+                    },
+                    "snapshot": {
+                      "file_bytes": 0
+                    }
+                  }
+                },
+                "final": {
+                  "node_id": 2,
+                  "group_id": "636c75737465725f32303236303932393132343835393232393739385f726166745f6c6f675f67726f7774685f313030",
+                  "paths": {
+                    "raft_log": {
+                      "file_bytes": 5285,
+                      "retained_log_entries": 8,
+                      "first_log_index": 252,
+                      "last_log_index": 259,
+                      "last_purged_log_index": 251,
+                      "committed_log_index": 259
+                    },
+                    "state_machine_journal": {
+                      "file_bytes": 2572
+                    },
+                    "state_machine_checkpoint": {
+                      "file_bytes": 0
+                    },
+                    "snapshot": {
+                      "file_bytes": 354752
+                    }
+                  }
+                },
+                "peak_observed_retained_log_entries": 32,
+                "observed_purge_index_transitions": 8,
+                "snapshot_builds_completed_delta": 8,
+                "net_file_size_delta_bytes": {
+                  "raft_log": 3883,
+                  "state_machine_journal": 1293,
+                  "state_machine_checkpoint": 0,
+                  "snapshot": 354752
+                }
+              },
+              "node_3": {
+                "initial": {
+                  "node_id": 3,
+                  "group_id": "636c75737465725f32303236303932393132343835393232393739385f726166745f6c6f675f67726f7774685f313030",
+                  "paths": {
+                    "raft_log": {
+                      "file_bytes": 1402,
+                      "retained_log_entries": 4,
+                      "first_log_index": 0,
+                      "last_log_index": 3,
+                      "last_purged_log_index": null,
+                      "committed_log_index": 3
+                    },
+                    "state_machine_journal": {
+                      "file_bytes": 1279
+                    },
+                    "state_machine_checkpoint": {
+                      "file_bytes": 0
+                    },
+                    "snapshot": {
+                      "file_bytes": 0
+                    }
+                  }
+                },
+                "final": {
+                  "node_id": 3,
+                  "group_id": "636c75737465725f32303236303932393132343835393232393739385f726166745f6c6f675f67726f7774685f313030",
+                  "paths": {
+                    "raft_log": {
+                      "file_bytes": 5285,
+                      "retained_log_entries": 8,
+                      "first_log_index": 252,
+                      "last_log_index": 259,
+                      "last_purged_log_index": 251,
+                      "committed_log_index": 259
+                    },
+                    "state_machine_journal": {
+                      "file_bytes": 2572
+                    },
+                    "state_machine_checkpoint": {
+                      "file_bytes": 0
+                    },
+                    "snapshot": {
+                      "file_bytes": 354752
+                    }
+                  }
+                },
+                "peak_observed_retained_log_entries": 32,
+                "observed_purge_index_transitions": 8,
+                "snapshot_builds_completed_delta": 8,
+                "net_file_size_delta_bytes": {
+                  "raft_log": 3883,
+                  "state_machine_journal": 1293,
+                  "state_machine_checkpoint": 0,
+                  "snapshot": 354752
+                }
+              }
+            },
+            "snapshot_builds_completed_before": {
+              "node_1": 0,
+              "node_2": 0,
+              "node_3": 0
+            },
+            "snapshot_builds_completed_after": {
+              "node_1": 8,
+              "node_2": 8,
+              "node_3": 8
+            },
+            "snapshot_purge_cycle_observed": true,
+            "post_cycle_observation_count": 33
+          },
+          "resource_samples": {
+            "samples": 3,
+            "memory_bytes_avg": 34007722.666666664,
+            "memory_bytes_max": 35880960.0,
+            "storage_bytes_avg": 373980.0,
+            "storage_bytes_max": 1093836.0,
+            "cpu_seconds": 0.46,
+            "elapsed_seconds": 0.274174842,
+            "per_node": {
+              "1": {
+                "samples": 4,
+                "memory_bytes_avg": 11552768.0,
+                "memory_bytes_max": 12406784.0,
+                "storage_bytes_avg": 94666.0,
+                "storage_bytes_max": 364612.0,
+                "cpu_seconds": 0.19
+              },
+              "2": {
+                "samples": 4,
+                "memory_bytes_avg": 10862592.0,
+                "memory_bytes_max": 11845632.0,
+                "storage_bytes_avg": 94666.0,
+                "storage_bytes_max": 364612.0,
+                "cpu_seconds": 0.13
+              },
+              "3": {
+                "samples": 4,
+                "memory_bytes_avg": 10630144.0,
+                "memory_bytes_max": 11628544.0,
+                "storage_bytes_avg": 94666.0,
+                "storage_bytes_max": 364612.0,
+                "cpu_seconds": 0.14
+              }
+            }
+          },
+          "server_metrics": {
+            "available": true,
+            "source": "GET /metrics",
+            "delta": {
+              "node_1.runnel_acknowledgements_total": 0.0,
+              "node_1.runnel_active_connections": 0.0,
+              "node_1.runnel_active_requests": 0.0,
+              "node_1.runnel_broker_connection_errors_total": 0.0,
+              "node_1.runnel_broker_connections_accepted_total": 1.0,
+              "node_1.runnel_broker_connections_closed_total": 1.0,
+              "node_1.runnel_broker_connections_rejected_total": 0.0,
+              "node_1.runnel_broker_max_connections": 0.0,
+              "node_1.runnel_broker_max_in_flight_requests": 0.0,
+              "node_1.runnel_broker_max_request_bytes": 0.0,
+              "node_1.runnel_broker_request_bytes_total": 48640.0,
+              "node_1.runnel_broker_request_duration_seconds_bucket{operation=\"ack\",le=\"+Inf\"}": 0.0,
+              "node_1.runnel_broker_request_duration_seconds_bucket{operation=\"ack\",le=\"0.0001\"}": 0.0,
+              "node_1.runnel_broker_request_duration_seconds_bucket{operation=\"ack\",le=\"0.001\"}": 0.0,
+              "node_1.runnel_broker_request_duration_seconds_bucket{operation=\"ack\",le=\"0.01\"}": 0.0,
+              "node_1.runnel_broker_request_duration_seconds_bucket{operation=\"ack\",le=\"0.1\"}": 0.0,
+              "node_1.runnel_broker_request_duration_seconds_bucket{operation=\"ack\",le=\"1\"}": 0.0,
+              "node_1.runnel_broker_request_duration_seconds_bucket{operation=\"ack\",le=\"10\"}": 0.0,
+              "node_1.runnel_broker_request_duration_seconds_bucket{operation=\"ack_group\",le=\"+Inf\"}": 0.0,
+              "node_1.runnel_broker_request_duration_seconds_bucket{operation=\"ack_group\",le=\"0.0001\"}": 0.0,
+              "node_1.runnel_broker_request_duration_seconds_bucket{operation=\"ack_group\",le=\"0.001\"}": 0.0,
+              "node_1.runnel_broker_request_duration_seconds_bucket{operation=\"ack_group\",le=\"0.01\"}": 0.0,
+              "node_1.runnel_broker_request_duration_seconds_bucket{operation=\"ack_group\",le=\"0.1\"}": 0.0,
+              "node_1.runnel_broker_request_duration_seconds_bucket{operation=\"ack_group\",le=\"1\"}": 0.0,
+              "node_1.runnel_broker_request_duration_seconds_bucket{operation=\"ack_group\",le=\"10\"}": 0.0,
+              "node_1.runnel_broker_request_duration_seconds_bucket{operation=\"configure_consumer\",le=\"+Inf\"}": 0.0,
+              "node_1.runnel_broker_request_duration_seconds_bucket{operation=\"configure_consumer\",le=\"0.0001\"}": 0.0,
+              "node_1.runnel_broker_request_duration_seconds_bucket{operation=\"configure_consumer\",le=\"0.001\"}": 0.0,
+              "node_1.runnel_broker_request_duration_seconds_bucket{operation=\"configure_consumer\",le=\"0.01\"}": 0.0,
+              "node_1.runnel_broker_request_duration_seconds_bucket{operation=\"configure_consumer\",le=\"0.1\"}": 0.0,
+              "node_1.runnel_broker_request_duration_seconds_bucket{operation=\"configure_consumer\",le=\"1\"}": 0.0,
+              "node_1.runnel_broker_request_duration_seconds_bucket{operation=\"configure_consumer\",le=\"10\"}": 0.0,
+              "node_1.runnel_broker_request_duration_seconds_bucket{operation=\"create_stream\",le=\"+Inf\"}": 0.0,
+              "node_1.runnel_broker_request_duration_seconds_bucket{operation=\"create_stream\",le=\"0.0001\"}": 0.0,
+              "node_1.runnel_broker_request_duration_seconds_bucket{operation=\"create_stream\",le=\"0.001\"}": 0.0,
+              "node_1.runnel_broker_request_duration_seconds_bucket{operation=\"create_stream\",le=\"0.01\"}": 0.0,
+              "node_1.runnel_broker_request_duration_seconds_bucket{operation=\"create_stream\",le=\"0.1\"}": 0.0,
+              "node_1.runnel_broker_request_duration_seconds_bucket{operation=\"create_stream\",le=\"1\"}": 0.0,
+              "node_1.runnel_broker_request_duration_seconds_bucket{operation=\"create_stream\",le=\"10\"}": 0.0,
+              "node_1.runnel_broker_request_duration_seconds_bucket{operation=\"health\",le=\"+Inf\"}": 0.0,
+              "node_1.runnel_broker_request_duration_seconds_bucket{operation=\"health\",le=\"0.0001\"}": 0.0,
+              "node_1.runnel_broker_request_duration_seconds_bucket{operation=\"health\",le=\"0.001\"}": 0.0,
+              "node_1.runnel_broker_request_duration_seconds_bucket{operation=\"health\",le=\"0.01\"}": 0.0,
+              "node_1.runnel_broker_request_duration_seconds_bucket{operation=\"health\",le=\"0.1\"}": 0.0,
+              "node_1.runnel_broker_request_duration_seconds_bucket{operation=\"health\",le=\"1\"}": 0.0,
+              "node_1.runnel_broker_request_duration_seconds_bucket{operation=\"health\",le=\"10\"}": 0.0,
+              "node_1.runnel_broker_request_duration_seconds_bucket{operation=\"inspect_consumer\",le=\"+Inf\"}": 0.0,
+              "node_1.runnel_broker_request_duration_seconds_bucket{operation=\"inspect_consumer\",le=\"0.0001\"}": 0.0,
+              "node_1.runnel_broker_request_duration_seconds_bucket{operation=\"inspect_consumer\",le=\"0.001\"}": 0.0,
+              "node_1.runnel_broker_request_duration_seconds_bucket{operation=\"inspect_consumer\",le=\"0.01\"}": 0.0,
+              "node_1.runnel_broker_request_duration_seconds_bucket{operation=\"inspect_consumer\",le=\"0.1\"}": 0.0,
+              "node_1.runnel_broker_request_duration_seconds_bucket{operation=\"inspect_consumer\",le=\"1\"}": 0.0,
+              "node_1.runnel_broker_request_duration_seconds_bucket{operation=\"inspect_consumer\",le=\"10\"}": 0.0,
+              "node_1.runnel_broker_request_duration_seconds_bucket{operation=\"invalid_request\",le=\"+Inf\"}": 0.0,
+              "node_1.runnel_broker_request_duration_seconds_bucket{operation=\"invalid_request\",le=\"0.0001\"}": 0.0,
+              "node_1.runnel_broker_request_duration_seconds_bucket{operation=\"invalid_request\",le=\"0.001\"}": 0.0,
+              "node_1.runnel_broker_request_duration_seconds_bucket{operation=\"invalid_request\",le=\"0.01\"}": 0.0,
+              "node_1.runnel_broker_request_duration_seconds_bucket{operation=\"invalid_request\",le=\"0.1\"}": 0.0,
+              "node_1.runnel_broker_request_duration_seconds_bucket{operation=\"invalid_request\",le=\"1\"}": 0.0,
+              "node_1.runnel_broker_request_duration_seconds_bucket{operation=\"invalid_request\",le=\"10\"}": 0.0,
+              "node_1.runnel_broker_request_duration_seconds_bucket{operation=\"poll\",le=\"+Inf\"}": 0.0,
+              "node_1.runnel_broker_request_duration_seconds_bucket{operation=\"poll\",le=\"0.0001\"}": 0.0,
+              "node_1.runnel_broker_request_duration_seconds_bucket{operation=\"poll\",le=\"0.001\"}": 0.0,
+              "node_1.runnel_broker_request_duration_seconds_bucket{operation=\"poll\",le=\"0.01\"}": 0.0,
+              "node_1.runnel_broker_request_duration_seconds_bucket{operation=\"poll\",le=\"0.1\"}": 0.0,
+              "node_1.runnel_broker_request_duration_seconds_bucket{operation=\"poll\",le=\"1\"}": 0.0,
+              "node_1.runnel_broker_request_duration_seconds_bucket{operation=\"poll\",le=\"10\"}": 0.0,
+              "node_1.runnel_broker_request_duration_seconds_bucket{operation=\"poll_group\",le=\"+Inf\"}": 0.0,
+              "node_1.runnel_broker_request_duration_seconds_bucket{operation=\"poll_group\",le=\"0.0001\"}": 0.0,
+              "node_1.runnel_broker_request_duration_seconds_bucket{operation=\"poll_group\",le=\"0.001\"}": 0.0,
+              "node_1.runnel_broker_request_duration_seconds_bucket{operation=\"poll_group\",le=\"0.01\"}": 0.0,
+              "node_1.runnel_broker_request_duration_seconds_bucket{operation=\"poll_group\",le=\"0.1\"}": 0.0,
+              "node_1.runnel_broker_request_duration_seconds_bucket{operation=\"poll_group\",le=\"1\"}": 0.0,
+              "node_1.runnel_broker_request_duration_seconds_bucket{operation=\"poll_group\",le=\"10\"}": 0.0,
+              "node_1.runnel_broker_request_duration_seconds_bucket{operation=\"publish\",le=\"+Inf\"}": 256.0,
+              "node_1.runnel_broker_request_duration_seconds_bucket{operation=\"publish\",le=\"0.0001\"}": 0.0,
+              "node_1.runnel_broker_request_duration_seconds_bucket{operation=\"publish\",le=\"0.001\"}": 246.0,
+              "node_1.runnel_broker_request_duration_seconds_bucket{operation=\"publish\",le=\"0.01\"}": 256.0,
+              "node_1.runnel_broker_request_duration_seconds_bucket{operation=\"publish\",le=\"0.1\"}": 256.0,
+              "node_1.runnel_broker_request_duration_seconds_bucket{operation=\"publish\",le=\"1\"}": 256.0,
+              "node_1.runnel_broker_request_duration_seconds_bucket{operation=\"publish\",le=\"10\"}": 256.0,
+              "node_1.runnel_broker_request_duration_seconds_bucket{operation=\"replay\",le=\"+Inf\"}": 0.0,
+              "node_1.runnel_broker_request_duration_seconds_bucket{operation=\"replay\",le=\"0.0001\"}": 0.0,
+              "node_1.runnel_broker_request_duration_seconds_bucket{operation=\"replay\",le=\"0.001\"}": 0.0,
+              "node_1.runnel_broker_request_duration_seconds_bucket{operation=\"replay\",le=\"0.01\"}": 0.0,
+              "node_1.runnel_broker_request_duration_seconds_bucket{operation=\"replay\",le=\"0.1\"}": 0.0,
+              "node_1.runnel_broker_request_duration_seconds_bucket{operation=\"replay\",le=\"1\"}": 0.0,
+              "node_1.runnel_broker_request_duration_seconds_bucket{operation=\"replay\",le=\"10\"}": 0.0,
+              "node_1.runnel_broker_request_duration_seconds_count{operation=\"ack\"}": 0.0,
+              "node_1.runnel_broker_request_duration_seconds_count{operation=\"ack_group\"}": 0.0,
+              "node_1.runnel_broker_request_duration_seconds_count{operation=\"configure_consumer\"}": 0.0,
+              "node_1.runnel_broker_request_duration_seconds_count{operation=\"create_stream\"}": 0.0,
+              "node_1.runnel_broker_request_duration_seconds_count{operation=\"health\"}": 0.0,
+              "node_1.runnel_broker_request_duration_seconds_count{operation=\"inspect_consumer\"}": 0.0,
+              "node_1.runnel_broker_request_duration_seconds_count{operation=\"invalid_request\"}": 0.0,
+              "node_1.runnel_broker_request_duration_seconds_count{operation=\"poll\"}": 0.0,
+              "node_1.runnel_broker_request_duration_seconds_count{operation=\"poll_group\"}": 0.0,
+              "node_1.runnel_broker_request_duration_seconds_count{operation=\"publish\"}": 256.0,
+              "node_1.runnel_broker_request_duration_seconds_count{operation=\"replay\"}": 0.0,
+              "node_1.runnel_broker_request_duration_seconds_sum{operation=\"ack\"}": 0.0,
+              "node_1.runnel_broker_request_duration_seconds_sum{operation=\"ack_group\"}": 0.0,
+              "node_1.runnel_broker_request_duration_seconds_sum{operation=\"configure_consumer\"}": 0.0,
+              "node_1.runnel_broker_request_duration_seconds_sum{operation=\"create_stream\"}": 0.0,
+              "node_1.runnel_broker_request_duration_seconds_sum{operation=\"health\"}": 0.0,
+              "node_1.runnel_broker_request_duration_seconds_sum{operation=\"inspect_consumer\"}": 0.0,
+              "node_1.runnel_broker_request_duration_seconds_sum{operation=\"invalid_request\"}": 0.0,
+              "node_1.runnel_broker_request_duration_seconds_sum{operation=\"poll\"}": 0.0,
+              "node_1.runnel_broker_request_duration_seconds_sum{operation=\"poll_group\"}": 0.0,
+              "node_1.runnel_broker_request_duration_seconds_sum{operation=\"publish\"}": 0.16820400000000002,
+              "node_1.runnel_broker_request_duration_seconds_sum{operation=\"replay\"}": 0.0,
+              "node_1.runnel_broker_request_failures_total{operation=\"ack\"}": 0.0,
+              "node_1.runnel_broker_request_failures_total{operation=\"ack_group\"}": 0.0,
+              "node_1.runnel_broker_request_failures_total{operation=\"configure_consumer\"}": 0.0,
+              "node_1.runnel_broker_request_failures_total{operation=\"create_stream\"}": 0.0,
+              "node_1.runnel_broker_request_failures_total{operation=\"health\"}": 0.0,
+              "node_1.runnel_broker_request_failures_total{operation=\"inspect_consumer\"}": 0.0,
+              "node_1.runnel_broker_request_failures_total{operation=\"invalid_request\"}": 0.0,
+              "node_1.runnel_broker_request_failures_total{operation=\"poll\"}": 0.0,
+              "node_1.runnel_broker_request_failures_total{operation=\"poll_group\"}": 0.0,
+              "node_1.runnel_broker_request_failures_total{operation=\"publish\"}": 0.0,
+              "node_1.runnel_broker_request_failures_total{operation=\"replay\"}": 0.0,
+              "node_1.runnel_broker_request_saturation_total": 0.0,
+              "node_1.runnel_broker_request_size_rejections_total": 0.0,
+              "node_1.runnel_broker_request_timeout_seconds": 0.0,
+              "node_1.runnel_broker_request_timeouts_total": 0.0,
+              "node_1.runnel_broker_requests_rejected_total": 0.0,
+              "node_1.runnel_broker_requests_total{operation=\"ack\"}": 0.0,
+              "node_1.runnel_broker_requests_total{operation=\"ack_group\"}": 0.0,
+              "node_1.runnel_broker_requests_total{operation=\"configure_consumer\"}": 0.0,
+              "node_1.runnel_broker_requests_total{operation=\"create_stream\"}": 0.0,
+              "node_1.runnel_broker_requests_total{operation=\"health\"}": 0.0,
+              "node_1.runnel_broker_requests_total{operation=\"inspect_consumer\"}": 0.0,
+              "node_1.runnel_broker_requests_total{operation=\"invalid_request\"}": 0.0,
+              "node_1.runnel_broker_requests_total{operation=\"poll\"}": 0.0,
+              "node_1.runnel_broker_requests_total{operation=\"poll_group\"}": 0.0,
+              "node_1.runnel_broker_requests_total{operation=\"publish\"}": 256.0,
+              "node_1.runnel_broker_requests_total{operation=\"replay\"}": 0.0,
+              "node_1.runnel_broker_response_bytes_total": 23956.0,
+              "node_1.runnel_broker_response_write_timeouts_total": 0.0,
+              "node_1.runnel_dead_letters_total": 0.0,
+              "node_1.runnel_delivered_bytes_total": 0.0,
+              "node_1.runnel_deliveries_total": 0.0,
+              "node_1.runnel_engine_health_available": 0.0,
+              "node_1.runnel_health_check_failures_total": 0.0,
+              "node_1.runnel_in_flight_deliveries": 0.0,
+              "node_1.runnel_metrics_scrape_failures_total": 0.0,
+              "node_1.runnel_metrics_scrapes_total": 1.0,
+              "node_1.runnel_process_uptime_seconds": 0.281859,
+              "node_1.runnel_published_bytes_total": 25600.0,
+              "node_1.runnel_publishes_total": 256.0,
+              "node_1.runnel_redeliveries_total": 0.0,
+              "node_1.runnel_snapshot_build_failures_total": 0.0,
+              "node_1.runnel_snapshot_builds_completed_total": 8.0,
+              "node_1.runnel_snapshot_builds_started_total": 8.0,
+              "node_1.runnel_snapshot_install_bytes_total": 0.0,
+              "node_1.runnel_snapshot_install_failures_total": 0.0,
+              "node_1.runnel_snapshot_installs_completed_total": 0.0,
+              "node_1.runnel_snapshot_installs_in_progress": 0.0,
+              "node_1.runnel_snapshot_installs_started_total": 0.0,
+              "node_1.runnel_snapshot_transfer_bytes_received_total": 0.0,
+              "node_1.runnel_snapshot_transfer_chunks_received_total": 0.0,
+              "node_1.runnel_snapshot_transfer_final_chunks_received_total": 0.0,
+              "node_1.runnel_storage_bytes": 25600.0,
+              "node_1.runnel_stream_creations_total": 0.0,
+              "node_1.runnel_streams": 0.0,
+              "node_2.runnel_acknowledgements_total": 0.0,
+              "node_2.runnel_active_connections": 0.0,
+              "node_2.runnel_active_requests": 0.0,
+              "node_2.runnel_broker_connection_errors_total": 0.0,
+              "node_2.runnel_broker_connections_accepted_total": 0.0,
+              "node_2.runnel_broker_connections_closed_total": 0.0,
+              "node_2.runnel_broker_connections_rejected_total": 0.0,
+              "node_2.runnel_broker_max_connections": 0.0,
+              "node_2.runnel_broker_max_in_flight_requests": 0.0,
+              "node_2.runnel_broker_max_request_bytes": 0.0,
+              "node_2.runnel_broker_request_bytes_total": 0.0,
+              "node_2.runnel_broker_request_duration_seconds_bucket{operation=\"ack\",le=\"+Inf\"}": 0.0,
+              "node_2.runnel_broker_request_duration_seconds_bucket{operation=\"ack\",le=\"0.0001\"}": 0.0,
+              "node_2.runnel_broker_request_duration_seconds_bucket{operation=\"ack\",le=\"0.001\"}": 0.0,
+              "node_2.runnel_broker_request_duration_seconds_bucket{operation=\"ack\",le=\"0.01\"}": 0.0,
+              "node_2.runnel_broker_request_duration_seconds_bucket{operation=\"ack\",le=\"0.1\"}": 0.0,
+              "node_2.runnel_broker_request_duration_seconds_bucket{operation=\"ack\",le=\"1\"}": 0.0,
+              "node_2.runnel_broker_request_duration_seconds_bucket{operation=\"ack\",le=\"10\"}": 0.0,
+              "node_2.runnel_broker_request_duration_seconds_bucket{operation=\"ack_group\",le=\"+Inf\"}": 0.0,
+              "node_2.runnel_broker_request_duration_seconds_bucket{operation=\"ack_group\",le=\"0.0001\"}": 0.0,
+              "node_2.runnel_broker_request_duration_seconds_bucket{operation=\"ack_group\",le=\"0.001\"}": 0.0,
+              "node_2.runnel_broker_request_duration_seconds_bucket{operation=\"ack_group\",le=\"0.01\"}": 0.0,
+              "node_2.runnel_broker_request_duration_seconds_bucket{operation=\"ack_group\",le=\"0.1\"}": 0.0,
+              "node_2.runnel_broker_request_duration_seconds_bucket{operation=\"ack_group\",le=\"1\"}": 0.0,
+              "node_2.runnel_broker_request_duration_seconds_bucket{operation=\"ack_group\",le=\"10\"}": 0.0,
+              "node_2.runnel_broker_request_duration_seconds_bucket{operation=\"configure_consumer\",le=\"+Inf\"}": 0.0,
+              "node_2.runnel_broker_request_duration_seconds_bucket{operation=\"configure_consumer\",le=\"0.0001\"}": 0.0,
+              "node_2.runnel_broker_request_duration_seconds_bucket{operation=\"configure_consumer\",le=\"0.001\"}": 0.0,
+              "node_2.runnel_broker_request_duration_seconds_bucket{operation=\"configure_consumer\",le=\"0.01\"}": 0.0,
+              "node_2.runnel_broker_request_duration_seconds_bucket{operation=\"configure_consumer\",le=\"0.1\"}": 0.0,
+              "node_2.runnel_broker_request_duration_seconds_bucket{operation=\"configure_consumer\",le=\"1\"}": 0.0,
+              "node_2.runnel_broker_request_duration_seconds_bucket{operation=\"configure_consumer\",le=\"10\"}": 0.0,
+              "node_2.runnel_broker_request_duration_seconds_bucket{operation=\"create_stream\",le=\"+Inf\"}": 0.0,
+              "node_2.runnel_broker_request_duration_seconds_bucket{operation=\"create_stream\",le=\"0.0001\"}": 0.0,
+              "node_2.runnel_broker_request_duration_seconds_bucket{operation=\"create_stream\",le=\"0.001\"}": 0.0,
+              "node_2.runnel_broker_request_duration_seconds_bucket{operation=\"create_stream\",le=\"0.01\"}": 0.0,
+              "node_2.runnel_broker_request_duration_seconds_bucket{operation=\"create_stream\",le=\"0.1\"}": 0.0,
+              "node_2.runnel_broker_request_duration_seconds_bucket{operation=\"create_stream\",le=\"1\"}": 0.0,
+              "node_2.runnel_broker_request_duration_seconds_bucket{operation=\"create_stream\",le=\"10\"}": 0.0,
+              "node_2.runnel_broker_request_duration_seconds_bucket{operation=\"health\",le=\"+Inf\"}": 0.0,
+              "node_2.runnel_broker_request_duration_seconds_bucket{operation=\"health\",le=\"0.0001\"}": 0.0,
+              "node_2.runnel_broker_request_duration_seconds_bucket{operation=\"health\",le=\"0.001\"}": 0.0,
+              "node_2.runnel_broker_request_duration_seconds_bucket{operation=\"health\",le=\"0.01\"}": 0.0,
+              "node_2.runnel_broker_request_duration_seconds_bucket{operation=\"health\",le=\"0.1\"}": 0.0,
+              "node_2.runnel_broker_request_duration_seconds_bucket{operation=\"health\",le=\"1\"}": 0.0,
+              "node_2.runnel_broker_request_duration_seconds_bucket{operation=\"health\",le=\"10\"}": 0.0,
+              "node_2.runnel_broker_request_duration_seconds_bucket{operation=\"inspect_consumer\",le=\"+Inf\"}": 0.0,
+              "node_2.runnel_broker_request_duration_seconds_bucket{operation=\"inspect_consumer\",le=\"0.0001\"}": 0.0,
+              "node_2.runnel_broker_request_duration_seconds_bucket{operation=\"inspect_consumer\",le=\"0.001\"}": 0.0,
+              "node_2.runnel_broker_request_duration_seconds_bucket{operation=\"inspect_consumer\",le=\"0.01\"}": 0.0,
+              "node_2.runnel_broker_request_duration_seconds_bucket{operation=\"inspect_consumer\",le=\"0.1\"}": 0.0,
+              "node_2.runnel_broker_request_duration_seconds_bucket{operation=\"inspect_consumer\",le=\"1\"}": 0.0,
+              "node_2.runnel_broker_request_duration_seconds_bucket{operation=\"inspect_consumer\",le=\"10\"}": 0.0,
+              "node_2.runnel_broker_request_duration_seconds_bucket{operation=\"invalid_request\",le=\"+Inf\"}": 0.0,
+              "node_2.runnel_broker_request_duration_seconds_bucket{operation=\"invalid_request\",le=\"0.0001\"}": 0.0,
+              "node_2.runnel_broker_request_duration_seconds_bucket{operation=\"invalid_request\",le=\"0.001\"}": 0.0,
+              "node_2.runnel_broker_request_duration_seconds_bucket{operation=\"invalid_request\",le=\"0.01\"}": 0.0,
+              "node_2.runnel_broker_request_duration_seconds_bucket{operation=\"invalid_request\",le=\"0.1\"}": 0.0,
+              "node_2.runnel_broker_request_duration_seconds_bucket{operation=\"invalid_request\",le=\"1\"}": 0.0,
+              "node_2.runnel_broker_request_duration_seconds_bucket{operation=\"invalid_request\",le=\"10\"}": 0.0,
+              "node_2.runnel_broker_request_duration_seconds_bucket{operation=\"poll\",le=\"+Inf\"}": 0.0,
+              "node_2.runnel_broker_request_duration_seconds_bucket{operation=\"poll\",le=\"0.0001\"}": 0.0,
+              "node_2.runnel_broker_request_duration_seconds_bucket{operation=\"poll\",le=\"0.001\"}": 0.0,
+              "node_2.runnel_broker_request_duration_seconds_bucket{operation=\"poll\",le=\"0.01\"}": 0.0,
+              "node_2.runnel_broker_request_duration_seconds_bucket{operation=\"poll\",le=\"0.1\"}": 0.0,
+              "node_2.runnel_broker_request_duration_seconds_bucket{operation=\"poll\",le=\"1\"}": 0.0,
+              "node_2.runnel_broker_request_duration_seconds_bucket{operation=\"poll\",le=\"10\"}": 0.0,
+              "node_2.runnel_broker_request_duration_seconds_bucket{operation=\"poll_group\",le=\"+Inf\"}": 0.0,
+              "node_2.runnel_broker_request_duration_seconds_bucket{operation=\"poll_group\",le=\"0.0001\"}": 0.0,
+              "node_2.runnel_broker_request_duration_seconds_bucket{operation=\"poll_group\",le=\"0.001\"}": 0.0,
+              "node_2.runnel_broker_request_duration_seconds_bucket{operation=\"poll_group\",le=\"0.01\"}": 0.0,
+              "node_2.runnel_broker_request_duration_seconds_bucket{operation=\"poll_group\",le=\"0.1\"}": 0.0,
+              "node_2.runnel_broker_request_duration_seconds_bucket{operation=\"poll_group\",le=\"1\"}": 0.0,
+              "node_2.runnel_broker_request_duration_seconds_bucket{operation=\"poll_group\",le=\"10\"}": 0.0,
+              "node_2.runnel_broker_request_duration_seconds_bucket{operation=\"publish\",le=\"+Inf\"}": 0.0,
+              "node_2.runnel_broker_request_duration_seconds_bucket{operation=\"publish\",le=\"0.0001\"}": 0.0,
+              "node_2.runnel_broker_request_duration_seconds_bucket{operation=\"publish\",le=\"0.001\"}": 0.0,
+              "node_2.runnel_broker_request_duration_seconds_bucket{operation=\"publish\",le=\"0.01\"}": 0.0,
+              "node_2.runnel_broker_request_duration_seconds_bucket{operation=\"publish\",le=\"0.1\"}": 0.0,
+              "node_2.runnel_broker_request_duration_seconds_bucket{operation=\"publish\",le=\"1\"}": 0.0,
+              "node_2.runnel_broker_request_duration_seconds_bucket{operation=\"publish\",le=\"10\"}": 0.0,
+              "node_2.runnel_broker_request_duration_seconds_bucket{operation=\"replay\",le=\"+Inf\"}": 0.0,
+              "node_2.runnel_broker_request_duration_seconds_bucket{operation=\"replay\",le=\"0.0001\"}": 0.0,
+              "node_2.runnel_broker_request_duration_seconds_bucket{operation=\"replay\",le=\"0.001\"}": 0.0,
+              "node_2.runnel_broker_request_duration_seconds_bucket{operation=\"replay\",le=\"0.01\"}": 0.0,
+              "node_2.runnel_broker_request_duration_seconds_bucket{operation=\"replay\",le=\"0.1\"}": 0.0,
+              "node_2.runnel_broker_request_duration_seconds_bucket{operation=\"replay\",le=\"1\"}": 0.0,
+              "node_2.runnel_broker_request_duration_seconds_bucket{operation=\"replay\",le=\"10\"}": 0.0,
+              "node_2.runnel_broker_request_duration_seconds_count{operation=\"ack\"}": 0.0,
+              "node_2.runnel_broker_request_duration_seconds_count{operation=\"ack_group\"}": 0.0,
+              "node_2.runnel_broker_request_duration_seconds_count{operation=\"configure_consumer\"}": 0.0,
+              "node_2.runnel_broker_request_duration_seconds_count{operation=\"create_stream\"}": 0.0,
+              "node_2.runnel_broker_request_duration_seconds_count{operation=\"health\"}": 0.0,
+              "node_2.runnel_broker_request_duration_seconds_count{operation=\"inspect_consumer\"}": 0.0,
+              "node_2.runnel_broker_request_duration_seconds_count{operation=\"invalid_request\"}": 0.0,
+              "node_2.runnel_broker_request_duration_seconds_count{operation=\"poll\"}": 0.0,
+              "node_2.runnel_broker_request_duration_seconds_count{operation=\"poll_group\"}": 0.0,
+              "node_2.runnel_broker_request_duration_seconds_count{operation=\"publish\"}": 0.0,
+              "node_2.runnel_broker_request_duration_seconds_count{operation=\"replay\"}": 0.0,
+              "node_2.runnel_broker_request_duration_seconds_sum{operation=\"ack\"}": 0.0,
+              "node_2.runnel_broker_request_duration_seconds_sum{operation=\"ack_group\"}": 0.0,
+              "node_2.runnel_broker_request_duration_seconds_sum{operation=\"configure_consumer\"}": 0.0,
+              "node_2.runnel_broker_request_duration_seconds_sum{operation=\"create_stream\"}": 0.0,
+              "node_2.runnel_broker_request_duration_seconds_sum{operation=\"health\"}": 0.0,
+              "node_2.runnel_broker_request_duration_seconds_sum{operation=\"inspect_consumer\"}": 0.0,
+              "node_2.runnel_broker_request_duration_seconds_sum{operation=\"invalid_request\"}": 0.0,
+              "node_2.runnel_broker_request_duration_seconds_sum{operation=\"poll\"}": 0.0,
+              "node_2.runnel_broker_request_duration_seconds_sum{operation=\"poll_group\"}": 0.0,
+              "node_2.runnel_broker_request_duration_seconds_sum{operation=\"publish\"}": 0.0,
+              "node_2.runnel_broker_request_duration_seconds_sum{operation=\"replay\"}": 0.0,
+              "node_2.runnel_broker_request_failures_total{operation=\"ack\"}": 0.0,
+              "node_2.runnel_broker_request_failures_total{operation=\"ack_group\"}": 0.0,
+              "node_2.runnel_broker_request_failures_total{operation=\"configure_consumer\"}": 0.0,
+              "node_2.runnel_broker_request_failures_total{operation=\"create_stream\"}": 0.0,
+              "node_2.runnel_broker_request_failures_total{operation=\"health\"}": 0.0,
+              "node_2.runnel_broker_request_failures_total{operation=\"inspect_consumer\"}": 0.0,
+              "node_2.runnel_broker_request_failures_total{operation=\"invalid_request\"}": 0.0,
+              "node_2.runnel_broker_request_failures_total{operation=\"poll\"}": 0.0,
+              "node_2.runnel_broker_request_failures_total{operation=\"poll_group\"}": 0.0,
+              "node_2.runnel_broker_request_failures_total{operation=\"publish\"}": 0.0,
+              "node_2.runnel_broker_request_failures_total{operation=\"replay\"}": 0.0,
+              "node_2.runnel_broker_request_saturation_total": 0.0,
+              "node_2.runnel_broker_request_size_rejections_total": 0.0,
+              "node_2.runnel_broker_request_timeout_seconds": 0.0,
+              "node_2.runnel_broker_request_timeouts_total": 0.0,
+              "node_2.runnel_broker_requests_rejected_total": 0.0,
+              "node_2.runnel_broker_requests_total{operation=\"ack\"}": 0.0,
+              "node_2.runnel_broker_requests_total{operation=\"ack_group\"}": 0.0,
+              "node_2.runnel_broker_requests_total{operation=\"configure_consumer\"}": 0.0,
+              "node_2.runnel_broker_requests_total{operation=\"create_stream\"}": 0.0,
+              "node_2.runnel_broker_requests_total{operation=\"health\"}": 0.0,
+              "node_2.runnel_broker_requests_total{operation=\"inspect_consumer\"}": 0.0,
+              "node_2.runnel_broker_requests_total{operation=\"invalid_request\"}": 0.0,
+              "node_2.runnel_broker_requests_total{operation=\"poll\"}": 0.0,
+              "node_2.runnel_broker_requests_total{operation=\"poll_group\"}": 0.0,
+              "node_2.runnel_broker_requests_total{operation=\"publish\"}": 0.0,
+              "node_2.runnel_broker_requests_total{operation=\"replay\"}": 0.0,
+              "node_2.runnel_broker_response_bytes_total": 0.0,
+              "node_2.runnel_broker_response_write_timeouts_total": 0.0,
+              "node_2.runnel_dead_letters_total": 0.0,
+              "node_2.runnel_delivered_bytes_total": 0.0,
+              "node_2.runnel_deliveries_total": 0.0,
+              "node_2.runnel_engine_health_available": 0.0,
+              "node_2.runnel_health_check_failures_total": 0.0,
+              "node_2.runnel_in_flight_deliveries": 0.0,
+              "node_2.runnel_metrics_scrape_failures_total": 0.0,
+              "node_2.runnel_metrics_scrapes_total": 1.0,
+              "node_2.runnel_process_uptime_seconds": 0.28223099999999995,
+              "node_2.runnel_published_bytes_total": 0.0,
+              "node_2.runnel_publishes_total": 0.0,
+              "node_2.runnel_redeliveries_total": 0.0,
+              "node_2.runnel_snapshot_build_failures_total": 0.0,
+              "node_2.runnel_snapshot_builds_completed_total": 8.0,
+              "node_2.runnel_snapshot_builds_started_total": 8.0,
+              "node_2.runnel_snapshot_install_bytes_total": 0.0,
+              "node_2.runnel_snapshot_install_failures_total": 0.0,
+              "node_2.runnel_snapshot_installs_completed_total": 0.0,
+              "node_2.runnel_snapshot_installs_in_progress": 0.0,
+              "node_2.runnel_snapshot_installs_started_total": 0.0,
+              "node_2.runnel_snapshot_transfer_bytes_received_total": 0.0,
+              "node_2.runnel_snapshot_transfer_chunks_received_total": 0.0,
+              "node_2.runnel_snapshot_transfer_final_chunks_received_total": 0.0,
+              "node_2.runnel_storage_bytes": 25600.0,
+              "node_2.runnel_stream_creations_total": 0.0,
+              "node_2.runnel_streams": 0.0,
+              "node_3.runnel_acknowledgements_total": 0.0,
+              "node_3.runnel_active_connections": 0.0,
+              "node_3.runnel_active_requests": 0.0,
+              "node_3.runnel_broker_connection_errors_total": 0.0,
+              "node_3.runnel_broker_connections_accepted_total": 0.0,
+              "node_3.runnel_broker_connections_closed_total": 0.0,
+              "node_3.runnel_broker_connections_rejected_total": 0.0,
+              "node_3.runnel_broker_max_connections": 0.0,
+              "node_3.runnel_broker_max_in_flight_requests": 0.0,
+              "node_3.runnel_broker_max_request_bytes": 0.0,
+              "node_3.runnel_broker_request_bytes_total": 0.0,
+              "node_3.runnel_broker_request_duration_seconds_bucket{operation=\"ack\",le=\"+Inf\"}": 0.0,
+              "node_3.runnel_broker_request_duration_seconds_bucket{operation=\"ack\",le=\"0.0001\"}": 0.0,
+              "node_3.runnel_broker_request_duration_seconds_bucket{operation=\"ack\",le=\"0.001\"}": 0.0,
+              "node_3.runnel_broker_request_duration_seconds_bucket{operation=\"ack\",le=\"0.01\"}": 0.0,
+              "node_3.runnel_broker_request_duration_seconds_bucket{operation=\"ack\",le=\"0.1\"}": 0.0,
+              "node_3.runnel_broker_request_duration_seconds_bucket{operation=\"ack\",le=\"1\"}": 0.0,
+              "node_3.runnel_broker_request_duration_seconds_bucket{operation=\"ack\",le=\"10\"}": 0.0,
+              "node_3.runnel_broker_request_duration_seconds_bucket{operation=\"ack_group\",le=\"+Inf\"}": 0.0,
+              "node_3.runnel_broker_request_duration_seconds_bucket{operation=\"ack_group\",le=\"0.0001\"}": 0.0,
+              "node_3.runnel_broker_request_duration_seconds_bucket{operation=\"ack_group\",le=\"0.001\"}": 0.0,
+              "node_3.runnel_broker_request_duration_seconds_bucket{operation=\"ack_group\",le=\"0.01\"}": 0.0,
+              "node_3.runnel_broker_request_duration_seconds_bucket{operation=\"ack_group\",le=\"0.1\"}": 0.0,
+              "node_3.runnel_broker_request_duration_seconds_bucket{operation=\"ack_group\",le=\"1\"}": 0.0,
+              "node_3.runnel_broker_request_duration_seconds_bucket{operation=\"ack_group\",le=\"10\"}": 0.0,
+              "node_3.runnel_broker_request_duration_seconds_bucket{operation=\"configure_consumer\",le=\"+Inf\"}": 0.0,
+              "node_3.runnel_broker_request_duration_seconds_bucket{operation=\"configure_consumer\",le=\"0.0001\"}": 0.0,
+              "node_3.runnel_broker_request_duration_seconds_bucket{operation=\"configure_consumer\",le=\"0.001\"}": 0.0,
+              "node_3.runnel_broker_request_duration_seconds_bucket{operation=\"configure_consumer\",le=\"0.01\"}": 0.0,
+              "node_3.runnel_broker_request_duration_seconds_bucket{operation=\"configure_consumer\",le=\"0.1\"}": 0.0,
+              "node_3.runnel_broker_request_duration_seconds_bucket{operation=\"configure_consumer\",le=\"1\"}": 0.0,
+              "node_3.runnel_broker_request_duration_seconds_bucket{operation=\"configure_consumer\",le=\"10\"}": 0.0,
+              "node_3.runnel_broker_request_duration_seconds_bucket{operation=\"create_stream\",le=\"+Inf\"}": 0.0,
+              "node_3.runnel_broker_request_duration_seconds_bucket{operation=\"create_stream\",le=\"0.0001\"}": 0.0,
+              "node_3.runnel_broker_request_duration_seconds_bucket{operation=\"create_stream\",le=\"0.001\"}": 0.0,
+              "node_3.runnel_broker_request_duration_seconds_bucket{operation=\"create_stream\",le=\"0.01\"}": 0.0,
+              "node_3.runnel_broker_request_duration_seconds_bucket{operation=\"create_stream\",le=\"0.1\"}": 0.0,
+              "node_3.runnel_broker_request_duration_seconds_bucket{operation=\"create_stream\",le=\"1\"}": 0.0,
+              "node_3.runnel_broker_request_duration_seconds_bucket{operation=\"create_stream\",le=\"10\"}": 0.0,
+              "node_3.runnel_broker_request_duration_seconds_bucket{operation=\"health\",le=\"+Inf\"}": 0.0,
+              "node_3.runnel_broker_request_duration_seconds_bucket{operation=\"health\",le=\"0.0001\"}": 0.0,
+              "node_3.runnel_broker_request_duration_seconds_bucket{operation=\"health\",le=\"0.001\"}": 0.0,
+              "node_3.runnel_broker_request_duration_seconds_bucket{operation=\"health\",le=\"0.01\"}": 0.0,
+              "node_3.runnel_broker_request_duration_seconds_bucket{operation=\"health\",le=\"0.1\"}": 0.0,
+              "node_3.runnel_broker_request_duration_seconds_bucket{operation=\"health\",le=\"1\"}": 0.0,
+              "node_3.runnel_broker_request_duration_seconds_bucket{operation=\"health\",le=\"10\"}": 0.0,
+              "node_3.runnel_broker_request_duration_seconds_bucket{operation=\"inspect_consumer\",le=\"+Inf\"}": 0.0,
+              "node_3.runnel_broker_request_duration_seconds_bucket{operation=\"inspect_consumer\",le=\"0.0001\"}": 0.0,
+              "node_3.runnel_broker_request_duration_seconds_bucket{operation=\"inspect_consumer\",le=\"0.001\"}": 0.0,
+              "node_3.runnel_broker_request_duration_seconds_bucket{operation=\"inspect_consumer\",le=\"0.01\"}": 0.0,
+              "node_3.runnel_broker_request_duration_seconds_bucket{operation=\"inspect_consumer\",le=\"0.1\"}": 0.0,
+              "node_3.runnel_broker_request_duration_seconds_bucket{operation=\"inspect_consumer\",le=\"1\"}": 0.0,
+              "node_3.runnel_broker_request_duration_seconds_bucket{operation=\"inspect_consumer\",le=\"10\"}": 0.0,
+              "node_3.runnel_broker_request_duration_seconds_bucket{operation=\"invalid_request\",le=\"+Inf\"}": 0.0,
+              "node_3.runnel_broker_request_duration_seconds_bucket{operation=\"invalid_request\",le=\"0.0001\"}": 0.0,
+              "node_3.runnel_broker_request_duration_seconds_bucket{operation=\"invalid_request\",le=\"0.001\"}": 0.0,
+              "node_3.runnel_broker_request_duration_seconds_bucket{operation=\"invalid_request\",le=\"0.01\"}": 0.0,
+              "node_3.runnel_broker_request_duration_seconds_bucket{operation=\"invalid_request\",le=\"0.1\"}": 0.0,
+              "node_3.runnel_broker_request_duration_seconds_bucket{operation=\"invalid_request\",le=\"1\"}": 0.0,
+              "node_3.runnel_broker_request_duration_seconds_bucket{operation=\"invalid_request\",le=\"10\"}": 0.0,
+              "node_3.runnel_broker_request_duration_seconds_bucket{operation=\"poll\",le=\"+Inf\"}": 0.0,
+              "node_3.runnel_broker_request_duration_seconds_bucket{operation=\"poll\",le=\"0.0001\"}": 0.0,
+              "node_3.runnel_broker_request_duration_seconds_bucket{operation=\"poll\",le=\"0.001\"}": 0.0,
+              "node_3.runnel_broker_request_duration_seconds_bucket{operation=\"poll\",le=\"0.01\"}": 0.0,
+              "node_3.runnel_broker_request_duration_seconds_bucket{operation=\"poll\",le=\"0.1\"}": 0.0,
+              "node_3.runnel_broker_request_duration_seconds_bucket{operation=\"poll\",le=\"1\"}": 0.0,
+              "node_3.runnel_broker_request_duration_seconds_bucket{operation=\"poll\",le=\"10\"}": 0.0,
+              "node_3.runnel_broker_request_duration_seconds_bucket{operation=\"poll_group\",le=\"+Inf\"}": 0.0,
+              "node_3.runnel_broker_request_duration_seconds_bucket{operation=\"poll_group\",le=\"0.0001\"}": 0.0,
+              "node_3.runnel_broker_request_duration_seconds_bucket{operation=\"poll_group\",le=\"0.001\"}": 0.0,
+              "node_3.runnel_broker_request_duration_seconds_bucket{operation=\"poll_group\",le=\"0.01\"}": 0.0,
+              "node_3.runnel_broker_request_duration_seconds_bucket{operation=\"poll_group\",le=\"0.1\"}": 0.0,
+              "node_3.runnel_broker_request_duration_seconds_bucket{operation=\"poll_group\",le=\"1\"}": 0.0,
+              "node_3.runnel_broker_request_duration_seconds_bucket{operation=\"poll_group\",le=\"10\"}": 0.0,
+              "node_3.runnel_broker_request_duration_seconds_bucket{operation=\"publish\",le=\"+Inf\"}": 0.0,
+              "node_3.runnel_broker_request_duration_seconds_bucket{operation=\"publish\",le=\"0.0001\"}": 0.0,
+              "node_3.runnel_broker_request_duration_seconds_bucket{operation=\"publish\",le=\"0.001\"}": 0.0,
+              "node_3.runnel_broker_request_duration_seconds_bucket{operation=\"publish\",le=\"0.01\"}": 0.0,
+              "node_3.runnel_broker_request_duration_seconds_bucket{operation=\"publish\",le=\"0.1\"}": 0.0,
+              "node_3.runnel_broker_request_duration_seconds_bucket{operation=\"publish\",le=\"1\"}": 0.0,
+              "node_3.runnel_broker_request_duration_seconds_bucket{operation=\"publish\",le=\"10\"}": 0.0,
+              "node_3.runnel_broker_request_duration_seconds_bucket{operation=\"replay\",le=\"+Inf\"}": 0.0,
+              "node_3.runnel_broker_request_duration_seconds_bucket{operation=\"replay\",le=\"0.0001\"}": 0.0,
+              "node_3.runnel_broker_request_duration_seconds_bucket{operation=\"replay\",le=\"0.001\"}": 0.0,
+              "node_3.runnel_broker_request_duration_seconds_bucket{operation=\"replay\",le=\"0.01\"}": 0.0,
+              "node_3.runnel_broker_request_duration_seconds_bucket{operation=\"replay\",le=\"0.1\"}": 0.0,
+              "node_3.runnel_broker_request_duration_seconds_bucket{operation=\"replay\",le=\"1\"}": 0.0,
+              "node_3.runnel_broker_request_duration_seconds_bucket{operation=\"replay\",le=\"10\"}": 0.0,
+              "node_3.runnel_broker_request_duration_seconds_count{operation=\"ack\"}": 0.0,
+              "node_3.runnel_broker_request_duration_seconds_count{operation=\"ack_group\"}": 0.0,
+              "node_3.runnel_broker_request_duration_seconds_count{operation=\"configure_consumer\"}": 0.0,
+              "node_3.runnel_broker_request_duration_seconds_count{operation=\"create_stream\"}": 0.0,
+              "node_3.runnel_broker_request_duration_seconds_count{operation=\"health\"}": 0.0,
+              "node_3.runnel_broker_request_duration_seconds_count{operation=\"inspect_consumer\"}": 0.0,
+              "node_3.runnel_broker_request_duration_seconds_count{operation=\"invalid_request\"}": 0.0,
+              "node_3.runnel_broker_request_duration_seconds_count{operation=\"poll\"}": 0.0,
+              "node_3.runnel_broker_request_duration_seconds_count{operation=\"poll_group\"}": 0.0,
+              "node_3.runnel_broker_request_duration_seconds_count{operation=\"publish\"}": 0.0,
+              "node_3.runnel_broker_request_duration_seconds_count{operation=\"replay\"}": 0.0,
+              "node_3.runnel_broker_request_duration_seconds_sum{operation=\"ack\"}": 0.0,
+              "node_3.runnel_broker_request_duration_seconds_sum{operation=\"ack_group\"}": 0.0,
+              "node_3.runnel_broker_request_duration_seconds_sum{operation=\"configure_consumer\"}": 0.0,
+              "node_3.runnel_broker_request_duration_seconds_sum{operation=\"create_stream\"}": 0.0,
+              "node_3.runnel_broker_request_duration_seconds_sum{operation=\"health\"}": 0.0,
+              "node_3.runnel_broker_request_duration_seconds_sum{operation=\"inspect_consumer\"}": 0.0,
+              "node_3.runnel_broker_request_duration_seconds_sum{operation=\"invalid_request\"}": 0.0,
+              "node_3.runnel_broker_request_duration_seconds_sum{operation=\"poll\"}": 0.0,
+              "node_3.runnel_broker_request_duration_seconds_sum{operation=\"poll_group\"}": 0.0,
+              "node_3.runnel_broker_request_duration_seconds_sum{operation=\"publish\"}": 0.0,
+              "node_3.runnel_broker_request_duration_seconds_sum{operation=\"replay\"}": 0.0,
+              "node_3.runnel_broker_request_failures_total{operation=\"ack\"}": 0.0,
+              "node_3.runnel_broker_request_failures_total{operation=\"ack_group\"}": 0.0,
+              "node_3.runnel_broker_request_failures_total{operation=\"configure_consumer\"}": 0.0,
+              "node_3.runnel_broker_request_failures_total{operation=\"create_stream\"}": 0.0,
+              "node_3.runnel_broker_request_failures_total{operation=\"health\"}": 0.0,
+              "node_3.runnel_broker_request_failures_total{operation=\"inspect_consumer\"}": 0.0,
+              "node_3.runnel_broker_request_failures_total{operation=\"invalid_request\"}": 0.0,
+              "node_3.runnel_broker_request_failures_total{operation=\"poll\"}": 0.0,
+              "node_3.runnel_broker_request_failures_total{operation=\"poll_group\"}": 0.0,
+              "node_3.runnel_broker_request_failures_total{operation=\"publish\"}": 0.0,
+              "node_3.runnel_broker_request_failures_total{operation=\"replay\"}": 0.0,
+              "node_3.runnel_broker_request_saturation_total": 0.0,
+              "node_3.runnel_broker_request_size_rejections_total": 0.0,
+              "node_3.runnel_broker_request_timeout_seconds": 0.0,
+              "node_3.runnel_broker_request_timeouts_total": 0.0,
+              "node_3.runnel_broker_requests_rejected_total": 0.0,
+              "node_3.runnel_broker_requests_total{operation=\"ack\"}": 0.0,
+              "node_3.runnel_broker_requests_total{operation=\"ack_group\"}": 0.0,
+              "node_3.runnel_broker_requests_total{operation=\"configure_consumer\"}": 0.0,
+              "node_3.runnel_broker_requests_total{operation=\"create_stream\"}": 0.0,
+              "node_3.runnel_broker_requests_total{operation=\"health\"}": 0.0,
+              "node_3.runnel_broker_requests_total{operation=\"inspect_consumer\"}": 0.0,
+              "node_3.runnel_broker_requests_total{operation=\"invalid_request\"}": 0.0,
+              "node_3.runnel_broker_requests_total{operation=\"poll\"}": 0.0,
+              "node_3.runnel_broker_requests_total{operation=\"poll_group\"}": 0.0,
+              "node_3.runnel_broker_requests_total{operation=\"publish\"}": 0.0,
+              "node_3.runnel_broker_requests_total{operation=\"replay\"}": 0.0,
+              "node_3.runnel_broker_response_bytes_total": 0.0,
+              "node_3.runnel_broker_response_write_timeouts_total": 0.0,
+              "node_3.runnel_dead_letters_total": 0.0,
+              "node_3.runnel_delivered_bytes_total": 0.0,
+              "node_3.runnel_deliveries_total": 0.0,
+              "node_3.runnel_engine_health_available": 0.0,
+              "node_3.runnel_health_check_failures_total": 0.0,
+              "node_3.runnel_in_flight_deliveries": 0.0,
+              "node_3.runnel_metrics_scrape_failures_total": 0.0,
+              "node_3.runnel_metrics_scrapes_total": 1.0,
+              "node_3.runnel_process_uptime_seconds": 0.28211600000000003,
+              "node_3.runnel_published_bytes_total": 0.0,
+              "node_3.runnel_publishes_total": 0.0,
+              "node_3.runnel_redeliveries_total": 0.0,
+              "node_3.runnel_snapshot_build_failures_total": 0.0,
+              "node_3.runnel_snapshot_builds_completed_total": 8.0,
+              "node_3.runnel_snapshot_builds_started_total": 8.0,
+              "node_3.runnel_snapshot_install_bytes_total": 0.0,
+              "node_3.runnel_snapshot_install_failures_total": 0.0,
+              "node_3.runnel_snapshot_installs_completed_total": 0.0,
+              "node_3.runnel_snapshot_installs_in_progress": 0.0,
+              "node_3.runnel_snapshot_installs_started_total": 0.0,
+              "node_3.runnel_snapshot_transfer_bytes_received_total": 0.0,
+              "node_3.runnel_snapshot_transfer_chunks_received_total": 0.0,
+              "node_3.runnel_snapshot_transfer_final_chunks_received_total": 0.0,
+              "node_3.runnel_storage_bytes": 25600.0,
+              "node_3.runnel_stream_creations_total": 0.0,
+              "node_3.runnel_streams": 0.0
+            }
+          },
+          "recovery": {
+            "scenario_id": "cluster_raft_log_growth_recovery:100",
+            "operation": "cluster_raft_log_growth_recovery",
+            "messages": 1,
+            "message_size_bytes": 100,
+            "elapsed_seconds": 0.060723621,
+            "elapsed_milliseconds": 60.723621,
+            "throughput_messages_per_second": 16.46805614572952,
+            "throughput_megabytes_per_second": 0.0016468056145729517,
+            "latency_sample_count": 1,
+            "latency_microseconds": {
+              "p50": 60723.621,
+              "p99": 60723.621,
+              "p999": 60723.621,
+              "max": 60723.621
+            },
+            "metadata": {
+              "restarted_node": 3,
+              "restart_ready_milliseconds": 53.285497,
+              "replayed_offset": 0,
+              "earliest_payload_verified": true,
+              "poll_latency_milliseconds": 2.152597,
+              "acknowledgement_latency_milliseconds": 1.393436,
+              "latency_scope": "restart through earliest retained message acknowledgement"
+            },
+            "resource_samples": {
+              "samples": 2,
+              "memory_bytes_avg": 30822400.0,
+              "memory_bytes_max": 35713024.0,
+              "storage_bytes_avg": 1095184.0,
+              "storage_bytes_max": 1096532.0,
+              "cpu_seconds": 0.0,
+              "elapsed_seconds": 0.06077171,
+              "per_node": {
+                "1": {
+                  "samples": 3,
+                  "memory_bytes_avg": 12431360.0,
+                  "memory_bytes_max": 12476416.0,
+                  "storage_bytes_avg": 365061.3333333333,
+                  "storage_bytes_max": 365960.0,
+                  "cpu_seconds": 0.0
+                },
+                "2": {
+                  "samples": 3,
+                  "memory_bytes_avg": 11845632.0,
+                  "memory_bytes_max": 11845632.0,
+                  "storage_bytes_avg": 365061.3333333333,
+                  "storage_bytes_max": 365960.0,
+                  "cpu_seconds": 0.010000000000000009
+                },
+                "3": {
+                  "samples": 3,
+                  "memory_bytes_avg": 8231594.666666667,
+                  "memory_bytes_max": 11628544.0,
+                  "storage_bytes_avg": 364612.0,
+                  "storage_bytes_max": 364612.0,
+                  "cpu_seconds": 0.0
+                }
+              }
+            }
+          }
+        }
+      ]
+    }
+  },
+  "status": "complete",
+  "generated_at": "2026-09-29T12:49:00.099397+00:00",
+  "finished_at": "2026-09-29T12:49:00.099397+00:00"
+}

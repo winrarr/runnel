@@ -5,10 +5,12 @@ from __future__ import annotations
 
 import argparse
 import base64
+import json
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
+from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from common import (
@@ -79,11 +81,22 @@ SCENARIO_NAMES = (
     "hot_ordering",
     "leader_failure_recovery",
     "follower_failure_recovery",
+    "raft_log_growth",
 )
 # Keep the retained-data probe beyond the local engine's bounded tail index so
 # recovery measurements exercise a non-trivial retained history.
 MIN_RETAINED_RECOVERY_MESSAGES = 1_025
 DEFAULT_RETAINED_RECOVERY_MESSAGES = 2_048
+DEFAULT_RAFT_LOG_GROWTH_MESSAGES = 256
+MIN_RAFT_LOG_GROWTH_MESSAGES = 64
+MAX_RAFT_LOG_GROWTH_MESSAGES = 4_096
+MAX_RAFT_LOG_GROWTH_LOGICAL_PAYLOAD_BYTES = 16 * 1024 * 1024
+DEFAULT_RAFT_LOG_GROWTH_OBSERVATION_EVERY = 8
+MAX_RAFT_LOG_GROWTH_OBSERVATION_EVERY = 1_024
+DEFAULT_RAFT_LOG_GROWTH_CYCLE_TIMEOUT_SECONDS = 30.0
+MIN_RAFT_LOG_GROWTH_CYCLE_TIMEOUT_SECONDS = 1.0
+MAX_RAFT_LOG_GROWTH_CYCLE_TIMEOUT_SECONDS = 300.0
+RAFT_SNAPSHOT_BUILDS_METRIC = "runnel_snapshot_builds_completed_total"
 
 
 @dataclass
@@ -384,6 +397,396 @@ def run_retained_hot_path(
             },
             metrics=cluster.metrics,
         )
+
+
+def parse_raft_log_growth_messages(value: str) -> int:
+    try:
+        messages = int(value)
+    except ValueError as error:
+        raise argparse.ArgumentTypeError(
+            "Raft log growth messages must be an integer"
+        ) from error
+    if not MIN_RAFT_LOG_GROWTH_MESSAGES <= messages <= MAX_RAFT_LOG_GROWTH_MESSAGES:
+        raise argparse.ArgumentTypeError(
+            "Raft log growth messages must be between "
+            f"{MIN_RAFT_LOG_GROWTH_MESSAGES} and {MAX_RAFT_LOG_GROWTH_MESSAGES}"
+        )
+    return messages
+
+
+def parse_raft_log_growth_observation_every(value: str) -> int:
+    try:
+        every = int(value)
+    except ValueError as error:
+        raise argparse.ArgumentTypeError(
+            "Raft log growth observation interval must be an integer"
+        ) from error
+    if not 1 <= every <= MAX_RAFT_LOG_GROWTH_OBSERVATION_EVERY:
+        raise argparse.ArgumentTypeError(
+            "Raft log growth observation interval must be between "
+            f"1 and {MAX_RAFT_LOG_GROWTH_OBSERVATION_EVERY} publishes"
+        )
+    return every
+
+
+def _data_group_directories(
+    cluster: Cluster, stream: str, *, timeout_seconds: float
+) -> dict[int, Path]:
+    deadline = time.monotonic() + timeout_seconds
+    directories: dict[int, Path] = {}
+    while time.monotonic() < deadline:
+        directories = {}
+        for node in cluster.nodes:
+            data_directory = Path(node.data_dir) / "groups" / "data"
+            for manifest_path in data_directory.glob("*/group.json"):
+                try:
+                    manifest = json.loads(manifest_path.read_bytes())
+                except (OSError, json.JSONDecodeError):
+                    continue
+                if isinstance(manifest, dict) and manifest.get("stream") == stream:
+                    if node.node_id in directories:
+                        raise BenchmarkError(
+                            f"multiple Raft data groups found for stream {stream!r} "
+                            f"on node {node.node_id}"
+                        )
+                    directories[node.node_id] = manifest_path.parent
+        if len(directories) == len(cluster.nodes):
+            return directories
+        time.sleep(0.05)
+    found = ", ".join(str(node_id) for node_id in sorted(directories)) or "none"
+    raise BenchmarkError(
+        f"Raft data group for stream {stream!r} did not become visible on every node "
+        f"within {timeout_seconds:g}s (visible nodes: {found})"
+    )
+
+
+def _file_size(path: Path) -> int:
+    try:
+        return path.stat().st_size
+    except FileNotFoundError:
+        return 0
+
+
+def _raft_data_group_state(node_id: int, directory: Path) -> dict[str, Any] | None:
+    log_path = directory / "raft-log.json"
+    try:
+        log_bytes = log_path.read_bytes()
+    except FileNotFoundError:
+        return None
+    try:
+        persisted = json.loads(log_bytes)
+    except json.JSONDecodeError as error:
+        raise BenchmarkError(f"could not parse benchmark Raft log {log_path}: {error}") from error
+    if not isinstance(persisted, dict) or persisted.get("version") != 1:
+        version = persisted.get("version") if isinstance(persisted, dict) else None
+        raise BenchmarkError(
+            f"unsupported Raft log format in benchmark data group: {version!r}"
+        )
+    log = persisted.get("log")
+    if not isinstance(log, dict):
+        raise BenchmarkError(f"Raft log at {log_path} has no entry map")
+    indexes = [int(index) for index in log]
+    purged = persisted.get("last_purged_log_id")
+    committed = persisted.get("committed")
+    state_directory = directory / "state-machine"
+    return {
+        "node_id": node_id,
+        "group_id": directory.name,
+        "paths": {
+            "raft_log": {
+                "file_bytes": len(log_bytes),
+                "retained_log_entries": len(log),
+                "first_log_index": min(indexes) if indexes else None,
+                "last_log_index": max(indexes) if indexes else None,
+                "last_purged_log_index": (
+                    purged.get("index") if isinstance(purged, dict) else None
+                ),
+                "committed_log_index": (
+                    committed.get("index") if isinstance(committed, dict) else None
+                ),
+            },
+            "state_machine_journal": {
+                "file_bytes": _file_size(state_directory / "state-machine.log")
+            },
+            "state_machine_checkpoint": {
+                "file_bytes": _file_size(state_directory / "state-machine.json")
+            },
+            "snapshot": {
+                "file_bytes": _file_size(state_directory / "snapshot.json")
+            },
+        },
+    }
+
+
+def _cluster_raft_data_group_state(
+    cluster: Cluster, directories: dict[int, Path]
+) -> dict[str, dict[str, Any]]:
+    states: dict[str, dict[str, Any]] = {}
+    for node in cluster.nodes:
+        state = _raft_data_group_state(node.node_id, directories[node.node_id])
+        if state is not None:
+            states[f"node_{node.node_id}"] = state
+    return states
+
+
+def _snapshot_build_counts(
+    metrics: dict[str, float] | None, node_ids: list[int]
+) -> dict[str, int | None]:
+    counts: dict[str, int | None] = {}
+    for node_id in node_ids:
+        metric_name = f"node_{node_id}.{RAFT_SNAPSHOT_BUILDS_METRIC}"
+        value = metrics.get(metric_name) if metrics else None
+        counts[f"node_{node_id}"] = int(value) if value is not None else None
+    return counts
+
+
+def _observed_purge_advanced(
+    initial: dict[str, dict[str, Any]], latest: dict[str, dict[str, Any]]
+) -> bool:
+    for node_name, state in latest.items():
+        before = initial.get(node_name)
+        if before is None:
+            continue
+        old_index = before["paths"]["raft_log"]["last_purged_log_index"]
+        new_index = state["paths"]["raft_log"]["last_purged_log_index"]
+        old_snapshot_bytes = before["paths"]["snapshot"]["file_bytes"]
+        new_snapshot_bytes = state["paths"]["snapshot"]["file_bytes"]
+        if (
+            new_index is not None
+            and (old_index is None or new_index > old_index)
+            and old_snapshot_bytes == 0
+            and new_snapshot_bytes > 0
+        ):
+            return True
+    return False
+
+
+def _summarize_raft_log_growth(
+    initial: dict[str, dict[str, Any]],
+    latest: dict[str, dict[str, Any]],
+    observations: list[dict[str, Any]],
+    build_counts_before: dict[str, int | None],
+    build_counts_after: dict[str, int | None],
+) -> dict[str, Any]:
+    per_node: dict[str, dict[str, Any]] = {}
+    for node_name, final_state in latest.items():
+        initial_state = initial[node_name]
+        old_log = initial_state["paths"]["raft_log"]
+        new_log = final_state["paths"]["raft_log"]
+        samples = [
+            sample["per_node"][node_name]
+            for sample in observations
+            if node_name in sample["per_node"]
+        ]
+        previous_purged = old_log["last_purged_log_index"]
+        purge_transitions = 0
+        peak_entries = old_log["retained_log_entries"]
+        for sample in samples:
+            sampled_log = sample["paths"]["raft_log"]
+            peak_entries = max(peak_entries, sampled_log["retained_log_entries"])
+            purged = sampled_log["last_purged_log_index"]
+            if purged is not None and (previous_purged is None or purged > previous_purged):
+                purge_transitions += 1
+            if purged is not None:
+                previous_purged = purged
+        if new_log["last_purged_log_index"] is not None and (
+            previous_purged is None
+            or new_log["last_purged_log_index"] > previous_purged
+        ):
+            purge_transitions += 1
+        file_size_deltas = {
+            path_name: final_state["paths"][path_name]["file_bytes"]
+            - initial_state["paths"][path_name]["file_bytes"]
+            for path_name in final_state["paths"]
+        }
+        before_builds = build_counts_before.get(node_name)
+        after_builds = build_counts_after.get(node_name)
+        per_node[node_name] = {
+            "initial": initial_state,
+            "final": final_state,
+            "peak_observed_retained_log_entries": peak_entries,
+            "observed_purge_index_transitions": purge_transitions,
+            "snapshot_builds_completed_delta": (
+                after_builds - before_builds
+                if before_builds is not None and after_builds is not None
+                else None
+            ),
+            "net_file_size_delta_bytes": file_size_deltas,
+        }
+    return per_node
+
+
+def run_raft_log_growth(
+    cluster: Cluster,
+    stream: str,
+    payload: str,
+    messages: int,
+    observation_every: int,
+    cycle_timeout_seconds: float,
+) -> dict[str, Any]:
+    """Measure durable public commits through a real snapshot and purge."""
+    setup = cluster.client(0)
+    try:
+        create_stream(setup, stream)
+        first_offset, _ = publish(setup, stream, payload)
+        if first_offset != 0:
+            raise BenchmarkError(
+                f"Raft log growth setup expected offset 0, got {first_offset}"
+            )
+    finally:
+        setup.close()
+
+    directories = _data_group_directories(
+        cluster, stream, timeout_seconds=cycle_timeout_seconds
+    )
+    initial_state = _cluster_raft_data_group_state(cluster, directories)
+    if len(initial_state) != cluster.node_count:
+        raise BenchmarkError("could not read every node's persisted Raft log at setup")
+    metrics_before = cluster.metrics()
+    build_counts_before = _snapshot_build_counts(
+        metrics_before, [node.node_id for node in cluster.nodes]
+    )
+    observations: list[dict[str, Any]] = []
+    observer_duration_ns = 0
+    measured_started_ns = 0
+
+    def observe(message_index: int, *, phase: str = "publish") -> None:
+        nonlocal observer_duration_ns
+        observer_started_ns = time.perf_counter_ns()
+        states = _cluster_raft_data_group_state(cluster, directories)
+        observer_duration_ns += time.perf_counter_ns() - observer_started_ns
+        if len(states) != cluster.node_count:
+            raise BenchmarkError("could not observe the persisted Raft log on every node")
+        observations.append(
+            {
+                "phase": phase,
+                "message_index": message_index,
+                "elapsed_milliseconds": (
+                    time.perf_counter_ns() - measured_started_ns
+                )
+                / 1_000_000,
+                "per_node": states,
+            }
+        )
+
+    def measured_publish() -> dict[str, Any]:
+        nonlocal measured_started_ns
+        client = cluster.client(0)
+        measured_started_ns = time.perf_counter_ns()
+        latencies: list[int] = []
+        try:
+            for message_index in range(messages):
+                offset, latency_ns = publish(client, stream, payload)
+                expected_offset = message_index + 1
+                if offset != expected_offset:
+                    raise BenchmarkError(
+                        f"Raft log growth expected offset {expected_offset}, got {offset}"
+                    )
+                latencies.append(latency_ns)
+                if (message_index + 1) % observation_every == 0:
+                    observe(message_index + 1)
+            if not observations or observations[-1]["message_index"] != messages:
+                observe(messages)
+        finally:
+            client.close()
+        elapsed_ns = time.perf_counter_ns() - measured_started_ns
+        return metric(
+            "cluster_raft_log_growth",
+            latencies,
+            elapsed_ns,
+            message_size=len(payload),
+            metadata={
+                "measured_publishes": messages,
+                "setup_messages_excluded": 1,
+                "observation_every_publishes": observation_every,
+                "observer_io_seconds": observer_duration_ns / 1_000_000_000,
+                "observer_io_fraction_of_measured_interval": (
+                    observer_duration_ns / elapsed_ns if elapsed_ns else 0.0
+                ),
+                "observed_state_samples": len(observations),
+                "consensus_history_source": "per-node data-group raft-log.json",
+                "broker_message_history_is_not_inferred_from_raft_entry_count": True,
+                "path_size_semantics": (
+                    "persisted file sizes and net footprint deltas; not bytes written"
+                ),
+                "observations": observations,
+            },
+        )
+
+    result = measure_scenario(cluster.stats, measured_publish, metrics=cluster.metrics)
+    deadline = time.monotonic() + cycle_timeout_seconds
+    final_state = _cluster_raft_data_group_state(cluster, directories)
+    metrics_after = cluster.metrics()
+    while not _observed_purge_advanced(initial_state, final_state):
+        if time.monotonic() >= deadline:
+            raise BenchmarkError(
+                "Raft log growth workload completed without observing a snapshot/purge "
+                f"cycle within {cycle_timeout_seconds:g}s; measured publishes={messages}"
+            )
+        time.sleep(0.05)
+        observe(messages, phase="snapshot_purge_wait")
+        final_state = _cluster_raft_data_group_state(cluster, directories)
+        metrics_after = cluster.metrics()
+
+    observations.append(
+        {
+            "phase": "snapshot_purge_complete",
+            "message_index": messages,
+            "elapsed_milliseconds": None,
+            "per_node": final_state,
+        }
+    )
+    build_counts_after = _snapshot_build_counts(
+        metrics_after, [node.node_id for node in cluster.nodes]
+    )
+    result["metadata"]["per_node"] = _summarize_raft_log_growth(
+        initial_state,
+        final_state,
+        observations,
+        build_counts_before,
+        build_counts_after,
+    )
+    result["metadata"]["snapshot_builds_completed_before"] = build_counts_before
+    result["metadata"]["snapshot_builds_completed_after"] = build_counts_after
+    result["metadata"]["snapshot_purge_cycle_observed"] = True
+    result["metadata"]["post_cycle_observation_count"] = len(observations)
+
+    def recover_after_growth() -> dict[str, Any]:
+        node_index = cluster.node_count - 1
+        restarted_node = cluster.nodes[node_index].node_id
+        recovery_started_ns = time.perf_counter_ns()
+        restart_ns = cluster.restart_node(node_index)
+        recovered = cluster.client(node_index)
+        try:
+            response, poll_ns = poll(recovered, stream, "raft-log-growth-recovery", 0)
+            if response.get("payload") != payload:
+                raise BenchmarkError(
+                    "Raft log growth recovery returned an unexpected earliest payload"
+                )
+            ack_ns = acknowledge(recovered, stream, "raft-log-growth-recovery", 0)
+        finally:
+            recovered.close()
+        elapsed_ns = time.perf_counter_ns() - recovery_started_ns
+        return metric(
+            "cluster_raft_log_growth_recovery",
+            [elapsed_ns],
+            elapsed_ns,
+            message_size=len(payload),
+            metadata={
+                "restarted_node": restarted_node,
+                "restart_ready_milliseconds": restart_ns / 1_000_000,
+                "replayed_offset": 0,
+                "earliest_payload_verified": True,
+                "poll_latency_milliseconds": poll_ns / 1_000_000,
+                "acknowledgement_latency_milliseconds": ack_ns / 1_000_000,
+                "latency_scope": "restart through earliest retained message acknowledgement",
+            },
+        )
+
+    result["recovery"] = measure_scenario(
+        cluster.stats, recover_after_growth
+    )
+    return result
 
 
 def publish_batch_request(

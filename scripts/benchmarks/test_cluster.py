@@ -29,6 +29,7 @@ from cluster_scenarios import (  # noqa: E402
     DEFAULT_HOT_ORDERING_CONCURRENCY,
     DEFAULT_HOT_ORDERING_TIMEOUT_SECONDS,
     DEFAULT_PUBLISH_BATCH_SIZE,
+    DEFAULT_RAFT_LOG_GROWTH_MESSAGES,
     DEFAULT_RETAINED_RECOVERY_MESSAGES,
     DEFAULT_SLOW_CONSUMER_BACKPRESSURE_TIMEOUT_SECONDS,
     DEFAULT_SCENARIOS,
@@ -39,12 +40,21 @@ from cluster_scenarios import (  # noqa: E402
     MAX_HOT_ORDERING_TIMEOUT_SECONDS,
     MAX_LEADER_FAILURE_TIMEOUT_SECONDS,
     MAX_PUBLISH_BATCH_SIZE,
+    MAX_RAFT_LOG_GROWTH_CYCLE_TIMEOUT_SECONDS,
+    MAX_RAFT_LOG_GROWTH_LOGICAL_PAYLOAD_BYTES,
+    MAX_RAFT_LOG_GROWTH_MESSAGES,
     MAX_SLOW_CONSUMER_BACKPRESSURE_TIMEOUT_SECONDS,
     MIN_RETAINED_RECOVERY_MESSAGES,
+    MIN_RAFT_LOG_GROWTH_CYCLE_TIMEOUT_SECONDS,
+    MIN_RAFT_LOG_GROWTH_MESSAGES,
     _hot_ordering_metadata,
+    _observed_purge_advanced,
+    _raft_data_group_state,
     batch_metric,
     hot_ordering_records,
     parse_retained_messages,
+    parse_raft_log_growth_messages,
+    parse_raft_log_growth_observation_every,
     parse_scenarios,
     poll_until_redelivered,
     publish_batch_request,
@@ -54,6 +64,7 @@ from cluster_scenarios import (  # noqa: E402
     run_publish_batch,
     run_retained_hot_path,
     run_retained_recovery,
+    run_raft_log_growth,
     run_slow_consumer_backpressure,
 )
 from common import BenchmarkError, metric, parse_nonnegative_int, percentile  # noqa: E402
@@ -159,6 +170,48 @@ class ClusterBenchmarkTests(unittest.TestCase):
             [{"operation": "cluster_retained_hot_path"}],
         )
 
+    def test_result_builder_records_raft_log_growth_controls(self) -> None:
+        with patch.object(
+            sys,
+            "argv",
+            ["cluster.py", "--scenarios", "raft_log_growth", "--payload-sizes", "1024"],
+        ):
+            args = parse_args()
+        cluster = SimpleNamespace(
+            image_id="sha256:test",
+            startup_ns=1_000_000,
+            peer_proxy_summary=lambda: {"enabled": False, "response_delay_ms": 0},
+            stats=SimpleNamespace(summary=lambda: {}),
+        )
+        with (
+            patch.object(cluster_results, "result_metadata", return_value={}),
+            patch.object(cluster_results, "resource_limits", return_value={}),
+        ):
+            result = cluster_results.build_result(
+                args,
+                run_id="run-id",
+                started_at=datetime(2026, 1, 1, tzinfo=UTC),
+                cluster=cluster,
+                scenarios=[],
+            )
+
+        self.assertEqual(
+            result["workload"]["raft_log_growth"],
+            {
+                "measured_messages": DEFAULT_RAFT_LOG_GROWTH_MESSAGES,
+                "minimum_messages": MIN_RAFT_LOG_GROWTH_MESSAGES,
+                "maximum_messages": MAX_RAFT_LOG_GROWTH_MESSAGES,
+                "maximum_logical_payload_bytes": MAX_RAFT_LOG_GROWTH_LOGICAL_PAYLOAD_BYTES,
+                "observation_every_publishes": 8,
+                "cycle_timeout_seconds": 30.0,
+                "minimum_cycle_timeout_seconds": MIN_RAFT_LOG_GROWTH_CYCLE_TIMEOUT_SECONDS,
+                "maximum_cycle_timeout_seconds": MAX_RAFT_LOG_GROWTH_CYCLE_TIMEOUT_SECONDS,
+                "setup_messages_excluded": 1,
+                "message_history_source": "public protocol; first setup publish is offset 0",
+                "consensus_history_source": "per-node data-group raft-log.json",
+            },
+        )
+
     def test_native_log_handle_closes_when_a_node_stops(self) -> None:
         class FakeProcess:
             pid = 123
@@ -222,6 +275,177 @@ class ClusterBenchmarkTests(unittest.TestCase):
 
         self.assertEqual(args.scenarios, ["retained_hot_path"])
         self.assertEqual(args.retained_messages, 2048)
+
+    def test_raft_log_growth_is_opt_in_and_uses_bounded_workload_options(self) -> None:
+        with patch.object(
+            sys,
+            "argv",
+            [
+                "cluster.py",
+                "--scenarios",
+                "raft_log_growth",
+                "--raft-log-growth-messages",
+                "128",
+                "--raft-log-growth-observation-every",
+                "2",
+                "--raft-log-growth-cycle-timeout-seconds",
+                "45",
+            ],
+        ):
+            args = parse_args()
+
+        self.assertEqual(args.scenarios, ["raft_log_growth"])
+        self.assertEqual(args.raft_log_growth_messages, 128)
+        self.assertEqual(args.raft_log_growth_observation_every, 2)
+        self.assertEqual(args.raft_log_growth_cycle_timeout_seconds, 45)
+        self.assertEqual(DEFAULT_RAFT_LOG_GROWTH_MESSAGES, 256)
+        self.assertEqual(
+            parse_raft_log_growth_messages(str(MIN_RAFT_LOG_GROWTH_MESSAGES)),
+            MIN_RAFT_LOG_GROWTH_MESSAGES,
+        )
+        self.assertEqual(
+            parse_raft_log_growth_messages(str(MAX_RAFT_LOG_GROWTH_MESSAGES)),
+            MAX_RAFT_LOG_GROWTH_MESSAGES,
+        )
+        self.assertEqual(parse_raft_log_growth_observation_every("1"), 1)
+
+    def test_raft_log_growth_rejects_unbounded_options_and_skip_recovery(self) -> None:
+        for invalid in (
+            str(MIN_RAFT_LOG_GROWTH_MESSAGES - 1),
+            str(MAX_RAFT_LOG_GROWTH_MESSAGES + 1),
+            "not-an-integer",
+        ):
+            with self.subTest(messages=invalid), self.assertRaises(
+                argparse.ArgumentTypeError
+            ):
+                parse_raft_log_growth_messages(invalid)
+        with self.assertRaises(argparse.ArgumentTypeError):
+            parse_raft_log_growth_observation_every("0")
+        with patch.object(
+            sys,
+            "argv",
+            ["cluster.py", "--scenarios", "raft_log_growth", "--skip-recovery"],
+        ):
+            with self.assertRaises(SystemExit):
+                parse_args()
+        with patch.object(
+            sys,
+            "argv",
+            [
+                "cluster.py",
+                "--scenarios",
+                "raft_log_growth",
+                "--raft-log-growth-messages",
+                str(MAX_RAFT_LOG_GROWTH_MESSAGES),
+                "--payload-sizes",
+                str(MAX_RAFT_LOG_GROWTH_LOGICAL_PAYLOAD_BYTES),
+            ],
+        ):
+            with self.assertRaises(SystemExit):
+                parse_args()
+        with patch.object(
+            sys,
+            "argv",
+            [
+                "cluster.py",
+                "--scenarios",
+                "raft_log_growth",
+                "--raft-log-growth-cycle-timeout-seconds",
+                "0.5",
+            ],
+        ):
+            with self.assertRaises(SystemExit):
+                parse_args()
+
+    def test_raft_log_growth_dispatches_selected_payload_size(self) -> None:
+        with patch.object(
+            sys,
+            "argv",
+            ["cluster.py", "--scenarios", "raft_log_growth", "--payload-sizes", "100"],
+        ):
+            args = parse_args()
+        cluster = SimpleNamespace()
+        expected = {"operation": "cluster_raft_log_growth"}
+        with patch.object(
+            cluster_cli, "run_raft_log_growth", return_value=expected
+        ) as run_growth:
+            results = cluster_cli.run_scenarios(args, cluster, "run-id")
+
+        run_growth.assert_called_once_with(
+            cluster,
+            "cluster_run-id_raft_log_growth_100",
+            "x" * 100,
+            args.raft_log_growth_messages,
+            args.raft_log_growth_observation_every,
+            args.raft_log_growth_cycle_timeout_seconds,
+        )
+        self.assertEqual(results, [expected])
+
+    def test_raft_data_group_observation_separates_consensus_and_state_paths(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            group = Path(temporary) / "groups" / "data" / "stream-id"
+            state = group / "state-machine"
+            state.mkdir(parents=True)
+            (group / "raft-log.json").write_text(
+                '{"version":1,"last_purged_log_id":{"index":10},'
+                '"log":{"11":{"log_id":{"index":11}},'
+                '"12":{"log_id":{"index":12}}},'
+                '"committed":{"index":12},"vote":null}',
+                encoding="utf-8",
+            )
+            (state / "state-machine.log").write_bytes(b"journal")
+            (state / "state-machine.json").write_bytes(b"checkpoint")
+            (state / "snapshot.json").write_bytes(b"snapshot")
+
+            observed = _raft_data_group_state(3, group)
+
+        self.assertEqual(observed["node_id"], 3)
+        self.assertEqual(observed["paths"]["raft_log"]["retained_log_entries"], 2)
+        self.assertEqual(observed["paths"]["raft_log"]["first_log_index"], 11)
+        self.assertEqual(observed["paths"]["raft_log"]["last_purged_log_index"], 10)
+        self.assertEqual(observed["paths"]["state_machine_journal"]["file_bytes"], 7)
+        self.assertEqual(
+            observed["paths"]["state_machine_checkpoint"]["file_bytes"], 10
+        )
+        self.assertEqual(observed["paths"]["snapshot"]["file_bytes"], 8)
+
+    def test_raft_log_growth_cycle_requires_new_snapshot_and_purged_index(self) -> None:
+        before = {
+            "node_1": {
+                "paths": {
+                    "raft_log": {"last_purged_log_index": None},
+                    "snapshot": {"file_bytes": 0},
+                }
+            }
+        }
+        snapshot_without_purge = {
+            "node_1": {
+                "paths": {
+                    "raft_log": {"last_purged_log_index": None},
+                    "snapshot": {"file_bytes": 12},
+                }
+            }
+        }
+        purged_without_snapshot = {
+            "node_1": {
+                "paths": {
+                    "raft_log": {"last_purged_log_index": 32},
+                    "snapshot": {"file_bytes": 0},
+                }
+            }
+        }
+        snapshot_and_purge = {
+            "node_1": {
+                "paths": {
+                    "raft_log": {"last_purged_log_index": 32},
+                    "snapshot": {"file_bytes": 12},
+                }
+            }
+        }
+
+        self.assertFalse(_observed_purge_advanced(before, snapshot_without_purge))
+        self.assertFalse(_observed_purge_advanced(before, purged_without_snapshot))
+        self.assertTrue(_observed_purge_advanced(before, snapshot_and_purge))
 
     def test_hot_ordering_options_are_opt_in_and_bounded(self) -> None:
         with patch.object(

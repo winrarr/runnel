@@ -30,6 +30,9 @@ from cluster_scenarios import (
     DEFAULT_PEER_FORWARDING_TIMEOUT_SECONDS,
     DEFAULT_PEER_RESPONSE_DELAY_MS,
     DEFAULT_PUBLISH_BATCH_SIZE,
+    DEFAULT_RAFT_LOG_GROWTH_CYCLE_TIMEOUT_SECONDS,
+    DEFAULT_RAFT_LOG_GROWTH_MESSAGES,
+    DEFAULT_RAFT_LOG_GROWTH_OBSERVATION_EVERY,
     DEFAULT_RETAINED_RECOVERY_MESSAGES,
     DEFAULT_SCENARIOS,
     DEFAULT_SLOW_CONSUMER_DELAY_MS,
@@ -43,9 +46,14 @@ from cluster_scenarios import (
     MAX_PEER_FORWARDING_TIMEOUT_SECONDS,
     MAX_PEER_RESPONSE_DELAY_MS,
     MAX_PUBLISH_BATCH_SIZE,
+    MAX_RAFT_LOG_GROWTH_CYCLE_TIMEOUT_SECONDS,
+    MAX_RAFT_LOG_GROWTH_LOGICAL_PAYLOAD_BYTES,
+    MIN_RAFT_LOG_GROWTH_CYCLE_TIMEOUT_SECONDS,
     MAX_SLOW_CONSUMER_BACKPRESSURE_TIMEOUT_SECONDS,
     MIN_RETAINED_RECOVERY_MESSAGES,
     parse_retained_messages,
+    parse_raft_log_growth_messages,
+    parse_raft_log_growth_observation_every,
     parse_scenarios,
     run_consume_ack,
     run_durable_publish,
@@ -59,6 +67,7 @@ from cluster_scenarios import (
     run_restart_recovery,
     run_retained_hot_path,
     run_retained_recovery,
+    run_raft_log_growth,
     run_slow_consumer,
     run_slow_consumer_backpressure,
 )
@@ -118,7 +127,7 @@ def parse_args() -> argparse.Namespace:
             "comma-separated scenarios to run (default: existing clustered workload; "
             "add retained_hot_path, peer_forwarding, publish_batch, hot_ordering, "
             "slow_consumer_backpressure, leader_failure_recovery, or "
-            "follower_failure_recovery explicitly for "
+            "follower_failure_recovery, or raft_log_growth explicitly for "
             "focused probes)"
         ),
     )
@@ -187,6 +196,24 @@ def parse_args() -> argparse.Namespace:
             "retained records preloaded for the restart-recovery growth probe "
             f"(minimum: {MIN_RETAINED_RECOVERY_MESSAGES})"
         ),
+    )
+    parser.add_argument(
+        "--raft-log-growth-messages",
+        type=parse_raft_log_growth_messages,
+        default=DEFAULT_RAFT_LOG_GROWTH_MESSAGES,
+        help="bounded measured durable publishes for the opt-in Raft log growth scenario",
+    )
+    parser.add_argument(
+        "--raft-log-growth-observation-every",
+        type=parse_raft_log_growth_observation_every,
+        default=DEFAULT_RAFT_LOG_GROWTH_OBSERVATION_EVERY,
+        help="sample persisted Raft and state-machine paths every N measured publishes",
+    )
+    parser.add_argument(
+        "--raft-log-growth-cycle-timeout-seconds",
+        type=parse_positive_float,
+        default=DEFAULT_RAFT_LOG_GROWTH_CYCLE_TIMEOUT_SECONDS,
+        help="bounded wait for data groups and an actual snapshot/purge cycle",
     )
     parser.add_argument(
         "--peer-forwarding-concurrency",
@@ -294,6 +321,33 @@ def parse_args() -> argparse.Namespace:
             "leader failure timeout exceeds the bounded maximum "
             f"of {MAX_LEADER_FAILURE_TIMEOUT_SECONDS:g} seconds"
         )
+    if (
+        args.raft_log_growth_cycle_timeout_seconds
+        > MAX_RAFT_LOG_GROWTH_CYCLE_TIMEOUT_SECONDS
+    ):
+        parser.error(
+            "Raft log growth cycle timeout exceeds the bounded maximum of "
+            f"{MAX_RAFT_LOG_GROWTH_CYCLE_TIMEOUT_SECONDS:g} seconds"
+        )
+    if (
+        args.raft_log_growth_cycle_timeout_seconds
+        < MIN_RAFT_LOG_GROWTH_CYCLE_TIMEOUT_SECONDS
+    ):
+        parser.error(
+            "Raft log growth cycle timeout must be at least "
+            f"{MIN_RAFT_LOG_GROWTH_CYCLE_TIMEOUT_SECONDS:g} second"
+        )
+    if "raft_log_growth" in args.scenarios and args.skip_recovery:
+        parser.error("raft_log_growth includes mandatory follower restart recovery")
+    if (
+        "raft_log_growth" in args.scenarios
+        and args.raft_log_growth_messages * sum(args.payload_sizes)
+        > MAX_RAFT_LOG_GROWTH_LOGICAL_PAYLOAD_BYTES
+    ):
+        parser.error(
+            "raft log growth payload volume exceeds the bounded maximum of "
+            f"{MAX_RAFT_LOG_GROWTH_LOGICAL_PAYLOAD_BYTES} logical bytes"
+        )
     if args.peer_response_delay_ms and args.runtime != "process":
         parser.error("peer response delay requires the native process runtime")
     if args.ack_timeout_ms <= 0:
@@ -357,6 +411,17 @@ def run_scenarios(
                     payload,
                     args.messages,
                     args.retained_messages,
+                )
+            )
+        if "raft_log_growth" in selected_scenarios:
+            scenarios.append(
+                run_raft_log_growth(
+                    cluster,
+                    f"cluster_{run_id}_raft_log_growth_{size}",
+                    payload,
+                    args.raft_log_growth_messages,
+                    args.raft_log_growth_observation_every,
+                    args.raft_log_growth_cycle_timeout_seconds,
                 )
             )
         if "slow_consumer" in selected_scenarios:
