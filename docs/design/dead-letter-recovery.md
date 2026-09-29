@@ -1,11 +1,11 @@
 # Dead-letter recovery across durable boundaries
 
-- Status: exploratory design note; local move reconciliation is implemented, while broader failure-boundary and provenance evidence remains open
-- Last reviewed: 2026-09-06
-- Baseline: `fa51d9789b7ce5b284eda62903641597b02f96e0`
+- Status: exploratory design note; local reconciliation is tested across injected file states, while physical durability, the accepted ID namespace contract, and provenance evidence remain open
+- Last reviewed: 2026-09-29
+- Baseline: `eaf93da579a86db01ceb452a2514d426934f4775`
 - Reading guide: [design-note conventions](README.md)
-- Related debt: [TD-017](../tech-debt.md#td-017-dead-letter-movement-spans-separate-durable-records) and [TD-018](../tech-debt.md#td-018-retry-policy-and-dead-letter-provenance-are-coarse)
-- Related decisions: [ADR 0014](../decisions/0014-local-retry-and-dead-letter-policy.md), [ADR 0016](../decisions/0016-clustered-retry-and-dead-letter-policy.md), and [ADR 0026](../decisions/0026-semantic-engine-error-classification.md)
+- Related debt: [TD-017](../tech-debt.md#td-017-dead-letter-movement-spans-separate-durable-records), [TD-018](../tech-debt.md#td-018-retry-policy-and-dead-letter-provenance-are-coarse), and [TD-029](../tech-debt.md#td-029-public-request-ids-can-collide-with-local-dead-letter-move-ids)
+- Related decisions: [ADR 0014](../decisions/0014-local-retry-and-dead-letter-policy.md), [ADR 0016](../decisions/0016-clustered-retry-and-dead-letter-policy.md), [ADR 0026](../decisions/0026-semantic-engine-error-classification.md), and [ADR 0027](../decisions/0027-consumer-scoped-retry-policy.md)
 - Related boundaries: [durability and delivery policy](durability-delivery-policy.md), [application-aware retry policy](application-aware-retry-policy.md), and [clustered outcomes](clustered-outcome-contract.md)
 
 This note separates the observed local append/reconcile behavior from the
@@ -38,7 +38,12 @@ rebuilt from the target stream log on open, for this internal move identity.
 This is not a new public request contract. A same-ID key/payload mismatch
 returns an explicit invalid-data storage error; the public publish request-ID
 behavior, which intentionally ignores mismatched payloads for compatibility,
-is not sufficient for this internal invariant.
+is not sufficient for this internal invariant. Both kinds of ID are held in
+the same per-target-stream request-ID index, and the internal value is
+predictable and within the public ID length limit. A public publish using that
+exact ID could therefore collide with a later move. The key/payload mismatch
+case is reproduced by
+[`dead_letter_move_content_mismatch_is_storage_error_without_acknowledgement`](../../crates/runnel-core/src/lib.rs#L1442): a public publish path reserves the exact move ID with different content, and the later move returns an invalid-data error again after reopen instead of advancing source progress. This is an at-least-once-safe outcome, but the source delivery can remain blocked until the target conflict is resolved. The matching-content case and the same interaction through the wire protocol are untested; the accepted identity contract remains open in TD-029.
 
 The current clustered implementation does not use this local move identity.
 It appends the derived record and advances source progress in one replicated
@@ -55,16 +60,25 @@ side effects remain the consumer's responsibility.
 ## Observed local append and reconciliation behavior
 
 The local engine has two independent durable objects. In
-[`Broker::poll_group`](../../crates/runnel-core/src/broker.rs#L233), an
-exhausted delivery calls [`Broker::dead_letter_record`](../../crates/runnel-core/src/broker.rs#L505),
+[`Broker::poll_group`](../../crates/runnel-core/src/broker.rs#L309), an
+exhausted delivery calls [`Broker::dead_letter_record`](../../crates/runnel-core/src/broker.rs#L592),
 which reads the source record, appends its key and payload to the derived
 stream, and only then persists a source `Acknowledge` event. Stream appends
 call `sync_data`; source consumer events append to a bounded journal and call
 `sync_all` before the operation continues. Recovery reconstructs consumer
 state from its checkpoint and journal and rebuilds request-aware target
 identity by scanning complete target-log frames. The relevant persistence
-boundaries are [`StreamLog::append_with_move_id`](../../crates/runnel-core/src/stream_log.rs#L314)
-and [`persist_consumer_event`](../../crates/runnel-core/src/consumer_state.rs#L91).
+boundaries are [`StreamLog::append_with_move_id`](../../crates/runnel-core/src/stream_log.rs#L332)
+and [`persist_consumer_event`](../../crates/runnel-core/src/consumer_state.rs#L144).
+
+Each new move stores its identity in the same request-ID map used by public
+publishes. The map is rebuilt from all complete request-aware frames on open;
+it grows with retained identities, and recovery scans the target file. This
+reconciliation path has no retention bound today, consistent with the broader
+local log/index limitations recorded in [TD-002](../tech-debt.md#td-002-one-file-and-a-startup-scan-per-local-stream).
+The broker also pins the consumer policy on first delivery; the attempt limit
+that triggers movement is the policy snapshot recorded for that source offset,
+even if the consumer's configured policy later changes ([ADR 0027](../decisions/0027-consumer-scoped-retry-policy.md)).
 
 The resulting durable order is intentional:
 
@@ -87,34 +101,41 @@ The internal move ID is currently a bounded, length-prefixed textual value:
 runnel-dlq/v1/<source-stream-length>:<source-stream>/<source-consumer-length>:<source-consumer>/<source-offset>
 ```
 
-[`dead_letter_move_id`](../../crates/runnel-core/src/lib.rs#L198) derives it
+[`dead_letter_move_id`](../../crates/runnel-core/src/lib.rs#L227) derives it
 from the validated source stream, source consumer, and source offset. The ID
 is stored in an `RNL3` request-aware target frame and is looked up only within
-that target stream's in-memory request-ID index. The writer enforces the
-request-aware key, payload, and identity limits. On reopen, complete request-
-aware frames rebuild that index; an incomplete trailing frame is discarded,
-while a complete checksum or format failure is reported rather than silently
-treated as a successful move.
+that target stream's in-memory request-ID index, which also holds public publish
+IDs. The writer enforces the request-aware key, payload, and identity limits.
+On reopen, complete request-aware frames rebuild that index; an incomplete
+trailing frame is discarded, while a complete checksum or format failure is
+reported rather than silently treated as a successful move.
 
-The meaningful process-crash states are:
+The relevant local recovery states and current evidence are:
 
-| Crash point | Durable state after recovery | Current result |
+| State or failure boundary | State observed after reopen | Evidence and limitation |
 | --- | --- | --- |
-| Before the target append reaches its durable point | Source remains eligible. The target may be absent, have an incomplete trailing frame that recovery truncates, or appear complete despite an uncertain sync. | The operation can return an I/O error. Under [ADR 0026](../decisions/0026-semantic-engine-error-classification.md), a generic storage result is `Unknown`; a complete-looking record alone is not a durability proof. Target-write and sync fault injection remain open in [TD-017](../tech-debt.md#td-017-dead-letter-movement-spans-separate-durable-records). |
-| After the target append is durable, before the source event is durable | Target contains the copied record and internal move identity; source progress has not advanced. | A retry reuses the same-content target record before advancing source progress. The injected source-persistence failure and reopen path are covered; target-write/sync ambiguity and legacy records remain open in TD-017. |
-| After the source event is durable | Target contains the record and source progress advances during recovery. | No second move is required for that source consumer and offset. |
-| Target write or source event has an ambiguous I/O result | The result depends on which bytes and sync boundaries reached durable storage. | The source must not be advanced on an unknown target result. A later source poll may reconcile the target using the same move ID; callers must use the engine's semantic outcome rather than blindly replaying an externally visible mutation. |
+| Before a complete target frame is written | Source remains eligible. The target may be absent or end with an incomplete frame that is truncated on reopen. | `dead_letter_move_recovers_after_partial_target_write_and_restart` injects a half-header write, checks unchanged source progress, reopens, and confirms one reconciled target record. The injected test does not simulate an OS write failure or power loss. |
+| A complete target frame is written but `sync_data` has not succeeded | Source remains eligible; a complete-looking target frame may be found on reopen. | `dead_letter_move_reconciles_complete_target_write_reported_as_failure` injects an error after the complete frame and before the real sync call. Reopen rebuilds the ID index and reuses the matching record. It does not establish whether an actual failed device sync leaves durable bytes. |
+| Target append succeeds before the source acknowledgement event is written | Target contains the copied record and move ID; source progress remains eligible. | `dead_letter_move_reconciles_target_after_restart` creates this state directly, then reopen/poll reconciles it. `dead_letter_move_reconciles_after_source_ack_persistence_failure_and_restart` exercises the same order through a failed source-event append. |
+| The complete source acknowledgement event is written but its sync returns an error | The test filesystem retains the event for reopen; source progress replays and the target remains single. | `dead_letter_move_retries_after_source_event_sync_failure_and_restart` injects the sync error after writing the journal event, drops and reopens the broker, and checks progress and the one target record. It is not a real sync failure or power-loss test. |
+| The public poll response is lost after a completed move | The server has completed the source transition and the response is unavailable to the client; after restart the source poll is empty and the target record is consumable once in the tested case. | `network_protocol_reconciles_dead_letter_after_ambiguous_poll_and_restart` covers this real-server journey. It does not kill the server between target sync and source-event persistence. |
 
 The local target append checks an existing move ID's key and payload before
-reusing it. The focused tests cover stable/scoped identity
-([identity](../../crates/runnel-core/src/lib.rs#L1037)), reuse after reopen
-([reopen](../../crates/runnel-core/src/lib.rs#L1083)), source-ack persistence
-failure ([source-ack failure](../../crates/runnel-core/src/lib.rs#L1129)), and
-same-ID content mismatch ([mismatch](../../crates/runnel-core/src/lib.rs#L1191)).
-The source-ack failure test exercises the case where the target append has
-completed and the source event fails; the next poll then reconciles the
-existing target record and persists source progress. This is a duplicate-safe
-local slice, not proof that every filesystem failure mode is safe.
+reusing it. Core tests cover stable/scoped/bounded identities
+([identity](../../crates/runnel-core/src/lib.rs#L1133)), repeated append and
+restart reconciliation ([retry](../../crates/runnel-core/src/lib.rs#L1143),
+[restart](../../crates/runnel-core/src/lib.rs#L1179)), source acknowledgement
+failure and injected file states ([source persistence](../../crates/runnel-core/src/lib.rs#L1225),
+[partial target frame](../../crates/runnel-core/src/lib.rs#L1287),
+[complete frame before sync](../../crates/runnel-core/src/lib.rs#L1331),
+[source event sync error](../../crates/runnel-core/src/lib.rs#L1375)), and
+same-ID content mismatch ([mismatch](../../crates/runnel-core/src/lib.rs#L1442)).
+Real-server tests cover movement after the attempt limit and restart recovery
+([restart](../../crates/runnel-server/tests/server_smoke.rs#L729)) plus a lost
+poll response and restart ([ambiguous response](../../crates/runnel-server/tests/server_smoke.rs#L821)).
+Together these tests support reconciliation for the injected and process-level
+states named above; they do not prove behavior under actual filesystem or
+device failures, power loss, or a process kill at the exact inter-log boundary.
 
 ## Observed clustered same-group movement
 
@@ -124,7 +145,7 @@ the original message is appended to the derived stream held in the same
 `SnapshotState` as the source consumer state, then source progress is
 advanced before the command response is returned. The state-machine journal
 is persisted before applying the command and replayed after a restart through
-[`StateMachineStore::apply`](../../crates/runnel-raft/src/state_machine_store.rs#L743).
+[`StateMachineStore::apply`](../../crates/runnel-raft/src/state_machine_store.rs#L766).
 The derived stream is resolved back to the source data group by
 [`data_group_for_stream`](../../crates/runnel-raft/src/group_manager.rs#L338)
 when it is addressed through the public protocol.
@@ -140,26 +161,40 @@ transition has no move-ID or source provenance field, so its duplicate-safety
 comes from source progress and replicated command application, not from a
 cross-stream identity index.
 
-The current evidence covers unit and persistent-engine retry/dead-letter
-behavior, plus real three-process reassignment and dead-letter recovery in
-[`cluster_smoke`](../../crates/runnel-server/tests/cluster_smoke.rs#L911).
-It does not establish a transaction across independent data groups. If a
-future placement policy puts the derived stream in another group, the
-cross-group problem returns and the current same-group claim must not be
-generalized without a separately accepted transaction or reconciliation
-design.
+The current evidence includes
+[`persistent_raft_dead_letters_after_the_configured_attempt_limit`](../../crates/runnel-raft/src/lib.rs#L1327),
+which reopens the persistent engine after the transition, and the real
+three-process failover test
+[`three_process_cluster_reassigns_group_delivery_after_node_failure`](../../crates/runnel-server/tests/cluster_smoke.rs#L928),
+which exercises retry exhaustion and dead-letter consumption after reassignment.
+The latter validates the current real-process same-group path; the focused
+persistent-engine test uses a single-node cluster. A second real-process test
+[`three_process_cluster_transfers_consumer_policy_and_delivery_snapshot_after_leader_failure`](../../crates/runnel-server/tests/cluster_smoke.rs#L1243)
+shows that a first-attempt policy snapshot still causes the terminal move after
+a leader change even though the consumer's current policy allows more
+attempts. This extends current evidence to policy transfer, not to split-group
+movement or a new transaction protocol.
+
+The clustered transition has no move ID or source-provenance field. Its
+duplicate-safety comes from replicated source progress and command application,
+not from a cross-stream identity index. The evidence does not establish a
+transaction across independent data groups. If a future placement policy puts
+the derived stream in another group, the cross-group problem returns and the
+current same-group claim must not be generalized without a separately accepted
+transaction or reconciliation design.
 
 ## Current provenance and redrive boundary
 
-Both engines currently expose only the copied key and payload as dead-letter
-content (along with the target's ordinary offset, timestamp, and delivery
-metadata). They do not expose the source stream incarnation, source consumer,
-source offset, attempt history, policy version, terminal reason, or a move
-identity through the public message/protocol model. Local `RNL3` frames carry
-the internal move ID for reconciliation, but it is not public provenance;
-clustered `StoredMessage` values carry no equivalent move ID. Existing
-dead-letter records therefore cannot be retroactively enriched with reliable
-origin metadata.
+Both engines currently expose the copied key and payload as dead-letter
+content, with a target offset and newly generated delivery metadata. The local
+append assigns a new timestamp; the clustered transition copies the stored
+source message, including its publish timestamp. Neither exposes the source
+stream incarnation, source consumer, source offset, attempt history, policy
+version, terminal reason, or a move identity through the public
+message/protocol model. Local `RNL3` frames carry the internal move ID for
+reconciliation, but it is not public provenance; clustered `StoredMessage`
+values carry no equivalent move ID. Existing dead-letter records therefore
+cannot be retroactively enriched with reliable origin metadata.
 
 There is also no broker redrive operation. An application can consume a
 dead-letter stream and publish a new record, but that is a new operation with
@@ -241,37 +276,40 @@ exactly-once processing for Runnel or any external consumer.
 
 ## Remaining evidence gates
 
-The implemented local slice has focused identity, restart, source-ack failure,
-and mismatch coverage. The gates below apply before claiming a broader
-duplicate-free local guarantee or any cross-group atomicity; they are not a
-retroactive implementation checklist:
+The local slice has focused identity, restart, injected file-state, source-event,
+and mismatch coverage. These gates identify evidence not established by those
+tests; they are not a retroactive implementation checklist:
 
-1. **Target durability faults:** fault injection at target writes and
-   `sync_data` boundaries shows that source progress never advances without a
-   durable target record. An uncertain target result leaves source progress
-   eligible for retry and is classified conservatively under [ADR 0026](../decisions/0026-semantic-engine-error-classification.md).
-2. **Duplicate-safe local recovery:** restart after a successful target append
-   and before source-event persistence, then repeat the move. The target has
-   one record for the move ID with the original key and payload, and source
-   progress advances once. The existing injected source-persistence test is a
-   focused slice; exact process-crash timing remains open.
+1. **Physical durability faults:** test or operational evidence using actual
+   filesystem/device write and sync failures, and power-loss conditions, shows
+   how source progress and target records recover. The current injected tests
+   model selected byte states and error returns but do not establish device
+   durability. Generic storage failures remain `Unknown` under [ADR 0026](../decisions/0026-semantic-engine-error-classification.md).
+2. **Exact local crash window:** terminate a real broker process after the
+   target `sync_data` and before source-event persistence, then restart and
+   prove a single same-content target record and eventual source progress. The
+   current real-server test covers restart after the completed move and a lost
+   response, not termination inside this interval.
 3. **Corruption and format handling:** a same-ID target record with different
    content, malformed or torn target data, an unsupported durable format, or
    an unavailable target produces an explicit storage/corruption outcome and
-   does not advance source progress. Legacy target records without an identity
-   must remain readable without being falsely reconciled.
+   does not advance source progress. A test covers same-ID key/payload mismatch
+   and a partial trailing target frame; broader malformed complete-frame,
+   unsupported-format, unavailable-target, and legacy-record reconciliation
+   behavior remains open.
 4. **Recovery and retention bounds:** identity lookup and reconciliation use
    bounded or explicitly accounted-for indexes/journals, do not scan unrelated
    streams without a documented bound, and retain move evidence until source
    progress no longer depends on it.
-5. **Real-process local coverage:** a broker-process test exercises the
-   target/source crash window through the public protocol, not only response
-   loss after the whole poll has committed. Existing restart and ambiguous
-   response tests remain useful but do not establish that exact window.
-6. **Cluster same-group coverage:** the existing three-node tests continue to
-   verify committed same-group dead-letter movement, restart, leader change,
-   follower recovery, and stale-delivery fencing. The result must be described
-   as same-data-group atomicity, not general cross-group atomicity.
+5. **Identity namespace contract:** define the accepted outcome when a public
+   publish ID equals a computed local move ID and verify it through the public
+   wire path. A core test already proves that conflicting key/payload content
+   fails reconciliation and leaves source progress unadvanced after reopen;
+   same-content reuse and the protocol path remain untested. The intended
+   contract and those coverage gaps are recorded in [TD-029](../tech-debt.md#td-029-public-request-ids-can-collide-with-local-dead-letter-move-ids).
+6. **Cluster same-group coverage:** retain real-process tests for committed
+   same-group movement through reassignment and policy transfer. Describe the
+   result as same-data-group atomicity, not general cross-group atomicity.
 7. **Future split-group coverage:** if the target ever moves to another
    durable group, add participant failure, coordinator/retry recovery,
    duplicate-command, retention, and ambiguous-client-outcome tests before
@@ -285,8 +323,12 @@ retroactive implementation checklist:
 
 - The current request-aware target record and rebuilt ID index provide the
   focused local deduplication slice without a second pending-move journal.
-  Whether that remains sufficient through partial writes, journal/checkpoint
-  compaction, retention, and future format changes is still unverified.
+  Tests cover partial frame recovery, a complete frame before sync, and a
+  source-event sync error on the current test filesystem. Behavior under real
+  device errors or power loss, retention, and future format changes remains
+  unverified. The index shares the public request-ID namespace; a core test
+  demonstrates that a conflicting ID blocks source progress across reopen.
+  TD-029 tracks the missing wire-path and same-content contract evidence.
 - **Hypothesis:** lazy reconciliation on the next source poll is sufficient
   for correctness. A background reconciler may be needed for operational
   visibility or to make progress when no consumer polls, but it must not
@@ -299,10 +341,11 @@ retroactive implementation checklist:
   distinguish intentionally separate moves by independent consumers. It must
   also define how old records with no provenance are represented rather than
   inferring origin from target offsets.
-- A target append can be durable while its response is lost, and filesystem
-  durability can differ from process-crash behavior. The tests must model
-  returned I/O errors, process termination, incomplete frames, and restart;
-  a clean in-memory retry is insufficient evidence.
+- A target append can complete while its response is lost, and filesystem
+  durability can differ from process-crash behavior. Injected returned errors,
+  partial frames, and restart tests cover selected cases; actual process
+  termination at the two-log boundary and filesystem/device durability remain
+  open. A clean in-memory retry is insufficient evidence.
 - If source and target storage are placed on different filesystems or devices
   in a future deployment, even an ordered pair of sync calls has no common
   durability boundary. The identity/reconciliation protocol remains useful,
