@@ -39,14 +39,14 @@ changes the work; otherwise state a safe assumption and proceed.
 
 - Inspect the touched code and its immediate surroundings. Aim for the clean,
   maintainable, performant design that best advances the assignment; do not
-  keep a needed change artificially small or preserve unused compatibility
-  solely to avoid churn. Unless an active consumer or accepted policy requires
-  backward compatibility, prefer a deliberate breaking change over obsolete
-  compatibility paths. When the better design needs a cohesive refactor across
-  owned areas or shared boundaries, use the proposal and agreement process
-  above rather than shrinking the solution. Assess material risks with
-  proportionate evidence, and follow the refactor and planning-record policy in
-  `AGENTS.md`, including its no-update rationale.
+  keep a needed change artificially small or preserve old behavior solely to
+  avoid churn. Backward compatibility is not a Runnel requirement; make
+  deliberate breaking changes when they improve the intended design and
+  remove obsolete compatibility paths. When the better design needs a
+  cohesive refactor across owned areas or shared boundaries, use the proposal
+  and agreement process above rather than shrinking the solution. Assess
+  material risks with proportionate evidence, and follow the refactor and
+  planning-record policy in `AGENTS.md`, including its no-update rationale.
 - For non-trivial changes to semantics, storage, replication, ordering,
   recovery, or operational safety, compare relevant reference designs and
   primary research before implementation, following `AGENTS.md`.
