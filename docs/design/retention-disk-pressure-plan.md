@@ -1,11 +1,12 @@
 # Retention and disk-pressure design
 
 - Status: exploratory design; implementation sequence is illustrative
-- Last reviewed: 2026-09-06
-- Baseline: `16b3c63cd4478eb49b960a70565a718db8d235ac`
+- Last reviewed: 2026-09-29
+- Baseline: `1aa210bbd3986a6da25e804e967dc8a37fdfee2f`
 - Reading guide: [design-note conventions](README.md)
 - Scope: safe retained-history policy, bounded cleanup, and durable-write admission
 - Related outcome: [Make retention and disk-pressure behavior safe](../backlog.md#make-retention-and-disk-pressure-behavior-safe)
+- Related decision: [ADR 0028: consumer-lag observation semantics](../decisions/0028-consumer-lag-observation-semantics.md)
 - Related research: [Distributed architecture exploration](../research/distributed-architecture-options.md),
   [Raft follower recovery and replacement](../research/raft-recovery-and-replacement.md),
   [Message encoding and compression study](../research/message-encoding-and-compression.md),
@@ -61,15 +62,15 @@ following observations are the starting point for this plan.
 
 | Area | Accepted current behavior | Consequence for this proposal |
 | --- | --- | --- |
-| Local storage | `runnel-core` uses one append-only log per stream with legacy `RNL1`, checksummed uncompressed `RNL2`, and request-aware checksummed `RNL3` frames. Normal server appends use `RNL1` for ordinary records and `RNL3` when a request or move identity is present; `RNL2` is an explicit core/test format path. Request-aware IDs are bounded at 1 KiB and request-aware keys/bodies at 128 bytes/64 MiB. Appends call `sync_data` before reporting success, open scans the complete log, and a bounded tail index plus sparse lookup window serves normal and cold reads. An incomplete trailing frame is truncated on recovery, while malformed complete records fail closed without rewriting the file. | Retention cannot safely delete a prefix of one mutable file. Segmentation, format metadata, and a durable retained-history floor are prerequisites; the current frames have no segment generation or retention metadata. |
-| Local consumers | Consumer state is a JSON checkpoint with a contiguous committed offset, out-of-order acknowledgements, and persisted delivery attempts. Active deliveries and their deadlines are in memory; a restart may redeliver an unacknowledged message. | A safe deletion watermark must use contiguous committed progress, not the highest acknowledged offset, and must fence active deliveries. |
-| Local replay | A new consumer starts at offset zero and ordinary polling follows its checkpoint. The additive `replay` operation reads one inclusive logical offset without creating delivery state or changing ordinary progress; there is still no retention policy or replay session. | A future replay cursor/session must remain distinct from ordinary consumer progress and must return an explicit unavailable-history outcome rather than turning a gap into `Empty`. |
-| Local dead letters | The source record is appended to a derived dead-letter stream before the source checkpoint advances. New local moves use a bounded source-stream/consumer/offset identity and same-content reconciliation, so a known completed target append is not appended again after source-state failure or reopen. The target and source remain separate durable records: target append/sync ambiguity, process-crash timing, and legacy target records remain open under [TD-017](../tech-debt.md#td-017-dead-letter-movement-spans-separate-durable-records). | Retention must preserve this at-least-once ordering and move-identity fence, and define whether derived streams inherit or override source retention. A future policy must not delete target evidence while source progress still depends on reconciliation. |
+| Local storage | `runnel-core` uses one append-only log per stream with legacy `RNL1`, checksummed uncompressed `RNL2`, and request-aware checksummed `RNL3` frames. Normal server appends use `RNL1` for ordinary records and `RNL3` when a request or move identity is present; `RNL2` is an explicit core/test format path. Request-aware IDs are bounded at 1 KiB and request-aware keys/bodies at 128 bytes/64 MiB. Appends call `sync_data` before reporting success and open scans the complete log. The newest 1,024 record locations and up to 1,024 sparse checkpoints are cached; the request-ID map is rebuilt from all `RNL3` frames and grows with distinct retained IDs. An incomplete trailing frame is truncated on recovery, while malformed complete records fail closed without rewriting the file. | Retention cannot safely delete a prefix of one mutable file. Segmentation, format metadata, and a durable retained-history floor are prerequisites; the current frames have no segment generation or retention metadata. Bounded record-location caches do not bound all retained metadata; see [TD-002](../tech-debt.md#td-002-one-file-and-a-startup-scan-per-local-stream). |
+| Local consumers | Durable consumer state is a JSON checkpoint plus an append-only event journal capped at 64 KiB. It records the contiguous committed offset, out-of-order acknowledgements, delivery attempts, an optional versioned consumer policy, and the policy pinned to assigned offsets. The in-memory consumer-state cache holds at most 1,024 entries and is not a complete catalogue; active deliveries and deadlines are also in memory. Checkpoint files are not size-bounded. A restart may redeliver an unacknowledged message. | A safe deletion watermark must use durable contiguous progress, not the highest acknowledged offset, and must fence active deliveries. Neither the bounded cache nor transient deliveries can establish a complete durable-consumer inventory; any retention query needs a bounded source and explicit coverage. |
+| Local replay | A new consumer starts at offset zero and ordinary polling follows its checkpoint. The additive `replay` operation reads one inclusive logical offset without creating delivery state or changing ordinary progress. All history is currently retained, so the floor is zero and `history_unavailable` applies only outside the available `[0, next)` range; there is still no retention policy or replay session. | A future replay cursor/session must remain distinct from ordinary consumer progress. When a retention floor is introduced, unavailable history must remain explicit rather than turning a gap into `Empty`. |
+| Local dead letters | The source record is appended to a derived dead-letter stream before the source checkpoint advances. New local moves use a bounded source-stream/consumer/offset identity and same-content reconciliation, so a known completed target append is not appended again after source-state failure or reopen. Since the previous review, test-scoped recovery checks cover partial target frames, complete frames reported failed before sync, and a source-event sync failure; a real-server test also drops the poll response and verifies recovery after restart. These do not reproduce device/power-loss failures or resolve legacy records; see [TD-017](../tech-debt.md#td-017-dead-letter-movement-spans-separate-durable-records). | Retention must preserve this at-least-once ordering and move-identity fence, and define whether derived streams inherit or override source retention. A future policy must not delete target evidence while source progress still depends on reconciliation. |
 | Clustered storage | `runnel-raft` keeps complete message vectors in each stream data group's replicated state, writes a state-machine journal before applying committed entries, and creates complete materialized snapshots. Snapshot transfer uses bounded 64 KiB chunks and retries from byte zero after interruption. Data-group membership comes from the configured peer map; the three-process setup is an evidence profile, not a universal topology. Raft log compaction is independent from broker history. | The clustered path needs replicated logical retention state but local, interruptible physical cleanup. A snapshot must not resurrect history below the committed retention floor, and capacity claims must be stated for configured membership rather than assumed three-voter behavior. |
-| Clustered consumers | Progress, out-of-order acknowledgements, attempts, in-flight ownership, deadlines, and fencing state are in the stream data-group state. Grouped polls and acknowledgements are leader-authorized writes. | Retention decisions affecting a cluster must be deterministic state-machine facts; local filesystem inspection cannot itself decide a replicated watermark. |
-| Admission | The server bounds connections, request frames, in-flight requests, and request duration. The public frame limit is bounded at 64 MiB including JSON/base64 representation; publish batches are capped at 1,024 records but are not atomic. Local storage work has a bounded executor. `BrokerError::kind()` and `BrokerError::outcome()` provide an engine-level semantic boundary, while the server still maps failures to provisional codes and the reusable client conservatively classifies post-write timeout/disconnect cases as unknown. | Disk admission must be checked before append, but races and `ENOSPC` still require an authoritative stage-aware retry/unknown outcome and resolution contract at the protocol boundary. Existing frame, record-count, and storage-executor limits must remain separate from a physical disk reserve. |
-| Metrics and health | `/metrics` exposes request/admission counters, request latency, process-lifetime delivery counters, storage bytes, health failures, and clustered snapshot activity. Local `storage_bytes` is the sum of `.log` file lengths; clustered `storage_bytes` is a logical sum of stored keys and payloads. Neither gauge includes all journal/checkpoint/snapshot bytes or detected filesystem availability. | Existing storage bytes are not a disk budget or a cross-engine physical-usage comparison. Add retained, reclaimable, reserved, pressure, lag, cleanup, and write-rejection signals without changing the existing gauge definition silently. |
-| Deployment | The illustrative Kubernetes deployment gives each of three static-cluster pods an independent 10 GiB claim, 1 GiB memory limit, 1 CPU limit, five-minute startup-probe window, and 30-second termination grace period. It has no broker retention or capacity settings. | A broker capacity policy must work without Kubernetes, use detected available capacity conservatively, and document that PVC size is not by itself free space available to the broker. |
+| Clustered consumers | Progress, out-of-order acknowledgements, versioned consumer policy, attempts, in-flight ownership, deadlines, and fencing state are in the stream data-group state. Grouped polls and acknowledgements are leader-authorized writes. | Retention decisions affecting a cluster must be deterministic state-machine facts; local filesystem inspection cannot itself decide a replicated watermark. Consumer-lag observation must follow [ADR 0028](../decisions/0028-consumer-lag-observation-semantics.md) and cannot be inferred by summing replica copies. |
+| Admission | The server bounds connections, request frames, in-flight requests, and request duration. The JSON-lines request limit defaults to 1 MiB and can be configured up to 64 MiB, including JSON/base64 representation; publish batches are capped at 1,024 records and 64 MiB of encoded request bytes, with per-record outcomes rather than atomicity. Local storage work has a bounded executor. `BrokerError::kind()` and `BrokerError::outcome()` provide an engine-level semantic boundary, while the server still maps failures to provisional codes and the reusable client conservatively classifies post-write timeout/disconnect cases as unknown. | Disk admission must be checked before append, but races and `ENOSPC` still require an authoritative stage-aware retry/unknown outcome and resolution contract at the protocol boundary. Existing frame, record-count, and storage-executor limits must remain separate from a physical disk reserve. |
+| Metrics and health | `/metrics` exposes request/admission counters, request latency, process-lifetime delivery counters, storage bytes, health failures, and clustered snapshot activity. Local `storage_bytes` sums `.log` file lengths; clustered `storage_bytes` sums logical stored keys and payloads. Neither includes every journal/checkpoint/snapshot byte or filesystem availability. The engine health query is subject to a one-second HTTP timeout; a failed/timed-out scrape omits engine-derived samples. There is no capacity provider or complete durable-consumer catalogue/source revision. [ADR 0028](../decisions/0028-consumer-lag-observation-semantics.md) accepts cursor-lag semantics only, not a runtime metric or bounded query. | Existing storage bytes are not a disk budget or a cross-engine physical-usage comparison. New lag and retention signals must keep coverage/freshness separate and must not represent unknown, stale, incomplete, or expired observations as zero. Do not silently change the existing gauge definition. |
+| Deployment | The illustrative Kubernetes deployment gives each of three static-cluster pods an independent 10 GiB claim, 1 GiB memory limit, 1 CPU limit, five-minute startup-probe window, and 30-second termination grace period. A `minAvailable: 2` PodDisruptionBudget protects Ready-count availability for Eviction API requests, but readiness does not establish quorum margin, replication progress, or disk capacity. It has no broker retention or capacity settings. | A broker capacity policy must work without Kubernetes, use detected available capacity conservatively, and document that PVC size is not by itself free space available to the broker. The PDB does not establish a durable-write or storage-capacity guarantee. |
 
 These facts are also tracked as [TD-002](../tech-debt.md), [TD-005],
 [TD-006], [TD-009], [TD-010], [TD-017], [TD-019], [TD-022], [TD-023], and
@@ -91,6 +92,12 @@ explicitly versioned decision changes them:
 - grouped delivery preserves per-key exclusion and stale-delivery fencing;
 - clustered committed state is recovered through the replicated state-machine
   and snapshot boundaries, not by exposing Raft details to clients;
+- consumer-lag observation, when added, does not change delivery, acknowledgement,
+  retention, replay, dead-letter, or readiness behavior. [ADR 0028](../decisions/0028-consumer-lag-observation-semantics.md)
+  defines cursor lag as `H - C` only for a same-revision stream head `H` and
+  contiguous durable cursor `C` with `F <= C <= H`, where `F` is the retained
+  floor; a cursor below a future floor is `retention_expired`, not a numeric
+  lag or a clamped cursor;
 - local dead-letter movement remains at least once across separate durable
   target and source writes; the current move identity reconciles a completed
   target append without a second target record, while uncertain I/O, process
@@ -503,7 +510,7 @@ normal replacement path, as recorded in [Raft recovery and replacement research]
 | Cleanup | No cleanup operation exists. | Crash-safe manifest publication followed by idempotent orphan deletion. |
 | Local recovery | Incomplete tails are truncated or discarded at the current frame boundary; complete history is scanned at open, bounded lookup metadata is rebuilt, and request-aware IDs are rebuilt from complete `RNL3` frames. | Versioned segments, bounded recovery, manifest validation, and cleanup recovery. |
 | Cluster recovery | Raft snapshots compact consensus history while snapshots/checkpoints still materialize complete retained state; transfer uses bounded chunks and retries from byte zero. Empty-replica replacement is test-only, while preserved-state restart and identity/layout validation are the supported evidence boundary. | Replicated retention facts with local cleanup; no weakening of the replacement boundary or assumption that consensus compaction removes broker history. |
-| Observability | Storage bytes and general request/snapshot metrics. | Retention, lag, pressure, admission, cleanup, recovery, and unavailable-history signals. |
+| Observability | Storage bytes and general request/snapshot metrics. ADR 0028 accepts consumer cursor-lag semantics but no runtime source, catalogue, metrics family, or complete-scope query. | Retention, lag, pressure, admission, cleanup, recovery, and unavailable-history signals, with lag freshness/coverage handled under ADR 0028 and no identity labels in default metrics. |
 
 Nothing in the proposed column is a current guarantee or an authorization to
 change the runtime in this documentation-only change.
@@ -725,10 +732,25 @@ or storage compatibility tests.
 
 ## Observability and operator behavior
 
-The existing metrics should remain backward-compatible while adding bounded,
-documented signals. Labels must be limited to a stream or fixed reason set;
-consumer identity should be opt-in or exposed through a bounded administrative
-description rather than creating unbounded Prometheus cardinality.
+The existing metrics should keep their current meanings while any new signals
+remain bounded and documented. Default Prometheus metrics must not label stream,
+consumer, member, key, offset, request ID, or delivery token. Use fixed reason
+labels for bounded dimensions; expose identity-specific detail only through a
+separate bounded administrative description if that interface is later
+accepted.
+
+Consumer-lag signals must follow the accepted observation semantics in
+[ADR 0028](../decisions/0028-consumer-lag-observation-semantics.md): cursor lag
+is `H - C` only when head and contiguous durable cursor share a source revision,
+meet an explicit freshness deadline, and `F <= C <= H`, where `F` is the
+retained floor. Report `retention_expired` and no numeric lag when `F > C`; a
+cursor above `H` is unknown. Keep freshness and coverage separate, and never
+map unknown, stale, incomplete, absent, or expired state to zero or caught-up.
+Count a shared-consumer group once, keep in-flight deliveries separate, and
+publish an aggregate only for its complete declared consumer scope. ADR 0028
+accepts these semantics, not a consumer catalogue, runtime query, metric family,
+freshness deadline, or coverage promise; those remain design and implementation
+gates.
 
 ### Gauges and status
 
@@ -740,17 +762,19 @@ At minimum expose:
   required headroom, and current pressure state;
 - retained bytes, reclaimable bytes, retention overage, logical floor offset,
   logical floor time, and the number of consumers/replay sessions constraining
-  each stream;
-- oldest contiguous consumer lag in records and bytes, plus the number of
-  lagging consumers in `protect` mode;
+  each stream through a bounded stream inspection that can establish complete
+  coverage; do not encode stream identity in default metric labels;
+- cursor lag for a complete declared consumer scope, with separate freshness
+  and coverage signals; any byte-lag or per-stream constrained-consumer count
+  needs a bounded source and explicit measurement definition;
 - cleanup in progress, selected cleanup budget, last successful cleanup time,
   and pending orphan bytes;
 - replay sessions in progress and their bounded resource usage; and
 - clustered redundancy that is below reserve, unable to clean, or not caught
   up sufficiently to satisfy the selected durability mode.
 
-Names should follow the current `runnel_*` convention. Exact names and label
-sets belong in the implementation ADR and metrics tests. The existing
+Names should follow the current `runnel_*` convention. Exact names and allowed
+fixed labels belong in the implementation ADR and metrics tests. The existing
 `runnel_storage_bytes` definition must not silently change.
 
 ### Counters, histograms, and diagnostics
@@ -969,6 +993,8 @@ exploratory records:
 - [ADR 0023: independent retained storage and placement](../decisions/0023-independent-retained-storage-and-placement.md)
 - [ADR 0024: explicit offset replay](../decisions/0024-explicit-offset-replay-read.md)
 - [ADR 0026: semantic engine error classification](../decisions/0026-semantic-engine-error-classification.md)
+- [ADR 0027: consumer-scoped retry policy](../decisions/0027-consumer-scoped-retry-policy.md)
+- [ADR 0028: consumer-lag observation semantics](../decisions/0028-consumer-lag-observation-semantics.md)
 - [Local engine storage and delivery implementation](../../crates/runnel-core/src/lib.rs)
 - [Clustered state-machine and group manager](../../crates/runnel-raft/src/lib.rs)
 - [Server admission and metrics](../../crates/runnel-server/src/main.rs)
