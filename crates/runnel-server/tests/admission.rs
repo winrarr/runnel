@@ -3,12 +3,10 @@ use std::fs;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, Command, ExitStatus, Stdio};
 #[cfg(unix)]
 use std::sync::mpsc::{self, Sender};
-#[cfg(unix)]
-use std::thread::JoinHandle;
-use std::thread::sleep;
+use std::thread::{self, JoinHandle, sleep};
 use std::time::{Duration, Instant};
 
 use runnel_protocol::{Request, Response};
@@ -18,6 +16,7 @@ struct RunningServer {
     child: Child,
     broker_addr: SocketAddr,
     http_addr: SocketAddr,
+    stderr_capture: Option<JoinHandle<CapturedOutput>>,
 }
 
 impl RunningServer {
@@ -34,33 +33,166 @@ impl RunningServer {
             &http_addr.to_string(),
         ]);
         command.args(extra_args);
+        Self::start_command(command, broker_addr, http_addr)
+            .unwrap_or_else(|error| panic!("{error}"))
+    }
+
+    fn start_command(
+        mut command: Command,
+        broker_addr: SocketAddr,
+        http_addr: SocketAddr,
+    ) -> Result<Self, String> {
+        command.stdout(Stdio::null()).stderr(Stdio::piped());
         let mut child = command
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
             .spawn()
-            .expect("runnel server should start");
-        if let Err(error) = wait_for_http(http_addr) {
-            // `Child` does not kill or reap itself when dropped before the
-            // RunningServer guard is constructed.
-            let _ = child.kill();
-            let _ = child.wait();
-            panic!("{error}");
+            .map_err(|error| format!("runnel server should start: {error}"))?;
+        let stderr = child.stderr.take().expect("stderr should be piped");
+        let stderr_capture = match thread::Builder::new()
+            .name("runnel-test-stderr".to_owned())
+            .spawn(move || capture_output(stderr))
+        {
+            Ok(stderr_capture) => stderr_capture,
+            Err(error) => {
+                let exit_status = stop_and_reap(&mut child);
+                return Err(format!(
+                    "failed to capture server stderr: {error}; child exit status: {}",
+                    exit_status_description(exit_status)
+                ));
+            }
+        };
+
+        if let Err(reason) = wait_for_http(http_addr, &mut child) {
+            let exit_status = stop_and_reap(&mut child);
+            let stderr = join_captured_output(stderr_capture);
+            return Err(format_startup_failure(&reason, exit_status, stderr));
         }
-        Self {
+
+        Ok(Self {
             child,
             broker_addr,
             http_addr,
-        }
+            stderr_capture: Some(stderr_capture),
+        })
     }
 }
 
 impl Drop for RunningServer {
     fn drop(&mut self) {
-        if self.child.try_wait().ok().flatten().is_none() {
-            let _ = self.child.kill();
-            let _ = self.child.wait();
+        let _ = stop_and_reap(&mut self.child);
+        if let Some(stderr_capture) = self.stderr_capture.take() {
+            let _ = join_captured_output(stderr_capture);
         }
     }
+}
+
+const STARTUP_READINESS_TIMEOUT: Duration = Duration::from_secs(5);
+const STARTUP_OUTPUT_CAPTURE_LIMIT: usize = 4 * 1024;
+
+struct CapturedOutput {
+    bytes: Vec<u8>,
+    truncated: bool,
+    read_error: Option<String>,
+}
+
+fn capture_output(mut reader: impl Read) -> CapturedOutput {
+    let mut bytes = Vec::with_capacity(STARTUP_OUTPUT_CAPTURE_LIMIT);
+    let mut buffer = [0; 1024];
+    let mut truncated = false;
+    let mut read_error = None;
+
+    loop {
+        match reader.read(&mut buffer) {
+            Ok(0) => break,
+            Ok(read) => {
+                let retained = read.min(STARTUP_OUTPUT_CAPTURE_LIMIT - bytes.len());
+                bytes.extend_from_slice(&buffer[..retained]);
+                truncated |= retained < read;
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(error) => {
+                read_error = Some(error.to_string());
+                break;
+            }
+        }
+    }
+
+    CapturedOutput {
+        bytes,
+        truncated,
+        read_error,
+    }
+}
+
+fn join_captured_output(reader: JoinHandle<CapturedOutput>) -> CapturedOutput {
+    reader.join().unwrap_or(CapturedOutput {
+        bytes: Vec::new(),
+        truncated: false,
+        read_error: Some("output capture thread panicked".to_owned()),
+    })
+}
+
+fn stop_and_reap(child: &mut Child) -> Result<ExitStatus, String> {
+    match child.try_wait() {
+        Ok(Some(_)) => {}
+        Ok(None) => {
+            let _ = child.kill();
+        }
+        Err(error) => {
+            let _ = child.kill();
+            return child
+                .wait()
+                .map_err(|wait_error| format!("could not reap child after {error}: {wait_error}"));
+        }
+    }
+
+    child
+        .wait()
+        .map_err(|error| format!("could not reap child: {error}"))
+}
+
+fn format_startup_failure(
+    reason: &str,
+    exit_status: Result<ExitStatus, String>,
+    stderr: CapturedOutput,
+) -> String {
+    format!(
+        "{reason}; child exit status: {}\n{}",
+        exit_status_description(exit_status),
+        format_captured_stderr(stderr),
+    )
+}
+
+fn exit_status_description(exit_status: Result<ExitStatus, String>) -> String {
+    match exit_status {
+        Ok(status) => status
+            .code()
+            .map_or_else(|| status.to_string(), |code| format!("code {code}")),
+        Err(error) => format!("unavailable ({error})"),
+    }
+}
+
+fn format_captured_stderr(output: CapturedOutput) -> String {
+    if output.bytes.is_empty() {
+        return match output.read_error {
+            Some(error) => format!("stderr: empty (read failed: {error})"),
+            None => "stderr: empty".to_owned(),
+        };
+    }
+
+    let truncation = if output.truncated {
+        format!("; truncated after {} bytes", output.bytes.len())
+    } else {
+        String::new()
+    };
+    let read_error = output
+        .read_error
+        .map(|error| format!("; read failed: {error}"))
+        .unwrap_or_default();
+    format!(
+        "stderr ({} bytes{truncation}{read_error}):\n{}",
+        output.bytes.len(),
+        String::from_utf8_lossy(&output.bytes)
+    )
 }
 
 #[test]
@@ -98,6 +230,96 @@ fn configured_admission_limits_are_exposed_as_gauges() {
     assert!(metrics.contains("# TYPE runnel_broker_max_request_bytes gauge"));
     assert!(metrics.contains("# TYPE runnel_broker_max_in_flight_requests gauge"));
     assert!(metrics.contains("# TYPE runnel_broker_request_timeout_seconds gauge"));
+}
+
+#[cfg(unix)]
+#[test]
+fn failed_server_start_reports_bounded_output_and_reaps_child() {
+    let directory = TempDir::new().unwrap();
+    let pid_file = directory.path().join("startup-child.pid");
+    let oversized_stderr = "startup diagnostic ".repeat(STARTUP_OUTPUT_CAPTURE_LIMIT);
+    let mut command = Command::new("/bin/sh");
+    command.args([
+        "-c",
+        "printf '%s' \"$$\" > \"$1\"; printf '%s' \"$2\" >&2; exit 23",
+        "startup-failure",
+    ]);
+    command.arg(&pid_file).arg(oversized_stderr);
+
+    let failure = match RunningServer::start_command(command, free_addr(), free_addr()) {
+        Ok(_) => panic!("a child that exits before readiness must fail startup"),
+        Err(failure) => failure,
+    };
+
+    assert!(
+        failure.contains("process exited before HTTP readiness"),
+        "early child exit should be distinguished from the readiness deadline: {failure}"
+    );
+    assert!(
+        failure.contains("child exit status: code 23"),
+        "startup failure should report the child's exit status: {failure}"
+    );
+    assert!(
+        failure.contains("startup diagnostic"),
+        "startup failure should include stderr: {failure}"
+    );
+    assert!(
+        failure.contains(&format!(
+            "truncated after {STARTUP_OUTPUT_CAPTURE_LIMIT} bytes"
+        )),
+        "startup failure should report the captured output bound: {failure}"
+    );
+    assert!(
+        failure.len() <= STARTUP_OUTPUT_CAPTURE_LIMIT + 1024,
+        "failure diagnostics must stay bounded, got {} bytes",
+        failure.len()
+    );
+    assert_child_process_reaped(&pid_file);
+}
+
+#[cfg(unix)]
+#[test]
+fn startup_deadline_kills_and_reaps_child() {
+    let directory = TempDir::new().unwrap();
+    let pid_file = directory.path().join("startup-child.pid");
+    let mut command = Command::new("/bin/sh");
+    command.args([
+        "-c",
+        "printf '%s' \"$$\" > \"$1\"; exec sleep 30",
+        "startup-timeout",
+    ]);
+    command.arg(&pid_file);
+
+    let unavailable_address = SocketAddr::from(([127, 0, 0, 1], 0));
+    let failure =
+        match RunningServer::start_command(command, unavailable_address, unavailable_address) {
+            Ok(_) => panic!("a child without an HTTP listener must time out"),
+            Err(failure) => failure,
+        };
+
+    assert!(
+        failure.contains("did not become ready within 5 seconds"),
+        "startup should preserve its five-second readiness deadline: {failure}"
+    );
+    assert!(
+        failure.contains("child exit status:"),
+        "timeout failure should report the child exit status: {failure}"
+    );
+    assert_child_process_reaped(&pid_file);
+}
+
+#[cfg(unix)]
+fn assert_child_process_reaped(pid_file: &Path) {
+    let pid = fs::read_to_string(pid_file).unwrap();
+    let process_check = Command::new("/bin/sh")
+        .args(["-c", "kill -0 \"$1\" 2>/dev/null", "reap-check", pid.trim()])
+        .status()
+        .expect("Unix shell should check whether the child PID still exists");
+    assert!(
+        !process_check.success(),
+        "startup failure should reap child process {}",
+        pid.trim()
+    );
 }
 
 #[test]
@@ -400,11 +622,12 @@ fn slow_writer_and_in_flight_admission_are_bounded() {
     );
     assert_eq!(metric_value(&metrics, "runnel_active_requests"), 1);
 
-    let metrics = wait_for_metric_at_least(
+    wait_for_metric_at_least(
         server.http_addr,
         "runnel_broker_response_write_timeouts_total",
         response_write_timeouts_before + 1,
     );
+    let metrics = wait_for_metric_at_most(server.http_addr, "runnel_active_requests", 0);
     assert_eq!(metric_value(&metrics, "runnel_active_requests"), 0);
 
     let started = Instant::now();
@@ -560,11 +783,13 @@ fn sustained_in_flight_pressure_reports_metrics_and_recovers() {
     assert_eq!(metric_value(&metrics, "runnel_active_requests"), 1);
     assert_eq!(metric_value(&metrics, "runnel_active_connections"), 4);
 
-    let metrics = wait_for_metric_at_least(
+    wait_for_metric_at_least(
         server.http_addr,
         "runnel_broker_response_write_timeouts_total",
         response_write_timeouts_before + 1,
     );
+    wait_for_metric_at_most(server.http_addr, "runnel_active_requests", 0);
+    let metrics = wait_for_metric_at_most(server.http_addr, "runnel_active_connections", 3);
     assert_eq!(metric_value(&metrics, "runnel_active_requests"), 0);
     assert_eq!(
         metric_value(&metrics, "runnel_active_connections"),
@@ -2076,24 +2301,55 @@ fn wait_for_metric_at_most(address: SocketAddr, name: &str, expected: u64) -> St
     }
 }
 
-fn wait_for_http(address: SocketAddr) -> Result<(), &'static str> {
-    let deadline = Instant::now() + Duration::from_secs(5);
-    while Instant::now() < deadline {
-        if let Ok(mut stream) = TcpStream::connect(address) {
-            stream
-                .set_read_timeout(Some(Duration::from_millis(200)))
-                .unwrap();
-            stream
-                .write_all(
-                    b"GET /health/ready HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
-                )
-                .unwrap();
-            let mut response = String::new();
-            if BufReader::new(stream).read_line(&mut response).is_ok() && response.contains("200") {
-                return Ok(());
+fn wait_for_http(address: SocketAddr, child: &mut Child) -> Result<(), String> {
+    let deadline = Instant::now() + STARTUP_READINESS_TIMEOUT;
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                return Err(format!(
+                    "runnel child process exited before HTTP readiness ({status})"
+                ));
+            }
+            Ok(None) => {}
+            Err(error) => {
+                return Err(format!(
+                    "could not check runnel child status before HTTP readiness: {error}"
+                ));
             }
         }
-        sleep(Duration::from_millis(25));
+
+        if probe_http_readiness(address) {
+            return Ok(());
+        }
+
+        let now = Instant::now();
+        if now >= deadline {
+            return Err(format!(
+                "runnel HTTP endpoint did not become ready within {} seconds",
+                STARTUP_READINESS_TIMEOUT.as_secs()
+            ));
+        }
+        sleep((deadline - now).min(Duration::from_millis(25)));
     }
-    Err("runnel HTTP endpoint did not become ready")
+}
+
+fn probe_http_readiness(address: SocketAddr) -> bool {
+    let Ok(mut stream) = TcpStream::connect(address) else {
+        return false;
+    };
+    if stream
+        .set_read_timeout(Some(Duration::from_millis(200)))
+        .is_err()
+    {
+        return false;
+    }
+    if stream
+        .write_all(b"GET /health/ready HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+        .is_err()
+    {
+        return false;
+    }
+
+    let mut response = String::new();
+    BufReader::new(stream).read_line(&mut response).is_ok() && response.contains("200")
 }
