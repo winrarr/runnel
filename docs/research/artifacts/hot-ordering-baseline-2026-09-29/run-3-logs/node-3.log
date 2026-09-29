@@ -1,0 +1,2 @@
+2026-09-29T14:59:56.655428Z  INFO runnel::bootstrap: runnel started broker=127.0.0.1:39201 http=127.0.0.1:55137 data_dir="/tmp/runnel-cluster-bench-tphjloel/node-3" engine=Raft
+2026-09-29T14:59:57.870962Z  INFO runnel::lifecycle: runnel shutting down reason="shutdown signal received"
