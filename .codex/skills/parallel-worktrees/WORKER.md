@@ -75,7 +75,13 @@ changes the work; otherwise state a safe assumption and proceed.
   [`docs/benchmarking.md`](../../../docs/benchmarking.md) and the benchmark
   rules in `SKILL.md`. Record the exact revision, workload, resources,
   isolation, repetitions, commands, and artifacts. Do not claim an improvement
-  from an inconclusive or uncontrolled comparison.
+  from an inconclusive or uncontrolled comparison. For a correctness or safety
+  improvement that you believe has no material performance effect, tell the
+  coordinator why and propose the focused and end-to-end tests that cover it;
+  the coordinator decides whether benchmark evidence is unnecessary. If the
+  coordinator requires a benchmark, assess the result against the intended
+  effect and coordinate its timing so no other tests, benchmarks, or
+  resource-heavy workloads run on the host during an authoritative comparison.
 
 ## Pull request and handoff
 
