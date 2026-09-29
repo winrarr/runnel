@@ -43,7 +43,7 @@ Runnel is a Rust message broker intended to offer durable streams, low operation
 - justfile: canonical Linux development command interface.
 - scripts/smoke.sh: repeatable broker/CLI/restart smoke test.
 - scripts/verify.sh: compatibility wrapper around just verify.
-- .codex/skills/parallel-worktrees/SKILL.md and WORKER.md: repository workflow for delegated work, worker verification and pull request handoffs, coordinated refactors, isolated tests, and benchmark resource separation.
+- .codex/skills/parallel-worktrees/SKILL.md and WORKER.md: repository workflow for parallel isolated changes, pull request handoffs, coordinated refactors, isolated tests, and benchmark resource separation.
 
 ## Sources of truth and boundaries
 
@@ -66,11 +66,11 @@ Backlog and tech-debt registers are inventories, not execution queues. Select wo
 - Prefer small domain types and explicit state transitions over transport-specific logic in the core.
 - Add a focused crash/recovery test before changing persistence, acknowledgement, or redelivery behavior.
 - Before merging, classify each independently reviewable change by one primary evidence class and optional secondary tags, then satisfy the applicable gate in [docs/testing.md](docs/testing.md). Use [docs/benchmarking.md](docs/benchmarking.md) for benchmark execution, interpretation, and reporting. Classification does not relax safety, current behavior guarantees, default-branch, CI, pull-request, or cleanup requirements.
-- Every handoff must state expected effects and non-effects, evidence and coverage gaps, and an evidence-based recommendation to merge, revise, rerun, or defer. Coordinators must collect and relay these fields for every delegated worker, including blocked or inconclusive work.
+- Every handoff must state expected effects and non-effects, evidence and coverage gaps, and an evidence-based recommendation to merge, revise, rerun, or defer. Preserve blocked or inconclusive evidence in the handoff.
 - Treat anything that could improve throughput or latency as worth considering. Evaluate allocation, copying, lock scope, batching, I/O, scheduling, transport, and encoding effects when making changes, while preserving correctness, bounded resource use, and predictable tail latency. Benchmark material assumptions instead of optimizing on intuition alone.
 - For any non-trivial design that could change broker semantics, storage, replication, ordering, recovery, or operational safety, compare relevant competitor or reference designs and primary research before implementation. Record direct sources, the differences that matter to Runnel, alternatives considered, hypotheses, and unresolved risks in `docs/research/` or `docs/design/`, and capture the accepted consequence in an ADR before treating the change as foundational.
 - When research or review surfaces a Runnel-relevant finding, assess whether it is reasonably implementable in the near future given the evidence, project goals, dependencies, and risks. If so, create or update a backlog item for an intended outcome that is not implemented, or a tech-debt item for a current shortcut. State the goal, rationale, constraints, and verifiable acceptance or retirement criteria, and record supporting evidence with a link to related research when applicable. Keep speculative or longer-horizon findings in research or design and state why they are deferred. Give substantive findings an explicit disposition even when no tracker update is warranted.
-- Treat refactoring as part of normal engineering judgment for every agent, including delegated workers and coordinators. Whenever work touches a subsystem, inspect the touched code and its immediate surrounding structure for improvements that would make current or likely future work clearer, safer, more performant, or easier to change. Favor the clean design that best advances the intended outcome; do not limit a necessary change to a minimal or local refactor solely to avoid implementation risk or churn. Backward compatibility is not a Runnel requirement. Make deliberate breaking changes when they improve the intended design, and remove obsolete adjacent code. Risk alone is not a reason to defer: evaluate tradeoffs, add proportionate evidence, and report remaining risks. For delegated work, workers may propose useful changes beyond their assigned boundary to the coordinator; follow the agreement and escalation process in the parallel-worktrees skill before expanding scope. If a worthwhile improvement is not part of the current outcome or cannot be integrated coherently, record it as a focused tech-debt item in the same change, whether or not it crosses the current task boundary. Task narrowness alone is not a reason to omit that record. A no-update assessment is valid only when inspection found no concrete improvement worth recording, and the handoff must say so. Coordinate cross-boundary work with affected owners and an integration plan. Tech-debt entries must state their goal, rationale, constraints, and verifiable retirement criteria. When work materially changes a backlog or tech-debt outcome, update that record in the same change. Every delegated handoff must include this refactor and planning-record assessment, and the coordinator must verify it before accepting the handoff.
+- Treat refactoring as part of normal engineering judgment for every contributor. Whenever work touches a subsystem, inspect the touched code and its immediate surrounding structure for improvements that would make current or likely future work clearer, safer, more performant, or easier to change. Favor the clean design that best advances the intended outcome; do not limit a necessary change to a minimal or local refactor solely to avoid implementation risk or churn. Backward compatibility is not a Runnel requirement. Make deliberate breaking changes when they improve the intended design, and remove obsolete adjacent code. Risk alone is not a reason to defer: evaluate tradeoffs, add proportionate evidence, and report remaining risks. When useful work crosses an agreed ownership boundary, describe its goal, rationale, affected scope, expected effects and non-effects, evidence, and risks; agree on an integration plan before changing that boundary. If a worthwhile improvement is not part of the current outcome or cannot be integrated coherently, record it as a focused tech-debt item in the same change. Task narrowness alone is not a reason to omit that record. A no-update assessment is valid only when inspection found no concrete improvement worth recording, and the handoff must say so. Tech-debt entries must state their goal, rationale, constraints, and verifiable retirement criteria. When work materially changes a backlog or tech-debt outcome, update that record in the same change. Every handoff must include the refactor and planning-record assessment.
 - Keep ADRs aligned with the accepted current state. Agents may revise existing ADRs when decisions or assumptions evolve; retain historical context only when it explains an important consequence, rejected alternative, migration, or compatibility constraint. Replace stale guidance instead of layering contradictory exceptions.
 - Treat `just` recipes, development scripts, and CLI flags as part of the developer-facing interface. When changing a test, benchmark, or operational workflow, expose useful workload, wait, timeout, retry, isolation, and output controls when they have a real use; keep defaults sensible, document them, and test them. If a task requires a repeatable script or workaround, consider whether that behavior is useful enough to promote into the normal user-facing interface as a recipe, script, or CLI option. Prefer explicit options over hard-coded values, without adding speculative configuration.
 - Keep network behavior covered by tests that start the real server process.
@@ -78,45 +78,13 @@ Backlog and tech-debt registers are inventories, not execution queues. Select wo
 - Use Conventional Commits for project commits and pull-request titles. Keep the type meaningful, use a scope when it clarifies ownership, and mark breaking changes explicitly with `!` and migration details.
 - Deliver every independently reviewable change through its own pull request on a non-`main` branch. Never push directly to `main` or bypass repository rulesets and required checks.
 
-## Change-run baseline and coordination
+## Change-run baseline
 
-Every agent change run must check the default branch before doing work. Human
-contributors must follow the same rule
-for every change run, as described in `CONTRIBUTING.md`, so local work does not
-silently start from stale project state:
+Every contributor must read and follow this file before starting a change. Every change run—including reviews, documentation or configuration changes—uses one recorded baseline from the default branch. The run lead establishes and shares that baseline and its verification state; all participants use the supplied baseline instead of repeating run-level checks. For an individual change, the person doing the work leads the run. Human contributors follow the same rule as described in `CONTRIBUTING.md`.
 
-Every agent, including the coordinator and delegated subagents, must read this
-`AGENTS.md` before starting work. Coordinators must state that requirement
-explicitly in worker prompts and must not rely on automatic project-instruction
-loading.
+When a newer default-branch revision appears during the run, update work based on an older revision only when the newer changes overlap its paths, shared contracts, dependencies, generated output, or integration behavior. Do not refresh independent work solely to chase unrelated commits. Required pull-request checks must still pass before merging.
 
-- At the beginning of every change run—including reviews, documentation or
-  configuration changes, coordination, and delegated work—run `git fetch origin
-  main`, record `git rev-parse origin/main`, and inspect the latest `ci.yml` run
-  for that SHA when GitHub access is available. Treat that commit as the task
-  baseline; do not assume the local `main` checkout is current.
-- When work is delegated to parallel worktrees, the coordinator gives every
-  worker the same baseline revision and requires the same starting-branch
-  check. Workers report their baseline and whether the branch was refreshed.
-  Do not make independent branches chase unrelated merges solely to satisfy
-  branch age.
-- Required pull-request checks still must pass before merging. Independently
-  reviewable pull requests may be merged in parallel. Coordinate or serialize
-  changes that overlap in files, shared contracts, dependencies, generated
-  output, or integration behavior; coordinated architectural refactors may
-  intentionally overlap when they follow domain responsibility and have an
-  explicit integration plan.
-- When coordinating delegated work, retain each worker's identifier, wait for
-  every requested worker to reach a final status or be explicitly cancelled,
-  and provide a progress/output update as each worker finishes. Include its
-  result, branch or pull request, evidence, gaps, and recommendation; do not
-  silently treat pending, blocked, or inconclusive work as complete.
-
-When checking a remote baseline, compare the `headSha`, `status`, and
-`conclusion` from
-`gh run list --workflow ci.yml --branch main --limit 1 --json headSha,status,conclusion,url`
-with the revision reported by `git rev-parse origin/main`; a successful older
-run does not prove that the newest commit has passed.
+For parallel worktrees, follow `.codex/skills/parallel-worktrees/SKILL.md` for the workflow. Shared engineering and evidence policies remain in this file.
 
 ## Canonical commands
 
@@ -162,4 +130,4 @@ The required CI path is .github/workflows/ci.yml. It runs the pinned toolchain c
 
 Put implementation behavior in code and tests, the initial audience and product boundaries in docs/product-fit.md, current technical boundaries in docs/architecture.md, source-backed investigations in docs/research/, unsettled alternatives and implementation proposals in docs/design/, durable accepted rationale in a dated decision record, external or user-mandated guardrails in docs/constraints.md, intended unfinished outcomes in docs/backlog.md, known implementation shortcuts in docs/tech-debt.md, verification workflows in docs/testing.md, benchmark evidence policy in docs/benchmarking.md, and operational deployment guidance beside its deployment artifact. Put workflow changes in justfile and CI changes in .github/workflows. Remove stale guidance instead of appending exceptions.
 
-When parallel delegated work is authorized, follow .codex/skills/parallel-worktrees/SKILL.md for delegation, isolation, lifecycle, and integration. Explicitly coordinated architectural efforts may overlap when that reflects the architecture rather than an artificial file boundary; identify an integration owner and reconcile shared changes before merging. Treat concurrent performance measurements as exploratory unless CPU, storage, and workload interference are controlled. Before removing a delegated worktree, explicitly stop or close its worker, including any nested workers, and verify that the worker and its owned processes and containers are gone. A clean Git status is not sufficient; preserve committed work and do not remove an active or dirty worktree.
+Parallel worktree orchestration follows .codex/skills/parallel-worktrees/SKILL.md. Explicitly coordinated architectural efforts may overlap when that reflects the architecture rather than an artificial file boundary; identify an integration owner and reconcile shared changes before merging. Treat concurrent performance measurements as exploratory unless CPU, storage, and workload interference are controlled.

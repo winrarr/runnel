@@ -14,10 +14,6 @@ changes the work; otherwise state a safe assumption and proceed.
   `git rev-parse --show-toplevel`, `git branch --show-current`, and
   `git rev-parse HEAD`. Stop if the path, branch, or revision differs from the
   assignment.
-- Run `git fetch origin main`, record `git rev-parse origin/main`, and compare
-  the latest `ci.yml` run's `headSha`, `status`, and `conclusion` with that
-  revision when GitHub access is available. Treat the matching revision as the
-  baseline. Report if and why the assigned branch needs refreshing.
 - Check `git status` and inspect the current code, tests, decisions, and nearby
   design or planning records. Treat backlog and tech-debt text as guidance to
   validate, not as accepted APIs or behavior.
@@ -99,8 +95,7 @@ changes the work; otherwise state a safe assumption and proceed.
 - Include a concise handoff in the PR description with:
   - goal, changed files, expected effects, and non-effects;
   - primary evidence class and any secondary evidence tags;
-  - baseline revision, matching baseline CI status, and whether the branch was
-    refreshed;
+  - supplied baseline revision and whether the branch was refreshed;
   - commands and results, focused and end-to-end coverage assessment, and any
     test or benchmark artifacts;
   - correctness, failure, and recovery considerations; evidence gaps and
