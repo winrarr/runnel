@@ -69,17 +69,21 @@ concurrent process-level test or benchmark unique resources, including:
 
 Shared Cargo registries are normally acceptable as caches, but shared target directories, generated benchmark files, and mutable broker data are not. Do not use a shared `benchmark-results/` path for concurrent writers.
 
-Parallel runs are suitable for exploratory correctness checks and rough optimization feedback. Host CPU scheduling, disk bandwidth, page cache, and kernel socket resources are still shared, so do not treat concurrent results as authoritative latency or throughput comparisons unless CPU and storage resources are explicitly isolated. Schedule authoritative comparisons sequentially otherwise.
+Keep at most two assigned work items in flight whose acceptance or merge recommendation requires benchmark evidence. A task holds its slot while required benchmark evidence or benchmark-related revisions remain outstanding. A worker may propose tests-only evidence for a correctness or safety improvement when they expect no material performance effect, but must explain that assessment and the proposed coverage; the worker does not decide the evidence gate. The orchestrator decides whether focused tests and applicable end-to-end verification are sufficient. If the orchestrator agrees, the task does not use a benchmark slot and those tests may run alongside other isolated tests. If the orchestrator does not agree, require an appropriate benchmark and assess its result before recommending merge. Changes intended to improve performance, or with a plausible significant performance impact, require relevant benchmark evidence. Fill other pool slots with independent work that does not need benchmark evidence when available. Change this cap only at the user's explicit direction.
 
-For any task that can affect throughput, latency, CPU, memory, batching,
-I/O, or scheduling, follow [docs/benchmarking.md](../../../docs/benchmarking.md)
-and determine whether the standard benchmark meaningfully covers the PR's
-changes. Require the assignee to run the canonical local benchmark before an
-improvement claim. If the standard benchmark does not meaningfully cover the
-PR, evaluate whether a focused targeted benchmark would be relevant and
-feasible with reasonable effort and controlled resources; when it is, require
-it before recommending that an optimization PR merge. Require authoritative
-comparisons to use `just bench-pr-local` after committing and, if inconclusive,
+Before an authoritative main-host benchmark, ensure no other tests, benchmarks, or resource-heavy workloads are running. The exclusive benchmark lock serializes participating benchmark commands; it does not stop arbitrary tests or workloads. Schedule the quiet window and assess the result against the expected effect before recommending merge.
+
+Parallel runs are suitable for correctness checks and exploratory optimization feedback. Host CPU scheduling, disk bandwidth, page cache, and kernel socket resources are shared; treat concurrent results as exploratory, not authoritative. Schedule authoritative comparisons on an otherwise idle host with no parallel tests or resource-heavy workloads running.
+
+For benchmark-required tasks, follow
+[docs/benchmarking.md](../../../docs/benchmarking.md) and determine whether
+the standard benchmark meaningfully covers the PR's changes. Require the
+assignee to run the canonical local benchmark before an improvement claim. If
+the standard benchmark does not meaningfully cover the PR, evaluate whether a
+focused targeted benchmark would be relevant and feasible with reasonable
+effort and controlled resources; when it is, require it before recommending
+that an optimization PR merge. Require authoritative comparisons to use
+`just bench-pr-local` after committing and, if inconclusive,
 `just bench-pr-local-until-stable` to retry complete comparisons. Treat a
 one-pair command such as `just bench-pr-local-quick` as diagnostic only. Never
 treat a hosted PR benchmark or concurrent task measurement as proof of a

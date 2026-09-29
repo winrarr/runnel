@@ -4,7 +4,7 @@ This document is the shared policy for deciding when to benchmark, interpreting 
 
 ## When to benchmark
 
-Benchmark a change when its goal is to improve throughput, latency, or tail latency, or when it changes a hot path with a plausible runtime effect. Performance-neutral documentation, tests, and configuration changes do not need the pull-request comparison unless they plausibly change runtime cost.
+Benchmark a change when its goal is to improve throughput, latency, or tail latency, when it changes a hot path with a plausible runtime effect, or when there is a plausible significant performance impact. Correctness or safety work may use focused correctness tests and applicable end-to-end verification without a benchmark when no material performance effect is expected and no performance claim is made. In delegated work, the worker may propose that evidence plan, but the orchestrator decides whether it is sufficient. If the orchestrator requires a benchmark, assess the result against the expected effect before making a merge recommendation. Performance-neutral documentation, tests, and configuration changes do not need the pull-request comparison unless they plausibly change runtime cost.
 
 Before running a benchmark, state the expected effects and non-effects: the behavior, runtime path, workload, and resource dimensions that should change or remain unchanged. Separate correctness, recovery, resource, operational, and test improvements from performance claims. A benchmark is useful only when it exercises the changed behavior; record any workload mismatch or coverage gap. For a performance-sensitive change, first determine whether the standard suite meaningfully covers the PR. If it does not, evaluate whether a focused targeted benchmark would be relevant and feasible with reasonable effort and controlled resources, and run it before claiming an improvement or recommending the change for merge when it is. If no relevant targeted benchmark is feasible, record the concrete blocker and do not make a performance claim.
 
@@ -17,6 +17,8 @@ just bench-pr-local
 ```
 
 It compares the current revision with `origin/main` using the same three-node workload, alternated paired runs, and a fixed Linux systemd user scope. The default budget is 2 CPUs and 2 GiB shared across the benchmark client and broker nodes. It runs at least three and at most seven pairs, stopping early when every throughput range is at most 10% and every p99 range is at most 20% for both revisions. It writes raw results, logs, and a Markdown report under `benchmark-results/pr-local/` and exits nonzero when the result is not stable.
+
+Run an authoritative main-host comparison only when no other tests, benchmarks, or resource-heavy workloads are running. The exclusive benchmark lock serializes benchmark commands that participate in that lock; it does not stop ordinary test commands or arbitrary workloads. If the host cannot be kept quiet, defer the authoritative run rather than treating a noisy result as evidence.
 
 When a complete run is inconclusive because the host remains noisy, retry the complete authoritative workflow while retaining every attempt:
 
