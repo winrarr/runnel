@@ -1,12 +1,12 @@
 # Hosted CI/CD evaluation: CircleCI Cloud against GitHub Actions
 
 - Status: desk evaluation complete; hosted trial not run
-- Last reviewed: 2026-09-06
+- Last reviewed: 2026-09-29
 - Scope: compare CircleCI Cloud with the current GitHub Actions workflow using
   Runnel's pull-request DAG and scheduled benchmark workloads
 - Primary evidence class: development-process/reliability
 - Secondary tags: tooling/CI, design/research
-- Baseline: `2acd807a925fdd664fa36128fec35c4116239a6d`
+- Initial desk-evaluation baseline: `2acd807a925fdd664fa36128fec35c4116239a6d`
 
 This is a source-backed evaluation, not a hosted performance result. It records
 what can be established from the repository, observed GitHub runs, and current
@@ -157,6 +157,70 @@ The current baseline run is a `push` run, so it does not include the separate
 pull-request security or title jobs. A security and status-surface timing
 comparison needs an actual PR event (or an equivalent manual trial invocation),
 and should record the push-only commit-subject check separately.
+
+## Pull-request timing sample (2026-09-29)
+
+This follow-up adds pull-request event timings at baseline
+`a429144a25c0a6b1d21fc5cf46048b8031263b29`; its [CI run
+36580389753](https://github.com/winrarr/runnel/actions/runs/36580389753)
+completed successfully on that exact SHA. The sample is the five recent
+documentation-only PRs [#309](https://github.com/winrarr/runnel/pull/309),
+[#310](https://github.com/winrarr/runnel/pull/310),
+[#311](https://github.com/winrarr/runnel/pull/311),
+[#312](https://github.com/winrarr/runnel/pull/312), and
+[#313](https://github.com/winrarr/runnel/pull/313). Their PR creation, workflow,
+job, and command-step timestamps were read from GitHub's run and job records.
+All listed workflows succeeded.
+
+For the tables below, `PR → run` is PR creation to CI workflow creation.
+`Job start` is measured from workflow creation to the job's `started_at`; it is
+the observable queued-job/startup interval, not a measure of runner provisioning
+alone. Verify and Integration are independent CI roots. Their `job / command`
+times use job `started_at` to `completed_at` and the corresponding named command
+step timestamps. Integration also shows the image-build step. `CI roots complete`
+is workflow creation to the later of Verify and Integration completion. Audit is
+a separate required workflow root. The informational title check is not part of
+required-check completion.
+
+| PR / CI run | PR → run | Verify job / `just verify` | Integration job / image build / `just integration` | CI roots complete |
+| --- | ---: | ---: | ---: | ---: |
+| [#309](https://github.com/winrarr/runnel/pull/309) · [CI 36579000910](https://github.com/winrarr/runnel/actions/runs/36579000910) | 0:04 | 2:46 / 2:28 | 2:30 / 0:09 / 1:38 | 2:49 |
+| [#310](https://github.com/winrarr/runnel/pull/310) · [CI 36579536111](https://github.com/winrarr/runnel/actions/runs/36579536111) | 0:04 | 3:01 / 2:42 | 2:14 / 0:06 / 1:37 | 3:03 |
+| [#311](https://github.com/winrarr/runnel/pull/311) · [CI 36580206137](https://github.com/winrarr/runnel/actions/runs/36580206137) | 0:04 | 3:01 / 2:43 | 2:12 / 0:06 / 1:37 | 3:03 |
+| [#312](https://github.com/winrarr/runnel/pull/312) · [CI 36580339781](https://github.com/winrarr/runnel/actions/runs/36580339781) | 0:04 | 3:10 / 2:51 | 2:24 / 0:07 / 1:44 | 3:13 |
+| [#313](https://github.com/winrarr/runnel/pull/313) · [CI 36580442429](https://github.com/winrarr/runnel/actions/runs/36580442429) | 0:04 | 2:52 / 2:34 | 2:22 / 0:09 / 1:34 | 2:55 |
+
+The Verify and Integration jobs began 2–3 seconds after CI workflow creation
+and began within one second of each other. Their job wall times include setup,
+actions, the command, and post-job steps; the named command durations show that
+`just verify` took 2:28–2:51, while `just integration` took 1:34–1:44. The
+Buildx image step took 0:06–0:09. Verify was the slower CI root in each sample.
+
+| PR / Security run | Audit job start after run creation | Audit job / `Audit dependencies` step |
+| --- | ---: | ---: |
+| [#309](https://github.com/winrarr/runnel/pull/309) · [Security 36579000959](https://github.com/winrarr/runnel/actions/runs/36579000959) | 0:04 | 0:10 / 0:04 |
+| [#310](https://github.com/winrarr/runnel/pull/310) · [Security 36579536571](https://github.com/winrarr/runnel/actions/runs/36579536571) | 0:02 | 0:14 / 0:05 |
+| [#311](https://github.com/winrarr/runnel/pull/311) · [Security 36580206195](https://github.com/winrarr/runnel/actions/runs/36580206195) | 0:04 | 0:12 / 0:05 |
+| [#312](https://github.com/winrarr/runnel/pull/312) · [Security 36580339598](https://github.com/winrarr/runnel/actions/runs/36580339598) | 0:02 | 0:11 / 0:03 |
+| [#313](https://github.com/winrarr/runnel/pull/313) · [Security 36580441767](https://github.com/winrarr/runnel/actions/runs/36580441767) | 0:03 | 0:13 / 0:04 |
+
+The audit jobs started 2–4 seconds after workflow creation. Their complete job
+spans were 0:10–0:14, of which the named dependency-audit step took 0:03–0:05.
+Across the three required roots, all required checks were complete 2:49–3:13
+after CI workflow creation (median 3:03). PR creation preceded workflow creation
+by four seconds in each case. These values describe check scheduling and
+execution; PR-open-to-check time is not worker coding time.
+
+This small, non-controlled, same-day sample of documentation-only PRs is not a
+general GitHub Actions latency distribution and cannot establish a provider
+advantage. GitHub's timestamps show short delays from workflow/job creation to
+job start in these runs, while most elapsed check time was job execution,
+especially `just verify`. The API records used here do not separately identify
+runner provisioning time, so the observed job-start interval cannot isolate
+that component. The sample does not change the evaluation: GitHub Actions
+remains the current baseline, and the required hosted CircleCI trial is still
+needed to compare providers, cache behavior, variability, diagnostics, and
+contributor experience under equivalent workloads.
 
 ## CircleCI equivalence assessment
 
