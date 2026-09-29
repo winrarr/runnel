@@ -1239,6 +1239,212 @@ fn three_process_cluster_reassigns_group_delivery_after_node_failure() {
     assert_live_nodes(&mut nodes);
 }
 
+#[test]
+fn three_process_cluster_transfers_consumer_policy_and_delivery_snapshot_after_leader_failure() {
+    let directory = TempDir::new().unwrap();
+    let addresses = (0..9).map(|_| free_addr()).collect::<Vec<_>>();
+    let cluster_nodes = vec![(1, addresses[6]), (2, addresses[7]), (3, addresses[8])];
+    let mut nodes = vec![
+        RunningNode::start(
+            1,
+            addresses[0],
+            addresses[3],
+            addresses[6],
+            directory.path().join("node-1"),
+            cluster_nodes.clone(),
+            true,
+        ),
+        RunningNode::start(
+            2,
+            addresses[1],
+            addresses[4],
+            addresses[7],
+            directory.path().join("node-2"),
+            cluster_nodes.clone(),
+            false,
+        ),
+        RunningNode::start(
+            3,
+            addresses[2],
+            addresses[5],
+            addresses[8],
+            directory.path().join("node-3"),
+            cluster_nodes,
+            false,
+        ),
+    ];
+    for node in &nodes {
+        wait_for_http(node.http_addr);
+    }
+
+    create_stream_on_any(&mut nodes, "policy-transfer-jobs");
+    // Public requests forward from followers, so probe the peer listener
+    // directly. Its local inspect operation reports NotLeader on followers
+    // and returns policy state without changing delivery state on the leader.
+    let initial_leader = data_group_leader(&nodes, "policy-transfer-jobs");
+    assert!(matches!(
+        wait_for_response_at(
+            nodes[initial_leader].broker_addr,
+            || Request::ConfigureConsumer {
+                stream: "policy-transfer-jobs".to_owned(),
+                consumer: "workers".to_owned(),
+                ack_timeout_ms: 0,
+                max_delivery_attempts: Some(1),
+            },
+            |response| matches!(
+                response,
+                Response::ConsumerPolicy {
+                    version: 1,
+                    configured: true,
+                    ack_timeout_ms: 0,
+                    max_delivery_attempts: Some(1),
+                    ..
+                }
+            ),
+        ),
+        Response::ConsumerPolicy {
+            version: 1,
+            configured: true,
+            ack_timeout_ms: 0,
+            max_delivery_attempts: Some(1),
+            ..
+        }
+    ));
+    assert!(matches!(
+        wait_for_response_at(
+            nodes[initial_leader].broker_addr,
+            || Request::Publish {
+                stream: "policy-transfer-jobs".to_owned(),
+                key: None,
+                payload: "use-pinned-policy".to_owned(),
+                request_id: Some("policy-transfer-job".to_owned()),
+            },
+            |response| matches!(response, Response::Published { offset: 0, .. }),
+        ),
+        Response::Published { offset: 0, .. }
+    ));
+    assert!(matches!(
+        wait_for_response_at(
+            nodes[initial_leader].broker_addr,
+            || Request::PollGroup {
+                stream: "policy-transfer-jobs".to_owned(),
+                consumer: "workers".to_owned(),
+                member: "member-before-failure".to_owned(),
+            },
+            |response| matches!(
+                response,
+                Response::Message {
+                    offset: 0,
+                    delivery_attempt: Some(1),
+                    delivery_token: Some(_),
+                    ..
+                }
+            ),
+        ),
+        Response::Message {
+            offset: 0,
+            delivery_attempt: Some(1),
+            delivery_token: Some(_),
+            ..
+        }
+    ));
+
+    // Version 2 applies to future records. The unacknowledged record must
+    // retain version 1 even after its state is replayed by a new leader.
+    assert!(matches!(
+        wait_for_response_at(
+            nodes[initial_leader].broker_addr,
+            || Request::ConfigureConsumer {
+                stream: "policy-transfer-jobs".to_owned(),
+                consumer: "workers".to_owned(),
+                ack_timeout_ms: 10_000,
+                max_delivery_attempts: Some(3),
+            },
+            |response| matches!(
+                response,
+                Response::ConsumerPolicy {
+                    version: 2,
+                    configured: true,
+                    ack_timeout_ms: 10_000,
+                    max_delivery_attempts: Some(3),
+                    ..
+                }
+            ),
+        ),
+        Response::ConsumerPolicy {
+            version: 2,
+            configured: true,
+            ack_timeout_ms: 10_000,
+            max_delivery_attempts: Some(3),
+            ..
+        }
+    ));
+    sleep(Duration::from_millis(10));
+    nodes[initial_leader].stop();
+
+    let new_leader = data_group_leader(&nodes, "policy-transfer-jobs");
+    assert_ne!(new_leader, initial_leader);
+    assert!(matches!(
+        wait_for_response_at(
+            nodes[new_leader].broker_addr,
+            || Request::InspectConsumer {
+                stream: "policy-transfer-jobs".to_owned(),
+                consumer: "workers".to_owned(),
+            },
+            |response| matches!(
+                response,
+                Response::ConsumerPolicy {
+                    version: 2,
+                    configured: true,
+                    ack_timeout_ms: 10_000,
+                    max_delivery_attempts: Some(3),
+                    ..
+                }
+            ),
+        ),
+        Response::ConsumerPolicy {
+            version: 2,
+            configured: true,
+            ack_timeout_ms: 10_000,
+            max_delivery_attempts: Some(3),
+            ..
+        }
+    ));
+
+    // Version 1's immediate expiry and one-attempt budget terminally move the
+    // first delivery. Version 2 would allow a second attempt, so this Empty
+    // response distinguishes the delivery snapshot from current consumer state.
+    assert!(matches!(
+        request(
+            nodes[new_leader].broker_addr,
+            Request::PollGroup {
+                stream: "policy-transfer-jobs".to_owned(),
+                consumer: "workers".to_owned(),
+                member: "member-after-failure".to_owned(),
+            },
+        ),
+        Ok(Response::Empty { .. })
+    ));
+    assert!(matches!(
+        request(
+            nodes[new_leader].broker_addr,
+            Request::PollGroup {
+                stream: "policy-transfer-jobs.dead-letter".to_owned(),
+                consumer: "inspector".to_owned(),
+                member: "inspector-1".to_owned(),
+            },
+        ),
+        Ok(Response::Message {
+            offset: 0,
+            payload,
+            delivery_attempt: Some(1),
+            delivery_token: Some(_),
+            ..
+        }) if payload == "use-pinned-policy"
+    ));
+    assert_live_nodes(&mut nodes);
+}
+
 #[cfg(feature = "test-replacement-recovery")]
 #[test]
 fn replacement_node_recovers_after_repeated_snapshot_interruptions() {
@@ -1518,6 +1724,72 @@ fn create_stream_on_any(nodes: &mut [RunningNode], stream: &str) -> usize {
             Ok(Response::StreamCreated { .. })
         )
     })
+}
+
+fn data_group_leader(nodes: &[RunningNode], stream: &str) -> usize {
+    let deadline = Instant::now() + CLUSTER_WAIT_TIMEOUT;
+    while Instant::now() < deadline {
+        let mut leader = None;
+        for (index, node) in nodes.iter().enumerate() {
+            if node.child.is_none() {
+                continue;
+            }
+            let response = direct_peer_inspect_consumer(node.peer_addr, stream);
+            let result = &response["Forward"]["ConsumerPolicy"];
+            if result["Ok"].is_object() {
+                assert!(
+                    leader.replace(index).is_none(),
+                    "multiple data-group leaders responded"
+                );
+                continue;
+            }
+            assert!(
+                result["Err"]["NotLeader"].is_object(),
+                "peer {} returned an unexpected leader probe response: {response}",
+                node.node_id
+            );
+        }
+        if let Some(leader) = leader {
+            return leader;
+        }
+        sleep(Duration::from_millis(50));
+    }
+    panic!("no live process reported itself as the data-group leader for {stream}");
+}
+
+fn direct_peer_inspect_consumer(peer_addr: SocketAddr, stream: &str) -> serde_json::Value {
+    let request = serde_json::json!({
+        "Forward": {
+            "InspectConsumer": {
+                "stream": stream,
+                "consumer": "leader-probe"
+            }
+        }
+    });
+    let encoded = serde_json::to_vec(&request).expect("peer probe request should encode");
+    let frame_size = u32::try_from(encoded.len()).expect("peer probe frame should fit in u32");
+    let mut connection = TcpStream::connect_timeout(&peer_addr, REQUEST_ATTEMPT_TIMEOUT)
+        .expect("peer probe should connect to a live process");
+    connection
+        .set_read_timeout(Some(REQUEST_ATTEMPT_TIMEOUT))
+        .expect("peer probe read timeout should be set");
+    connection
+        .set_write_timeout(Some(REQUEST_ATTEMPT_TIMEOUT))
+        .expect("peer probe write timeout should be set");
+    connection
+        .write_all(&frame_size.to_be_bytes())
+        .and_then(|()| connection.write_all(&encoded))
+        .expect("peer probe request should be written");
+
+    let mut response_size = [0; 4];
+    connection
+        .read_exact(&mut response_size)
+        .expect("peer probe response frame should be readable");
+    let mut response = vec![0; u32::from_be_bytes(response_size) as usize];
+    connection
+        .read_exact(&mut response)
+        .expect("peer probe response should be readable");
+    serde_json::from_slice(&response).expect("peer probe response should decode")
 }
 
 fn wait_for_stream_on_any(nodes: &mut [RunningNode], stream: &str) -> usize {
