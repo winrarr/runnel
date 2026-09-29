@@ -1,7 +1,8 @@
 # Consume batches: proposed contract
 
 - Status: implementation-ready design proposal; no runtime API or behavior is accepted yet
-- Reviewed against repository baseline: `3d2f2a6a68ef978ed43a0735159f26db332483d9`
+- Implementation review baseline: `3d2f2a6a68ef978ed43a0735159f26db332483d9`
+- Linked research refreshed at default-branch revision: `1aa210bbd3986a6da25e804e967dc8a37fdfee2f`
 - Primary evidence class: design/research
 - Related outcome: [Make batching preserve per-record outcomes](../backlog.md#make-batching-preserve-per-record-outcomes)
 - Source study: [Consume-batch semantics](../research/consume-batch-semantics.md)
@@ -160,9 +161,11 @@ time. Local lease expiry uses a monotonic clock; clustered
 expiry uses the replicated lease-clock floor and absolute deadline described
 in [ADR 0015](../decisions/0015-clustered-shared-consumer-ownership.md). At this
 baseline, both engines reject an ack that observes expiry before reassignment;
-the shared-engine contract test exercises that case. The older research note
-predates the aligned test and should be refreshed before runtime work relies on
-its earlier boundary-gap discussion.
+the shared-engine contract test exercises that case. The refreshed
+[consume-batch research note](../research/consume-batch-semantics.md) records
+the aligned result and the matching test coverage. The remaining batch question
+is how one ack vector reports an expired receipt alongside valid receipts, not
+which single-record expiry rule the engines use.
 
 ## Reference designs and alternatives
 
@@ -199,10 +202,12 @@ same-key exclusion within/across batches, out-of-order per-key ack, duplicate
 and stale receipts, a mixed ack result, lost ack response and same-member poll
 retry after response loss, disconnect during response, local journal failure
 before/after append and restart redelivery, clustered restart and leader
-change around commit, deadline expiry before reassignment, and request timeout
-during collection. Real-server tests must cover wire and client outcome mapping. The
-relevant end-to-end gate is the protocol/restart test and, for clustered
-behavior, the three-process cluster test.
+change around commit, a batch vector with an expired receipt before reassignment,
+and request timeout during collection. The existing shared-engine contract
+already covers the single-receipt expiry case before reassignment. Real-server
+tests must cover wire and client outcome mapping. The relevant end-to-end gate
+is the protocol/restart test and, for clustered behavior, the three-process
+cluster test.
 
 No performance claim is made by this design. Before recommending an
 optimization implementation, compare the scalar path with count, encoded-byte,
