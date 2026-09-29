@@ -1,8 +1,8 @@
 # Single-node to clustered migration boundary
 
 - Status: exploratory design note; not an accepted compatibility decision
-- Last reviewed: 2026-09-06
-- Baseline: `8e7857221870a205553c94fa88df45a0dda1c991`
+- Last reviewed: 2026-09-29
+- Baseline: `4cb11ab3ef0b4ff956c729d1ada1a21066bd0cfd`
 - Reading guide: [design-note conventions](README.md)
 - Scope: backlog outcome [Make growth from one node to a cluster non-disruptive](../backlog.md#make-growth-from-one-node-to-a-cluster-non-disruptive)
 
@@ -43,18 +43,20 @@ boundary; it does not turn the current engine into a migration service.
 
 | Classification | Evidence in the current repository | Consequence for this note |
 | --- | --- | --- |
-| Observed local behavior | The local broker selects one durable writer format at startup, scans known `RNL1`, `RNL2`, and `RNL3` frame magics, truncates an incomplete trailing frame during normal recovery, and persists consumer checkpoints/journal events. Active delivery members, tokens, and `Instant` deadlines are process memory. See [`BrokerState::open`](../../crates/runnel-core/src/broker.rs), [`StreamLog::open`](../../crates/runnel-core/src/stream_log.rs), and the recovery tests in [`runnel-core`](../../crates/runnel-core/src/lib.rs). | A converter can preserve logical records and durable consumer state only after a normal source recovery boundary. It cannot copy volatile delivery ownership. |
-| Observed clustered behavior | The clustered engine selects the Raft backend at process startup. Startup validates clustered storage identity and persisted artifacts before opening groups; stream creation reconciles metadata `Creating`/`Active` state with one data group per stream and the configured peer set. The current layout uses `storage.json`, `groups/metadata`, and `groups/data/<hex-stream>` with an identity-bearing `group.json`. See [`PersistentEngine::open_with_config`](../../crates/runnel-raft/src/engine.rs), [`GroupManager`](../../crates/runnel-raft/src/group_manager.rs), [`StateMachineStore`](../../crates/runnel-raft/src/state_machine_store.rs), and [`SnapshotState`](../../crates/runnel-raft/src/state_machine.rs). The detailed current artifact/version evidence is in the [TD-007 compatibility note](td-007-storage-compatibility-evidence.md) and [TD-009 snapshot note](td-009-snapshot-evidence.md). | A fresh target can be populated only through a future logical import path. The existing public `Publish`, `CreateStream`, and snapshot-recovery paths are not a local-to-cluster interchange format. |
+| Observed local behavior | The local broker selects one durable writer format at startup, scans known `RNL1`, `RNL2`, and `RNL3` frame magics, truncates an incomplete trailing frame during normal recovery, and persists consumer checkpoints/journal events. Consumer state includes the configured versioned policy and policy snapshots pinned to attempted offsets; process-local delivery members, tokens, and `Instant` deadlines are not durable. See [`BrokerState::open`](../../crates/runnel-core/src/broker.rs), [`ConsumerState`](../../crates/runnel-core/src/consumer_state.rs), [`StreamLog::open`](../../crates/runnel-core/src/stream_log.rs), and the recovery tests in [`runnel-core`](../../crates/runnel-core/src/lib.rs). | A converter can preserve logical records and durable consumer state only after a normal source recovery boundary. It must preserve configured policy and per-offset policy snapshots as well as progress and attempts; it cannot copy volatile delivery ownership. |
+| Observed clustered behavior | The clustered engine selects the Raft backend at process startup. Startup validates clustered storage identity and persisted artifacts before opening groups; stream creation reconciles metadata `Creating`/`Active` state with one data group per stream and the configured peer set. The current layout uses `storage.json`, `groups/metadata`, and `groups/data/<hex-stream>` with an identity-bearing `group.json`. Grouped consumer state includes configured policy and per-offset policy snapshots along with durable progress and attempts; delivery ownership and deadlines are replicated. See [`PersistentEngine::open_with_config`](../../crates/runnel-raft/src/engine.rs), [`GroupConsumerState`](../../crates/runnel-raft/src/delivery.rs), [`GroupManager`](../../crates/runnel-raft/src/group_manager.rs), [`StateMachineStore`](../../crates/runnel-raft/src/state_machine_store.rs), and [`SnapshotState`](../../crates/runnel-raft/src/state_machine.rs). The detailed current artifact/version evidence is in the [TD-007 compatibility note](td-007-storage-compatibility-evidence.md) and [TD-009 snapshot note](td-009-snapshot-evidence.md). | A fresh target can be populated only through a future logical import path. The existing public `Publish`, `CreateStream`, and snapshot-recovery paths are not a local-to-cluster interchange format. |
 | Observed absence | There is no migration command, import/export schema, durable migration phase, writer-fence epoch, endpoint-generation owner, or migration-specific status/metric in the current code. The engine now exposes backend-independent failure kind and safe attempt-outcome classification, but the provisional server still emits its existing error codes and has no migration or stage-aware outcome vocabulary. Existing clustered identity checks intentionally reject ambiguous state; they do not convert it. Current snapshot and peer metrics describe recovery activity only. The current tests cover local recovery and clustered restart/failure, not cross-engine migration. | Any phase, fence, activation, rollback, or migration-status behavior below is proposed work and must not be described as current support. |
 | Proposed first supported slice | Side-by-side logical export/import into an empty target using the configured static voter set (the initial supported shape is three nodes), with a source fence for the final boundary, validation before serving, external endpoint cutover, and source retention until the recovery window ends. | This is the proposed first supported slice for the backlog outcome. It preserves the application messaging model, not zero downtime or automatic downgrade. |
 
 The current evidence is useful but deliberately weaker than migration evidence.
 Local tests cover request-ID recovery, mixed legacy/versioned frame replay,
-consumer journal recovery, durable attempts, dead-letter retry identity, and
-incomplete/corrupt input. Cluster tests cover Raft state-machine recovery,
-stream lifecycle, request-ID deduplication, grouped delivery fencing, durable
-restart, leader failure, and the test-only interrupted snapshot replacement
-experiment. The real-process coverage is in
+consumer journal recovery, durable attempts, configured consumer-policy
+isolation and persistence, per-offset policy pinning, dead-letter retry
+identity, and incomplete/corrupt input. Cluster tests cover Raft state-machine
+recovery, stream lifecycle, request-ID deduplication, grouped delivery fencing,
+durable restart, consumer-policy and pinned-attempt transfer across leader
+failure, and the test-only interrupted snapshot replacement experiment. The
+real-process coverage is in
 [`cluster_smoke.rs`](../../crates/runnel-server/tests/cluster_smoke.rs). None
 of these tests proves a local export, cross-engine state conversion, writer
 fence, endpoint switch, or rollback boundary; those remain explicit gaps in
@@ -70,17 +72,20 @@ tested read-forward and fail-closed storage cases, [TD-008](td-008-static-cluste
 separates static-cluster evidence from replacement support, [TD-009](td-009-snapshot-evidence.md)
 and [TD-010](td-010-retained-state-evidence.md) document snapshot and retained-state
 cost boundaries, and the [clustered outcome contract](clustered-outcome-contract.md)
-keeps safe attempt outcomes separate from operation-stage evidence. None of
-those notes implements or authorizes migration.
+keeps safe attempt outcomes separate from operation-stage evidence. [ADR 0027](../decisions/0027-consumer-scoped-retry-policy.md)
+also accepts durable versioned consumer policies and per-offset policy
+pinning; this state is included in the transfer boundary here. None of these
+decisions or notes implements or authorizes migration.
 
 The test-to-claim mapping is:
 
 | Current claim | Existing evidence | Not established by that evidence |
 | --- | --- | --- |
 | Local logical history can be recovered and scanned safely | `versioned_reader_replays_mixed_legacy_and_versioned_frames`, `incomplete_trailing_frame_is_discarded_on_recovery`, `complete_legacy_record_with_malformed_key_fails_closed_on_recovery`, and `versioned_checksum_corruption_fails_recovery` in [`runnel-core/src/lib.rs`](../../crates/runnel-core/src/lib.rs). | A stable export schema, source-generation marker, or cross-engine digest. |
-| Local durable consumer and retry state survives failures | `consumer_delivery_journal_recovers_committed_events_and_discards_partial_tail`, `acknowledged_group_progress_and_retry_state_survive_restart`, and `request_id_deduplication_survives_restart` in [`runnel-core/src/lib.rs`](../../crates/runnel-core/src/lib.rs). | Conversion into clustered state or behavior for a fence racing with an acknowledgement. |
+| Local durable consumer progress/attempts and configured-policy/pinning behavior | `consumer_delivery_journal_recovers_committed_events_and_discards_partial_tail`, `acknowledged_group_progress_and_retry_state_survive_restart`, `consumer_policy_is_isolated_durable_and_pinned_per_delivery`, and `request_id_deduplication_survives_restart` in [`runnel-core/src/lib.rs`](../../crates/runnel-core/src/lib.rs). | Restart recovery of a pinned per-offset policy has no focused assertion (also recorded in the [TD-010 evidence note](td-010-retained-state-evidence.md)); conversion into clustered state, export of configured and per-offset policy snapshots, or behavior for a fence racing with an acknowledgement. |
 | Cluster state recovers and rejects ambiguous storage | `persistent_engine_recovers_committed_state_after_reopen`, `persisted_storage_rejects_cluster_identity_mismatch_without_rewriting_data`, `partial_cluster_layout_is_rejected_without_opening_as_empty`, and `rejected_snapshot_install_preserves_existing_state` in [`runnel-raft/src/lib.rs`](../../crates/runnel-raft/src/lib.rs). | Local-to-cluster import, migration authority, endpoint ownership, or production replica replacement. |
 | Cluster delivery and process failures have a correctness baseline | `three_process_cluster_preserves_group_delivery_through_replica_restart`, `three_process_cluster_reassigns_group_delivery_after_node_failure`, and `three_process_cluster_replicates_and_recovers_after_failures` in [`cluster_smoke.rs`](../../crates/runnel-server/tests/cluster_smoke.rs). | Any cross-engine cutover, stale local writer rejection, or rollback after target writes. |
+| Cluster consumer policy and an attempted record's pinned policy survive leadership change | `persistent_raft_consumer_policy_is_durable_and_pins_attempts` in [`runnel-raft/src/lib.rs`](../../crates/runnel-raft/src/lib.rs) and `three_process_cluster_transfers_consumer_policy_and_delivery_snapshot_after_leader_failure` in [`cluster_smoke.rs`](../../crates/runnel-server/tests/cluster_smoke.rs). | Importing local configured policies/snapshots into clustered state or migrating a policy update that races with the source fence. |
 | Engine failures have a backend-independent retry boundary | `classifies_failures_without_exposing_backend_details` and `retains_diagnostic_sources_for_backend_failures` in [`runnel-engine/src/lib.rs`](../../crates/runnel-engine/src/lib.rs), with shared local and clustered assertions in [`engine_contract.rs`](../../crates/runnel-core/tests/engine_contract.rs) and [`runnel-raft/src/lib.rs`](../../crates/runnel-raft/src/lib.rs). | The classification does not identify a migration phase, writer-fence epoch, commit/apply stage, or endpoint authority; a future migration surface still needs explicit evidence for those boundaries. |
 | Provisional protocol support is declared consistently | `protocol_support_stays_aligned_across_wire_client_and_server` in [`runnel-server/src/protocol.rs`](../../crates/runnel-server/src/protocol.rs) checks the shared `runnel-json-lines` v1 and UTF-8/base64 declarations. | The declaration is source-level only: the listener has no runtime handshake or cross-version migration guarantee. |
 
@@ -102,7 +107,7 @@ explicitly defers mixed engines and live engine migration.
 | Stream history | `streams/<stream>.log`, with legacy `RNL1`, versioned `RNL2`, and request-aware `RNL3` record families. Each frame carries a logical offset, publish timestamp, optional UTF-8 key, payload lengths, and, for `RNL3`, a request ID. Current versioned/request-aware writers bound keys to 128 bytes, payloads to 64 MiB, and request IDs to 1 KiB. | Read records in logical offset order and write an explicitly versioned import representation. Preserve fields and bytes, not the local frame layout or file name. A mixed valid frame history is a source format case, not a target cluster format. |
 | Recovery/index state | The local log scans complete frames on open, truncates only an incomplete trailing frame, retains a bounded recent index, and uses a bounded sparse index for older reads. The async engine dispatches this synchronous work through bounded per-stream storage lanes; those lanes are execution isolation, not a migration boundary. | Export only after normal recovery has established a complete source boundary. A malformed complete frame is a validation failure; it must not be skipped or turned into a gap. |
 | Producer retry identity | The local `request_ids` map is rebuilt from request-aware frames. A repeated request ID returns its first recovered offset and, for public publishes, preserves the current behavior of ignoring a key/payload mismatch. | Export every recovered request ID and its original offset. The importer must reject an offset mismatch or duplicate conflicting mapping, while preserving the current public retry result. Records without a request ID remain non-deduplicated. |
-| Ordinary and grouped consumer state | `consumers/<stream>/<consumer>.json` contains `committed_offset`, out-of-order `acknowledged_offsets`, and `delivery_attempts`. The adjacent `.json.tmp` path is an append-only event journal with a bounded size; checkpoint compaction writes a separate `.checkpoint.tmp` file and renames it into place. | Convert the logical state into the clustered consumer-state schema. Do not copy the JSON file or either temporary path as if it were a clustered snapshot. Validate every offset against the imported stream and preserve attempts. |
+| Ordinary and grouped consumer state | Local `consumers/<stream>/<consumer>.json` stores `committed_offset`, out-of-order `acknowledged_offsets`, `delivery_attempts`, optional versioned `policy`, and per-offset `delivery_policies` pinned on first assignment and reused on retries. The adjacent `.json.tmp` path is an append-only event journal with a bounded size; checkpoint compaction writes a separate `.checkpoint.tmp` file and renames it into place. Older checkpoints/journal events default absent policy fields. | Convert this logical state into the clustered consumer-state schema. Preserve the configured policy version and values plus every persisted per-offset policy snapshot with its attempt; these snapshots keep an in-progress record's retry budget stable across a later policy update. Do not copy the JSON file or either temporary path as if it were a clustered snapshot. Validate every offset and policy against the imported stream and accepted policy limits. |
 | Active deliveries | Local in-flight ownership, deadlines, and delivery tokens are process memory. Attempts are persisted before a delivery is returned, but local tokens do not survive restart. | Do not transfer local tokens, members, or `Instant` deadlines. At the fence, outstanding deliveries become eligible redeliveries on the target; an acknowledgement that races after the fence is rejected and must be retried against the target. |
 | Stream and consumer names/paths | Stream, consumer, and member names are restricted to 1–128 ASCII letters, digits, `.`, `_`, and `-`; stream and consumer names are later used below the local `streams` and `consumers` directories. | Validate names before export and again before import. A migration tool must never accept an arbitrary source path or infer a name from an unsafe filename. |
 
@@ -136,7 +141,8 @@ evidence note](td-010-retained-state-evidence.md). Its state includes:
   by their position in the stream vector;
 - ordinary consumer offsets;
 - grouped consumer `committed_offset`, out-of-order acknowledged offsets,
-  delivery attempts, in-flight member/token/deadline state, and the replicated
+  delivery attempts, optional versioned consumer policy, per-offset policy
+  snapshots, in-flight member/token/deadline state, and the replicated
   lease-clock floor;
 - per-stream request-ID-to-offset deduplication; and
 - redelivery and dead-letter counters.
@@ -185,7 +191,8 @@ The proposed supported boundary has these goals:
   consumer state, to a fresh supported static cluster;
 - preserve logical offsets, record ordering, timestamps, keys, exact payload
   bytes, replay eligibility, request-ID retry identity, acknowledged progress,
-  and persisted delivery attempts;
+  persisted delivery attempts, configured consumer policies, and the policy
+  snapshots already pinned to attempted records;
 - make the authoritative writer and serving deployment unambiguous after every
   interruption or restart;
 - make copy, validation, fencing, cutover, and cleanup progress visible and
@@ -269,14 +276,19 @@ matrix; this is not current migration support.
   supported `RNL1`, `RNL2`, and `RNL3` record families in the combinations the
   current reader accepts.
 - Valid stream and consumer names, complete logical offsets, and consumer
-  states whose offsets and attempt entries can be checked against their stream.
+  states whose offsets, attempt entries, configured policy, and per-offset
+  policy snapshots can be checked against their stream and supported bounds.
 - A source process that has a durable migration record and can acquire the
   writer fence. For the first operational release, the final copy starts only
   after the source broker is stopped or placed in an equivalent fenced mode.
 - A source configuration whose delivery and retention behavior is either equal
   to the target or explicitly covered by a compatibility rule. The first
-  implementation should require equal `ack_timeout` and
-  `max_delivery_attempts` values.
+  implementation should preserve each configured consumer policy and its
+  version, plus the policy snapshot pinned to each outstanding attempt. For
+  consumers without an explicit policy, and attempts whose old journal event
+  has no policy snapshot, require equivalent source and target broker-wide
+  acknowledgement-timeout and attempt-limit fallbacks unless the importer can
+  preserve their effective behavior another verified way.
 
 ### Target
 
@@ -318,10 +330,13 @@ It should:
    lengths, timestamp fields, and request-ID mappings;
 3. load each consumer checkpoint and journal, replaying only complete events and
    checking committed, out-of-order acknowledged, and attempt offsets against
-   `[earliest, next)`;
+   `[earliest, next)`, and checking configured and per-offset policy versions
+   and values against supported limits;
 4. record source configuration and compatibility descriptors, including the
-   acknowledgement timeout, attempt limit, retention/replay policy, protocol
-   version, local record-format families, and migration tool version;
+   broker-wide fallback acknowledgement timeout and attempt limit, each
+   configured consumer policy and per-offset pinned policy snapshot,
+   retention/replay policy, protocol version, local record-format families,
+   and migration tool version;
 5. estimate source backup, target-per-node, target journal/snapshot, staging,
    temporary, and transfer-buffer requirements; and
 6. write a source and target inventory with counts and content digests before
@@ -398,6 +413,14 @@ For every `(stream, consumer)` pair, import:
 - every out-of-order acknowledged offset that is still at or above the
   committed offset;
 - every persisted delivery attempt, preserving its maximum observed attempt;
+- the configured consumer policy, including whether it is explicit, its
+  monotonic version, acknowledgement timeout, and attempt limit;
+- each outstanding attempted offset's pinned policy snapshot, so a policy
+  change made after first delivery does not silently change that record's
+  retry or dead-letter behavior;
+- for attempted offsets with no persisted policy snapshot, the same effective
+  source fallback policy, including legacy events whose attempt record predates
+  per-offset policy snapshots;
 - the consumer’s stream/name identity and a state digest; and
 - no local delivery token, `Instant` deadline, or transient member ownership.
 
@@ -603,9 +626,9 @@ small compatibility matrix:
 | Public protocol | The current client and server share the provisional `runnel-json-lines` v1 declaration and UTF-8/base64 payload representations; existing requests/responses and client outcome classes remain valid after reconnect. | This declaration is source-level only because v1 has no runtime handshake. Protocol redesign, transparent automatic client reconnection, and new topology fields remain deferred. |
 | Local record encoding | Valid source histories read by the current local reader, including supported mixed `RNL1`/`RNL2`/`RNL3` frames. | Unknown versions, malformed complete frames, unbounded lengths, or guessed format conversion. |
 | Cluster representation | Current target metadata/data-group layout: `storage.json` and the Raft log use version 1, the state-machine journal uses record version 1, checkpoint and snapshot payloads emit version 2 with narrow version-1 read-forward support, and the current `group.json` manifest shape binds stream/group identity. | Import into an older target, unknown target schema, or arbitrary OpenRaft on-disk layout. |
-| Consumer semantics | Local committed and out-of-order acknowledged progress plus delivery attempts convert into coherent clustered state. Outstanding local tokens become redelivery. | Transferring local volatile leases/tokens or changing retry/ack semantics during migration. |
+| Consumer semantics | Local committed and out-of-order acknowledged progress, attempts, configured consumer policy/version, and per-offset pinned policy snapshots convert into coherent clustered state. Outstanding local tokens become redelivery. | Transferring local volatile leases/tokens, dropping a pinned retry-policy snapshot, or changing retry/ack semantics during migration. |
 | Producer identity | All recovered source request IDs map to the same logical offsets after import. | Deduplicating requests that had no ID, inventing IDs, or silently changing key/payload conflict behavior. |
-| Configuration | Equal acknowledgement timeout, attempt limit, current unlimited-retention policy, and one-record inclusive offset-replay contract. | An unreviewed policy change whose effects could alter redelivery, dead letters, retention floors, or replay eligibility. |
+| Configuration | Preserve configured per-consumer policies and versions plus per-offset policy snapshots; require equal source/target broker-wide fallback acknowledgement timeout and attempt limit for unconfigured consumers and attempts without a persisted snapshot, unless equivalent behavior is otherwise established. Preserve the current unlimited-retention policy and one-record inclusive offset-replay contract. | An unreviewed policy change whose effects could alter redelivery, dead letters, retention floors, or replay eligibility; silently resetting policy versions or replacing the snapshot pinned to an attempted record. |
 | Identity | New target cluster identity; deterministic target stream identity and validated data-group manifests. | Copying local state into a target `storage.json`, reusing a different cluster/node identity, or guessing ownership. |
 | Downgrade | Abort and source recovery before activation. | Automatic post-activation downgrade, old-binary startup against target-only state, or source pointer rollback after target writes. |
 
@@ -905,8 +928,12 @@ that remains an open storage design question.
   gate under target process loss and avoid serving any missing stream as empty.
 - **In-flight consumer state.** Local tokens and deadlines are volatile while
   clustered delivery uses replicated tokens and absolute lease timestamps.
-  Verify redelivery, attempt limits, stale acknowledgements, and keyed
-  ordering across the fence.
+  Current local and clustered state also retain consumer policy versions and
+  per-offset policy snapshots; the migration must preserve these while making
+  source tokens stale. Existing local restart and clustered leader-failure
+  tests cover policy persistence/transfer, but not cross-engine conversion.
+  Verify redelivery, attempt limits, stale acknowledgements, and keyed ordering
+  across the fence.
 - **Request-ID semantics.** Preserve source first-mapping behavior and test
   retry after response loss, restart, leader change, and target import retry.
   Decide later whether mismatched key/payload retries should remain accepted.
@@ -969,6 +996,7 @@ boundaries, and no additional tech-debt item is warranted for them here.
 - [ADR 0023: independent retained storage and placement](../decisions/0023-independent-retained-storage-and-placement.md)
 - [ADR 0024: explicit offset replay](../decisions/0024-explicit-offset-replay-read.md)
 - [ADR 0026: semantic engine error classification](../decisions/0026-semantic-engine-error-classification.md)
+- [ADR 0027: consumer-scoped retry policy](../decisions/0027-consumer-scoped-retry-policy.md)
 - [Raft follower recovery and replacement research](../research/raft-recovery-and-replacement.md)
 - [Testing and local operation](../testing.md)
 
