@@ -1,8 +1,8 @@
 # TD-026 isolated Raft log persistence baseline
 
-Status: initial lower-level performance evidence; the clustered commit-cost bound remains open
+Status: isolated persistence growth and initial live clustered snapshot/purge evidence; the clustered commit-cost bound remains open
 
-Measured: 2026-09-28
+Measured: isolated persistence baseline on 2026-09-28; live clustered samples on 2026-09-29
 
 Code baseline: [`b97901ebf86ab7594756b2e34ef1b9b519abff20`](https://github.com/winrarr/runnel/commit/b97901ebf86ab7594756b2e34ef1b9b519abff20) (exact `ci.yml` run [36461610629](https://github.com/winrarr/runnel/actions/runs/36461610629) passed)
 
@@ -100,8 +100,23 @@ Each row reports the median and observed min–max of the paired append and comm
 
 The raw CSV contains separate operation observations; the table's pair ranges retain the same sample number when adding append and `save_committed`. These 20-sample ranges are descriptive, not confidence intervals or p99 estimates. For larger retained histories, the size of each complete rewrite increasingly dominates the fixed sync cost. With small payloads, observed time growth is much smaller and less consistent even though the full serialized file is still rewritten.
 
+## Live clustered sample
+
+On 2026-09-29, the opt-in `raft_log_growth` process scenario exercised a three-node static Multi-Raft cluster through the public line-delimited JSON protocol. Each run made one setup publish, excluded from timing, then 256 sequential durable-quorum publishes to a dedicated stream. It recorded one live per-node Raft and state-machine file-state sample every eight publishes, waited for an actual snapshot and purge-index advance, then restarted follower node 3 and verified the earliest retained payload at offset 0 through poll and acknowledgement. The two runs used 100-byte and 1,024-byte payloads, respectively (run IDs `20260929124859229798` and `20260929124932218934`). The server binary came from code revision `49652a19cbd11fe68f79c602df3522a42dfaceba`; the benchmark harness was the in-progress `raft_log_growth` implementation in this change. The raw runner metadata's `source.revision` is the worktree HEAD and does not identify a separate harness commit.
+
+The host was a 12th Gen Intel Core i9-12900H with Linux `7.0.0-34-generic`, 20 logical CPUs, and ext4 on the local encrypted volume. The systemd user scope covered the client and three broker processes with a 200% CPU quota and 2 GiB memory limit. The cluster acknowledged durable quorum commits; batching was disabled and compression was not used.
+
+| Payload | Throughput (msg/s) | p50 / p99 / p99.9 / max publish latency (ms) | Observer I/O share of measured interval | Peak sampled retained entries per node | Final retained entries; purged through | Net per-node file-size deltas: Raft log / state journal / checkpoint / snapshot |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 100 B | 934.8 | 0.810 / 1.358 / 5.428 / 6.801 | 16.9% | 32 | 8; 251 | +3,883 / +1,293 / 0 / +354,752 B |
+| 1,024 B | 350.6 | 1.690 / 3.362 / 11.876 / 14.397 | 32.3% | 40 | 8; 251 | +29,759 / +12,381 / 0 / +3,160,025 B |
+
+All nodes recorded eight completed snapshot builds and eight observed purge-index advances in each run. After the cycle, restarting node 3 became ready in 53.3 ms (100 B) and 108.2 ms (1,024 B); both runs replayed and verified the earliest retained payload at offset 0, then acknowledged it. Raw run artifacts preserve the complete workload, resource samples, per-node observations, and recovery metadata: [100-byte JSON](td-026-cluster-log-growth-100b.json), [1-KiB JSON](td-026-cluster-log-growth-1kib.json), and [tabular per-node observations](td-026-cluster-log-growth-observations.csv).
+
+These are two single, descriptive runs. The observer itself accounted for 16.9% and 32.3% of the measured interval, so throughput and latency are materially affected by observation overhead and cannot be treated as uncontended cost estimates. The sampled peaks of 32 and 40 retained entries are lower bounds on the peaks between observations, observed only for this 256-publish workload and these payload sizes. They do not establish a general retention bound or supported workload limit. File-size deltas describe persisted path footprints before and after the interval; they do not measure serialized bytes written, device-level writes, or per-path I/O time. Raft log entry counts describe consensus history and are not broker message counts.
+
 ## Disposition and next evidence
 
-This measurement answers the narrow storage question: yes, the full-map rewrite produces measurable local cost growth as retained encoded history increases. It does not establish an accepted cost bound for clustered commits, and it does not demonstrate that a normal live cluster retains 36 entries or more after snapshot and purge behavior.
+The isolated measurement answers the narrow storage question: the full-map rewrite's serialized output grows with retained encoded history. The live clustered scenario now confirms that the real benchmark can observe retained Raft-log growth, snapshot builds, purge-index advances, per-path file footprints, and restart replay/ack after compaction. Neither measurement establishes an accepted cost bound for clustered commits. The observed peaks are sampled under one workload and cannot establish the maximum retained-log length.
 
-Keep [TD-026](../tech-debt.md#td-026-raft-log-persistence-rewrites-retained-entries) open. The next evidence should run the real three-node benchmark through actual snapshot and purge cycles, correlate the live retained Raft-log count with committed append batches and payload sizes, and report end-to-end latency and recovery. Separate Raft-log writes from state-machine journal and snapshot work using an opt-in, per-path measurement boundary; include device-level write and resource data when available. Do not infer a product limit or redesign storage from this isolated microbenchmark.
+Keep [TD-026](../tech-debt.md#td-026-raft-log-persistence-rewrites-retained-entries) open. Next evidence should repeat the live runs under controlled observation overhead, vary message count, payload, and append batch size through multiple snapshot/purge cycles, and add per-path write attribution that distinguishes Raft-log serialization from state-machine journal and snapshot work. Include device-level writes where available. Do not infer a product limit or redesign storage from these initial observations.

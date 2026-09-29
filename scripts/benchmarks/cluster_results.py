@@ -9,6 +9,13 @@ from typing import TYPE_CHECKING, Any
 
 from cluster_resources import resource_limits
 from cluster_scenarios import MAX_HOT_ORDERING_MESSAGES
+from cluster_scenarios import (
+    MAX_RAFT_LOG_GROWTH_CYCLE_TIMEOUT_SECONDS,
+    MAX_RAFT_LOG_GROWTH_LOGICAL_PAYLOAD_BYTES,
+    MAX_RAFT_LOG_GROWTH_MESSAGES,
+    MIN_RAFT_LOG_GROWTH_CYCLE_TIMEOUT_SECONDS,
+    MIN_RAFT_LOG_GROWTH_MESSAGES,
+)
 from common import result_metadata
 
 if TYPE_CHECKING:
@@ -53,6 +60,20 @@ def build_workload(args: argparse.Namespace) -> dict[str, Any]:
         workload["retained_recovery_messages"] = args.retained_messages
     if "retained_hot_path" in selected_scenarios:
         workload["retained_hot_path_messages"] = args.retained_messages
+    if "raft_log_growth" in selected_scenarios:
+        workload["raft_log_growth"] = {
+            "measured_messages": args.raft_log_growth_messages,
+            "minimum_messages": MIN_RAFT_LOG_GROWTH_MESSAGES,
+            "maximum_messages": MAX_RAFT_LOG_GROWTH_MESSAGES,
+            "maximum_logical_payload_bytes": MAX_RAFT_LOG_GROWTH_LOGICAL_PAYLOAD_BYTES,
+            "observation_every_publishes": args.raft_log_growth_observation_every,
+            "cycle_timeout_seconds": args.raft_log_growth_cycle_timeout_seconds,
+            "minimum_cycle_timeout_seconds": MIN_RAFT_LOG_GROWTH_CYCLE_TIMEOUT_SECONDS,
+            "maximum_cycle_timeout_seconds": MAX_RAFT_LOG_GROWTH_CYCLE_TIMEOUT_SECONDS,
+            "setup_messages_excluded": 1,
+            "message_history_source": "public protocol; first setup publish is offset 0",
+            "consensus_history_source": "per-node data-group raft-log.json",
+        }
     return workload
 
 

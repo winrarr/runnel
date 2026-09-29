@@ -55,6 +55,20 @@ just bench-cluster
 
 The runner defaults to native broker processes with independent durable directories and exercises the public protocol through multiple nodes. It measures durable publish, non-grouped consume/acknowledge, a bounded slow-consumer backlog drain, sequential shared-consumer delivery, parallel shared-consumer delivery, restart recovery, and retained-data recovery for the selected payload sizes. Each result records the node count, acknowledgement timeout, quorum durability boundary, protocol boundary, workload, throughput, p50/p99/p99.9 latency, aggregate and per-node broker CPU time, resident memory, and on-disk storage samples. Results use the same `backends` shape as the single-node container and comparison runners, so they can be normalized into the existing history dashboard.
 
+The opt-in `raft_log_growth` scenario runs a bounded sequence of single-message durable publishes against one stream, samples each node's current data-group Raft entry count and purge index plus the persisted Raft log, state-machine journal, checkpoint, and snapshot file sizes, then waits for an actual snapshot/purge before restarting a follower and verifying replay and acknowledgement of offset 0. For example:
+
+```text
+python3 scripts/benchmarks/cluster.py \
+  --scenarios raft_log_growth \
+  --raft-log-growth-messages 256 \
+  --raft-log-growth-observation-every 8 \
+  --raft-log-growth-cycle-timeout-seconds 30 \
+  --payload-sizes 1024 \
+  --output benchmark-results/raft-log-growth.json
+```
+
+The measured publish interval reports throughput and p50/p99/p99.9 request latency; resource samples include per-node CPU, memory, and total data-directory footprint. The raw scenario observations are machine-readable in the JSON artifact, and metadata reports how much interval time was spent reading persisted paths. The default samples every eight publishes; use a wider interval to reduce observation work or a narrower interval for more detail, and interpret the observed peak as a sampled lower bound. File sizes and net footprint deltas identify which persisted paths grow or compact; they do not measure bytes written or physical write amplification. Snapshot build metrics are aggregate per node, while purge indices and file sizes come from the selected stream's data group. Raft entries count consensus commands, not broker messages. This first live-cluster evidence covers unbatched requests through real compaction cycles; it does not establish per-path write cost or an accepted commit-cost bound. Collect it under the exclusive benchmark lock with bounded, recorded CPU and memory resources, and compare only runs with matching runtime, topology, payload size, message count, observation interval, durability, and resource limits.
+
 The opt-in `publish_batch` scenario measures the clustered public `publish_batch` protocol path, which is not part of the default workload. Setup creates the stream and publishes the warmup records outside the measured interval. Measured requests contain up to 32 records by default, rotate persistent clients across the cluster nodes, and validate one published outcome and contiguous offset for every input record. Set `--batch-size` from 1 through the protocol's 1,024-record limit for one focused case. To repeat a comparable batch-size matrix with independent artifacts, use `matrix.py --scenarios publish_batch --batch-size-values 1,8,32`; each batch size becomes a separate case and is never combined with another size. The result counts records for throughput and uses one latency sample per batch request, recording `batch_size`, batch count, outcome validation, setup exclusion, and the latency scope in scenario metadata. This is a clustered batching baseline, not evidence that the current engine commits a batch atomically or that it performs one consensus append per request; compare only runs with matching batch size, payload, message count, topology, runtime, and resource limits.
 
 Run the same three-node workload with one bounded Docker container per broker:
