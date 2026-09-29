@@ -811,10 +811,11 @@ mod tests {
     #[test]
     fn grouped_dispatch_index_releases_keys_after_ack_and_expiry() {
         let directory = tempdir().unwrap();
+        let ack_timeout = Duration::from_secs(2);
         let broker = Broker::open(
             directory.path(),
             BrokerConfig {
-                ack_timeout: Duration::from_millis(100),
+                ack_timeout,
                 max_delivery_attempts: None,
             },
         )
@@ -848,7 +849,7 @@ mod tests {
             AckResult::Acknowledged
         );
 
-        std::thread::sleep(Duration::from_millis(250));
+        std::thread::sleep(ack_timeout + Duration::from_millis(100));
         let (redelivered_offset, redelivered_token) =
             delivery(broker.poll_group("events", "workers", "replacement"));
         assert_eq!(redelivered_offset, other_offset);
