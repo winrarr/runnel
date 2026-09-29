@@ -1,8 +1,12 @@
 # TD-002: Local retained-storage scalability evidence
 
 - Status: exploratory design and evidence note; no implementation authorized
-- Last reviewed: 2026-09-06
-- Baseline: `d7c390a4962a9f7200df4306447a245f7bc5052a`
+- Last reviewed: 2026-09-29
+- Source and test baseline: `9c173ac295bb32cb55336255baa825959ac34d4d`
+  (exact CI run [36607359414](https://github.com/winrarr/runnel/actions/runs/36607359414) passed)
+- Historical Criterion baseline: `d7c390a4962a9f7200df4306447a245f7bc5052a`.
+  The values below were carried forward, not rerun at the source and test
+  baseline above.
 - Scope: local stream-log growth, segmentation, indexing, retention, and recovery
 - Related debt: [TD-002](../tech-debt.md)
 - Related outcomes: [Make retained data operationally scalable](../backlog.md) and [Make retained-state growth independent of the hot path](../backlog.md)
@@ -16,29 +20,34 @@ retention API remain open.
 
 ## Observed baseline
 
-The local engine currently owns one append-only `streams/<stream>.log` file per
-stream. It supports three recognized frame families: legacy `RNL1`, checksummed
-version-1 `RNL2`, and request-aware checksummed version-1 `RNL3`. The frame
-families have fixed headers of 28, 44, and 48 bytes respectively, before key,
-request-ID, and payload bytes. The normal broker path uses `RNL1`; versioned
-formats are explicit core configuration/test paths.
+The local engine owns one append-only `streams/<stream>.log` file per stream.
+Readers recognize legacy `RNL1`, checksummed version-1 `RNL2`, and
+request-aware checksummed version-1 `RNL3` frames. Their fixed headers are 28,
+44, and 48 bytes, followed by variable key, request-ID, and payload fields.
+`Broker::open` selects the `RNL1` mode by default: publishes without a request
+ID use `RNL1`, while request-aware publishes use `RNL3`. `RNL2` writes require
+the explicit versioned core path.
 
-On `StreamLog::open`, the reader starts at byte zero and parses every complete
-frame to recover the next logical offset, sparse checkpoints, the bounded tail
-index, and request-ID locations. `RNL1` skips payload bytes after reading the
-header and key; `RNL2` and `RNL3` read payload bytes to verify their checksums.
-Offsets must be contiguous. A suffix that does not contain a complete frame is
-truncated to the last complete cursor; complete malformed, unsupported, or
-checksum-invalid data fails recovery.
+When the broker opens, it processes each stream log from byte zero and parses
+every complete frame to recover the next logical offset and rebuild its
+in-memory lookup state. `RNL1` reads the header and key, then seeks over the
+payload. `RNL2` and `RNL3` read the payload in chunks to verify its checksum.
+Offsets must be contiguous. A suffix without a complete frame is truncated to
+the last complete cursor; complete malformed, unsupported, or checksum-invalid
+data fails recovery. The current reader is incremental across records; opening
+does not materialize the whole log or all payloads at once.
 
-The current lookup structures deliberately bound only part of the metadata:
+The current lookup structures bound record locations, but not all retained
+metadata:
 
 | Structure | Current behavior | What it does not guarantee |
 | --- | --- | --- |
-| Tail record index | Keeps the newest 1,024 record locations and message metadata. | A cold lookup older than the tail can still scan durable history. |
-| Sparse offset index | Records every 64th offset and keeps at most 1,024 recent checkpoints. | An old checkpoint can be evicted; a cold scan can then start at byte zero. |
-| Request-ID map | Retains one string-to-offset entry for every distinct request-aware ID seen in the file. | The bounded tail and sparse index do not bound request-ID metadata. |
-| Durable file | Retains the complete stream history in one file. | There is no independent immutable region to reclaim, compact, or validate in isolation. |
+| Tail record index | Keeps the newest 1,024 `RecordIndex` entries with offsets, payload lengths, timestamps, and optional key/request-ID strings. Payload bodies stay on disk. | Entry count is bounded, but bytes depend on retained metadata. Older reads scan the log. |
+| Sparse offset index | Keeps at most 1,024 checkpoints spaced 64 logical offsets apart, covering roughly the latest 65,536 offsets. | A read before the oldest checkpoint starts its scan at byte zero. |
+| Request-ID map | Keeps one entry per distinct `RNL3` ID per stream, rebuilt on open. Duplicate IDs in a file keep the earliest offset; a retry resolves to that offset without comparing key or payload. | Map size grows with distinct retained IDs, outside the tail/index bounds. |
+| Durable file | Retains the complete append-only stream history, including acknowledged records. | Acknowledgement does not reclaim space; there is no independent region to remove or validate. |
+
+The request-ID path is exercised by [stream-scoped retry and restart tests](../../crates/runnel-core/src/lib.rs#L492) and its lookup is visible in [`StreamLog::open`](../../crates/runnel-core/src/stream_log.rs#L92). The specific historical `RNL1` per-record allocation and compatibility boundary is tracked separately in [TD-028](../tech-debt.md#td-028-rnl1-materialization-lacks-an-operational-allocation-budget) and [TD-007's local-stream evidence](td-007-storage-compatibility-evidence.md#local-stream-history); this note concerns aggregate history growth and lookup cost, not a new `RNL1` size policy.
 
 Normal appends call `sync_data` before reporting success; a publish batch
 appends its records and syncs once after the batch. Consumer checkpoints and
@@ -46,16 +55,41 @@ delivery-attempt journals are separate from the stream log. There is no
 retention policy, segment manifest, active-generation selector, or supported
 one-file-to-segmented migration today.
 
-These are observations of the baseline, not compatibility promises. The
-authoritative implementation is `crates/runnel-core/src/stream_log.rs` and its
-recovery and bounded-index tests in `crates/runnel-core/src/lib.rs`.
+These are observations of the source and test baseline, not compatibility
+promises. The authoritative implementation is [`stream_log.rs`](../../crates/runnel-core/src/stream_log.rs#L60), with recovery and bounded-index coverage in [`lib.rs`](../../crates/runnel-core/src/lib.rs#L1685) and the sparse-index unit tests in [`stream_log.rs`](../../crates/runnel-core/src/stream_log.rs#L1173).
 
-## Current measured evidence
+### Reopen and cold-lookup work
 
-The Criterion benchmark `streaming_recovery_retained_messages` reopens a
-prepared default-format stream and measures startup scanning. On the baseline
-host, with 100-byte payloads and 10 samples per case, the reported central
-times were:
+Open scans every complete record in each stream file and rebuilds the offset,
+tail, and request-ID structures. `RNL1` reopen therefore remains proportional
+to the retained record count and key bytes while seeking past payload bodies;
+`RNL2` and `RNL3` also checksum every retained payload byte. The broker opens
+the stream files in a loop, so process startup work accumulates across streams.
+The resulting tail, sparse index, and request-ID maps remain resident for the
+broker lifetime.
+
+For polling, a committed offset within the tail starts with a binary lower
+bound and then scans tail entries until it finds a deliverable candidate.
+Older offsets start from the nearest retained sparse checkpoint and parse
+records forward. If the requested offset predates the oldest retained
+checkpoint, the scan starts at byte zero. Direct record/replay reads use the
+same tail-or-sparse strategy. Thus the checkpoint bounds scan work only within
+its retained window; it does not create a bound for older history or for a
+consumer that must skip many acknowledged/in-flight candidates.
+
+## Committed measurements and current benchmark coverage
+
+The values carried forward here are historical Criterion central estimates
+recorded against `d7c390a4962a9f7200df4306447a245f7bc5052a`; they have not been
+rerun against the source and test baseline at the top of this note. The
+repository contains the summary values but no raw Criterion report for these
+local cases, so per-sample spread and full host/run provenance are unavailable.
+
+[`streaming_recovery_retained_messages`](../../crates/runnel-core/benches/broker.rs#L470)
+prepares one default-format stream outside the timed loop, then repeatedly
+opens it. The source configures 10 samples per case, a one-second warm-up, and
+a three-second measurement window. The recorded cases use 100-byte payloads
+and reported these central reopen times:
 
 | Retained records | Reopen time |
 | ---: | ---: |
@@ -64,29 +98,53 @@ times were:
 | 5,000 | 2.37 ms |
 | 20,000 | 9.59 ms |
 
-The `retained_history_restart_cold_replay` benchmark includes both reopen and
-the first cold poll at offset 1,024. Its reported central times were 27.9 ms
-for 65,537 records and 64.2 ms for 131,072 records. The latter cases are
-deliberately beyond the 1,024-record tail cache and exercise the current sparse
-lookup boundary.
+[`retained_history_restart_cold_replay`](../../crates/runnel-core/benches/broker.rs#L545)
+prepares the stream and consumer checkpoint outside the timed loop, then
+measures both reopen and the first poll at offset 1,024, using the same
+100-byte payload. Its reported central times were 27.9 ms for 65,537 records
+and 64.2 ms for 131,072 records. At 65,537 records the requested offset still
+has a retained sparse checkpoint; at 131,072 it predates the retained
+checkpoint window and the poll scan starts at byte zero. Both times include
+the full open scan, so this pair does not separate that extra cold-lookup work
+from reopen cost.
 
-These results are useful evidence of approximately linear work for this
-default `RNL1`, 100-byte workload, not a product SLO or a cross-filesystem
-prediction. They do not measure resident memory, request-ID-map growth,
-retention cleanup, crash-at-rollover behavior, large payloads, versioned-frame
-checksum cost, concurrent streams, or cold offsets whose sparse checkpoint has
-been evicted. The restart-plus-cold-poll benchmark also combines two costs, so
-it cannot identify how much time is spent opening versus locating the first
-record. Re-run on controlled resources before making a performance claim; use
-the benchmark policy in [benchmarking.md](../benchmarking.md).
+These values support approximately linear reopen-time growth for one default
+`RNL1` stream with 100-byte payloads on that host: 200 times as many records
+from 100 to 20,000 corresponded to about 211 times the reported central time.
+They are growth evidence for this case, not a product SLO, throughput result,
+or cross-filesystem prediction.
 
-The current result is not an argument to rush a format rewrite. At 20,000
-records the measured reopen path is small on this host. Segmentation is
-primarily justified by the unbounded growth and operational constraints that
-one file cannot address: independent retention, bounded startup/recovery
-work, isolated corruption or cleanup, and a path to substantially larger
-retained streams. Whether it improves hot-path latency must be measured rather
-than assumed.
+The current source also defines a separate
+[`retained_history_lookup`](../../crates/runnel-core/benches/broker.rs#L505)
+case for 5,000 and 20,000 records. It creates and opens a prepared stream in
+Criterion's setup closure, then times a poll from the midpoint checkpoint.
+This exercises a tail-cache miss with an in-window sparse checkpoint,
+isolating the poll path from the open scan. No result values or raw report for
+this local case are checked in, so it provides no measured latency claim.
+
+Neither historical result set measures resident memory or request-ID-map
+growth; large payloads; `RNL2`/`RNL3` checksum cost; many streams; publish or
+delivery throughput; tail latency; retention, cleanup, or reclamation; physical
+storage bytes or write amplification; or resource behavior at an operational
+limit. The cases do not exercise segment rollover or cleanup crashes because
+the measured implementation has no segments or reclamation. They also do not
+establish cold filesystem-page-cache behavior: the benchmark clears neither
+OS caches nor controls cache state. The combined
+restart/poll result cannot attribute time to open versus lookup, and the
+separate lookup case has no committed result. These limitations leave both
+per-record allocation policy and aggregate retained-history growth unresolved;
+the former is tracked by [TD-028](../tech-debt.md#td-028-rnl1-materialization-lacks-an-operational-allocation-budget),
+while this note and its linked backlog outcomes address aggregate growth. Use
+the benchmark policy in [benchmarking.md](../benchmarking.md) for controlled
+comparisons.
+
+These measurements do not justify a format rewrite by themselves. At 20,000
+records the historical reopen estimate is small on its host, while the current
+single-file layout still has no independent retention or reclamation unit and
+its startup/index rebuild scales with retained history. Segmentation is a
+candidate for those operational limits and larger retained streams. Any
+claimed benefit to publish or delivery latency, memory, or disk amplification
+needs separate controlled measurements.
 
 ## Invariants a future representation must preserve
 
@@ -227,9 +285,10 @@ scalability, retention, recovery, and compatibility together.
 
 ## Refactor and planning assessment
 
-No safe runtime refactor is included in this evidence-only change. The
-existing `StreamLog` boundaries are sufficiently explicit for measurement and
-future replacement, while introducing segment abstractions before the format,
-retention, and migration invariants are accepted would create compatibility
-surface without retiring the debt. The focused follow-up remains TD-002 rather
-than a speculative second storage-debt item.
+This evidence-only change found no narrow runtime cleanup supported by the
+review. Introducing segment abstractions before the format, retention, and
+migration invariants are accepted would add runtime surface without retiring
+the debt. Aggregate retained-history growth and its missing measurements
+remain in TD-002 and the linked backlog outcomes; the separate per-record
+`RNL1` allocation and compatibility boundary is already tracked by TD-028 and
+TD-007. No new debt item or backlog change is needed.
