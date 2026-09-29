@@ -2,7 +2,7 @@
 
 - Status: exploratory evidence note; no migration implementation authorized
 - Last reviewed: 2026-09-29
-- Baseline: `20d51c40c02a755dccd2c95fd44921cca50f8458`
+- Baseline: `6b53cc0ed3a83017e59d42319ce696f825fb388f`
 - Scope: local durable files, clustered durable artifacts, and the boundary
   between same-binary recovery and supported release upgrades
 - Related debt: [TD-007](../tech-debt.md#td-007-storage-format-compatibility-is-not-yet-defined)
@@ -30,9 +30,17 @@ version boundaries:
   request-ID persistence and restart recovery are tested separately. A
   complete record with an invalid legacy key, unsupported magic, checksum
   mismatch in formats that carry one, or offset gap fails recovery; an
-  incomplete trailing frame is discarded. `RNL1`
-  still has no explicit storage-level key or payload size cap; see the evidence
-  matrix for this recovery-bound gap.
+  incomplete trailing frame is discarded. The initial `RNL1` writer encoded a
+  28-byte header (magic, little-endian `u64` offset and timestamp, and
+  independent little-endian `u32` key and payload lengths) followed by UTF-8
+  key bytes and opaque payload bytes, with no lower format or application cap.
+  Each field could therefore be as large as `u32::MAX` bytes, for a maximum
+  encoded record of `28 + 2 × u32::MAX` (8,589,934,618) bytes, subject to
+  physical storage and process addressability. This establishes the historical
+  encoded envelope, not that near-limit records exist or that such allocations
+  are operationally safe.
+  The current reader has no smaller `RNL1` allocation limit; see the evidence
+  matrix and [TD-028](../tech-debt.md#td-028-rnl1-materialization-lacks-an-operational-allocation-budget).
 - Local consumer checkpoints and their bounded JSON-lines event journal
   recover progress and delivery attempts on reopen. These artifacts do not
   carry an explicit format version, so those tests establish same-binary
@@ -65,7 +73,7 @@ startup converts the source artifact into a new generation.
 
 | Boundary | Current evidence | What remains unproven |
 | --- | --- | --- |
-| Local stream history | Reader dispatches `RNL1`, `RNL2`, and `RNL3`; it checks record-length arithmetic and completeness, contiguous offsets, and format-specific fields/checksums. `RNL2` and `RNL3` have explicit key/body limits. Tests cover incomplete tails, one malformed complete legacy key, mixed `RNL1`/`RNL2` history, `RNL2` checksum failure, request-ID restart recovery, and bounded request-ID parsing. [`lib.rs`](../../crates/runnel-core/src/lib.rs#L45) [`stream_log.rs`](../../crates/runnel-core/src/stream_log.rs#L13) [`stream_log.rs`](../../crates/runnel-core/src/stream_log.rs#L101) [`stream_log.rs`](../../crates/runnel-core/src/stream_log.rs#L727) [`stream_log.rs`](../../crates/runnel-core/src/stream_log.rs#L751) [`stream_log.rs`](../../crates/runnel-core/src/stream_log.rs#L769) [`stream_log.rs`](../../crates/runnel-core/src/stream_log.rs#L556) [`stream_log.rs`](../../crates/runnel-core/src/stream_log.rs#L807) [`stream_log.rs`](../../crates/runnel-core/src/stream_log.rs#L913) [`lib.rs`](../../crates/runnel-core/src/lib.rs#L1824) [`lib.rs`](../../crates/runnel-core/src/lib.rs#L1850) [`lib.rs`](../../crates/runnel-core/src/lib.rs#L1888) [`lib.rs`](../../crates/runnel-core/src/lib.rs#L1967) [`lib.rs`](../../crates/runnel-core/src/lib.rs#L2000) [`lib.rs`](../../crates/runnel-core/src/lib.rs#L2046) [`lib.rs`](../../crates/runnel-core/src/lib.rs#L2086) [`lib.rs`](../../crates/runnel-core/src/lib.rs#L2148) [`lib.rs`](../../crates/runnel-core/src/lib.rs#L551) | The mixed-format test does not mix `RNL3` with the other families. `RNL1` has u32 key/body lengths but no explicit format-level size caps: the reader allocates the key while reopening and allocates the payload when delivering it. Thus tests establish rejection of one malformed complete legacy key, not bounded allocation for every complete legacy record. Determine the valid historical envelope before imposing a limit that could refuse previously readable data. There is no root generation marker, cross-release writer/reader matrix, proof an older binary can interpret newer frames, or conversion path. |
+| Local stream history | Reader dispatches `RNL1`, `RNL2`, and `RNL3`; it checks record-length arithmetic and completeness, contiguous offsets, and format-specific fields/checksums. `RNL2` and `RNL3` have explicit key/body limits. Tests cover incomplete tails, one malformed complete legacy key, mixed `RNL1`/`RNL2` history, `RNL2` checksum failure, request-ID restart recovery, and bounded request-ID parsing. [`lib.rs`](../../crates/runnel-core/src/lib.rs#L45) [`stream_log.rs`](../../crates/runnel-core/src/stream_log.rs#L13) [`stream_log.rs`](../../crates/runnel-core/src/stream_log.rs#L101) [`stream_log.rs`](../../crates/runnel-core/src/stream_log.rs#L727) [`stream_log.rs`](../../crates/runnel-core/src/stream_log.rs#L751) [`stream_log.rs`](../../crates/runnel-core/src/stream_log.rs#L769) [`stream_log.rs`](../../crates/runnel-core/src/stream_log.rs#L782) [`stream_log.rs`](../../crates/runnel-core/src/stream_log.rs#L556) [`stream_log.rs`](../../crates/runnel-core/src/stream_log.rs#L807) [`stream_log.rs`](../../crates/runnel-core/src/stream_log.rs#L913) [`lib.rs`](../../crates/runnel-core/src/lib.rs#L1824) [`lib.rs`](../../crates/runnel-core/src/lib.rs#L1850) [`lib.rs`](../../crates/runnel-core/src/lib.rs#L1888) [`lib.rs`](../../crates/runnel-core/src/lib.rs#L1967) [`lib.rs`](../../crates/runnel-core/src/lib.rs#L2000) [`lib.rs`](../../crates/runnel-core/src/lib.rs#L2046) [`lib.rs`](../../crates/runnel-core/src/lib.rs#L2086) [`lib.rs`](../../crates/runnel-core/src/lib.rs#L2148) [`lib.rs`](../../crates/runnel-core/src/lib.rs#L551) [initial writer and reader](https://github.com/winrarr/runnel/blob/b47d9df4bb6b7675c2f3eba9fc8e5e8f1c273ce7/crates/runnel-core/src/lib.rs#L294-L396) [initial TCP input path](https://github.com/winrarr/runnel/blob/b47d9df4bb6b7675c2f3eba9fc8e5e8f1c273ce7/crates/runnel-server/src/main.rs#L217-L245) | The mixed-format test does not mix `RNL3` with the other families. The historical writer accepted any key/body byte lengths that fit `u32` (`u32::MAX` each); this is an encoded ceiling, not proof that near-limit files exist. The initial reader also loaded the whole log into memory. The current reader verifies completeness before allocation, allocates a complete key during recovery, and allocates a complete payload on delivery, with no smaller `RNL1` cap. Tests do not cover valid near-limit `RNL1` data or resource behavior at a policy boundary. Do not apply `RNL2`/`RNL3` limits retroactively without an accepted compatibility path for existing data. There is no root generation marker, cross-release writer/reader matrix, proof an older binary can interpret newer frames, or conversion path. |
 | Local consumer state | JSON checkpoints persist committed and out-of-order acknowledgement progress, delivery attempts, and policy; a bounded JSON-lines journal replays events and discards an incomplete final line. Tests cover reopen after an acknowledgement journal failure, partial-tail recovery, the journal bound, and rejection of oversized journal data. [`consumer_state.rs`](../../crates/runnel-core/src/consumer_state.rs#L13) [`consumer_state.rs`](../../crates/runnel-core/src/consumer_state.rs#L120) [`consumer_state.rs`](../../crates/runnel-core/src/consumer_state.rs#L228) [`lib.rs`](../../crates/runnel-core/src/lib.rs#L1515) [`lib.rs`](../../crates/runnel-core/src/lib.rs#L1574) [`lib.rs`](../../crates/runnel-core/src/lib.rs#L1624) [`lib.rs`](../../crates/runnel-core/src/lib.rs#L1664) | Checkpoint and journal records have no explicit schema version or release-pair writer contract. Delivery tokens and deadlines are volatile. No old-binary/new-state reopen test exists. |
 | Cluster storage identity | `storage.json` records metadata version 1, cluster name, and node ID. Existing mismatched, malformed, or unsupported metadata and unmarked grouped state fail before group open in covered cases. [`engine.rs`](../../crates/runnel-raft/src/engine.rs#L29) [`engine.rs`](../../crates/runnel-raft/src/engine.rs#L48) [`engine.rs`](../../crates/runnel-raft/src/engine.rs#L901) [`lib.rs`](../../crates/runnel-raft/src/lib.rs#L1639) [`lib.rs`](../../crates/runnel-raft/src/lib.rs#L1859) [`lib.rs`](../../crates/runnel-raft/src/lib.rs#L2093) | The marker identifies cluster and node ownership; it is not a generation selector, migration record, or downgrade authority. New-store initialization may write it. |
 | Clustered layout preflight | Startup rejects recognized old single-group paths. Validation checks the metadata group, data-group directory names, stream/group identity in `group.json`, Raft logs, checkpoints, journals, and snapshots before `GroupManager` opens groups. `group.json` has no explicit schema-version field. Tests cover old root layouts, missing metadata group, unsupported data-group log, contradictory manifest, and an unchanged current-layout fixture. [`engine.rs`](../../crates/runnel-raft/src/engine.rs#L32) [`engine.rs`](../../crates/runnel-raft/src/engine.rs#L901) [`group_manager.rs`](../../crates/runnel-raft/src/group_manager.rs#L86) [`group_manager.rs`](../../crates/runnel-raft/src/group_manager.rs#L671) [`group_manager.rs`](../../crates/runnel-raft/src/group_manager.rs#L686) [`group_manager.rs`](../../crates/runnel-raft/src/group_manager.rs#L816) [`lib.rs`](../../crates/runnel-raft/src/lib.rs#L1797) [`lib.rs`](../../crates/runnel-raft/src/lib.rs#L1893) [`lib.rs`](../../crates/runnel-raft/src/lib.rs#L1954) | The fixture verifies the validator on a known current layout. It is not an end-to-end migration from the old layout, proof against arbitrary filesystem contents, or crash-safe activation evidence. The manifest shape is an identity check, not a release compatibility contract. |
@@ -134,11 +142,12 @@ layout.
 No runtime refactor is included in this evidence-only review. Adding generation
 selection, migration ownership, or shared format abstractions before a policy
 is accepted would add runtime surface without retiring TD-007. The RNL1
-allocation-bound gap is recorded as a verified coverage limitation above; a
-focused planning-record proposal is with the coordinator, and no tracker file
-was changed. Existing TD-007 debt and storage-upgrade backlog records remain
-open. The adjacent `DurableFormat` source comment now names the request-aware
-RNL3 reader path, matching the parser and its restart-recovery test.
+allocation-bound gap is recorded as a specific resource-policy debt in
+[TD-028](../tech-debt.md#td-028-rnl1-materialization-lacks-an-operational-allocation-budget).
+That item does not set a new cap or authorize a migration. Existing TD-007 debt
+and storage-upgrade backlog records remain open. The adjacent `DurableFormat`
+source comment now names the request-aware RNL3 reader path, matching the parser
+and its restart-recovery test.
 
 ## Verification
 
