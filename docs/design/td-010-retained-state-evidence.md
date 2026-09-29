@@ -1,20 +1,21 @@
 # TD-010: Clustered retained-state materialization evidence
 
 - Status: exploratory design and evidence note; no implementation authorized
-- Last reviewed: 2026-09-06
-- Baseline: `2774d69aaab462431b8fac342dba7084b8abb9d7`
+- Last reviewed: 2026-09-29
+- Baseline: `d385e52a9d7fb49e6e58d0349c0011fd6c7710fe`
 - Scope: clustered data-group retained messages, materialized state, journal replay, and resource growth
 - Related debt: [TD-010](../tech-debt.md#td-010-clustered-state-materializes-complete-retained-history)
 - Related outcome: [Make retained-state growth independent of the hot path](../backlog.md#make-retained-state-growth-independent-of-the-hot-path)
+- Related decision: [ADR 0023: Separate retained storage and placement identity](../decisions/0023-independent-retained-storage-and-placement.md)
 - Related research: [Systems performance research for Runnel](../research/systems-performance-research.md)
 - Separate concern: [TD-009](../tech-debt.md#td-009-snapshots-rewrite-the-complete-materialized-group-state) owns the cost and crash contract of full snapshot creation and installation
 
 This note records what the clustered state machine currently materializes, where
-retained payloads are copied or scanned, and what evidence is needed before
-retained data is separated from replicated semantic state. It is not an
-accepted storage decision, an implementation plan, or a commitment to a
-particular database or file layout. Rust code and tests remain authoritative if
-this note becomes stale.
+retained payloads are copied or scanned, and what evidence is still needed to
+implement the accepted separation between retained payload storage and
+replicated semantic state. It is not an additional storage decision, an
+implementation plan, or a commitment to a particular database or file layout.
+Rust code and tests remain authoritative if this note becomes stale.
 
 ## Question and boundary
 
@@ -26,10 +27,15 @@ The clustered engine has two different durable histories:
 
 TD-010 asks whether the second layer can keep publish, consume, replay,
 acknowledgement, and recovery work predictable while retained message payloads
-grow. It does not ask whether the current snapshot should be full, staged, or
-extent-based. Those are TD-009 questions. A future retained-data design still
-has to provide a state image or equivalent snapshot input to the snapshot
-contract.
+grow. [ADR 0023](../decisions/0023-independent-retained-storage-and-placement.md)
+already accepts a hidden storage/placement boundary and segmented retained
+payloads while keeping logical stream identity stable. This note evaluates the
+current implementation and the evidence needed for that direction; exact
+segment and manifest formats, indexes, transaction substrate, and recovery
+protocol remain unsettled. It does not ask whether the current snapshot should
+be full, staged, or extent-based. Those cost and crash-contract questions are
+tracked by TD-009. Any retained-data implementation still has to provide a
+consistent state image or equivalent snapshot input to that contract.
 
 ## Observed current representation
 
@@ -37,11 +43,13 @@ contract.
 
 Each data group currently owns a `SnapshotState` containing stream state,
 ordinary consumer offsets, grouped-consumer state, lease-clock state,
-producer-request deduplication, and counters. A `StreamState` stores every
-retained message in a `Vec<StoredMessage>`; each message owns its key, payload,
-and publication timestamp. A publish assigns the next offset from the vector
-length and moves the command payload into the vector. There is no retention
-floor, tombstone, or external payload reference in this model.
+producer-request deduplication, and counters. Grouped-consumer state also holds
+configured consumer policy and per-offset delivery policies pinned as attempts
+are created. A `StreamState` stores every retained message in a
+`Vec<StoredMessage>`; each message owns its key, payload, and publication
+timestamp. A publish assigns the next offset from the vector length and moves
+the command payload into the vector. There is no retention floor, tombstone, or
+external payload reference in this model.
 
 This representation makes the first semantic model easy to inspect:
 
@@ -49,13 +57,15 @@ This representation makes the first semantic model easy to inspect:
 - replay and ordinary polling locate a message directly by logical offset;
 - grouped delivery scans the materialized vector from the consumer's committed
   offset, subject to the scheduler rules tracked separately in TD-016; and
-- acknowledged consumer progress, in-flight delivery tokens, attempts, and
-  deduplication live beside the retained messages in the same state image.
+- acknowledged consumer progress, configured and pinned delivery policies,
+  in-flight delivery tokens, attempts, and deduplication live beside the
+  retained messages in the same state image.
 
-The authoritative definitions are [`StoredMessage` and `StreamState`](../../crates/runnel-raft/src/state_machine.rs#L109-L136)
-and [`SnapshotState`](../../crates/runnel-raft/src/state_machine.rs#L182-L198).
+The authoritative definitions are [`StoredMessage` and `StreamState`](../../crates/runnel-raft/src/state_machine.rs#L122-L149),
+[`SnapshotState`](../../crates/runnel-raft/src/state_machine.rs#L195-L211),
+and [`GroupConsumerState`](../../crates/runnel-raft/src/delivery.rs#L20-L33).
 The publish transition and offset assignment are in
-[`apply_command`](../../crates/runnel-raft/src/state_machine.rs#L258-L304).
+[`apply_command`](../../crates/runnel-raft/src/state_machine.rs#L296-L335).
 
 ### Apply and journal path
 
@@ -80,7 +90,7 @@ The current path therefore has these memory and I/O characteristics:
 The journal format and replay behavior are implemented in
 [`state_machine_journal.rs`](../../crates/runnel-raft/src/state_machine_journal.rs)
 and the apply path is in
-[`StateMachineStore::apply`](../../crates/runnel-raft/src/state_machine_store.rs#L743-L775).
+[`StateMachineStore::apply`](../../crates/runnel-raft/src/state_machine_store.rs#L766-L797).
 
 ### Open and recovery path
 
@@ -117,16 +127,17 @@ Snapshot building serializes borrowed views of the complete materialized state
 under a read lock, then persists the complete JSON snapshot and compacts the
 journal through the snapshot's applied log. The borrowed view avoids cloning
 each retained message before serialization, but the encoded snapshot is still a
-full retained-state representation. Installation validates and deserializes
-the complete input, writes the snapshot and checkpoint, compacts the journal,
-and swaps the active state only after those durable steps succeed.
+full retained-state representation; the encoded byte vector is also cloned into
+the cached snapshot. Installation validates and deserializes the complete
+input, writes the snapshot and checkpoint, compacts the journal, and swaps the
+active state only after those durable steps succeed.
 
 These behaviors are useful correctness evidence and are deliberately kept
 separate from the TD-010 redesign question. The full-state transfer,
 serialization, installation staging, and snapshot cadence remain TD-009 even
 when the eventual state store uses external or extent-backed retained data.
-See [`build_snapshot`](../../crates/runnel-raft/src/state_machine_store.rs#L687-L729)
-and [`install_snapshot`](../../crates/runnel-raft/src/state_machine_store.rs#L787-L845).
+See [`build_snapshot`](../../crates/runnel-raft/src/state_machine_store.rs#L710-L742)
+and [`install_snapshot`](../../crates/runnel-raft/src/state_machine_store.rs#L810-L868).
 
 ## Current correctness and retention invariants
 
@@ -147,8 +158,9 @@ the following logical outcomes:
    relocation or compaction must not turn a valid offset into an empty result
    or a duplicate.
 4. **Consumer progress.** Ordinary and grouped acknowledgements, out-of-order
-   acknowledgement state, in-flight delivery tokens, attempts, lease-clock
-   floors, and dead-letter outcomes recover consistently with retained data.
+   acknowledgement state, configured consumer policies, per-offset pinned
+   delivery policies, in-flight delivery tokens, attempts, lease-clock floors,
+   and dead-letter outcomes recover consistently with retained data.
    A retained-data operation cannot advance consumer state merely because an
    index or payload reference was updated.
 5. **Request deduplication.** A retried publish with a known request identity
@@ -182,11 +194,13 @@ limits:
 
 | Evidence | What it proves | What it does not prove |
 | --- | --- | --- |
-| `state_machine_journal_replays_a_retained_batch_after_restart` applies and reopens 256 messages | Journal replay reconstructs retained payloads in order after restart. | Recovery time, peak memory, larger payloads, malformed complete records, or bounded replay work. |
-| `retained_history_survives_snapshot_install_and_reopen` transfers and reopens 256 messages | A full snapshot can preserve the retained first/last payloads through install and reopen. | Incremental transfer, snapshot cost at scale, concurrent apply, retention cleanup, or replacement safety in the production path. |
-| `snapshots_bound_consensus_history_and_recover_state` publishes 40 messages, builds a snapshot, purges consensus history, and reopens | Consensus-log compaction is separate from retained message recovery in the tested path. | That state-machine materialization or snapshot cost is bounded as retained history grows. |
-| `cluster_retained_recovery` preloads 2,048 records, restarts one process, replays offset 0, and acknowledges it | A real three-node process probe exercises restart and cold replay beyond the local 1,024-record tail-index threshold. | The probe's one recovery point does not isolate startup from journal replay, measure full retained-state replay, test retention, or establish a memory bound. |
-| `retained_hot_path` preloads a selected history and measures later durable publishes | The clustered publish path has a repeatable post-preload hot-path baseline. | Consume/replay cost, state serialization cost, retention, storage amplification, or performance beyond selected history and payload sizes. |
+| [`state_machine_journal_replays_a_retained_batch_after_restart`](../../crates/runnel-raft/src/lib.rs#L1744) applies and reopens 256 messages | Journal replay reconstructs retained payloads in order after restart. | Recovery time, peak memory, larger payloads, malformed complete records, or bounded replay work. |
+| [`retained_history_survives_snapshot_install_and_reopen`](../../crates/runnel-raft/src/lib.rs#L2193) transfers and reopens 256 messages | A full snapshot can preserve the retained first/last payloads through install and reopen. | Incremental transfer, snapshot cost at scale, concurrent apply, retention cleanup, or replacement safety in the production path. |
+| [`snapshots_bound_consensus_history_and_recover_state`](../../crates/runnel-raft/src/lib.rs#L2119) publishes 40 messages, builds a snapshot, purges consensus history, and reopens | Consensus-log compaction is separate from retained message recovery in the tested path. | That state-machine materialization or snapshot cost is bounded as retained history grows. |
+| [`persistent_raft_consumer_policy_is_durable_and_pins_attempts`](../../crates/runnel-raft/src/lib.rs#L1443) configures policy, changes it after a delivery attempt, and reopens the engine | Current consumer policy and version survive reopen; the test exercises attempt-policy pinning across a policy update. | Retained-history scale, recovery of a pinned per-offset policy after restart, old policy formats beyond the tested fixtures, or bounded policy metadata growth. |
+| [`legacy_checkpoint_defaults_lease_floor_and_group_poll_survives_replay`](../../crates/runnel-raft/src/state_machine_store.rs#L1119) opens a version-1 checkpoint without a lease floor, journals a grouped poll, and reopens | Legacy checkpoint conversion defaults the floor and journal replay restores it with the in-flight delivery. | Retained-history scale, other legacy schemas, or a bound on recovery memory/work. |
+| [`cluster_retained_recovery`](../../scripts/benchmarks/cluster_scenarios.py#L1760) preloads 2,048 records by default, restarts one process, replays offset 0, and acknowledges it | A real three-node process probe exercises restart and cold replay beyond the local 1,024-record tail-index threshold. It records retained count and logical payload bytes, one elapsed sample from before node stop/restart through the earliest replay acknowledgement, restart-to-ready time separately, and resource samples spanning the operation. The current metadata and [benchmark guide](../../scripts/benchmarks/README.md#clustered-baseline) incorrectly label the elapsed sample as starting at readiness. | It reads and acknowledges only the earliest record; one size and one sample per invocation do not establish a growth curve or isolate restart, readiness, replay, and acknowledgement costs. It does not test retention or attribute peak memory to recovery. |
+| [`retained_hot_path`](../../scripts/benchmarks/cluster_scenarios.py#L367) preloads a selected history and measures later durable publishes | The clustered publish path has a repeatable post-preload hot-path baseline with retained-count and logical-payload-byte metadata. | Consume/replay cost, state serialization cost, retention, storage amplification, or performance beyond selected history and payload sizes. |
 
 The clustered probes record workload and resource metadata, but the repository
 does not yet provide a dedicated measurement of state-machine apply batch size,
@@ -233,7 +247,9 @@ not evidence that the representation scales.
 
 ## Candidate directions and trade-offs
 
-The following are concrete approaches to evaluate, not requirements:
+The following are concrete implementation approaches to evaluate within ADR
+0023's accepted segmented-retained-state and hidden-identity boundary; they do
+not reopen that decision or select a substrate:
 
 | Direction | Potential benefit | Costs and proof obligations |
 | --- | --- | --- |
@@ -284,23 +300,29 @@ following on the intended clustered workload envelope:
   compaction, and interrupted cleanup at the selected durability boundary.
 - A current retained-history fixture recovers with exact logical equality,
   including opaque payload bytes, key/timestamp, logical offset, request-ID
-  deduplication, consumer progress, attempts, and in-flight fencing.
+  deduplication, consumer progress, configured policy versions, pinned
+  per-offset delivery policies, attempts, and in-flight fencing.
 - The public engine and protocol contracts do not expose physical extents,
   materialization, consensus indexes, or storage paths.
 - A consequential format or semantics choice is captured in an ADR before a
   production implementation, and migration/replacement behavior is addressed
   separately from an experimental fixture.
 
-Until these gates are met, retain the current inspectable state machine and
-treat external payload storage, extent manifests, caches, and embedded
-databases as competing hypotheses. Do not mark TD-010 retired because a
-benchmark exists or because snapshot serialization has fewer transient clones.
+Until these gates are met, retain the current inspectable state machine as the
+baseline. Treat extent formats, index and manifest encoding, transaction
+substrates, and cache policy as implementation hypotheses within ADR 0023's
+accepted logical-identity and segmented-retained-state boundary. Do not mark
+TD-010 retired because a benchmark exists or because snapshot serialization
+has fewer transient clones.
 
 ## Refactor and planning assessment
 
-No safe runtime refactor is included in this evidence-only change. The current
-`StateMachineStore` and journal boundaries are explicit enough to measure, and
-introducing payload-reference abstractions before their crash and retention
-contract is accepted would add compatibility surface without retiring TD-010.
-The snapshot lifecycle remains intentionally tracked by TD-009; no new
-tech-debt item is needed.
+No runtime refactor is included in this evidence-only refresh. The current
+`StateMachineStore` and journal boundaries are explicit enough to measure;
+introducing payload-reference abstractions before the accepted high-level
+architecture has evidence-backed format, crash-ordering, retention-cleanup,
+and recovery contracts would add compatibility surface without retiring
+TD-010. TD-009 still owns snapshot cost and crash evidence. This review records
+the recovery-scenario result-label defect under [TD-011](../tech-debt.md#td-011-end-to-end-benchmark-coverage-is-incomplete);
+the existing TD-010 and backlog outcome cover retained-state growth, so no
+additional planning record is needed.
