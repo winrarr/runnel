@@ -1,10 +1,10 @@
 # TD-008 static-cluster evidence and retirement gates
 
 - Status: scoped evidence review; no runtime or compatibility decision
-- Last reviewed: 2026-09-06
-- Baseline: `origin/main` `1619035024efbac1aa2b6ea623d0477e8b46c511`
-- Scope: the current three-node Multi-Raft slice and the outcome evidence needed before membership, placement, or replica replacement can be treated as supported
-- Related: [TD-008](../tech-debt.md#td-008-distributed-raft-backend-is-an-early-static-cluster-implementation), [ADR 0004](../decisions/0004-multi-raft-first-distributed-engine.md), [ADR 0006](../decisions/0006-separate-metadata-and-data-groups.md), [ADR 0018](../decisions/0018-safe-replica-recovery-boundary.md), and [ADR 0023](../decisions/0023-independent-retained-storage-and-placement.md)
+- Last reviewed: 2026-09-29
+- Baseline: `origin/main` `c1d0766cd0ac3e844e9763e261cebc03d539cd3a`
+- Scope: the current static Multi-Raft slice and the outcome evidence needed before membership, placement, or replica replacement can be treated as supported
+- Related: [TD-008](../tech-debt.md#td-008-distributed-raft-backend-is-an-early-static-cluster-implementation), [ADR 0004](../decisions/0004-multi-raft-first-distributed-engine.md), [ADR 0006](../decisions/0006-separate-metadata-and-data-groups.md), [ADR 0007](../decisions/0007-snapshot-based-replica-recovery.md), [ADR 0015](../decisions/0015-clustered-shared-consumer-ownership.md), [ADR 0018](../decisions/0018-safe-replica-recovery-boundary.md), [ADR 0019](../decisions/0019-clustered-storage-identity.md), [ADR 0023](../decisions/0023-independent-retained-storage-and-placement.md), and [ADR 0027](../decisions/0027-consumer-scoped-retry-policy.md)
 
 This note makes the current clustered evidence legible and separates it from
 the production outcomes that TD-008 still lacks. It does not authorize a
@@ -17,20 +17,23 @@ topology concept. Code and tests at the baseline remain authoritative.
 
 | Area | Evidence in the baseline | What that evidence does not establish |
 | --- | --- | --- |
-| Group topology | `GroupManager` opens one metadata group and lazily opens one data group per stream. Each newly initialized group uses the configured peer map as its membership. [`group_manager.rs`](../../crates/runnel-raft/src/group_manager.rs#L112-L182) [`group_manager.rs`](../../crates/runnel-raft/src/group_manager.rs#L369-L427) | The configured peer map is not a dynamic membership authority. There is no supported add, remove, learner, promotion, or replacement lifecycle. |
-| Stream lifecycle | Metadata records `Creating`; the configured nodes prepare the data group, the group initializes its stream state, and metadata is then activated. Retries can reconcile an already-created state. [`group_manager.rs`](../../crates/runnel-raft/src/group_manager.rs#L358-L427) [ADR 0006](../decisions/0006-separate-metadata-and-data-groups.md) | Metadata and data-group activation are not one atomic transaction. The current path does not cover membership or placement changes during creation. |
-| Topology-free access | Requests may enter any node. The engine resolves the relevant group's leader and forwards to a configured peer, with bounded attempts and no public group or node assignment. [`engine.rs`](../../crates/runnel-raft/src/engine.rs#L888-L1085) [`forwarding.rs`](../../crates/runnel-raft/src/forwarding.rs#L32-L118) | A forwarding timeout can occur after proposal or apply. The provisional protocol does not expose a stage-aware outcome or a general operation-resolution protocol. |
-| Durable messaging path | The data-group state machine applies publishes, consumer progress, attempts, delivery ownership, and dead-letter transitions through the replicated group. Publish request IDs are retained for the current deduplication path. [`state_machine.rs`](../../crates/runnel-raft/src/state_machine.rs#L164-L380) | The current request-ID scope and fingerprint policy are not a final compatibility contract. An unacknowledged client operation can still be ambiguous at the wire boundary. |
-| Process restart and one-node failure | `three_process_cluster_replicates_and_recovers_after_failures` publishes and consumes through different nodes, restarts a follower, stops the leader, continues on a new leader, and observes the committed records. [`cluster_smoke.rs`](../../crates/runnel-server/tests/cluster_smoke.rs#L153-L597) | This is one controlled process scenario, not a complete partition, disk, corruption, delayed-response, or repeated-failure matrix. It does not prove recovery after an empty or inconsistent replica is started with the same voter identity. |
-| Shared-consumer recovery | The cluster tests cover replicated grouped leases and tokens across follower restart, reassignment after node failure, stale-token rejection, and post-rejoin terminal acknowledgement. [`cluster_smoke.rs`](../../crates/runnel-server/tests/cluster_smoke.rs#L599-L908) [`cluster_smoke.rs`](../../crates/runnel-server/tests/cluster_smoke.rs#L910-L1124) | Consumer membership is still transient request state. Durable member registration, graceful leave, bounded churn, and placement-aware rebalancing remain open. |
-| Snapshot recovery | Snapshot chunks are bounded. The opt-in replacement experiment retries interrupted transfers from byte zero and checks that the replacement eventually recovers records, consumer state, and post-recovery leader failure. [`cluster_smoke.rs`](../../crates/runnel-server/tests/cluster_smoke.rs#L1226-L1429) [ADR 0018](../decisions/0018-safe-replica-recovery-boundary.md) | The experiment is test-only. It does not make an erased directory a supported replacement, and it does not provide resumable transfer, promotion, fencing, or an operational recovery procedure. |
-| Identity and storage safety | Clustered storage records cluster and node identity and preflight rejects unsupported or contradictory layouts before opening them. [`engine.rs`](../../crates/runnel-raft/src/engine.rs#L47-L93) [`engine.rs`](../../crates/runnel-raft/src/engine.rs#L804-L846) | Identity validation prevents accidental reuse; it is not membership reconfiguration or proof that a replacement has caught up. |
+| Group topology | `GroupManager` opens the metadata group, restores persisted data groups, and materializes a data group per stream as needed. A newly initialized group takes its voter set from the configured peer map. The accepted initial direction is three static voters, but server configuration requires a nonempty peer list containing the local node and does not enforce exactly three; the process tests below use three nodes. [`group_manager.rs`](../../crates/runnel-raft/src/group_manager.rs#L94-L181) [`group_manager.rs`](../../crates/runnel-raft/src/group_manager.rs#L184-L215) [`group_manager.rs`](../../crates/runnel-raft/src/group_manager.rs#L358-L433) [`bootstrap.rs`](../../crates/runnel-server/src/bootstrap.rs#L101-L122) [`bootstrap.rs`](../../crates/runnel-server/src/bootstrap.rs#L158-L178) [ADR 0004](../decisions/0004-multi-raft-first-distributed-engine.md) | The peer map is static runtime configuration, not a supported membership authority or reconfiguration API. OpenRaft membership is persisted in group state, but there is no supported add, remove, learner, promotion, or replacement lifecycle. |
+| Stream lifecycle | The metadata group records `Creating`; the manager prepares the stream data group on each configured peer, initializes it with that same peer set, initializes the stream state, then records `Active`. Retried creation resumes this idempotent reconciliation path. [`group_manager.rs`](../../crates/runnel-raft/src/group_manager.rs#L358-L433) [ADR 0006](../decisions/0006-separate-metadata-and-data-groups.md) | Metadata and data-group activation are separate replicated transitions, not one atomic transaction. A partial create is retryable, but the path does not coordinate membership or placement changes during creation. |
+| Topology-free access | Requests can enter any configured broker node. The engine resolves the operation's group leader and forwards to a configured peer; forwarding has bounded attempts and per-RPC timeouts, and group/node assignment remains internal. [`engine.rs`](../../crates/runnel-raft/src/engine.rs#L971-L1204) [`forwarding.rs`](../../crates/runnel-raft/src/forwarding.rs#L10-L119) | A forwarding timeout can occur after proposal or apply. The provisional protocol does not expose a stage-aware outcome or a general operation-resolution protocol. |
+| Durable messaging path | Data-group state includes retained messages, ordinary consumer progress, grouped progress and out-of-order acknowledgements, per-consumer retry policy, attempts, in-flight member ownership and tokens, a replicated lease-clock floor, request-ID deduplication, and dead-letter counters. Applied state is journaled before materialization; checkpoints and full state-machine snapshots provide recovery inputs. [`state_machine.rs`](../../crates/runnel-raft/src/state_machine.rs#L195-L211) [`state_machine.rs`](../../crates/runnel-raft/src/state_machine.rs#L296-L335) [`delivery.rs`](../../crates/runnel-raft/src/delivery.rs#L11-L33) [`state_machine_store.rs`](../../crates/runnel-raft/src/state_machine_store.rs#L438-L475) [`state_machine_store.rs`](../../crates/runnel-raft/src/state_machine_store.rs#L710-L750) | Request IDs are currently scoped per stream and map to an offset without a stored payload fingerprint; conflict handling is not a final compatibility contract. An unacknowledged client operation can still be ambiguous at the wire boundary. |
+| Process restart and one-node failure | `three_process_cluster_replicates_and_recovers_after_failures` publishes and consumes through different nodes, retries a publish ID, restarts a follower with its state, stops the leader, continues through the new leader, and observes later records. The separate group-delivery failure test also restarts a failed node and checks terminal acknowledgement after rejoin. [`cluster_smoke.rs`](../../crates/runnel-server/tests/cluster_smoke.rs#L153-L597) [`cluster_smoke.rs`](../../crates/runnel-server/tests/cluster_smoke.rs#L927-L1239) | These are controlled three-process scenarios, not a complete partition, disk, corruption, delayed-response, or repeated-failure matrix. The empty-directory case is covered only by the separately gated experiment below, not by the default restart path. |
+| Shared-consumer recovery | `three_process_cluster_preserves_group_delivery_through_replica_restart` checks durable grouped leases and tokens across follower restart, out-of-order acknowledgement, expired-token rejection, redelivery, and durable progress after another restart. `three_process_cluster_reassigns_group_delivery_after_node_failure` covers reassignment after leader failure, stale-token rejection, and terminal acknowledgement after rejoin. [`cluster_smoke.rs`](../../crates/runnel-server/tests/cluster_smoke.rs#L599-L925) [`cluster_smoke.rs`](../../crates/runnel-server/tests/cluster_smoke.rs#L927-L1239) [`delivery.rs`](../../crates/runnel-raft/src/delivery.rs#L11-L33) | Delivery ownership for a member is persisted only while an offset is in flight; there is no separate durable member registration, incarnation, graceful-leave, churn, or placement-aware rebalance protocol. |
+| Snapshot recovery | Snapshots compact consensus history while retaining the complete materialized group state; the current policy snapshots after 32 log entries, keeps a four-entry suffix, and caps peer chunks at 64 KiB. The explicitly enabled replacement experiment interrupts transfer repeatedly and checks retained records, consumer progress, metrics, subsequent failover, and process liveness. [`group_manager.rs`](../../crates/runnel-raft/src/group_manager.rs#L23-L31) [`state_machine_store.rs`](../../crates/runnel-raft/src/state_machine_store.rs#L710-L750) [`cluster_smoke.rs`](../../crates/runnel-server/tests/cluster_smoke.rs#L1242-L1443) [`justfile`](../../justfile#L47-L51) [ADR 0007](../decisions/0007-snapshot-based-replica-recovery.md) [ADR 0018](../decisions/0018-safe-replica-recovery-boundary.md) | The experiment requires `test-replacement-recovery`, which enables permissive follower-log rollback only for this test. It exercises one empty directory with the same voter ID, but does not make that an allowed operator replacement procedure or provide resumable transfer, promotion, fencing, or an operational recovery process. [`runnel-raft/Cargo.toml`](../../crates/runnel-raft/Cargo.toml#L1-L12) [`cluster_smoke.rs`](../../crates/runnel-server/tests/cluster_smoke.rs#L1242-L1245) |
+| Identity and storage safety | `storage.json` records format version, cluster name, and node ID; startup rejects mismatched identity, legacy layout, missing identity on existing clustered data, malformed or contradictory group manifests, and invalid persisted Raft/state-machine structures before opening groups. [`engine.rs`](../../crates/runnel-raft/src/engine.rs#L40-L110) [`engine.rs`](../../crates/runnel-raft/src/engine.rs#L887-L929) [`group_manager.rs`](../../crates/runnel-raft/src/group_manager.rs#L671-L757) [`state_machine_store.rs`](../../crates/runnel-raft/src/state_machine_store.rs#L680-L700) [`log_store.rs`](../../crates/runnel-raft/src/log_store.rs#L93-L95) [`group_manager.rs`](../../crates/runnel-raft/src/group_manager.rs#L839-L872) [`lib.rs`](../../crates/runnel-raft/src/lib.rs#L1638-L1692) [`lib.rs`](../../crates/runnel-raft/src/lib.rs#L2093-L2116) [ADR 0019](../decisions/0019-clustered-storage-identity.md) | This guards a persisted directory against configured cluster/node mismatches; it is not a node-incarnation or membership transition. A new empty directory can initialize with an existing node ID, and identity validation does not prove that its data is caught up or safe to serve. |
 
-The strongest current conclusion is therefore narrow: a configured three-node
-cluster is a useful correctness baseline for replicated stream operations,
-leader failover, preserved-state restart, and an explicitly experimental
-snapshot transfer. It is not evidence for elastic capacity, automatic
-placement, or replacing a lost replica.
+The strongest current conclusion is therefore narrow: the configured-peer
+static Multi-Raft slice is a useful correctness baseline. Current real-process
+evidence uses three nodes and covers replicated stream operations, leader
+failover, preserved-state restart, and an explicitly experimental snapshot
+transfer. The test topology does not establish a universal three-node engine
+invariant or failure tolerance for other peer counts. It is not evidence for
+elastic capacity, automatic placement, or supported replacement of a lost
+replica.
 
 ### Accepted constraints and deliberate limits
 
@@ -40,18 +43,33 @@ placement, or replacing a lost replica.
 - [ADR 0006](../decisions/0006-separate-metadata-and-data-groups.md) accepts a
   reconciled stream lifecycle and keeps group and placement identities out of
   the public model.
+- [ADR 0007](../decisions/0007-snapshot-based-replica-recovery.md) accepts
+  snapshot-based consensus-history compaction and recovery mechanics, while
+  leaving snapshot tuning and resumable transfer unfinished.
+- [ADR 0015](../decisions/0015-clustered-shared-consumer-ownership.md) accepts
+  replicated delivery leases, tokens, attempts, and progress; it does not add
+  durable consumer-member registration.
+- [ADR 0027](../decisions/0027-consumer-scoped-retry-policy.md) accepts a
+  durable consumer-scoped retry policy that is applied through the same
+  replicated data-group state.
 - [ADR 0018](../decisions/0018-safe-replica-recovery-boundary.md) keeps empty
   replica recovery test-only until a controlled replacement lifecycle exists.
+- [ADR 0019](../decisions/0019-clustered-storage-identity.md) requires
+  clustered storage identity to fail closed on mismatches; this local marker
+  does not record a node incarnation or membership transition.
 - [ADR 0023](../decisions/0023-independent-retained-storage-and-placement.md)
   accepts hidden movable placement units as a future boundary while leaving
   their mapping, replication engine, and split policy undecided.
 
 The [Raft follower recovery and replacement research](../research/raft-recovery-and-replacement.md)
-provides the relevant external comparison. OpenRaft's documented follower-log
-rollback warning supports keeping permissive rollback out of the default
-build; Kafka, Redpanda, and learner-based reconfiguration designs support
-treating normal restart and controlled replacement as separate operations.
-Those sources inform the gates below but do not define Runnel's protocol.
+records the relevant external comparison and distinguishes a three-process
+development profile from an engine-wide topology invariant. That note's source
+baseline predates this review, so the implementation claims above were checked
+against this document's baseline. OpenRaft's documented follower-log rollback
+warning supports keeping permissive rollback out of the default build; Kafka,
+Redpanda, and learner-based reconfiguration designs support treating normal
+restart and controlled replacement as separate operations. Those sources
+inform the gates below but do not define Runnel's protocol.
 
 ## Inferences and recommendations
 
@@ -59,19 +77,22 @@ Those sources inform the gates below but do not define Runnel's protocol.
 
 The safest dependency order is:
 
-1. establish a supported recovery/replacement boundary for one existing data
-   group;
-2. establish durable membership transitions and their failure semantics;
-3. introduce placement movement or splitting only after the first two are
-   independently proven;
+1. define and prove a supported recovery/replacement boundary for an existing
+   data group, including the identity and membership transitions that keep a
+   replica non-authoritative until validated catch-up;
+2. define the failure semantics and quorum boundary for those transitions;
+3. introduce placement movement or splitting only after recovery and
+   membership safety are proven;
 4. measure group density, skew, recovery cost, and resource bounds before
    replacing one-group-per-stream placement.
 
 This is a recommendation from the observed coupling between group membership,
-snapshot recovery, and stream placement. It is not an implementation task
-list. Placement work that starts before replacement and fencing are defined
-would make a lost-replica recovery problem depend on an additional movement
-protocol.
+snapshot recovery, and stream placement. The recovery and membership items are
+related outcomes, not independent prerequisites: replacement cannot make a
+replica authoritative before its identity, catch-up, and fencing boundary is
+defined. This is not an implementation task list. Placement work that starts
+before replacement and fencing are defined would make a lost-replica recovery
+problem depend on an additional movement protocol.
 
 ### Keep application intent stable
 
@@ -173,28 +194,40 @@ of liveness.
 ## Retirement recommendation
 
 TD-008 remains open. The current evidence is sufficient to keep the static
-three-node backend as a development and correctness baseline, but not to
-claim production-grade clustering. The next implementation decision should
-select and test one controlled replacement lifecycle (M1–M4 and R1–R4) before
-attempting dynamic placement (P1–P4). The existing backlog outcomes for
+peer-map backend as a development and correctness baseline, but not to claim
+production-grade clustering. The three-process tests are evidence for that
+configured test topology, not proof of a fixed engine-wide voter count. The
+next implementation decision should define and test one controlled replacement
+lifecycle, including identity, membership, catch-up, and fencing transitions
+(M1–M4 and R1–R4), before attempting dynamic placement (P1–P4). The existing
+backlog outcomes for
 membership/failover, placement, storage growth, overload, compatibility,
 security, and observability remain separate retirement work; passing the
 current cluster smoke test cannot close them collectively.
 
 ## Refactor and planning assessment
 
-The touched implementation was reviewed at the `GroupManager`, forwarding,
-state-machine, and real-process test boundaries. No safe local refactor is
-included: the apparent extractions—a durable membership authority, a
-replacement state machine, and a placement map—are the substantive design
-changes already owned by TD-008 and the related backlog/ADR records. Splitting
-them out now would create an unaccepted abstraction rather than reduce risk.
+The current `GroupManager`, forwarding, state-machine, and real-process test
+boundaries were reviewed. No independent local refactor is identified: a
+durable membership authority, a replacement lifecycle, and a placement map
+would each be substantive design changes already owned by TD-008 and the
+related backlog/ADR records. Introducing part of one during an evidence refresh
+would create an unaccepted boundary rather than reduce risk.
+
+No backlog or tech-debt update is needed. TD-008 and its linked outcomes
+already capture the unfinished membership, replacement, placement, storage,
+and observability work; this refresh updates observed evidence without
+retiring or expanding those commitments.
 
 ## Verification
 
-This update changes documentation only. The focused evidence gate is the
-existing `just isolated cluster-test` real-process workflow plus
-`cargo test -p runnel-raft`; no benchmark result is implied by this note.
+This refresh changes documentation only. It was checked with `git diff
+--check` and a local Markdown path/fragment scan. No runtime tests, cluster
+tests, or benchmarks were run for this document update. The linked default
+three-process evidence is in `cluster_smoke`; `just cluster-test` is the
+documented real-process workflow, while `just cluster-replacement-test` is the
+separate opt-in experiment and does not establish a supported replacement
+contract.
 
 ## Sources
 
