@@ -1,11 +1,12 @@
 # Clustered durability and outcome contract
 
-- Status: proposed design note; not an accepted wire or compatibility decision
+- Status: proposed target only; this note accepts no general outcome or wire
+  contract. ADR 0027 separately accepts consumer retry policy.
 - Date: 2026-09-03
-- Last reviewed: 2026-09-06
-- Baseline: `190758439fc240808795398d57c6d75a0416f807`
+- Last reviewed: 2026-09-29
+- Baseline: `4cb11ab3ef0b4ff956c729d1ada1a21066bd0cfd`
 - Scope: clustered writes, leader forwarding, client retry boundaries, and the evidence required to make those behaviors public
-- Related work: [clustered durability and outcomes backlog item](../backlog.md#make-clustered-durability-and-outcomes-explicit), [current architecture](../architecture.md), [distributed architecture research](../research/distributed-architecture-options.md), [Multi-Raft implementation plan](multi-raft-implementation-plan.md), [durability and delivery policy](durability-delivery-policy.md), [application-aware retry policy](application-aware-retry-policy.md), [Raft recovery research](../research/raft-recovery-and-replacement.md), [protocol compatibility design](protocol-compatibility.md), and [ADR 0026](../decisions/0026-semantic-engine-error-classification.md)
+- Related work: [clustered durability and outcomes backlog item](../backlog.md#make-clustered-durability-and-outcomes-explicit), [current architecture](../architecture.md), [distributed architecture research](../research/distributed-architecture-options.md), [Multi-Raft implementation plan](multi-raft-implementation-plan.md), [durability and delivery policy](durability-delivery-policy.md), [application-aware retry policy](application-aware-retry-policy.md), [Raft recovery research](../research/raft-recovery-and-replacement.md), [protocol compatibility design](protocol-compatibility.md), [ADR 0026](../decisions/0026-semantic-engine-error-classification.md), [ADR 0027](../decisions/0027-consumer-scoped-retry-policy.md), and [TD-025](../tech-debt.md#td-025-shared-engine-errors-expose-implementation-specific-failure-details)
 
 This note turns the current clustered implementation and the remaining durability backlog into an implementation-ready semantic target. It does not change the runtime, protocol, backlog, or compatibility policy. In particular, the line-delimited JSON protocol remains provisional v1, and no field or error code proposed below is accepted for v1 without a separate compatibility decision. Example fields, stage names, state transitions, and test gates are illustrative outcome requirements, not an accepted API, module layout, storage format, or implementation sequence.
 
@@ -62,11 +63,11 @@ themselves establish the proposed public guarantee:
 
 | Layer | Current behavior | Contract consequence |
 | --- | --- | --- |
-| `runnel-engine` | Operations return `Result<T, BrokerError>`. `BrokerError::kind()` provides a stable semantic reason and `BrokerError::outcome()` classifies failures as rejected, retryable, or unknown; successful results are confirmed at the engine boundary. Concrete variants and diagnostic sources remain available. | The engine has a backend-independent outcome boundary, but it does not expose operation stage or a universal durability point. A caller must not treat a `BrokerError` variant or its text as stage evidence. |
-| `runnel-raft` | Stream and consumer mutations use OpenRaft `client_write`; the backend opens one metadata group and one data group per stream, with each initialized group using the configured peer map as its membership. The three-process tests use three voters, but startup accepts any non-empty configured peer set and has no dynamic membership lifecycle. | A successful mutation is intended to mean committed and applied, not merely accepted by a follower. Quorum size and failure tolerance must be stated for the configured membership rather than inferred from the development topology. |
-| Durable storage | The custom Raft log uses an atomic replacement whose file and parent directory are synced. The state-machine apply journal is synced with `sync_data` before in-memory application; checkpoints and snapshots are atomically replaced, and snapshots include retained messages, consumer state, and deduplication state. | Recovery must test both the consensus record and the materialized broker state. Filesystem and hardware flush semantics remain an explicit assumption. |
-| Server/protocol | v1 returns `Published` or an error with `code` and `message`; `NotLeader` is mapped to `cluster_error`. | v1 does not expose authoritative outcome classes or a commit/apply stage. Generic `cluster_error` cannot safely drive automatic retry, even though the engine can classify an internal `NotLeader` as retryable. |
-| Client | A successful response is `Confirmed`; local encoding errors are `Rejected`; pre-connect failures are `Retryable`; write/read/EOF/timeout failures after request work begins are `Unknown`. No automatic replay is performed. | This is a useful v1 client safety baseline, but the broker must eventually provide the evidence needed to resolve unknowns. |
+| `runnel-engine` | `BrokerError::kind()` and `BrokerError::outcome()` provide a backend-independent reason and `Rejected`/`Retryable`/`Unknown` classification; a successful `Result` is the confirmed engine result. `NotLeader` and `StreamNotReady` classify as retryable, while generic cluster failures remain unknown. | This boundary does not report proposal, commit, apply, or response stage. The classification is not serialized on the wire; variants and error text are not stage evidence. |
+| `runnel-raft` | `PersistentEngine` routes operations to each metadata or stream data-group leader. Mutations call OpenRaft `client_write`; client forwarding preserves the operation fields, including publish `request_id`. Membership is initialized from the configured peer map; there is no dynamic membership lifecycle. | A successful `client_write` result includes the state-machine response, but the engine does not return a stage record. Three-process tests exercise three configured voters; that profile does not establish a universal membership or availability guarantee. |
+| Durable storage | The Raft log is atomically replaced with file and parent-directory syncs. State-machine apply appends and `sync_data`s the journal entry before applying it in memory. Checkpoints and snapshots are atomically replaced; snapshots contain retained messages, consumer state, and publish deduplication state. Snapshot install/reopen and process-restart paths have coverage, but there is no crash injection at each commit/apply/response boundary. | Recovery must cover the consensus record and materialized state. The flush guarantee still depends on the filesystem and device honoring sync operations. |
+| Server/protocol | The provisional JSON-lines protocol returns successful operation responses or `{code, message}` errors. `NotLeader` and generic cluster errors map to `cluster_error`. Consumer-policy operations are current v1 operations under ADR 0027; the canonical Rust request fixtures pin their JSON fields and optional-field behavior. | The wire carries no authoritative outcome class or commit/apply stage. The client treats `cluster_error` as unknown, even when the underlying engine error is `NotLeader`. The fixtures do not establish cross-language compatibility or clustered outcome behavior. |
+| Client | `AttemptOutcome` classifies non-error responses as confirmed and local encoding errors as rejected. Pre-request connection failures are retryable. The static server-code map also treats `connection_limit`, `request_saturated`, and `stream_not_ready` as retryable; `cluster_error`, `request_timeout`, and connection failures after request work may have started are unknown. The client does not automatically replay requests. | v1 exposes a conservative attempt classification to the caller, not a negotiated broker outcome. Retryability for those named codes is a client mapping, not proof that all cluster failures are safe to retry. |
 
 The target success point for a mutating operation in one data group is:
 
@@ -88,7 +89,7 @@ The future protocol should distinguish two concepts:
 - `correlation_id` identifies one wire attempt and response exchange. A new connection, retry, or forwarding hop may use a new correlation ID. It is not a deduplication key.
 - A stable `operation_id` identifies one application intent across client retries, leader changes, and internal forwarding. Every hop carries the same operation ID. Its scope must include an authenticated or otherwise collision-resistant producer namespace, operation kind, and target stream/group.
 
-The current optional v1 `request_id` exists only on publish requests, is not echoed, and is currently stored as a raw per-stream key. The current clustered state returns the old offset when the same ID is reused, even if the new key or payload differs; it has no producer namespace or retention policy. That behavior is observed compatibility, not the target contract. The future contract must persist the original request fingerprint and return a definitive `request_id_conflict`-style rejection for a reused identity with different intent. The exact name, scope, retention, and authentication of the identity are unresolved and require the compatibility/ADR process.
+The current optional v1 `request_id` exists only on publish requests, is not echoed, and is stored as a raw per-stream key. Cluster forwarding carries it unchanged. Reusing an ID returns the prior offset without comparing the new key or payload; the ID has no producer namespace or retention policy. `three_process_cluster_replicates_and_recovers_after_failures` sends the same ID, key, and payload through different nodes and observes offset `0`, but does not test conflicting reuse. That behavior is observed compatibility, not the target contract. The future contract must persist the original request fingerprint and return a definitive `request_id_conflict`-style rejection for a reused identity with different intent. The exact name, scope, retention, and authentication of the identity are unresolved and require the compatibility/ADR process.
 
 The deduplication record must contain enough durable information to reproduce the original result, such as the operation fingerprint, terminal outcome, offset or delivery result, and expiry/retention metadata. It must be included in snapshots and replacement recovery. Once the record expires or is compacted, the safe replay guarantee expires with it and the client must be told how to handle that boundary. Unbounded per-stream identity maps are not an acceptable long-term storage design.
 
@@ -104,15 +105,17 @@ Each forwarded request should carry:
 - an absolute deadline or remaining budget;
 - enough group/term context for diagnostics, without exposing topology in the public response.
 
-The current implementation makes up to three leader-refresh rounds, each with a
-two-second timeout per peer call. Each round can try every configured peer
-other than the receiving node, so the total number of forwarding calls can
-exceed three. This is liveness behavior, not a safety boundary: a timeout can
-occur after the target leader has committed, and retrying the same mutation is
-safe only when durable identity makes it idempotent. A future forwarding layer
-should return the leader’s definitive response when possible, and otherwise
-preserve `unknown` through the public boundary. `NotLeader` and peer transport
-errors should not be exposed as a promise that the command was not applied.
+The current `ClientForwarder` makes up to three rounds. In each round it tries
+the known leader first, then every other configured peer except the receiving
+node; each peer call has a two-second timeout. The total calls can therefore
+exceed three, and there is no single end-to-end forwarding deadline. A peer's
+`NotLeader` response refreshes the preferred leader for the next attempt. This
+is liveness behavior, not a safety boundary: a timeout or exhausted forwarding
+attempts can occur after the target leader has committed, and the client sees
+a generic `cluster_error`. Retrying the same mutation is safe only when durable
+identity makes it idempotent. A future forwarding layer should return the
+leader’s definitive response when possible and otherwise preserve `unknown`
+through the public boundary.
 
 ## Retry boundaries
 
@@ -129,7 +132,7 @@ The boundary must be based on what the broker can prove, not on which socket exc
 | Leader or peer dies after proposal, including a forwarding timeout | The command may be committed on the old or new leader. | `unknown` unless the broker proves non-application. | Retry only with the same operation ID, or surface the ambiguity. |
 | Server returns an explicit stage-aware error | The broker supplies authoritative evidence. | The encoded class (`rejected`, `retryable`, or `unknown`) | Follow that class; do not reinterpret a generic transport code. |
 
-The current server uses `request_timeout` for both incomplete frame and engine timeout paths, and maps consensus failures to `cluster_error`. Until v2 can carry an outcome class, the client’s existing classification is the conservative compatibility behavior: only clearly pre-request failures are retryable; server execution and connection failures are unknown. A generic `cluster_error` must not become an automatic retry instruction.
+The current server uses `request_timeout` for incomplete frames and timed-out engine work, and maps consensus failures to `cluster_error`. Its client maps `connection_limit`, `request_saturated`, and `stream_not_ready` to retryable, maps `cluster_error` and `request_timeout` to unknown, and does not automatically replay. Until a versioned protocol carries authoritative outcomes, a generic `cluster_error` must not become an automatic retry instruction.
 
 Retries are for the same intent, not merely the same payload. A client should use a new correlation ID for each attempt and reuse the stable operation ID. If no stable identity was supplied for a non-idempotent publish, the client must choose between possible duplication and possible loss; the library must not hide that choice.
 
@@ -163,7 +166,7 @@ Consumer delivery remains at least once. Group ownership, attempts, deadlines, t
 
 ## Observability
 
-The current server metrics cover request totals, failures, durations, bytes, health, stream operations, and snapshot activity. They do not distinguish quorum commit, state-machine apply, forwarding, deduplication, or client-visible ambiguity. An implementation of this contract should add low-cardinality evidence at both server and client boundaries:
+The current server metrics cover request totals, failures, durations, bytes, health, stream operations, snapshot activity, request timeouts, and response-write timeouts. They do not distinguish quorum commit, state-machine apply, forwarding, deduplication, or client-visible ambiguity. The client exposes `AttemptOutcome` to callers but does not publish outcome metrics. An implementation of this contract should add low-cardinality evidence at both server and client boundaries:
 
 - `operations_total{operation,outcome,reason}` for confirmed, rejected, retryable, and broker-observed unknown results;
 - proposal, quorum-commit, state-apply, response-write, and response-loss counters, with histograms for proposal-to-commit, commit-to-apply, and end-to-end confirmed latency;
@@ -171,7 +174,7 @@ The current server metrics cover request totals, failures, durations, bytes, hea
 - group health/readiness and aggregate committed/applied indexes or replication lag, without putting stream names, request IDs, payload hashes, or delivery tokens in metric labels;
 - structured logs or traces carrying correlation ID, a redacted operation hash, group identity, and internal term/index only where access is appropriate.
 
-The server cannot know whether a disconnected client classified an attempt as unknown. It should report `response_lost` or `response_write_timeout`, not pretend to count client outcomes. The client should record unknown attempts, resolution attempts, retry decisions, and whether a deduplication receipt was returned. Readiness should eventually expose whether the groups required for a durable workload have a leader and quorum; metadata readiness alone is insufficient evidence for every data stream.
+The server cannot know whether a disconnected client classified an attempt as unknown. It currently counts response-write timeouts, but does not report a general response-loss outcome. It should report observable response-write failures without pretending to count client outcomes. The client should record unknown attempts, resolution attempts, retry decisions, and whether a deduplication receipt was returned. Readiness should eventually expose whether the groups required for a durable workload have a leader and quorum; metadata readiness alone is insufficient evidence for every data stream.
 
 ## Required implementation and test gates
 
@@ -194,7 +197,9 @@ The following gates are required before this becomes a public guarantee. Tests m
 
 ### Required real-process public tests
 
-Extend the existing three-process cluster coverage to include:
+The baseline already covers parts of the first and fifth scenarios; those
+tests do not establish the unknown-outcome resolution guarantees in the other
+scenarios. Extend the real-process coverage to include:
 
 1. Publish through a follower, stop one node, restart it, and read the confirmed record through the new leader.
 2. Lose quorum before proposal and assert `retryable` with no record; restore quorum and retry.
@@ -204,7 +209,38 @@ Extend the existing three-process cluster coverage to include:
 6. Verify request-ID conflict, per-record batch ambiguity, restart recovery, and absence of topology/storage paths from public responses.
 7. Assert outcome, response-loss, forwarding, commit/apply, dedup, and quorum-health metrics for the corresponding scenarios.
 
-`just cluster-test` already covers follower forwarding, quorum replication, leader failure, restart, grouped delivery, stale tokens, and dead-letter behavior. The local real-server [request-ID response-loss test](../../crates/runnel-server/tests/client_retry.rs) demonstrates conservative `unknown` classification and single-node deduplication, but the cluster tests do not yet combine post-commit response loss with clustered resolution. The public four-outcome contract, pre-proposal no-quorum classification, generic operation identity, and outcome metrics also remain unestablished. `just verify` owns the real-process cluster smoke test in the normal verification path; `just integration` covers the separate process/container integration sequence. These commands should remain the canonical gates as the tests are added.
+`three_process_cluster_replicates_and_recovers_after_failures` covers public
+follower forwarding, a follower restart, leader failure, and replicated
+post-failure publishing in the three-process setup. The
+`three_process_cluster_preserves_group_delivery_through_replica_restart` and
+`three_process_cluster_reassigns_group_delivery_after_node_failure` tests
+cover grouped delivery state, fencing, and recovery. The
+`three_process_cluster_transfers_consumer_policy_and_delivery_snapshot_after_leader_failure`
+test verifies consumer-policy inspection and a pinned delivery policy after
+leader replacement. Its helper identifies the data-group leader with a
+read-only `InspectConsumer` probe over the peer listener because the public
+request path forwards to the leader; the test assertions use public requests.
+None intentionally drops a clustered write, poll, or acknowledgement
+response after commit and resolves it through another node.
+
+The real-server [request-ID response-loss test](../../crates/runnel-server/tests/client_retry.rs)
+demonstrates conservative `unknown` classification and deduplication only for
+a single-node publish. The cluster tests do not yet establish post-commit
+response-loss resolution, no-quorum-before-proposal classification, conflicting
+request-ID rejection, or a generic operation identity. Existing server metrics
+cover request behavior and response-write timeouts, but outcome, forwarding,
+deduplication, commit/apply, and quorum-health metrics remain unestablished.
+`just verify` owns the real-process cluster smoke test in the normal
+verification path; `just integration` covers the separate process/container
+integration sequence. These remain the canonical gates as coverage is added.
+
+The protocol [wire tests](../../crates/runnel-protocol/tests/wire.rs) now
+include `consumer_policy_request_fixtures_pin_serialization_and_deserialization`,
+which pins the exact `configure_consumer` and `inspect_consumer` request JSON
+and the current `max_delivery_attempts` omission-to-`null` Serde behavior.
+This is evidence for the Rust wire shape only; it does not establish
+cross-language interoperability, a stage-aware outcome, or clustered
+response-loss resolution.
 
 ## Compatibility and rollout boundary
 
@@ -218,8 +254,11 @@ The current v1 line protocol remains unchanged by this design. In v1:
 The accepted engine classification in [ADR 0026](../decisions/0026-semantic-engine-error-classification.md)
 does not change these wire rules. In particular, a `NotLeader` engine error is
 retryable to an engine caller, while v1 still maps it to `cluster_error` and
-the client conservatively treats that response as unknown. Only a future
-versioned response can carry an authoritative outcome class to applications.
+the client treats that response as unknown. The client's retryable mappings
+for `connection_limit`, `request_saturated`, and `stream_not_ready` are also
+static response-code rules rather than a general wire outcome field. Only a
+future versioned response can carry an authoritative outcome class to
+applications.
 
 A future negotiated protocol version may add a response outcome class, per-attempt correlation ID, stable operation identity, fingerprint conflict, and explicit retry/resolution metadata. The wire names, identity scope, retention behavior, batch semantics, and error-code vocabulary require a compatibility decision and interoperability fixtures. Adding fields that old v1 clients ignore is not sufficient if the meaning of an existing response changes. No storage-path, offset-layout, Raft term, or node-placement concept should become public as part of this work.
 
@@ -255,22 +294,33 @@ The implementation should validate these hypotheses rather than silently convert
 - Cancellation of a client future and cancellation of a server-side `client_write` are not the same event. A cancelled request may still commit; tests must cover this boundary.
 - There is currently no authenticated producer namespace or TLS-level identity contract. Collision resistance and malicious reuse of operation IDs remain unresolved until authentication is designed.
 
-This note intentionally does not update the clustered durability backlog: the
-engine classification is an enabling boundary, while the durable operation
-identity, stage-aware responses, and real-process ambiguity gates remain
-unimplemented.
+This note does not update the clustered durability backlog: the durable
+operation identity, stage-aware responses, and real-process ambiguity gates
+remain unimplemented and are tracked in the linked clustered-outcomes backlog
+item and TD-025. ADRs 0026 and 0027 describe accepted engine-error and
+consumer-policy behavior; this proposed target does not change either decision.
 
 ## Evidence and recommendation
 
-Primary evidence class: Contract/semantic. Secondary tags: public-contract, storage/recovery, compatibility.
+Primary evidence class: Design/research. Secondary tag: clustered outcomes.
 
-The engine classification is implemented and has no wire, storage, or
-performance effect. Unit coverage exercises every current error variant, and
-shared contract assertions run against both local and persistent clustered
-engines. Existing real-server retry, timeout, forwarding, restart, and stale
-delivery tests remain the evidence for transport boundaries. The broader
-four-outcome protocol, durable operation identities, stage-aware ambiguity
-resolution, and related metrics remain coverage gaps. Recommendation: retain
-this note as the target for that future protocol work; use the accepted engine
-classification now for backend-independent retry decisions without treating it
-as a public v1 guarantee.
+Source evidence at the baseline is in [`BrokerError::outcome`](../../crates/runnel-engine/src/lib.rs),
+the [`ClientForwarder`](../../crates/runnel-raft/src/forwarding.rs) and Raft
+write paths ([`engine.rs`](../../crates/runnel-raft/src/engine.rs)), and the
+state-machine [journal](../../crates/runnel-raft/src/state_machine_journal.rs)
+and [snapshot store](../../crates/runnel-raft/src/state_machine_store.rs).
+Server evidence is in [error mapping](../../crates/runnel-server/src/dispatch.rs)
+and [metrics](../../crates/runnel-server/src/observability.rs); client
+classification is in the [`AttemptOutcome` mapping](../../crates/runnel-client/src/lib.rs).
+
+Unit coverage classifies engine errors; the real-process tests named above
+cover follower forwarding, replica/leader failures, grouped delivery, and
+policy transfer. The local real-server retry test covers a dropped publish
+response and request-ID resolution only in a single-node engine. Clustered
+ambiguity resolution, no-quorum classification, identity conflicts, and
+stage/outcome metrics remain gaps. Recommendation: retain this as a proposed
+target, and do not treat its outcome vocabulary or wire examples as accepted
+protocol behavior. No runtime refactor is warranted by this documentation
+refresh. No ADR or tracker update is needed: accepted decisions remain aligned,
+and remaining clustered outcome work is already tracked by the linked
+backlog item and TD-025.
