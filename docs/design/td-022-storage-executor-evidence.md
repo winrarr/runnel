@@ -2,8 +2,8 @@
 
 - Status: exploratory evidence note; no executor or concurrency change authorized
 - Last reviewed: 2026-10-02
-- Baseline: `a7726f529883fa5b2869b4507ffdae3a1770cfce`
-- Baseline CI state at run start: the coordinator's exact-head check was in progress; no follow-up baseline CI lookup was made
+- Baseline: `710f370a2525697c1bab7734ab0bd62f8b68fc61`
+- Baseline CI state: PR #349's exact-head Verify, Integration/container smoke, audit, and title checks passed before merge; no separate CI check of the merged baseline was run
 - Scope: local synchronous filesystem work, asynchronous admission, stream ordering, and slow-I/O behavior
 - Related debt: [TD-022](../tech-debt.md#td-022-local-durable-io-has-bounded-async-isolation-but-incomplete-evidence)
 - Related outcome: [Make concurrent broker work scale predictably](../backlog.md#make-concurrent-broker-work-scale-predictably)
@@ -190,7 +190,7 @@ reaches an append to the FIFO after releasing its held read/open. The tests
 exercise network requests, server timeouts, health endpoints, metrics, release,
 and recovery, but not a slow or full storage device:
 
-- [`storage_stall_is_bounded_and_durable_traffic_continues`](../../crates/runnel-server/tests/admission.rs#L1562)
+- [`storage_stall_is_bounded_and_durable_traffic_continues`](../../crates/runnel-server/tests/admission.rs#L1788)
   uses a 500 ms request deadline. It expects the stalled poll and protocol
   health request to time out within one second, readiness and metrics to
   respond within two seconds, and a different stream to publish and poll
@@ -199,12 +199,12 @@ and recovery, but not a slow or full storage device:
   process/admission samples, and omits engine-derived samples until recovery
   ([readiness handler](../../crates/runnel-server/src/observability.rs#L305),
   [metrics fallback](../../crates/runnel-server/src/observability.rs#L344)).
-- [`timed_out_same_stream_waiter_does_not_poison_following_request`](../../crates/runnel-server/tests/admission.rs#L1712)
+- [`timed_out_same_stream_waiter_does_not_poison_following_request`](../../crates/runnel-server/tests/admission.rs#L1938)
   holds one poll in the FIFO, lets a second same-stream request hit its 1.5 s
   timeout, releases the FIFO, and verifies the next poll and health request
   succeed. It demonstrates waiter cleanup, not cancellation of the blocked
   filesystem call.
-- [`storage_stall_shutdown_is_bounded_and_restart_recovers`](../../crates/runnel-server/tests/admission.rs#L1811)
+- [`storage_stall_shutdown_is_bounded_and_restart_recovers`](../../crates/runnel-server/tests/admission.rs#L2037)
   sends SIGTERM while the operation is blocked, then releases the FIFO
   immediately before waiting for process exit. The released-stall shutdown
   completes within two seconds and restart recovers the prior durable publish.
@@ -217,7 +217,7 @@ and recovery, but not a slow or full storage device:
   queued-poll completion and health recovery after FIFO release. Health
   dispatch bypasses the stream lane but blocks on the held stream mutex until
   its one-second health deadline.
-- [`global_storage_admission_is_bounded_observable_and_recovers`](../../crates/runnel-server/tests/admission.rs#L1135)
+- [`global_storage_admission_is_bounded_observable_and_recovers`](../../crates/runnel-server/tests/admission.rs#L1361)
   holds 32 distinct-stream reads in FIFOs and sends 64 candidate polls on
   distinct streams. It observes 32 prompt global-admission `storage_error`
   responses while 32 candidates remain admitted behind 32 running operations.
@@ -432,5 +432,6 @@ remain the same; [ADR 0001](../decisions/0001-single-node-durable-log.md)
 and [ADR 0026](../decisions/0026-semantic-engine-error-classification.md)
 remain the relevant storage and outcome boundaries; [ADR 0020](../decisions/0020-stable-optimization-evidence.md)
 governs any later optimization claim. No runtime tests apply to this
-documentation-only refresh; `git diff --check` passed. No local device-stall,
-process-exit, or benchmark evidence was generated.
+documentation-only refresh; `git diff --check` and focused Markdown
+link/anchor verification passed. No local device-stall, process-exit, or
+benchmark evidence was generated.
