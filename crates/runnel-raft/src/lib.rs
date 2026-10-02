@@ -1009,6 +1009,12 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn single_node_raft_implements_consumer_policy_configuration_contract() {
+        let engine = SingleNodeEngine::new(1).await.unwrap();
+        runnel_test_support::assert_consumer_policy_configuration_contract(&engine).await;
+    }
+
+    #[tokio::test]
     async fn single_node_raft_implements_replay_contract() {
         let engine = SingleNodeEngine::new(1).await.unwrap();
         runnel_test_support::assert_replay_contract(&engine).await;
