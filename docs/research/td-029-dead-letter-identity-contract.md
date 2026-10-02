@@ -2,7 +2,7 @@
 
 - Status: exploratory research; the storage identity contract is not accepted
 - Last reviewed: 2026-10-02
-- Baseline: `906199f88e2b275750a270e33c9e4d213f050740` (includes PRs #346 and #348)
+- Baseline: `6b7178e508c609b4df0a566f8654721f23f36b68` (includes PRs #346 and #348; refreshed across #350, #353, and #359)
 - Related debt: [TD-002](../tech-debt.md#td-002-one-file-and-a-startup-scan-per-local-stream), [TD-017](../tech-debt.md#td-017-dead-letter-movement-spans-separate-durable-records), and [TD-029](../tech-debt.md#td-029-public-request-ids-can-collide-with-local-dead-letter-move-ids)
 - Related design: [Dead-letter recovery across durable boundaries](../design/dead-letter-recovery.md)
 - Related decisions: [ADR 0014](../decisions/0014-local-retry-and-dead-letter-policy.md) and [ADR 0016](../decisions/0016-clustered-retry-and-dead-letter-policy.md)
@@ -57,9 +57,9 @@ upgrade ambiguity needs an explicit compatibility policy before implementation.
   target key and payload also match. Different content returns invalid data and
   leaves source progress unadvanced. Equal content returns the existing
   offset. This distinction is covered by
-  [`dead_letter_move_content_mismatch_is_storage_error_without_acknowledgement`](../../crates/runnel-core/src/lib.rs#L1450)
+  [`dead_letter_move_content_mismatch_is_storage_error_without_acknowledgement`](../../crates/runnel-core/src/lib.rs#L1442)
   and
-  [`dead_letter_move_same_content_public_id_reconciles_after_restart`](../../crates/runnel-core/src/lib.rs#L1489).
+  [`dead_letter_move_same_content_public_id_reconciles_after_restart`](../../crates/runnel-core/src/lib.rs#L1481).
 - The core test injects source-ack persistence failure after a public publish
   used the exact move ID and matching content, then checks recovery and repeated
   reopen. The real-process test

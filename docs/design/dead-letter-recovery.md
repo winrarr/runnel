@@ -2,7 +2,7 @@
 
 - Status: exploratory design note; local reconciliation and both conflicting-content and same-content public-ID wire outcomes are tested, while physical durability, the accepted ID identity contract, and provenance evidence remain open
 - Last reviewed: 2026-10-02
-- Baseline: `906199f88e2b275750a270e33c9e4d213f050740`
+- Baseline: `6b7178e508c609b4df0a566f8654721f23f36b68` (includes PRs #346 and #348; refreshed across #350, #353, and #359)
 - Reading guide: [design-note conventions](README.md)
 - Related debt: [TD-017](../tech-debt.md#td-017-dead-letter-movement-spans-separate-durable-records), [TD-018](../tech-debt.md#td-018-retry-policy-and-dead-letter-provenance-are-coarse), and [TD-029](../tech-debt.md#td-029-public-request-ids-can-collide-with-local-dead-letter-move-ids)
 - Related decisions: [ADR 0014](../decisions/0014-local-retry-and-dead-letter-policy.md), [ADR 0016](../decisions/0016-clustered-retry-and-dead-letter-policy.md), [ADR 0026](../decisions/0026-semantic-engine-error-classification.md), and [ADR 0027](../decisions/0027-consumer-scoped-retry-policy.md)
@@ -43,7 +43,7 @@ the same per-target-stream request-ID index, and the internal value is
 predictable and within the public ID length limit. A public publish using that
 exact ID could therefore collide with a later move. The key/payload mismatch
 case is reproduced by
-[`dead_letter_move_content_mismatch_is_storage_error_without_acknowledgement`](../../crates/runnel-core/src/lib.rs#L1450): a public publish path reserves the exact move ID with different content, and the later move returns an invalid-data error again after reopen instead of advancing source progress. The real-server test [`network_protocol_preserves_public_record_on_dead_letter_move_id_collision_after_restart`](../../crates/runnel-server/tests/server_smoke.rs#L923) now verifies the same mismatch through the wire path: the poll response is classified as `storage_error`, the conflicting public target record remains unchanged, and polling the source after restart still returns the error rather than showing advanced progress. This at-least-once-safe outcome can leave the source delivery blocked until the target conflict is resolved. Matching-content public-ID reuse is also covered by core test [`dead_letter_move_same_content_public_id_reconciles_after_restart`](../../crates/runnel-core/src/lib.rs#L1489) and real-server test [`network_protocol_reconciles_same_content_public_dead_letter_id_after_restart`](../../crates/runnel-server/tests/server_smoke.rs#L1053): after a public publish uses the move ID with matching key and payload, the local retry treats it as the existing move and source progress completes across restart. These tests establish behavior but not move provenance. The typed-identity alternatives and RNL3 upgrade ambiguity are assessed in the [TD-029 dead-letter identity research note](../research/td-029-dead-letter-identity-contract.md); the accepted identity contract remains open in TD-029.
+[`dead_letter_move_content_mismatch_is_storage_error_without_acknowledgement`](../../crates/runnel-core/src/lib.rs#L1442): a public publish path reserves the exact move ID with different content, and the later move returns an invalid-data error again after reopen instead of advancing source progress. The real-server test [`network_protocol_preserves_public_record_on_dead_letter_move_id_collision_after_restart`](../../crates/runnel-server/tests/server_smoke.rs#L923) now verifies the same mismatch through the wire path: the poll response is classified as `storage_error`, the conflicting public target record remains unchanged, and polling the source after restart still returns the error rather than showing advanced progress. This at-least-once-safe outcome can leave the source delivery blocked until the target conflict is resolved. Matching-content public-ID reuse is also covered by core test [`dead_letter_move_same_content_public_id_reconciles_after_restart`](../../crates/runnel-core/src/lib.rs#L1481) and real-server test [`network_protocol_reconciles_same_content_public_dead_letter_id_after_restart`](../../crates/runnel-server/tests/server_smoke.rs#L1053): after a public publish uses the move ID with matching key and payload, the local retry treats it as the existing move and source progress completes across restart. These tests establish behavior but not move provenance. The typed-identity alternatives and RNL3 upgrade ambiguity are assessed in the [TD-029 dead-letter identity research note](../research/td-029-dead-letter-identity-contract.md); the accepted identity contract remains open in TD-029.
 
 The current clustered implementation does not use this local move identity.
 It appends the derived record and advances source progress in one replicated
@@ -142,12 +142,12 @@ device failures, power loss, or a process kill at the exact inter-log boundary.
 ## Observed clustered same-group movement
 
 The clustered engine has a different boundary. A grouped `PollGroup` is one
-Raft command. In [`apply_group_poll`](../../crates/runnel-raft/src/delivery.rs#L49),
+Raft command. In [`apply_group_poll`](../../crates/runnel-raft/src/delivery.rs#L55),
 the original message is appended to the derived stream held in the same
 `SnapshotState` as the source consumer state, then source progress is
 advanced before the command response is returned. The state-machine journal
 is persisted before applying the command and replayed after a restart through
-[`StateMachineStore::apply`](../../crates/runnel-raft/src/state_machine_store.rs#L766).
+[`StateMachineStore::apply`](../../crates/runnel-raft/src/state_machine_store.rs#L782).
 The derived stream is resolved back to the source data group by
 [`data_group_for_stream`](../../crates/runnel-raft/src/group_manager.rs#L338)
 when it is addressed through the public protocol.
@@ -164,7 +164,7 @@ comes from source progress and replicated command application, not from a
 cross-stream identity index.
 
 The current evidence includes
-[`persistent_raft_dead_letters_after_the_configured_attempt_limit`](../../crates/runnel-raft/src/lib.rs#L1327),
+[`persistent_raft_dead_letters_after_the_configured_attempt_limit`](../../crates/runnel-raft/src/lib.rs#L1344),
 which reopens the persistent engine after the transition, and the real
 three-process failover test
 [`three_process_cluster_reassigns_group_delivery_after_node_failure`](../../crates/runnel-server/tests/cluster_smoke.rs#L928),
