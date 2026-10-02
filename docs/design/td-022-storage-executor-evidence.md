@@ -1,9 +1,9 @@
 # TD-022: Local durable-I/O isolation evidence
 
 - Status: exploratory evidence note; no executor or concurrency change authorized
-- Last reviewed: 2026-09-29
-- Baseline: `62793482c849940cfc1f0d99afe960e014d37da4`
-- Baseline CI state supplied with this assignment: run [#36592168031](https://github.com/winrarr/runnel/actions/runs/36592168031) was pending
+- Last reviewed: 2026-10-02
+- Baseline: `a7726f529883fa5b2869b4507ffdae3a1770cfce`
+- Baseline CI state at run start: the coordinator's exact-head check was in progress; no follow-up baseline CI lookup was made
 - Scope: local synchronous filesystem work, asynchronous admission, stream ordering, and slow-I/O behavior
 - Related debt: [TD-022](../tech-debt.md#td-022-local-durable-io-has-bounded-async-isolation-but-incomplete-evidence)
 - Related outcome: [Make concurrent broker work scale predictably](../backlog.md#make-concurrent-broker-work-scale-predictably)
@@ -26,8 +26,11 @@ work?
 
 The current answer is narrower than “local storage is non-blocking.” Async
 network requests are kept off the runtime thread and admitted blocking work is
-bounded. A filesystem call that has started remains synchronous and cannot be
-canceled by the caller's request timeout.
+bounded. A caller's request timeout cancels its wait for the engine future; it
+does not cancel a storage closure after dispatch has submitted it to Tokio's
+blocking pool. The closure can continue after the client receives a timeout,
+and an operating-system call inside that closure has its own platform-specific
+completion and interruption behavior.
 
 ## Observed baseline
 
@@ -112,15 +115,37 @@ execution queue is full”. The provisional server maps either to the generic
 request instead waits until its protocol deadline, the server returns
 `request_timeout` ([request execution](../../crates/runnel-server/src/connection.rs#L245)).
 Cancellation while queued on a stream lane removes that waiter; cancellation
-while waiting for execution prevents a closure from starting. Once
-`spawn_blocking` has started the closure, dropping the async request or its
-join handle does not stop the synchronous filesystem call. It may finish after
-the client received a timeout, leaving the durable outcome unknown to that
-client. [ADR 0026](../decisions/0026-semantic-engine-error-classification.md)
+while waiting for an execution permit prevents dispatch from submitting a
+closure. After `spawn_blocking` returns a handle, timing out the request drops
+the awaiting future and its `JoinHandle`; Tokio documents that dropping a
+`JoinHandle` detaches the task, and that an already-started `spawn_blocking`
+task cannot be aborted. Runnel does not call `abort` on this handle. The
+submitted closure retains its admission, lane, and execution permits until it
+returns, even though the request has ended. If it later completes a durable
+write, the client may not know whether the operation took effect.
+[ADR 0026](../decisions/0026-semantic-engine-error-classification.md)
 classifies generic storage failures conservatively as `Unknown`; the
 provisional protocol still does not distinguish executor saturation, device
 pressure, sync failure, and a possibly committed write whose response was
 lost. These distinctions do not justify silently retrying a timed-out write.
+
+This is a runtime cancellation boundary, not a claim that every operating
+system file call is uninterruptible. Rust's `std::fs` calls are synchronous;
+for example, `File::sync_all` attempts to sync OS-internal file content and
+metadata before returning. Tokio's inability to abort a started blocking task
+does not specify whether an individual OS call can return early, fail, or be
+interrupted on a particular platform. POSIX specifies that opening a FIFO in
+blocking mode waits for the matching endpoint, while a blocking pipe/FIFO read
+can wait for data or writer closure and may return `EINTR` if interrupted
+before reading data. The exact operation and result therefore need platform
+and device evidence before describing a real storage stall as uninterruptible.
+Primary references are Tokio's [`spawn_blocking` and cancellation contract](https://docs.rs/tokio/1.53.1/tokio/task/fn.spawn_blocking.html),
+[`JoinHandle` drop behavior](https://docs.rs/tokio/1.53.1/tokio/task/struct.JoinHandle.html),
+[`Runtime` shutdown behavior](https://docs.rs/tokio/1.53.1/tokio/runtime/struct.Runtime.html#shutdown),
+Rust's [`File::sync_all`](https://doc.rust-lang.org/std/fs/struct.File.html#method.sync_all),
+and The Open Group's POSIX [`open()` FIFO semantics](https://pubs.opengroup.org/onlinepubs/9799919799/functions/open.html)
+and [`read()` semantics](https://pubs.opengroup.org/onlinepubs/9799919799/functions/read.html).
+The Tokio version is 1.53.1, matching the repository's `Cargo.lock`.
 
 Optional instrumentation adds a `core.storage_dispatch` timer and separate
 timers for stream-lock wait, append/read, and consumer-state persistence
@@ -154,15 +179,18 @@ Separate adapter tests cover concurrent-publish offset order and restart
 recovery ([core async tests](../../crates/runnel-core/src/lib.rs#L342)). The
 held-mutex test is not an injected slow filesystem measurement.
 
-The real-process server tests use FIFOs at the consumer-state journal path
+The real-process server tests create FIFOs at the consumer-state journal path
 (`consumer.json.tmp`, [path construction](../../crates/runnel-core/src/consumer_state.rs#L221))
-to create deterministic blocking points in actual filesystem calls. The
-global-saturation probe blocks journal reads; the same-stream pressure path
-also reaches an append to the FIFO after releasing its held read. The tests
+so a synchronous filesystem open waits at the FIFO's matching-endpoint
+rendezvous. This is a real blocked OS/FIFO operation, deliberately released by
+the test harness opening the other endpoint; it is not an actual-device or
+uninterruptible-I/O experiment. The global-saturation probe holds journal
+operations at that controlled boundary; the same-stream pressure path also
+reaches an append to the FIFO after releasing its held read/open. The tests
 exercise network requests, server timeouts, health endpoints, metrics, release,
 and recovery, but not a slow or full storage device:
 
-- [`storage_stall_is_bounded_and_durable_traffic_continues`](../../crates/runnel-server/tests/admission.rs#L1337)
+- [`storage_stall_is_bounded_and_durable_traffic_continues`](../../crates/runnel-server/tests/admission.rs#L1562)
   uses a 500 ms request deadline. It expects the stalled poll and protocol
   health request to time out within one second, readiness and metrics to
   respond within two seconds, and a different stream to publish and poll
@@ -171,17 +199,17 @@ and recovery, but not a slow or full storage device:
   process/admission samples, and omits engine-derived samples until recovery
   ([readiness handler](../../crates/runnel-server/src/observability.rs#L305),
   [metrics fallback](../../crates/runnel-server/src/observability.rs#L344)).
-- [`timed_out_same_stream_waiter_does_not_poison_following_request`](../../crates/runnel-server/tests/admission.rs#L1485)
+- [`timed_out_same_stream_waiter_does_not_poison_following_request`](../../crates/runnel-server/tests/admission.rs#L1712)
   holds one poll in the FIFO, lets a second same-stream request hit its 1.5 s
   timeout, releases the FIFO, and verifies the next poll and health request
   succeed. It demonstrates waiter cleanup, not cancellation of the blocked
   filesystem call.
-- [`storage_stall_shutdown_is_bounded_and_restart_recovers`](../../crates/runnel-server/tests/admission.rs#L1584)
-  sends SIGTERM while the operation is blocked, then releases the FIFO before
-  waiting for process exit. The released-stall shutdown completes within two
-  seconds and restart recovers the prior durable publish. It does not measure
-  exit while a call remains blocked.
-- [`sustained_storage_pressure_is_bounded_observable_and_recovers`](../../crates/runnel-server/tests/admission.rs#L623)
+- [`storage_stall_shutdown_is_bounded_and_restart_recovers`](../../crates/runnel-server/tests/admission.rs#L1811)
+  sends SIGTERM while the operation is blocked, then releases the FIFO
+  immediately before waiting for process exit. The released-stall shutdown
+  completes within two seconds and restart recovers the prior durable publish.
+  It does not measure process exit while a call remains blocked.
+- [`sustained_storage_pressure_is_bounded_observable_and_recovers`](../../crates/runnel-server/tests/admission.rs#L850)
   holds one storage operation on a stream, queues 32 same-stream waiters, and
   checks prompt rejection of additional polls as `storage_error`, without
   counting them as request timeouts. It checks request-failure metrics,
@@ -189,7 +217,7 @@ and recovery, but not a slow or full storage device:
   queued-poll completion and health recovery after FIFO release. Health
   dispatch bypasses the stream lane but blocks on the held stream mutex until
   its one-second health deadline.
-- [`global_storage_admission_is_bounded_observable_and_recovers`](../../crates/runnel-server/tests/admission.rs#L928)
+- [`global_storage_admission_is_bounded_observable_and_recovers`](../../crates/runnel-server/tests/admission.rs#L1135)
   holds 32 distinct-stream reads in FIFOs and sends 64 candidate polls on
   distinct streams. It observes 32 prompt global-admission `storage_error`
   responses while 32 candidates remain admitted behind 32 running operations.
@@ -219,8 +247,10 @@ coverage does not establish:
   consumer-event sync failure exists for dead-letter recovery
   ([core test](../../crates/runnel-core/src/lib.rs#L1394)), but it does not
   simulate a device failure or a process crash during that call;
-- shutdown or force-exit bounds while a started filesystem call remains
-  uninterruptible; current shutdown evidence releases the FIFO first;
+- shutdown or force-exit bounds while a storage closure or filesystem call
+  remains blocked; current shutdown evidence releases the FIFO before waiting
+  for process exit. The OS-call behavior, whether it returns on its own, and
+  whether a process can terminate while it remains blocked are not established;
 - fairness or service-time guarantees between busy streams, including a
   measured one-hot-stream versus many-hot-stream and hot/cold mix at global
   saturation; the global FIFO probe verifies the admission boundary, not
@@ -283,17 +313,41 @@ rejection for memory and tail latency; more execution slots can trade local
 parallelism for filesystem contention; and a dedicated health path can trade
 isolation for capacity reserved from message work.
 
-## Concrete future options, not requirements
+## Alternatives and concrete evidence, not requirements
 
-Future work can compare the retained bounded executor with alternatives after
-the missing evidence identifies the bottleneck. Useful measurements should
-separate, where instrumentation allows, protocol admission, stream-lane wait,
-global executor admission, execution-permit wait, stream-lock wait, filesystem
-read/write/sync, and response delivery. Include same-stream and many-stream
-workloads, hot/cold mixes, slow consumers, and explicit device/resource
-pressure. Keep any scheduler, reserved-capacity, or batching option
-hypothetical until it states what remains ordered, what is durable before
-success, how cancellation works, and what response-loss retry can observe.
+The retained bounded `spawn_blocking` executor is the current implementation;
+its tested claim is bounded admission and progress for unrelated work while
+capacity remains, not isolation from arbitrary device stalls. A dedicated
+blocking-thread pool could separate storage calls from Tokio's general
+blocking pool, but a stuck call would still occupy a worker and would still
+need an explicit shutdown and outcome policy. A platform asynchronous-I/O
+backend could change the waiting and cancellation model, but it would need
+operation-specific evidence that cancellation reaches the OS request and
+preserves the durable outcome contract. A separately supervised storage
+process could isolate broker control-plane threads, but it would not by itself
+resolve whether an in-flight write committed or whether the operating system
+can terminate the worker promptly. These are hypotheses to compare after the
+failure mode is reproduced; none is selected here.
+
+Before claiming device-stall isolation, use a controlled device or filesystem
+fault that blocks the actual read, write, or sync boundary under test, rather
+than a FIFO rendezvous. Record the OS, kernel, filesystem and mount, backing
+device, operation, fault mechanism, resource limits, and how the fault is
+released. Keep the operation blocked past the client deadline and separately
+through the server's graceful-drain phase; observe whether the caller returns,
+whether the closure still occupies executor capacity, what unrelated streams
+and health/metrics endpoints can do at one and at all 32 execution slots, and
+whether the process exits. After release or restart, inspect durable state to
+classify the timed-out operation as not started, failed, completed, or
+ambiguous. Report throughput and latency distributions only for controlled,
+repeated resource-scoped runs. Useful stage timing should distinguish, where
+instrumentation allows, protocol admission, stream-lane wait, global executor
+admission, execution-permit wait, stream-lock wait, filesystem read/write/sync,
+and response delivery. Include same-stream and many-stream workloads,
+hot/cold mixes, slow consumers, and explicit device/resource pressure. Keep any
+scheduler, reserved-capacity, or batching option hypothetical until it states
+what remains ordered, what is durable before success, how cancellation works,
+and what response-loss retry can observe.
 
 ## Outcome and evidence gates
 
@@ -353,20 +407,30 @@ fairness, resource, and operational questions:
 If these gates are not met, retain the current bounded executor and keep
 TD-022 open. Any runtime or public-outcome change still needs an accepted
 durability, cancellation, timeout, and compatibility consequence in an ADR.
-The server's 25-second task-drain timeout is not a 25-second guarantee for a
-started blocking filesystem call: after that timeout the lifecycle aborts
-async task handles, which does not interrupt an already-running blocking
-closure ([shutdown drain](../../crates/runnel-server/src/lifecycle.rs#L73)).
+The server's 25-second task-drain timeout bounds only that async drain: after
+it expires, lifecycle code aborts its TCP, HTTP, and peer task handles
+([shutdown drain](../../crates/runnel-server/src/lifecycle.rs#L66)). The binary
+uses `#[tokio::main]` ([entry point](../../crates/runnel-server/src/main.rs#L8));
+Tokio documents that dropping a runtime waits for started `spawn_blocking`
+work to return and may wait indefinitely. Runnel does not call
+`Runtime::shutdown_timeout`, so the 25-second drain is not a bounded process
+exit guarantee if a submitted blocking closure remains stuck. No current test
+holds one through this runtime shutdown boundary.
 
 ## Refactor and planning assessment
 
 No runtime refactor is proposed: this refresh only brings the evidence note
-into line with the existing executor, tests, optional instrumentation, and
+into line with the existing executor, tests, Tokio's documented lifecycle, and
 accepted error classification. Inspection found no immediate code refactor
-that belongs in this evidence-only change. TD-022 and the concurrent-work
-backlog item already record the near-term outcome and missing evidence, so no
-additional or changed planning item is warranted. No ADR is changed because
-the implementation and accepted decisions remain the same; [ADR 0001](../decisions/0001-single-node-durable-log.md)
+that belongs in this evidence-only change. TD-022 already explicitly says its
+synthetic FIFO tests do not establish shutdown behavior for an uninterruptible
+filesystem call, and its retirement condition includes shutdown isolation; the
+current wording therefore tracks this unresolved boundary. The related
+concurrent-work backlog item remains aligned, so no register update is
+warranted. No ADR is changed because the implementation and accepted decisions
+remain the same; [ADR 0001](../decisions/0001-single-node-durable-log.md)
 and [ADR 0026](../decisions/0026-semantic-engine-error-classification.md)
 remain the relevant storage and outcome boundaries; [ADR 0020](../decisions/0020-stable-optimization-evidence.md)
-governs any later optimization claim.
+governs any later optimization claim. No runtime tests apply to this
+documentation-only refresh; `git diff --check` passed. No local device-stall,
+process-exit, or benchmark evidence was generated.
