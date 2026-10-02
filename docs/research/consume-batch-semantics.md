@@ -1,12 +1,12 @@
 # Consume-batch semantics study
 
 - Status: source-backed exploratory research; no runtime change or accepted API decision
-- Last reviewed: 2026-09-28
-- Repository baseline: `a5a228e59c2caa19c1a6520cde6a6abdd9e90196`
+- Last reviewed: 2026-09-29
+- Repository baseline: `edff28340e063760881d0fe2e81a00c47b9cf4c1`
 - Primary evidence class: research/design
 - Scope: bounded consume delivery and acknowledgement contracts for the local and early clustered engines
 - Related outcome: [Make batching preserve per-record outcomes](../backlog.md#make-batching-preserve-per-record-outcomes)
-- Related decisions: [ADR 0013](../decisions/0013-local-shared-consumer-delivery.md), [ADR 0015](../decisions/0015-clustered-shared-consumer-ownership.md)
+- Related decisions: [ADR 0013](../decisions/0013-local-shared-consumer-delivery.md), [ADR 0015](../decisions/0015-clustered-shared-consumer-ownership.md), [ADR 0027](../decisions/0027-consumer-scoped-retry-policy.md)
 - Related performance evidence: [Systems performance research for Runnel](systems-performance-research.md)
 
 This note compares consume-batch contracts against the behavior in the code at
@@ -16,11 +16,11 @@ delivery limits, or atomicity semantics.
 
 ## Assessment
 
-The safest candidate for an initial Runnel consume batch is bounded delivery
-with a distinct receipt and acknowledgement outcome for each record. If
+One candidate for evaluation is bounded delivery with a distinct receipt and
+acknowledgement outcome for each record. If
 acknowledgement round trips are a measured bottleneck, one acknowledgement
 request could carry multiple receipts while preserving per-record validation
-and outcomes. That transport optimization must not silently mean “ack all
+and outcomes. Neither alternative should silently mean “ack all
 through this offset” or make a partially processed application batch
 all-or-nothing.
 
@@ -52,11 +52,14 @@ reviewed. The present evidence does not establish a throughput gain for Runnel.
 
 The provisional wire protocol has `poll` and `poll_group` requests. Each returns
 one `message` or `empty` response. A separate `ack` or `ack_group` request
-acknowledges one offset. The typed client exposes one-message poll methods and
-does not retry a poll after an uncertain transport result. Publish has a
-bounded batch shape already: at most 1,024 records and 64 MiB of encoded
-request, with ordered per-record results. Its existence does not imply that
-consume batches use the same limits or durability behavior. See the
+acknowledges one offset. The typed client exposes one-message text and binary
+poll methods and does not retry a poll after an uncertain transport result.
+Transport and broker errors retain rejected, retryable, or unknown
+classifications. A cancelled request may have an unknown result that the caller
+must resolve before retrying. Publish has a bounded batch shape already: at
+most 1,024 records and 64 MiB of encoded request, with ordered per-record
+results. Its existence does not imply that consume batches use the same limits
+or durability behavior. See the
 [protocol types](../../crates/runnel-protocol/src/lib.rs),
 [typed client](../../crates/runnel-client/src/lib.rs),
 [server framing](../../crates/runnel-server/src/protocol.rs), and
@@ -69,6 +72,7 @@ consume batches use the same limits or durability behavior. See the
 | Clustered delivery | One grouped poll submits a `PollGroup` Raft write and carries the leader-selected absolute lease deadline. One grouped ack submits an `AckGroup` write. The replicated state keeps in-flight deliveries, attempts, policy, and out-of-order ack state; tokens fence reassignment. `apply_group_ack` observes the replicated lease clock and removes expired entries before checking the token, so the old token is rejected as stale even before a replacement poll. The reusable engine assertion covers this, and a state-machine unit test also checks the deadline and backward-clock floor. | One batch command could reduce protocol and consensus operations per record, but changes the replicated state transition and error surface. A commit/response timeout can make all or part of the assigned set uncertain. Batch acknowledgement still needs explicit per-item results and retry behavior. |
 | Progress | Local and clustered consumers track a contiguous committed offset plus out-of-order acknowledged offsets. Grouped acks identify member, offset, and delivery token. The compatibility ordinary ack omits the token. | Prefix acknowledgement is not equivalent to Runnel's existing per-record acknowledgement, especially for shared work that can complete out of order. The ordinary tokenless path also needs an explicit decision if batched deliveries are independently reassigned. |
 | Size and timing | The wire listener has a configurable request-frame limit capped at 64 MiB. The typed client has a configurable response-buffer bound, with a 65 MiB default. Consume currently returns one record; it has no batch count, aggregate response-byte, or collection-wait policy. | Future delivery bounds must apply to encoded response bytes as well as record count and decoded payload bytes. A maximum wait adds queueing latency and must fit within request and lease timeouts. |
+| Durable consumer retry policy | `configure_consumer` and `inspect_consumer` expose a versioned policy for each stream/consumer. Repeating current values is idempotent; changed values advance the version. The acknowledgement timeout is bounded to seven days (zero is allowed), and a configured attempt limit must be positive. Unconfigured consumers retain broker-wide fallback policy. Both engines persist the policy and a snapshot for each offset on its first assignment. That offset continues using its pinned acknowledgement timeout and attempt limit on retries and terminal movement after later policy updates. The local snapshot is in the consumer journal; clustered policy and per-offset snapshots are replicated with consumer state. | A future batch cannot assume one policy version or lease for every item. Batch assignment and retry rules need to preserve each offset's pinned policy; changing the policy must not implicitly alter already assigned records. This is an observed constraint, not a selected batch contract. |
 
 Relevant code and current semantic decisions are in
 [local poll and ack](../../crates/runnel-core/src/broker.rs),
@@ -76,8 +80,44 @@ Relevant code and current semantic decisions are in
 [local candidate selection](../../crates/runnel-core/src/stream_log.rs),
 [clustered poll and ack](../../crates/runnel-raft/src/engine.rs),
 [replicated delivery transitions](../../crates/runnel-raft/src/delivery.rs),
-[ADR 0013](../decisions/0013-local-shared-consumer-delivery.md), and
-[ADR 0015](../decisions/0015-clustered-shared-consumer-ownership.md).
+[ADR 0013](../decisions/0013-local-shared-consumer-delivery.md),
+[ADR 0015](../decisions/0015-clustered-shared-consumer-ownership.md), and
+[ADR 0027](../decisions/0027-consumer-scoped-retry-policy.md).
+
+### Current coverage and limits
+
+No consume-batch request, response, engine operation, or typed client method
+exists at this baseline. Current batch APIs and network tests cover publish
+batches only. Existing one-record coverage is relevant to the constraints but
+does not establish batch outcomes:
+
+- The local and persistent clustered engine tests verify that an assigned
+  offset keeps its old attempt limit after version 2 is configured and that
+  the current policy version survives reopen. Neither test reopens with that
+  offset still pending under its old snapshot.
+- The real three-process transfer test configures version 1, delivers an
+  offset, changes the current policy to version 2, fails the original leader,
+  and verifies the new leader sees version 2 while the offset still follows
+  version 1 and moves to the derived dead-letter stream. This establishes that
+  current policy and an assigned offset's policy snapshot transfer together;
+  it does not test consume batches or imply that every in-flight lease survives
+  failover unchanged.
+- A reusable local/cluster engine assertion covers a token-bearing ack just
+  after expiry and before reassignment; separate real-process tests cover
+  single-record restart and leader-failure delivery paths. They do not define
+  mixed per-item results for a batch.
+
+See the [local policy test](../../crates/runnel-core/src/lib.rs#L984),
+[persistent clustered policy test](../../crates/runnel-raft/src/lib.rs#L1443),
+[three-process policy transfer test](../../crates/runnel-server/tests/cluster_smoke.rs#L1243),
+[local shared engine contract](../../crates/runnel-core/tests/engine_contract.rs#L265),
+[clustered expiry contract](../../crates/runnel-raft/src/lib.rs#L1226),
+[shared assertion implementation](../../crates/runnel-test-support/src/lib.rs#L342),
+the [local restart test source](../../crates/runnel-server/tests/server_smoke.rs)
+(`network_protocol_reassigns_group_delivery_after_restart`),
+and the [cluster node-failure test](../../crates/runnel-server/tests/cluster_smoke.rs#L928).
+The accepted retry-policy details are in
+[ADR 0027](../decisions/0027-consumer-scoped-retry-policy.md).
 
 ## Reference behavior
 
@@ -228,8 +268,11 @@ supported payload, response loss after assignment, retry of the same receive
 identity, disconnect during response, an ack vector with an expired or
 reassigned token among valid tokens and an explicit result for each item,
 response loss after ack, restart, leader change, lease expiry while later batch
-entries wait, member replacement, same-key records, and out-of-order ack
-across different keys.
+entries wait, member replacement, same-key records, out-of-order ack across
+different keys, and multiple per-offset policy snapshots within one batch. A
+policy update between first assignments should also be exercised across local
+restart and clustered leadership transfer before deciding how such a batch
+reports outcomes.
 Network and failure tests should start real broker processes. Reusable engine
 assertions should preserve topology-free semantics where practical.
 
@@ -253,15 +296,17 @@ assertions should preserve topology-free semantics where practical.
   Batching may improve small-message throughput while increasing tail latency,
   memory, lease expiries, or queueing. The current benchmarks do not quantify
   that tradeoff.
-- **Refactor/planning assessment:** the local and clustered acknowledgement
-  implementations, reusable engine assertion, focused tests, ADRs 0013 and
-  0015, and shared-consumer backlog criterion were inspected. No code refactor
-  is warranted: both implementations already follow their accepted expiry
-  decisions, and this change corrects the research record. No backlog, debt, or
-  ADR update is needed: the existing backlog criterion already records this
-  expected result and the test evidence now covers it; the broader batch
-  outcome and its unresolved batch-specific rules remain open. No separate
-  actionable refactor or tech-debt item was identified.
+- **Refactor/planning assessment:** the local and clustered implementations,
+  reusable engine assertion, policy and transfer tests, ADRs 0013, 0015, and
+  0027, and the shared-consumer and batching backlog outcomes were inspected.
+  No code refactor is warranted: current code follows the accepted single-record
+  fencing and retry-policy decisions, and this update corrects the research
+  record. No backlog, debt, or ADR change is needed: the existing batching
+  acceptance criteria already cover per-record outcomes, partial failure,
+  ordering, bounds, restart/failover, and latency/resource evidence. Policy
+  transfer coverage strengthens the future evidence base but does not complete
+  a batch criterion. No separate actionable refactor or tech-debt item was
+  identified.
 - **Unresolved evidence:** no workload has established whether network round
   trips, per-record local sync, consensus round trips, JSON/base64 work, or
   client-side processing dominates; no batch size or ack model is selected.
