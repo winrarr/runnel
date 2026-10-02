@@ -62,6 +62,10 @@ for the same evidence labels and outcome/evidence gates.
 - [Cluster replication-progress telemetry](cluster-replication-progress-telemetry.md)
   examines the pinned OpenRaft signals and bounded observability options for
   the early static cluster.
+- [TD-028 RNL1 allocation policy evidence](td-028-rnl1-allocation-policy.md)
+  compares legacy-record allocation policies and records the corpus,
+  compatibility, and non-destructive conversion evidence needed before a
+  limit is accepted.
 - [Systems performance research for Runnel](systems-performance-research.md)
   connects established and recent systems research on durable batching,
   queueing, replicated-log writes, cache lines, and I/O to Runnel's current
