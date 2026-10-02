@@ -66,6 +66,9 @@ for the same evidence labels and outcome/evidence gates.
   compares legacy-record allocation policies and records the corpus,
   compatibility, and non-destructive conversion evidence needed before a
   limit is accepted.
+- [TD-029 dead-letter identity contract](td-029-dead-letter-identity-contract.md)
+  compares durable identity domains for public request IDs and local
+  dead-letter moves, including the unresolved RNL3 upgrade ambiguity.
 - [Systems performance research for Runnel](systems-performance-research.md)
   connects established and recent systems research on durable batching,
   queueing, replicated-log writes, cache lines, and I/O to Runnel's current
