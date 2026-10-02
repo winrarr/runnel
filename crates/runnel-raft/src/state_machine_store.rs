@@ -2,6 +2,8 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::io::Cursor;
 use std::path::{Path, PathBuf};
+#[cfg(test)]
+use std::sync::atomic::AtomicBool;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 
@@ -301,6 +303,8 @@ pub(super) struct StateMachineStore {
     pub(super) state: RwLock<StateMachineData>,
     snapshot_idx: AtomicU64,
     current_snapshot: RwLock<Option<StoredSnapshot>>,
+    #[cfg(test)]
+    fail_next_checkpoint_persist: AtomicBool,
     path: Option<PathBuf>,
     journal: Option<StdMutex<fs::File>>,
     kind: GroupKind,
@@ -428,6 +432,8 @@ impl StateMachineStore {
             state: RwLock::new(state),
             snapshot_idx: AtomicU64::new(0),
             current_snapshot: RwLock::new(current_snapshot),
+            #[cfg(test)]
+            fail_next_checkpoint_persist: AtomicBool::new(false),
             path: Some(path),
             journal: Some(StdMutex::new(journal)),
             kind,
@@ -469,6 +475,16 @@ impl StateMachineStore {
         let persisted = PersistedStateRef::new(state);
         let bytes = serde_json::to_vec(&persisted)
             .map_err(|error| StorageIOError::write_state_machine(&error))?;
+        #[cfg(test)]
+        if self
+            .fail_next_checkpoint_persist
+            .swap(false, Ordering::Relaxed)
+        {
+            let error = std::io::Error::other("injected checkpoint persistence failure");
+            return Err(StorageError::IO {
+                source: StorageIOError::write_state_machine(&error),
+            });
+        }
         atomic_write(&path.join("state-machine.json"), &bytes)
             .map_err(|error| StorageIOError::write_state_machine(&error))?;
         Ok(())
@@ -1007,6 +1023,71 @@ mod tests {
         let state = reopened.state.read().await;
         let message = &state.state.streams["events"].messages[0];
         assert_eq!(message.payload, b"first");
+    }
+
+    #[tokio::test]
+    async fn checkpoint_failure_after_snapshot_persist_recovers_new_snapshot() {
+        let directory = tempfile::tempdir().unwrap();
+        let state_directory = directory.path().join("state-machine");
+        let store =
+            Arc::new(StateMachineStore::open(&state_directory, GroupKind::Combined).unwrap());
+        let mut state_machine = store.clone();
+
+        let first_meta = snapshot_meta(1, "first");
+        let first_data = snapshot_data(b"first");
+        state_machine
+            .install_snapshot(&first_meta, Box::new(Cursor::new(first_data.clone())))
+            .await
+            .unwrap();
+        let checkpoint_path = state_directory.join("state-machine.json");
+        let checkpoint_before = fs::read(&checkpoint_path).unwrap();
+
+        let second_meta = snapshot_meta(2, "second");
+        let second_data = snapshot_data(b"second");
+        store
+            .fail_next_checkpoint_persist
+            .store(true, Ordering::Relaxed);
+        assert!(
+            state_machine
+                .install_snapshot(&second_meta, Box::new(Cursor::new(second_data.clone())))
+                .await
+                .is_err()
+        );
+
+        let snapshot_path = state_directory.join("snapshot.json");
+        let persisted_snapshot: StoredSnapshot =
+            serde_json::from_slice(&fs::read(snapshot_path).unwrap()).unwrap();
+        assert_eq!(persisted_snapshot.meta, second_meta);
+        assert_eq!(persisted_snapshot.data, second_data);
+        assert_eq!(fs::read(checkpoint_path).unwrap(), checkpoint_before);
+        {
+            let state = store.state.read().await;
+            assert_eq!(state.state.streams["events"].messages[0].payload, b"first");
+        }
+        let current = state_machine
+            .get_current_snapshot()
+            .await
+            .unwrap()
+            .expect("failed install must not publish a new current snapshot");
+        assert_eq!(current.meta, first_meta);
+        assert_eq!(current.snapshot.into_inner(), first_data);
+
+        drop(state_machine);
+        drop(store);
+
+        let reopened =
+            Arc::new(StateMachineStore::open(&state_directory, GroupKind::Combined).unwrap());
+        let state = reopened.state.read().await;
+        assert_eq!(state.state.streams["events"].messages[0].payload, b"second");
+        drop(state);
+        let mut reopened_state_machine = reopened.clone();
+        let recovered_snapshot = reopened_state_machine
+            .get_current_snapshot()
+            .await
+            .unwrap()
+            .expect("reopen must select the complete newer persisted snapshot");
+        assert_eq!(recovered_snapshot.meta, second_meta);
+        assert_eq!(recovered_snapshot.snapshot.into_inner(), second_data);
     }
 
     #[tokio::test]

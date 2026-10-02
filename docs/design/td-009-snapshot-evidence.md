@@ -1,8 +1,8 @@
 # TD-009: Clustered snapshot scalability and compatibility evidence
 
 - Status: exploratory evidence note; no implementation authorized
-- Last reviewed: 2026-09-29
-- Baseline: `9547662ca63c98fb5d971618ecc2a49ed555d2ad`
+- Last reviewed: 2026-10-02
+- Baseline: `821f2c24b6b8feafdc6563cc6eb76746f75c34d1`
 - Scope: OpenRaft state-machine snapshot creation, transfer, installation,
   recovery, and the path toward incremental or streaming snapshots
 - Related debt: [TD-009](../tech-debt.md)
@@ -58,7 +58,7 @@ the group directory:
 | `state-machine/state-machine.log` | Length-prefixed JSON apply journal, record version 1, with a 64 MiB per-record limit | Durable apply record replayed after the selected checkpoint or snapshot. Only an incomplete final frame is truncated. |
 | `state-machine/snapshot.json` | JSON `StoredSnapshot` wrapper containing OpenRaft `SnapshotMeta` and a JSON snapshot payload | Current snapshot cache and persisted recovery image. The atomic replacement syncs the file and parent directory. |
 
-On [`StateMachineStore::open`](../../crates/runnel-raft/src/state_machine_store.rs#L387-L435), recovery loads the checkpoint, validates and selects the snapshot only when its applied log boundary is newer, then reads the journal and replays entries strictly after the selected boundary. Journal reading materializes its contents before replay; only a partial final frame is truncated, while a complete malformed or unsupported record fails startup. Cluster identity, group manifest, and persisted-artifact preflight are owned by the surrounding clustered storage layer. The [TD-007 evidence note](td-007-storage-compatibility-evidence.md) records that preflight validates artifact shapes and identities but does not prove mixed-release compatibility or every cross-file boundary.
+On [`StateMachineStore::open`](../../crates/runnel-raft/src/state_machine_store.rs#L391-L442), recovery loads the checkpoint, validates and selects the snapshot only when its applied log boundary is newer, then reads the journal and replays entries strictly after the selected boundary. Journal reading materializes its contents before replay; only a partial final frame is truncated, while a complete malformed or unsupported record fails startup. Cluster identity, group manifest, and persisted-artifact preflight are owned by the surrounding clustered storage layer. The [TD-007 evidence note](td-007-storage-compatibility-evidence.md) records that preflight validates artifact shapes and identities but does not prove mixed-release compatibility or every cross-file boundary.
 
 The checkpoint and snapshot payload are version 2 on write and accept version
 1 on read; an omitted snapshot version defaults to version 1. Missing legacy
@@ -97,11 +97,11 @@ but parsing a snapshot alone does not prove those identities agree. The
 version-1 journal has no read-forward path. No mixed-version writer, rolling
 upgrade, or downgrade matrix is established.
 
-Sources: [`PersistedSnapshotState`, stream adapters, and snapshot wrapper](../../crates/runnel-raft/src/state_machine_store.rs#L34-L250), [`GroupConsumerState`](../../crates/runnel-raft/src/delivery.rs#L12-L33), and [format validation](../../crates/runnel-raft/src/state_machine_store.rs#L316-L358).
+Sources: [`PersistedSnapshotState`, stream adapters, and snapshot wrapper](../../crates/runnel-raft/src/state_machine_store.rs#L58-L250), [`GroupConsumerState`](../../crates/runnel-raft/src/delivery.rs#L21-L33), [checkpoint version validation](../../crates/runnel-raft/src/state_machine_store.rs#L314-L339), and [snapshot format validation](../../crates/runnel-raft/src/state_machine_store.rs#L897-L912).
 
 ### Build path
 
-[`StateMachineStore::build_snapshot`](../../crates/runnel-raft/src/state_machine_store.rs#L711-L750)
+[`StateMachineStore::build_snapshot`](../../crates/runnel-raft/src/state_machine_store.rs#L726-L768)
 holds a read lock while it serializes a borrowed view of the complete
 `SnapshotState` into one `Vec<u8>`. Borrowed views avoid cloning each
 `StoredMessage` before encoding, but they do not make the operation
@@ -123,10 +123,10 @@ it does not imply that no newer snapshot file was written.
 
 ### Install path
 
-[`begin_receiving_snapshot`](../../crates/runnel-raft/src/state_machine_store.rs#L804-L808)
+[`begin_receiving_snapshot`](../../crates/runnel-raft/src/state_machine_store.rs#L820-L824)
 returns an empty `Cursor<Vec<u8>>`, so OpenRaft's receiver accumulates the
 complete transfer in memory. Then
-[`StateMachineStore::install_snapshot`](../../crates/runnel-raft/src/state_machine_store.rs#L810-L875)
+[`StateMachineStore::install_snapshot`](../../crates/runnel-raft/src/state_machine_store.rs#L826-L884)
 owns the complete byte vector, validates the version and JSON payload,
 materializes a complete `SnapshotState`, and holds the state write lock while it:
 
@@ -136,12 +136,22 @@ materializes a complete `SnapshotState`, and holds the state write lock while it
 4. replaces in-memory state and publishes the current-snapshot cache.
 
 In-memory state and the current-snapshot cache remain unchanged until all
-durable steps succeed. A rejected payload does not mutate state, and a focused
-test makes the first snapshot write fail while preserving the previous image.
-That test does not inject failure after each later stage. More generally, a
-failure after an earlier atomic write can leave a newer durable snapshot or
-checkpoint for restart recovery, so tests do not establish “every failed
-install leaves every file untouched.” Install latency and temporary
+durable steps succeed. A rejected payload does not mutate state, and focused
+tests cover both a first snapshot-file write failure and a test-only checkpoint
+failure after the new snapshot is atomically persisted. In the latter case,
+the injected error occurs after checkpoint encoding but before its atomic file
+replacement. The install returns an error, the old checkpoint remains
+byte-for-byte intact, and the running state and snapshot cache remain old;
+reopening selects the complete newer snapshot because its applied-log boundary
+is later. A checked install error therefore does not promise that the prior
+image will remain authoritative after restart. This exercises the state-machine
+store's recovery selection from the resulting files, not an abrupt process
+crash, an actual checkpoint file-write failure, device-level failure, or
+OpenRaft log-store/commit interaction. Journal-compaction failure and abrupt
+termination at later boundaries remain untested. More
+generally, a failure after an earlier atomic write can leave a newer durable
+snapshot or checkpoint for restart recovery, so tests do not establish “every
+failed install leaves every file untouched.” Install latency and temporary
 memory/workspace demand scale with the complete snapshot, and ordinary group
 operations wait behind the state write lock.
 
@@ -193,11 +203,16 @@ The current tests establish these properties:
 3. **Invalid snapshots fail closed.** Invalid JSON, unsupported payload
    versions, and malformed persisted snapshots are rejected before serving
    state or creating a new journal.
-4. **Checked install failures preserve the serving image.** Invalid payload
-   validation and a failure on the first snapshot-file write leave the prior
-   in-memory state and current-snapshot cache available. The persistence
-   fixture reopens the previous valid image. Later-write and abrupt-crash
-   boundaries are not covered by that test.
+4. **Checked install failures preserve the running image, with restart
+   selection depending on the durable boundary.** Invalid payload validation
+   and a failure on the first snapshot-file write leave the prior in-memory
+   state and current-snapshot cache available; the first-write fixture reopens
+   the previous checkpoint. A test-only checkpoint failure after snapshot
+   persistence leaves the old checkpoint and running image intact, but reopen
+   selects the complete newer snapshot. This confirms a complete recoverable
+   state-machine image at that checked failure point; it does not establish
+   OpenRaft log-store interaction, process-crash or device-failure behavior,
+   journal-compaction failure recovery, or every install boundary.
 5. **Legacy read-forward is narrow.** Version-1 snapshot payloads and legacy
    stream arrays are converted in memory to current stream identity/lifecycle
    state; missing grouped-delivery and lease-clock fields use defaults.
@@ -231,7 +246,8 @@ The direct state-machine tests are in
 | `snapshots_bound_consensus_history_and_recover_state` | Builds after 40 publishes, checks the remaining journal is strictly after the snapshot log boundary, reopens, and reads the earliest retained record. | A maximum retained-state size, bounded build latency, or every log/snapshot/purge interleaving. |
 | `retained_history_survives_snapshot_install_and_reopen` | Builds and installs a 256-message image, reopens both stores, and checks first/last payloads. | Large-stream scaling, full state equality across every field, or process failure during install. |
 | `rejected_snapshot_install_preserves_existing_state` | Invalid transfer bytes are rejected without changing the current polled state; install-failure counters return to an idle gauge. | Filesystem or process failures after persistence begins. |
-| `failed_snapshot_persistence_keeps_previous_state_and_recovers_checkpoint` | Forces the initial `snapshot.json` write to fail, checks the previous in-memory snapshot/state, then reopens the previous checkpoint. | Failure after the snapshot write, checkpoint write, journal compaction, or cache publication. |
+| `failed_snapshot_persistence_keeps_previous_state_and_recovers_checkpoint` | Forces the initial `snapshot.json` write to fail, checks the previous in-memory snapshot/state, then reopens the previous checkpoint. | Later persistence failures, journal compaction, or cache publication. |
+| `checkpoint_failure_after_snapshot_persist_recovers_new_snapshot` | Injects a test-only checkpoint-persist error after the new `snapshot.json` is durably replaced and checkpoint encoding completes but before checkpoint replacement; checks the old checkpoint bytes and running state/cache, then reopens and verifies selection of the complete newer snapshot. | Actual checkpoint file-write failure, abrupt process/device failure, the surrounding OpenRaft log-store interaction, journal-compaction failure, and other install boundaries. |
 | `legacy_snapshot_format_recovers_metadata_messages_and_progress` and `legacy_snapshot_defaults_lease_floor_and_applied_commands_advance_it` | Exercise version-1 legacy stream arrays, consumer offset, absent lease-clock default, and current replay after read-forward. | Mixed-version writers, old/new binary interoperability, or downgrade. |
 | `grouped_lease_clock_floor_survives_snapshot_recovery_and_backward_time` and related grouped-delivery state-machine tests | Round-trip the current payload while checking lease-clock floor, in-flight delivery, attempts, and token fencing. | Snapshot filesystem install/recovery of every grouped-policy transition or crash timing. |
 | `unsupported_snapshot_version_is_rejected_without_creating_journal` and `invalid_persisted_snapshot_is_rejected_before_startup` | Unsupported or malformed persisted snapshot data fails startup; the unsupported-version test also checks that no state-machine journal is created. | Identity/boundary agreement across otherwise parseable checkpoint, snapshot, journal, and Raft-log files. |
@@ -254,7 +270,7 @@ current operations have the following qualitative shape:
 | --- | --- | --- |
 | Build | Traverse and JSON-encode `O(B + S)` materialized state while holding a read lock; retain an encoded copy for the snapshot cache; write a second JSON wrapper; then read/rewrite the journal suffix | The [TD-026 live cluster sample](../research/td-026-log-store-persistence-baseline.md) observes snapshot file-size deltas and completed build counts during two single runs; no build-duration, lock-wait, or snapshot-attributed peak-memory measurement. |
 | Transfer | Send the complete encoded snapshot in chunks; the current receiver assembles the complete transfer in an in-memory cursor, and retrying starts at byte zero | Real-process multi-chunk and repeated-interruption test; no retry-waste or concurrent-transfer resource matrix. |
-| Install | Decode and materialize the complete state, then write a complete snapshot and checkpoint and compact journal while holding the state write lock | Failure-preservation tests and 256-message install/reopen test; no real-process incoming-install latency, temporary workspace, lock-wait, or large-payload matrix. |
+| Install | Decode and materialize the complete state, then write a complete snapshot and checkpoint and compact journal while holding the state write lock | Failure-preservation tests, including recovery selection after an injected post-snapshot checkpoint error, and 256-message install/reopen test; no real-process incoming-install latency, temporary workspace, lock-wait, or large-payload matrix. |
 | Reopen | Read/validate the checkpoint and snapshot, choose the newer applied boundary, read the full journal, and replay entries after that boundary | TD-026 reports restart readiness and acknowledgement of offset 0 after a snapshot/purge cycle in two single runs; no snapshot-size matrix, controlled cold-start distribution, or recovery memory profile. |
 
 ### Current measured evidence
@@ -369,20 +385,17 @@ gates are satisfied:
 
 ## Refactor and planning assessment
 
-No safe runtime refactor is included in this evidence-only change. The source
-audit found no distinct low-risk refactor to record: the unmeasured snapshot
-costs and crash cases already appear in TD-009's retirement gates. Introducing
-a snapshot abstraction or manifest type now would add a compatibility surface
-without evidence that it solves a demonstrated bottleneck.
-
-No separate backlog, tech-debt, or ADR update is warranted. TD-009 remains the
-focused implementation debt; TD-010 covers retained-state materialization;
-TD-007 covers storage compatibility and migration. The new TD-026 observation
-adds file-growth and restart context but does not meet TD-009's retirement
-criteria or create a new intended outcome. ADR 0023 already accepts the
-high-level retained-data boundary; this note only clarifies evidence and leaves
-format and migration choices open. A future implementation should update the
-existing records and accepted decision as its scope requires.
+No runtime refactor is included in this test-and-evidence change. The added
+failure seam is compiled only for tests; the existing install ordering remains
+unchanged. TD-009 already owns the snapshot install and recovery gates, so this
+result updates its evidence and debt context without creating a separate
+backlog item or changing the accepted snapshot architecture. The test narrows
+one checked persistence boundary but does not meet TD-009's retirement
+criteria. TD-010 covers retained-state materialization; TD-007 covers storage
+compatibility and migration. ADR 0023 already accepts the high-level
+retained-data boundary; this note leaves format and migration choices open.
+A future runtime change should update the existing records and accepted
+decision as its scope requires.
 
 ## References
 
