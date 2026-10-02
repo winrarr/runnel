@@ -40,6 +40,7 @@ WORKFLOWS = (
     "bench-container-smoke",
     "bench-cluster",
     "bench-cluster-smoke",
+    "bench-cluster-peer-forwarding-smoke",
     "bench-cluster-matrix-smoke",
     "bench-cluster-container",
     "bench-cluster-container-smoke",
@@ -121,7 +122,11 @@ def environment(isolation: Isolation) -> dict[str, str]:
 
 
 def cluster_command(
-    isolation: Isolation, *, runtime: str, smoke: bool = False
+    isolation: Isolation,
+    *,
+    runtime: str,
+    smoke: bool = False,
+    peer_forwarding_smoke: bool = False,
 ) -> list[str]:
     """Build the native or container clustered benchmark command."""
     artifact = isolation.artifact_dir
@@ -171,6 +176,19 @@ def cluster_command(
                 "--payload-sizes",
                 "100",
                 "--skip-recovery",
+            ]
+        )
+    if peer_forwarding_smoke:
+        command.extend(
+            [
+                "--scenarios",
+                "peer_forwarding",
+                "--peer-forwarding-stream-count",
+                "2",
+                "--peer-forwarding-concurrency",
+                "8",
+                "--peer-forwarding-timeout-seconds",
+                "30",
             ]
         )
     return command
@@ -234,6 +252,13 @@ def command_for(workflow: str, isolation: Isolation) -> list[str]:
         return cluster_command(isolation, runtime="process")
     if workflow == "bench-cluster-smoke":
         return cluster_command(isolation, runtime="process", smoke=True)
+    if workflow == "bench-cluster-peer-forwarding-smoke":
+        return cluster_command(
+            isolation,
+            runtime="process",
+            smoke=True,
+            peer_forwarding_smoke=True,
+        )
     if workflow == "bench-cluster-matrix-smoke":
         target_dir = Path(os.environ.get("CARGO_TARGET_DIR", str(isolation.target_dir)))
         return [

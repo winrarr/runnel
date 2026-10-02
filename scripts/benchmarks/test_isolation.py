@@ -81,6 +81,18 @@ class IsolationRunnerTests(unittest.TestCase):
         self.assertIn(run.image, " ".join(command))
         self.assertIn("--build", command)
 
+    def test_peer_forwarding_smoke_is_an_isolated_multi_stream_process_run(self) -> None:
+        run = self.new_run()
+        command = isolated.command_for("bench-cluster-peer-forwarding-smoke", run)
+
+        command_text = " ".join(command)
+        self.assertIn("--scenarios peer_forwarding", command_text)
+        self.assertIn("--peer-forwarding-stream-count 2", command_text)
+        self.assertIn("--peer-forwarding-concurrency 8", command_text)
+        self.assertIn("--messages 20", command_text)
+        self.assertIn("--warmup 2", command_text)
+        self.assertIn(str(run.artifact_dir), command_text)
+
     def test_workflows_use_isolated_outputs_when_they_produce_them(self) -> None:
         run = self.new_run()
 

@@ -38,6 +38,7 @@ from cluster import (  # noqa: E402
     DEFAULT_WARMUP,
     MAX_LEADER_FAILURE_TIMEOUT_SECONDS,
     MAX_PEER_FORWARDING_CONCURRENCY,
+    MAX_PEER_FORWARDING_STREAM_COUNT,
     MAX_PEER_FORWARDING_TIMEOUT_SECONDS,
     MAX_PEER_RESPONSE_DELAY_MS,
     MAX_PUBLISH_BATCH_SIZE,
@@ -181,6 +182,17 @@ def parse_args() -> argparse.Namespace:
         default=60.0,
     )
     parser.add_argument(
+        "--peer-forwarding-stream-count-values",
+        type=lambda value: parse_integer_values(
+            value, minimum=1, label="peer forwarding stream counts"
+        ),
+        default=[1],
+        help=(
+            "comma-separated peer_forwarding stream/data-group counts; each case "
+            "keeps the aggregate measured publish count fixed"
+        ),
+    )
+    parser.add_argument(
         "--failure-timeout-seconds",
         type=parse_positive_float,
         default=DEFAULT_LEADER_FAILURE_TIMEOUT_SECONDS,
@@ -254,6 +266,22 @@ def parse_args() -> argparse.Namespace:
             "concurrency values exceed the bounded maximum "
             f"of {MAX_PEER_FORWARDING_CONCURRENCY}"
         )
+    if any(
+        value > MAX_PEER_FORWARDING_STREAM_COUNT
+        for value in args.peer_forwarding_stream_count_values
+    ):
+        parser.error(
+            "peer forwarding stream counts exceed the bounded maximum "
+            f"of {MAX_PEER_FORWARDING_STREAM_COUNT}"
+        )
+    if (
+        "peer_forwarding" in args.scenarios
+        and any(value > args.messages for value in args.peer_forwarding_stream_count_values)
+    ):
+        parser.error(
+            "peer forwarding stream counts cannot exceed measured publishes; "
+            "each stream must receive at least one"
+        )
     if args.peer_response_delay_ms > MAX_PEER_RESPONSE_DELAY_MS:
         parser.error(
             "peer response delay exceeds the bounded maximum "
@@ -307,25 +335,32 @@ def matrix_cases(args: argparse.Namespace) -> list[dict[str, Any]]:
             if scenario == "publish_batch"
             else args.batch_size_values[:1]
         )
+        stream_count_values = (
+            args.peer_forwarding_stream_count_values
+            if scenario == "peer_forwarding"
+            else args.peer_forwarding_stream_count_values[:1]
+        )
         for runtime in args.runtimes:
             for payload_size in args.payload_sizes:
                 for concurrency in concurrency_values:
                     for delay_ms in delay_values:
                         for retained_messages in retained_values:
                             for batch_size in batch_size_values:
-                                for repetition in range(1, args.repetitions + 1):
-                                    cases.append(
-                                        {
-                                            "scenario": scenario,
-                                            "runtime": runtime,
-                                            "payload_size": payload_size,
-                                            "concurrency": concurrency,
-                                            "slow_consumer_delay_ms": delay_ms,
-                                            "retained_messages": retained_messages,
-                                            "batch_size": batch_size,
-                                            "repetition": repetition,
-                                        }
-                                    )
+                                for stream_count in stream_count_values:
+                                    for repetition in range(1, args.repetitions + 1):
+                                        cases.append(
+                                            {
+                                                "scenario": scenario,
+                                                "runtime": runtime,
+                                                "payload_size": payload_size,
+                                                "concurrency": concurrency,
+                                                "slow_consumer_delay_ms": delay_ms,
+                                                "retained_messages": retained_messages,
+                                                "batch_size": batch_size,
+                                                "stream_count": stream_count,
+                                                "repetition": repetition,
+                                            }
+                                        )
     if len(cases) > args.max_cases:
         raise BenchmarkError(
             f"matrix expands to {len(cases)} cases, exceeding --max-cases {args.max_cases}"
@@ -382,6 +417,8 @@ def case_command(
             str(args.peer_response_delay_ms),
             "--peer-forwarding-timeout-seconds",
             str(args.peer_forwarding_timeout_seconds),
+            "--peer-forwarding-stream-count",
+            str(case["stream_count"]),
             "--leader-failure-timeout-seconds",
             str(args.failure_timeout_seconds),
             "--payload-sizes",
@@ -400,11 +437,16 @@ def case_id(index: int, case: dict[str, Any]) -> str:
     batch_size = (
         f"batch-{case['batch_size']}-" if case["scenario"] == "publish_batch" else ""
     )
+    stream_count = (
+        f"streams-{case['stream_count']}-"
+        if case["scenario"] == "peer_forwarding"
+        else ""
+    )
     return (
         f"case-{index:03d}-{scenario}-{case['runtime']}-"
         f"payload-{case['payload_size']}-c{case['concurrency']}-"
         f"delay-{case['slow_consumer_delay_ms']}-retained-{case['retained_messages']}-"
-        f"{batch_size}r{case['repetition']}"
+        f"{batch_size}{stream_count}r{case['repetition']}"
     )
 
 
@@ -559,6 +601,7 @@ def run_matrix(
         "scenarios": args.scenarios,
         "payload_sizes_bytes": args.payload_sizes,
         "concurrency_values": args.concurrency_values,
+        "peer_forwarding_stream_count_values": args.peer_forwarding_stream_count_values,
         "slow_consumer_delay_values_ms": args.slow_consumer_delays_ms,
         "slow_consumer_timeout_seconds": args.slow_consumer_timeout_seconds,
         "retained_message_values": args.retained_message_values,

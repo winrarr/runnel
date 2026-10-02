@@ -65,6 +65,9 @@ bench-cluster:
 bench-cluster-smoke:
     python3 scripts/benchmarks/lock.py --path {{benchmark_lock}} --mode shared -- python3 scripts/benchmarks/cluster.py --build --messages 20 --warmup 2 --payload-sizes 100 --skip-recovery
 
+bench-cluster-peer-forwarding-smoke:
+    python3 scripts/isolated.py bench-cluster-peer-forwarding-smoke
+
 bench-cluster-matrix:
     python3 scripts/benchmarks/lock.py --path {{benchmark_lock}} --mode exclusive -- python3 scripts/benchmarks/matrix.py --build
 
@@ -113,6 +116,7 @@ docker-build:
 
 integration:
     RUNNEL_TEST_CAPTURE_LOGS=1 python3 scripts/isolated.py smoke
+    just bench-cluster-peer-forwarding-smoke
     if [ "${RUNNEL_INTEGRATION_IMAGE_READY:-0}" != "1" ]; then just docker-build; fi
     RUNNEL_TEST_CAPTURE_LOGS=1 RUNNEL_INTEGRATION_IMAGE_READY=1 python3 scripts/isolated.py bench-container-smoke
     RUNNEL_TEST_CAPTURE_LOGS=1 RUNNEL_INTEGRATION_IMAGE_READY=1 python3 scripts/isolated.py bench-cluster-container-smoke

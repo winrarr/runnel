@@ -57,6 +57,8 @@ DEFAULT_PEER_FORWARDING_CONCURRENCY = 8
 DEFAULT_PEER_RESPONSE_DELAY_MS = 0
 DEFAULT_PEER_FORWARDING_TIMEOUT_SECONDS = 60.0
 MAX_PEER_FORWARDING_CONCURRENCY = 128
+DEFAULT_PEER_FORWARDING_STREAM_COUNT = 1
+MAX_PEER_FORWARDING_STREAM_COUNT = 64
 MAX_PEER_RESPONSE_DELAY_MS = 2_000
 MAX_PEER_FORWARDING_TIMEOUT_SECONDS = 300.0
 MAX_SLOW_CONSUMER_BACKPRESSURE_TIMEOUT_SECONDS = 300.0
@@ -1633,24 +1635,45 @@ def run_peer_forwarding(
     warmup: int,
     concurrency: int,
     timeout_seconds: float,
+    stream_count: int = DEFAULT_PEER_FORWARDING_STREAM_COUNT,
 ) -> dict[str, Any]:
-    """Publish through a follower to exercise the topology-free peer pool.
+    """Publish through a follower across bounded streams to exercise peer paths.
 
-    The setup is sent through the bootstrap node and excluded from the
-    measured interval. Measured publishes use persistent public clients on a
-    different node, so the Raft engine must forward each operation over its
-    shared topology-free peer lane. Concurrency above the current four shared
-    permits queues behind that lane; optional peer-response delay is applied by
-    the run-scoped native proxy configured on ``Cluster``.
+    Setup creates and warms every stream through the bootstrap node and is
+    excluded from the measured interval. The total measured publish count is
+    distributed round-robin across streams, keeping aggregate work fixed as
+    stream and data-group count grows. Measured publishes use persistent public
+    clients on a different node, so the Raft engine must forward each operation
+    over its shared topology-free peer lane. Concurrency above the current four
+    shared permits queues behind that lane; optional peer-response delay is
+    applied by the run-scoped native proxy configured on ``Cluster``.
     """
+    if messages <= 0 or warmup < 0 or stream_count <= 0:
+        raise BenchmarkError("peer forwarding workload counts are invalid")
+    if stream_count > MAX_PEER_FORWARDING_STREAM_COUNT:
+        raise BenchmarkError(
+            "peer forwarding stream count exceeds the bounded maximum of "
+            f"{MAX_PEER_FORWARDING_STREAM_COUNT}"
+        )
+    if stream_count > messages:
+        raise BenchmarkError(
+            "peer forwarding stream count cannot exceed measured publishes; "
+            "each stream must receive at least one"
+        )
+
+    stream_names = [
+        stream if stream_count == 1 else f"{stream}-{stream_index + 1}"
+        for stream_index in range(stream_count)
+    ]
     setup = cluster.client(0)
     try:
-        publish_stream(setup, stream, payload, warmup)
+        for stream_name in stream_names:
+            publish_stream(setup, stream_name, payload, warmup)
     finally:
         setup.close()
 
     latencies: list[int] = []
-    offsets: list[int] = []
+    offsets_by_stream: list[list[int]] = [[] for _ in stream_names]
     lock = threading.Lock()
     deadline = time.monotonic() + timeout_seconds
     ingress_index = PEER_FORWARDING_INGRESS_NODE_INDEX
@@ -1664,9 +1687,12 @@ def run_peer_forwarding(
                     raise BenchmarkError(
                         "peer forwarding benchmark exceeded its bounded runtime"
                     )
-                published, elapsed = publish(client, stream, payload)
+                stream_index = message_index % stream_count
+                published, elapsed = publish(
+                    client, stream_names[stream_index], payload
+                )
                 with lock:
-                    offsets.append(published)
+                    offsets_by_stream[stream_index].append(published)
                     latencies.append(elapsed)
         finally:
             client.close()
@@ -1679,14 +1705,18 @@ def run_peer_forwarding(
             futures = [executor.submit(worker, index) for index in range(concurrency)]
             for future in futures:
                 future.result()
-        ordered_offsets = sorted(offsets)
-        if len(ordered_offsets) != messages or any(
-            offset != warmup + index for index, offset in enumerate(ordered_offsets)
-        ):
-            raise BenchmarkError(
-                "peer forwarding returned non-contiguous offsets: "
-                f"received {len(ordered_offsets)} of {messages}"
-            )
+        for stream_index, offsets in enumerate(offsets_by_stream):
+            ordered_offsets = sorted(offsets)
+            expected_messages = (messages + stream_count - 1 - stream_index) // stream_count
+            if len(ordered_offsets) != expected_messages or any(
+                offset != warmup + index
+                for index, offset in enumerate(ordered_offsets)
+            ):
+                raise BenchmarkError(
+                    "peer forwarding returned non-contiguous offsets for stream "
+                    f"{stream_index + 1}: received {len(ordered_offsets)} of "
+                    f"{expected_messages}"
+                )
         result = metric(
             "cluster_peer_forwarding",
             latencies,
@@ -1699,6 +1729,20 @@ def run_peer_forwarding(
                 "forwarding_target": "data-group leader selected by the cluster",
                 "concurrency": concurrency,
                 "warmup": warmup,
+                "stream_count": stream_count,
+                "data_group_count": stream_count,
+                "setup_streams_created": stream_count,
+                "setup_warmup_messages_per_stream": warmup,
+                "setup_warmup_messages_total": warmup * stream_count,
+                "measurement_messages_total": messages,
+                "measurement_distribution": "round_robin_across_streams",
+                "measurement_messages_per_stream_min": messages // stream_count,
+                "measurement_messages_per_stream_max": (
+                    messages + stream_count - 1
+                ) // stream_count,
+                "characterization_scope": (
+                    "fixed_total_work_across_data_group_counts"
+                ),
                 "peer_response_delay_ms": cluster.peer_response_delay_ms,
                 "peer_response_proxy_enabled": proxy_summary["enabled"],
                 "latency_scope": (

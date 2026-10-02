@@ -8,7 +8,10 @@ from datetime import datetime
 from typing import TYPE_CHECKING, Any
 
 from cluster_resources import resource_limits
-from cluster_scenarios import MAX_HOT_ORDERING_MESSAGES
+from cluster_scenarios import (
+    MAX_HOT_ORDERING_MESSAGES,
+    MAX_PEER_FORWARDING_STREAM_COUNT,
+)
 from cluster_scenarios import (
     MAX_RAFT_LOG_GROWTH_CYCLE_TIMEOUT_SECONDS,
     MAX_RAFT_LOG_GROWTH_LOGICAL_PAYLOAD_BYTES,
@@ -58,6 +61,20 @@ def build_workload(args: argparse.Namespace) -> dict[str, Any]:
     selected_scenarios = set(args.scenarios)
     if not args.skip_recovery and "cluster_retained_recovery" in selected_scenarios:
         workload["retained_recovery_messages"] = args.retained_messages
+    if "peer_forwarding" in selected_scenarios:
+        workload["peer_forwarding"] = {
+            "stream_count": args.peer_forwarding_stream_count,
+            "data_group_count": args.peer_forwarding_stream_count,
+            "maximum_stream_count": MAX_PEER_FORWARDING_STREAM_COUNT,
+            "measured_messages_total": args.messages,
+            "measured_messages_distribution": "round_robin_across_streams",
+            "warmup_messages_per_stream": args.warmup,
+            "setup_streams_created": args.peer_forwarding_stream_count,
+            "setup_warmup_messages_total": (
+                args.warmup * args.peer_forwarding_stream_count
+            ),
+            "setup_excluded_from_measurement": True,
+        }
     if "retained_hot_path" in selected_scenarios:
         workload["retained_hot_path_messages"] = args.retained_messages
     if "raft_log_growth" in selected_scenarios:

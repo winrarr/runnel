@@ -179,6 +179,67 @@ class MatrixBenchmarkTests(unittest.TestCase):
         batch_index = command.index("--batch-size")
         self.assertEqual(command[batch_index + 1], str(cases[1]["batch_size"]))
 
+    def test_peer_forwarding_expands_bounded_stream_counts_and_records_them(self) -> None:
+        args = self.parse(
+            "--messages",
+            "8",
+            "--concurrency-values",
+            "2",
+            "--scenarios",
+            "peer_forwarding",
+            "--payload-sizes",
+            "100",
+            "--peer-forwarding-stream-count-values",
+            "1,2,4",
+        )
+
+        cases = matrix.matrix_cases(args)
+
+        self.assertEqual([case["stream_count"] for case in cases], [1, 2, 4])
+        self.assertEqual(
+            len({matrix.case_id(index, case) for index, case in enumerate(cases, 1)}),
+            3,
+        )
+        command = matrix.case_command(
+            args,
+            cases[1],
+            Path("/tmp/matrix/result.json"),
+            Path("/tmp/matrix/logs"),
+            build=False,
+        )
+        stream_count_index = command.index("--peer-forwarding-stream-count")
+        self.assertEqual(command[stream_count_index + 1], "2")
+
+    def test_peer_forwarding_stream_count_values_are_bounded_and_fit_messages(self) -> None:
+        for arguments in (
+            [
+                "--scenarios",
+                "peer_forwarding",
+                "--messages",
+                "2",
+                "--peer-forwarding-stream-count-values",
+                "1,3",
+            ],
+            ["--peer-forwarding-stream-count-values", "65"],
+        ):
+            with self.subTest(arguments=arguments), self.assertRaises(SystemExit):
+                self.parse(*arguments)
+
+    def test_stream_count_values_do_not_expand_other_scenarios(self) -> None:
+        args = self.parse(
+            "--scenarios",
+            "durable_publish",
+            "--payload-sizes",
+            "100",
+            "--peer-forwarding-stream-count-values",
+            "1,2,4",
+        )
+
+        cases = matrix.matrix_cases(args)
+
+        self.assertEqual(len(cases), 1)
+        self.assertEqual(cases[0]["stream_count"], 1)
+
     def test_publish_batch_values_are_bounded_and_keep_legacy_single_size(self) -> None:
         args = self.parse("--scenarios", "publish_batch")
         self.assertEqual(args.batch_size, 32)
