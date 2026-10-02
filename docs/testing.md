@@ -6,7 +6,7 @@ The canonical local end-to-end check is:
 just smoke
 ```
 
-This is a real broker test, not a mock or an in-process shortcut. It builds the server and CLI, allocates temporary local ports and storage, starts `runnel`, uses `runnelctl` to create streams, publish, consume, acknowledge, and share work between members of a consumer, restarts the broker, verifies redelivery and durable consumer state, checks readiness and metrics, and removes its temporary data.
+This is a real broker test, not a mock or an in-process shortcut. It builds the server and CLI, allocates temporary local ports and storage, starts `runnel`, and uses `runnelctl` to create streams, publish, consume, acknowledge, and share work between members of a consumer. It also configures and inspects a consumer retry policy. After restarting the broker, it verifies redelivery and durable consumer state, including the policy values and version, checks readiness and metrics, and removes its temporary data.
 
 Run it whenever changing storage, delivery, protocol, process startup, shutdown, or deployment behavior. CI invokes the same recipe.
 
