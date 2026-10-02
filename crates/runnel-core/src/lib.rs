@@ -1485,6 +1485,65 @@ mod tests {
         }
     }
 
+    #[test]
+    fn dead_letter_move_same_content_public_id_reconciles_after_restart() {
+        let directory = tempdir().unwrap();
+        let config = BrokerConfig {
+            ack_timeout: Duration::ZERO,
+            max_delivery_attempts: Some(1),
+        };
+        let move_id = dead_letter_move_id("events", "worker", 0).unwrap();
+
+        {
+            let broker = Broker::open(directory.path(), config.clone()).unwrap();
+            broker
+                .publish("events", Some("order-1".to_owned()), b"poison".to_vec())
+                .unwrap();
+            assert!(matches!(
+                broker.poll("events", "worker").unwrap(),
+                PollResult::Message(Message {
+                    offset: 0,
+                    delivery_attempt: Some(1),
+                    ..
+                })
+            ));
+            assert_eq!(
+                broker
+                    .publish_with_request_id(
+                        "events.dead-letter",
+                        Some("order-1".to_owned()),
+                        b"poison".to_vec(),
+                        Some(move_id.clone()),
+                    )
+                    .unwrap(),
+                0
+            );
+
+            broker.fail_next_dead_letter_ack_persist();
+            assert!(matches!(
+                broker.poll("events", "worker"),
+                Err(BrokerError::Io(error)) if error.kind() == io::ErrorKind::Interrupted
+            ));
+            let source_state = load_consumer_state(directory.path(), "events", "worker").unwrap();
+            assert_eq!(source_state.committed_offset, 0);
+            assert_eq!(source_state.delivery_attempts.get(&0), Some(&1));
+            assert_dead_letter_move(&broker, &move_id);
+        }
+
+        {
+            let broker = Broker::open(directory.path(), config.clone()).unwrap();
+            assert_eq!(broker.poll("events", "worker").unwrap(), PollResult::Empty);
+            let source_state = load_consumer_state(directory.path(), "events", "worker").unwrap();
+            assert_eq!(source_state.committed_offset, 1);
+            assert!(source_state.delivery_attempts.is_empty());
+            assert_dead_letter_move(&broker, &move_id);
+        }
+
+        let broker = Broker::open(directory.path(), config).unwrap();
+        assert_eq!(broker.poll("events", "worker").unwrap(), PollResult::Empty);
+        assert_dead_letter_move(&broker, &move_id);
+    }
+
     fn delivery(result: Result<PollResult, BrokerError>) -> (Offset, String) {
         match result.unwrap() {
             PollResult::Message(message) => (
