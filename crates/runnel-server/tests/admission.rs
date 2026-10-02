@@ -1128,6 +1128,232 @@ fn sustained_storage_pressure_is_bounded_observable_and_recovers() {
         metric_value(&recovered_metrics, "runnel_active_requests"),
         0
     );
+
+    assert_repeated_storage_pressure_cycle(server.broker_addr, server.http_addr, directory.path());
+}
+
+#[cfg(unix)]
+fn assert_repeated_storage_pressure_cycle(
+    broker_addr: SocketAddr,
+    http_addr: SocketAddr,
+    directory: &Path,
+) {
+    const STREAM_QUEUE_CAPACITY: usize = 32;
+    const CANDIDATE_REQUESTS: usize = STREAM_QUEUE_CAPACITY + 1;
+
+    let fifo = directory.join("consumers/storage-pressure/blocked.json.tmp");
+    let mut fifos = StoragePressureFifos::default();
+    fifos.create(&fifo);
+    let metrics_before = http_metrics(http_addr);
+    let poll_failures_before = labeled_metric_value(
+        &metrics_before,
+        "runnel_broker_request_failures_total",
+        "operation=\"poll\"",
+    );
+    let request_timeouts_before =
+        metric_value(&metrics_before, "runnel_broker_request_timeouts_total");
+    let mut clients = StoragePressureClients::default();
+    let (response_sender, response_receiver) = mpsc::channel();
+
+    let blocked_response_sender = response_sender.clone();
+    clients.push_started(std::thread::spawn(move || {
+        let started = Instant::now();
+        let response = try_request(
+            broker_addr,
+            Request::Poll {
+                stream: "storage-pressure".to_owned(),
+                consumer: "blocked".to_owned(),
+            },
+            Duration::from_secs(20),
+        );
+        let _ = blocked_response_sender.send((usize::MAX, started.elapsed(), response));
+        usize::MAX
+    }));
+    let blocker_writer = fs::OpenOptions::new()
+        .write(true)
+        .open(&fifo)
+        .expect("test writer should pair with the repeated blocked journal read");
+    wait_for_metric_at_least(http_addr, "runnel_active_requests", 1);
+
+    for index in 0..CANDIDATE_REQUESTS {
+        let (start_sender, start_receiver) = mpsc::channel();
+        let response_sender = response_sender.clone();
+        clients.push(
+            start_sender,
+            std::thread::spawn(move || {
+                start_receiver
+                    .recv()
+                    .expect("repeated-pressure clients should start together");
+                let started = Instant::now();
+                let response = try_request(
+                    broker_addr,
+                    Request::Poll {
+                        stream: "storage-pressure".to_owned(),
+                        consumer: format!("repeat-{index}"),
+                    },
+                    Duration::from_secs(20),
+                );
+                let _ = response_sender.send((index, started.elapsed(), response));
+                index
+            }),
+        );
+    }
+    drop(response_sender);
+    clients.start();
+
+    let (rejected_index, elapsed, response) = response_receiver
+        .recv_timeout(Duration::from_secs(3))
+        .expect("the repeated full stream queue should reject excess work");
+    assert!(elapsed < Duration::from_secs(1));
+    let response = response.unwrap_or_else(|error| {
+        panic!("repeated-pressure overflow should receive a protocol response: {error}")
+    });
+    assert!(matches!(
+        response,
+        Response::Error { code, message }
+            if code == "storage_error" && message.contains("storage stream queue is full")
+    ));
+
+    let saturated_metrics = wait_for_metric_at_least(
+        http_addr,
+        "runnel_active_requests",
+        (STREAM_QUEUE_CAPACITY + 1) as u64,
+    );
+    assert_eq!(
+        metric_value(&saturated_metrics, "runnel_active_requests"),
+        (STREAM_QUEUE_CAPACITY + 1) as u64,
+        "the repeated blocker and full waiter queue should remain admitted"
+    );
+    assert_eq!(
+        metric_value(&saturated_metrics, "runnel_engine_health_available"),
+        0
+    );
+    assert!(
+        labeled_metric_value(
+            &saturated_metrics,
+            "runnel_broker_request_failures_total",
+            "operation=\"poll\"",
+        ) > poll_failures_before
+    );
+    assert_eq!(
+        metric_value(&saturated_metrics, "runnel_broker_request_timeouts_total"),
+        request_timeouts_before,
+        "repeated storage admission rejection should not count as a timeout"
+    );
+    let started = Instant::now();
+    assert!(http_ready(http_addr).starts_with("HTTP/1.1 503"));
+    assert!(
+        started.elapsed() < Duration::from_secs(2),
+        "repeated-pressure readiness should report unavailable within its deadline"
+    );
+    let started = Instant::now();
+    let metrics_response = http_metrics_response(http_addr);
+    assert!(metrics_response.starts_with("HTTP/1.1 200"));
+    assert!(
+        started.elapsed() < Duration::from_secs(2),
+        "repeated-pressure metrics should remain scrapeable within their deadline"
+    );
+    assert_eq!(
+        metric_value(
+            response_body(&metrics_response),
+            "runnel_engine_health_available"
+        ),
+        0
+    );
+    assert!(http_liveness(http_addr).starts_with("HTTP/1.1 200"));
+
+    drop(blocker_writer);
+    release_fifo_write_stall(&fifo);
+    let completed = clients.join();
+    assert_eq!(completed.len(), CANDIDATE_REQUESTS + 1);
+    for result in completed {
+        result.expect("repeated-pressure client should finish after FIFO release");
+    }
+    let responses = response_receiver.try_iter().collect::<Vec<_>>();
+    assert_eq!(responses.len(), CANDIDATE_REQUESTS);
+    let mut seen_candidates = vec![false; CANDIDATE_REQUESTS];
+    for (index, _elapsed, response) in responses {
+        let response = response.unwrap_or_else(|error| {
+            panic!("repeated-pressure request {index} should receive a response: {error}")
+        });
+        if index == usize::MAX {
+            assert!(matches!(
+                response,
+                Response::Error { code, .. } if code == "storage_error"
+            ));
+            continue;
+        }
+        if index == rejected_index {
+            panic!("rejected candidate {index} must not complete after FIFO release");
+        }
+        assert!(
+            !seen_candidates[index],
+            "candidate {index} should respond once"
+        );
+        seen_candidates[index] = true;
+        assert!(matches!(
+            response,
+            Response::Message { payload, .. } if payload == "storage pressure probe"
+        ));
+    }
+    for (index, received) in seen_candidates.into_iter().enumerate() {
+        assert_eq!(received, index != rejected_index);
+    }
+
+    fifos.remove_all();
+    wait_for_metric_at_most(http_addr, "runnel_active_requests", 0);
+    assert!(http_ready(http_addr).starts_with("HTTP/1.1 200"));
+    assert!(http_liveness(http_addr).starts_with("HTTP/1.1 200"));
+    let recovered_metrics = http_metrics(http_addr);
+    assert_eq!(
+        metric_value(&recovered_metrics, "runnel_engine_health_available"),
+        1
+    );
+    assert_eq!(
+        metric_value(&recovered_metrics, "runnel_active_requests"),
+        0
+    );
+    assert_eq!(
+        metric_value(&recovered_metrics, "runnel_broker_request_timeouts_total"),
+        request_timeouts_before
+    );
+
+    let recovery_stream = "storage-pressure-repeat-recovery";
+    assert!(matches!(
+        request(
+            broker_addr,
+            Request::CreateStream {
+                stream: recovery_stream.to_owned(),
+            },
+        ),
+        Response::StreamCreated { .. }
+    ));
+    assert!(matches!(
+        request(
+            broker_addr,
+            Request::Publish {
+                stream: recovery_stream.to_owned(),
+                key: None,
+                payload: "durable-after-repeated-pressure".to_owned(),
+                request_id: None,
+            },
+        ),
+        Response::Published { offset: 0, .. }
+    ));
+    assert!(matches!(
+        request(
+            broker_addr,
+            Request::Poll {
+                stream: recovery_stream.to_owned(),
+                consumer: "recovery-reader".to_owned(),
+            },
+        ),
+        Response::Message { payload, .. } if payload == "durable-after-repeated-pressure"
+    ));
+    assert!(matches!(
+        request(broker_addr, Request::Health),
+        Response::Health { .. }
+    ));
 }
 
 #[cfg(unix)]
