@@ -46,6 +46,25 @@ To share work between local worker processes, use one consumer name and a distin
     cargo run -p runnel-cli -- consume jobs workers --member worker-a
     cargo run -p runnel-cli -- ack jobs workers 0 --member worker-a --delivery-token <token-from-consume>
 
+Configure and inspect a durable policy for one stream and consumer pair:
+
+    cargo run -p runnel-cli -- configure-consumer events worker 5000 --max-delivery-attempts 5
+    cargo run -p runnel-cli -- inspect-consumer events worker
+
+Both commands return a `consumer_policy` JSON response. For these values, it includes:
+
+    {
+      "type": "consumer_policy",
+      "stream": "events",
+      "consumer": "worker",
+      "version": 1,
+      "configured": true,
+      "ack_timeout_ms": 5000,
+      "max_delivery_attempts": 5
+    }
+
+`version` advances when the values change; repeating the same configuration is idempotent. An unconfigured consumer reports `configured: false` and `version: 0`, with `ack_timeout_ms` and `max_delivery_attempts` showing the broker-wide fallback values. Omitting `--max-delivery-attempts` when configuring sets that consumer's attempt limit to `null` (no limit), rather than inheriting the broker-wide attempt limit. The timeout is in milliseconds; zero is allowed, its maximum is seven days, and a specified attempt limit must be positive. Configuration applies only to an existing stream and the named consumer; other consumers on the stream are unaffected. See [ADR 0027](docs/decisions/0027-consumer-scoped-retry-policy.md) for the policy semantics.
+
 The broker listens on 127.0.0.1:4222. Health endpoints and metrics listen on 127.0.0.1:8080:
 
     curl http://127.0.0.1:8080/health/live
