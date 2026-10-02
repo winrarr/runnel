@@ -31,7 +31,7 @@ jobs:
       - run: just verify
 
   integration:
-    name: Integration, peer-forwarding, and container smoke tests
+    name: Integration and container smoke tests
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     env:
