@@ -39,6 +39,7 @@ from cluster_scenarios import (  # noqa: E402
     MAX_HOT_ORDERING_MESSAGES,
     MAX_HOT_ORDERING_TIMEOUT_SECONDS,
     MAX_LEADER_FAILURE_TIMEOUT_SECONDS,
+    MAX_PEER_FORWARDING_STREAM_COUNT,
     MAX_PUBLISH_BATCH_SIZE,
     MAX_RAFT_LOG_GROWTH_CYCLE_TIMEOUT_SECONDS,
     MAX_RAFT_LOG_GROWTH_LOGICAL_PAYLOAD_BYTES,
@@ -211,6 +212,49 @@ class ClusterBenchmarkTests(unittest.TestCase):
                 "consensus_history_source": "per-node data-group raft-log.json",
             },
         )
+
+    def test_result_builder_records_peer_forwarding_stream_setup_semantics(self) -> None:
+        with patch.object(
+            sys,
+            "argv",
+            [
+                "cluster.py",
+                "--scenarios",
+                "peer_forwarding",
+                "--messages",
+                "10",
+                "--warmup",
+                "3",
+                "--peer-forwarding-stream-count",
+                "2",
+            ],
+        ):
+            args = parse_args()
+        cluster = SimpleNamespace(
+            image_id="sha256:test",
+            startup_ns=1_000_000,
+            peer_proxy_summary=lambda: {"enabled": False, "response_delay_ms": 0},
+            stats=SimpleNamespace(summary=lambda: {}),
+        )
+        with (
+            patch.object(cluster_results, "result_metadata", return_value={}),
+            patch.object(cluster_results, "resource_limits", return_value={}),
+        ):
+            result = cluster_results.build_result(
+                args,
+                run_id="run-id",
+                started_at=datetime(2026, 1, 1, tzinfo=UTC),
+                cluster=cluster,
+                scenarios=[{"operation": "cluster_peer_forwarding"}],
+            )
+
+        forwarding = result["workload"]["peer_forwarding"]
+        self.assertEqual(forwarding["stream_count"], 2)
+        self.assertEqual(forwarding["data_group_count"], 2)
+        self.assertEqual(forwarding["measured_messages_total"], 10)
+        self.assertEqual(forwarding["warmup_messages_per_stream"], 3)
+        self.assertEqual(forwarding["setup_warmup_messages_total"], 6)
+        self.assertTrue(forwarding["setup_excluded_from_measurement"])
 
     def test_native_log_handle_closes_when_a_node_stops(self) -> None:
         class FakeProcess:
@@ -692,15 +736,44 @@ class ClusterBenchmarkTests(unittest.TestCase):
                 "5",
                 "--peer-forwarding-timeout-seconds",
                 "12.5",
+                "--peer-forwarding-stream-count",
+                "2",
             ],
         ):
             args = parse_args()
 
         self.assertEqual(args.scenarios, ["peer_forwarding"])
         self.assertEqual(args.peer_forwarding_concurrency, 8)
+        self.assertEqual(args.peer_forwarding_stream_count, 2)
         self.assertEqual(args.peer_response_delay_ms, 5)
         self.assertEqual(args.peer_forwarding_timeout_seconds, 12.5)
         self.assertEqual(parse_positive_float("0.5"), 0.5)
+
+    def test_peer_forwarding_stream_count_is_bounded_and_fits_total_messages(self) -> None:
+        with patch.object(sys, "argv", ["cluster.py"]):
+            args = parse_args()
+        self.assertEqual(args.peer_forwarding_stream_count, 1)
+
+        for arguments in (
+            ["cluster.py", "--peer-forwarding-stream-count", "0"],
+            [
+                "cluster.py",
+                "--peer-forwarding-stream-count",
+                str(MAX_PEER_FORWARDING_STREAM_COUNT + 1),
+            ],
+            [
+                "cluster.py",
+                "--scenarios",
+                "peer_forwarding",
+                "--messages",
+                "2",
+                "--peer-forwarding-stream-count",
+                "3",
+            ],
+        ):
+            with patch.object(sys, "argv", arguments), self.subTest(arguments=arguments):
+                with self.assertRaises(SystemExit):
+                    parse_args()
 
     def test_publish_batch_request_validates_each_published_outcome(self) -> None:
         class FakeClient:
@@ -973,6 +1046,62 @@ class ClusterBenchmarkTests(unittest.TestCase):
         self.assertEqual(result["metadata"]["forwarding_ingress_node"], 2)
         self.assertEqual(result["metadata"]["peer_response_delay_ms"], 5)
         self.assertTrue(result["metadata"]["peer_response_proxy_enabled"])
+
+    def test_peer_forwarding_distributes_total_messages_and_checks_offsets_per_stream(self) -> None:
+        created_streams: list[tuple[str, int]] = []
+        published_streams: list[str] = []
+        offsets = {"events-1": 2, "events-2": 2}
+        lock = threading.Lock()
+        cluster = SimpleNamespace(
+            node_count=3,
+            peer_response_delay_ms=0,
+            stats=object(),
+            metrics=lambda: None,
+            peer_proxy_summary=lambda: {"enabled": False},
+            client=lambda _index, **_: SimpleNamespace(close=lambda: None),
+        )
+
+        def publish_setup(_client: object, stream: str, _payload: str, count: int) -> None:
+            created_streams.append((stream, count))
+
+        def publish_message(
+            _client: object, stream: str, _payload: str
+        ) -> tuple[int, int]:
+            with lock:
+                published_streams.append(stream)
+                offset = offsets[stream]
+                offsets[stream] += 1
+            return offset, 100
+
+        def run_measurement(_stats: object, operation: object, **_: object) -> dict:
+            return operation()
+
+        with (
+            patch("cluster_scenarios.publish_stream", side_effect=publish_setup),
+            patch("cluster_scenarios.measure_scenario", side_effect=run_measurement),
+            patch("cluster_scenarios.publish", side_effect=publish_message),
+        ):
+            result = run_peer_forwarding(
+                cluster,
+                "events",
+                "payload",
+                messages=5,
+                warmup=2,
+                concurrency=3,
+                timeout_seconds=1,
+                stream_count=2,
+            )
+
+        self.assertEqual(created_streams, [("events-1", 2), ("events-2", 2)])
+        self.assertEqual(published_streams.count("events-1"), 3)
+        self.assertEqual(published_streams.count("events-2"), 2)
+        self.assertEqual(result["messages"], 5)
+        self.assertEqual(result["metadata"]["stream_count"], 2)
+        self.assertEqual(result["metadata"]["data_group_count"], 2)
+        self.assertEqual(result["metadata"]["setup_warmup_messages_total"], 4)
+        self.assertEqual(result["metadata"]["measurement_messages_total"], 5)
+        self.assertEqual(result["metadata"]["measurement_messages_per_stream_min"], 2)
+        self.assertEqual(result["metadata"]["measurement_messages_per_stream_max"], 3)
 
     def test_leader_failure_recovery_reports_only_observed_public_endpoint_service(self) -> None:
         requests: list[tuple[int, dict[str, object]]] = []

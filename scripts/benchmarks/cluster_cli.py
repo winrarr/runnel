@@ -27,6 +27,7 @@ from cluster_scenarios import (
     DEFAULT_HOT_ORDERING_TIMEOUT_SECONDS,
     DEFAULT_LEADER_FAILURE_TIMEOUT_SECONDS,
     DEFAULT_PEER_FORWARDING_CONCURRENCY,
+    DEFAULT_PEER_FORWARDING_STREAM_COUNT,
     DEFAULT_PEER_FORWARDING_TIMEOUT_SECONDS,
     DEFAULT_PEER_RESPONSE_DELAY_MS,
     DEFAULT_PUBLISH_BATCH_SIZE,
@@ -43,6 +44,7 @@ from cluster_scenarios import (
     MAX_HOT_ORDERING_TIMEOUT_SECONDS,
     MAX_LEADER_FAILURE_TIMEOUT_SECONDS,
     MAX_PEER_FORWARDING_CONCURRENCY,
+    MAX_PEER_FORWARDING_STREAM_COUNT,
     MAX_PEER_FORWARDING_TIMEOUT_SECONDS,
     MAX_PEER_RESPONSE_DELAY_MS,
     MAX_PUBLISH_BATCH_SIZE,
@@ -222,6 +224,15 @@ def parse_args() -> argparse.Namespace:
         help="concurrent persistent follower clients for the peer-forwarding scenario",
     )
     parser.add_argument(
+        "--peer-forwarding-stream-count",
+        type=int,
+        default=DEFAULT_PEER_FORWARDING_STREAM_COUNT,
+        help=(
+            "number of streams/data groups for peer_forwarding; measured publishes "
+            "are distributed round-robin across them"
+        ),
+    )
+    parser.add_argument(
         "--peer-response-delay-ms",
         type=parse_nonnegative_int,
         default=DEFAULT_PEER_RESPONSE_DELAY_MS,
@@ -261,6 +272,21 @@ def parse_args() -> argparse.Namespace:
         parser.error(
             "peer forwarding concurrency exceeds the bounded maximum "
             f"of {MAX_PEER_FORWARDING_CONCURRENCY}"
+        )
+    if args.peer_forwarding_stream_count <= 0:
+        parser.error("peer forwarding stream count must be positive")
+    if args.peer_forwarding_stream_count > MAX_PEER_FORWARDING_STREAM_COUNT:
+        parser.error(
+            "peer forwarding stream count exceeds the bounded maximum "
+            f"of {MAX_PEER_FORWARDING_STREAM_COUNT}"
+        )
+    if (
+        "peer_forwarding" in args.scenarios
+        and args.peer_forwarding_stream_count > args.messages
+    ):
+        parser.error(
+            "peer forwarding stream count cannot exceed measured publishes; "
+            "each stream must receive at least one"
         )
     if args.batch_size <= 0 or args.batch_size > MAX_PUBLISH_BATCH_SIZE:
         parser.error(
@@ -488,6 +514,7 @@ def run_scenarios(
                     args.warmup,
                     args.peer_forwarding_concurrency,
                     args.peer_forwarding_timeout_seconds,
+                    stream_count=args.peer_forwarding_stream_count,
                 )
             )
         if not args.skip_recovery and size == args.payload_sizes[0]:

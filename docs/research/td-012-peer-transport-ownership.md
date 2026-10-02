@@ -98,10 +98,13 @@ The change deliberately does not pool the persistent per-group Raft streams. Tha
 - The default opt-in `peer_forwarding` clustered benchmark exercises eight
   concurrent follower-ingress publishes against the four shared compatibility
   permits and can inject a bounded delay into `Forward` responses. Its
-  concurrency, delay, and timeout are configurable. It reports follower
-  round-trip p50/p99/p99.9 and resource samples, but it does not isolate pool
-  wait from quorum processing, compare against an alternate connection
-  strategy, or exercise snapshot/control interference.
+  concurrency, delay, timeout, and stream count are configurable. A bounded
+  stream-count sweep creates one data group per stream, distributes the fixed
+  total measured publishes round-robin, and records the aggregate excluded
+  warmup setup. This characterizes follower-ingress publish behavior as data
+  group count grows; it does not isolate pool wait from quorum processing,
+  directly count retained per-group replication streams, compare against an
+  alternate connection strategy, or exercise snapshot/control interference.
 - Snapshot chunks are serial on their dedicated OpenRaft snapshot client and do
   not share the transport stream used by that group's log replication and
   replication-loop heartbeats. A real-process snapshot-plus-control probe may
@@ -130,10 +133,10 @@ The change deliberately does not pool the persistent per-group Raft streams. Tha
 
 The source review corrects the snapshot/control contention hypothesis but does
 not retire TD-012. The current `peer_forwarding` workload can measure forwarding
-saturation and follower round-trip latency for one stream; it cannot
-characterize persistent replication connection growth across many streams or
-compare a different transport strategy. Keep the runtime and ADRs unchanged
-until a bounded candidate has a workload that exercises its target dimension
-and a controlled comparison. Connection-density and tail-latency measurements
-remain the next evidence needed; do not claim an optimization from the existing
-pool tests or forwarding baseline alone.
+saturation and follower round-trip latency across bounded data-group counts at
+fixed aggregate measured work. It does not directly observe retained replication
+connections or compare a different transport strategy. Keep the runtime and
+ADRs unchanged until a controlled comparison measures a candidate strategy.
+Connection counts, alternative-strategy comparison, snapshot/control effects,
+and stable tail-latency evidence remain open; do not claim an optimization from
+this density characterization or the existing pool tests alone.

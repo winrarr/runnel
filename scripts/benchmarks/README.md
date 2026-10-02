@@ -147,18 +147,23 @@ python3 scripts/benchmarks/cluster.py \
   --warmup 16 \
   --payload-sizes 100 \
   --peer-forwarding-concurrency 8 \
+  --peer-forwarding-stream-count 4 \
   --peer-response-delay-ms 5 \
   --peer-forwarding-timeout-seconds 60 \
   --output benchmark-results/peer-forwarding.json
 ```
 
-The setup creates the stream and publishes warmup records through node 1; that work is excluded from measurement. Each measured publish uses one persistent public client per worker on node 2, the non-bootstrap ingress node, and therefore exercises the broker's internal `Forward` request to the data-group leader. The default eight workers exceed the current four shared forwarding permits (five pooled connections minus one reserved control connection), making pool wait visible when peer responses are delayed. The benchmark validates that all measured offsets are present and contiguous, but it does not expose offsets as a public product guarantee.
+`--peer-forwarding-stream-count` is bounded from 1 to 64 and defaults to one. Each stream maps to a data group. The setup creates all selected streams and publishes `--warmup` records to each through node 1; this work is excluded from measurement. The measured `--messages` value remains the total across all streams, distributed round-robin, and the selected stream count cannot exceed that total. The result validates contiguous offsets independently within every stream. Increasing stream count therefore keeps measured publish work fixed while increasing data-group count and setup work; it is a data-group-density characterization baseline, not a transport-strategy comparison.
+
+Each measured publish uses one persistent public client per worker on node 2, the non-bootstrap ingress node, and therefore exercises the broker's internal `Forward` request to the data-group leader. The default eight workers exceed the current four shared forwarding permits (five pooled connections minus one reserved control connection), making pool wait visible when peer responses are delayed. Offsets are validated for benchmark correctness and are not exposed as a public product guarantee.
 
 `--peer-response-delay-ms` enables a run-scoped native TCP proxy on every peer address. The proxy forwards the real framed peer protocol and delays only `Forward` responses, leaving Raft control responses on the same transport but outside the injected delay; it is deliberately a bounded perturbation for response-delay and saturation experiments, not a production topology. A zero delay keeps direct peer connections. The proxy is native-process-only because container peers cannot reach the host loopback proxy. Keep the delay small enough for the cluster's acknowledgement and request timeouts. The focused scenario has a bounded wall-clock budget from `--peer-forwarding-timeout-seconds` (default 60 seconds, maximum 300); individual protocol requests retain the broker's 30-second timeout.
 
-The result uses the normal schema-v2 envelope and records the selected scenarios, message and warmup counts, payload sizes, forwarding concurrency, response delay, timeout, runtime, resource limits, full source revision, host provenance, and public-protocol durability boundary. Its `cluster_peer_forwarding` record reports throughput, logical payload throughput, p50/p99/p99.9/maximum follower round-trip latency, aggregate and per-node CPU/memory samples, and `/metrics` deltas. The scenario metadata identifies the forwarding ingress, operation, setup and latency boundaries, delay, concurrency, and saturation interpretation. When enabled, raw backend metadata at `backends.runnel-cluster.peer_response_proxy` additionally reports proxy connections, framed requests/responses, delayed responses, and per-node listen/target ports. These counters include cluster startup and setup traffic; use the scenario latency and metric deltas for measured comparisons.
+The result uses the normal schema-v2 envelope and records the selected scenarios, message and warmup counts, payload sizes, forwarding concurrency, stream/data-group count, response delay, timeout, runtime, resource limits, full source revision, host provenance, and public-protocol durability boundary. Its `cluster_peer_forwarding` record reports total measured publishes, stream count, aggregate setup warmup count, per-stream measured message range, throughput, logical payload throughput, p50/p99/p99.9/maximum follower round-trip latency, aggregate and per-node CPU/memory samples, and `/metrics` deltas. The scenario metadata identifies the forwarding ingress, operation, setup and latency boundaries, delay, concurrency, and saturation interpretation. When enabled, raw backend metadata at `backends.runnel-cluster.peer_response_proxy` additionally reports proxy connections, framed requests/responses, delayed responses, and per-node listen/target ports. These counters include cluster startup and setup traffic; use the scenario latency and metric deltas for measured comparisons.
 
-This probe establishes a repeatable forwarding and overload baseline; it is not evidence of a runtime performance improvement. Compare only runs with the same native runtime, topology, payload, warmup, message count, forwarding concurrency, response delay, timeout, resource budget, and source/build conditions. The delayed forwarding responses still include the target's normal quorum work, so a result does not isolate pool wait from consensus or target-processing cost. The public clustered benchmark remains unchanged unless `peer_forwarding` is selected in `--scenarios`.
+This probe establishes a repeatable forwarding, overload, and bounded data-group-density baseline; it is not evidence of a runtime performance improvement. Compare only runs with the same native runtime, topology, payload, stream count, warmup per stream, total measured message count, forwarding concurrency, response delay, timeout, resource budget, and source/build conditions. The delayed forwarding responses still include the target's normal quorum work, so a result does not isolate pool wait from consensus or target-processing cost. The public clustered benchmark remains unchanged unless `peer_forwarding` is selected in `--scenarios`.
+
+The sequential `matrix.py` runner can expand this dimension with `--peer-forwarding-stream-count-values 1,4,16`. It creates one independent case per stream count and retains each result artifact. Keep the matrix small enough to fit `--max-cases` and the outer `--case-timeout-seconds` budget.
 
 `--skip-recovery` skips restart and failure-recovery scenarios, including the retained-data recovery, leader-failure, and follower-failure probes; it does not skip the independent `retained_hot_path` publish probe. The cluster's temporary durable directories, generated stream names, native ports, process/container resources, and container network are run-scoped. Supply distinct output and log paths when invoking the script directly; use the isolation runner when independent process-heavy workflows overlap.
 
@@ -170,6 +175,12 @@ For a quick lifecycle check:
 
 ```text
 just bench-cluster-smoke
+```
+
+For an isolated process-level check of the multi-stream forwarding scenario:
+
+```text
+just bench-cluster-peer-forwarding-smoke
 ```
 
 For a container lifecycle check, use `just bench-cluster-container-smoke`. Neither smoke workflow is a performance gate. Host scheduling, background processes, filesystem, kernel state, Docker networking, and container resource enforcement can materially affect the numbers. Keep the host and workload metadata with any result used for comparison.
