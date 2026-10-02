@@ -99,7 +99,8 @@ changes the work; otherwise state a safe assumption and proceed.
 - Include a concise handoff in the PR description with:
   - goal, changed files, expected effects, and non-effects;
   - primary evidence class and any secondary evidence tags;
-  - supplied baseline revision and whether the branch was refreshed;
+  - supplied baseline revision and, only if a merge conflict required it,
+    the branch update and conflict resolution;
   - commands and results, focused and end-to-end coverage assessment, and any
     test or benchmark artifacts;
   - correctness, failure, and recovery considerations; evidence gaps and

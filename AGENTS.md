@@ -82,7 +82,7 @@ Backlog and tech-debt registers are inventories, not execution queues. Select wo
 
 Every contributor must read and follow this file before starting a change. Every change run—including reviews, documentation or configuration changes—uses one recorded baseline from the default branch. The run lead establishes and shares that baseline and its verification state; all participants use the supplied baseline instead of repeating run-level checks. For an individual change, the person doing the work leads the run. Human contributors follow the same rule as described in `CONTRIBUTING.md`.
 
-When a newer default-branch revision appears during the run, update work based on an older revision only when the newer changes overlap its paths, shared contracts, dependencies, generated output, or integration behavior. Do not refresh independent work solely to chase unrelated commits. Required pull-request checks must still pass before merging.
+When a newer default-branch revision appears during the run, do not merge, rebase, or otherwise refresh an existing task branch merely because paths, contracts, dependencies, generated output, or integration behavior overlap. Merge a ready pull request against the current default branch after review and its exact-head required checks pass. Update a task branch only to resolve an actual merge conflict; after resolving one, rerun the checks affected by the resolution. If another repository gate blocks merging without a conflict, report the exact blocker rather than refreshing the branch automatically.
 
 For parallel worktrees, follow `.codex/skills/parallel-worktrees/SKILL.md` for the workflow. Shared engineering and evidence policies remain in this file.
 
