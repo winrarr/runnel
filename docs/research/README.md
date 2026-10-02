@@ -69,6 +69,7 @@ for the same evidence labels and outcome/evidence gates.
 - [TD-029 dead-letter identity contract](td-029-dead-letter-identity-contract.md)
   compares durable identity domains for public request IDs and local
   dead-letter moves, including the unresolved RNL3 upgrade ambiguity.
+- [TD-018 retry-policy source review (2026-10)](td-018-retry-policy-review-2026-10.md) checks the exploratory retry design against current Runnel behavior and current primary broker documentation without accepting new policy semantics.
 - [Systems performance research for Runnel](systems-performance-research.md)
   connects established and recent systems research on durable batching,
   queueing, replicated-log writes, cache lines, and I/O to Runnel's current
