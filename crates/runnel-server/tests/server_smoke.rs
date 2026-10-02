@@ -1050,6 +1050,136 @@ fn network_protocol_preserves_public_record_on_dead_letter_move_id_collision_aft
 }
 
 #[test]
+fn network_protocol_reconciles_same_content_public_dead_letter_id_after_restart() {
+    let directory = TempDir::new().unwrap();
+    let server = RunningServer::start_with_args(
+        directory.path(),
+        &["--ack-timeout-ms", "10", "--max-delivery-attempts", "1"],
+    );
+
+    assert!(matches!(
+        request(
+            server.broker_addr,
+            Request::Publish {
+                stream: "events".to_owned(),
+                key: Some("order-1".to_owned()),
+                payload: "poison".to_owned(),
+                request_id: None,
+            },
+        ),
+        Response::Published { offset: 0, .. }
+    ));
+    assert!(matches!(
+        request(
+            server.broker_addr,
+            Request::Poll {
+                stream: "events".to_owned(),
+                consumer: "worker".to_owned(),
+            },
+        ),
+        Response::Message {
+            offset: 0,
+            delivery_attempt: Some(1),
+            ..
+        }
+    ));
+    assert!(matches!(
+        request(
+            server.broker_addr,
+            Request::Publish {
+                stream: "events.dead-letter".to_owned(),
+                key: Some("order-1".to_owned()),
+                payload: "poison".to_owned(),
+                request_id: Some("runnel-dlq/v1/6:events/6:worker/0".to_owned()),
+            },
+        ),
+        Response::Published { offset: 0, .. }
+    ));
+
+    sleep(Duration::from_millis(20));
+    assert!(matches!(
+        request(
+            server.broker_addr,
+            Request::Poll {
+                stream: "events".to_owned(),
+                consumer: "worker".to_owned(),
+            },
+        ),
+        Response::Empty { .. }
+    ));
+    assert!(matches!(
+        request(
+            server.broker_addr,
+            Request::Replay {
+                stream: "events.dead-letter".to_owned(),
+                consumer: "inspector".to_owned(),
+                offset: 0,
+            },
+        ),
+        Response::ReplayMessage {
+            offset: 0,
+            key: Some(key),
+            payload,
+            ..
+        } if key == "order-1" && payload == "poison"
+    ));
+    assert!(matches!(
+        request(
+            server.broker_addr,
+            Request::Replay {
+                stream: "events.dead-letter".to_owned(),
+                consumer: "inspector".to_owned(),
+                offset: 1,
+            },
+        ),
+        Response::Error { code, .. } if code == "history_unavailable"
+    ));
+    server.stop();
+
+    let server = RunningServer::start_with_args(
+        directory.path(),
+        &["--ack-timeout-ms", "10", "--max-delivery-attempts", "1"],
+    );
+    assert!(matches!(
+        request(
+            server.broker_addr,
+            Request::Poll {
+                stream: "events".to_owned(),
+                consumer: "worker".to_owned(),
+            },
+        ),
+        Response::Empty { .. }
+    ));
+    assert!(matches!(
+        request(
+            server.broker_addr,
+            Request::Replay {
+                stream: "events.dead-letter".to_owned(),
+                consumer: "inspector".to_owned(),
+                offset: 0,
+            },
+        ),
+        Response::ReplayMessage {
+            offset: 0,
+            key: Some(key),
+            payload,
+            ..
+        } if key == "order-1" && payload == "poison"
+    ));
+    assert!(matches!(
+        request(
+            server.broker_addr,
+            Request::Replay {
+                stream: "events.dead-letter".to_owned(),
+                consumer: "inspector".to_owned(),
+                offset: 1,
+            },
+        ),
+        Response::Error { code, .. } if code == "history_unavailable"
+    ));
+}
+
+#[test]
 fn network_protocol_reassigns_group_delivery_after_restart() {
     let directory = TempDir::new().unwrap();
     let server = RunningServer::start(directory.path());
