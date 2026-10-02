@@ -27,10 +27,11 @@ changes the work; otherwise state a safe assumption and proceed.
   task ownership and the integration plan, then proceed. If either of you is
   unsure, the coordinator escalates the scope decision to the user before the
   boundary changes.
-- Own the evidence plan: before implementation, identify the primary evidence
-  class, applicable gate in [`docs/testing.md`](../../../docs/testing.md),
-  acceptance criteria, and verification commands. Choose how to meet them
-  under the repository's documented policies.
+- Choose the primary evidence class, applicable gate in
+  [`docs/testing.md`](../../../docs/testing.md), and verification approach
+  that covers the acceptance criteria. Follow the shared policies in
+  `AGENTS.md`, `docs/testing.md`, and `docs/benchmarking.md`; the coordinator
+  reviews whether the resulting evidence supports the outcome and claims.
 
 ## Implementation and verification
 
@@ -73,14 +74,12 @@ changes the work; otherwise state a safe assumption and proceed.
   processes, ports, data, output paths, and build targets as required by
   `SKILL.md`.
 - For performance-sensitive work, follow
-  [`docs/benchmarking.md`](../../../docs/benchmarking.md) and the benchmark
-  rules in `SKILL.md`. Record the exact revision, workload, resources,
-  isolation, repetitions, commands, and artifacts. Do not claim an improvement
-  from an inconclusive or uncontrolled comparison. The coordinator reviews
-  whether the evidence satisfies the documented gates and supports the claim,
-  and requests more work only for a concrete gap, failed or required check, or
-  unsupported claim. Coordinate benchmark timing and resource reservations
-  when an authoritative comparison needs a quiet host window.
+  [`docs/benchmarking.md`](../../../docs/benchmarking.md) and record the exact
+  revision, workload, resources, isolation, repetitions, commands, and
+  artifacts. Do not claim an improvement from an inconclusive or uncontrolled
+  comparison. Choose evidence suited to the change; explain any coverage gap
+  or why a benchmark does not apply. Coordinate authoritative benchmark timing
+  so no other tests, benchmarks, or resource-heavy workloads run on the host.
 
 ## Pull request and handoff
 
@@ -92,12 +91,11 @@ changes the work; otherwise state a safe assumption and proceed.
   its workflows, assess and address failures, and update the PR title and
   description to reflect the current work and evidence as they change; the PR
   description does not need a revision history. Mark it ready and hand it to
-  the coordinator only when you consider the assignment complete, the handoff
-  is complete, and all required checks have passed on the exact final head. If
-  a check fails, diagnose and address it before handoff. If a blocker prevents
-  readiness, keep the PR in draft and send the coordinator a progress update
-  with the evidence and blocker. Do not merge the PR or enable auto-merge; the
-  coordinator owns review and integration.
+  the coordinator only when the assignment is complete, it is ready for
+  independent review, and all required checks pass on the exact final PR head.
+  If a blocker prevents readiness, keep the PR in draft and send the
+  coordinator a progress update with the evidence and blocker. Do not merge
+  the PR or enable auto-merge; the coordinator owns review and integration.
 - Include a concise handoff in the PR description with:
   - goal, changed files, expected effects, and non-effects;
   - primary evidence class and any secondary evidence tags;
@@ -109,9 +107,9 @@ changes the work; otherwise state a safe assumption and proceed.
   - refactor and backlog/tech-debt assessment, including any updates or an
     explicit no-update rationale;
   - a recommendation to merge, revise, rerun, or defer, with reasons.
-- At handoff, tell the coordinator the PR URL, branch and worktree, check
-  status, final head revision, and recommendation. Verify required PR checks,
-  including the relevant end-to-end job, against that exact head. The
+- At handoff, tell the coordinator the PR URL, branch and worktree, green
+  required-check status, final head revision, and recommendation. Include the
+  relevant end-to-end job and verify it passed against that exact head. The
   coordinator is the reviewer and will send any requested revisions directly;
   do not wait for review comments. Keep the worktree and branch available
   until the coordinator closes the work, and do not stop authorized nested
