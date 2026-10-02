@@ -13,9 +13,11 @@ pull-request policies.
 
 At the start of a run, the orchestrator performs the single baseline check
 required by `AGENTS.md`: fetch `origin/main`, record its revision, and inspect
-the latest `ci.yml` run when GitHub access is available. Compare its `headSha`,
-`status`, and `conclusion` with that revision; an older successful run does not
-establish the current baseline. Share the revision and CI state with workers.
+the latest `ci.yml` run on `main` when GitHub access is available. Record its
+`headSha`, `status`, and `conclusion`, noting that a default-branch run may lag
+the current revision and is periodic health evidence. Passing required checks
+on the exact pull-request head are the merge gate; do not wait for a new
+default-branch run. Share the revision and CI state with workers.
 Workers confirm their worktree `HEAD` matches the supplied revision; they do
 not repeat the run-level fetch or CI check. Inspect the run with:
 
@@ -24,14 +26,15 @@ gh run list --workflow ci.yml --branch main --limit 1 --json headSha,status,conc
 ```
 
 Do not inspect or wait for another baseline CI run during the same run; each
-PR still needs its required checks to pass before merge. A newer default-branch
-revision does not by itself require updating an existing task branch, even if
-paths, contracts, dependencies, generated output, or integration behavior
-overlap. Merge a ready PR against the current base after review and exact-head
-required checks pass. Merge or rebase the latest base into a task branch only
-to resolve an actual merge conflict, then rerun checks affected by the
-resolution. If another repository gate blocks merging without a conflict,
-report the exact blocker instead of refreshing the branch automatically.
+PR still needs its required checks to pass on its exact final head before
+merge. A newer default-branch revision does not by itself require updating an
+existing task branch, even if paths, contracts, dependencies, generated output,
+or integration behavior overlap. Merge a ready PR against the current base
+after review and exact-head required checks pass. Merge or rebase the latest
+base into a task branch only to resolve an actual merge conflict, then rerun
+checks affected by the resolution. If another repository gate blocks merging
+without a conflict, report the exact blocker instead of refreshing the branch
+automatically.
 
 Use the task request, dependencies, risk, and learning value to select work
 from `docs/backlog.md` and `docs/tech-debt.md`. Confirm an item still applies
