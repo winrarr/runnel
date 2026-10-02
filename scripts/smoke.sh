@@ -51,7 +51,7 @@ start_server() {
         --data-dir "$data_dir" \
         --listen "$broker_addr" \
         --http-listen "127.0.0.1:$http_port" \
-        --ack-timeout-ms 50 \
+        --ack-timeout-ms 5000 \
         --max-delivery-attempts 2 \
         >"$log_file" 2>&1 &
     server_pid=$!
@@ -130,6 +130,29 @@ if response != {"type": "empty", "stream": stream, "consumer": consumer}:
 PY
 }
 
+assert_acknowledged_response() {
+    local output=$1
+    local stream=$2
+    local consumer=$3
+    local offset=$4
+    python3 - "$output" "$stream" "$consumer" "$offset" <<'PY'
+import json
+import sys
+
+response = json.loads(sys.argv[1])
+_, _, stream, consumer, offset = sys.argv
+expected = {
+    "type": "acknowledged",
+    "stream": stream,
+    "consumer": consumer,
+    "offset": int(offset),
+    "already_acknowledged": False,
+}
+if response != expected:
+    raise SystemExit(f"unexpected acknowledgement response: {response}")
+PY
+}
+
 assert_policy_field() {
     local output=$1
     local field=$2
@@ -165,7 +188,8 @@ start_server
 "$cli_binary" --server "$broker_addr" publish events hello
 output=$("$cli_binary" --server "$broker_addr" consume events worker)
 assert_contains "$output" '"offset": 0'
-"$cli_binary" --server "$broker_addr" ack events worker 0
+ack_output=$("$cli_binary" --server "$broker_addr" ack events worker 0)
+assert_acknowledged_response "$ack_output" events worker 0
 output=$("$cli_binary" --server "$broker_addr" replay events worker 0)
 assert_replay_message "$output" events worker 0 hello
 output=$("$cli_binary" --server "$broker_addr" consume events worker)
@@ -190,11 +214,21 @@ if [ "$group_a_offset" = "$group_b_offset" ]; then
     printf '%s\n' 'group members received the same record' >&2
     exit 1
 fi
-"$cli_binary" --server "$broker_addr" ack jobs workers "$group_a_offset" \
-    --member worker-a --delivery-token "$group_a_token"
-"$cli_binary" --server "$broker_addr" ack jobs workers "$group_b_offset" \
-    --member worker-b --delivery-token "$group_b_token"
+ack_output=$("$cli_binary" --server "$broker_addr" ack jobs workers "$group_a_offset" \
+    --member worker-a --delivery-token "$group_a_token")
+assert_acknowledged_response "$ack_output" jobs workers "$group_a_offset"
+ack_output=$("$cli_binary" --server "$broker_addr" ack jobs workers "$group_b_offset" \
+    --member worker-b --delivery-token "$group_b_token")
+assert_acknowledged_response "$ack_output" jobs workers "$group_b_offset"
 
+"$cli_binary" --server "$broker_addr" create-stream poison
+policy_output=$("$cli_binary" --server "$broker_addr" configure-consumer poison poison-worker 50 \
+    --max-delivery-attempts 2)
+assert_policy_field "$policy_output" type consumer_policy
+assert_policy_field "$policy_output" stream poison
+assert_policy_field "$policy_output" consumer poison-worker
+assert_policy_field "$policy_output" ack_timeout_ms 50
+assert_policy_field "$policy_output" max_delivery_attempts 2
 "$cli_binary" --server "$broker_addr" publish poison poison
 output=$("$cli_binary" --server "$broker_addr" consume poison poison-worker)
 assert_contains "$output" '"delivery_attempt": 1'
