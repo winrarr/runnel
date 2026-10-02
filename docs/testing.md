@@ -112,13 +112,19 @@ The Criterion suite includes durable publish, legacy publish/poll/ack, two-membe
 - `just bench-test` runs the benchmark normalization and dashboard tests.
 - `just ci` runs `just verify` and `just integration`; integration exercises the isolated process smoke, peer-forwarding process smoke, and both single-node and three-node container smoke workflows, building an image unless a prebuilt integration image is supplied.
 
+## Pull-request CI path selection
+
+The required CI and security workflows trigger on every pull request so their required check contexts are always reported. Do not add workflow-level `paths` or `paths-ignore` filters to them: GitHub leaves checks pending when the entire workflow is skipped. Instead, `.github/workflows/ci.yml` and `.github/workflows/security.yml` use `dorny/paths-filter` with the shared rules in `.github/ci-paths.yaml` to conditionally run their required jobs. A skipped required job reports success under its existing check name.
+
+Changes to Rust crates, Cargo manifests or lockfile, scripts, build configuration, or relevant workflow files run the affected verification or integration jobs. Dependency files and security workflow changes run `audit`. Documentation and research-only pull requests still run path detection and pull-request title validation, while unaffected runtime and audit jobs skip. If path detection fails, the dependent jobs run as a safe fallback. Pushes to `main` continue to run verification and integration unconditionally, and scheduled or manually dispatched security audits remain unconditional.
+
 Benchmark workflows, applicability, interpretation, and required handoff evidence are documented in [benchmarking.md](benchmarking.md). Workload semantics, comparison boundaries, and harness-specific options are documented in [scripts/benchmarks/README.md](../scripts/benchmarks/README.md).
 
 ## Merge evidence classes
 
 Classify each independently reviewable pull request by its primary intended outcome before deciding what evidence is required. Add secondary tags when a change has another material concern, such as `hot-path`, `storage/recovery`, `public-contract`, `breaking`, `security`, or `deployment`. If a pull request contains independent outcomes, split it when practical; otherwise satisfy the evidence requirements for every applicable class.
 
-This matrix sets the minimum evidence for the change's main claim. It does not relax the global requirements for safety invariants, crash recovery, default branch checks, required CI, pull-request delivery, or worker cleanup.
+This matrix sets the minimum evidence for the change's main claim. It does not relax the global requirements for safety invariants, crash recovery, default branch checks, required CI for affected paths, pull-request delivery, or worker cleanup.
 
 | Primary class | Evidence required before merge | Benchmark treatment |
 | --- | --- | --- |

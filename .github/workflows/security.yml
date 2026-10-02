@@ -10,7 +10,23 @@ permissions:
   contents: read
 
 jobs:
+  changes:
+    name: Detect audit paths
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-24.04
+    permissions:
+      pull-requests: read
+    outputs:
+      audit: ${{ steps.filter.outputs.audit }}
+    steps:
+      - uses: dorny/paths-filter@v4
+        id: filter
+        with:
+          filters: .github/ci-paths.yaml
+
   audit:
+    needs: changes
+    if: ${{ !cancelled() && (needs.changes.result != 'success' || needs.changes.outputs.audit == 'true') }}
     runs-on: ubuntu-24.04
     env:
       RUSTUP_TOOLCHAIN: stable
