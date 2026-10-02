@@ -974,7 +974,7 @@ class ClusterBenchmarkTests(unittest.TestCase):
         self.assertEqual(result["metadata"]["peer_response_delay_ms"], 5)
         self.assertTrue(result["metadata"]["peer_response_proxy_enabled"])
 
-    def test_leader_failure_recovery_checks_both_survivors_and_restarted_node(self) -> None:
+    def test_leader_failure_recovery_reports_only_observed_public_endpoint_service(self) -> None:
         requests: list[tuple[int, dict[str, object]]] = []
         state = {"failed_publish": False, "polls": 0}
 
@@ -1032,10 +1032,38 @@ class ClusterBenchmarkTests(unittest.TestCase):
         self.assertEqual(result["operation"], "cluster_leader_failure_recovery")
         self.assertEqual(result["restart_ready_seconds"], 0.002)
         self.assertEqual(result["metadata"]["failed_node"], 1)
+        self.assertEqual(result["metadata"]["failed_node_role"], "bootstrap_assumed_leader")
         self.assertEqual(result["metadata"]["surviving_nodes"], [2, 3])
+        self.assertEqual(result["metadata"]["bootstrap_assumed_initial_leader_node"], 1)
         self.assertEqual(result["metadata"]["initial_leader_selection"], "bootstrap_assumption")
-        self.assertTrue(result["metadata"]["replacement_leader_observed"])
-        self.assertEqual(result["metadata"]["request_attempts"]["publish_after_leader_failure"], 2)
+        self.assertEqual(
+            result["metadata"]["replacement_leader_identity"],
+            "not exposed by the provisional public protocol",
+        )
+        self.assertEqual(
+            result["metadata"]["public_request_endpoints"],
+            {
+                "publish_after_failure": [2],
+                "poll_after_failure": [2, 3],
+                "ack_after_failure": [3, 2],
+                "publish_after_restart": [1],
+                "poll_after_restart": [1],
+                "ack_after_restart": [2],
+            },
+        )
+        self.assertTrue(result["metadata"]["verified"]["survivor_endpoint_requests_succeeded"])
+        self.assertTrue(
+            result["metadata"]["verified"]["restarted_endpoint_publish_and_poll_succeeded"]
+        )
+        self.assertEqual(result["metadata"]["restarted_endpoint_consumed_offset"], 2)
+        self.assertEqual(result["metadata"]["request_attempts"]["publish_after_failure"], 2)
+        self.assertNotIn("replacement_leader_observed", result["metadata"])
+        self.assertNotIn("initial_leader_node", result["metadata"])
+        self.assertNotIn("restart_recovered_message_offset", result["metadata"])
+        self.assertNotIn(
+            "surviving_nodes_elected_and_served", result["metadata"]["verified"]
+        )
+        self.assertNotIn("surviving_nodes_served", result["metadata"]["verified"])
         publish_request_ids = [
             request.get("request_id")
             for _, request in requests
@@ -1108,6 +1136,7 @@ class ClusterBenchmarkTests(unittest.TestCase):
         self.assertEqual(result["operation"], "cluster_follower_failure_recovery")
         self.assertEqual(result["metadata"]["failed_node"], 2)
         self.assertEqual(result["metadata"]["failed_node_role"], "follower")
+        self.assertEqual(result["metadata"]["failure_state"], "follower_process_stop")
         self.assertEqual(
             result["metadata"]["initial_leader_selection"],
             "not_required_for_follower_probe",

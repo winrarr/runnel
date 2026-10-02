@@ -1874,9 +1874,9 @@ def run_node_failure_recovery(
     """Exercise one bounded process-stop and same-node restart.
 
     The public protocol does not expose leader identity, so the leader probe
-    keeps its bootstrap assumption. The follower probe uses the same public
-    sequence with a non-bootstrap node, separating process recovery from
-    leader-election observation without adding broker-specific controls.
+    treats the stopped bootstrap node as the assumed initial leader and records
+    only successful requests through the surviving public endpoints. The
+    follower probe uses the same public sequence with a non-bootstrap node.
     """
     if failure_kind not in {"leader", "follower"}:
         raise BenchmarkError(f"unsupported failure kind: {failure_kind}")
@@ -1909,7 +1909,7 @@ def run_node_failure_recovery(
             stream if failure_kind == "leader" else f"follower-failure-{stream}"
         )
         failure_phase = f"{failure_kind}-failure"
-        response, _, attempts[f"publish_after_{failure_kind}_failure"] = request_until_response(
+        response, _, attempts["publish_after_failure"] = request_until_response(
             cluster,
             survivor_indices[0],
             {
@@ -2016,14 +2016,20 @@ def run_node_failure_recovery(
                 "nodes": cluster.node_count,
                 "failed_node": cluster.nodes[failed_index].node_id,
                 "surviving_nodes": [cluster.nodes[index].node_id for index in survivor_indices],
-                "failure_state": f"{failure_kind}_process_stop",
-                "failed_node_role": failure_kind,
+                "failure_state": (
+                    "bootstrap_assumed_leader_process_stop"
+                    if failure_kind == "leader"
+                    else "follower_process_stop"
+                ),
+                "failed_node_role": (
+                    "bootstrap_assumed_leader" if failure_kind == "leader" else "follower"
+                ),
                 "initial_leader_selection": (
                     "bootstrap_assumption"
                     if failure_kind == "leader"
                     else "not_required_for_follower_probe"
                 ),
-                "initial_leader_node": (
+                "bootstrap_assumed_initial_leader_node": (
                     cluster.nodes[failed_index].node_id
                     if failure_kind == "leader"
                     else None
@@ -2035,48 +2041,66 @@ def run_node_failure_recovery(
                     if failure_kind == "leader"
                     else "follower probe does not require identifying the current leader"
                 ),
-                "replacement_leader_observed": failure_kind == "leader",
                 "replacement_leader_identity": (
                     "not exposed by the provisional public protocol"
                     if failure_kind == "leader"
                     else "not applicable"
                 ),
-                "replacement_observation": (
-                    "both surviving public endpoints committed, consumed, and acknowledged "
-                    "records after the failed node stopped"
+                "survivor_endpoint_observation": (
+                    "publish through the first surviving endpoint, poll through both "
+                    "surviving endpoints, and acknowledge through both surviving endpoints "
+                    "completed after the failed process stopped"
                 ),
-                "public_protocol_survivor_nodes": [
-                    cluster.nodes[index].node_id for index in survivor_indices[:2]
-                ],
+                "public_request_endpoints": {
+                    "publish_after_failure": [
+                        cluster.nodes[survivor_indices[0]].node_id
+                    ],
+                    "poll_after_failure": [
+                        cluster.nodes[survivor_indices[0]].node_id,
+                        cluster.nodes[survivor_indices[1]].node_id,
+                    ],
+                    "ack_after_failure": [
+                        cluster.nodes[survivor_indices[1]].node_id,
+                        cluster.nodes[survivor_indices[0]].node_id,
+                    ],
+                    "publish_after_restart": [cluster.nodes[failed_index].node_id],
+                    "poll_after_restart": [cluster.nodes[failed_index].node_id],
+                    "ack_after_restart": [
+                        cluster.nodes[survivor_indices[0]].node_id
+                    ],
+                },
                 "post_failure_publish_offset": 1,
                 "post_failure_consumed_offsets": [0, 1],
                 "post_restart_publish_offset": 2,
-                "restart_recovered_message_offset": 2,
+                "restarted_endpoint_consumed_offset": 2,
                 "fault_sequence_messages": 3,
                 "verified_message_count": 3,
                 "metrics_counter_reset_on_restart_expected": True,
                 "verified": {
-                    "surviving_nodes_elected_and_served": failure_kind == "leader",
-                    "surviving_nodes_served": True,
+                    "survivor_endpoint_requests_succeeded": True,
                     "publish_after_failure": True,
                     "consume_after_failure": True,
                     "ack_after_failure": True,
-                    "publish_after_leader_failure": True,
-                    "consume_after_leader_failure": True,
-                    "ack_after_leader_failure": True,
                     "stopped_node_restarted": True,
-                    "restarted_node_served_and_recovered": True,
+                    "restarted_endpoint_publish_and_poll_succeeded": True,
                 },
                 "setup_excluded": True,
                 "request_identity_for_retried_publishes": "stable request_id",
                 "bounded_timeout_seconds": timeout_seconds,
                 "latency_scope": (
-                    "stopped-bootstrap-leader-through-survivor-failover-and-restarted-node-ack"
+                    "stopped-bootstrap-assumed-leader-through-survivor-endpoint-requests-"
+                    "restarted-endpoint-publish-poll-and-survivor-ack"
                     if failure_kind == "leader"
-                    else "stopped-follower-through-survivor-service-and-restarted-node-ack"
+                    else "stopped-follower-through-survivor-endpoint-requests-"
+                    "restarted-endpoint-publish-poll-and-survivor-ack"
                 ),
                 "failure_scope": (
-                    f"one {failure_kind} process stop in a static quorum followed by same-process restart; "
+                    (
+                        "one bootstrap-assumed-leader process stop"
+                        if failure_kind == "leader"
+                        else "one non-bootstrap follower process stop"
+                    )
+                    + " in a static quorum followed by same-process restart; "
                     "network partitions, storage loss, and membership changes are excluded"
                 ),
                 "request_attempts": attempts,
