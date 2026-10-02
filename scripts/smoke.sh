@@ -79,6 +79,57 @@ json_field() {
     python3 -c 'import json, sys; print(json.load(sys.stdin)[sys.argv[1]])' "$field"
 }
 
+assert_replay_message() {
+    local output=$1
+    local stream=$2
+    local consumer=$3
+    local offset=$4
+    local payload=$5
+    python3 - "$output" "$stream" "$consumer" "$offset" "$payload" <<'PY'
+import json
+import sys
+
+_, output, stream, consumer, offset, payload = sys.argv
+message = json.loads(output)
+expected_fields = {
+    "type",
+    "stream",
+    "consumer",
+    "offset",
+    "key",
+    "payload",
+    "published_at_ms",
+}
+if set(message) != expected_fields:
+    raise SystemExit(f"unexpected replay response fields: {sorted(message)}")
+if (
+    message["type"] != "replay_message"
+    or message["stream"] != stream
+    or message["consumer"] != consumer
+    or message["offset"] != int(offset)
+    or message["key"] is not None
+    or message["payload"] != payload
+    or type(message["published_at_ms"]) is not int
+):
+    raise SystemExit(f"unexpected replay response: {message}")
+PY
+}
+
+assert_empty_response() {
+    local output=$1
+    local stream=$2
+    local consumer=$3
+    python3 - "$output" "$stream" "$consumer" <<'PY'
+import json
+import sys
+
+response = json.loads(sys.argv[1])
+_, _, stream, consumer = sys.argv
+if response != {"type": "empty", "stream": stream, "consumer": consumer}:
+    raise SystemExit(f"ordinary consumer progress changed: {response}")
+PY
+}
+
 assert_policy_field() {
     local output=$1
     local field=$2
@@ -115,8 +166,10 @@ start_server
 output=$("$cli_binary" --server "$broker_addr" consume events worker)
 assert_contains "$output" '"offset": 0'
 "$cli_binary" --server "$broker_addr" ack events worker 0
+output=$("$cli_binary" --server "$broker_addr" replay events worker 0)
+assert_replay_message "$output" events worker 0 hello
 output=$("$cli_binary" --server "$broker_addr" consume events worker)
-assert_contains "$output" '"type": "empty"'
+assert_empty_response "$output" events worker
 
 "$cli_binary" --server "$broker_addr" publish events recover-me
 "$cli_binary" --server "$broker_addr" consume events recovery-worker
