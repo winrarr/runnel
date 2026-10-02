@@ -79,6 +79,30 @@ json_field() {
     python3 -c 'import json, sys; print(json.load(sys.stdin)[sys.argv[1]])' "$field"
 }
 
+assert_policy_field() {
+    local output=$1
+    local field=$2
+    local expected=$3
+    local actual
+    actual=$(printf '%s' "$output" | json_field "$field")
+    if [ "$actual" != "$expected" ]; then
+        printf 'consumer policy field %s: expected %s, got %s\n' \
+            "$field" "$expected" "$actual" >&2
+        exit 1
+    fi
+}
+
+assert_consumer_policy() {
+    local output=$1
+    assert_policy_field "$output" type consumer_policy
+    assert_policy_field "$output" stream events
+    assert_policy_field "$output" consumer retry-policy-worker
+    assert_policy_field "$output" version 1
+    assert_policy_field "$output" configured True
+    assert_policy_field "$output" ack_timeout_ms 1234
+    assert_policy_field "$output" max_delivery_attempts 7
+}
+
 trap cleanup EXIT INT TERM
 
 allocate_ports
@@ -132,11 +156,20 @@ assert_contains "$output" '"payload": "poison"'
 "$cli_binary" --server "$broker_addr" ack poison.dead-letter poison-inspector 0
 curl -fsS "http://127.0.0.1:$http_port/metrics" | grep -Eq 'runnel_dead_letters_total 1'
 
+policy_output=$("$cli_binary" --server "$broker_addr" configure-consumer events retry-policy-worker 1234 \
+    --max-delivery-attempts 7)
+assert_consumer_policy "$policy_output"
+
+policy_output=$("$cli_binary" --server "$broker_addr" inspect-consumer events retry-policy-worker)
+assert_consumer_policy "$policy_output"
+
 stop_server
 start_server
 output=$("$cli_binary" --server "$broker_addr" consume events recovery-worker)
 assert_contains "$output" '"offset": 1'
 "$cli_binary" --server "$broker_addr" ack events recovery-worker 1
+policy_output=$("$cli_binary" --server "$broker_addr" inspect-consumer events retry-policy-worker)
+assert_consumer_policy "$policy_output"
 curl -fsS "http://127.0.0.1:$http_port/health/ready" >/dev/null
 curl -fsS "http://127.0.0.1:$http_port/metrics" | grep -Eq 'runnel_streams 4'
 
