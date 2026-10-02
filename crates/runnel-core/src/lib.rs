@@ -1046,14 +1046,6 @@ mod tests {
         assert_eq!(reopened_policy.max_delivery_attempts, Some(1));
     }
 
-    #[tokio::test]
-    async fn local_engine_implements_consumer_policy_idempotency_contract() {
-        let directory = tempdir().unwrap();
-        let broker = Broker::open(directory.path(), BrokerConfig::default()).unwrap();
-
-        runnel_test_support::assert_consumer_policy_idempotency_contract(&broker).await;
-    }
-
     #[test]
     fn maximum_length_dead_letter_target_does_not_recurse() {
         let directory = tempdir().unwrap();

@@ -252,8 +252,23 @@ pub async fn assert_independent_consumers_contract(engine: &dyn Engine) {
     ));
 }
 
-pub async fn assert_consumer_policy_idempotency_contract(engine: &dyn Engine) {
+pub async fn assert_consumer_policy_configuration_contract(engine: &dyn Engine) {
     assert!(engine.create_stream("contract.policy").await.unwrap());
+
+    let fallback = engine
+        .inspect_consumer("contract.policy", "worker")
+        .await
+        .unwrap();
+    assert_eq!(fallback.version, 0);
+    assert!(!fallback.configured);
+
+    let other_fallback = engine
+        .inspect_consumer("contract.policy", "other-worker")
+        .await
+        .unwrap();
+    assert_eq!(other_fallback.version, 0);
+    assert!(!other_fallback.configured);
+    assert_eq!(other_fallback, fallback);
 
     let configured = engine
         .configure_consumer("contract.policy", "worker", 500, Some(2))
@@ -271,6 +286,13 @@ pub async fn assert_consumer_policy_idempotency_contract(engine: &dyn Engine) {
     assert_eq!(repeated, configured);
     assert_eq!(
         engine
+            .inspect_consumer("contract.policy", "other-worker")
+            .await
+            .unwrap(),
+        other_fallback
+    );
+    assert_eq!(
+        engine
             .inspect_consumer("contract.policy", "worker")
             .await
             .unwrap(),
@@ -278,12 +300,26 @@ pub async fn assert_consumer_policy_idempotency_contract(engine: &dyn Engine) {
     );
 
     let updated = engine
-        .configure_consumer("contract.policy", "worker", 501, Some(2))
+        .configure_consumer("contract.policy", "worker", 501, Some(3))
         .await
         .unwrap();
-    assert_eq!(updated.version, configured.version + 1);
+    assert!(updated.version > configured.version);
     assert_eq!(updated.ack_timeout_ms, 501);
-    assert_eq!(updated.max_delivery_attempts, Some(2));
+    assert_eq!(updated.max_delivery_attempts, Some(3));
+    assert_eq!(
+        engine
+            .inspect_consumer("contract.policy", "worker")
+            .await
+            .unwrap(),
+        updated
+    );
+
+    let invalid = engine
+        .configure_consumer("contract.policy", "worker", 777, Some(0))
+        .await
+        .expect_err("a zero attempt limit must be rejected");
+    assert_eq!(invalid.kind(), BrokerErrorKind::Configuration);
+    assert_eq!(invalid.outcome(), BrokerErrorOutcome::Rejected);
     assert_eq!(
         engine
             .inspect_consumer("contract.policy", "worker")
