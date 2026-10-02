@@ -2,7 +2,7 @@
 
 - Status: source refresh for an exploratory design; no policy choice accepted
 - Last reviewed: 2026-10-02
-- Baseline: `906199f88e2b275750a270e33c9e4d213f050740`
+- Baseline: `a42fbfd207b1a26f4b52fce8110311453d55a009`
 - Related design: [Application-aware retry and dead-letter provenance](../design/application-aware-retry-policy.md) and [Dead-letter recovery across durable boundaries](../design/dead-letter-recovery.md)
 - Related decision and tracking: [ADR 0027](../decisions/0027-consumer-scoped-retry-policy.md), [TD-018](../tech-debt.md#td-018-retry-policy-and-dead-letter-provenance-are-coarse), and [Make retry policy application-aware](../backlog.md#make-retry-policy-application-aware)
 
