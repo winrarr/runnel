@@ -1034,7 +1034,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn persistent_raft_implements_consumer_policy_idempotency_contract() {
+    async fn persistent_raft_implements_consumer_policy_configuration_contract() {
         let directory = tempfile::tempdir().unwrap();
         let peers = BTreeMap::from([(1, "127.0.0.1:0".to_owned())]);
         let engine = PersistentEngine::open(
@@ -1047,7 +1047,7 @@ mod tests {
         .await
         .unwrap();
 
-        runnel_test_support::assert_consumer_policy_idempotency_contract(&engine).await;
+        runnel_test_support::assert_consumer_policy_configuration_contract(&engine).await;
     }
 
     #[tokio::test]
