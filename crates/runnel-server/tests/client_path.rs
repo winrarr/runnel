@@ -177,6 +177,49 @@ async fn typed_client_configures_consumer_retry_policy_and_dead_letters() {
 }
 
 #[tokio::test]
+async fn typed_client_consumer_policy_idempotency_preserves_and_advances_versions() {
+    let directory = TempDir::new().unwrap();
+    let server = RunningServer::start(directory.path(), &[]);
+    let mut client = Client::connect(server.broker_addr).await.unwrap();
+    client.create_stream("events").await.unwrap();
+
+    let initial = client
+        .configure_consumer("events", "worker", 50, Some(4))
+        .await
+        .unwrap();
+    assert!(initial.configured);
+    assert_eq!(initial.version, 1);
+    assert_eq!(initial.ack_timeout_ms, 50);
+    assert_eq!(initial.max_delivery_attempts, Some(4));
+    assert_eq!(
+        client.inspect_consumer("events", "worker").await.unwrap(),
+        initial
+    );
+
+    let repeated = client
+        .configure_consumer("events", "worker", 50, Some(4))
+        .await
+        .unwrap();
+    assert_eq!(repeated, initial);
+    assert_eq!(
+        client.inspect_consumer("events", "worker").await.unwrap(),
+        initial
+    );
+
+    let changed = client
+        .configure_consumer("events", "worker", 75, Some(4))
+        .await
+        .unwrap();
+    assert_eq!(changed.version, repeated.version + 1);
+    assert_eq!(changed.ack_timeout_ms, 75);
+    assert_eq!(changed.max_delivery_attempts, Some(4));
+    assert_eq!(
+        client.inspect_consumer("events", "worker").await.unwrap(),
+        changed
+    );
+}
+
+#[tokio::test]
 async fn typed_client_accepts_a_large_binary_response_within_its_byte_bound() {
     let directory = TempDir::new().unwrap();
     let server = RunningServer::start(directory.path(), &["--max-request-bytes", "32768"]);
