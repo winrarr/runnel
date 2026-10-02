@@ -27,9 +27,10 @@ changes the work; otherwise state a safe assumption and proceed.
   task ownership and the integration plan, then proceed. If either of you is
   unsure, the coordinator escalates the scope decision to the user before the
   boundary changes.
-- Identify the primary evidence class, applicable gate in
-  [`docs/testing.md`](../../../docs/testing.md), relevant acceptance criteria,
-  and verification commands before implementation.
+- Own the evidence plan: before implementation, identify the primary evidence
+  class, applicable gate in [`docs/testing.md`](../../../docs/testing.md),
+  acceptance criteria, and verification commands. Choose how to meet them
+  under the repository's documented policies.
 
 ## Implementation and verification
 
@@ -75,13 +76,11 @@ changes the work; otherwise state a safe assumption and proceed.
   [`docs/benchmarking.md`](../../../docs/benchmarking.md) and the benchmark
   rules in `SKILL.md`. Record the exact revision, workload, resources,
   isolation, repetitions, commands, and artifacts. Do not claim an improvement
-  from an inconclusive or uncontrolled comparison. For a correctness or safety
-  improvement that you believe has no material performance effect, tell the
-  coordinator why and propose the focused and end-to-end tests that cover it;
-  the coordinator decides whether benchmark evidence is unnecessary. If the
-  coordinator requires a benchmark, assess the result against the intended
-  effect and coordinate its timing so no other tests, benchmarks, or
-  resource-heavy workloads run on the host during an authoritative comparison.
+  from an inconclusive or uncontrolled comparison. The coordinator reviews
+  whether the evidence satisfies the documented gates and supports the claim,
+  and requests more work only for a concrete gap, failed or required check, or
+  unsupported claim. Coordinate benchmark timing and resource reservations
+  when an authoritative comparison needs a quiet host window.
 
 ## Pull request and handoff
 
@@ -93,11 +92,12 @@ changes the work; otherwise state a safe assumption and proceed.
   its workflows, assess and address failures, and update the PR title and
   description to reflect the current work and evidence as they change; the PR
   description does not need a revision history. Mark it ready and hand it to
-  the coordinator only when you consider the assignment complete and the PR
-  ready for independent review. If a blocker prevents readiness, keep the PR
-  in draft and send the coordinator a progress update with the evidence and
-  blocker. Do not merge the PR or enable auto-merge; the coordinator owns
-  review and integration.
+  the coordinator only when you consider the assignment complete, the handoff
+  is complete, and all required checks have passed on the exact final head. If
+  a check fails, diagnose and address it before handoff. If a blocker prevents
+  readiness, keep the PR in draft and send the coordinator a progress update
+  with the evidence and blocker. Do not merge the PR or enable auto-merge; the
+  coordinator owns review and integration.
 - Include a concise handoff in the PR description with:
   - goal, changed files, expected effects, and non-effects;
   - primary evidence class and any secondary evidence tags;

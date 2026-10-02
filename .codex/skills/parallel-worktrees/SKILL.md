@@ -14,7 +14,14 @@ run's `headSha`, `status`, and `conclusion` with the fetched revision; an older
 successful run is not evidence that the current baseline passed. Share the
 revision and CI state with every assignment. Do not ask each assignee to repeat
 the run-level fetch or CI lookup; each assignee reports worktree identity and
-confirms that its `HEAD` matches the supplied baseline. Inspect the run with
+confirms that its `HEAD` matches the supplied baseline. This identity check is
+not a request for the assignee to fetch or independently check the baseline.
+After this initial check, do not inspect or wait for another baseline CI run
+during the same rolling run. Required PR checks have passed before merge, so
+treat that merged change as covered on `main`. After a merge, use the resulting
+`main` commit as the next baseline and start the replacement immediately. Track
+overlap from the merged work and update affected assignments without adding a
+post-merge baseline CI gate. Inspect the initial run with
 `gh run list --workflow ci.yml --branch main --limit 1 --json headSha,status,conclusion,url`.
 
 ## Before spawning
@@ -27,7 +34,7 @@ confirms that its `HEAD` matches the supplied baseline. Inspect the run with
 - Split independent work by responsibility, file ownership, and an explicit domain boundary. The refactoring and backlog/tech-debt policy is defined once in the repository root `AGENTS.md`; ensure every assignment follows that policy. For an explicitly coordinated architectural refactor, overlapping paths are allowed when they reflect the domain; name an integration owner, explain the overlap, and define how shared changes will be reconciled.
 - Use the committed baseline established at the start of the run. If relevant uncommitted edits matter, create a clearly identified local baseline or explicit patch.
 - Give every assignee the baseline revision, owned paths, expected result, and instruction not to revert unrelated work.
-- Before spawning, give the user a short summary of each proposed worker's feature or outcome and primary evidence class, such as performance, correctness, reliability, or benchmark infrastructure. For performance-sensitive work, include a best-effort expectation of the likely direction and rough magnitude of change when possible, or explicitly say that no direct performance change is expected or that the magnitude is unclear. Label estimates as expectations rather than measured results; do not invent precision.
+- Before spawning, give the user a short summary of each proposed worker's feature or outcome and a provisional primary evidence class, such as performance, correctness, reliability, or benchmark infrastructure. The worker confirms the class and owns the evidence plan. For performance-sensitive work, include a best-effort expectation of the likely direction and rough magnitude of change when possible, or explicitly say that no direct performance change is expected or that the magnitude is unclear. Label estimates as expectations rather than measured results; do not invent precision.
 - Update an assignment when a newer `main` commit overlaps its paths or shared contracts, dependencies, generated output, or integration behavior; independent work may remain on the recorded baseline when it is cleanly mergeable.
 - Treat implicit worktree allocation as a serialized critical section. Do not issue concurrent spawn or resume calls until each prior worker's worktree identity has been validated, unless all worktrees were explicitly provisioned beforehand.
 - After each assignee is provisioned and before editing starts, verify `git worktree list --porcelain` and record a task-to-path-to-branch mapping. Keep the orchestrator worktree on the default branch; every task path must be distinct, outside the repository root, on its assigned branch, and at the recorded baseline. If any check fails, stop the assignee before editing, preserve any patch, and provision a replacement worktree; do not switch branches inside a shared or ambiguous worktree.
@@ -69,30 +76,30 @@ concurrent process-level test or benchmark unique resources, including:
 
 Shared Cargo registries are normally acceptable as caches, but shared target directories, generated benchmark files, and mutable broker data are not. Do not use a shared `benchmark-results/` path for concurrent writers.
 
-Keep at most two assigned work items in flight whose acceptance or merge recommendation requires benchmark evidence. A task holds its slot while required benchmark evidence or benchmark-related revisions remain outstanding. A worker may propose tests-only evidence for a correctness or safety improvement when they expect no material performance effect, but must explain that assessment and the proposed coverage; the worker does not decide the evidence gate. The orchestrator decides whether focused tests and applicable end-to-end verification are sufficient. If the orchestrator agrees, the task does not use a benchmark slot and those tests may run alongside other isolated tests. If the orchestrator does not agree, require an appropriate benchmark and assess its result before recommending merge. Changes intended to improve performance, or with a plausible significant performance impact, require relevant benchmark evidence. Fill other pool slots with independent work that does not need benchmark evidence when available. Change this cap only at the user's explicit direction.
+Keep at most two assigned work items in flight whose applicable evidence gate requires benchmark evidence. A task holds its slot while that evidence or benchmark-related revisions remain outstanding. The worker owns the evidence plan and execution: choose the tests, benchmarks, and supporting sources needed to meet the acceptance criteria and repository policies, and explain the choices and any coverage gaps in the handoff. The orchestrator reviews whether the evidence supports the claimed outcome and satisfies those policies. Request additional work only for a concrete gap, failed or required check, or unsupported claim, and identify the relevant criterion. Do not prescribe a preferred method or add a one-off evidence requirement as a matter of reviewer preference. Changes intended to improve performance, or with a plausible significant performance impact, require relevant benchmark evidence under [docs/benchmarking.md](../../../docs/benchmarking.md). Fill other pool slots with independent work that does not need benchmark evidence when available. Change this cap only at the user's explicit direction.
 
-Before an authoritative main-host benchmark, ensure no other tests, benchmarks, or resource-heavy workloads are running. The exclusive benchmark lock serializes participating benchmark commands; it does not stop arbitrary tests or workloads. Schedule the quiet window and assess the result against the expected effect before recommending merge.
+Before an authoritative main-host benchmark, ensure no other tests, benchmarks, or resource-heavy workloads are running. The exclusive benchmark lock serializes participating benchmark commands; it does not stop arbitrary tests or workloads. The worker owns benchmark design, execution, and analysis; coordinate the quiet window and resource reservation so the worker can collect controlled evidence.
 
 Parallel runs are suitable for correctness checks and exploratory optimization feedback. Host CPU scheduling, disk bandwidth, page cache, and kernel socket resources are shared; treat concurrent results as exploratory, not authoritative. Schedule authoritative comparisons on an otherwise idle host with no parallel tests or resource-heavy workloads running.
 
-For benchmark-required tasks, follow
-[docs/benchmarking.md](../../../docs/benchmarking.md) and determine whether
-the standard benchmark meaningfully covers the PR's changes. Require the
-assignee to run the canonical local benchmark before an improvement claim. If
-the standard benchmark does not meaningfully cover the PR, evaluate whether a
-focused targeted benchmark would be relevant and feasible with reasonable
-effort and controlled resources; when it is, require it before recommending
-that an optimization PR merge. Require authoritative comparisons to use
-`just bench-pr-local` after committing and, if inconclusive,
+For benchmark-required tasks, workers follow
+[docs/benchmarking.md](../../../docs/benchmarking.md), determine whether the
+standard benchmark meaningfully covers the change, and choose any relevant
+targeted benchmark. Workers run the canonical local benchmark before making an
+improvement claim. If the standard benchmark does not meaningfully cover the
+change, the worker assesses whether a focused targeted benchmark is relevant
+and feasible with reasonable effort and controlled resources. Authoritative
+comparisons use `just bench-pr-local` after committing and, if inconclusive,
 `just bench-pr-local-until-stable` to retry complete comparisons. Treat a
 one-pair command such as `just bench-pr-local-quick` as diagnostic only. Never
 treat a hosted PR benchmark or concurrent task measurement as proof of a
-performance change. Do not claim or merge an optimization from an inconclusive
+performance change. Do not claim an optimization from an inconclusive
 authoritative result; investigate or rerun it under the same controlled
 conditions rather than selecting a favorable sample. If no targeted benchmark
-is feasible, require the handoff to record the concrete blocker and coverage
-gap; do not recommend merging solely as an optimization until the changed path
-has appropriate evidence.
+is feasible, the worker records the concrete blocker and coverage gap. The
+orchestrator checks the handoff against the documented policy and does not
+recommend merging an optimization without appropriate evidence for the changed
+path.
 
 ## Assignment and handoff protocol
 
@@ -103,11 +110,15 @@ orchestrator explicitly authorizes it; any authorized nested task receives the
 same worktree, ownership, and identity checks.
 
 Each assignment states the goal, acceptance criteria, owned paths, supplied
-baseline revision and CI state, task-to-worktree mapping, expected evidence
-class, resource and isolation constraints, and coordination boundaries. The
-orchestrator requires a pre-edit worktree identity report and stops work if it
-does not match the mapping or supplied baseline. Assignments prohibit reverting
-unrelated changes.
+baseline revision and CI state, task-to-worktree mapping, resource and
+isolation constraints, and coordination boundaries. Keep assignments
+outcome-focused. Leave design, research order, implementation approach,
+evidence method, and verification commands to the worker unless repository
+policy or the user requires a specific method. The worker confirms the primary
+evidence class and determines the plan from the acceptance criteria and
+repository policies. The orchestrator requires a pre-edit worktree identity
+report and stops work if it does not match the mapping or supplied baseline.
+Assignments prohibit reverting unrelated changes.
 
 If an assignee proposes work across its assigned paths or another task's
 ownership boundary, the orchestrator obtains the goal, rationale, affected
@@ -158,9 +169,14 @@ planning assessment, required checks, mergeability, and relevant repository
 gates before making the final recommendation. If recommending merge, either
 wait for required checks and merge when they pass, or enable auto-merge while
 checks are pending when the repository supports it. Auto-merge does not bypass
-required checks. In rolling mode, refresh the default-branch baseline and start
-exactly one replacement only after the actual merge, never merely because
-auto-merge was enabled, unless a stop condition has been reached.
+required checks. In rolling mode, use the commit produced by the actual merge
+as the next baseline and start exactly one replacement immediately after that
+merge, never merely because auto-merge was enabled, unless a stop condition has
+been reached. Share the commit and the merged PR's passing required checks with
+the replacement; do not run or wait for a separate post-merge baseline CI
+check. The replacement confirms its worktree matches the supplied commit and
+updates its work only if merged changes overlap relevant paths, contracts,
+dependencies, generated output, or integration behavior.
 
 If the orchestrator does not recommend merging a work item—including when it
 recommends revise, rerun, defer, or records blocked/inconclusive evidence—leave
@@ -183,7 +199,15 @@ the orchestrator's review or merge recommendation.
 
 ## Integration
 
-Review each branch independently before integration. Check the diff against the recorded baseline, rerun focused tests in a clean worktree, and run the repository verification path. Do not merge an optimization solely because a microbenchmark improved: preserve durability, ordering, timeout, ambiguous-outcome, bounded-resource, and recovery guarantees.
+Review each branch independently before integration. Check the diff against
+the recorded baseline, assess the worker's evidence against the acceptance
+criteria and documented repository gates, and verify that required PR checks
+passed on the exact head. Do not repeat passing worker or PR checks by default;
+rerun verification when a commit changes, a check fails, a concrete evidence
+gap remains, or integration creates a new interaction that needs coverage. Do
+not merge an optimization solely because a microbenchmark improved: preserve
+durability, ordering, timeout, ambiguous-outcome, bounded-resource, and
+recovery guarantees.
 
 Merge independently reviewable pull requests in parallel once their required pull-request checks pass, or enable auto-merge after the orchestrator's recommendation while checks are pending. Coordinate or serialize changes that overlap in files, shared contracts, dependencies, generated output, or integration behavior; overlapping architectural refactors require integration review and must not be merged independently just because their pull requests are individually green. Never bypass required checks to compensate for a flaky test; diagnose whether the failure is in the implementation, test harness, environment, or resource isolation.
 
