@@ -161,6 +161,11 @@ mod tests {
         }
     }
 
+    async fn persistent_lease_clock_floor(engine: &PersistentEngine, stream: &str) -> u64 {
+        let group = engine.manager.data_group_for_stream(stream).await.unwrap();
+        group.state_machine.state.read().await.state.lease_clock_ms
+    }
+
     struct PollGroupTestRequest<'a> {
         stream: &'a str,
         consumer: &'a str,
@@ -1037,6 +1042,78 @@ mod tests {
         runnel_test_support::assert_shared_delivery_contract(&engine).await;
         runnel_test_support::assert_independent_consumers_contract(&engine).await;
         runnel_test_support::assert_key_ordering_contract(&engine).await;
+    }
+
+    #[tokio::test]
+    async fn persistent_compatibility_poll_and_ack_observe_and_persist_lease_clock_floor() {
+        let directory = tempfile::tempdir().unwrap();
+        let peers = BTreeMap::from([(1, "127.0.0.1:0".to_owned())]);
+        let cluster_name = "runnel-compatibility-lease-clock-test".to_owned();
+        let engine = PersistentEngine::open(
+            1,
+            cluster_name.clone(),
+            directory.path(),
+            peers.clone(),
+            true,
+        )
+        .await
+        .unwrap();
+        engine.create_stream("events").await.unwrap();
+        engine.create_stream("other").await.unwrap();
+        engine
+            .publish("events", None, b"lease-floor".to_vec(), None)
+            .await
+            .unwrap();
+
+        assert_eq!(persistent_lease_clock_floor(&engine, "events").await, 0);
+        assert_eq!(persistent_lease_clock_floor(&engine, "other").await, 0);
+        assert!(matches!(
+            engine.poll("events", "workers").await.unwrap(),
+            PollResult::Message(Message { offset: 0, .. })
+        ));
+        let poll_floor = persistent_lease_clock_floor(&engine, "events").await;
+        assert!(poll_floor > 0);
+        assert_eq!(persistent_lease_clock_floor(&engine, "other").await, 0);
+
+        drop(engine);
+        let engine = PersistentEngine::open(
+            1,
+            cluster_name.clone(),
+            directory.path(),
+            peers.clone(),
+            true,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            persistent_lease_clock_floor(&engine, "events").await,
+            poll_floor
+        );
+
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while now_ms() <= poll_floor {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .expect("wall-clock observation should advance beyond the poll observation");
+        assert_eq!(
+            engine.ack("events", "workers", 0).await.unwrap(),
+            AckResult::Acknowledged
+        );
+        let ack_floor = persistent_lease_clock_floor(&engine, "events").await;
+        assert!(ack_floor > poll_floor);
+        assert_eq!(persistent_lease_clock_floor(&engine, "other").await, 0);
+
+        drop(engine);
+        let reopened = PersistentEngine::open(1, cluster_name, directory.path(), peers, true)
+            .await
+            .unwrap();
+        assert_eq!(
+            persistent_lease_clock_floor(&reopened, "events").await,
+            ack_floor
+        );
+        assert_eq!(persistent_lease_clock_floor(&reopened, "other").await, 0);
     }
 
     #[tokio::test]
