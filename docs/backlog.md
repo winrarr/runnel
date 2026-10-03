@@ -268,6 +268,8 @@ Goal: bound retained storage and define what happens as consumers lag or usable 
 
 Rationale: an append-only broker without enforceable retention and admission policy eventually turns ordinary consumer lag into an availability or data-loss incident.
 
+Current progress: a real-server test now repeats synthetic same-stream storage-executor saturation and verifies bounded rejection, health/readiness/metrics behavior, recovery, and subsequent durable traffic. It does not exercise filesystem-capacity admission, `ENOSPC`, retention cleanup, or interrupted deletion; those outcomes remain unimplemented.
+
 Constraints:
 
 - retention and admission decisions must preserve the selected replay and acknowledged-durability guarantees;
