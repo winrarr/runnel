@@ -147,7 +147,7 @@ Goal: let multiple worker instances share one durable consumer while preserving 
 
 Rationale: small applications need a single durable worker without extra coordination, while growing applications should be able to add workers without learning about partitions or triggering application-managed rebalancing.
 
-Current progress: local and clustered grouped delivery now cover durable attempts, out-of-order acknowledgements, expiry, stale-delivery fencing, bounded expiry lookup, and real-process restart/failure paths. Lease expiry fences an acknowledgement when that operation observes the deadline, even if no replacement poll has assigned the record; expiry remains demand-driven, with no background timer. The shared engine also reports currently tracked in-flight deliveries. Broader failover, replay, retry-policy, dead-letter, and scalable ownership behavior remain incomplete.
+Current progress: local and clustered grouped delivery now cover durable attempts, out-of-order acknowledgements, expiry, stale-delivery fencing, bounded expiry lookup, and real-process restart/failure paths. A real three-process public-protocol test also verifies that an in-flight key blocks its successor while another key progresses, preserves the held member receipt across a repeated poll, and releases the successor after acknowledgement. Lease expiry fences an acknowledgement when that operation observes the deadline, even if no replacement poll has assigned the record; expiry remains demand-driven, with no background timer. The shared engine also reports currently tracked in-flight deliveries. Broader failover, replay, retry-policy, dead-letter, and scalable ownership behavior remain incomplete.
 
 Constraints:
 

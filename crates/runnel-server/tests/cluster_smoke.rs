@@ -28,6 +28,7 @@ const SNAPSHOT_INTERRUPTION_ATTEMPTS: usize = 3;
 // current delivery. A longer lease keeps a loaded CI runner from expiring the
 // current token while the intentionally stale acknowledgements are committed.
 const REASSIGN_ACK_TIMEOUT_MS: u64 = 5_000;
+const KEY_ORDERING_ACK_TIMEOUT_MS: u64 = 60_000;
 
 struct RunningNode {
     node_id: u64,
@@ -593,6 +594,227 @@ fn three_process_cluster_replicates_and_recovers_after_failures() {
         2,
         "after-leader-failure",
     );
+    assert_live_nodes(&mut nodes);
+}
+
+#[test]
+fn three_process_cluster_serializes_same_key_while_other_keys_progress() {
+    let directory = TempDir::new().unwrap();
+    let addresses = (0..9).map(|_| free_addr()).collect::<Vec<_>>();
+    let cluster_nodes = vec![(1, addresses[6]), (2, addresses[7]), (3, addresses[8])];
+    let mut nodes = vec![
+        RunningNode::start_with_ack_timeout(
+            1,
+            addresses[0],
+            addresses[3],
+            addresses[6],
+            directory.path().join("node-1"),
+            cluster_nodes.clone(),
+            true,
+            KEY_ORDERING_ACK_TIMEOUT_MS,
+        ),
+        RunningNode::start_with_ack_timeout(
+            2,
+            addresses[1],
+            addresses[4],
+            addresses[7],
+            directory.path().join("node-2"),
+            cluster_nodes.clone(),
+            false,
+            KEY_ORDERING_ACK_TIMEOUT_MS,
+        ),
+        RunningNode::start_with_ack_timeout(
+            3,
+            addresses[2],
+            addresses[5],
+            addresses[8],
+            directory.path().join("node-3"),
+            cluster_nodes,
+            false,
+            KEY_ORDERING_ACK_TIMEOUT_MS,
+        ),
+    ];
+    for node in &nodes {
+        wait_for_http(node.http_addr);
+    }
+
+    let producer_node = create_stream_on_any(&mut nodes, "ordered-jobs");
+    for (offset, key, payload) in [
+        (0, "key-a", "first-a"),
+        (1, "key-a", "second-a"),
+        (2, "key-b", "first-b"),
+    ] {
+        assert!(matches!(
+            wait_for_response_at(
+                nodes[producer_node].broker_addr,
+                || Request::Publish {
+                    stream: "ordered-jobs".to_owned(),
+                    key: Some(key.to_owned()),
+                    payload: payload.to_owned(),
+                    request_id: Some(format!("ordered-job-{offset}")),
+                },
+                |response| matches!(response, Response::Published { offset: published, .. } if *published == offset),
+            ),
+            Response::Published { offset: published, .. } if published == offset
+        ));
+    }
+
+    let member_a_node = (producer_node + 1) % nodes.len();
+    let member_b_node = (producer_node + 2) % nodes.len();
+    let first_a = wait_for_response_at(
+        nodes[member_a_node].broker_addr,
+        || Request::PollGroup {
+            stream: "ordered-jobs".to_owned(),
+            consumer: "workers".to_owned(),
+            member: "member-a".to_owned(),
+        },
+        |response| {
+            matches!(
+                response,
+                Response::Message {
+                    offset: 0,
+                    key: Some(key),
+                    payload,
+                    delivery_attempt: Some(1),
+                    delivery_token: Some(_),
+                    ..
+                } if key == "key-a" && payload == "first-a"
+            )
+        },
+    );
+    let first_a_token = match first_a {
+        Response::Message {
+            delivery_token: Some(token),
+            ..
+        } => token,
+        response => panic!("expected first key-a delivery, got {response:?}"),
+    };
+
+    let first_b = wait_for_response_at(
+        nodes[member_b_node].broker_addr,
+        || Request::PollGroup {
+            stream: "ordered-jobs".to_owned(),
+            consumer: "workers".to_owned(),
+            member: "member-b".to_owned(),
+        },
+        |response| {
+            matches!(
+                response,
+                Response::Message {
+                    offset: 2,
+                    key: Some(key),
+                    payload,
+                    delivery_attempt: Some(1),
+                    delivery_token: Some(_),
+                    ..
+                } if key == "key-b" && payload == "first-b"
+            )
+        },
+    );
+    let first_b_token = match first_b {
+        Response::Message {
+            delivery_token: Some(token),
+            ..
+        } => token,
+        response => panic!("expected first key-b delivery, got {response:?}"),
+    };
+    assert!(matches!(
+        wait_for_response_at(
+            nodes[member_b_node].broker_addr,
+            || Request::AckGroup {
+                stream: "ordered-jobs".to_owned(),
+                consumer: "workers".to_owned(),
+                member: "member-b".to_owned(),
+                offset: 2,
+                delivery_token: first_b_token.clone(),
+            },
+            |response| matches!(response, Response::Acknowledged { .. }),
+        ),
+        Response::Acknowledged { .. }
+    ));
+
+    // Treat either semantic response as terminal: if the same-key successor
+    // escapes the gate, fail immediately instead of retrying until lease expiry.
+    let blocked_poll = wait_for_response_at(
+        nodes[member_b_node].broker_addr,
+        || Request::PollGroup {
+            stream: "ordered-jobs".to_owned(),
+            consumer: "workers".to_owned(),
+            member: "member-b".to_owned(),
+        },
+        |response| matches!(response, Response::Empty { .. } | Response::Message { .. }),
+    );
+    assert!(
+        matches!(blocked_poll, Response::Empty { .. }),
+        "member-b received the same-key successor while member-a held its lease: {blocked_poll:?}"
+    );
+
+    let repeated_a = wait_for_response_at(
+        nodes[member_a_node].broker_addr,
+        || Request::PollGroup {
+            stream: "ordered-jobs".to_owned(),
+            consumer: "workers".to_owned(),
+            member: "member-a".to_owned(),
+        },
+        |response| matches!(response, Response::Message { .. }),
+    );
+    assert!(
+        matches!(
+            &repeated_a,
+            Response::Message {
+                offset: 0,
+                key: Some(key),
+                payload,
+                delivery_attempt: Some(1),
+                delivery_token: Some(token),
+                ..
+            } if key == "key-a" && payload == "first-a" && token == &first_a_token
+        ),
+        "repeated member-a poll changed its held receipt: {repeated_a:?}"
+    );
+
+    assert!(matches!(
+        wait_for_response_at(
+            nodes[member_a_node].broker_addr,
+            || Request::AckGroup {
+                stream: "ordered-jobs".to_owned(),
+                consumer: "workers".to_owned(),
+                member: "member-a".to_owned(),
+                offset: 0,
+                delivery_token: first_a_token.clone(),
+            },
+            |response| matches!(response, Response::Acknowledged { .. }),
+        ),
+        Response::Acknowledged { .. }
+    ));
+
+    assert!(matches!(
+        wait_for_response_at(
+            nodes[member_b_node].broker_addr,
+            || Request::PollGroup {
+                stream: "ordered-jobs".to_owned(),
+                consumer: "workers".to_owned(),
+                member: "member-b".to_owned(),
+            },
+            |response| matches!(
+                response,
+                Response::Message {
+                    offset: 1,
+                    key: Some(key),
+                    payload,
+                    delivery_attempt: Some(1),
+                    delivery_token: Some(_),
+                    ..
+                } if key == "key-a" && payload == "second-a"
+            ),
+        ),
+        Response::Message {
+            offset: 1,
+            key: Some(key),
+            payload,
+            ..
+        } if key == "key-a" && payload == "second-a"
+    ));
     assert_live_nodes(&mut nodes);
 }
 
