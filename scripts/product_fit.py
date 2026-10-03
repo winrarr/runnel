@@ -5,6 +5,8 @@ The harness exercises the public JSON-lines protocol against real broker
 processes. It produces a reviewable artifact containing the pre-registered
 manifest, request transcript, message ledger, Prometheus snapshots, resource
 samples, broker logs, latency distributions, and an explicit claim matrix.
+The background-work slice also checks the in-flight gauge while two deliveries
+are held; that point observation is not a broker-wide limit or product promise.
 Automated results are repository evidence only; operator effort and product
 fit remain unknown until an intended participant completes the worksheet.
 """
@@ -305,7 +307,9 @@ def load_manifest(path: Path) -> dict[str, Any]:
     if manifest.get("schema_version") != 1:
         raise ProductFitError("manifest schema_version must be 1")
     workloads = manifest.get("workloads")
-    if not isinstance(workloads, dict) or not {"background_work", "events_replay"}.issubset(workloads):
+    if not isinstance(workloads, dict) or not {"background_work", "events_replay"}.issubset(
+        workloads
+    ):
         raise ProductFitError("manifest must define background_work and events_replay workloads")
     for name, workload in workloads.items():
         if not isinstance(workload, dict) or not isinstance(workload.get("budgets"), dict):
@@ -313,6 +317,32 @@ def load_manifest(path: Path) -> dict[str, Any]:
         for key, value in workload["budgets"].items():
             if not isinstance(value, (int, float)) or value <= 0:
                 raise ProductFitError(f"workload {name} budget {key} must be positive")
+
+    background_work = workloads["background_work"]
+    observations = background_work.get("registered_observations")
+    if not isinstance(observations, dict):
+        raise ProductFitError("background_work must register its in-flight observation")
+    in_flight = observations.get("in_flight_deliveries_while_two_held")
+    if not isinstance(in_flight, dict):
+        raise ProductFitError(
+            "background_work must register in_flight_deliveries_while_two_held"
+        )
+    held_count = in_flight.get("held_delivery_count")
+    expected_value = in_flight.get("expected_metric_value")
+    if in_flight.get("metric") != "runnel_in_flight_deliveries":
+        raise ProductFitError(
+            "background_work in-flight observation must use runnel_in_flight_deliveries"
+        )
+    if type(held_count) is not int or held_count != 2:
+        raise ProductFitError("background_work in-flight observation must hold exactly two deliveries")
+    if type(expected_value) is not int or expected_value != held_count:
+        raise ProductFitError(
+            "background_work in-flight metric expectation must equal the held delivery count"
+        )
+    if type(background_work.get("messages")) is not int or background_work["messages"] < held_count:
+        raise ProductFitError("background_work must publish enough messages for its held-delivery observation")
+    if not isinstance(in_flight.get("scope"), str) or not in_flight["scope"].strip():
+        raise ProductFitError("background_work in-flight observation must document its scope")
     return manifest
 
 
@@ -370,6 +400,54 @@ def latency_summary(values: list[float]) -> dict[str, Any]:
             "p95": percentile(values, 95),
             "p99": percentile(values, 99),
             "max": max(values, default=0.0),
+        },
+    }
+
+
+def check_exact(value: float | None, expected: int) -> dict[str, Any]:
+    return {
+        "status": "pass" if value is not None and value == expected else "fail",
+        "observed": value,
+        "expected": expected,
+    }
+
+
+def in_flight_observation(
+    metrics: dict[str, float] | None,
+    registration: dict[str, Any],
+    held_offsets: list[int],
+    observation_elapsed_ms: float,
+    ack_timeout_ms: int,
+) -> dict[str, Any]:
+    metric = registration["metric"]
+    expected = registration["expected_metric_value"]
+    observed = metrics.get(metric) if metrics is not None else None
+    held_count = registration["held_delivery_count"]
+    distinct_offsets = len(set(held_offsets))
+    metric_check = check_exact(observed, expected)
+    held_check = check_exact(float(distinct_offsets), held_count)
+    lease_check = {
+        "status": "pass" if observation_elapsed_ms < ack_timeout_ms else "fail",
+        "observed_elapsed_ms": observation_elapsed_ms,
+        "ack_timeout_ms": ack_timeout_ms,
+        "condition": "observation completed before the registered acknowledgement timeout",
+    }
+    return {
+        "status": "pass"
+        if metric_check["status"] == held_check["status"] == lease_check["status"] == "pass"
+        else "fail",
+        "metric": metric,
+        "expected_metric_value": expected,
+        "observed_metric_value": observed,
+        "held_delivery_count": len(held_offsets),
+        "distinct_held_offsets": distinct_offsets,
+        "held_offsets": held_offsets,
+        "observation_elapsed_ms": observation_elapsed_ms,
+        "scope": registration["scope"],
+        "checks": {
+            "metric_value": metric_check,
+            "distinct_held_deliveries": held_check,
+            "lease_window": lease_check,
         },
     }
 
@@ -497,14 +575,53 @@ def run_background_work(
         member_a = ProtocolClient(broker)
         member_b = ProtocolClient(broker)
         held = None
+        observation_started = time.perf_counter_ns()
         response, elapsed = poll_group(member_a, ledger, stream, workload["consumer"], "worker-a")
         latencies["poll"].append(elapsed)
         if response["type"] != "message" or not response.get("delivery_token"):
             raise ProductFitError(f"expected first grouped delivery, got {response}")
         held = response
-        time.sleep(config["ack_timeout_ms"] / 1_000 * 1.5)
+        registration = workload["registered_observations"]["in_flight_deliveries_while_two_held"]
+        response, elapsed = poll_group(member_b, ledger, stream, workload["consumer"], "worker-b")
+        latencies["poll"].append(elapsed)
+        if response["type"] != "message" or not response.get("delivery_token"):
+            raise ProductFitError(f"expected second held grouped delivery, got {response}")
+        if response["offset"] == held["offset"]:
+            raise ProductFitError("two-member in-flight observation delivered the same offset twice")
+        second_held = response
+        in_flight_metrics = broker.metrics()
+        observation_elapsed_ms = (time.perf_counter_ns() - observation_started) / 1_000_000
+        observation = in_flight_observation(
+            in_flight_metrics,
+            registration,
+            [held["offset"], second_held["offset"]],
+            observation_elapsed_ms,
+            config["ack_timeout_ms"],
+        )
+        record_ledger(
+            ledger,
+            operation="in_flight_metric_observation",
+            metric=observation["metric"],
+            expected=observation["expected_metric_value"],
+            observed=observation["observed_metric_value"],
+            held_offsets=observation["held_offsets"],
+            outcome=observation["status"],
+        )
 
         acknowledged: set[int] = set()
+        _, elapsed = ack_group(
+            member_b,
+            ledger,
+            stream,
+            workload["consumer"],
+            "worker-b",
+            second_held["offset"],
+            second_held["delivery_token"],
+        )
+        latencies["ack"].append(elapsed)
+        acknowledged.add(second_held["offset"])
+        time.sleep(config["ack_timeout_ms"] / 1_000 * 1.5)
+
         deadline = time.monotonic() + DEFAULT_TIMEOUT_SECONDS
         while held["offset"] not in acknowledged and time.monotonic() < deadline:
             response, elapsed = poll_group(member_b, ledger, stream, workload["consumer"], "worker-b")
@@ -682,6 +799,9 @@ def run_background_work(
         broker,
         started,
         extra={"stale_acknowledgements": 1, "poison_attempts": poison_attempts},
+        registered_observations={
+            "in_flight_deliveries_while_two_held": observation,
+        },
     )
     result["_transcript"] = broker.transcript
     result["_ledger"] = ledger
@@ -874,6 +994,7 @@ def build_workload_result(
     broker: RunningBroker,
     started: int,
     extra: dict[str, Any],
+    registered_observations: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     elapsed_seconds = (time.perf_counter_ns() - started) / 1_000_000_000
     latency = {operation: latency_summary(samples) for operation, samples in latencies.items()}
@@ -888,9 +1009,13 @@ def build_workload_result(
         "disk_growth_bytes": check_upper(resources["storage_growth_bytes"], budgets["disk_growth_bytes"]),
         "recovery_seconds": check_upper(recovery_seconds, budgets["recovery_seconds"]),
     }
+    observations = registered_observations or {}
+    observations_pass = all(item["status"] == "pass" for item in observations.values())
     return {
         "name": name,
-        "status": "pass" if all(item["status"] == "pass" for item in checks.values()) else "fail",
+        "status": "pass"
+        if all(item["status"] == "pass" for item in checks.values()) and observations_pass
+        else "fail",
         "elapsed_seconds": elapsed_seconds,
         "messages": workload["messages"],
         "latency": latency,
@@ -899,6 +1024,7 @@ def build_workload_result(
         "resources": resources,
         "server_metrics": metrics,
         "budget_checks": checks,
+        "registered_observations": observations,
         "ledger_events": len(ledger),
         "readiness": broker.readiness,
         "exit_codes": broker.exit_codes,
@@ -938,6 +1064,12 @@ def write_artifact(output_dir: Path, manifest: dict[str, Any], results: list[dic
         {key: value for key, value in result.items() if not key.startswith("_")}
         for result in results
     ]
+    background_work = next((result for result in public_results if result["name"] == "background_work"), None)
+    in_flight_observation = None
+    if background_work is not None:
+        in_flight_observation = background_work.get("registered_observations", {}).get(
+            "in_flight_deliveries_while_two_held"
+        )
     artifact = {
         "schema_version": 1,
         "generated_at": utc_now(),
@@ -950,12 +1082,18 @@ def write_artifact(output_dir: Path, manifest: dict[str, Any], results: list[dic
         "claims": {
             "repository_semantics": "pass" if workloads_pass else "fail",
             "registered_numeric_budgets": "pass" if workloads_pass else "fail",
+            "background_work_two_held_in_flight_observation": (
+                in_flight_observation["status"] if in_flight_observation is not None else "unknown"
+            ),
             "operator_effort": "unknown",
             "intended_user_product_fit": "unknown",
         },
         "evidence_gaps": [
             "No intended-user onboarding or recovery participant completed the worksheet.",
             "The manifest is a representative engineering envelope, not a user-signed product SLO.",
+            "The two-held-delivery in-flight gauge is a point observation in this reference scenario, not a broker-wide bound or supported product limit.",
+            "Consumer lag is not measured; the current metrics do not expose a consumer-lag signal.",
+            "Brief RSS samples do not establish a sustained or supported memory bound.",
             "Retention, disk pressure, migration, and broad network fault behavior are outside these local workloads.",
         ],
         "files": {

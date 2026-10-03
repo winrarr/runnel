@@ -12,12 +12,15 @@ Goal: validate that the audience and workloads in [product-fit.md](product-fit.m
 
 Rationale: the initial product thesis is specific enough to guide development, but its workload budgets, usability, and operating envelope are not yet supported by intended-user evidence. Without that validation, infrastructure work can expand faster than evidence of user value.
 
-Progress: on 2026-09-06, the repeatable product-fit harness passed the two
-pre-registered local reference workloads against representative latency,
-throughput, RSS, storage-growth, and restart budgets. These are repository
-measurements, not application SLOs; intended-user exercises, bounded
-in-flight/lag evidence, broader fault coverage, and one-node-to-cluster
-migration evidence remain unknown. See the [validation
+Progress: the repeatable harness passed the two pre-registered local reference
+workloads against representative latency, throughput, RSS, storage-growth,
+and restart budgets on 2026-09-06. On 2026-10-03, the background-work
+workload also recorded a passing point observation of
+`runnel_in_flight_deliveries=2` while two distinct deliveries were held. These
+are repository measurements, not application SLOs or supported limits.
+Intended-user exercises, consumer lag, steady slow-consumer and sustained
+memory bounds, broader fault coverage, and one-node-to-cluster migration
+evidence remain open. See the [validation
 record](research/initial-product-fit-validation.md).
 
 Constraints:

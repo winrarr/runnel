@@ -6,7 +6,7 @@
   "encoding": "utf-8",
   "workloads": {
     "background_work": {
-      "description": "Durable background jobs with two transient workers, an expired delivery, a dead-letter path, and restart recovery.",
+      "description": "Durable background jobs with two transient workers, a two-held-delivery in-flight metric observation, an expired delivery, a dead-letter path, and restart recovery.",
       "durability_mode": "local append-only durable log",
       "stream": "fit.jobs",
       "poison_stream": "fit.poison",
@@ -20,6 +20,14 @@
       "keys": ["customer-a", "customer-a", "customer-b", null],
       "ack_timeout_ms": 100,
       "max_delivery_attempts": 2,
+      "registered_observations": {
+        "in_flight_deliveries_while_two_held": {
+          "metric": "runnel_in_flight_deliveries",
+          "held_delivery_count": 2,
+          "expected_metric_value": 2,
+          "scope": "Exact point observation while two grouped deliveries are deliberately held in this local reference scenario; not a broker-wide bound or supported product limit."
+        }
+      },
       "budgets": {
         "publish_p95_ms": 250,
         "publish_p99_ms": 1000,
