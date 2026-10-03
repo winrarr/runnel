@@ -9,7 +9,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from common import BenchmarkError
-from resources import StatsSampler
+from resources import DEFAULT_PROBE_TIMEOUT_SECONDS, StatsSampler
 
 
 def inspect_image(image: str) -> str | None:
@@ -109,6 +109,29 @@ class DockerContainer:
             capture_output=True,
         )
         self.created = False
+
+    def prepare_data_for_host_cleanup(self) -> bool:
+        """Make broker-owned bind-mounted descendants removable by the host."""
+        if not self.created:
+            return True
+        try:
+            result = subprocess.run(
+                [
+                    "docker",
+                    "exec",
+                    self.name,
+                    "sh",
+                    "-c",
+                    "find /var/lib/runnel -mindepth 1 -exec chmod a+rwX {} +",
+                ],
+                capture_output=True,
+                text=True,
+                check=False,
+                timeout=DEFAULT_PROBE_TIMEOUT_SECONDS,
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            return False
+        return result.returncode == 0
 
     def close(self) -> str:
         logs = self.logs()

@@ -7,6 +7,7 @@ import os
 import shutil
 import socket
 import subprocess
+import sys
 import tempfile
 import time
 from collections.abc import Iterator
@@ -202,6 +203,15 @@ class Cluster:
 
     def close(self) -> None:
         self.stats.close()
+        for node in self.nodes:
+            if node.container is None:
+                continue
+            if not node.container.prepare_data_for_host_cleanup():
+                print(
+                    f"could not make container data descendants removable for {node.container.name}",
+                    file=sys.stderr,
+                    flush=True,
+                )
         for index in range(self.node_count):
             self.stop_node(index)
         for node in self.nodes:

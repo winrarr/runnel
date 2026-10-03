@@ -1,6 +1,7 @@
 import argparse
 import socket
 import socketserver
+import subprocess
 import sys
 import tempfile
 import threading
@@ -17,10 +18,12 @@ sys.path.insert(0, str(SCRIPT_DIR))
 import cluster_cli  # noqa: E402
 import cluster_lifecycle  # noqa: E402
 import cluster_results  # noqa: E402
+from resources import DEFAULT_PROBE_TIMEOUT_SECONDS  # noqa: E402
 from cluster import parse_args, parse_positive_float, resource_limits  # noqa: E402
 from cluster_faults import PeerResponseDelayProxy  # noqa: E402
 from cluster_lifecycle import Cluster  # noqa: E402
 from cluster_resources import (  # noqa: E402
+    container_peer_tcp_endpoint_count,
     ProcessStats,
     _container_host_pids,
     parse_owned_peer_tcp_endpoints,
@@ -1435,6 +1438,176 @@ class ClusterBenchmarkTests(unittest.TestCase):
                 "{{.Name}} {{.State.Pid}}",
                 "runnel-node-2",
             ],
+        )
+
+    def test_container_procfs_fallback_counts_pid_one_sockets_with_a_bounded_probe(self) -> None:
+        output = (
+            "__RUNNEL_UIDS__10001 10001\n"
+            "SOCKET socket:[12345]\n"
+            "__RUNNEL_TCP4__\n"
+            "  sl local_address rem_address st tx_queue rx_queue tr tm->when retrnsmt uid timeout inode\n"
+            "   0: 0100007F:1B59 0100007F:1B5A 01 00000000:00000000 00:00000000 00000000 1000 0 12345\n"
+            "__RUNNEL_TCP6__\n"
+        )
+        with patch(
+            "cluster_resources.subprocess.run",
+            return_value=SimpleNamespace(returncode=0, stdout=output),
+        ) as docker_exec:
+            count = container_peer_tcp_endpoint_count(
+                "runnel-node-1",
+                peer_listener_port=7001,
+                peer_destination_ports={7002},
+            )
+
+        self.assertEqual(
+            count,
+            {"count": 1, "process_identity_verified": True},
+        )
+        command = docker_exec.call_args.args[0]
+        self.assertEqual(command[:3], ["docker", "exec", "runnel-node-1"])
+        self.assertIn("/proc/1/fd/*", command[-1])
+        self.assertIn("/proc/1/net/tcp", command[-1])
+        self.assertIn(
+            "if [ -e /proc/1/net/tcp6 ]; then cat /proc/1/net/tcp6 || exit 1; fi",
+            command[-1],
+        )
+        self.assertIn('[ "$exec_uid" = "$broker_uid" ] || exit 2', command[-1])
+        self.assertEqual(
+            docker_exec.call_args.kwargs["timeout"],
+            DEFAULT_PROBE_TIMEOUT_SECONDS,
+        )
+
+    def test_container_procfs_fallback_rejects_a_mismatched_process_uid(self) -> None:
+        with patch(
+            "cluster_resources.subprocess.run",
+            return_value=SimpleNamespace(
+                returncode=0,
+                stdout="__RUNNEL_UIDS__1000 10001\nSOCKET socket:[12345]\n",
+            ),
+        ):
+            count = container_peer_tcp_endpoint_count(
+                "runnel-node-1",
+                peer_listener_port=7001,
+                peer_destination_ports={7002},
+            )
+
+        self.assertIsNone(count)
+
+    def test_container_procfs_fallback_timeout_is_bounded_and_unavailable(self) -> None:
+        with patch(
+            "cluster_resources.subprocess.run",
+            side_effect=subprocess.TimeoutExpired("docker exec", 2),
+        ) as docker_exec:
+            count = container_peer_tcp_endpoint_count(
+                "runnel-node-1",
+                peer_listener_port=7001,
+                peer_destination_ports={7002},
+            )
+
+        self.assertIsNone(count)
+        self.assertEqual(
+            docker_exec.call_args.kwargs["timeout"],
+            DEFAULT_PROBE_TIMEOUT_SECONDS,
+        )
+
+    def test_container_procfs_fallback_rejects_a_failed_tcp6_read(self) -> None:
+        with patch(
+            "cluster_resources.subprocess.run",
+            return_value=SimpleNamespace(
+                returncode=1,
+                stdout=(
+                    "__RUNNEL_UIDS__10001 10001\n"
+                    "__RUNNEL_TCP4__\n"
+                    "__RUNNEL_TCP6__\n"
+                ),
+            ),
+        ):
+            count = container_peer_tcp_endpoint_count(
+                "runnel-node-1",
+                peer_listener_port=7001,
+                peer_destination_ports={7002},
+            )
+
+        self.assertIsNone(count)
+
+    def test_container_peer_census_uses_exec_fallback_with_explicit_provenance(self) -> None:
+        node = SimpleNamespace(
+            node_id=1,
+            peer_port=7001,
+            peer_address_port=7001,
+            process=None,
+            container=SimpleNamespace(created=True, name="runnel-node-1"),
+        )
+        cluster = SimpleNamespace(runtime="container", nodes=[node])
+        with (
+            patch(
+                "cluster_resources._container_host_pids",
+                return_value={"runnel-node-1": 201},
+            ),
+            patch(
+                "cluster_resources.process_peer_tcp_endpoint_count",
+                return_value=None,
+            ),
+            patch(
+                "cluster_resources.container_peer_tcp_endpoint_count",
+                return_value={"count": 0, "process_identity_verified": True},
+            ) as fallback,
+        ):
+            census = peer_connection_census(cluster)
+
+        self.assertTrue(census["available"])
+        self.assertEqual(
+            census["per_node"]["1"],
+            {
+                "available": True,
+                "established_socket_endpoint_count": 0,
+                "observation_source": "docker_exec_container_procfs_fd_inode_join",
+                "docker_host_pid_resolved": True,
+                "container_process_identity_verified": True,
+            },
+        )
+        self.assertEqual(
+            census["observation_sources"],
+            ["docker_exec_container_procfs_fd_inode_join"],
+        )
+        fallback.assert_called_once_with(
+            "runnel-node-1",
+            peer_listener_port=7001,
+            peer_destination_ports=set(),
+        )
+
+    def test_container_peer_census_remains_unavailable_when_both_procfs_paths_fail(self) -> None:
+        node = SimpleNamespace(
+            node_id=1,
+            peer_port=7001,
+            peer_address_port=7001,
+            process=None,
+            container=SimpleNamespace(created=True, name="runnel-node-1"),
+        )
+        cluster = SimpleNamespace(runtime="container", nodes=[node])
+        with (
+            patch(
+                "cluster_resources._container_host_pids",
+                return_value={"runnel-node-1": 201},
+            ),
+            patch(
+                "cluster_resources.process_peer_tcp_endpoint_count",
+                return_value=None,
+            ),
+            patch(
+                "cluster_resources.container_peer_tcp_endpoint_count",
+                return_value=None,
+            ),
+        ):
+            census = peer_connection_census(cluster)
+
+        self.assertFalse(census["available"])
+        self.assertEqual(
+            census["per_node"]["1"],
+            {
+                "available": False,
+                "unavailable_reason": "procfs_socket_ownership_unavailable",
+            },
         )
 
     def test_peer_census_uses_broker_owned_process_sockets_for_each_node(self) -> None:

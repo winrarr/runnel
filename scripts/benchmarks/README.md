@@ -9,6 +9,7 @@ isolation runner:
 just isolated bench-container-smoke
 just isolated bench-cluster-smoke
 just isolated bench-cluster-container-smoke
+just isolated bench-cluster-peer-forwarding-container-smoke
 ```
 
 Each run receives a unique Cargo target directory, temporary directory, output
@@ -185,7 +186,13 @@ For an isolated process-level check of the multi-stream forwarding scenario:
 just bench-cluster-peer-forwarding-smoke
 ```
 
-For a container lifecycle check, use `just bench-cluster-container-smoke`. Neither smoke workflow is a performance gate. Host scheduling, background processes, filesystem, kernel state, Docker networking, and container resource enforcement can materially affect the numbers. Keep the host and workload metadata with any result used for comparison.
+For a container lifecycle check, use `just bench-cluster-container-smoke`. To check multi-stream peer forwarding and direct socket visibility inside broker containers, use:
+
+```text
+just bench-cluster-peer-forwarding-container-smoke
+```
+
+That Linux+Docker workflow samples broker-owned established peer socket endpoints after setup warmup and after measured forwarding, and fails unless both samples include available non-negative counts for all three nodes with direct procfs provenance. Host-PID procfs is tried first; Docker exec may collect the broker's own procfs when host access is restricted, and the artifact records which route was used. Neither smoke workflow is a performance gate. Host scheduling, background processes, filesystem, kernel state, Docker networking, and container resource enforcement can materially affect the numbers. Keep the host and workload metadata with any result used for comparison.
 
 ## Profiling
 

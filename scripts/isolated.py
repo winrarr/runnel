@@ -14,6 +14,7 @@ untracked external state still need their own isolation design.
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import shlex
 import shutil
@@ -30,6 +31,15 @@ from benchmarks.lock import lock_command
 ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_WORKFLOW = "test"
 INTEGRATION_IMAGE = "runnel:dev"
+CONTAINER_PEER_FORWARDING_CENSUS_SOURCES = {
+    "host_pid_procfs_fd_inode_join",
+    "docker_exec_container_procfs_fd_inode_join",
+}
+PEER_FORWARDING_CENSUS_BOUNDARIES = (
+    "after_setup_warmup",
+    "after_measured_forwarding",
+)
+CLUSTER_NODE_IDS = {"1", "2", "3"}
 WORKFLOWS = (
     "test",
     "smoke",
@@ -41,6 +51,7 @@ WORKFLOWS = (
     "bench-cluster",
     "bench-cluster-smoke",
     "bench-cluster-peer-forwarding-smoke",
+    "bench-cluster-peer-forwarding-container-smoke",
     "bench-cluster-matrix-smoke",
     "bench-cluster-container",
     "bench-cluster-container-smoke",
@@ -259,6 +270,13 @@ def command_for(workflow: str, isolation: Isolation) -> list[str]:
             smoke=True,
             peer_forwarding_smoke=True,
         )
+    if workflow == "bench-cluster-peer-forwarding-container-smoke":
+        return cluster_command(
+            isolation,
+            runtime="container",
+            smoke=True,
+            peer_forwarding_smoke=True,
+        )
     if workflow == "bench-cluster-matrix-smoke":
         target_dir = Path(os.environ.get("CARGO_TARGET_DIR", str(isolation.target_dir)))
         return [
@@ -311,6 +329,79 @@ def command_for(workflow: str, isolation: Isolation) -> list[str]:
     raise ValueError(f"unsupported workflow: {workflow}")
 
 
+def peer_forwarding_container_census_error(artifact_path: Path) -> str | None:
+    """Require direct socket counts for both settled container boundaries."""
+    try:
+        result = json.loads(artifact_path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as error:
+        return f"could not read benchmark artifact: {error}"
+
+    if not isinstance(result, dict):
+        return "benchmark artifact root must be a JSON object"
+    backends = result.get("backends")
+    if not isinstance(backends, dict):
+        return "benchmark artifact has no backend object"
+    backend = backends.get("runnel-cluster")
+    if not isinstance(backend, dict):
+        return "benchmark artifact has no clustered Runnel backend"
+    if backend.get("runtime") != "container":
+        return "benchmark artifact is not from the container runtime"
+    scenarios = backend.get("scenarios")
+    if not isinstance(scenarios, list):
+        return "container benchmark artifact has no scenario list"
+    scenario = next(
+        (
+            item
+            for item in scenarios
+            if isinstance(item, dict)
+            and item.get("operation") == "cluster_peer_forwarding"
+        ),
+        None,
+    )
+    if scenario is None:
+        return "benchmark artifact has no peer_forwarding scenario"
+    metadata = scenario.get("metadata")
+    if not isinstance(metadata, dict):
+        return "peer_forwarding artifact has no scenario metadata object"
+    census = metadata.get("peer_connection_census")
+    if not isinstance(census, dict):
+        return "peer_forwarding artifact has no socket census"
+    sample_boundaries = census.get("sample_boundaries")
+    if not isinstance(sample_boundaries, list) or any(
+        not isinstance(boundary, str) for boundary in sample_boundaries
+    ):
+        return "peer_forwarding census has invalid sample boundaries"
+    boundaries = set(sample_boundaries)
+    if not set(PEER_FORWARDING_CENSUS_BOUNDARIES).issubset(boundaries):
+        return "peer_forwarding census is missing a settled sample boundary"
+    if census.get("all_samples_available") is not True:
+        return "peer_forwarding census reports unavailable samples"
+
+    for boundary in PEER_FORWARDING_CENSUS_BOUNDARIES:
+        sample = census.get(boundary)
+        if not isinstance(sample, dict) or sample.get("available") is not True:
+            return f"peer_forwarding census is unavailable at {boundary}"
+        per_node = sample.get("per_node")
+        if not isinstance(per_node, dict) or set(per_node) != CLUSTER_NODE_IDS:
+            return f"peer_forwarding census at {boundary} must contain nodes 1, 2, and 3"
+        for node_id, node_sample in per_node.items():
+            if not isinstance(node_sample, dict) or node_sample.get("available") is not True:
+                return f"peer_forwarding census is unavailable for node {node_id} at {boundary}"
+            count = node_sample.get("established_socket_endpoint_count")
+            if type(count) is not int or count < 0:
+                return f"peer_forwarding census has an invalid count for node {node_id} at {boundary}"
+            if node_sample.get("observation_source") not in CONTAINER_PEER_FORWARDING_CENSUS_SOURCES:
+                return f"peer_forwarding census has no direct procfs source for node {node_id} at {boundary}"
+            if node_sample.get("docker_host_pid_resolved") is not True:
+                return f"peer_forwarding census did not resolve node {node_id}'s Docker host PID"
+            if (
+                node_sample["observation_source"] == "docker_exec_container_procfs_fd_inode_join"
+                and node_sample.get("container_process_identity_verified") is not True
+            ):
+                return f"peer_forwarding census did not verify the broker identity for node {node_id}"
+    return None
+
+
 def remove_owned_image(isolation: Isolation) -> None:
     try:
         subprocess.run(
@@ -335,8 +426,21 @@ def run(workflow: str, *, keep: bool) -> int:
     completed = False
     try:
         result = subprocess.run(command, cwd=ROOT, env=env, check=False)
-        completed = result.returncode == 0
-        return result.returncode
+        if result.returncode != 0:
+            return result.returncode
+        if workflow == "bench-cluster-peer-forwarding-container-smoke":
+            validation_error = peer_forwarding_container_census_error(
+                isolation.artifact_dir / "cluster-container.json"
+            )
+            if validation_error is not None:
+                print(
+                    f"container peer-forwarding census validation failed: {validation_error}",
+                    file=sys.stderr,
+                    flush=True,
+                )
+                return 1
+        completed = True
+        return 0
     finally:
         if keep or not completed:
             print(f"isolated state retained at {isolation.runtime_dir}", file=sys.stderr, flush=True)
@@ -345,6 +449,7 @@ def run(workflow: str, *, keep: bool) -> int:
                 "bench-container",
                 "bench-cluster-container",
                 "bench-cluster-container-smoke",
+                "bench-cluster-peer-forwarding-container-smoke",
                 "bench-compare",
             }:
                 remove_owned_image(isolation)
