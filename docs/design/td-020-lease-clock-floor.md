@@ -207,9 +207,7 @@ and delivery. This covers a concrete invalid-ack outcome through the
 outcome. The [three-process clustered tests](../../crates/runnel-server/tests/cluster_smoke.rs)
 cover real follower restart, leader/process failure, reassignment, durable
 attempts, and stale-token rejection. They use the host clock and do not inject
-skew or jumps. No focused assertion exercises the public compatibility
-`poll`/`ack` aliases' effect on the floor; their behavior is inferred from the
-shared `PollGroup`/`AckGroup` construction path, not established by this test.
+skew or jumps. The focused [`persistent_compatibility_poll_and_ack_observe_and_persist_lease_clock_floor`](../../crates/runnel-raft/src/lib.rs) test exercises both compatibility aliases through a persistent single-node Raft group. It verifies that each command advances only the target stream group's floor and that the floor survives reopen after both poll and acknowledgement. This does not cover follower forwarding or controlled clocks.
 
 The unit fixture that advances the floor through a second stream is useful for
 state-machine arithmetic but is not evidence that one stream advances another
