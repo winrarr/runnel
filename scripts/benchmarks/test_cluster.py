@@ -1571,7 +1571,7 @@ class ClusterBenchmarkTests(unittest.TestCase):
         )
         self.assertEqual(
             result["metadata"]["latency_scope"],
-            "pre_restart_to_earliest_replay_acknowledgement",
+            "pre_restart_through_earliest_replay_acknowledgement_and_client_close",
         )
         self.assertEqual(
             result["metadata"]["resource_sample_scope"],
