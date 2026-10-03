@@ -1698,6 +1698,7 @@ def run_peer_forwarding(
             client.close()
 
     proxy_summary = cluster.peer_proxy_summary()
+    connections_after_setup = cluster.peer_connection_census()
 
     def operation() -> dict[str, Any]:
         started = time.perf_counter_ns()
@@ -1757,7 +1758,21 @@ def run_peer_forwarding(
         )
         return result
 
-    return measure_scenario(cluster.stats, operation, metrics=cluster.metrics)
+    result = measure_scenario(cluster.stats, operation, metrics=cluster.metrics)
+    connections_after_measurement = cluster.peer_connection_census()
+    result["metadata"]["peer_connection_census"] = {
+        "sample_boundaries": [
+            "after_setup_warmup",
+            "after_measured_forwarding",
+        ],
+        "after_setup_warmup": connections_after_setup,
+        "after_measured_forwarding": connections_after_measurement,
+        "all_samples_available": (
+            connections_after_setup["available"]
+            and connections_after_measurement["available"]
+        ),
+    }
+    return result
 
 
 def run_restart_recovery(cluster: Cluster, stream: str, payload: str) -> dict[str, Any]:
