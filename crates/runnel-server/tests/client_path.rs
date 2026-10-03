@@ -13,6 +13,7 @@ use runnel_protocol::{PublishBatchRecordResponse, Response};
 use tempfile::TempDir;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader as AsyncBufReader};
 use tokio::net::{TcpListener as AsyncTcpListener, TcpStream as AsyncTcpStream};
+use tokio::sync::oneshot;
 
 struct RunningServer {
     child: Child,
@@ -680,6 +681,150 @@ async fn typed_publish_batch_retries_after_lost_response_without_duplicates() {
     );
 }
 
+#[tokio::test]
+async fn typed_publish_batch_response_timeout_reports_unknown_and_retries() {
+    let directory = TempDir::new().unwrap();
+    let server = RunningServer::start(directory.path(), &[]);
+    let mut setup = Client::connect(server.broker_addr).await.unwrap();
+    setup.create_stream("events").await.unwrap();
+    drop(setup);
+
+    let proxy_listener = AsyncTcpListener::bind("127.0.0.1:0").await.unwrap();
+    let proxy_address = proxy_listener.local_addr().unwrap();
+    let (response_sender, response_receiver) = oneshot::channel();
+    let (release_sender, release_receiver) = oneshot::channel();
+    let proxy = ProxyGuard {
+        handle: Some(tokio::spawn(withhold_response_proxy(
+            proxy_listener,
+            server.broker_addr,
+            response_sender,
+            release_receiver,
+        ))),
+    };
+
+    let binary_payload = vec![0, 1, 255, b'\n', 0];
+    let records = vec![
+        PublishBatchRecord::with_options(
+            binary_payload.clone(),
+            PublishOptions::default()
+                .with_key("first-key")
+                .with_request_id("response-timeout-batch-first"),
+        ),
+        PublishBatchRecord::with_options(
+            b"second".to_vec(),
+            PublishOptions::default()
+                .with_key("second-key")
+                .with_request_id("response-timeout-batch-second"),
+        ),
+    ];
+    let response_timeout = Duration::from_secs(2);
+    let mut client = Client::connect_with_config(
+        proxy_address,
+        ClientConfig {
+            response_timeout,
+            ..ClientConfig::default()
+        },
+    )
+    .await
+    .unwrap();
+    let publish_started = Instant::now();
+    let mut publish = Box::pin(client.publish_batch("events", records.clone()));
+    let (broker_response, response_captured_at) = tokio::select! {
+        biased;
+        response = response_receiver => response.expect("proxy should report the complete broker response"),
+        attempt = &mut publish => panic!("typed client timed out before the proxy observed the broker's successful response: {attempt:?}"),
+    };
+    assert!(
+        response_captured_at.duration_since(publish_started) < response_timeout,
+        "proxy should capture the successful broker response before the client timeout"
+    );
+
+    let Response::PublishBatch { stream, outcomes } =
+        serde_json::from_slice::<Response>(&broker_response).unwrap()
+    else {
+        panic!("the broker should return a publish-batch response");
+    };
+    assert_eq!(stream, "events");
+    assert_eq!(outcomes.len(), records.len());
+    assert!(matches!(
+        &outcomes[0],
+        PublishBatchRecordResponse::Published { offset: 0 }
+    ));
+    assert!(matches!(
+        &outcomes[1],
+        PublishBatchRecordResponse::Published { offset: 1 }
+    ));
+
+    let timed_out = publish.await;
+    assert!(matches!(
+        timed_out.attempt.as_ref(),
+        Some(AttemptFailure::Client(ClientError::ResponseTimeout { timeout }))
+            if *timeout == response_timeout
+    ));
+    assert_eq!(timed_out.outcomes.len(), records.len());
+    assert!(timed_out.outcomes.iter().all(|outcome| matches!(
+        outcome,
+        PublishBatchOutcome::Unknown { code, .. } if code == "client_error"
+    )));
+
+    release_sender
+        .send(())
+        .expect("proxy should still be withholding the captured response");
+    assert_eq!(proxy.finish().await.unwrap(), broker_response);
+
+    client.reconnect(server.broker_addr).await.unwrap();
+    let retry = client.publish_batch("events", records).await;
+    assert!(retry.attempt.is_none());
+    assert_eq!(
+        retry.outcomes,
+        vec![
+            PublishBatchOutcome::Confirmed(PublishReceipt {
+                stream: "events".to_owned(),
+                offset: 0,
+            }),
+            PublishBatchOutcome::Confirmed(PublishReceipt {
+                stream: "events".to_owned(),
+                offset: 1,
+            }),
+        ]
+    );
+
+    let mut verifier = Client::connect(server.broker_addr).await.unwrap();
+    let first = verifier
+        .poll_bytes("events", "verifier")
+        .await
+        .unwrap()
+        .expect("the first accepted batch record should be available");
+    assert_eq!(first.offset, 0);
+    assert_eq!(first.key.as_deref(), Some("first-key"));
+    assert_eq!(first.payload, binary_payload);
+    verifier
+        .ack("events", "verifier", first.offset)
+        .await
+        .unwrap();
+
+    let second = verifier
+        .poll_bytes("events", "verifier")
+        .await
+        .unwrap()
+        .expect("the second accepted batch record should be available");
+    assert_eq!(second.offset, 1);
+    assert_eq!(second.key.as_deref(), Some("second-key"));
+    assert_eq!(second.payload, b"second");
+    verifier
+        .ack("events", "verifier", second.offset)
+        .await
+        .unwrap();
+    assert!(
+        verifier
+            .poll_bytes("events", "verifier")
+            .await
+            .unwrap()
+            .is_none(),
+        "retrying a timed-out batch must not append duplicate records"
+    );
+}
+
 struct ProxyGuard {
     handle: Option<tokio::task::JoinHandle<Vec<u8>>>,
 }
@@ -727,6 +872,43 @@ async fn drop_first_response_proxy(listener: AsyncTcpListener, broker_addr: Sock
         client_writer.write_all(&response).await.unwrap();
     }
     dropped_response.expect("the proxy should have dropped its first broker response")
+}
+
+async fn withhold_response_proxy(
+    listener: AsyncTcpListener,
+    broker_addr: SocketAddr,
+    response_sender: oneshot::Sender<(Vec<u8>, Instant)>,
+    release_receiver: oneshot::Receiver<()>,
+) -> Vec<u8> {
+    let (client, _) = listener.accept().await.unwrap();
+    let (client_reader, client_writer) = client.into_split();
+    let mut client_reader = AsyncBufReader::new(client_reader);
+    let mut request = Vec::new();
+    client_reader.read_until(b'\n', &mut request).await.unwrap();
+
+    let broker = AsyncTcpStream::connect(broker_addr).await.unwrap();
+    let (broker_reader, mut broker_writer) = broker.into_split();
+    broker_writer.write_all(&request).await.unwrap();
+    let mut broker_reader = AsyncBufReader::new(broker_reader);
+    let mut response = Vec::new();
+    broker_reader
+        .read_until(b'\n', &mut response)
+        .await
+        .unwrap();
+    assert!(
+        response.ends_with(b"\n"),
+        "broker response should be complete"
+    );
+    response_sender
+        .send((response.clone(), Instant::now()))
+        .expect("test should inspect the broker response before client timeout");
+
+    release_receiver
+        .await
+        .expect("test should release the withheld client response after timeout");
+    drop(client_reader);
+    drop(client_writer);
+    response
 }
 
 #[cfg(unix)]
