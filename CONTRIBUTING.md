@@ -36,13 +36,7 @@ Create a non-`main` branch for each independently reviewable change and deliver
 it through a separate pull request. Direct pushes to `main` and bypassing
 repository rulesets or required checks are not allowed.
 
-Every human change run must begin by fetching `origin/main`, recording its
-revision, and checking the latest default-branch CI run for that exact commit.
-Pull-request branches do not need to be rebased solely because `main` advanced:
-update the branch and rerun relevant checks when changes overlap in owned paths,
-shared contracts, generated files, dependencies, or integration behavior;
-otherwise a cleanly mergeable disjoint branch may proceed from its recorded
-baseline.
+At each change run, fetch and record `origin/main` and the latest default-branch CI run's revision and state when available; scheduled runs may lag, so do not wait for them. Required checks on the exact PR head gate merge. Follow `AGENTS.md` for branch updates: a newer `main` or overlapping paths alone is not enough; update only for an actual merge conflict or concrete integration need, and rerun affected checks.
 
 For performance-sensitive changes, follow [docs/benchmarking.md](docs/benchmarking.md)
 for benchmark applicability, result interpretation, and pull-request evidence.
