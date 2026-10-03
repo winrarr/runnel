@@ -2,7 +2,7 @@
 
 Status: scoped implementation note
 
-Reviewed: 2026-09-29
+Reviewed: 2026-10-03
 
 Baseline: `origin/main` `49652a19cbd11fe68f79c602df3522a42dfaceba`
 
@@ -103,8 +103,10 @@ The change deliberately does not pool the persistent per-group Raft streams. Tha
   total measured publishes round-robin, and records the aggregate excluded
   warmup setup. This characterizes follower-ingress publish behavior as data
   group count grows; it does not isolate pool wait from quorum processing,
-  directly count retained per-group replication streams, compare against an
-  alternate connection strategy, or exercise snapshot/control interference.
+  attribute connections to individual groups or traffic classes, compare
+  against an alternate connection strategy, or exercise snapshot/control
+  interference. It now records a settled-boundary per-process socket endpoint
+  census; the evidence and limits are recorded below.
 - Snapshot chunks are serial on their dedicated OpenRaft snapshot client and do
   not share the transport stream used by that group's log replication and
   replication-loop heartbeats. A real-process snapshot-plus-control probe may
@@ -116,9 +118,8 @@ The change deliberately does not pool the persistent per-group Raft streams. Tha
 - Pool capacity, fallback behavior, and idle expiry are still fixed policy
   values. Their p99/p99.9 behavior under group density, delayed forwarding
   responses, peer replacement, and overflow-address fairness remains open. The
-  forwarding probe covers one stream and does not measure the number of retained
-  per-group replication streams; no authoritative transport-strategy
-  performance comparison exists yet.
+  forwarding probe does not measure retained per-group replication streams; no
+  authoritative transport-strategy performance comparison exists yet.
 - Timeout behavior does not prove remote cancellation: a timed-out forwarding
   or Raft request may continue consuming peer and state-machine capacity after
   the caller has abandoned its connection. The interaction between that work,
@@ -134,9 +135,42 @@ The change deliberately does not pool the persistent per-group Raft streams. Tha
 The source review corrects the snapshot/control contention hypothesis but does
 not retire TD-012. The current `peer_forwarding` workload can measure forwarding
 saturation and follower round-trip latency across bounded data-group counts at
-fixed aggregate measured work. It does not directly observe retained replication
-connections or compare a different transport strategy. Keep the runtime and
-ADRs unchanged until a controlled comparison measures a candidate strategy.
-Connection counts, alternative-strategy comparison, snapshot/control effects,
-and stable tail-latency evidence remain open; do not claim an optimization from
-this density characterization or the existing pool tests alone.
+fixed aggregate measured work, and now exposes direct per-node counts of
+established broker-owned socket endpoints matching peer ports. Keep the runtime
+and ADRs unchanged until a controlled comparison measures a candidate strategy.
+Per-group attribution, unique inter-node connection counts,
+alternative-strategy comparison, snapshot/control effects, and stable
+tail-latency evidence remain open; do not claim an optimization from this
+density characterization or the existing pool tests alone.
+
+## Peer socket census evidence
+
+The opt-in scenario takes Linux procfs snapshots after setup warmup and after
+measured forwarding. For each broker it joins socket inodes found under
+`/proc/<pid>/fd` with established entries in `/proc/<pid>/net/tcp` and `tcp6`,
+then counts endpoints whose local port is that broker's peer listener or whose
+remote port matches a configured peer destination. Container mode resolves
+the broker's host PID with `docker inspect` and uses the same procfs method. If
+Linux procfs, Docker inspection, or process ownership data is unavailable, the
+artifact reports the census as unavailable instead of substituting an inferred
+count.
+
+An isolated native-process forwarding smoke on revision
+`444652e0b4b4617e058d51cdf2e88ed111f6c23f` observed 8, 4, and 4 endpoints on
+nodes 1, 2, and 3 after setup warmup, then 12, 8, and 4 after measured
+forwarding. The two census operations took about 17.0 ms and 18.0 ms. The
+machine-readable artifact is
+`benchmark-results/isolated/25ad03b97ce34cbc/cluster.json`; it covers 20
+measured publishes, two streams, two warmup publishes per stream, and
+concurrency eight. This is a diagnostic smoke, not an authoritative performance
+comparison.
+
+These are per-process socket endpoint counts, not unique connections: one
+inter-node connection can be represented at both brokers. Port matching does
+not identify the Raft group or distinguish replication, snapshot, compatibility
+pool, or other peer-port traffic. The snapshots are read sequentially and are
+not an atomic cluster-wide sample; collection time is outside the forwarding
+measurement. The container host-PID and procfs route has focused unit coverage,
+but this run did not exercise an actual containerized cluster. Direct endpoint
+observability is therefore available for supported Linux runs, while the
+broader transport strategy question remains unresolved.
