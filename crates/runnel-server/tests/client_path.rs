@@ -9,6 +9,7 @@ use runnel_client::{
     AttemptFailure, AttemptOutcome, Client, ClientConfig, ClientError, PublishBatchOutcome,
     PublishBatchRecord, PublishOptions, PublishReceipt,
 };
+use runnel_protocol::{PublishBatchRecordResponse, Response};
 use tempfile::TempDir;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader as AsyncBufReader};
 use tokio::net::{TcpListener as AsyncTcpListener, TcpStream as AsyncTcpStream};
@@ -536,7 +537,11 @@ async fn typed_publish_retry_with_stable_identity_does_not_duplicate() {
         .unwrap();
     assert_eq!(receipt.offset, 0);
     drop(client);
-    proxy.finish().await.unwrap();
+    let dropped_response = proxy.finish().await.unwrap();
+    assert!(matches!(
+        serde_json::from_slice::<Response>(&dropped_response).unwrap(),
+        Response::Published { stream, offset } if stream == "events" && offset == 0
+    ));
 
     let mut verifier = Client::connect(server.broker_addr).await.unwrap();
     let message = verifier
@@ -559,12 +564,128 @@ async fn typed_publish_retry_with_stable_identity_does_not_duplicate() {
     );
 }
 
+#[tokio::test]
+async fn typed_publish_batch_retries_after_lost_response_without_duplicates() {
+    let directory = TempDir::new().unwrap();
+    let server = RunningServer::start(directory.path(), &[]);
+    let mut setup = Client::connect(server.broker_addr).await.unwrap();
+    setup.create_stream("events").await.unwrap();
+    drop(setup);
+
+    let proxy_listener = AsyncTcpListener::bind("127.0.0.1:0").await.unwrap();
+    let proxy_address = proxy_listener.local_addr().unwrap();
+    let proxy = ProxyGuard {
+        handle: Some(tokio::spawn(drop_first_response_proxy(
+            proxy_listener,
+            server.broker_addr,
+        ))),
+    };
+
+    let binary_payload = vec![0, 1, 255, b'\n', 0];
+    let records = vec![
+        PublishBatchRecord::with_options(
+            binary_payload.clone(),
+            PublishOptions::default()
+                .with_key("first-key")
+                .with_request_id("batch-first-once"),
+        ),
+        PublishBatchRecord::with_options(
+            b"second".to_vec(),
+            PublishOptions::default()
+                .with_key("second-key")
+                .with_request_id("batch-second-once"),
+        ),
+    ];
+
+    let mut client = Client::connect(proxy_address).await.unwrap();
+    let lost_attempt = client.publish_batch("events", records.clone()).await;
+    assert!(matches!(
+        lost_attempt.attempt.as_ref(),
+        Some(AttemptFailure::Client(ClientError::Eof))
+    ));
+    assert_eq!(lost_attempt.outcomes.len(), records.len());
+    assert!(lost_attempt.outcomes.iter().all(|outcome| matches!(
+        outcome,
+        PublishBatchOutcome::Unknown { code, .. } if code == "client_error"
+    )));
+
+    client.reconnect(proxy_address).await.unwrap();
+    let retry = client.publish_batch("events", records).await;
+    assert!(retry.attempt.is_none());
+    assert_eq!(
+        retry.outcomes,
+        vec![
+            PublishBatchOutcome::Confirmed(PublishReceipt {
+                stream: "events".to_owned(),
+                offset: 0,
+            }),
+            PublishBatchOutcome::Confirmed(PublishReceipt {
+                stream: "events".to_owned(),
+                offset: 1,
+            }),
+        ]
+    );
+    drop(client);
+
+    let dropped_response = proxy.finish().await.unwrap();
+    let Response::PublishBatch { stream, outcomes } =
+        serde_json::from_slice::<Response>(&dropped_response).unwrap()
+    else {
+        panic!("the broker should have accepted the first batch before its response was dropped");
+    };
+    assert_eq!(stream, "events");
+    assert_eq!(outcomes.len(), 2);
+    assert!(matches!(
+        &outcomes[0],
+        PublishBatchRecordResponse::Published { offset: 0 }
+    ));
+    assert!(matches!(
+        &outcomes[1],
+        PublishBatchRecordResponse::Published { offset: 1 }
+    ));
+
+    let mut verifier = Client::connect(server.broker_addr).await.unwrap();
+    let first = verifier
+        .poll_bytes("events", "verifier")
+        .await
+        .unwrap()
+        .expect("the first batch record should be available exactly once");
+    assert_eq!(first.offset, 0);
+    assert_eq!(first.key.as_deref(), Some("first-key"));
+    assert_eq!(first.payload, binary_payload);
+    verifier
+        .ack("events", "verifier", first.offset)
+        .await
+        .unwrap();
+
+    let second = verifier
+        .poll_bytes("events", "verifier")
+        .await
+        .unwrap()
+        .expect("the second batch record should be available exactly once");
+    assert_eq!(second.offset, 1);
+    assert_eq!(second.key.as_deref(), Some("second-key"));
+    assert_eq!(second.payload, b"second");
+    verifier
+        .ack("events", "verifier", second.offset)
+        .await
+        .unwrap();
+    assert!(
+        verifier
+            .poll_bytes("events", "verifier")
+            .await
+            .unwrap()
+            .is_none(),
+        "retrying after response loss must not append duplicate records"
+    );
+}
+
 struct ProxyGuard {
-    handle: Option<tokio::task::JoinHandle<()>>,
+    handle: Option<tokio::task::JoinHandle<Vec<u8>>>,
 }
 
 impl ProxyGuard {
-    async fn finish(mut self) -> Result<(), tokio::task::JoinError> {
+    async fn finish(mut self) -> Result<Vec<u8>, tokio::task::JoinError> {
         self.handle
             .take()
             .expect("proxy handle should be present")
@@ -580,7 +701,8 @@ impl Drop for ProxyGuard {
     }
 }
 
-async fn drop_first_response_proxy(listener: AsyncTcpListener, broker_addr: SocketAddr) {
+async fn drop_first_response_proxy(listener: AsyncTcpListener, broker_addr: SocketAddr) -> Vec<u8> {
+    let mut dropped_response = None;
     for drop_response in [true, false] {
         let (client, _) = listener.accept().await.unwrap();
         let (client_reader, mut client_writer) = client.into_split();
@@ -599,10 +721,12 @@ async fn drop_first_response_proxy(listener: AsyncTcpListener, broker_addr: Sock
             .unwrap();
 
         if drop_response {
+            dropped_response = Some(response);
             continue;
         }
         client_writer.write_all(&response).await.unwrap();
     }
+    dropped_response.expect("the proxy should have dropped its first broker response")
 }
 
 #[cfg(unix)]
