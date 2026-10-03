@@ -4,11 +4,15 @@
 from __future__ import annotations
 
 import os
+import re
+import subprocess
+import sys
 import time
 from pathlib import Path
 from typing import Any, Protocol
 
 from resources import (
+    DEFAULT_PROBE_TIMEOUT_SECONDS,
     PeriodicSampler,
     directory_size,
     read_cpu_seconds,
@@ -56,6 +60,201 @@ def process_stats(pid: int) -> tuple[float, int] | None:
         return cpu_seconds, rss
     except (IndexError, OSError, ValueError):
         return None
+
+
+def parse_owned_peer_tcp_endpoints(
+    tables: list[str],
+    owned_inodes: set[str],
+    *,
+    peer_listener_port: int,
+    peer_destination_ports: set[int],
+) -> int:
+    """Count owned established socket endpoints on this node's peer path."""
+    matched_inodes: set[str] = set()
+    for table in tables:
+        for line in table.splitlines()[1:]:
+            fields = line.split()
+            if len(fields) < 10 or fields[3] != "01":
+                continue
+            inode = fields[9]
+            if inode not in owned_inodes:
+                continue
+            try:
+                local_port = int(fields[1].rsplit(":", 1)[1], 16)
+                remote_port = int(fields[2].rsplit(":", 1)[1], 16)
+            except (IndexError, ValueError):
+                continue
+            if (
+                local_port == peer_listener_port
+                or remote_port in peer_destination_ports
+            ):
+                matched_inodes.add(inode)
+    return len(matched_inodes)
+
+
+def process_peer_tcp_endpoint_count(
+    pid: int,
+    *,
+    peer_listener_port: int,
+    peer_destination_ports: set[int],
+    proc_root: Path = Path("/proc"),
+) -> int | None:
+    """Count this broker's established peer TCP sockets from Linux procfs.
+
+    Joining the broker's socket file descriptors to its network namespace's
+    TCP tables excludes sockets owned by unrelated processes in the same
+    namespace. ``None`` means procfs could not provide a complete observation.
+    """
+    process_root = proc_root / str(pid)
+    try:
+        socket_inodes = set()
+        for descriptor in (process_root / "fd").iterdir():
+            try:
+                target = os.readlink(descriptor)
+            except FileNotFoundError:
+                continue
+            match = re.fullmatch(r"socket:\[(\d+)\]", target)
+            if match is not None:
+                socket_inodes.add(match.group(1))
+
+        tables = [(process_root / "net" / "tcp").read_text(encoding="utf-8")]
+        try:
+            tables.append(
+                (process_root / "net" / "tcp6").read_text(encoding="utf-8")
+            )
+        except FileNotFoundError:
+            pass
+    except OSError:
+        return None
+
+    return parse_owned_peer_tcp_endpoints(
+        tables,
+        socket_inodes,
+        peer_listener_port=peer_listener_port,
+        peer_destination_ports=peer_destination_ports,
+    )
+
+
+def _container_host_pids(nodes: list[Any]) -> dict[str, int]:
+    containers = [
+        node.container
+        for node in nodes
+        if node.container is not None and node.container.created
+    ]
+    if not containers:
+        return {}
+    try:
+        result = subprocess.run(
+            [
+                "docker",
+                "inspect",
+                "--format",
+                "{{.Name}} {{.State.Pid}}",
+                *(container.name for container in containers),
+            ],
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=DEFAULT_PROBE_TIMEOUT_SECONDS,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return {}
+    if result.returncode != 0:
+        return {}
+
+    host_pids: dict[str, int] = {}
+    for line in result.stdout.splitlines():
+        fields = line.split()
+        if len(fields) != 2:
+            continue
+        name = fields[0].removeprefix("/")
+        try:
+            pid = int(fields[1])
+        except ValueError:
+            continue
+        if pid > 0:
+            host_pids[name] = pid
+    return host_pids
+
+
+def peer_connection_census(cluster: ResourceCluster) -> dict[str, Any]:
+    """Observe established peer socket endpoints owned by each broker."""
+    started_ns = time.perf_counter_ns()
+    result: dict[str, Any] = {
+        "method": "linux_procfs_process_fd_inode_join",
+        "scope": (
+            "established TCP socket endpoints owned by each broker process; "
+            "local endpoint matches its peer listener port or remote endpoint "
+            "matches a configured peer destination port"
+        ),
+        "count_semantics": (
+            "per-node socket endpoints, not unique TCP connections; one "
+            "inter-node connection can appear once at each broker endpoint"
+        ),
+        "available": False,
+        "per_node": {},
+    }
+    if sys.platform != "linux":
+        result["unavailable_reason"] = "linux_procfs_required"
+        result["observation_duration_ms"] = (
+            time.perf_counter_ns() - started_ns
+        ) / 1_000_000
+        return result
+
+    all_available = True
+    container_pids = (
+        _container_host_pids(cluster.nodes)
+        if cluster.runtime == "container"
+        else {}
+    )
+    for node in cluster.nodes:
+        if cluster.runtime == "container":
+            pid = (
+                container_pids.get(node.container.name)
+                if node.container is not None
+                else None
+            )
+        else:
+            process = node.process
+            pid = (
+                process.pid
+                if process is not None and process.poll() is None
+                else None
+            )
+        if pid is None:
+            all_available = False
+            result["per_node"][str(node.node_id)] = {
+                "available": False,
+                "unavailable_reason": "broker_process_unavailable",
+            }
+            continue
+
+        count = process_peer_tcp_endpoint_count(
+            pid,
+            peer_listener_port=node.peer_port,
+            peer_destination_ports={
+                other.peer_address_port
+                for other in cluster.nodes
+                if other.node_id != node.node_id
+            },
+        )
+        if count is None:
+            all_available = False
+            result["per_node"][str(node.node_id)] = {
+                "available": False,
+                "unavailable_reason": "procfs_socket_ownership_unavailable",
+            }
+            continue
+        result["per_node"][str(node.node_id)] = {
+            "available": True,
+            "established_socket_endpoint_count": count,
+        }
+
+    result["available"] = all_available
+    result["observation_duration_ms"] = (
+        time.perf_counter_ns() - started_ns
+    ) / 1_000_000
+    return result
 
 
 class ProcessStats(PeriodicSampler):

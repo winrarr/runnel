@@ -20,7 +20,14 @@ import cluster_results  # noqa: E402
 from cluster import parse_args, parse_positive_float, resource_limits  # noqa: E402
 from cluster_faults import PeerResponseDelayProxy  # noqa: E402
 from cluster_lifecycle import Cluster  # noqa: E402
-from cluster_resources import ProcessStats, process_stats  # noqa: E402
+from cluster_resources import (  # noqa: E402
+    ProcessStats,
+    _container_host_pids,
+    parse_owned_peer_tcp_endpoints,
+    peer_connection_census,
+    process_peer_tcp_endpoint_count,
+    process_stats,
+)
 from cluster_scenarios import (  # noqa: E402
     DEFAULT_COLD_KEY_COUNT,
     DEFAULT_COLD_MESSAGES_PER_KEY,
@@ -984,6 +991,7 @@ class ClusterBenchmarkTests(unittest.TestCase):
             stats=object(),
             metrics=lambda: None,
             peer_proxy_summary=lambda: {"enabled": False},
+            peer_connection_census=lambda: {"available": True, "per_node": {}},
             client=lambda _index, **_: SimpleNamespace(close=lambda: None),
         )
 
@@ -1007,12 +1015,25 @@ class ClusterBenchmarkTests(unittest.TestCase):
                 )
 
     def test_peer_forwarding_records_follower_roundtrip_metadata(self) -> None:
+        census_samples = iter(
+            [
+                {
+                    "available": True,
+                    "per_node": {"1": {"established_socket_endpoint_count": 4}},
+                },
+                {
+                    "available": True,
+                    "per_node": {"1": {"established_socket_endpoint_count": 6}},
+                },
+            ]
+        )
         cluster = SimpleNamespace(
             node_count=3,
             peer_response_delay_ms=5,
             stats=object(),
             metrics=lambda: None,
             peer_proxy_summary=lambda: {"enabled": True},
+            peer_connection_census=lambda: next(census_samples),
             client=lambda _index, **_: SimpleNamespace(close=lambda: None),
         )
         next_offset = 2
@@ -1046,6 +1067,22 @@ class ClusterBenchmarkTests(unittest.TestCase):
         self.assertEqual(result["metadata"]["forwarding_ingress_node"], 2)
         self.assertEqual(result["metadata"]["peer_response_delay_ms"], 5)
         self.assertTrue(result["metadata"]["peer_response_proxy_enabled"])
+        self.assertEqual(
+            result["metadata"]["peer_connection_census"]["sample_boundaries"],
+            ["after_setup_warmup", "after_measured_forwarding"],
+        )
+        self.assertEqual(
+            result["metadata"]["peer_connection_census"]["after_setup_warmup"][
+                "per_node"
+            ]["1"]["established_socket_endpoint_count"],
+            4,
+        )
+        self.assertEqual(
+            result["metadata"]["peer_connection_census"]["after_measured_forwarding"][
+                "per_node"
+            ]["1"]["established_socket_endpoint_count"],
+            6,
+        )
 
     def test_peer_forwarding_distributes_total_messages_and_checks_offsets_per_stream(self) -> None:
         created_streams: list[tuple[str, int]] = []
@@ -1058,6 +1095,7 @@ class ClusterBenchmarkTests(unittest.TestCase):
             stats=object(),
             metrics=lambda: None,
             peer_proxy_summary=lambda: {"enabled": False},
+            peer_connection_census=lambda: {"available": True, "per_node": {}},
             client=lambda _index, **_: SimpleNamespace(close=lambda: None),
         )
 
@@ -1316,6 +1354,199 @@ class ClusterBenchmarkTests(unittest.TestCase):
         self.assertIsNotNone(sample)
         self.assertGreaterEqual(sample[0], 0)
         self.assertGreaterEqual(sample[1], 0)
+
+    def test_peer_tcp_census_matches_owned_established_socket_endpoints(self) -> None:
+        tcp = """\
+  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode
+   0: 0100007F:1B58 0100007F:9C40 01 00000000:00000000 00:00000000 00000000 1000 0 101
+   1: 0100007F:9C40 0100007F:1F40 01 00000000:00000000 00:00000000 00000000 1000 0 102
+   2: 0100007F:9C40 0100007F:1F40 0A 00000000:00000000 00:00000000 00000000 1000 0 103
+   3: 0100007F:9C40 0100007F:9C41 01 00000000:00000000 00:00000000 00000000 1000 0 104
+   4: 0100007F:1B58 0100007F:9C40 01 00000000:00000000 00:00000000 00000000 1000 0 105
+"""
+        tcp6 = """\
+  sl  local_address                         remote_address                        st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode
+   0: 00000000000000000000000000000000:9C40 00000000000000000000000000000000:1B58 01 00000000:00000000 00:00000000 00000000 1000 0 106
+"""
+
+        count = parse_owned_peer_tcp_endpoints(
+            [tcp, tcp6],
+            {"101", "102", "103", "104", "106"},
+            peer_listener_port=7000,
+            peer_destination_ports={7000, 8000},
+        )
+
+        self.assertEqual(count, 3)
+
+    def test_process_peer_tcp_census_joins_procfs_socket_fds_to_peer_endpoints(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            process_root = Path(temporary_directory) / "1234"
+            (process_root / "fd").mkdir(parents=True)
+            (process_root / "net").mkdir()
+            (process_root / "fd" / "7").symlink_to("socket:[12345]")
+            (process_root / "fd" / "8").symlink_to("/tmp/not-a-socket")
+            (process_root / "net" / "tcp").write_text(
+                "  sl local_address rem_address st tx_queue rx_queue tr "
+                "tm->when retrnsmt uid timeout inode\n"
+                "0: 0100007F:1B58 0100007F:9C40 01 00000000:00000000 "
+                "00:00000000 00000000 1000 0 12345\n",
+                encoding="utf-8",
+            )
+
+            count = process_peer_tcp_endpoint_count(
+                1234,
+                peer_listener_port=7000,
+                peer_destination_ports={8000},
+                proc_root=Path(temporary_directory),
+            )
+
+        self.assertEqual(count, 1)
+
+    def test_unreadable_process_has_no_peer_socket_count(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            count = process_peer_tcp_endpoint_count(
+                1234,
+                peer_listener_port=7000,
+                peer_destination_ports={8000},
+                proc_root=Path(temporary_directory),
+            )
+
+        self.assertIsNone(count)
+
+    def test_container_peer_census_resolves_the_broker_host_pid(self) -> None:
+        node = SimpleNamespace(
+            container=SimpleNamespace(created=True, name="runnel-node-2")
+        )
+        with patch(
+            "cluster_resources.subprocess.run",
+            return_value=SimpleNamespace(
+                returncode=0, stdout="/runnel-node-2 4321\n"
+            ),
+        ) as inspect:
+            pids = _container_host_pids([node])
+
+        self.assertEqual(pids, {"runnel-node-2": 4321})
+        self.assertEqual(
+            inspect.call_args.args[0],
+            [
+                "docker",
+                "inspect",
+                "--format",
+                "{{.Name}} {{.State.Pid}}",
+                "runnel-node-2",
+            ],
+        )
+
+    def test_peer_census_uses_broker_owned_process_sockets_for_each_node(self) -> None:
+        nodes = [
+            SimpleNamespace(
+                node_id=1,
+                peer_port=7001,
+                peer_address_port=7001,
+                process=SimpleNamespace(pid=101, poll=lambda: None),
+                container=None,
+            ),
+            SimpleNamespace(
+                node_id=2,
+                peer_port=7002,
+                peer_address_port=7002,
+                process=SimpleNamespace(pid=102, poll=lambda: None),
+                container=None,
+            ),
+        ]
+        cluster = SimpleNamespace(runtime="process", nodes=nodes)
+        with patch(
+            "cluster_resources.process_peer_tcp_endpoint_count",
+            side_effect=[3, 5],
+        ) as count_sockets:
+            census = peer_connection_census(cluster)
+
+        self.assertTrue(census["available"])
+        self.assertEqual(
+            {
+                node_id: value["established_socket_endpoint_count"]
+                for node_id, value in census["per_node"].items()
+            },
+            {"1": 3, "2": 5},
+        )
+        self.assertEqual(
+            count_sockets.call_args_list[0].kwargs,
+            {
+                "peer_listener_port": 7001,
+                "peer_destination_ports": {7002},
+            },
+        )
+
+    def test_container_peer_census_reports_missing_process_without_a_count(self) -> None:
+        node = SimpleNamespace(
+            node_id=2,
+            peer_port=7000,
+            peer_address_port=7000,
+            process=None,
+            container=SimpleNamespace(created=True, name="runnel-node-2"),
+        )
+        cluster = SimpleNamespace(runtime="container", nodes=[node])
+        with patch("cluster_resources._container_host_pids", return_value={}):
+            census = peer_connection_census(cluster)
+
+        self.assertFalse(census["available"])
+        self.assertEqual(
+            census["per_node"]["2"],
+            {
+                "available": False,
+                "unavailable_reason": "broker_process_unavailable",
+            },
+        )
+
+    def test_container_peer_census_uses_each_brokers_procfs_network_namespace(self) -> None:
+        nodes = [
+            SimpleNamespace(
+                node_id=1,
+                peer_port=7000,
+                peer_address_port=7000,
+                process=None,
+                container=SimpleNamespace(created=True, name="runnel-node-1"),
+            ),
+            SimpleNamespace(
+                node_id=2,
+                peer_port=7000,
+                peer_address_port=7000,
+                process=None,
+                container=SimpleNamespace(created=True, name="runnel-node-2"),
+            ),
+        ]
+        cluster = SimpleNamespace(runtime="container", nodes=nodes)
+        with (
+            patch(
+                "cluster_resources._container_host_pids",
+                return_value={"runnel-node-1": 201, "runnel-node-2": 202},
+            ),
+            patch(
+                "cluster_resources.process_peer_tcp_endpoint_count",
+                side_effect=[4, 6],
+            ) as count_sockets,
+        ):
+            census = peer_connection_census(cluster)
+
+        self.assertTrue(census["available"])
+        self.assertEqual(
+            {
+                node_id: value["established_socket_endpoint_count"]
+                for node_id, value in census["per_node"].items()
+            },
+            {"1": 4, "2": 6},
+        )
+        self.assertEqual(
+            count_sockets.call_args_list[0].args,
+            (201,),
+        )
+        self.assertEqual(
+            count_sockets.call_args_list[1].kwargs,
+            {
+                "peer_listener_port": 7000,
+                "peer_destination_ports": {7000},
+            },
+        )
 
     def test_process_stats_preserves_per_node_storage_samples(self) -> None:
         summary = ProcessStats._summarize_nodes(

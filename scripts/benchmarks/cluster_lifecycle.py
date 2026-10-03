@@ -16,7 +16,7 @@ from pathlib import Path
 from typing import Any
 
 from cluster_faults import PeerResponseDelayProxy
-from cluster_resources import ProcessStats
+from cluster_resources import ProcessStats, peer_connection_census
 from cluster_scenarios import DEFAULT_PEER_RESPONSE_DELAY_MS
 from common import (
     BenchmarkError,
@@ -147,6 +147,10 @@ class Cluster:
                 {f"node_{node.node_id}.{name}": value for name, value in metrics.items()}
             )
         return snapshot or None
+
+    def peer_connection_census(self) -> dict[str, Any]:
+        """Count established peer socket endpoints owned by each broker."""
+        return peer_connection_census(self)
 
     @contextmanager
     def connected_clients(self) -> Iterator[list[LineClient]]:
