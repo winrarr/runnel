@@ -94,6 +94,7 @@ Useful workflows:
     just isolated bench-container-smoke
     just isolated bench-cluster-smoke
     just isolated bench-cluster-peer-forwarding-smoke
+    just isolated bench-cluster-peer-forwarding-container-smoke
     just isolated bench-cluster-matrix-smoke
     just isolated bench-cluster-container-smoke
     just cluster-test
@@ -104,6 +105,7 @@ Useful workflows:
     just bench-cluster
     just bench-cluster-smoke
     just bench-cluster-peer-forwarding-smoke
+    just bench-cluster-peer-forwarding-container-smoke
     just bench-cluster-matrix
     just bench-cluster-matrix-smoke
     just bench-cluster-container
@@ -124,7 +126,8 @@ The existing scripts/verify.sh command remains as a thin compatibility wrapper a
 The required pull-request CI gate is a two-branch DAG: `Verify` and `Integration`
 run in parallel and both must pass. `Verify` owns the real three-node
 `cluster_smoke` test; `Integration` owns the process smoke and container smoke
-workflows and reuses one prebuilt image for both container checks.
+workflows and reuses one prebuilt image for its single-node and three-node
+container checks, including the peer-forwarding socket-census smoke.
 
 Contributions use Conventional Commits because pull-request titles become the
 release-facing subjects after squash merges. See [AGENTS.md](AGENTS.md) for the

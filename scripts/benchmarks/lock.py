@@ -60,6 +60,7 @@ def lock_command(workflow: str, command: list[str]) -> list[str]:
         "bench-cluster-matrix-smoke": "shared",
         "bench-cluster-container": "exclusive",
         "bench-cluster-container-smoke": "shared",
+        "bench-cluster-peer-forwarding-container-smoke": "shared",
         "profile-cluster": "exclusive",
         "profile-cluster-instrumented": "exclusive",
         "bench-compare": "exclusive",

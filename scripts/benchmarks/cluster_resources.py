@@ -177,6 +177,85 @@ def _container_host_pids(nodes: list[Any]) -> dict[str, int]:
     return host_pids
 
 
+def container_peer_tcp_endpoint_count(
+    container_name: str,
+    *,
+    peer_listener_port: int,
+    peer_destination_ports: set[int],
+) -> dict[str, Any] | None:
+    """Count broker-owned peer endpoints from the container's own procfs.
+
+    Some Linux hosts restrict access to another UID's ``/proc/<host-pid>/fd``.
+    Running this read-only collection through Docker exec uses the configured
+    container user, which can inspect the broker process in the shared
+    container PID namespace without granting host-level ptrace access.
+    """
+    script = " ".join(
+        [
+            'exec_uid=$(id -u) || exit 1;',
+            "broker_uid=;",
+            "while read -r field real effective saved fs; do",
+            'if [ "$field" = "Uid:" ]; then broker_uid=$effective; break; fi;',
+            "done < /proc/1/status;",
+            '[ -n "$broker_uid" ] || exit 1;',
+            'printf "__RUNNEL_UIDS__%s %s\\n" "$exec_uid" "$broker_uid";',
+            '[ "$exec_uid" = "$broker_uid" ] || exit 2;',
+            "for fd in /proc/1/fd/*; do",
+            'target=$(readlink "$fd" 2>/dev/null) || continue;',
+            'case "$target" in socket:*) printf "SOCKET %s\\n" "$target";; esac;',
+            "done;",
+            'printf "__RUNNEL_TCP4__\\n";',
+            "cat /proc/1/net/tcp || exit 1;",
+            'printf "__RUNNEL_TCP6__\\n";',
+            "if [ -e /proc/1/net/tcp6 ]; then cat /proc/1/net/tcp6 || exit 1; fi",
+        ]
+    )
+    try:
+        result = subprocess.run(
+            ["docker", "exec", container_name, "sh", "-c", script],
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=DEFAULT_PROBE_TIMEOUT_SECONDS,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if result.returncode != 0:
+        return None
+
+    _, separator, remainder = result.stdout.partition("__RUNNEL_UIDS__")
+    if not separator:
+        return None
+    identity_line, separator, output = remainder.partition("\n")
+    if not separator:
+        return None
+    uid_match = re.fullmatch(r"(\d+) (\d+)", identity_line)
+    if uid_match is None or uid_match.group(1) != uid_match.group(2):
+        return None
+
+    socket_lines, separator, tables = output.partition("__RUNNEL_TCP4__\n")
+    if not separator:
+        return None
+    tcp4, separator, tcp6 = tables.partition("__RUNNEL_TCP6__\n")
+    if not separator:
+        return None
+    owned_inodes = {
+        match.group(1)
+        for line in socket_lines.splitlines()
+        if (match := re.fullmatch(r"SOCKET socket:\[(\d+)\]", line))
+        is not None
+    }
+    return {
+        "count": parse_owned_peer_tcp_endpoints(
+            [tcp4, tcp6],
+            owned_inodes,
+            peer_listener_port=peer_listener_port,
+            peer_destination_ports=peer_destination_ports,
+        ),
+        "process_identity_verified": True,
+    }
+
+
 def peer_connection_census(cluster: ResourceCluster) -> dict[str, Any]:
     """Observe established peer socket endpoints owned by each broker."""
     started_ns = time.perf_counter_ns()
@@ -238,6 +317,20 @@ def peer_connection_census(cluster: ResourceCluster) -> dict[str, Any]:
                 if other.node_id != node.node_id
             },
         )
+        observation_source = "host_pid_procfs_fd_inode_join"
+        if count is None and cluster.runtime == "container":
+            container_count = container_peer_tcp_endpoint_count(
+                node.container.name,
+                peer_listener_port=node.peer_port,
+                peer_destination_ports={
+                    other.peer_address_port
+                    for other in cluster.nodes
+                    if other.node_id != node.node_id
+                },
+            )
+            observation_source = "docker_exec_container_procfs_fd_inode_join"
+            if container_count is not None:
+                count = container_count["count"]
         if count is None:
             all_available = False
             result["per_node"][str(node.node_id)] = {
@@ -248,9 +341,24 @@ def peer_connection_census(cluster: ResourceCluster) -> dict[str, Any]:
         result["per_node"][str(node.node_id)] = {
             "available": True,
             "established_socket_endpoint_count": count,
+            "observation_source": observation_source,
+            "docker_host_pid_resolved": cluster.runtime == "container",
+            "container_process_identity_verified": (
+                cluster.runtime == "container"
+                and observation_source == "docker_exec_container_procfs_fd_inode_join"
+                and container_count is not None
+                and container_count["process_identity_verified"]
+            ),
         }
 
     result["available"] = all_available
+    result["observation_sources"] = sorted(
+        {
+            node_result["observation_source"]
+            for node_result in result["per_node"].values()
+            if node_result.get("available") is True
+        }
+    )
     result["observation_duration_ms"] = (
         time.perf_counter_ns() - started_ns
     ) / 1_000_000

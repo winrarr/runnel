@@ -150,10 +150,15 @@ measured forwarding. For each broker it joins socket inodes found under
 `/proc/<pid>/fd` with established entries in `/proc/<pid>/net/tcp` and `tcp6`,
 then counts endpoints whose local port is that broker's peer listener or whose
 remote port matches a configured peer destination. Container mode resolves
-the broker's host PID with `docker inspect` and uses the same procfs method. If
-Linux procfs, Docker inspection, or process ownership data is unavailable, the
-artifact reports the census as unavailable instead of substituting an inferred
-count.
+the broker's host PID with `docker inspect` and first tries the same host-PID
+procfs method. Some Docker hosts restrict reading another UID's `/proc/<pid>/fd`;
+when that method cannot produce a complete count, a bounded `docker exec` reads
+the broker container's `/proc/1/fd` and `/proc/1/net/tcp`/`tcp6`. The fallback
+accepts a count only when the Docker-exec UID matches the effective UID of
+broker PID 1. It records the observation source and identity check per node. A
+missing optional `tcp6` file is allowed; a failed read of an existing TCP table,
+missing host PID, identity mismatch, or bounded probe timeout leaves the count
+unavailable rather than inferred.
 
 An isolated native-process forwarding smoke on revision
 `444652e0b4b4617e058d51cdf2e88ed111f6c23f` observed 8, 4, and 4 endpoints on
@@ -165,12 +170,36 @@ measured publishes, two streams, two warmup publishes per stream, and
 concurrency eight. This is a diagnostic smoke, not an authoritative performance
 comparison.
 
+An initial isolated container attempt on baseline revision
+`8511b09d7d6951d8a2281e04027f71365ad7202d` found Docker host PIDs but could not
+read their socket ownership through host procfs; all node counts were
+unavailable in `benchmark-results/isolated/823306bfcec4450b/cluster-container.json`.
+This diagnostic exposed the host's procfs restriction and did not substitute
+configured stream counts or request metrics.
+
+After adding the bounded container-procfs fallback, an isolated three-node
+container forwarding smoke on revision
+`fc33ff18a8270112138b609964e47b30fae4c259` observed 8, 4, and 4 established
+socket endpoints on nodes 1, 2, and 3 after setup warmup, then 12, 8, and 4
+after measured forwarding. Each node used
+`docker_exec_container_procfs_fd_inode_join`; `docker_host_pid_resolved` and
+`container_process_identity_verified` were true for all six samples. The
+machine-readable result is
+`benchmark-results/isolated/952d70ec76574f21/cluster-container.json`. It covers
+20 measured publishes, two streams, two warmup publishes per stream, and
+concurrency eight. The sequential census operations took 208.9 ms after warmup
+and 218.0 ms after measured forwarding. The isolated workflow validated both
+boundaries and all three available non-negative per-node counts, then removed
+its containers, network, image, and unique temporary directory. This is a
+diagnostic smoke, not an authoritative performance comparison.
+
 These are per-process socket endpoint counts, not unique connections: one
 inter-node connection can be represented at both brokers. Port matching does
 not identify the Raft group or distinguish replication, snapshot, compatibility
 pool, or other peer-port traffic. The snapshots are read sequentially and are
 not an atomic cluster-wide sample; collection time is outside the forwarding
-measurement. The container host-PID and procfs route has focused unit coverage,
-but this run did not exercise an actual containerized cluster. Direct endpoint
-observability is therefore available for supported Linux runs, while the
-broader transport strategy question remains unresolved.
+measurement. The real-container census gap is now covered for this supported
+Linux+Docker smoke path, but one diagnostic run does not establish repeatability
+across hosts or runtimes. Direct endpoint observability is available where one
+of the two recorded procfs paths succeeds, while the broader transport strategy
+question remains unresolved.

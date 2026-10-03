@@ -80,6 +80,7 @@ jobs:
           tags: runnel:dev
           cache-from: type=gha,scope=runnel-ci
           cache-to: type=gha,mode=max,scope=runnel-ci,ignore-error=true
+      # Includes the isolated three-node peer-forwarding container census smoke.
       - run: just integration
       - name: Capture integration diagnostics
         if: failure()

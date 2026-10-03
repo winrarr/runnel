@@ -2,15 +2,48 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import patch
 
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 sys.path.insert(0, str(SCRIPT_DIR))
 
 from runtime import DockerContainer  # noqa: E402
+from resources import DEFAULT_PROBE_TIMEOUT_SECONDS  # noqa: E402
 
 
 class DockerRuntimeTests(unittest.TestCase):
+    def test_container_cleanup_permissions_skip_host_owned_mount_root(self) -> None:
+        container = DockerContainer(
+            name="benchmark-node",
+            image="runnel:test",
+            network="benchmark-network",
+            cpus="1",
+            memory="1g",
+            data_dir=Path("/tmp/benchmark-node"),
+            data_target="/var/lib/runnel",
+            created=True,
+        )
+        with patch(
+            "runtime.subprocess.run",
+            return_value=SimpleNamespace(returncode=0),
+        ) as docker_exec:
+            prepared = container.prepare_data_for_host_cleanup()
+
+        self.assertTrue(prepared)
+        command = docker_exec.call_args.args[0]
+        self.assertEqual(command[:5], ["docker", "exec", "benchmark-node", "sh", "-c"])
+        self.assertEqual(
+            command[5],
+            "find /var/lib/runnel -mindepth 1 -exec chmod a+rwX {} +",
+        )
+        self.assertNotIn("chmod -R", command[5])
+        self.assertEqual(
+            docker_exec.call_args.kwargs["timeout"],
+            DEFAULT_PROBE_TIMEOUT_SECONDS,
+        )
+
     def test_run_command_contains_shared_limits_mount_and_protocol_ports(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             container = DockerContainer(
