@@ -1,117 +1,27 @@
 # Worker assignment and pull request handoff
 
-Use this guide for every task delegated through the parallel-worktrees skill.
-It supplements the repository root `AGENTS.md` and `SKILL.md`; it does not
-override either one. Confirm the assignment's owner, scope, baseline, and
-acceptance criteria. Ask the coordinator only when a missing detail materially
-changes the work; otherwise state a safe assumption and proceed.
+This checklist covers delegated tasks. Follow the repository root `AGENTS.md` and [`SKILL.md`](SKILL.md), which own shared engineering and parallel-worktree policy. Confirm the assignment's owner, scope, baseline, and acceptance criteria. Ask only when a missing detail materially changes the work; otherwise state a safe assumption and proceed.
 
 ## Before editing
 
-- Read the repository root [`AGENTS.md`](../../../AGENTS.md),
-  [`SKILL.md`](SKILL.md), and this guide.
-- Confirm the assigned worktree identity and report `pwd`,
-  `git rev-parse --show-toplevel`, `git branch --show-current`, and
-  `git rev-parse HEAD`. Stop if the path, branch, or revision differs from the
-  assignment.
-- Check `git status` and inspect the current code, tests, decisions, and nearby
-  design or planning records. Treat backlog and tech-debt text as guidance to
-  validate, not as accepted APIs or behavior.
-- Keep edits inside the assigned worktree. Include same-change planning-record
-  updates required by `AGENTS.md`. Do not discard, rewrite, or stage unrelated
-  work. If a better solution crosses your assigned scope, another worker's
-  ownership, or a shared boundary, send the coordinator a proposal with its
-  goal, rationale, affected scope, expected effects and non-effects, evidence,
-  risks, and recommendation. Do not silently shrink the design or edit across
-  the boundary. If you and the coordinator agree the change is best, update
-  task ownership and the integration plan, then proceed. If either of you is
-  unsure, the coordinator escalates the scope decision to the user before the
-  boundary changes.
-- Choose the primary evidence class, applicable gate in
-  [`docs/testing.md`](../../../docs/testing.md), and verification approach
-  that covers the acceptance criteria. Follow the shared policies in
-  `AGENTS.md`, `docs/testing.md`, and `docs/benchmarking.md`; the coordinator
-  reviews whether the resulting evidence supports the outcome and claims.
+- Read `AGENTS.md`, [`SKILL.md`](SKILL.md), and this checklist.
+- Verify `pwd`, `git rev-parse --show-toplevel`, `git branch --show-current`, and `git rev-parse HEAD` match the assignment. Stop if they do not.
+- Check `git status`; inspect the implementation, tests, decisions, and nearby planning records. Treat backlog and tech-debt items as guidance to validate, and preserve unrelated work.
+- Keep the supplied baseline; follow `AGENTS.md` before updating the branch.
+- Choose the primary evidence class, applicable gate in [`docs/testing.md`](../../../docs/testing.md), and verification approach for the acceptance criteria.
+- Keep edits within the assignment. For work that crosses an ownership or shared boundary, propose its goal, rationale, scope, expected effects and non-effects, evidence, risks, and recommendation to the coordinator. Proceed only after agreement and an updated ownership and integration plan; ask the user if the scope remains unclear.
 
 ## Implementation and verification
 
-- Inspect the touched code and its immediate surroundings. Aim for the clean,
-  maintainable, performant design that best advances the assignment; do not
-  keep a needed change artificially small or preserve old behavior solely to
-  avoid churn. Backward compatibility is not a Runnel requirement; make
-  deliberate breaking changes when they improve the intended design and
-  remove obsolete compatibility paths. When the better design needs a
-  cohesive refactor across owned areas or shared boundaries, use the proposal
-  and agreement process above rather than shrinking the solution. Assess
-  material risks with proportionate evidence, and follow the refactor and
-  planning-record policy in `AGENTS.md`, including its no-update rationale.
-- For non-trivial changes to semantics, storage, replication, ordering,
-  recovery, or operational safety, compare relevant reference designs and
-  primary research before implementation, following `AGENTS.md`.
-- Keep accepted decisions and current architecture documentation aligned when
-  the change alters them; update the affected ADR or architecture document as
-  appropriate rather than changing records that do not describe the new state.
-- Use focused tests for changed behavior and the canonical `just` commands.
-  Add crash/recovery coverage before changing persistence, acknowledgement, or
-  redelivery behavior. Keep network behavior covered by tests that start the
-  real server process.
-- Assess end-to-end coverage explicitly. Identify which process, network,
-  restart, cluster, or deployment journey exercises the changed acceptance
-  criteria, and check that the test asserts the behavior at issue. Run the
-  end-to-end command required by the applicable testing gate when the change
-  affects that path. Do not present unit or engine-contract tests as
-  end-to-end coverage. If no existing end-to-end test covers the behavior, add
-  one when in scope or report the concrete gap and why it remains.
-- For documentation-only work, state why runtime tests do not apply and run
-  applicable document checks, such as `git diff --check`.
-- If a check or PR workflow fails, inspect its logs and assess whether the
-  cause is the change, a test or workflow defect, or the environment. Fix
-  relevant issues and rerun the affected checks; do not rerun blindly.
-  Distinguish a confirmed fix from a transient failure, inconclusive run, or
-  unresolved blocker, and report the commands and results.
-- Use `just isolated <workflow>` for supported process-heavy tests or
-  benchmarks run concurrently. Give other concurrent workflows unique
-  processes, ports, data, output paths, and build targets as required by
-  `SKILL.md`.
-- For performance-sensitive work, follow
-  [`docs/benchmarking.md`](../../../docs/benchmarking.md) and record the exact
-  revision, workload, resources, isolation, repetitions, commands, and
-  artifacts. Do not claim an improvement from an inconclusive or uncontrolled
-  comparison. Choose evidence suited to the change; explain any coverage gap
-  or why a benchmark does not apply. Coordinate authoritative benchmark timing
-  so no other tests, benchmarks, or resource-heavy workloads run on the host.
+- Follow `AGENTS.md` for design, refactoring, research, decisions, and planning records. Follow `docs/testing.md` and `docs/benchmarking.md` for evidence.
+- Assess end-to-end coverage against the acceptance criteria and run the applicable gate. Add coverage when in scope or report the concrete gap. For documentation-only work, explain why runtime tests do not apply and run applicable document checks.
+- Use `just isolated <workflow>` for supported concurrent process tests and benchmarks; isolate resources for other concurrent workflows as required by [`SKILL.md`](SKILL.md).
+- For performance work, report the revision, workload, resources, isolation, repetitions, commands, artifacts, and evidence limits. Do not claim improvement from inconclusive or uncontrolled results.
+- When a check fails, inspect its logs, diagnose the cause, fix relevant issues, and rerun affected checks. Report transient failures and unresolved blockers.
 
 ## Pull request and handoff
 
-- Before committing, inspect the complete diff, run `git diff --check`, and
-  stage only files in the agreed scope, including required planning-record
-  updates. Use a Conventional Commit for both the commit and PR title.
-- Push the branch and open exactly one pull request for the assignment. Keep
-  it as a draft while implementation or verification is in progress. Monitor
-  its workflows, assess and address failures, and update the PR title and
-  description to reflect the current work and evidence as they change; the PR
-  description does not need a revision history. Mark it ready and hand it to
-  the coordinator only when the assignment is complete, it is ready for
-  independent review, and all required checks pass on the exact final PR head.
-  If a blocker prevents readiness, keep the PR in draft and send the
-  coordinator a progress update with the evidence and blocker. Do not merge
-  the PR or enable auto-merge; the coordinator owns review and integration.
-- Include a concise handoff in the PR description with:
-  - goal, changed files, expected effects, and non-effects;
-  - primary evidence class and any secondary evidence tags;
-  - supplied baseline revision and, only if a merge conflict required it,
-    the branch update and conflict resolution;
-  - commands and results, focused and end-to-end coverage assessment, and any
-    test or benchmark artifacts;
-  - correctness, failure, and recovery considerations; evidence gaps and
-    unresolved risks;
-  - refactor and backlog/tech-debt assessment, including any updates or an
-    explicit no-update rationale;
-  - a recommendation to merge, revise, rerun, or defer, with reasons.
-- At handoff, tell the coordinator the PR URL, branch and worktree, green
-  required-check status, final head revision, and recommendation. Include the
-  relevant end-to-end job and verify it passed against that exact head. The
-  coordinator is the reviewer and will send any requested revisions directly;
-  do not wait for review comments. Keep the worktree and branch available
-  until the coordinator closes the work, and do not stop authorized nested
-  workers before then.
+- Before committing, inspect the complete diff, run `git diff --check`, and stage only agreed paths, including required planning-record updates. Use Conventional Commits for the commit and PR title.
+- If the assignment produces a change, push the branch and open one draft PR. Keep it in draft while work or checks remain; monitor and resolve relevant failures and keep its title and description current. Mark it ready only when the assignment is complete, independently reviewable, and required checks pass on its exact final head. If a blocker remains, keep it in draft and report the evidence and blocker. If no change is warranted, report the evidence and disposition to the coordinator without opening an empty PR. Do not merge or enable auto-merge; the coordinator owns integration.
+- Include the handoff required by `AGENTS.md` in the PR description: goal and files, effects and non-effects, evidence class and any secondary tags, commands and results, relevant end-to-end coverage, gaps and risks, refactor and planning-record assessment, and recommendation. State the supplied baseline and any justified branch update with its reason and scope.
+- Tell the coordinator the PR URL, branch, worktree, final revision, exact-head check status (including the relevant end-to-end job), evidence gaps, and recommendation. Keep the branch and worktree available until the coordinator closes the task, including any explicitly authorized nested work.

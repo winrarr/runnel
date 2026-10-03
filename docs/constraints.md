@@ -13,5 +13,4 @@ These constraints come from the product brief and should guide implementation ch
 - The broker must remain correct without Kubernetes; container and Kubernetes support are operational surfaces, not correctness dependencies.
 
 Repository workflow, pull requests, and branch-freshness checks are documented
-in [CONTRIBUTING.md](../CONTRIBUTING.md) and [AGENTS.md](../AGENTS.md), rather
-than repeated here as product constraints.
+in [AGENTS.md](../AGENTS.md), rather than repeated here as product constraints.

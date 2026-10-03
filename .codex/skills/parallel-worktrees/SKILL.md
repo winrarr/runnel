@@ -25,16 +25,7 @@ not repeat the run-level fetch or CI check. Inspect the run with:
 gh run list --workflow ci.yml --branch main --limit 1 --json headSha,status,conclusion,url
 ```
 
-Do not inspect or wait for another baseline CI run during the same run; each
-PR still needs its required checks to pass on its exact final head before
-merge. A newer default-branch revision does not by itself require updating an
-existing task branch, even if paths, contracts, dependencies, generated output,
-or integration behavior overlap. Merge a ready PR against the current base
-after review and exact-head required checks pass. Merge or rebase the latest
-base into a task branch only to resolve an actual merge conflict, then rerun
-checks affected by the resolution. If another repository gate blocks merging
-without a conflict, report the exact blocker instead of refreshing the branch
-automatically.
+Do not repeat the baseline CI lookup during the run. Required checks must pass on each PR's exact final head before merge. Keep task branches at their supplied baseline as `main` advances; follow `AGENTS.md` for branch-update exceptions. Merge ready PRs against the current base after review and exact-head checks pass; report other repository blockers instead of syncing automatically.
 
 Use the task request, dependencies, risk, and learning value to select work
 from `docs/backlog.md` and `docs/tech-debt.md`. Confirm an item still applies
@@ -117,22 +108,12 @@ evidence and stated gaps, tracker updates, mergeability, and applicable
 repository gates. Request revisions when a required check or gate fails, or
 when the outcome or claims lack support. Do not repeat green checks by default.
 
-The orchestrator owns the merge decision. Merge a PR once it is independently
-ready: review is complete and exact-head required checks pass. Auto-merge may
-be enabled after recommending merge when supported, and must not bypass
-required checks. Coordinate genuinely coupled changes in files, contracts,
-dependencies, generated output, or integration behavior before declaring them
-ready; this coordination does not require refreshing a branch from a newer
-base. Resolve actual merge conflicts in the task branch and rerun affected
-checks. If another repository gate blocks a ready PR without a conflict,
-report the exact blocker rather than syncing the branch automatically.
+The orchestrator owns the merge decision. Merge a PR when review is complete and exact-head required checks pass. Auto-merge may be enabled after recommending merge when supported; it must not bypass checks. Coordinate genuinely coupled changes before handoff, follow `AGENTS.md` for branch updates, and report repository blockers instead of syncing automatically.
 
-For a rolling pool, use the commit from each actual merge as the next supplied
-baseline for a replacement task. Do not run or wait for a separate post-merge
-baseline CI check. Share the merged commit and its passing PR checks with the
-replacement. Existing tasks keep their supplied baseline; update their branch
-only to resolve an actual merge conflict, not merely because a merged change
-overlaps their work.
+For a rolling pool, give each replacement the commit and passing PR checks from
+the preceding merge as its baseline; do not run a separate post-merge CI check.
+Existing tasks keep their supplied baseline, with branch updates governed by
+`AGENTS.md`.
 
 Use [`WORKER.md`](WORKER.md) as the worker checklist. Keep shared engineering
 policy in `AGENTS.md` and orchestration policy here. The final status reports
