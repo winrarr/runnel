@@ -225,7 +225,7 @@ Goal: amortize protocol and durability overhead for publish and consume workload
 
 Rationale: batching is necessary for efficient small-message workloads, but an underspecified batch can hide partial success or force unsafe retries.
 
-Current progress: bounded binary-safe publish batches now return ordered per-record outcomes, preserve request-ID deduplication, and use explicit local and clustered durability boundaries. An opt-in clustered publish-batch baseline records per-record throughput and batch round-trip latency. Consume batches and the broader batch-size, failure, recovery, and resource tradeoff matrix remain open.
+Current progress: bounded binary-safe publish batches now return ordered per-record outcomes, preserve request-ID deduplication, and use explicit local and clustered durability boundaries. An opt-in clustered publish-batch baseline records per-record throughput and batch round-trip latency. The advisory [consume-batch proposal](design/consume-batches.md) now specifies mixed ack-vector outcomes and the local journal versus replicated-command uncertainty boundaries. No consume-batch contract or runtime behavior is accepted; implementation tests and the broader batch-size, failure, recovery, and resource tradeoff matrix remain open.
 
 Constraints:
 

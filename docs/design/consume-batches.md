@@ -1,7 +1,7 @@
 # Consume batches: proposed contract
 
 - Status: implementation-ready design proposal; no runtime API or behavior is accepted yet
-- Implementation review baseline: `3d2f2a6a68ef978ed43a0735159f26db332483d9`
+- Implementation review baseline: `71631f127665b5086931694ca55ba4adae6e705e`
 - Linked research refreshed at default-branch revision: `1aa210bbd3986a6da25e804e967dc8a37fdfee2f`
 - Primary evidence class: design/research
 - Related outcome: [Make batching preserve per-record outcomes](../backlog.md#make-batching-preserve-per-record-outcomes)
@@ -163,9 +163,94 @@ in [ADR 0015](../decisions/0015-clustered-shared-consumer-ownership.md). At this
 baseline, both engines reject an ack that observes expiry before reassignment;
 the shared-engine contract test exercises that case. The refreshed
 [consume-batch research note](../research/consume-batch-semantics.md) records
-the aligned result and the matching test coverage. The remaining batch question
-is how one ack vector reports an expired receipt alongside valid receipts, not
-which single-record expiry rule the engines use.
+the aligned result and the matching test coverage.
+
+## Ack-vector mixed outcomes and failures
+
+Do not fail the whole ack vector when one receipt is expired or stale. Evaluate
+the list at one engine state and one time sample, then return outcomes in input
+order. An expired receipt maps to the existing stale-delivery rejection; a
+receipt already acknowledged maps to `already_confirmed`; each currently valid
+receipt is independently eligible for acknowledgement. This matches the
+current scalar behavior: the local engine removes expired leases before
+checking a receipt, then returns `StaleDelivery` for a missing or mismatched
+group receipt ([local ack path](../../crates/runnel-core/src/broker.rs#L432));
+the clustered state machine observes its lease-clock floor, removes expired
+leases, and returns `GroupStaleDelivery` for that entry
+([cluster ack path](../../crates/runnel-raft/src/delivery.rs#L308)). The
+existing per-receipt results must therefore remain meaningful when siblings
+are accepted. SQS provides a useful API precedent: batch delete reports
+success and failure per entry even when the HTTP request itself succeeds
+([AWS `DeleteMessageBatch`](https://docs.aws.amazon.com/AWSSimpleQueueService/latest/APIReference/API_DeleteMessageBatch.html)).
+Runnel must keep its own durable receipt and lease semantics; the SQS result
+shape does not define them.
+
+Persist the eligible subset as one bounded local journal transition or one
+replicated data-group command. A mixed completed response can then say, for
+example, that an expired receipt was rejected while valid siblings were
+confirmed. This atomicity applies only to the accepted acknowledgement subset;
+it does not make the entire input vector or application work transactional.
+Reject duplicate offsets during whole-request validation before mutation, so
+the result for a given offset cannot depend on input order. Preserve input
+order in the output even though consumer progress can advance out of order.
+
+For the local journal, a write failure known to occur before any acknowledgement
+event bytes are appended can report valid receipts as retryable, while expired
+receipts remain rejected. A write or sync failure after append begins is
+unknown for every otherwise-valid receipt because the event may be replayable
+after restart; it must not be reported as a confirmed prefix. Use one complete
+replayable event for the successful subset, rather than several acknowledgement
+lines in one append, so recovery can apply the whole subset or none of it. On
+any uncertain write, invalidate or reconcile the cached consumer state before
+another mutation or journal compaction, and align the in-flight index with
+whatever acknowledgements replay as applied. This matters because a member poll
+can return its in-flight delivery before consulting cached consumer progress.
+Today the local ack path returns directly when `persist_consumer_event` fails,
+before updating cached progress or removing the in-flight receipt
+([local acknowledgement path](../../crates/runnel-core/src/broker.rs#L480));
+the journal loader replays complete newline-terminated events and truncates an
+incomplete tail ([journal persistence and replay](../../crates/runnel-core/src/consumer_state.rs#L144)).
+If the vector was evaluated before the failure, return those per-item statuses
+(`rejected` for expired entries plus `retryable` or `unknown` for the otherwise
+valid entries); reserve a whole-request error for failures that prevent item
+evaluation. That makes stale-cache handling and complete-event recovery
+explicit acceptance requirements for a future vector path.
+
+For the cluster, compute every item result in one committed state-machine
+transition using one observed lease-clock value. A committed transition applies
+all valid siblings and retains the rejected expired entries as per-item
+results. A failure known to precede submission is retryable; after submission,
+a timeout, connection loss, or leader change leaves the entire vector unknown
+to a client that did not receive its response. Retrying the exact receipt list
+resolves committed entries as already confirmed and leaves expired receipts
+rejected. A complete server response can preserve mixed item outcomes, but a
+client that loses that response must conservatively classify every submitted
+entry as unknown until it retries.
+
+| Ack-vector model | Tradeoff |
+|---|---|
+| Fail the whole vector when any receipt is stale | Avoids mixed state changes, but an expired receipt blocks valid independent work and forces clients to split and resubmit the vector. |
+| Run the current scalar ack once per receipt | Reuses proven single-ack behavior, but keeps one local sync or quorum command per item and can stop after a confirmed prefix. The result must then distinguish confirmed, unknown, and not-attempted suffix entries. |
+| Return `unknown` for the whole vector on every backend failure | Safest when no response arrives or cluster submission is ambiguous, but discards known stale outcomes after a local vector was evaluated. |
+| Return per-item validation results and commit the valid subset in one transition | Recommended: preserves independent outcomes and amortizes the durability boundary. Local event recovery is all-or-none for that subset; a submitted clustered command is reconciled by replaying the exact receipts. |
+
+| Scenario | Completed vector result | Recovery assertion |
+|---|---|---|
+| One expired receipt before reassignment plus one valid receipt, in either input order | Expired entry is rejected as stale; valid entry is confirmed. | Valid progress is durable; expired work remains eligible for redelivery with a new token. |
+| Already-confirmed, valid out-of-order, and expired receipts in one vector | Each result maps to its corresponding input item; out-of-order progress is retained without skipping an unacknowledged gap. | Retrying the same list reports already confirmed for committed work and stale for the expired token. |
+| Duplicate offsets or malformed vector | One request-level rejection before state mutation. | No receipt is acknowledged and no lease is removed. |
+| Local failure before append; failure after complete event write but before successful sync; incomplete-tail recovery | With a complete vector response, expired entries are rejected and eligible entries are retryable before append or unknown after append. A lost response makes every submitted entry unknown to the client. | Reopen may recover the complete successful subset or none, never a prefix. Exact retry resolves each receipt. Follow an uncertain write with another poll/ack and compaction boundary to prove stale cached state cannot erase the recovered event. |
+| Cluster command committed but response lost during leader change | No complete vector result reaches the caller, so all submitted entries are unknown. | Retrying on the new leader returns already confirmed for accepted entries and stale for expired entries; durable progress is not lost or applied twice. |
+| Client disconnect or malformed response while reading the vector result | All entries are unknown to the client. | Exact retry returns per-receipt resolution; no automatic retry changes receipt identity. |
+
+The first, second, and fourth rows are required local and state-machine tests;
+the leader-change row requires the real three-process cluster test; the final
+row requires the real server and typed-client path. Inject local failures both
+before append, during a partial event append, and after a complete event write,
+then test restart/replay plus subsequent journal compaction rather than
+inferring recovery from a returned error alone. Test a committed cluster
+command whose reply is lost separately from a known pre-submit routing
+rejection.
 
 ## Reference designs and alternatives
 
@@ -199,12 +284,12 @@ the Raft state machine while holding apply or stream locks is not acceptable.
 Before implementation, add engine-contract and local/cluster tests for ordered
 partial batches, empty and byte/count truncation, oversized first record,
 same-key exclusion within/across batches, out-of-order per-key ack, duplicate
-and stale receipts, a mixed ack result, lost ack response and same-member poll
-retry after response loss, disconnect during response, local journal failure
-before/after append and restart redelivery, clustered restart and leader
-change around commit, a batch vector with an expired receipt before reassignment,
-and request timeout during collection. The existing shared-engine contract
-already covers the single-receipt expiry case before reassignment. Real-server
+and stale receipts, the mixed-vector resolution matrix above, lost ack response
+and same-member poll retry after response loss, disconnect during response,
+local journal failure before/after append and restart redelivery, clustered restart and leader
+change around commit, and request timeout during collection. The existing
+shared-engine contract already covers the single-receipt expiry case before
+reassignment. Real-server
 tests must cover wire and client outcome mapping. The relevant end-to-end gate
 is the protocol/restart test and, for clustered behavior, the three-process
 cluster test.
