@@ -1,8 +1,8 @@
 # Initial product-fit validation
 
 - Status: repeatable repository harness recorded; product-fit claim remains unknown
-- Last reviewed: 2026-09-06
-- Evidence baseline: `90582712d8a67154cd12746cbc3cee07566038c4`
+- Last reviewed: 2026-10-03
+- Evidence baseline: `181fe5a2d163c53e72a9b0953bdc290efb058148`
 - Scope: validate the audience, workloads, and product promise in
   [product-fit.md](../product-fit.md) against the current single-node and early
   three-node slices.
@@ -40,7 +40,7 @@ inventing measurements or choosing thresholds after seeing results:
 | Delivery and durability | `B_safety` requires zero loss of a confirmed durable publish, zero successful stale acknowledgements, and zero concurrent delivery of the same requested ordering key. Redelivery of work that was not durably acknowledged is allowed and must be counted. The current representative harness asserts the first two and records delivery evidence; keyed-overlap measurement remains separate. |
 | End-to-end latency | The current manifest registers `publish_p95_ms` and `publish_p99_ms` for publish-to-confirm request latency only. Each observed publish percentile must be at or below its workload limit under the stated local durability mode. Publish-to-consume and consume-to-ack distributions are recorded by the harness but have no registered pass limits yet. |
 | Throughput | The current manifest registers a minimum scenario rate and workload volume; each run has a finite measured duration. It is useful as a repeatable engineering check, not a sustained-rate claim; an intended workload must register duration, allowed errors, and a sustained `B_rate` before making that claim. |
-| Memory and in-flight work | The current manifest registers an `rss_peak_bytes` ceiling. Peak resident memory must stay within it, but the harness only observes in-flight delivery metrics; a permitted in-flight/lag envelope and a steady slow-consumer test remain open. |
+| Memory and in-flight work | The current manifest registers an `rss_peak_bytes` ceiling and an exact point observation of `runnel_in_flight_deliveries` while two grouped deliveries are held. This is not a permitted in-flight envelope or supported limit. A steady slow-consumer test, consumer-lag signal, and sustained memory bound remain open. |
 | Storage growth | The current manifest registers a physical directory-growth ceiling. Report physical bytes and bytes per logical record when useful, but logical retained bytes, recovery headroom, and an enforceable retention boundary remain unregistered; an unbounded append-only log is not a retention guarantee. |
 | Recovery | The current manifest registers `recovery_seconds` from local broker restart to ready service. Confirmed durable data has zero recovery-point loss in the exercised workload; allowed duplicates and redeliveries are classified rather than hidden. Cluster recovery and migration need separate budgets. |
 | Operator effort | The current representative manifest does not register `B_onboard` or `B_recover`. An intended-user study must add numeric limits and a critical task list; the participant must complete the tasks without editing broker files or learning internal storage/topology concepts. |
@@ -108,7 +108,7 @@ other checks. The commands above are validation workflows, not application
 benchmarks: they do not report latency distributions, sustained throughput,
 resident-memory samples, storage growth, or participant task times.
 
-### Combined claim and budget disposition
+### Historical combined claim and budget disposition (2026-09-04 checks)
 
 | Criterion | Disposition from this run |
 | --- | --- |
@@ -124,7 +124,7 @@ that requires numeric operating budgets and intended-user evidence. A green
 test is not evidence that an engineer understands consumer groups, replay,
 redelivery, stale acknowledgements, or cluster recovery.
 
-### Current reference workload run (2026-09-06)
+### Reference workload run (2026-09-06)
 
 The harness was run from the current evidence baseline
 `90582712d8a67154cd12746cbc3cee07566038c4` with
@@ -148,6 +148,45 @@ end-to-end limits, and does not establish concurrent keyed-overlap absence, a
 sustained-rate envelope, or an operator-effort result; those remain separate
 evidence requirements. The generated package was kept in the temporary output
 directory rather than committed to the repository.
+
+### Two-held in-flight observation (2026-10-03)
+
+The updated, pre-registered background-work workload was run from harness and
+manifest revision `181fe5a2d163c53e72a9b0953bdc290efb058148` with:
+
+```text
+just product-fit --workload background_work --output-dir /tmp/runnel-product-fit-inflight-envelope-20261003T195218Z
+```
+
+The command built `runnel-server` and then exercised one real local broker
+process through the public protocol. The host was Linux
+7.0.0-34-generic on x86_64 with 20 logical CPUs and Python 3.14.4. It was a
+native process run without CPU or memory cgroup limits; the host was otherwise
+idle for the measurement. The broker was stopped cleanly after the workload
+and restart path. The generated result is at
+`/tmp/runnel-product-fit-inflight-envelope-20261003T195218Z/result.json`;
+its manifest, transcript, ledger, resource samples, and broker log remain next
+to it in that temporary output directory.
+
+| Observation or budget | Result |
+| --- | ---: |
+| Held grouped deliveries | 2 distinct offsets: 0 and 2 |
+| `runnel_in_flight_deliveries` at the registered observation point | 2 (pass), observed 1.59 ms after the first poll and before the 100 ms acknowledgement timeout |
+| Background-work automated status | Pass |
+| Publish p95 / p99 | 0.332 / 0.410 ms |
+| Scenario throughput | 29.09 msg/s |
+| RSS peak | 15.6 MiB |
+| Storage growth | 7,094 B |
+| Restart-to-ready | 0.055 s |
+
+This confirms only that the metric reported two deliveries at that exact point
+in this small local reference scenario. It does not set a broker-wide bound,
+supported product limit, or permitted operating envelope. RSS is a brief
+sample, not a sustained memory bound. Consumer lag is not measured and the
+current metrics expose no lag signal. The result artifact therefore keeps
+`product_fit_status` as `unknown`; intended-user validation, steady
+slow-consumer behavior, lag, memory and in-flight limits, retention and disk
+pressure, migration, and broad fault coverage remain open.
 
 ### Evidence-supported operating point and explicit boundaries
 
@@ -437,9 +476,9 @@ performance runs should follow [benchmarking.md](../benchmarking.md), and
 synthetic or local results alone cannot satisfy the product-fit outcome.
 
 Current conclusion: the reference harness adds reproducible automated evidence
-for the two local workloads and passes its representative budgets, but initial
-product fit remains `unknown` until intended-user exercises, application-owned
-budgets, broader resource/fault coverage, and a documented
-single-node-to-cluster migration result are available. The backlog progress
-note records this partial result; the evidence does not warrant adoption claims
-or closure of the outcome.
+for the two local workloads and a passing, scenario-specific point observation
+of two held deliveries. Initial product fit remains `unknown` until
+intended-user exercises, application-owned budgets, broader resource/fault
+coverage, and a documented single-node-to-cluster migration result are
+available. The backlog progress note records this partial result; the evidence
+does not warrant adoption claims or closure of the outcome.
