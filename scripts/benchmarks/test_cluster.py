@@ -1508,6 +1508,77 @@ class ClusterBenchmarkTests(unittest.TestCase):
         )
         self.assertEqual(result["restart_ready_seconds"], 0.002)
 
+    def test_retained_recovery_declares_latency_and_resource_sample_windows(self) -> None:
+        events: list[str] = []
+
+        class Measurements:
+            def begin(self) -> object:
+                events.append("resource_start")
+                return object()
+
+            def end(self, _token: object) -> dict[str, str]:
+                events.append("resource_end")
+                return {"window": "recorded"}
+
+        client = SimpleNamespace(close=lambda: events.append("client_close"))
+        cluster = SimpleNamespace(
+            nodes=[SimpleNamespace(node_id=1)],
+            stats=Measurements(),
+            metrics=lambda: None,
+            restart_node=lambda _: events.append("node_restart") or 2_000_000,
+            client=lambda _: client,
+        )
+        clock_values = iter((100, 200))
+        timer_names = iter(("latency_start", "latency_end"))
+
+        def record_timer_boundary() -> int:
+            events.append(next(timer_names))
+            return next(clock_values)
+
+        def poll_record(*_args: object) -> tuple[dict[str, object], int]:
+            events.append("replay")
+            return {"offset": 0, "payload": "payload"}, 100
+
+        def acknowledge_record(*_args: object) -> int:
+            events.append("acknowledge")
+            return 200
+
+        with (
+            patch("cluster_scenarios.preload"),
+            patch(
+                "cluster_scenarios.time.perf_counter_ns",
+                side_effect=record_timer_boundary,
+            ),
+            patch("cluster_scenarios.poll", side_effect=poll_record),
+            patch("cluster_scenarios.acknowledge", side_effect=acknowledge_record),
+        ):
+            result = run_retained_recovery(
+                cluster, "retained-events", "payload", MIN_RETAINED_RECOVERY_MESSAGES
+            )
+
+        self.assertEqual(
+            events,
+            [
+                "resource_start",
+                "latency_start",
+                "node_restart",
+                "replay",
+                "acknowledge",
+                "client_close",
+                "latency_end",
+                "resource_end",
+            ],
+        )
+        self.assertEqual(
+            result["metadata"]["latency_scope"],
+            "pre_restart_through_earliest_replay_acknowledgement_and_client_close",
+        )
+        self.assertEqual(
+            result["metadata"]["resource_sample_scope"],
+            "before_recovery_operation_through_operation_return",
+        )
+        self.assertEqual(result["resource_samples"], {"window": "recorded"})
+
     def test_retained_recovery_rejects_wrong_replayed_payload(self) -> None:
         cluster = SimpleNamespace(
             nodes=[SimpleNamespace(node_id=1)],

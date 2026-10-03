@@ -1837,7 +1837,10 @@ def run_retained_recovery(
                 "retained_logical_payload_bytes": retained_messages * len(payload),
                 "recovery_probe_offset": 0,
                 "publish_setup_excluded": True,
-                "latency_scope": "restart_ready_to_earliest_replay_acknowledgement",
+                "latency_scope": (
+                    "pre_restart_through_earliest_replay_acknowledgement_and_client_close"
+                ),
+                "resource_sample_scope": "before_recovery_operation_through_operation_return",
                 "redelivery_expected": False,
                 "restarted_node": cluster.nodes[0].node_id,
             },
