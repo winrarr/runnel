@@ -6,7 +6,8 @@ use std::thread::sleep;
 use std::time::{Duration, Instant};
 
 use runnel_client::{
-    AttemptFailure, AttemptOutcome, Client, ClientConfig, ClientError, PublishOptions,
+    AttemptFailure, AttemptOutcome, Client, ClientConfig, ClientError, PublishBatchOutcome,
+    PublishBatchRecord, PublishOptions, PublishReceipt,
 };
 use tempfile::TempDir;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader as AsyncBufReader};
@@ -127,6 +128,101 @@ async fn typed_client_keeps_a_connection_and_preserves_binary_payloads() {
             .is_none()
     );
     assert_eq!(client.health().await.unwrap().streams, 1);
+}
+
+#[tokio::test]
+async fn typed_publish_batch_preserves_outcomes_and_request_id_replay_after_restart() {
+    let directory = TempDir::new().unwrap();
+    let server = RunningServer::start(directory.path(), &[]);
+    let mut client = Client::connect(server.broker_addr).await.unwrap();
+    client.create_stream("events").await.unwrap();
+
+    let binary_payload = vec![0, 1, 255, b'\n', b'_', 0];
+    let records = vec![
+        PublishBatchRecord::with_options(
+            binary_payload.clone(),
+            PublishOptions::default()
+                .with_key("binary-key")
+                .with_request_id("batch-first"),
+        ),
+        // Request IDs over the core's 1,024-byte record limit are rejected
+        // independently, leaving the later valid batch record eligible.
+        PublishBatchRecord::with_options(
+            b"rejected".to_vec(),
+            PublishOptions::default().with_request_id("x".repeat(1_025)),
+        ),
+        PublishBatchRecord::with_options(
+            b"tail".to_vec(),
+            PublishOptions::default()
+                .with_key("tail-key")
+                .with_request_id("batch-tail"),
+        ),
+    ];
+
+    let first_attempt = client.publish_batch("events", records.clone()).await;
+    assert!(first_attempt.attempt.is_none());
+    assert_eq!(first_attempt.outcomes.len(), 3);
+    assert_eq!(
+        first_attempt.outcomes[0],
+        PublishBatchOutcome::Confirmed(PublishReceipt {
+            stream: "events".to_owned(),
+            offset: 0,
+        })
+    );
+    assert!(matches!(
+        &first_attempt.outcomes[1],
+        PublishBatchOutcome::Rejected { code, .. } if code == "invalid_record"
+    ));
+    assert_eq!(
+        first_attempt.outcomes[2],
+        PublishBatchOutcome::Confirmed(PublishReceipt {
+            stream: "events".to_owned(),
+            offset: 1,
+        })
+    );
+
+    drop(client);
+    drop(server);
+
+    let server = RunningServer::start(directory.path(), &[]);
+    let mut recovered = Client::connect(server.broker_addr).await.unwrap();
+    let replay = recovered.publish_batch("events", records).await;
+    assert!(replay.attempt.is_none());
+    assert_eq!(replay.outcomes, first_attempt.outcomes);
+
+    let first = recovered
+        .poll_bytes("events", "verifier")
+        .await
+        .unwrap()
+        .expect("the first accepted batch record should be available");
+    assert_eq!(first.offset, 0);
+    assert_eq!(first.key.as_deref(), Some("binary-key"));
+    assert_eq!(first.payload, binary_payload);
+    recovered
+        .ack("events", "verifier", first.offset)
+        .await
+        .unwrap();
+
+    let tail = recovered
+        .poll_bytes("events", "verifier")
+        .await
+        .unwrap()
+        .expect("the record following the rejection should be available");
+    assert_eq!(tail.offset, 1);
+    assert_eq!(tail.key.as_deref(), Some("tail-key"));
+    assert_eq!(tail.payload, b"tail");
+    recovered
+        .ack("events", "verifier", tail.offset)
+        .await
+        .unwrap();
+    assert!(
+        recovered
+            .poll_bytes("events", "verifier")
+            .await
+            .unwrap()
+            .is_none(),
+        "replaying the batch after restart must not append duplicates"
+    );
 }
 
 #[tokio::test]
