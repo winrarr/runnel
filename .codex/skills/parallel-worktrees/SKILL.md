@@ -25,7 +25,7 @@ not repeat the run-level fetch or CI check. Inspect the run with:
 gh run list --workflow ci.yml --branch main --limit 1 --json headSha,status,conclusion,url
 ```
 
-Do not repeat the baseline CI lookup during the run. Required checks must pass on each PR's exact final head before merge. Keep task branches at their supplied baseline as `main` advances; an overlap with `main` alone does not justify an update. Follow `AGENTS.md` for the narrow exceptions. Update a branch for overlapping worker changes only when they cannot be independently reviewed or verified; agree on the integration plan, keep the update minimal, and rerun affected checks. Merge ready PRs against the current base after review and exact-head checks pass; report other repository blockers instead of syncing automatically.
+Do not repeat the baseline CI lookup during the run. Required checks must pass on each PR's exact final head before merge. Keep task branches at their supplied baseline as `main` advances; follow `AGENTS.md` for branch-update exceptions. Merge ready PRs against the current base after review and exact-head checks pass; report other repository blockers instead of syncing automatically.
 
 Use the task request, dependencies, risk, and learning value to select work
 from `docs/backlog.md` and `docs/tech-debt.md`. Confirm an item still applies

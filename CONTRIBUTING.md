@@ -36,7 +36,7 @@ Create a non-`main` branch for each independently reviewable change and deliver
 it through a separate pull request. Direct pushes to `main` and bypassing
 repository rulesets or required checks are not allowed.
 
-At each change run, fetch and record `origin/main` and the latest default-branch CI run's revision and state when available; scheduled runs may lag, so do not wait for them. Required checks on the exact PR head gate merge. Follow `AGENTS.md` for branch updates: a newer `main` or overlapping paths alone is not enough; update only for an actual merge conflict or concrete integration need, and rerun affected checks.
+At each change run, fetch and record `origin/main` and the latest default-branch CI run's revision and state when available; scheduled runs may lag, so do not wait for them. Required checks on the exact PR head gate merge. Follow `AGENTS.md` for branch updates; a newer `main` or overlapping paths alone is not enough.
 
 For performance-sensitive changes, follow [docs/benchmarking.md](docs/benchmarking.md)
 for benchmark applicability, result interpretation, and pull-request evidence.
