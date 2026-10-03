@@ -6,13 +6,23 @@ use std::process::{Child, Command, Stdio};
 use std::thread::sleep;
 use std::time::{Duration, Instant};
 
-use runnel_protocol::{Request, Response};
+use runnel_client::{
+    AttemptFailure, Client, ClientConfig, ClientError, PublishBatchOutcome, PublishBatchRecord,
+    PublishOptions, PublishReceipt,
+};
+use runnel_protocol::{PublishBatchRecordResponse, Request, Response};
 use tempfile::TempDir;
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader as AsyncBufReader};
+use tokio::net::{TcpListener as AsyncTcpListener, TcpStream as AsyncTcpStream};
+use tokio::sync::oneshot;
 
 // Restart and log replay can be substantially slower on contended CI disks;
 // keep the assertion bounded without treating an intermediate empty poll as
 // successful recovery.
 const CLUSTER_WAIT_TIMEOUT: Duration = Duration::from_secs(120);
+// The response proxy remains closed until the bounded leader probe proves a
+// survivor, so allow that recovery window before classifying a client timeout.
+const WITHHELD_BATCH_RESPONSE_TIMEOUT: Duration = Duration::from_secs(180);
 // Durable publishes and snapshot recovery can overlap while a node rejoins;
 // keep ordinary request helpers tolerant of the bounded cluster recovery
 // window. Retrying helpers use a shorter per-attempt timeout below.
@@ -593,6 +603,184 @@ fn three_process_cluster_replicates_and_recovers_after_failures() {
         REPLICATION_OBSERVER,
         2,
         "after-leader-failure",
+    );
+    assert_live_nodes(&mut nodes);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn typed_batch_retry_after_leader_change_does_not_duplicate_records() {
+    let directory = TempDir::new().unwrap();
+    let addresses = (0..9).map(|_| free_addr()).collect::<Vec<_>>();
+    let cluster_nodes = vec![(1, addresses[6]), (2, addresses[7]), (3, addresses[8])];
+    let mut nodes = vec![
+        RunningNode::start(
+            1,
+            addresses[0],
+            addresses[3],
+            addresses[6],
+            directory.path().join("node-1"),
+            cluster_nodes.clone(),
+            true,
+        ),
+        RunningNode::start(
+            2,
+            addresses[1],
+            addresses[4],
+            addresses[7],
+            directory.path().join("node-2"),
+            cluster_nodes.clone(),
+            false,
+        ),
+        RunningNode::start(
+            3,
+            addresses[2],
+            addresses[5],
+            addresses[8],
+            directory.path().join("node-3"),
+            cluster_nodes,
+            false,
+        ),
+    ];
+    for node in &nodes {
+        wait_for_http(node.http_addr);
+    }
+
+    let stream = "typed-batch-failover";
+    create_stream_on_any(&mut nodes, stream);
+    let contacted_leader = data_group_leader(&nodes, stream);
+
+    let proxy_listener = AsyncTcpListener::bind("127.0.0.1:0").await.unwrap();
+    let proxy_address = proxy_listener.local_addr().unwrap();
+    let (response_sender, response_receiver) = oneshot::channel();
+    let (release_sender, release_receiver) = oneshot::channel();
+    let proxy = tokio::spawn(withhold_first_response_proxy(
+        proxy_listener,
+        nodes[contacted_leader].broker_addr,
+        response_sender,
+        release_receiver,
+    ));
+
+    let binary_payload = vec![0, 1, 255, b'\n', 0];
+    let records = vec![
+        PublishBatchRecord::with_options(
+            binary_payload.clone(),
+            PublishOptions::default()
+                .with_key("first-key")
+                .with_request_id("leader-change-batch-first"),
+        ),
+        PublishBatchRecord::with_options(
+            b"second".to_vec(),
+            PublishOptions::default()
+                .with_key("second-key")
+                .with_request_id("leader-change-batch-second"),
+        ),
+    ];
+    let mut client = Client::connect_with_config(
+        proxy_address,
+        ClientConfig {
+            connect_timeout: REQUEST_ATTEMPT_TIMEOUT,
+            request_timeout: REQUEST_ATTEMPT_TIMEOUT,
+            response_timeout: WITHHELD_BATCH_RESPONSE_TIMEOUT,
+            ..ClientConfig::default()
+        },
+    )
+    .await
+    .unwrap();
+    let mut publish = Box::pin(client.publish_batch(stream, records.clone()));
+    let broker_response = tokio::select! {
+        attempt = &mut publish => panic!("proxy should withhold the successful batch response: {attempt:?}"),
+        response = response_receiver => response.expect("proxy should deliver the broker response to the test"),
+    };
+
+    let Response::PublishBatch {
+        stream: response_stream,
+        outcomes,
+    } = serde_json::from_slice::<Response>(&broker_response).unwrap()
+    else {
+        panic!("the contacted leader should return a publish-batch response");
+    };
+    assert_eq!(response_stream, stream);
+    assert_eq!(outcomes.len(), 2);
+    assert!(matches!(
+        &outcomes[0],
+        PublishBatchRecordResponse::Published { offset: 0 }
+    ));
+    assert!(matches!(
+        &outcomes[1],
+        PublishBatchRecordResponse::Published { offset: 1 }
+    ));
+    assert_eq!(
+        data_group_leader(&nodes, stream),
+        contacted_leader,
+        "the responding broker should still be the data-group leader before it is stopped"
+    );
+
+    nodes[contacted_leader].stop();
+    let surviving_leader = data_group_leader(&nodes, stream);
+    assert_ne!(surviving_leader, contacted_leader);
+
+    release_sender
+        .send(())
+        .expect("proxy should still be holding the client connection");
+    let lost_attempt = publish.await;
+    assert!(matches!(
+        lost_attempt.attempt.as_ref(),
+        Some(AttemptFailure::Client(ClientError::Eof))
+    ));
+    assert_eq!(lost_attempt.outcomes.len(), records.len());
+    assert!(lost_attempt.outcomes.iter().all(|outcome| matches!(
+        outcome,
+        PublishBatchOutcome::Unknown { code, .. } if code == "client_error"
+    )));
+    proxy
+        .await
+        .expect("response proxy should finish after releasing the client");
+
+    client
+        .reconnect(nodes[surviving_leader].broker_addr)
+        .await
+        .unwrap();
+    let retry = client.publish_batch(stream, records).await;
+    assert!(retry.attempt.is_none());
+    assert_eq!(
+        retry.outcomes,
+        vec![
+            PublishBatchOutcome::Confirmed(PublishReceipt {
+                stream: stream.to_owned(),
+                offset: 0,
+            }),
+            PublishBatchOutcome::Confirmed(PublishReceipt {
+                stream: stream.to_owned(),
+                offset: 1,
+            }),
+        ]
+    );
+
+    let first = client
+        .poll_bytes(stream, "verifier")
+        .await
+        .unwrap()
+        .expect("the first batch record should be present once after failover");
+    assert_eq!(first.offset, 0);
+    assert_eq!(first.key.as_deref(), Some("first-key"));
+    assert_eq!(first.payload, binary_payload);
+    client.ack(stream, "verifier", first.offset).await.unwrap();
+
+    let second = client
+        .poll_bytes(stream, "verifier")
+        .await
+        .unwrap()
+        .expect("the second batch record should be present once after failover");
+    assert_eq!(second.offset, 1);
+    assert_eq!(second.key.as_deref(), Some("second-key"));
+    assert_eq!(second.payload, b"second");
+    client.ack(stream, "verifier", second.offset).await.unwrap();
+    assert!(
+        client
+            .poll_bytes(stream, "verifier")
+            .await
+            .unwrap()
+            .is_none()
     );
     assert_live_nodes(&mut nodes);
 }
@@ -1977,6 +2165,53 @@ fn data_group_leader(nodes: &[RunningNode], stream: &str) -> usize {
         sleep(Duration::from_millis(50));
     }
     panic!("no live process reported itself as the data-group leader for {stream}");
+}
+
+async fn withhold_first_response_proxy(
+    listener: AsyncTcpListener,
+    broker_addr: SocketAddr,
+    response_sender: oneshot::Sender<Vec<u8>>,
+    release_receiver: oneshot::Receiver<()>,
+) {
+    let (client, _) = listener
+        .accept()
+        .await
+        .expect("proxy should accept the typed client connection");
+    let (client_reader, client_writer) = client.into_split();
+    let mut client_reader = AsyncBufReader::new(client_reader);
+    let mut request = Vec::new();
+    client_reader
+        .read_until(b'\n', &mut request)
+        .await
+        .expect("proxy should read the client's batch request");
+
+    let broker = AsyncTcpStream::connect(broker_addr)
+        .await
+        .expect("proxy should connect to the current leader");
+    let (broker_reader, mut broker_writer) = broker.into_split();
+    broker_writer
+        .write_all(&request)
+        .await
+        .expect("proxy should forward the batch to the leader");
+    let mut broker_reader = AsyncBufReader::new(broker_reader);
+    let mut response = Vec::new();
+    broker_reader
+        .read_until(b'\n', &mut response)
+        .await
+        .expect("proxy should read the leader's complete response");
+    assert!(
+        response.ends_with(b"\n"),
+        "broker response should be line complete"
+    );
+    response_sender
+        .send(response)
+        .expect("test should inspect the successful broker response");
+
+    release_receiver
+        .await
+        .expect("test should release the withheld client connection");
+    drop(client_reader);
+    drop(client_writer);
 }
 
 fn direct_peer_inspect_consumer(peer_addr: SocketAddr, stream: &str) -> serde_json::Value {
