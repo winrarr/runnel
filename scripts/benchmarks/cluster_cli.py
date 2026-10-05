@@ -34,6 +34,8 @@ from cluster_scenarios import (
     DEFAULT_RAFT_LOG_GROWTH_CYCLE_TIMEOUT_SECONDS,
     DEFAULT_RAFT_LOG_GROWTH_MESSAGES,
     DEFAULT_RAFT_LOG_GROWTH_OBSERVATION_EVERY,
+    DEFAULT_SNAPSHOT_BUILD_MESSAGES,
+    DEFAULT_SNAPSHOT_BUILD_TIMEOUT_SECONDS,
     DEFAULT_RETAINED_RECOVERY_MESSAGES,
     DEFAULT_SCENARIOS,
     DEFAULT_SLOW_CONSUMER_DELAY_MS,
@@ -50,10 +52,15 @@ from cluster_scenarios import (
     MAX_PUBLISH_BATCH_SIZE,
     MAX_RAFT_LOG_GROWTH_CYCLE_TIMEOUT_SECONDS,
     MAX_RAFT_LOG_GROWTH_LOGICAL_PAYLOAD_BYTES,
+    MAX_SNAPSHOT_BUILD_LOGICAL_PAYLOAD_BYTES,
+    MAX_SNAPSHOT_BUILD_RETAINED_MESSAGES,
+    MAX_SNAPSHOT_BUILD_TIMEOUT_SECONDS,
     MIN_RAFT_LOG_GROWTH_CYCLE_TIMEOUT_SECONDS,
+    MIN_SNAPSHOT_BUILD_TIMEOUT_SECONDS,
     MAX_SLOW_CONSUMER_BACKPRESSURE_TIMEOUT_SECONDS,
     MIN_RETAINED_RECOVERY_MESSAGES,
     parse_retained_messages,
+    parse_snapshot_build_messages,
     parse_raft_log_growth_messages,
     parse_raft_log_growth_observation_every,
     parse_scenarios,
@@ -70,6 +77,7 @@ from cluster_scenarios import (
     run_retained_hot_path,
     run_retained_recovery,
     run_raft_log_growth,
+    run_snapshot_build_hot_path,
     run_slow_consumer,
     run_slow_consumer_backpressure,
 )
@@ -129,7 +137,8 @@ def parse_args() -> argparse.Namespace:
             "comma-separated scenarios to run (default: existing clustered workload; "
             "add retained_hot_path, peer_forwarding, publish_batch, hot_ordering, "
             "slow_consumer_backpressure, leader_failure_recovery, or "
-            "follower_failure_recovery, or raft_log_growth explicitly for "
+            "follower_failure_recovery, raft_log_growth, or "
+            "snapshot_build_hot_path explicitly for "
             "focused probes)"
         ),
     )
@@ -195,7 +204,8 @@ def parse_args() -> argparse.Namespace:
         type=parse_retained_messages,
         default=DEFAULT_RETAINED_RECOVERY_MESSAGES,
         help=(
-            "retained records preloaded for the restart-recovery growth probe "
+            "retained records preloaded for retained-history, hot-path, and "
+            "snapshot-build probes "
             f"(minimum: {MIN_RETAINED_RECOVERY_MESSAGES})"
         ),
     )
@@ -216,6 +226,18 @@ def parse_args() -> argparse.Namespace:
         type=parse_positive_float,
         default=DEFAULT_RAFT_LOG_GROWTH_CYCLE_TIMEOUT_SECONDS,
         help="bounded wait for data groups and an actual snapshot/purge cycle",
+    )
+    parser.add_argument(
+        "--snapshot-build-messages",
+        type=parse_snapshot_build_messages,
+        default=DEFAULT_SNAPSHOT_BUILD_MESSAGES,
+        help="bounded measured durable publishes for snapshot_build_hot_path",
+    )
+    parser.add_argument(
+        "--snapshot-build-cycle-timeout-seconds",
+        type=parse_positive_float,
+        default=DEFAULT_SNAPSHOT_BUILD_TIMEOUT_SECONDS,
+        help="bounded wait for an observed completed build in snapshot_build_hot_path",
     )
     parser.add_argument(
         "--peer-forwarding-concurrency",
@@ -363,6 +385,22 @@ def parse_args() -> argparse.Namespace:
             "Raft log growth cycle timeout must be at least "
             f"{MIN_RAFT_LOG_GROWTH_CYCLE_TIMEOUT_SECONDS:g} second"
         )
+    if (
+        args.snapshot_build_cycle_timeout_seconds
+        > MAX_SNAPSHOT_BUILD_TIMEOUT_SECONDS
+    ):
+        parser.error(
+            "snapshot build timeout exceeds the bounded maximum of "
+            f"{MAX_SNAPSHOT_BUILD_TIMEOUT_SECONDS:g} seconds"
+        )
+    if (
+        args.snapshot_build_cycle_timeout_seconds
+        < MIN_SNAPSHOT_BUILD_TIMEOUT_SECONDS
+    ):
+        parser.error(
+            "snapshot build timeout must be at least "
+            f"{MIN_SNAPSHOT_BUILD_TIMEOUT_SECONDS:g} second"
+        )
     if "raft_log_growth" in args.scenarios and args.skip_recovery:
         parser.error("raft_log_growth includes mandatory follower restart recovery")
     if (
@@ -374,6 +412,23 @@ def parse_args() -> argparse.Namespace:
             "raft log growth payload volume exceeds the bounded maximum of "
             f"{MAX_RAFT_LOG_GROWTH_LOGICAL_PAYLOAD_BYTES} logical bytes"
         )
+    if "snapshot_build_hot_path" in args.scenarios:
+        if args.retained_messages > MAX_SNAPSHOT_BUILD_RETAINED_MESSAGES:
+            parser.error(
+                "snapshot-build retained messages exceed the bounded maximum of "
+                f"{MAX_SNAPSHOT_BUILD_RETAINED_MESSAGES}"
+            )
+        snapshot_build_logical_payload_bytes = (
+            args.retained_messages + args.snapshot_build_messages
+        ) * sum(args.payload_sizes)
+        if (
+            snapshot_build_logical_payload_bytes
+            > MAX_SNAPSHOT_BUILD_LOGICAL_PAYLOAD_BYTES
+        ):
+            parser.error(
+                "snapshot-build workload volume exceeds the bounded maximum of "
+                f"{MAX_SNAPSHOT_BUILD_LOGICAL_PAYLOAD_BYTES} logical bytes"
+            )
     if args.peer_response_delay_ms and args.runtime != "process":
         parser.error("peer response delay requires the native process runtime")
     if args.ack_timeout_ms <= 0:
@@ -448,6 +503,17 @@ def run_scenarios(
                     args.raft_log_growth_messages,
                     args.raft_log_growth_observation_every,
                     args.raft_log_growth_cycle_timeout_seconds,
+                )
+            )
+        if "snapshot_build_hot_path" in selected_scenarios:
+            scenarios.append(
+                run_snapshot_build_hot_path(
+                    cluster,
+                    f"cluster_{run_id}_snapshot_build_hot_path_{size}",
+                    payload,
+                    args.snapshot_build_messages,
+                    args.retained_messages,
+                    args.snapshot_build_cycle_timeout_seconds,
                 )
             )
         if "slow_consumer" in selected_scenarios:

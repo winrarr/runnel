@@ -59,6 +59,14 @@ from cluster_scenarios import (  # noqa: E402
     MAX_RAFT_LOG_GROWTH_OBSERVATION_EVERY,
     MIN_RAFT_LOG_GROWTH_CYCLE_TIMEOUT_SECONDS,
     MIN_RAFT_LOG_GROWTH_MESSAGES,
+    DEFAULT_SNAPSHOT_BUILD_MESSAGES,
+    DEFAULT_SNAPSHOT_BUILD_TIMEOUT_SECONDS,
+    MAX_SNAPSHOT_BUILD_LOGICAL_PAYLOAD_BYTES,
+    MAX_SNAPSHOT_BUILD_MESSAGES,
+    MAX_SNAPSHOT_BUILD_RETAINED_MESSAGES,
+    MAX_SNAPSHOT_BUILD_TIMEOUT_SECONDS,
+    MIN_SNAPSHOT_BUILD_MESSAGES,
+    MIN_SNAPSHOT_BUILD_TIMEOUT_SECONDS,
 )
 from common import (  # noqa: E402
     BenchmarkError,
@@ -191,6 +199,22 @@ def parse_args() -> argparse.Namespace:
         type=parse_positive_float,
         default=DEFAULT_RAFT_LOG_GROWTH_CYCLE_TIMEOUT_SECONDS,
         help="bounded wait for an observed snapshot/purge cycle in raft_log_growth",
+    )
+    parser.add_argument(
+        "--snapshot-build-message-values",
+        type=lambda value: parse_integer_values(
+            value,
+            minimum=MIN_SNAPSHOT_BUILD_MESSAGES,
+            label="snapshot build message values",
+        ),
+        default=[DEFAULT_SNAPSHOT_BUILD_MESSAGES],
+        help="comma-separated measured publish counts for snapshot_build_hot_path",
+    )
+    parser.add_argument(
+        "--snapshot-build-cycle-timeout-seconds",
+        type=parse_positive_float,
+        default=DEFAULT_SNAPSHOT_BUILD_TIMEOUT_SECONDS,
+        help="bounded setup/build wait for snapshot_build_hot_path",
     )
     parser.add_argument(
         "--runtimes",
@@ -329,6 +353,21 @@ def parse_args() -> argparse.Namespace:
             f"{MIN_RAFT_LOG_GROWTH_CYCLE_TIMEOUT_SECONDS:g} and "
             f"{MAX_RAFT_LOG_GROWTH_CYCLE_TIMEOUT_SECONDS:g} seconds"
         )
+    if any(value > MAX_SNAPSHOT_BUILD_MESSAGES for value in args.snapshot_build_message_values):
+        parser.error(
+            "snapshot build message values must not exceed "
+            f"{MAX_SNAPSHOT_BUILD_MESSAGES}"
+        )
+    if not (
+        MIN_SNAPSHOT_BUILD_TIMEOUT_SECONDS
+        <= args.snapshot_build_cycle_timeout_seconds
+        <= MAX_SNAPSHOT_BUILD_TIMEOUT_SECONDS
+    ):
+        parser.error(
+            "snapshot build cycle timeout must be between "
+            f"{MIN_SNAPSHOT_BUILD_TIMEOUT_SECONDS:g} and "
+            f"{MAX_SNAPSHOT_BUILD_TIMEOUT_SECONDS:g} seconds"
+        )
     if (
         "raft_log_growth" in args.scenarios
         and max(args.raft_log_growth_message_values) * max(args.payload_sizes)
@@ -338,6 +377,25 @@ def parse_args() -> argparse.Namespace:
             "Raft log growth workload volume exceeds the bounded maximum of "
             f"{MAX_RAFT_LOG_GROWTH_LOGICAL_PAYLOAD_BYTES} logical bytes"
         )
+    if "snapshot_build_hot_path" in args.scenarios:
+        if any(
+            value > MAX_SNAPSHOT_BUILD_RETAINED_MESSAGES
+            for value in args.retained_message_values
+        ):
+            parser.error(
+                "snapshot build retained-message values must not exceed "
+                f"{MAX_SNAPSHOT_BUILD_RETAINED_MESSAGES}"
+            )
+        if (
+            max(
+                args.retained_message_values
+            )
+            + max(args.snapshot_build_message_values)
+        ) * max(args.payload_sizes) > MAX_SNAPSHOT_BUILD_LOGICAL_PAYLOAD_BYTES:
+            parser.error(
+                "snapshot-build workload volume exceeds the bounded maximum of "
+                f"{MAX_SNAPSHOT_BUILD_LOGICAL_PAYLOAD_BYTES} logical bytes"
+            )
     if any(value > MAX_PEER_FORWARDING_CONCURRENCY for value in args.concurrency_values):
         parser.error(
             "concurrency values exceed the bounded maximum "
@@ -404,7 +462,8 @@ def matrix_cases(args: argparse.Namespace) -> list[dict[str, Any]]:
         )
         retained_values = (
             args.retained_message_values
-            if scenario in {"cluster_retained_recovery", "retained_hot_path"}
+            if scenario
+            in {"cluster_retained_recovery", "retained_hot_path", "snapshot_build_hot_path"}
             else args.retained_message_values[:1]
         )
         batch_size_values = (
@@ -427,6 +486,11 @@ def matrix_cases(args: argparse.Namespace) -> list[dict[str, Any]]:
             if scenario == "peer_forwarding"
             else args.peer_forwarding_stream_count_values[:1]
         )
+        snapshot_build_message_values = (
+            args.snapshot_build_message_values
+            if scenario == "snapshot_build_hot_path"
+            else args.snapshot_build_message_values[:1]
+        )
         for (
             runtime,
             payload_size,
@@ -437,6 +501,7 @@ def matrix_cases(args: argparse.Namespace) -> list[dict[str, Any]]:
             growth_messages,
             observation_every,
             stream_count,
+            snapshot_build_messages,
         ) in product(
             args.runtimes,
             args.payload_sizes,
@@ -447,6 +512,7 @@ def matrix_cases(args: argparse.Namespace) -> list[dict[str, Any]]:
             raft_log_growth_message_values,
             raft_log_growth_observation_values,
             stream_count_values,
+            snapshot_build_message_values,
         ):
             for repetition in range(1, args.repetitions + 1):
                 cases.append(
@@ -461,6 +527,7 @@ def matrix_cases(args: argparse.Namespace) -> list[dict[str, Any]]:
                         "stream_count": stream_count,
                         "raft_log_growth_messages": growth_messages,
                         "raft_log_growth_observation_every": observation_every,
+                        "snapshot_build_messages": snapshot_build_messages,
                         "repetition": repetition,
                     }
                 )
@@ -520,6 +587,10 @@ def case_command(
             str(case["raft_log_growth_observation_every"]),
             "--raft-log-growth-cycle-timeout-seconds",
             str(args.raft_log_growth_cycle_timeout_seconds),
+            "--snapshot-build-messages",
+            str(case["snapshot_build_messages"]),
+            "--snapshot-build-cycle-timeout-seconds",
+            str(args.snapshot_build_cycle_timeout_seconds),
             "--peer-forwarding-concurrency",
             str(case["concurrency"]),
             "--peer-response-delay-ms",
@@ -553,7 +624,8 @@ def case_id(index: int, case: dict[str, Any]) -> str:
     )
     retained = (
         f"retained-{case['retained_messages']}-"
-        if case["scenario"] in {"cluster_retained_recovery", "retained_hot_path"}
+        if case["scenario"]
+        in {"cluster_retained_recovery", "retained_hot_path", "snapshot_build_hot_path"}
         else ""
     )
     growth = (
@@ -562,11 +634,16 @@ def case_id(index: int, case: dict[str, Any]) -> str:
         if case["scenario"] == "raft_log_growth"
         else ""
     )
+    snapshot_build = (
+        f"snapshot-publishes-{case['snapshot_build_messages']}-"
+        if case["scenario"] == "snapshot_build_hot_path"
+        else ""
+    )
     return (
         f"case-{index:03d}-{scenario}-{case['runtime']}-"
         f"payload-{case['payload_size']}-c{case['concurrency']}-"
         f"delay-{case['slow_consumer_delay_ms']}-{retained}"
-        f"{batch_size}{stream_count}{growth}r{case['repetition']}"
+        f"{batch_size}{stream_count}{growth}{snapshot_build}r{case['repetition']}"
     )
 
 
@@ -732,6 +809,10 @@ def run_matrix(
         ),
         "raft_log_growth_cycle_timeout_seconds": (
             args.raft_log_growth_cycle_timeout_seconds
+        ),
+        "snapshot_build_message_values": args.snapshot_build_message_values,
+        "snapshot_build_cycle_timeout_seconds": (
+            args.snapshot_build_cycle_timeout_seconds
         ),
         "runtimes": args.runtimes,
         "repetitions": args.repetitions,

@@ -263,6 +263,79 @@ class MatrixBenchmarkTests(unittest.TestCase):
             with self.subTest(options=options), self.assertRaises(SystemExit):
                 self.parse(*options)
 
+    def test_snapshot_build_matrix_sweeps_payload_retention_and_publish_count(self) -> None:
+        args = self.parse(
+            "--scenarios",
+            "snapshot_build_hot_path",
+            "--payload-sizes",
+            "100,1024",
+            "--retained-message-values",
+            "1025,2048",
+            "--snapshot-build-message-values",
+            "64,128",
+            "--snapshot-build-cycle-timeout-seconds",
+            "45",
+            "--repetitions",
+            "2",
+            "--max-cases",
+            "32",
+        )
+
+        cases = matrix.matrix_cases(args)
+
+        self.assertEqual(len(cases), 16)
+        self.assertEqual({case["retained_messages"] for case in cases}, {1025, 2048})
+        self.assertEqual({case["snapshot_build_messages"] for case in cases}, {64, 128})
+        self.assertEqual({case["payload_size"] for case in cases}, {100, 1024})
+        self.assertEqual({case["repetition"] for case in cases}, {1, 2})
+        identifiers = [
+            matrix.case_id(index, case) for index, case in enumerate(cases, 1)
+        ]
+        self.assertEqual(len(set(identifiers)), len(cases))
+        self.assertIn("retained-1025", identifiers[0])
+        self.assertIn("snapshot-publishes-64", identifiers[0])
+
+        command = matrix.case_command(
+            args,
+            cases[1],
+            Path("/tmp/matrix/result.json"),
+            Path("/tmp/matrix/logs"),
+            build=False,
+        )
+        message_index = command.index("--snapshot-build-messages")
+        timeout_index = command.index("--snapshot-build-cycle-timeout-seconds")
+        retained_index = command.index("--retained-messages")
+        self.assertEqual(command[message_index + 1], "64")
+        self.assertEqual(command[timeout_index + 1], "45.0")
+        self.assertEqual(command[retained_index + 1], "1025")
+
+    def test_snapshot_build_matrix_rejects_oversized_inputs(self) -> None:
+        with self.assertRaises(SystemExit):
+            self.parse(
+                "--scenarios",
+                "snapshot_build_hot_path",
+                "--snapshot-build-message-values",
+                "4097",
+            )
+        with self.assertRaises(SystemExit):
+            self.parse(
+                "--scenarios",
+                "snapshot_build_hot_path",
+                "--retained-message-values",
+                str(matrix.MAX_SNAPSHOT_BUILD_RETAINED_MESSAGES + 1),
+            )
+        with self.assertRaises(SystemExit):
+            self.parse(
+                "--scenarios",
+                "snapshot_build_hot_path",
+                "--payload-sizes",
+                "8192",
+                "--retained-message-values",
+                "2048",
+                "--snapshot-build-message-values",
+                "256",
+            )
+
     def test_combined_growth_retained_and_batch_cases_stay_factorized(self) -> None:
         args = self.parse(
             "--scenarios",

@@ -22,6 +22,7 @@ from common import (
     measure_message_batch,
     measure_scenario,
     metric,
+    metric_delta,
     percentile,
     poll,
     publish,
@@ -84,6 +85,7 @@ SCENARIO_NAMES = (
     "leader_failure_recovery",
     "follower_failure_recovery",
     "raft_log_growth",
+    "snapshot_build_hot_path",
 )
 # Keep the retained-data probe beyond the local engine's bounded tail index so
 # recovery measurements exercise a non-trivial retained history.
@@ -98,7 +100,24 @@ MAX_RAFT_LOG_GROWTH_OBSERVATION_EVERY = 1_024
 DEFAULT_RAFT_LOG_GROWTH_CYCLE_TIMEOUT_SECONDS = 30.0
 MIN_RAFT_LOG_GROWTH_CYCLE_TIMEOUT_SECONDS = 1.0
 MAX_RAFT_LOG_GROWTH_CYCLE_TIMEOUT_SECONDS = 300.0
+DEFAULT_SNAPSHOT_BUILD_MESSAGES = 256
+MIN_SNAPSHOT_BUILD_MESSAGES = 64
+MAX_SNAPSHOT_BUILD_MESSAGES = 4_096
+MAX_SNAPSHOT_BUILD_RETAINED_MESSAGES = 16_384
+MAX_SNAPSHOT_BUILD_LOGICAL_PAYLOAD_BYTES = 16 * 1024 * 1024
+DEFAULT_SNAPSHOT_BUILD_TIMEOUT_SECONDS = 30.0
+MIN_SNAPSHOT_BUILD_TIMEOUT_SECONDS = 1.0
+MAX_SNAPSHOT_BUILD_TIMEOUT_SECONDS = 300.0
 RAFT_SNAPSHOT_BUILDS_METRIC = "runnel_snapshot_builds_completed_total"
+SNAPSHOT_BUILD_METRICS = {
+    "builds_started": "runnel_snapshot_builds_started_total",
+    "builds_completed": RAFT_SNAPSHOT_BUILDS_METRIC,
+    "build_failures": "runnel_snapshot_build_failures_total",
+    "builds_in_progress": "runnel_snapshot_builds_in_progress",
+    "duration_sum_seconds": "runnel_snapshot_build_duration_seconds_sum",
+    "duration_count": "runnel_snapshot_build_duration_seconds_count",
+    "duration_max_seconds": "runnel_snapshot_build_duration_seconds_max",
+}
 
 
 @dataclass
@@ -401,6 +420,233 @@ def run_retained_hot_path(
         )
 
 
+def _snapshot_build_metrics(
+    metrics: dict[str, float] | None, node_ids: list[int]
+) -> dict[str, dict[str, float | None]]:
+    """Read snapshot build metrics as per-process aggregates without group labels."""
+    values: dict[str, dict[str, float | None]] = {}
+    for node_id in node_ids:
+        node_name = f"node_{node_id}"
+        values[node_name] = {
+            name: metrics.get(f"{node_name}.{metric_name}") if metrics else None
+            for name, metric_name in SNAPSHOT_BUILD_METRICS.items()
+        }
+    return values
+
+
+def _snapshot_build_metric_deltas(
+    before: dict[str, float] | None,
+    after: dict[str, float] | None,
+    node_ids: list[int],
+) -> dict[str, Any]:
+    if before is None or after is None:
+        return {"available": False, "per_node": {}}
+
+    before_values = _snapshot_build_metrics(before, node_ids)
+    after_values = _snapshot_build_metrics(after, node_ids)
+    per_node: dict[str, dict[str, Any]] = {}
+    for node_name in before_values:
+        initial = before_values[node_name]
+        final = after_values[node_name]
+        if any(value is None for value in (*initial.values(), *final.values())):
+            return {"available": False, "per_node": {}}
+
+        started = final["builds_started"] - initial["builds_started"]
+        completed = final["builds_completed"] - initial["builds_completed"]
+        failures = final["build_failures"] - initial["build_failures"]
+        duration_count = final["duration_count"] - initial["duration_count"]
+        duration_sum = final["duration_sum_seconds"] - initial["duration_sum_seconds"]
+        if min(started, completed, failures, duration_count, duration_sum) < 0:
+            return {"available": False, "per_node": {}}
+        duration_max_before = initial["duration_max_seconds"]
+        duration_max_after = final["duration_max_seconds"]
+        per_node[node_name] = {
+            "builds_started_delta": int(started),
+            "builds_completed_delta": int(completed),
+            "build_failures_delta": int(failures),
+            "builds_in_progress_after": int(final["builds_in_progress"]),
+            "build_duration_count_delta": int(duration_count),
+            "build_duration_seconds_sum_delta": duration_sum,
+            "build_duration_seconds_mean": (
+                duration_sum / duration_count if duration_count else None
+            ),
+            "build_duration_seconds_max_since_process_start_before": duration_max_before,
+            "build_duration_seconds_max_since_process_start_after": duration_max_after,
+            "build_duration_seconds_max_in_this_interval": (
+                duration_max_after
+                if duration_max_after > duration_max_before
+                else None
+            ),
+        }
+    return {"available": True, "per_node": per_node}
+
+
+def _wait_for_snapshot_build_cycle(
+    cluster: Cluster,
+    node_ids: list[int],
+    timeout_seconds: float,
+    *,
+    previous: dict[str, dict[str, float | None]] | None = None,
+) -> dict[str, float]:
+    """Wait for a quiet build boundary, optionally requiring new completions."""
+    deadline = time.monotonic() + timeout_seconds
+    previous_started: tuple[float, ...] | None = None
+    quiet_samples = 0
+    while time.monotonic() < deadline:
+        metrics = cluster.metrics()
+        latest = _snapshot_build_metrics(metrics, node_ids)
+        if metrics is not None and all(
+            value is not None
+            for node_values in latest.values()
+            for value in node_values.values()
+        ):
+            idle = all(
+                values["builds_in_progress"] == 0 for values in latest.values()
+            )
+            started = tuple(
+                values["builds_started"] or 0.0
+                for values in latest.values()
+            )
+            has_new_completion = previous is None or sum(
+                values["builds_completed"] or 0.0 for values in latest.values()
+            ) > sum(
+                values["builds_completed"] or 0.0 for values in previous.values()
+            )
+            if idle and has_new_completion:
+                quiet_samples = quiet_samples + 1 if started == previous_started else 1
+                if quiet_samples >= 3:
+                    return metrics
+            else:
+                quiet_samples = 0
+            previous_started = started
+        else:
+            quiet_samples = 0
+            previous_started = None
+        time.sleep(0.025)
+    if previous is None:
+        raise BenchmarkError(
+            "snapshot-build setup did not reach an idle metric boundary within "
+            f"{timeout_seconds:g}s"
+        )
+    raise BenchmarkError(
+        "snapshot-build workload did not observe a completed build and a stable idle "
+        f"metric boundary within {timeout_seconds:g}s"
+    )
+
+
+def run_snapshot_build_hot_path(
+    cluster: Cluster,
+    stream: str,
+    payload: str,
+    measured_messages: int,
+    retained_messages: int,
+    cycle_timeout_seconds: float,
+) -> dict[str, Any]:
+    """Measure durable publishes while snapshots build over retained state."""
+    preload(cluster, stream, payload, retained_messages)
+    node_ids = [node.node_id for node in cluster.nodes]
+    _wait_for_snapshot_build_cycle(cluster, node_ids, cycle_timeout_seconds)
+    metrics_before = cluster.metrics()
+    if metrics_before is None:
+        raise BenchmarkError("snapshot build metrics were unavailable after setup")
+    build_metrics_before = _snapshot_build_metrics(metrics_before, node_ids)
+
+    def measured_publishes_and_wait() -> dict[str, Any]:
+        started_ns = time.perf_counter_ns()
+        with cluster.stats.observe_snapshot_build_publishes():
+            with cluster.connected_clients() as clients:
+                latencies = publish_messages(
+                    lambda offset: clients[offset % len(clients)],
+                    stream,
+                    payload,
+                    measured_messages,
+                    expected_offset=retained_messages,
+                )
+        publish_elapsed_ns = time.perf_counter_ns() - started_ns
+        _wait_for_snapshot_build_cycle(
+            cluster,
+            node_ids,
+            cycle_timeout_seconds,
+            previous=build_metrics_before,
+        )
+
+        elapsed_before_wait_ns = publish_elapsed_ns
+        elapsed_with_wait_ns = time.perf_counter_ns() - started_ns
+        return metric(
+            "cluster_snapshot_build_hot_path",
+            latencies,
+            publish_elapsed_ns,
+            message_size=len(payload),
+            metadata={
+                "measured_durable_publishes": measured_messages,
+                "retained_messages_before_measurement": retained_messages,
+                "retained_logical_payload_bytes_before_measurement": (
+                    retained_messages * len(payload)
+                ),
+                "publish_setup_excluded": True,
+                "snapshot_completion_wait_seconds": max(
+                    0,
+                    elapsed_with_wait_ns - elapsed_before_wait_ns,
+                )
+                / 1_000_000_000,
+                "snapshot_completion_wait_excluded_from_publish_interval": True,
+                "resource_sample_scope": (
+                    "measured publishes through at least one successful snapshot build "
+                    "and zero active builds on every node; samples during the publish "
+                    "loop identify sampled build overlap"
+                ),
+                "latency_scope": "one public durable publish roundtrip per sample",
+            },
+        )
+
+    with cluster.stats.observe_snapshot_builds():
+        result = measure_scenario(cluster.stats, measured_publishes_and_wait)
+    metrics_after = cluster.metrics()
+    build_metric_deltas = _snapshot_build_metric_deltas(
+        metrics_before, metrics_after, node_ids
+    )
+    if not build_metric_deltas["available"]:
+        raise BenchmarkError("snapshot build metrics were unavailable during the probe")
+    if not any(
+        node_metrics["builds_completed_delta"] > 0
+        for node_metrics in build_metric_deltas["per_node"].values()
+    ):
+        raise BenchmarkError("snapshot build metrics reported no completed build")
+    result["server_metrics"] = metric_delta(metrics_before, metrics_after)
+    result["metadata"]["snapshot_build_metrics_per_node"] = build_metric_deltas[
+        "per_node"
+    ]
+    result["metadata"]["snapshot_build_metrics_scope"] = (
+        "aggregate metrics for all Raft groups in each broker process; no group labels"
+    )
+    result["metadata"]["snapshot_build_observed"] = True
+    memory_observations = result["resource_samples"].get(
+        "snapshot_build_memory_observations", {}
+    )
+    overlap_samples = sum(
+        node_observations.get(
+            "samples_with_build_in_progress_during_measured_publishes", 0
+        )
+        for node_observations in memory_observations.get("per_node", {}).values()
+    )
+    result["metadata"]["snapshot_build_overlap_samples_during_publishes"] = (
+        overlap_samples
+    )
+    result["metadata"]["snapshot_build_overlap_sample_observed"] = overlap_samples > 0
+    result["metadata"]["snapshot_build_overlap_sampling_scope"] = (
+        "100 ms RSS and active-build gauge samples aligned only during measured "
+        "publishes; zero samples means the sampler may have missed a shorter build"
+    )
+    result["metadata"]["retained_state_boundary"] = {
+        "messages_per_stream": retained_messages,
+        "logical_payload_bytes_per_stream": retained_messages * len(payload),
+        "payload_bytes": len(payload),
+        "replicated_nodes": cluster.node_count,
+        "stream_count": 1,
+    }
+    return result
+
+
 def parse_raft_log_growth_messages(value: str) -> int:
     try:
         messages = int(value)
@@ -429,6 +675,21 @@ def parse_raft_log_growth_observation_every(value: str) -> int:
             f"1 and {MAX_RAFT_LOG_GROWTH_OBSERVATION_EVERY} publishes"
         )
     return every
+
+
+def parse_snapshot_build_messages(value: str) -> int:
+    try:
+        messages = int(value)
+    except ValueError as error:
+        raise argparse.ArgumentTypeError(
+            "snapshot build messages must be an integer"
+        ) from error
+    if not MIN_SNAPSHOT_BUILD_MESSAGES <= messages <= MAX_SNAPSHOT_BUILD_MESSAGES:
+        raise argparse.ArgumentTypeError(
+            "snapshot build messages must be between "
+            f"{MIN_SNAPSHOT_BUILD_MESSAGES} and {MAX_SNAPSHOT_BUILD_MESSAGES}"
+        )
+    return messages
 
 
 def _data_group_directories(

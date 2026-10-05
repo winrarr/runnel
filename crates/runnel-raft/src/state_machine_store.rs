@@ -6,6 +6,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
+use std::time::Instant;
 
 use openraft::storage::{RaftStateMachine, Snapshot};
 use openraft::{
@@ -255,6 +256,10 @@ struct SnapshotMetrics {
     builds_started: AtomicU64,
     builds_completed: AtomicU64,
     build_failures: AtomicU64,
+    builds_in_progress: AtomicU64,
+    build_duration_nanos_sum: AtomicU64,
+    build_duration_count: AtomicU64,
+    build_duration_nanos_max: AtomicU64,
     installs_started: AtomicU64,
     installs_completed: AtomicU64,
     install_failures: AtomicU64,
@@ -270,6 +275,10 @@ pub struct SnapshotMetricsSnapshot {
     pub builds_started: u64,
     pub builds_completed: u64,
     pub build_failures: u64,
+    pub builds_in_progress: u64,
+    pub build_duration_nanos_sum: u64,
+    pub build_duration_count: u64,
+    pub build_duration_nanos_max: u64,
     pub installs_started: u64,
     pub installs_completed: u64,
     pub install_failures: u64,
@@ -286,6 +295,10 @@ impl SnapshotMetrics {
             builds_started: self.builds_started.load(Ordering::Relaxed),
             builds_completed: self.builds_completed.load(Ordering::Relaxed),
             build_failures: self.build_failures.load(Ordering::Relaxed),
+            builds_in_progress: self.builds_in_progress.load(Ordering::Relaxed),
+            build_duration_nanos_sum: self.build_duration_nanos_sum.load(Ordering::Relaxed),
+            build_duration_count: self.build_duration_count.load(Ordering::Relaxed),
+            build_duration_nanos_max: self.build_duration_nanos_max.load(Ordering::Relaxed),
             installs_started: self.installs_started.load(Ordering::Relaxed),
             installs_completed: self.installs_completed.load(Ordering::Relaxed),
             install_failures: self.install_failures.load(Ordering::Relaxed),
@@ -294,6 +307,54 @@ impl SnapshotMetrics {
             transfer_chunks: self.transfer_chunks.load(Ordering::Relaxed),
             transfer_final_chunks: self.transfer_final_chunks.load(Ordering::Relaxed),
             transfer_bytes: self.transfer_bytes.load(Ordering::Relaxed),
+        }
+    }
+}
+
+struct SnapshotBuildAttempt<'a> {
+    metrics: &'a SnapshotMetrics,
+    started_at: Instant,
+    in_progress: bool,
+}
+
+impl<'a> SnapshotBuildAttempt<'a> {
+    fn start(metrics: &'a SnapshotMetrics) -> Self {
+        metrics.builds_started.fetch_add(1, Ordering::Relaxed);
+        metrics.builds_in_progress.fetch_add(1, Ordering::Relaxed);
+        Self {
+            metrics,
+            started_at: Instant::now(),
+            in_progress: true,
+        }
+    }
+
+    fn finish(mut self) {
+        let elapsed_nanos = u64::try_from(self.started_at.elapsed().as_nanos()).unwrap_or(u64::MAX);
+        self.metrics
+            .build_duration_nanos_sum
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+                Some(current.saturating_add(elapsed_nanos))
+            })
+            .expect("saturating snapshot duration update always succeeds");
+        self.metrics
+            .build_duration_count
+            .fetch_add(1, Ordering::Relaxed);
+        self.metrics
+            .build_duration_nanos_max
+            .fetch_max(elapsed_nanos, Ordering::Relaxed);
+        self.metrics
+            .builds_in_progress
+            .fetch_sub(1, Ordering::Relaxed);
+        self.in_progress = false;
+    }
+}
+
+impl Drop for SnapshotBuildAttempt<'_> {
+    fn drop(&mut self) {
+        if self.in_progress {
+            self.metrics
+                .builds_in_progress
+                .fetch_sub(1, Ordering::Relaxed);
         }
     }
 }
@@ -725,7 +786,7 @@ fn is_optional_log_after(candidate: Option<LogId<NodeId>>, current: Option<LogId
 
 impl RaftSnapshotBuilder<TypeConfig> for Arc<StateMachineStore> {
     async fn build_snapshot(&mut self) -> Result<Snapshot<TypeConfig>, StorageError<NodeId>> {
-        self.metrics.builds_started.fetch_add(1, Ordering::Relaxed);
+        let build_attempt = SnapshotBuildAttempt::start(&self.metrics);
         let result = async {
             let (data, last_applied_log, last_membership) = {
                 let state = self.state.read().await;
@@ -757,6 +818,7 @@ impl RaftSnapshotBuilder<TypeConfig> for Arc<StateMachineStore> {
             })
         }
         .await;
+        build_attempt.finish();
         if result.is_ok() {
             self.metrics
                 .builds_completed
@@ -946,6 +1008,51 @@ fn legacy_format_version() -> u32 {
 mod tests {
     use super::*;
     use openraft::storage::RaftStateMachine;
+
+    #[tokio::test]
+    async fn snapshot_build_metrics_record_success_and_clear_progress_gauge() {
+        let directory = tempfile::tempdir().unwrap();
+        let store =
+            Arc::new(StateMachineStore::open(directory.path(), GroupKind::Metadata).unwrap());
+        let mut builder = store.clone();
+
+        builder.build_snapshot().await.unwrap();
+
+        let metrics = store.snapshot_metrics();
+        assert_eq!(metrics.builds_started, 1);
+        assert_eq!(metrics.builds_completed, 1);
+        assert_eq!(metrics.build_failures, 0);
+        assert_eq!(metrics.builds_in_progress, 0);
+        assert_eq!(metrics.build_duration_count, 1);
+        assert!(metrics.build_duration_nanos_sum > 0);
+        assert_eq!(
+            metrics.build_duration_nanos_max,
+            metrics.build_duration_nanos_sum
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_snapshot_build_records_duration_and_clears_progress_gauge() {
+        let directory = tempfile::tempdir().unwrap();
+        let store =
+            Arc::new(StateMachineStore::open(directory.path(), GroupKind::Metadata).unwrap());
+        fs::create_dir(directory.path().join("snapshot.json")).unwrap();
+        let mut builder = store.clone();
+
+        assert!(builder.build_snapshot().await.is_err());
+
+        let metrics = store.snapshot_metrics();
+        assert_eq!(metrics.builds_started, 1);
+        assert_eq!(metrics.builds_completed, 0);
+        assert_eq!(metrics.build_failures, 1);
+        assert_eq!(metrics.builds_in_progress, 0);
+        assert_eq!(metrics.build_duration_count, 1);
+        assert!(metrics.build_duration_nanos_sum > 0);
+        assert_eq!(
+            metrics.build_duration_nanos_max,
+            metrics.build_duration_nanos_sum
+        );
+    }
 
     fn snapshot_meta(index: u64, snapshot_id: &str) -> SnapshotMeta<NodeId, BasicNode> {
         SnapshotMeta {

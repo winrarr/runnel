@@ -1,6 +1,6 @@
 # TD-009: Clustered snapshot scalability and compatibility evidence
 
-- Status: exploratory evidence note; no implementation authorized
+- Status: snapshot-build telemetry and a bounded measurement probe are implemented; representation and recovery changes remain exploratory
 - Last reviewed: 2026-10-02
 - Baseline: `821f2c24b6b8feafdc6563cc6eb76746f75c34d1`
 - Scope: OpenRaft state-machine snapshot creation, transfer, installation,
@@ -268,7 +268,7 @@ current operations have the following qualitative shape:
 
 | Operation | Current work and temporary state | Evidence currently available |
 | --- | --- | --- |
-| Build | Traverse and JSON-encode `O(B + S)` materialized state while holding a read lock; retain an encoded copy for the snapshot cache; write a second JSON wrapper; then read/rewrite the journal suffix | The [TD-026 live cluster sample](../research/td-026-log-store-persistence-baseline.md) observes snapshot file-size deltas and completed build counts during two single runs; no build-duration, lock-wait, or snapshot-attributed peak-memory measurement. |
+| Build | Traverse and JSON-encode `O(B + S)` materialized state while holding a read lock; retain an encoded copy for the snapshot cache; write a second JSON wrapper; then read/rewrite the journal suffix | Process metrics now expose build in-progress, returned-attempt duration count/sum, and process-lifetime maximum duration across registered groups. They do not separate lock wait from serialization or persistence. The bounded probe records 100 ms active-build RSS samples as a lower bound, not peak or incremental memory; a completed live probe is needed for workload-specific measurements. |
 | Transfer | Send the complete encoded snapshot in chunks; the current receiver assembles the complete transfer in an in-memory cursor, and retrying starts at byte zero | Real-process multi-chunk and repeated-interruption test; no retry-waste or concurrent-transfer resource matrix. |
 | Install | Decode and materialize the complete state, then write a complete snapshot and checkpoint and compact journal while holding the state write lock | Failure-preservation tests, including recovery selection after an injected post-snapshot checkpoint error, and 256-message install/reopen test; no real-process incoming-install latency, temporary workspace, lock-wait, or large-payload matrix. |
 | Reopen | Read/validate the checkpoint and snapshot, choose the newer applied boundary, read the full journal, and replay entries after that boundary | TD-026 reports restart readiness and acknowledgement of offset 0 after a snapshot/purge cycle in two single runs; no snapshot-size matrix, controlled cold-start distribution, or recovery memory profile. |
@@ -292,6 +292,46 @@ note does not construct a `StateMachineStore`, build snapshots, or purge. Its
 Raft-log rewrite timings must not be attributed to snapshot work. The live
 sample improves file-growth and restart context, but neither experiment
 isolates snapshot serialization, transfer, install, or lock contention.
+
+### Snapshot-build telemetry and probe limits
+
+The Prometheus endpoint reports unlabeled per-process aggregates over all
+currently registered Raft groups. `runnel_snapshot_builds_in_progress` is the
+current count of active builder calls. The duration sum, count, and maximum
+cover builder calls that returned either success or failure; the elapsed
+wall-clock interval starts on entry to `build_snapshot` and ends after any
+wait to acquire the state read lock, encoding, snapshot persistence, journal
+compaction, and cache publication. The maximum is a process-lifetime gauge.
+Calls cancelled or aborted before returning decrement the active gauge but do
+not contribute duration, completed, or failure counts; `builds_started` still
+increases. These series are emitted when clustered
+snapshot diagnostics are available; the local engine omits them rather than
+reporting zero. No group, stream, peer, or consumer names are metric labels.
+The scrape aggregates a fixed number of atomics per registered group, adding
+four relaxed atomic reads to the existing snapshot-metric walk. The new
+attempt accounting adds a fixed number of relaxed atomic updates per builder
+call. The existing group walk is `O(G)` for `G` currently registered groups,
+with no additional traversal or per-group network request; `G` has no
+configured upper cap, so total scrape work remains proportional to registered
+groups.
+
+The opt-in `snapshot_build_hot_path` probe preloads one stream through public
+durable publishes, excludes that setup from publish latency, and runs 64 to
+4,096 measured durable publishes against 1,025 to 16,384 retained records.
+Combined logical payload across retained and measured records is capped at
+16 MiB per invocation. It waits at most 1 to 300 seconds for an idle boundary
+and a newly completed successful build. The result records per-process metric
+deltas and samples process RSS beside the active-build gauge at the existing
+100 ms resource cadence. It counts active-build samples taken during the
+measured publish loop separately from samples in the later completion wait;
+zero overlapping samples means the cadence may have missed a shorter build,
+not that no overlap occurred. Metric scraping is enabled only for this
+scenario; its observer duration is included in the result. The maximum RSS
+observed while a build gauge was active is a sampled lower bound, not peak or
+incremental memory. Publish latency excludes the post-publish build-completion
+wait, while the resource interval includes that wait through an idle boundary.
+The probe does not measure install, transfer, lock wait separately, cold
+recovery, or behavior beyond its explicit state and payload limits.
 
 The exact peak memory multiplier depends on allocator capacity, JSON shape,
 OpenRaft buffering, and payload distribution, so it should be measured rather
