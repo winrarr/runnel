@@ -278,7 +278,7 @@ Goal: bound retained storage and define what happens as consumers lag or usable 
 
 Rationale: an append-only broker without enforceable retention and admission policy eventually turns ordinary consumer lag into an availability or data-loss incident.
 
-Current progress: a real-server test now repeats synthetic same-stream storage-executor saturation and verifies bounded rejection, health/readiness/metrics behavior, recovery, and subsequent durable traffic. It does not exercise filesystem-capacity admission, `ENOSPC`, retention cleanup, or interrupted deletion; those outcomes remain unimplemented.
+Current progress: a real-server test now repeats synthetic same-stream storage-executor saturation and verifies bounded rejection, health/readiness/metrics behavior, recovery, and subsequent durable traffic. The [source-backed retention and disk-pressure review](research/retention-disk-pressure-semantics.md) separates history eligibility, consumer/replay entitlement, and physical write admission; it compares time/size limits, acknowledgement-driven retention, filesystem preflight and `ENOSPC`, cleanup ordering, and bounded observability without selecting a policy or API. It identifies that the local consumer cache is not a complete retention inventory and that existing `storage_bytes` is not filesystem capacity. It does not exercise filesystem-capacity admission, `ENOSPC`, retention cleanup, or interrupted deletion; those outcomes remain unimplemented and the acceptance criteria remain open.
 
 Constraints:
 
