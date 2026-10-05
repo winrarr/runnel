@@ -1792,6 +1792,44 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn persisted_storage_rejects_node_identity_mismatch_before_inspecting_groups() {
+        let directory = tempfile::tempdir().unwrap();
+        let cluster_name = "runnel-node-identity-mismatch-test";
+        let metadata_path = directory.path().join(STORAGE_METADATA_FILE);
+        let metadata_before = serde_json::to_vec(&PersistedStorageMetadata {
+            version: STORAGE_METADATA_FORMAT_VERSION,
+            cluster_name: cluster_name.to_owned(),
+            node_id: 1,
+        })
+        .unwrap();
+        fs::write(&metadata_path, &metadata_before).unwrap();
+
+        let groups_path = directory.path().join("groups");
+        let groups_before = b"persisted group state must not be inspected";
+        fs::write(&groups_path, groups_before).unwrap();
+
+        let error = match PersistentEngine::open(
+            2,
+            cluster_name.to_owned(),
+            directory.path(),
+            BTreeMap::from([(2, "127.0.0.1:0".to_owned())]),
+            false,
+        )
+        .await
+        {
+            Ok(_) => panic!("opening node 1 storage as node 2 must fail"),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains("node identity mismatch"), "{error}");
+        assert!(
+            error.contains("storage belongs to node 1, configured node is 2"),
+            "{error}"
+        );
+        assert_eq!(fs::read(&metadata_path).unwrap(), metadata_before);
+        assert_eq!(fs::read(&groups_path).unwrap(), groups_before);
+    }
+
+    #[tokio::test]
     async fn state_machine_journal_replays_and_discards_a_partial_tail() {
         let directory = tempfile::tempdir().unwrap();
         let state_directory = directory.path().join("state-machine");
