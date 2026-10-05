@@ -644,7 +644,7 @@ Constraints:
 Acceptance criteria:
 
 - a documented replacement scenario distinguishes preserved-state restart, temporary outage while peers continue, missing or inconsistent local state, configured identity mismatch, and an old or duplicate process returning with the same node ID;
-- storage-identity tests separately reject a configured cluster-name mismatch and a configured node-ID mismatch against the persisted marker before opening groups or rewriting the marker;
+- storage-identity tests separately reject a configured cluster-name mismatch and a configured node-ID mismatch against the persisted marker; the node-ID regression rejects the mismatch before inspecting group state or rewriting the marker;
 - a replacement cannot serve or affect quorum decisions before the cluster has validated its recovered state;
 - repeated interruption, restart, and leader failure during replacement preserve acknowledged data and consumer progress;
 - process, storage, transport, and consensus failures are distinguishable in tests and diagnostics;
