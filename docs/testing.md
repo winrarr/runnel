@@ -111,7 +111,7 @@ The Criterion suite includes durable publish, legacy publish/poll/ack, two-membe
 - `just cluster-replacement-test` explicitly enables the test-only permissive recovery feature and runs the experimental empty replacement-node snapshot recovery and interrupted snapshot transfer checks.
 - `just bench-cluster-peer-forwarding-smoke` runs the bounded multi-stream follower-forwarding scenario against three real broker processes; it is a correctness/lifecycle smoke, not performance evidence.
 - `just bench-cluster-peer-forwarding-container-smoke` runs the same bounded forwarding workload in three broker containers and fails unless both settled-boundary samples contain available non-negative socket counts for all three nodes with direct procfs provenance; it is a diagnostic lifecycle check, not performance evidence.
-- `just bench-test` runs the benchmark normalization and dashboard tests.
+- `just bench-test` runs the Python script test suite, including benchmark normalization/dashboard tests and the RNL1 size-audit parser fixtures.
 - `just ci` runs `just verify` and `just integration`; integration exercises the isolated process smoke, peer-forwarding process smoke, and single-node, three-node, and three-node peer-forwarding container smoke workflows, building an image unless a prebuilt integration image is supplied.
 
 ## Pull-request CI path selection
