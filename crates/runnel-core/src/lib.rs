@@ -28,10 +28,10 @@ use std::io::Write;
 use stream_log::REQUEST_ID_MAX_LEN;
 #[cfg(test)]
 use stream_log::{
-    LEGACY_HEADER_LEN, LEGACY_MAGIC, MAX_IN_MEMORY_RECORDS, REQUEST_ID_FORMAT_VERSION,
-    REQUEST_ID_HEADER_LEN, REQUEST_ID_MAGIC, REQUEST_ID_MAX_BODY_LEN, REQUEST_ID_MAX_KEY_LEN,
-    VERSIONED_FORMAT_VERSION, VERSIONED_HEADER_LEN, VERSIONED_MAGIC, VERSIONED_MAX_BODY_LEN,
-    VERSIONED_MAX_KEY_LEN,
+    LEGACY_HEADER_LEN, LEGACY_MAGIC, LEGACY_REQUEST_ID_FORMAT_VERSION, MAX_IN_MEMORY_RECORDS,
+    REQUEST_ID_FORMAT_VERSION, REQUEST_ID_HEADER_LEN, REQUEST_ID_MAGIC, REQUEST_ID_MAX_BODY_LEN,
+    REQUEST_ID_MAX_KEY_LEN, VERSIONED_FORMAT_VERSION, VERSIONED_HEADER_LEN, VERSIONED_MAGIC,
+    VERSIONED_MAX_BODY_LEN, VERSIONED_MAX_KEY_LEN,
 };
 const DEFAULT_ACK_TIMEOUT: Duration = Duration::from_secs(30);
 const DEAD_LETTER_SUFFIX: &str = ".dead-letter";
@@ -1172,7 +1172,7 @@ mod tests {
         let target = broker.get_stream("events.dead-letter").unwrap();
         let target = broker.lock_stream(&target).unwrap();
         assert_eq!(target.log.next_offset(), 1);
-        assert_eq!(target.log.request_id_count(), 1);
+        assert_eq!(target.log.request_identity_count(), 1);
     }
 
     #[test]
@@ -1258,7 +1258,7 @@ mod tests {
             let target = broker.get_stream("events.dead-letter").unwrap();
             let target = broker.lock_stream(&target).unwrap();
             assert_eq!(target.log.next_offset(), 1);
-            assert_eq!(target.log.request_offset(&move_id), Some(0));
+            assert_eq!(target.log.dead_letter_move_offset(&move_id), Some(0));
         }
 
         {
@@ -1272,7 +1272,7 @@ mod tests {
             let target = broker.get_stream("events.dead-letter").unwrap();
             let target = broker.lock_stream(&target).unwrap();
             assert_eq!(target.log.next_offset(), 1);
-            assert_eq!(target.log.request_offset(&move_id), Some(0));
+            assert_eq!(target.log.dead_letter_move_offset(&move_id), Some(0));
         }
 
         let broker = Broker::open(directory.path(), config).unwrap();
@@ -1280,7 +1280,7 @@ mod tests {
         let target = broker.get_stream("events.dead-letter").unwrap();
         let target = broker.lock_stream(&target).unwrap();
         assert_eq!(target.log.next_offset(), 1);
-        assert_eq!(target.log.request_offset(&move_id), Some(0));
+        assert_eq!(target.log.dead_letter_move_offset(&move_id), Some(0));
     }
 
     #[test]
@@ -1429,17 +1429,113 @@ mod tests {
     }
 
     fn assert_dead_letter_move(broker: &Broker, move_id: &str) {
+        assert_dead_letter_move_at(broker, move_id, 0, 1);
+    }
+
+    fn assert_dead_letter_move_at(
+        broker: &Broker,
+        move_id: &str,
+        offset: Offset,
+        target_len: Offset,
+    ) {
         let target = broker.get_stream("events.dead-letter").unwrap();
         let mut target = broker.lock_stream(&target).unwrap();
-        assert_eq!(target.log.next_offset(), 1);
-        assert_eq!(target.log.request_offset(move_id), Some(0));
-        let message = target.log.read_message("events.dead-letter", 0).unwrap();
+        assert_eq!(target.log.next_offset(), target_len);
+        assert_eq!(target.log.dead_letter_move_offset(move_id), Some(offset));
+        let message = target
+            .log
+            .read_message("events.dead-letter", offset)
+            .unwrap();
         assert_eq!(message.key.as_deref(), Some("order-1"));
         assert_eq!(message.payload, b"poison");
     }
 
+    fn append_legacy_request_id_record(
+        root: &Path,
+        stream: &str,
+        offset: Offset,
+        key: Option<&str>,
+        payload: &[u8],
+        request_id: &str,
+    ) {
+        let key_bytes = key.unwrap_or_default().as_bytes();
+        let request_id_bytes = request_id.as_bytes();
+        let payload_len = u32::try_from(payload.len()).unwrap();
+        let key_len = u32::try_from(key_bytes.len()).unwrap();
+        let request_id_len = u32::try_from(request_id_bytes.len()).unwrap();
+        let mut header = [0; REQUEST_ID_HEADER_LEN];
+        header[..4].copy_from_slice(REQUEST_ID_MAGIC);
+        header[4] = LEGACY_REQUEST_ID_FORMAT_VERSION;
+        header[6..8].copy_from_slice(&(REQUEST_ID_HEADER_LEN as u16).to_le_bytes());
+        header[8..12].copy_from_slice(&payload_len.to_le_bytes());
+        header[12..16].copy_from_slice(&payload_len.to_le_bytes());
+        header[16..24].copy_from_slice(&offset.to_le_bytes());
+        header[32..36].copy_from_slice(&key_len.to_le_bytes());
+        header[36..40].copy_from_slice(&request_id_len.to_le_bytes());
+        let checksum =
+            stream_log::request_id_checksum(&header, key_bytes, request_id_bytes, payload);
+        header[44..48].copy_from_slice(&checksum.to_le_bytes());
+
+        let path = stream_path(root, stream);
+        let mut file = OpenOptions::new().append(true).open(path).unwrap();
+        file.write_all(&header).unwrap();
+        file.write_all(key_bytes).unwrap();
+        file.write_all(request_id_bytes).unwrap();
+        file.write_all(payload).unwrap();
+        file.sync_all().unwrap();
+    }
+
     #[test]
-    fn dead_letter_move_content_mismatch_is_storage_error_without_acknowledgement() {
+    fn dead_letter_move_identity_rejects_different_content_after_restart() {
+        let directory = tempdir().unwrap();
+        let config = BrokerConfig::default();
+        let move_id = dead_letter_move_id("events", "worker", 0).unwrap();
+
+        {
+            let broker = Broker::open(directory.path(), config.clone()).unwrap();
+            broker.create_stream("events.dead-letter").unwrap();
+            let target = broker.get_stream("events.dead-letter").unwrap();
+            let mut target = broker.lock_stream(&target).unwrap();
+            assert_eq!(
+                target
+                    .log
+                    .append_with_move_id(
+                        Some("order-1".to_owned()),
+                        b"poison".to_vec(),
+                        move_id.clone(),
+                    )
+                    .unwrap(),
+                0
+            );
+        }
+
+        let broker = Broker::open(directory.path(), config).unwrap();
+        let target = broker.get_stream("events.dead-letter").unwrap();
+        let mut target = broker.lock_stream(&target).unwrap();
+        assert_eq!(
+            target
+                .log
+                .append_with_move_id(
+                    Some("order-1".to_owned()),
+                    b"poison".to_vec(),
+                    move_id.clone(),
+                )
+                .unwrap(),
+            0
+        );
+        assert!(matches!(
+            target.log.append_with_move_id(
+                Some("wrong-key".to_owned()),
+                b"different".to_vec(),
+                move_id,
+            ),
+            Err(BrokerError::Io(error)) if error.kind() == io::ErrorKind::InvalidData
+        ));
+        assert_eq!(target.log.next_offset(), 1);
+    }
+
+    #[test]
+    fn public_move_id_collision_with_different_content_does_not_block_source_progress() {
         for (key, payload) in [
             (Some("wrong-key".to_owned()), b"poison".to_vec()),
             (Some("order-1".to_owned()), b"wrong-payload".to_vec()),
@@ -1460,25 +1556,39 @@ mod tests {
 
             let move_id = dead_letter_move_id("events", "worker", 0).unwrap();
             broker
-                .publish_with_request_id("events.dead-letter", key, payload, Some(move_id))
+                .publish_with_request_id("events.dead-letter", key, payload.clone(), Some(move_id))
                 .unwrap();
-            let error = broker.poll("events", "worker").unwrap_err();
-            assert!(matches!(
-                error,
-                BrokerError::Io(error) if error.kind() == io::ErrorKind::InvalidData
-            ));
+            assert_eq!(broker.poll("events", "worker").unwrap(), PollResult::Empty);
+            let source_state = load_consumer_state(directory.path(), "events", "worker").unwrap();
+            assert_eq!(source_state.committed_offset, 1);
+            assert_dead_letter_move_at(
+                &broker,
+                &dead_letter_move_id("events", "worker", 0).unwrap(),
+                1,
+                2,
+            );
 
             drop(broker);
             let broker = Broker::open(directory.path(), config).unwrap();
-            assert!(matches!(
-                broker.poll("events", "worker"),
-                Err(BrokerError::Io(error)) if error.kind() == io::ErrorKind::InvalidData
-            ));
+            assert_eq!(broker.poll("events", "worker").unwrap(), PollResult::Empty);
+            assert_eq!(
+                broker
+                    .replay("events.dead-letter", "inspector", 0)
+                    .unwrap()
+                    .payload,
+                payload
+            );
+            assert_dead_letter_move_at(
+                &broker,
+                &dead_letter_move_id("events", "worker", 0).unwrap(),
+                1,
+                2,
+            );
         }
     }
 
     #[test]
-    fn dead_letter_move_same_content_public_id_reconciles_after_restart() {
+    fn same_content_public_move_id_does_not_impersonate_move_across_restart() {
         let directory = tempdir().unwrap();
         let config = BrokerConfig {
             ack_timeout: Duration::ZERO,
@@ -1519,7 +1629,10 @@ mod tests {
             let source_state = load_consumer_state(directory.path(), "events", "worker").unwrap();
             assert_eq!(source_state.committed_offset, 0);
             assert_eq!(source_state.delivery_attempts.get(&0), Some(&1));
-            assert_dead_letter_move(&broker, &move_id);
+            assert_dead_letter_move_at(&broker, &move_id, 1, 2);
+            let public = broker.replay("events.dead-letter", "inspector", 0).unwrap();
+            assert_eq!(public.key.as_deref(), Some("order-1"));
+            assert_eq!(public.payload, b"poison");
         }
 
         {
@@ -1528,12 +1641,150 @@ mod tests {
             let source_state = load_consumer_state(directory.path(), "events", "worker").unwrap();
             assert_eq!(source_state.committed_offset, 1);
             assert!(source_state.delivery_attempts.is_empty());
-            assert_dead_letter_move(&broker, &move_id);
+            assert_dead_letter_move_at(&broker, &move_id, 1, 2);
+            assert_eq!(
+                broker
+                    .publish_with_request_id(
+                        "events.dead-letter",
+                        Some("changed-key".to_owned()),
+                        b"changed payload".to_vec(),
+                        Some(move_id.clone()),
+                    )
+                    .unwrap(),
+                0
+            );
         }
 
         let broker = Broker::open(directory.path(), config).unwrap();
         assert_eq!(broker.poll("events", "worker").unwrap(), PollResult::Empty);
-        assert_dead_letter_move(&broker, &move_id);
+        assert_dead_letter_move_at(&broker, &move_id, 1, 2);
+        let public = broker.replay("events.dead-letter", "inspector", 0).unwrap();
+        assert_eq!(public.payload, b"poison");
+    }
+
+    #[test]
+    fn legacy_public_move_id_remains_public_and_does_not_satisfy_new_move() {
+        let directory = tempdir().unwrap();
+        let config = BrokerConfig {
+            ack_timeout: Duration::ZERO,
+            max_delivery_attempts: Some(1),
+        };
+        let move_id = dead_letter_move_id("events", "worker", 0).unwrap();
+
+        {
+            let broker = Broker::open(directory.path(), config.clone()).unwrap();
+            broker
+                .publish("events", Some("order-1".to_owned()), b"poison".to_vec())
+                .unwrap();
+            assert!(matches!(
+                broker.poll("events", "worker").unwrap(),
+                PollResult::Message(Message {
+                    offset: 0,
+                    delivery_attempt: Some(1),
+                    ..
+                })
+            ));
+            broker.create_stream("events.dead-letter").unwrap();
+        }
+        append_legacy_request_id_record(
+            directory.path(),
+            "events.dead-letter",
+            0,
+            Some("order-1"),
+            b"poison",
+            &move_id,
+        );
+
+        let broker = Broker::open(directory.path(), config).unwrap();
+        assert_eq!(broker.poll("events", "worker").unwrap(), PollResult::Empty);
+        let source_state = load_consumer_state(directory.path(), "events", "worker").unwrap();
+        assert_eq!(source_state.committed_offset, 1);
+        assert_dead_letter_move_at(&broker, &move_id, 1, 2);
+
+        assert_eq!(
+            broker
+                .publish_with_request_id(
+                    "events.dead-letter",
+                    Some("different-key".to_owned()),
+                    b"different payload".to_vec(),
+                    Some(move_id),
+                )
+                .unwrap(),
+            0
+        );
+        let old_public = broker.replay("events.dead-letter", "inspector", 0).unwrap();
+        assert_eq!(old_public.key.as_deref(), Some("order-1"));
+        assert_eq!(old_public.payload, b"poison");
+    }
+
+    #[test]
+    fn interrupted_legacy_move_retries_as_typed_move_once_after_restart() {
+        let directory = tempdir().unwrap();
+        let config = BrokerConfig {
+            ack_timeout: Duration::ZERO,
+            max_delivery_attempts: Some(1),
+        };
+        let move_id = dead_letter_move_id("events", "worker", 0).unwrap();
+
+        {
+            let broker = Broker::open(directory.path(), config.clone()).unwrap();
+            broker
+                .publish("events", Some("order-1".to_owned()), b"poison".to_vec())
+                .unwrap();
+            assert!(matches!(
+                broker.poll("events", "worker").unwrap(),
+                PollResult::Message(Message {
+                    offset: 0,
+                    delivery_attempt: Some(1),
+                    ..
+                })
+            ));
+            broker.create_stream("events.dead-letter").unwrap();
+        }
+        // This RNL3 v1 frame models an old internal append whose source ack was not durable.
+        append_legacy_request_id_record(
+            directory.path(),
+            "events.dead-letter",
+            0,
+            Some("order-1"),
+            b"poison",
+            &move_id,
+        );
+
+        {
+            let broker = Broker::open(directory.path(), config.clone()).unwrap();
+            broker.fail_next_dead_letter_ack_persist();
+            assert!(matches!(
+                broker.poll("events", "worker"),
+                Err(BrokerError::Io(error)) if error.kind() == io::ErrorKind::Interrupted
+            ));
+            let source_state = load_consumer_state(directory.path(), "events", "worker").unwrap();
+            assert_eq!(source_state.committed_offset, 0);
+            assert_dead_letter_move_at(&broker, &move_id, 1, 2);
+        }
+
+        {
+            let broker = Broker::open(directory.path(), config.clone()).unwrap();
+            assert_eq!(broker.poll("events", "worker").unwrap(), PollResult::Empty);
+            let source_state = load_consumer_state(directory.path(), "events", "worker").unwrap();
+            assert_eq!(source_state.committed_offset, 1);
+            assert_dead_letter_move_at(&broker, &move_id, 1, 2);
+        }
+
+        let broker = Broker::open(directory.path(), config).unwrap();
+        assert_eq!(broker.poll("events", "worker").unwrap(), PollResult::Empty);
+        assert_dead_letter_move_at(&broker, &move_id, 1, 2);
+        assert_eq!(
+            broker
+                .publish_with_request_id(
+                    "events.dead-letter",
+                    Some("changed-key".to_owned()),
+                    b"changed payload".to_vec(),
+                    Some(move_id),
+                )
+                .unwrap(),
+            0
+        );
     }
 
     fn delivery(result: Result<PollResult, BrokerError>) -> (Offset, String) {
@@ -1982,6 +2233,77 @@ mod tests {
             .unwrap(),
             0
         );
+    }
+
+    #[test]
+    fn request_id_reader_fails_closed_on_unknown_versions_and_identity_flags() {
+        for (version, flags, expected_error) in [
+            (3, 0, "unsupported request-aware record version"),
+            (
+                LEGACY_REQUEST_ID_FORMAT_VERSION,
+                1,
+                "unsupported request-aware record flags",
+            ),
+            (
+                REQUEST_ID_FORMAT_VERSION,
+                2,
+                "unsupported request-aware record flags",
+            ),
+        ] {
+            let directory = tempdir().unwrap();
+            {
+                let broker = Broker::open(directory.path(), BrokerConfig::default()).unwrap();
+                broker.create_stream("events").unwrap();
+            }
+
+            let path = directory.path().join("streams/events.log");
+            let mut header = [0; REQUEST_ID_HEADER_LEN];
+            header[..4].copy_from_slice(REQUEST_ID_MAGIC);
+            header[4] = version;
+            header[5] = flags;
+            let mut file = OpenOptions::new().append(true).open(&path).unwrap();
+            file.write_all(&header).unwrap();
+            file.sync_all().unwrap();
+
+            let error = match Broker::open(directory.path(), BrokerConfig::default()) {
+                Err(BrokerError::Io(error)) => error,
+                Err(error) => panic!("expected invalid request-aware frame, got {error}"),
+                Ok(_) => panic!("expected invalid request-aware frame to fail recovery"),
+            };
+            assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+            assert_eq!(error.to_string(), expected_error);
+        }
+    }
+
+    #[test]
+    fn request_identity_kind_is_covered_by_frame_checksum() {
+        let directory = tempdir().unwrap();
+        {
+            let broker = Broker::open(directory.path(), BrokerConfig::default()).unwrap();
+            broker
+                .publish_with_request_id(
+                    "events",
+                    None,
+                    b"payload".to_vec(),
+                    Some("public-id".to_owned()),
+                )
+                .unwrap();
+        }
+
+        let path = directory.path().join("streams/events.log");
+        let mut bytes = fs::read(&path).unwrap();
+        assert_eq!(bytes[4], REQUEST_ID_FORMAT_VERSION);
+        assert_eq!(bytes[5], 0);
+        bytes[5] = 1;
+        fs::write(&path, bytes).unwrap();
+
+        let error = match Broker::open(directory.path(), BrokerConfig::default()) {
+            Err(BrokerError::Io(error)) => error,
+            Err(error) => panic!("expected identity kind mutation to fail recovery, got {error}"),
+            Ok(_) => panic!("expected identity kind mutation to fail recovery"),
+        };
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert_eq!(error.to_string(), "request-aware record checksum mismatch");
     }
 
     #[tokio::test]

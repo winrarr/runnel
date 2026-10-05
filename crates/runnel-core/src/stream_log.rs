@@ -17,7 +17,8 @@ pub(super) const LEGACY_HEADER_LEN: usize = 28;
 pub(super) const VERSIONED_HEADER_LEN: usize = 44;
 pub(super) const REQUEST_ID_HEADER_LEN: usize = 48;
 pub(super) const VERSIONED_FORMAT_VERSION: u8 = 1;
-pub(super) const REQUEST_ID_FORMAT_VERSION: u8 = 1;
+pub(super) const LEGACY_REQUEST_ID_FORMAT_VERSION: u8 = 1;
+pub(super) const REQUEST_ID_FORMAT_VERSION: u8 = 2;
 const VERSIONED_ENCODING_BYTES: u8 = 0;
 const VERSIONED_COMPRESSION_NONE: u8 = 0;
 pub(super) const VERSIONED_MAX_KEY_LEN: u32 = 128;
@@ -33,6 +34,49 @@ const MAX_SPARSE_INDEX_ENTRIES: usize = 1024;
 struct RequestAwareLimits {
     max_key_len: u32,
     max_body_len: u32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RequestIdentityKind {
+    Public,
+    DeadLetterMove,
+}
+
+impl RequestIdentityKind {
+    fn flag(self) -> u8 {
+        match self {
+            Self::Public => 0,
+            Self::DeadLetterMove => 1,
+        }
+    }
+}
+
+#[derive(Debug, Default)]
+struct RequestIdentityIndex {
+    public: HashMap<String, Offset>,
+    dead_letter_moves: HashMap<String, Offset>,
+}
+
+impl RequestIdentityIndex {
+    fn get(&self, identity: &str, kind: RequestIdentityKind) -> Option<Offset> {
+        match kind {
+            RequestIdentityKind::Public => self.public.get(identity).copied(),
+            RequestIdentityKind::DeadLetterMove => self.dead_letter_moves.get(identity).copied(),
+        }
+    }
+
+    fn remember(&mut self, identity: String, kind: RequestIdentityKind, offset: Offset) {
+        let identities = match kind {
+            RequestIdentityKind::Public => &mut self.public,
+            RequestIdentityKind::DeadLetterMove => &mut self.dead_letter_moves,
+        };
+        identities.entry(identity).or_insert(offset);
+    }
+
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.public.len() + self.dead_letter_moves.len()
+    }
 }
 
 #[cfg(test)]
@@ -64,7 +108,9 @@ pub(super) struct StreamLog {
     // bounded while older replay requests use the bounded sparse index as a scan starting point.
     records: VecDeque<RecordIndex>,
     sparse_index: SparseIndex,
-    request_ids: HashMap<String, Offset>,
+    // Keep values at the existing one-offset size per retained identity. The second map adds
+    // per-stream and capacity-slack costs; only a cross-namespace collision duplicates a key.
+    request_ids: RequestIdentityIndex,
     next_offset: Offset,
     #[cfg(test)]
     dead_letter_move_write_failure: Option<DeadLetterMoveWriteFailure>,
@@ -82,7 +128,7 @@ impl StreamLog {
             durable_format,
             records: VecDeque::with_capacity(MAX_IN_MEMORY_RECORDS),
             sparse_index: SparseIndex::new(),
-            request_ids: HashMap::new(),
+            request_ids: RequestIdentityIndex::default(),
             next_offset: 0,
             #[cfg(test)]
             dead_letter_move_write_failure: None,
@@ -94,7 +140,7 @@ impl StreamLog {
         let file_len = file.metadata()?.len();
         let mut records = VecDeque::with_capacity(MAX_IN_MEMORY_RECORDS);
         let mut sparse_index = SparseIndex::new();
-        let mut request_ids = HashMap::new();
+        let mut request_ids = RequestIdentityIndex::default();
         let mut cursor = 0;
         let mut next_offset = 0;
         file.seek(SeekFrom::Start(cursor))?;
@@ -107,10 +153,11 @@ impl StreamLog {
             next_offset = next_offset
                 .checked_add(1)
                 .ok_or_else(|| invalid_record_data("record offset exceeds u64 range"))?;
-            if let Some(request_id) = parsed.index.request_id.as_ref() {
-                request_ids
-                    .entry(request_id.clone())
-                    .or_insert(parsed.index.offset);
+            if let (Some(request_id), Some(identity_kind)) = (
+                parsed.index.request_id.as_ref(),
+                parsed.index.request_identity_kind,
+            ) {
+                request_ids.remember(request_id.clone(), identity_kind, parsed.index.offset);
             }
             remember_record(&mut records, parsed.index);
         }
@@ -132,7 +179,15 @@ impl StreamLog {
     }
 
     pub(super) fn request_offset(&self, request_id: &str) -> Option<Offset> {
-        self.request_ids.get(request_id).copied()
+        self.identity_offset(request_id, RequestIdentityKind::Public)
+    }
+
+    pub(super) fn dead_letter_move_offset(&self, move_id: &str) -> Option<Offset> {
+        self.identity_offset(move_id, RequestIdentityKind::DeadLetterMove)
+    }
+
+    fn identity_offset(&self, identity: &str, kind: RequestIdentityKind) -> Option<Offset> {
+        self.request_ids.get(identity, kind)
     }
 
     #[cfg(test)]
@@ -141,7 +196,7 @@ impl StreamLog {
     }
 
     #[cfg(test)]
-    pub(super) fn request_id_count(&self) -> usize {
+    pub(super) fn request_identity_count(&self) -> usize {
         self.request_ids.len()
     }
 
@@ -240,6 +295,7 @@ impl StreamLog {
                 payload_len,
                 key,
                 request_id: None,
+                request_identity_kind: None,
                 published_at_ms,
             },
         );
@@ -313,6 +369,7 @@ impl StreamLog {
                 payload_len: body_len,
                 key,
                 request_id: None,
+                request_identity_kind: None,
                 published_at_ms,
             },
         );
@@ -326,7 +383,13 @@ impl StreamLog {
         payload: Vec<u8>,
         request_id: String,
     ) -> Result<Offset, BrokerError> {
-        self.append_with_request_id_sync(key, payload, request_id, true, false)
+        self.append_with_request_id_sync(
+            key,
+            payload,
+            request_id,
+            RequestIdentityKind::Public,
+            true,
+        )
     }
 
     pub(super) fn append_with_move_id(
@@ -335,7 +398,7 @@ impl StreamLog {
         payload: Vec<u8>,
         move_id: String,
     ) -> Result<Offset, BrokerError> {
-        if let Some(offset) = self.request_ids.get(&move_id).copied() {
+        if let Some(offset) = self.dead_letter_move_offset(&move_id) {
             let existing = self.find_record(offset)?;
             if existing.key.as_ref() != key.as_ref() || self.read_payload(&existing)? != payload {
                 return Err(invalid_record_data(
@@ -347,7 +410,13 @@ impl StreamLog {
 
         // Move identities are internal request-aware records. Unlike public request IDs, their
         // key and payload are part of the identity invariant and are checked on every retry.
-        self.append_with_request_id_sync(key, payload, move_id, true, true)
+        self.append_with_request_id_sync(
+            key,
+            payload,
+            move_id,
+            RequestIdentityKind::DeadLetterMove,
+            true,
+        )
     }
 
     fn append_with_request_id_sync(
@@ -355,8 +424,8 @@ impl StreamLog {
         key: Option<String>,
         payload: Vec<u8>,
         request_id: String,
+        identity_kind: RequestIdentityKind,
         sync: bool,
-        dead_letter_move: bool,
     ) -> Result<Offset, BrokerError> {
         let limits = request_aware_limits(self.durable_format);
         let key_bytes = key.as_deref().unwrap_or_default().as_bytes();
@@ -402,6 +471,7 @@ impl StreamLog {
         let mut header = [0; REQUEST_ID_HEADER_LEN];
         header[..4].copy_from_slice(REQUEST_ID_MAGIC);
         header[4] = REQUEST_ID_FORMAT_VERSION;
+        header[5] = identity_kind.flag();
         header[6..8].copy_from_slice(&(REQUEST_ID_HEADER_LEN as u16).to_le_bytes());
         header[8..12].copy_from_slice(&payload_len.to_le_bytes());
         header[12..16].copy_from_slice(&payload_len.to_le_bytes());
@@ -413,13 +483,11 @@ impl StreamLog {
         header[44..48].copy_from_slice(&checksum.to_le_bytes());
 
         #[cfg(test)]
-        let move_write_failure = if dead_letter_move {
+        let move_write_failure = if identity_kind == RequestIdentityKind::DeadLetterMove {
             self.dead_letter_move_write_failure.take()
         } else {
             None
         };
-        #[cfg(not(test))]
-        let _ = dead_letter_move;
         #[cfg(test)]
         if matches!(
             move_write_failure,
@@ -458,10 +526,11 @@ impl StreamLog {
                 payload_len,
                 key,
                 request_id: Some(request_id.clone()),
+                request_identity_kind: Some(identity_kind),
                 published_at_ms,
             },
         );
-        self.request_ids.insert(request_id, offset);
+        self.request_ids.remember(request_id, identity_kind, offset);
         self.next_offset = offset.saturating_add(1);
         Ok(offset)
     }
@@ -480,16 +549,20 @@ impl StreamLog {
         } in records
         {
             if let Some(request_id) = request_id.as_ref()
-                && let Some(offset) = self.request_ids.get(request_id)
+                && let Some(offset) = self.request_offset(request_id)
             {
-                outcomes.push(Ok(*offset));
+                outcomes.push(Ok(offset));
                 continue;
             }
 
             let outcome = match request_id {
-                Some(request_id) => {
-                    self.append_with_request_id_sync(key, payload, request_id, false, false)
-                }
+                Some(request_id) => self.append_with_request_id_sync(
+                    key,
+                    payload,
+                    request_id,
+                    RequestIdentityKind::Public,
+                    false,
+                ),
                 None => self.append_with_sync(key, payload, false),
             };
             match outcome {
@@ -646,6 +719,7 @@ pub(super) struct RecordIndex {
     payload_len: u32,
     key: Option<String>,
     request_id: Option<String>,
+    request_identity_kind: Option<RequestIdentityKind>,
     published_at_ms: u64,
 }
 
@@ -798,6 +872,7 @@ fn read_legacy_record(
             payload_len,
             key,
             request_id: None,
+            request_identity_kind: None,
             published_at_ms,
         },
         next_cursor: cursor + record_len,
@@ -904,6 +979,7 @@ fn read_versioned_record(
             payload_len: stored_len,
             key,
             request_id: None,
+            request_identity_kind: None,
             published_at_ms: u64::from_le_bytes(header[24..32].try_into().unwrap()),
         },
         next_cursor: cursor + record_len,
@@ -924,16 +1000,22 @@ fn read_request_id_record(
     let mut header = [0; REQUEST_ID_HEADER_LEN];
     header[..4].copy_from_slice(&magic);
     file.read_exact(&mut header[4..])?;
-    if header[4] != REQUEST_ID_FORMAT_VERSION {
-        return Err(invalid_record_data(
-            "unsupported request-aware record version",
-        ));
-    }
-    if header[5] != 0 {
-        return Err(invalid_record_data(
-            "unsupported request-aware record flags",
-        ));
-    }
+    let identity_kind = match (header[4], header[5]) {
+        (LEGACY_REQUEST_ID_FORMAT_VERSION, 0) | (REQUEST_ID_FORMAT_VERSION, 0) => {
+            RequestIdentityKind::Public
+        }
+        (REQUEST_ID_FORMAT_VERSION, 1) => RequestIdentityKind::DeadLetterMove,
+        (LEGACY_REQUEST_ID_FORMAT_VERSION, _) | (REQUEST_ID_FORMAT_VERSION, _) => {
+            return Err(invalid_record_data(
+                "unsupported request-aware record flags",
+            ));
+        }
+        _ => {
+            return Err(invalid_record_data(
+                "unsupported request-aware record version",
+            ));
+        }
+    };
     let header_len = u16::from_le_bytes(header[6..8].try_into().unwrap()) as usize;
     if header_len != REQUEST_ID_HEADER_LEN {
         return Err(invalid_record_data(
@@ -1025,6 +1107,7 @@ fn read_request_id_record(
             payload_len: stored_len,
             key,
             request_id: Some(request_id),
+            request_identity_kind: Some(identity_kind),
             published_at_ms: u64::from_le_bytes(header[24..32].try_into().unwrap()),
         },
         next_cursor: cursor + record_len,
@@ -1085,7 +1168,7 @@ fn versioned_checksum(header: &[u8; VERSIONED_HEADER_LEN], key: &[u8], body: &[u
     crc32c_finalize(crc32c_update(checksum, body))
 }
 
-fn request_id_checksum(
+pub(super) fn request_id_checksum(
     header: &[u8; REQUEST_ID_HEADER_LEN],
     key: &[u8],
     request_id: &[u8],
