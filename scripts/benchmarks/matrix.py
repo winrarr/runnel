@@ -18,6 +18,7 @@ import subprocess
 import sys
 import time
 from datetime import UTC, datetime
+from itertools import product
 from pathlib import Path
 from typing import Any, Callable
 
@@ -47,6 +48,17 @@ from cluster import (  # noqa: E402
     parse_positive_float,
     parse_scenarios,
     parse_sizes,
+)
+from cluster_scenarios import (  # noqa: E402
+    DEFAULT_RAFT_LOG_GROWTH_CYCLE_TIMEOUT_SECONDS,
+    DEFAULT_RAFT_LOG_GROWTH_MESSAGES,
+    DEFAULT_RAFT_LOG_GROWTH_OBSERVATION_EVERY,
+    MAX_RAFT_LOG_GROWTH_CYCLE_TIMEOUT_SECONDS,
+    MAX_RAFT_LOG_GROWTH_LOGICAL_PAYLOAD_BYTES,
+    MAX_RAFT_LOG_GROWTH_MESSAGES,
+    MAX_RAFT_LOG_GROWTH_OBSERVATION_EVERY,
+    MIN_RAFT_LOG_GROWTH_CYCLE_TIMEOUT_SECONDS,
+    MIN_RAFT_LOG_GROWTH_MESSAGES,
 )
 from common import (  # noqa: E402
     BenchmarkError,
@@ -149,6 +161,36 @@ def parse_args() -> argparse.Namespace:
             value, minimum=1_025, label="retained message values"
         ),
         default=DEFAULT_RETAINED_MESSAGE_VALUES,
+    )
+    parser.add_argument(
+        "--raft-log-growth-message-values",
+        type=lambda value: parse_integer_values(
+            value,
+            minimum=MIN_RAFT_LOG_GROWTH_MESSAGES,
+            label="Raft log growth messages",
+        ),
+        default=[DEFAULT_RAFT_LOG_GROWTH_MESSAGES],
+        help=(
+            "comma-separated measured publish counts for raft_log_growth; "
+            "the observed retained log size can be lower when purge advances"
+        ),
+    )
+    parser.add_argument(
+        "--raft-log-growth-observation-every-values",
+        type=lambda value: parse_integer_values(
+            value, minimum=1, label="Raft log growth observation intervals"
+        ),
+        default=[DEFAULT_RAFT_LOG_GROWTH_OBSERVATION_EVERY],
+        help=(
+            "comma-separated publish intervals for sampling persisted Raft and "
+            "state-machine paths during raft_log_growth"
+        ),
+    )
+    parser.add_argument(
+        "--raft-log-growth-cycle-timeout-seconds",
+        type=parse_positive_float,
+        default=DEFAULT_RAFT_LOG_GROWTH_CYCLE_TIMEOUT_SECONDS,
+        help="bounded wait for an observed snapshot/purge cycle in raft_log_growth",
     )
     parser.add_argument(
         "--runtimes",
@@ -261,6 +303,41 @@ def parse_args() -> argparse.Namespace:
             "batch size values must be between 1 and "
             f"{MAX_PUBLISH_BATCH_SIZE} records"
         )
+    if any(
+        value > MAX_RAFT_LOG_GROWTH_MESSAGES
+        for value in args.raft_log_growth_message_values
+    ):
+        parser.error(
+            "Raft log growth message values must not exceed "
+            f"{MAX_RAFT_LOG_GROWTH_MESSAGES}"
+        )
+    if any(
+        value > MAX_RAFT_LOG_GROWTH_OBSERVATION_EVERY
+        for value in args.raft_log_growth_observation_every_values
+    ):
+        parser.error(
+            "Raft log growth observation intervals must not exceed "
+            f"{MAX_RAFT_LOG_GROWTH_OBSERVATION_EVERY}"
+        )
+    if not (
+        MIN_RAFT_LOG_GROWTH_CYCLE_TIMEOUT_SECONDS
+        <= args.raft_log_growth_cycle_timeout_seconds
+        <= MAX_RAFT_LOG_GROWTH_CYCLE_TIMEOUT_SECONDS
+    ):
+        parser.error(
+            "Raft log growth cycle timeout must be between "
+            f"{MIN_RAFT_LOG_GROWTH_CYCLE_TIMEOUT_SECONDS:g} and "
+            f"{MAX_RAFT_LOG_GROWTH_CYCLE_TIMEOUT_SECONDS:g} seconds"
+        )
+    if (
+        "raft_log_growth" in args.scenarios
+        and max(args.raft_log_growth_message_values) * max(args.payload_sizes)
+        > MAX_RAFT_LOG_GROWTH_LOGICAL_PAYLOAD_BYTES
+    ):
+        parser.error(
+            "Raft log growth workload volume exceeds the bounded maximum of "
+            f"{MAX_RAFT_LOG_GROWTH_LOGICAL_PAYLOAD_BYTES} logical bytes"
+        )
     if any(value > MAX_PEER_FORWARDING_CONCURRENCY for value in args.concurrency_values):
         parser.error(
             "concurrency values exceed the bounded maximum "
@@ -335,32 +412,58 @@ def matrix_cases(args: argparse.Namespace) -> list[dict[str, Any]]:
             if scenario == "publish_batch"
             else args.batch_size_values[:1]
         )
+        raft_log_growth_message_values = (
+            args.raft_log_growth_message_values
+            if scenario == "raft_log_growth"
+            else args.raft_log_growth_message_values[:1]
+        )
+        raft_log_growth_observation_values = (
+            args.raft_log_growth_observation_every_values
+            if scenario == "raft_log_growth"
+            else args.raft_log_growth_observation_every_values[:1]
+        )
         stream_count_values = (
             args.peer_forwarding_stream_count_values
             if scenario == "peer_forwarding"
             else args.peer_forwarding_stream_count_values[:1]
         )
-        for runtime in args.runtimes:
-            for payload_size in args.payload_sizes:
-                for concurrency in concurrency_values:
-                    for delay_ms in delay_values:
-                        for retained_messages in retained_values:
-                            for batch_size in batch_size_values:
-                                for stream_count in stream_count_values:
-                                    for repetition in range(1, args.repetitions + 1):
-                                        cases.append(
-                                            {
-                                                "scenario": scenario,
-                                                "runtime": runtime,
-                                                "payload_size": payload_size,
-                                                "concurrency": concurrency,
-                                                "slow_consumer_delay_ms": delay_ms,
-                                                "retained_messages": retained_messages,
-                                                "batch_size": batch_size,
-                                                "stream_count": stream_count,
-                                                "repetition": repetition,
-                                            }
-                                        )
+        for (
+            runtime,
+            payload_size,
+            concurrency,
+            delay_ms,
+            retained_messages,
+            batch_size,
+            growth_messages,
+            observation_every,
+            stream_count,
+        ) in product(
+            args.runtimes,
+            args.payload_sizes,
+            concurrency_values,
+            delay_values,
+            retained_values,
+            batch_size_values,
+            raft_log_growth_message_values,
+            raft_log_growth_observation_values,
+            stream_count_values,
+        ):
+            for repetition in range(1, args.repetitions + 1):
+                cases.append(
+                    {
+                        "scenario": scenario,
+                        "runtime": runtime,
+                        "payload_size": payload_size,
+                        "concurrency": concurrency,
+                        "slow_consumer_delay_ms": delay_ms,
+                        "retained_messages": retained_messages,
+                        "batch_size": batch_size,
+                        "stream_count": stream_count,
+                        "raft_log_growth_messages": growth_messages,
+                        "raft_log_growth_observation_every": observation_every,
+                        "repetition": repetition,
+                    }
+                )
     if len(cases) > args.max_cases:
         raise BenchmarkError(
             f"matrix expands to {len(cases)} cases, exceeding --max-cases {args.max_cases}"
@@ -411,6 +514,12 @@ def case_command(
             str(case["batch_size"]),
             "--retained-messages",
             str(case["retained_messages"]),
+            "--raft-log-growth-messages",
+            str(case["raft_log_growth_messages"]),
+            "--raft-log-growth-observation-every",
+            str(case["raft_log_growth_observation_every"]),
+            "--raft-log-growth-cycle-timeout-seconds",
+            str(args.raft_log_growth_cycle_timeout_seconds),
             "--peer-forwarding-concurrency",
             str(case["concurrency"]),
             "--peer-response-delay-ms",
@@ -442,11 +551,22 @@ def case_id(index: int, case: dict[str, Any]) -> str:
         if case["scenario"] == "peer_forwarding"
         else ""
     )
+    retained = (
+        f"retained-{case['retained_messages']}-"
+        if case["scenario"] in {"cluster_retained_recovery", "retained_hot_path"}
+        else ""
+    )
+    growth = (
+        f"growth-{case['raft_log_growth_messages']}-observe-"
+        f"{case['raft_log_growth_observation_every']}-"
+        if case["scenario"] == "raft_log_growth"
+        else ""
+    )
     return (
         f"case-{index:03d}-{scenario}-{case['runtime']}-"
         f"payload-{case['payload_size']}-c{case['concurrency']}-"
-        f"delay-{case['slow_consumer_delay_ms']}-retained-{case['retained_messages']}-"
-        f"{batch_size}{stream_count}r{case['repetition']}"
+        f"delay-{case['slow_consumer_delay_ms']}-{retained}"
+        f"{batch_size}{stream_count}{growth}r{case['repetition']}"
     )
 
 
@@ -606,6 +726,13 @@ def run_matrix(
         "slow_consumer_timeout_seconds": args.slow_consumer_timeout_seconds,
         "retained_message_values": args.retained_message_values,
         "batch_size_values": args.batch_size_values,
+        "raft_log_growth_message_values": args.raft_log_growth_message_values,
+        "raft_log_growth_observation_every_values": (
+            args.raft_log_growth_observation_every_values
+        ),
+        "raft_log_growth_cycle_timeout_seconds": (
+            args.raft_log_growth_cycle_timeout_seconds
+        ),
         "runtimes": args.runtimes,
         "repetitions": args.repetitions,
         "ack_timeout_ms": args.ack_timeout_ms,
