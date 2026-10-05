@@ -1,6 +1,8 @@
 import io
 import json
+import os
 import struct
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -190,6 +192,56 @@ class Rnl1SizeAuditTests(unittest.TestCase):
                 self.assertEqual(after.st_mtime_ns, before.st_mtime_ns)
                 self.assertEqual(after.st_ctime_ns, before.st_ctime_ns)
             self.assertEqual(target.read_bytes(), original)
+
+    @unittest.skipUnless(hasattr(os, "mkfifo"), "FIFO fixture requires mkfifo")
+    def test_fifo_is_rejected_promptly_before_open(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            data = data_directory(Path(temporary))
+            fifo = data / "streams" / "events.log"
+            os.mkfifo(fifo)
+            regular = data / "streams" / "regular.log"
+            regular.write_bytes(legacy_record(0, b"key", b"payload"))
+
+            directory_fd = audit._open_stream_directory(data / "streams")
+            real_open = os.open
+            real_stat = os.stat
+            try:
+                with patch.object(audit.os, "open", wraps=real_open) as open_path:
+                    with self.assertRaisesRegex(OSError, "not a regular file"):
+                        audit._open_regular_read_only(fifo.name, directory_fd)
+                    open_path.assert_not_called()
+
+                regular_metadata = real_stat(regular)
+                with (
+                    patch.object(audit.os, "stat", return_value=regular_metadata),
+                    patch.object(audit.os, "open", wraps=real_open) as open_race,
+                ):
+                    with self.assertRaisesRegex(OSError, "not a regular file"):
+                        audit._open_regular_read_only(fifo.name, directory_fd)
+                    flags = open_race.call_args.args[1]
+                    self.assertTrue(flags & os.O_NONBLOCK)
+            finally:
+                os.close(directory_fd)
+
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    str(SCRIPT_DIR.parent / "rnl1_size_audit.py"),
+                    str(data),
+                ],
+                capture_output=True,
+                text=True,
+                timeout=5,
+                check=False,
+            )
+
+            self.assertEqual(result.returncode, 1, result.stderr)
+            report = json.loads(result.stdout)
+            self.assertEqual(report["report_state"], "unreadable")
+            self.assertEqual(report["files"][0]["state"], "unreadable")
+            self.assertIn(
+                "not a regular file", report["files"][0]["error"]["reason"]
+            )
 
     def test_file_changed_during_scan_is_flagged(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

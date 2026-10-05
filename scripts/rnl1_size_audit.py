@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Read-only, bounded-memory inventory of Runnel stream-log record sizes.
+"""Read-only Runnel log-size inventory with fixed per-record scratch memory.
 
 The report contains lengths and validation outcomes only. It never emits stream
 keys, request IDs, payload bytes, or absolute source paths. Incomplete final
@@ -489,13 +489,20 @@ def _scan_open_file(file: BinaryIO, stats: FileStats) -> None:
 def _no_mutation_flags(*, directory: bool = False) -> int:
     nofollow = getattr(os, "O_NOFOLLOW", None)
     noatime = getattr(os, "O_NOATIME", None)
+    nonblock = 0 if directory else getattr(os, "O_NONBLOCK", None)
     directory_flag = getattr(os, "O_DIRECTORY", None) if directory else 0
-    if nofollow is None or noatime is None or directory_flag is None:
+    if (
+        nofollow is None
+        or noatime is None
+        or nonblock is None
+        or directory_flag is None
+    ):
         raise OSError(
             errno.ENOTSUP,
-            "this platform cannot guarantee no-atime, no-follow inspection",
+            "this platform cannot guarantee no-atime, no-follow, "
+            "nonblocking inspection",
         )
-    return os.O_RDONLY | nofollow | noatime | directory_flag
+    return os.O_RDONLY | nofollow | noatime | nonblock | directory_flag
 
 
 def _open_stream_directory(path: Path) -> int:
@@ -506,6 +513,8 @@ def _open_regular_read_only(name: str, directory_fd: int) -> BinaryIO:
     metadata = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
     if stat.S_ISLNK(metadata.st_mode):
         raise OSError(errno.ELOOP, "symbolic link refused")
+    if not stat.S_ISREG(metadata.st_mode):
+        raise OSError(errno.EINVAL, "not a regular file")
     descriptor = os.open(
         name,
         _no_mutation_flags(),
@@ -618,7 +627,14 @@ def audit_data_directory(data_directory: Path) -> dict[str, object]:
         },
         "report_state": report_state,
         "read_only": True,
-        "open_flags": ["O_RDONLY", "O_NOFOLLOW", "O_NOATIME"],
+        "open_flags": {
+            "stream_directory": ["O_RDONLY", "O_NOFOLLOW", "O_NOATIME", "O_DIRECTORY"],
+            "log_files": ["O_RDONLY", "O_NOFOLLOW", "O_NOATIME", "O_NONBLOCK"],
+        },
+        "memory_model": (
+            "fixed 64 KiB record scratch buffer; summaries and JSON output grow "
+            "with the number of log files"
+        ),
         "directory_changed_during_scan": directory_changed,
         "scratch_buffer_bytes": SCRATCH_BUFFER_BYTES,
         "validated": [
