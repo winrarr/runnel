@@ -694,7 +694,7 @@ Goal: support efficient production data and peer communication without changing 
 
 Rationale: framing, payload representation, connection management, copying, and batching can dominate small-message latency and throughput.
 
-Current progress: binary-safe payloads, bounded peer control/data capacity, lazy idle-socket expiry, payload-copy reductions, peer-forwarding saturation scenarios, a bounded fixed-total-work peer-forwarding sweep across stream/data-group counts, and publish-batch workload coverage now exist. Protocol versioning, multiplexing or cluster-scoped transport ownership, transport-strategy comparisons, equivalent end-to-end measurements, and broader failure semantics remain open.
+Current progress: binary-safe payloads, bounded peer control/data capacity, lazy idle-socket expiry, payload-copy reductions, peer-forwarding saturation scenarios, a bounded fixed-total-work peer-forwarding sweep across stream/data-group counts, and publish-batch workload coverage now exist. The internal peer RPC is still unversioned; its JSON schema includes Serde-serialized OpenRaft types, and the development deployment does not support mixed-binary rolling upgrades. The [peer protocol versioning research](research/peer-protocol-versioning.md) records why a wire marker alone would not establish compatibility and the policy, mismatch handling, and real-process upgrade evidence needed before making that promise. Protocol versioning, multiplexing or cluster-scoped transport ownership, transport-strategy comparisons, equivalent end-to-end measurements, and broader failure semantics remain open.
 
 Constraints:
 
