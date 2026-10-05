@@ -57,6 +57,9 @@ for the same evidence labels and outcome/evidence gates.
   distinguishes the current unversioned internal RPC schema from local
   storage and public-client versions, and records the evidence gates for any
   future mixed-version or rolling-upgrade support.
+- [Cluster peer transport security](cluster-peer-transport-security.md)
+  records the unauthenticated static peer boundary, reference designs, and
+  evidence needed before choosing transport security.
 - [TD-013 native competitor benchmark semantics](td-013-native-competitor-semantics.md)
   records the current native-tool boundaries and a future common workload
   envelope without treating the comparison as a ranking.
