@@ -1,13 +1,14 @@
 # Retention and disk-pressure design
 
 - Status: exploratory design; implementation sequence is illustrative
-- Last reviewed: 2026-10-03
-- Baseline: `71631f127665b5086931694ca55ba4adae6e705e`
+- Last reviewed: 2026-10-05
+- Baseline: `959565214725760b77e71ae876865dff8444dbc9`
 - Reading guide: [design-note conventions](README.md)
 - Scope: safe retained-history policy, bounded cleanup, and durable-write admission
 - Related outcome: [Make retention and disk-pressure behavior safe](../backlog.md#make-retention-and-disk-pressure-behavior-safe)
 - Related decision: [ADR 0028: consumer-lag observation semantics](../decisions/0028-consumer-lag-observation-semantics.md)
-- Related research: [Distributed architecture exploration](../research/distributed-architecture-options.md),
+- Related research: [Retention and disk-pressure semantics](../research/retention-disk-pressure-semantics.md),
+  [Distributed architecture exploration](../research/distributed-architecture-options.md),
   [Raft follower recovery and replacement](../research/raft-recovery-and-replacement.md),
   [Message encoding and compression study](../research/message-encoding-and-compression.md),
   and [Systems performance research for Runnel](../research/systems-performance-research.md)
@@ -144,9 +145,15 @@ The comparison leaves three deliberate differences from the reference systems:
   future API needs first-ack removal, it should be a separately named semantic
   mode with its own compatibility and recovery decision.
 
-The following policy is the recommended starting point. It is deliberately
-not accepted until the implementation, failure tests, and measurements below
-exist and a dedicated ADR records the compatibility consequences.
+The source review [Retention and disk-pressure semantics](../research/retention-disk-pressure-semantics.md)
+maps the remaining choices across history eligibility, consumer/replay state,
+age/size/lag/reserve precedence, `ENOSPC` outcomes, deletion recovery, and
+bounded operator signals. The policy below is one candidate for discussion;
+it is not selected by the comparison or accepted for implementation.
+
+The following policy is an illustrative candidate. It is deliberately not
+accepted until the implementation, failure tests, and measurements below exist
+and a dedicated ADR records the compatibility consequences.
 
 ### Configuration vocabulary
 
@@ -222,8 +229,11 @@ cleanup workspace.
 
 ### Precedence
 
-When a retention cycle and a publish happen together, apply decisions in this
-order:
+The order below is a candidate, not an accepted precedence rule. In particular,
+it does not decide whether a configured age/size limit may override consumer or
+replay protection; that choice is mapped in the [source review](../research/retention-disk-pressure-semantics.md).
+If this candidate is retained, a retention cycle and publish would be handled
+in this order:
 
 1. Validate the request and preserve durable-write, checkpoint, active-lease,
    corruption, and identity safety. Disk pressure never authorizes an
@@ -904,32 +914,32 @@ gates, a bounded-resource budget, and a documented p99/p99.9 regression policy
 in the ADR, then use the existing repeated-range rules to distinguish stable
 direction from host noise.
 
-## Recommended initial operational defaults
+## Unvalidated operational hypotheses
 
-These are rollout hypotheses, not accepted defaults:
+No numeric reserve, pressure watermark, cleanup interval, or cleanup budget is
+supported by current measurements. Earlier example values are removed from
+this plan rather than treated as launch defaults. The evidence needed to set
+them is described in [Retention and disk-pressure semantics](../research/retention-disk-pressure-semantics.md)
+and the benchmark plan below.
 
-- Existing streams retain unlimited history. If finite retention is later
-  enabled, `protect` is the conservative initial lag policy until an operator
-  explicitly selects the destructive `expire` behavior.
-- A newly created stream should also default to unlimited retention in the
-  first compatibility release. A production deployment should be encouraged
-  to set a finite `max_bytes` or `max_age` after measuring its replay needs.
-- Reserve defaults to the greater of 10% of effective capacity, 256 MiB, and
-  four maximum publish batches, with validation that one maximum legal durable
-  operation still fits. Operators can set an explicit reserve for known
-  snapshot/cleanup amplification.
-- Low pressure begins below reserve plus two maximum publish batches; critical
-  pressure begins at reserve. Recovery of normal admission uses hysteresis at
-  the low-water mark plus the same bounded margin.
-- Cleanup runs periodically (a starting hypothesis is 30 seconds), runs
-  immediately on low pressure, and deletes no more than one segment or a
-  bounded byte/time budget per turn. The segment target and budget must be
-  measured against the deployment's storage device.
-- `protect` is the default lag policy. `expire` requires explicit per-stream
-  configuration and an auditable destructive transition.
-- Cleanup, health, metrics, and shutdown retain reserved execution capacity;
-  no background queue is allowed to grow with publish rate or retained
-  history.
+The remaining hypotheses are decision prompts, not defaults:
+
+- Preserve unlimited retention for existing data unless a versioned,
+  operator-visible transition establishes a finite policy. Whether new streams
+  default to unlimited retention or require an explicit limit remains open.
+- If `protect` is offered, determine how a complete durable consumer/replay
+  inventory bounds its pins and how publish admission behaves when a pin
+  prevents reclamation. If `expire` is offered, define the explicit unavailable
+  history and acknowledgement-fencing outcomes first.
+- Derive reserve and cleanup budgets from the largest legal durable mutation,
+  bounded concurrency, manifest/checkpoint/snapshot work, filesystem behavior,
+  and actual recovery needs. Measure them on supported deployment storage.
+- Choose pressure hysteresis and cleanup cadence from measured reclaim rate,
+  workload burst, segment granularity, and foreground tail latency.
+- Preserve capacity for health, metrics, acknowledgement/recovery work, and
+  shutdown only where those operations have an explicit durable-write budget;
+  do not imply they can succeed after the filesystem has refused the required
+  write.
 
 The current illustrative Kubernetes values (10 GiB claims, 1 GiB memory,
 five-minute startup probe, and 30-second termination grace) should remain
@@ -941,7 +951,8 @@ budget. Kubernetes must not be required for the policy to be safe.
 ## Unresolved decisions
 
 The following require explicit resolution before implementation is treated as
-an accepted product behavior:
+an accepted product behavior. The [source review](../research/retention-disk-pressure-semantics.md)
+organizes their alternatives and evidence needs by decision:
 
 1. What exact versioned public operation configures retention and starts,
    polls, acknowledges, resets, and ends a replay session? The accepted v1
