@@ -2,7 +2,7 @@
 
 - Status: source-backed research; proposed semantic contract recorded in ADR 0030; runtime API and behavior are not implemented
 - Last reviewed: 2026-10-05
-- Repository baseline: `7a20de5f03f6976c3d411f5bdf5f878824c99fc5`
+- Repository baseline: `f52d367fd5a6860a20607ac3024cc44edfeb3ec0` (pre-change baseline)
 - Primary evidence class: research/design
 - Scope: bounded consume delivery and acknowledgement contracts for the local and early clustered engines
 - Related outcome: [Make batching preserve per-record outcomes](../backlog.md#make-batching-preserve-per-record-outcomes)
@@ -89,10 +89,18 @@ exists at this baseline. Current batch APIs and network tests cover publish
 batches only. Existing one-record coverage is relevant to the constraints but
 does not establish batch outcomes:
 
-- The local and persistent clustered engine tests verify that an assigned
-  offset keeps its old attempt limit after version 2 is configured and that
-  the current policy version survives reopen. Neither test reopens with that
-  offset still pending under its old snapshot.
+- At the supplied baseline, the local and persistent clustered engine tests
+  verified that an assigned offset kept its old attempt limit after version 2
+  was configured and that the current policy version survived reopen, but
+  neither reopened with that offset still pending under its old snapshot. This
+  change adds `pending_delivery_keeps_pinned_attempt_limit_after_reopen` and
+  `persistent_raft_pending_delivery_keeps_pinned_attempt_limit_after_reopen`.
+  Each test assigns an offset under version 1 with attempt limit 2, commits
+  version 2 with limit 1 while the offset remains unacknowledged, closes and
+  reopens the engine, verifies version 2 remains current, then observes attempt
+  2 under the pinned limit and terminal movement at that original limit. This
+  establishes pending-snapshot reopen behavior for the local consumer journal
+  and the persistent one-node Raft engine.
 - The real three-process transfer test configures version 1, delivers an
   offset, changes the current policy to version 2, fails the original leader,
   and verifies the new leader sees version 2 while the offset still follows
@@ -120,6 +128,15 @@ the [local restart test source](../../crates/runnel-server/tests/server_smoke.rs
 and the [cluster node-failure test](../../crates/runnel-server/tests/cluster_smoke.rs).
 The accepted retry-policy details are in
 [ADR 0027](../decisions/0027-consumer-scoped-retry-policy.md).
+
+The pending-offset recovery tests added by this change are
+`pending_delivery_keeps_pinned_attempt_limit_after_reopen` and
+`persistent_raft_pending_delivery_keeps_pinned_attempt_limit_after_reopen` in
+those respective test modules. The persistent test exercises a one-node Raft
+engine reopen; multi-node cluster restart with a pending snapshot remains
+uncovered. Existing three-process leader-failure coverage verifies transfer of
+the current policy and pinned snapshot to a new leader, which is a separate
+failure path.
 
 ## Reference behavior
 
@@ -264,12 +281,15 @@ reassigned token among valid tokens and an explicit result for each item,
 response loss after ack, restart, leader change, lease expiry while later batch
 entries wait, member replacement, same-key records, out-of-order ack across
 different keys, and multiple per-offset policy snapshots within one batch. A
-policy update between first assignments should be exercised across local
-restart and clustered leadership transfer. Tests must also cover the existing
-attempt-limit dead-letter boundary for candidates encountered before and among
-returned records, plus wakeups after publish, acknowledgement, and observed
-expiry. These establish the proposed contract; they do not establish a
-performance gain.
+policy update between first assignments is covered for single-record delivery
+by the local and persistent-engine reopen tests and the existing real-process
+cluster leader-failure test. A consume-batch implementation still needs to
+exercise mixed per-offset snapshots across local restart and clustered
+leadership transfer. Tests must also cover the existing attempt-limit
+dead-letter boundary for candidates encountered before and among returned
+records, plus wakeups after publish, acknowledgement, and observed expiry.
+These establish the proposed contract; they do not establish a performance
+gain.
 Network and failure tests should start real broker processes. Reusable engine
 assertions should preserve topology-free semantics where practical.
 
@@ -280,8 +300,12 @@ assertions should preserve topology-free semantics where practical.
   count/bytes/time, restart and leader-change tests, and latency/resource
   evidence. The existing shared-consumer acceptance criterion for matching
   local and clustered ack results after expiry but before reassignment is now
-  covered by the reusable engine assertion; vector outcomes and the other
-  batch-specific cases remain open.
+  covered by the reusable engine assertion. New single-record recovery tests
+  establish pending policy-snapshot reopen behavior in the local journal and
+  persistent one-node Raft engine; the existing three-process leader-failure
+  test covers transfer to a new leader, while process restart of a three-node
+  cluster with a pending snapshot remains untested. Vector outcomes and the
+  other batch-specific cases remain open.
 - **Near-term vs deferred:** recommend accepting the semantic contract proposed
   in ADR 0030 because both engines expose the necessary delivery and durability
   boundaries and the reviewed references support bounded receive and per-entry
