@@ -194,8 +194,8 @@ metadata would require an explicit retention or expiry contract, changing
 current replay behavior. These resource choices overlap TD-002 and are not
 resolved here.
 
-**Assessment:** strongest fit for the identity separation goal. ADR 0029
-accepts the frame/upgrade policy and treatment of legacy RNL3 records.
+**Assessment:** strongest fit for the identity separation goal. Proposed ADR
+0029 recommends the frame/upgrade policy and treatment of legacy RNL3 records.
 
 ### Add a local transaction or recovery journal
 
