@@ -334,21 +334,22 @@ Goal: reduce storage, network, and CPU overhead with efficient message represent
 
 Rationale: small messages and long-lived streams make framing, copying, encoding, and compression costs significant parts of Runnel's performance and storage profile.
 
-Current progress: the provisional protocol and reusable client support validated binary-safe payloads through padded base64 while retaining the legacy text path. Version negotiation, mixed-format recovery, compression, and representative resource measurements remain open.
+Current progress: the provisional protocol and reusable client support validated binary-safe payloads through padded base64 while retaining the legacy text path. Current review confirms that peer commands and clustered persistence encode payload `Vec<u8>` values as JSON integer arrays, local `RNL1`/`RNL2`/`RNL3` records remain uncompressed, and public/peer codecs are not negotiated. The [message encoding and compression study](research/message-encoding-and-compression.md) compares compression placement across client batches, public and peer frames, retained blocks, and separate Raft/state-machine artifacts; the [day-one plan](design/encoding-compression-day1-plan.md) keeps the candidate frame and codec work exploratory. Version negotiation, mixed-format recovery, compression, and representative resource measurements remain open.
 
 Constraints:
 
 - the wire and durable formats must be versioned and recoverable across compatible upgrades;
-- compression must be selectable according to workload and must not silently weaken durability, ordering, replay, or corruption detection;
+- compression placement and codec must be independently measurable for public wire, peer wire, retained data, and clustered persistence; compression must not silently weaken durability, ordering, replay, or corruption detection;
 - bounded memory and predictable tail latency take priority over compression ratio alone;
 - format changes must remain independent from any one storage engine or replication architecture.
 
 Acceptance criteria:
 
-- representative message sizes have documented encoding, compression, CPU, memory, storage, and latency measurements;
-- the broker can identify, validate, and recover supported format versions after restart;
-- mixed-format retained data has documented read, replay, upgrade, and retention behavior;
-- benchmarks demonstrate when compression improves total resource usage and when it should be disabled.
+- encoding and compression are compared separately across 100 B, 1 KiB, 16 KiB, and 1 MiB payloads that include random, repeated-text, JSON-like, and already-compressed data;
+- measurements record logical, envelope, stored, and wire bytes; codec CPU; allocations/copies; peak and concurrent buffer memory; throughput; batch wait; publish/replay p50, p99, and p99.9; and recovery cost under stated local and three-node resource limits;
+- each tested codec/placement identifies its version and size/window limits, checksum coverage, and the exact writer, reader, persistence, and forwarding boundaries;
+- restart and fault evidence covers old-format plus candidate-format data, incomplete tails, complete corruption, unsupported required metadata, and preservation of logical offsets, request identities, replay, acknowledgement, redelivery, and dead-letter results;
+- controlled results document where compression reduces total framed bytes without exceeding the workload's CPU, memory, recovery, and tail-latency budgets, and where an uncompressed path should be selected.
 
 ### Make retained-state growth independent of the hot path
 
