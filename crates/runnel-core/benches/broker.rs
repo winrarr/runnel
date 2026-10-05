@@ -24,7 +24,7 @@ const BOUNDED_INDEX_COLD_OFFSET: u64 = 1_024;
 const SHARED_TAIL_HISTORY_MESSAGE_COUNT: u64 = 2_048;
 const SHARED_TAIL_START_OFFSET: u64 = 1_900;
 const SHARED_TAIL_POLL_COUNT: u64 = 100;
-const SHARED_UNACKED_MEMBER_COUNT: u64 = 64;
+const SHARED_UNACKED_MEMBER_COUNTS: &[usize] = &[1, 4, 16, 64];
 const PUBLISH_BATCH_RECORD_COUNT: u64 = 32;
 
 fn configured_group<'a, M: Measurement>(
@@ -246,35 +246,48 @@ fn shared_consumer_keyed_poll_ack(c: &mut Criterion) {
 }
 
 fn shared_consumer_many_in_flight(c: &mut Criterion) {
-    let mut group = message_group(
-        c,
-        "shared_consumer_many_in_flight",
-        SHARED_UNACKED_MEMBER_COUNT,
-        20,
-    );
-    group.bench_function("100-byte_messages_64_unacked_members", |benchmark| {
-        benchmark.iter_batched(
-            || {
-                let (directory, broker) = open_delivery_broker();
-                publish_messages(&broker, "bench", SHARED_UNACKED_MEMBER_COUNT, PAYLOAD);
-                let members = (0..SHARED_UNACKED_MEMBER_COUNT)
-                    .map(|index| format!("member-{index}"))
-                    .collect::<Vec<_>>();
-                (directory, broker, members)
+    let mut group = configured_group(c, "shared_consumer_many_in_flight", 20);
+    for member_count in SHARED_UNACKED_MEMBER_COUNTS {
+        let message_count = *member_count as u64;
+        group.throughput(Throughput::ElementsAndBytes {
+            elements: message_count,
+            bytes: message_count * PAYLOAD.len() as u64,
+        });
+        let member_label = if *member_count == 1 {
+            "member"
+        } else {
+            "members"
+        };
+        group.bench_function(
+            format!("100-byte_messages_{member_count}_unacked_{member_label}"),
+            |benchmark| {
+                benchmark.iter_batched(
+                    || {
+                        let (directory, broker) = open_delivery_broker();
+                        publish_messages(&broker, "bench", message_count, PAYLOAD);
+                        let members = (0..*member_count)
+                            .map(|index| format!("member-{index}"))
+                            .collect::<Vec<_>>();
+                        (directory, broker, members)
+                    },
+                    |(_directory, broker, members)| {
+                        for (offset, member) in members.iter().enumerate() {
+                            let message =
+                                match broker.poll_group("bench", "workers", member).unwrap() {
+                                    PollResult::Message(message) => message,
+                                    PollResult::Empty => {
+                                        panic!("shared benchmark should have a message")
+                                    }
+                                };
+                            assert_eq!(message.offset, offset as u64);
+                            black_box(message);
+                        }
+                    },
+                    BatchSize::SmallInput,
+                );
             },
-            |(_directory, broker, members)| {
-                for (offset, member) in members.iter().enumerate() {
-                    let message = match broker.poll_group("bench", "workers", member).unwrap() {
-                        PollResult::Message(message) => message,
-                        PollResult::Empty => panic!("shared benchmark should have a message"),
-                    };
-                    assert_eq!(message.offset, offset as u64);
-                    black_box(message);
-                }
-            },
-            BatchSize::SmallInput,
         );
-    });
+    }
     group.finish();
 }
 
