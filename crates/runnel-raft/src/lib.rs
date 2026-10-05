@@ -42,7 +42,7 @@ use delivery::lease_expired;
 pub use engine::{InMemoryCluster, PersistentEngine, RaftGroup, SingleNodeEngine};
 #[cfg(test)]
 use group_manager::DataGroupManifest;
-pub use group_manager::GroupManager;
+pub use group_manager::{GroupManager, ReplicationProgressSnapshot};
 pub use state_machine::{Command, CommandResponse, StreamLifecycle, StreamMetadata};
 #[cfg(test)]
 use state_machine::{GroupKind, SnapshotState, StoredMessage, StreamState, apply_command};
