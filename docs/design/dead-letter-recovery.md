@@ -1,19 +1,19 @@
 # Dead-letter recovery across durable boundaries
 
-- Status: exploratory design note; local typed identity and legacy RNL3 recovery are implemented under proposed [ADR 0029](../decisions/0029-local-typed-dead-letter-move-identities.md), pending decision review; physical durability, retention, provenance, and split-group behavior remain open
+- Status: exploratory design note; local typed identity and legacy RNL3 lookup policy are implemented under accepted [ADR 0029](../decisions/0029-local-typed-dead-letter-move-identities.md); physical durability, retention, provenance, and split-group behavior remain open
 - Last reviewed: 2026-10-05
-- Baseline: `f999c1b9ad5d22408bbbe6c6276a42e825cd62ef` (the pre-change baseline for TD-029)
+- Baseline: `f999c1b9ad5d22408bbbe6c6276a42e825cd62ef` (the pre-change baseline for the local identity contract)
 - Reading guide: [design-note conventions](README.md)
-- Related debt: [TD-017](../tech-debt.md#td-017-dead-letter-movement-spans-separate-durable-records), [TD-018](../tech-debt.md#td-018-retry-policy-and-dead-letter-provenance-are-coarse), and [TD-029](../tech-debt.md#td-029-public-request-ids-can-collide-with-local-dead-letter-move-ids)
+- Related debt: [TD-017](../tech-debt.md#td-017-dead-letter-movement-spans-separate-durable-records) and [TD-018](../tech-debt.md#td-018-retry-policy-and-dead-letter-provenance-are-coarse)
 - Related decisions: [ADR 0014](../decisions/0014-local-retry-and-dead-letter-policy.md), [ADR 0016](../decisions/0016-clustered-retry-and-dead-letter-policy.md), [ADR 0026](../decisions/0026-semantic-engine-error-classification.md), [ADR 0027](../decisions/0027-consumer-scoped-retry-policy.md), and [ADR 0029](../decisions/0029-local-typed-dead-letter-move-identities.md)
 - Related boundaries: [durability and delivery policy](durability-delivery-policy.md), [application-aware retry policy](application-aware-retry-policy.md), and [clustered outcomes](clustered-outcome-contract.md)
 
 This note separates the observed local append/reconcile behavior from the
-clustered same-group transition and from future cross-group choices. Proposed
+clustered same-group transition and from future cross-group choices. Accepted
 ADR 0029 records the implemented local identity policy and its RNL3 version-2
-format consequences, pending decision review. The design proposals and open
-gates below still describe other recovery, retention, and cross-group
-questions; they do not expand the proposed local identity scope.
+format consequences. The design proposals and open gates below still describe
+other recovery, retention, and cross-group questions; they do not expand the
+accepted local identity scope.
 
 ## Scope and non-goals
 
@@ -40,14 +40,17 @@ log on open. Public retry still returns the first public offset without
 comparing retry content. A move retry looks up only a typed move and checks its
 key and payload before source acknowledgement. Public records with the same
 text, whether same-content or conflicting-content, remain separate and cannot
-block or impersonate a move. RNL3 version-1 records have no provenance and are
-read as public. If a pending old move exists, upgrade recovery may append one
-new typed move before advancing source progress. This possible duplicate is
-the at-least-once-safe recovery path; the change does not claim exactly-once
-movement. Older readers fail closed on version 2, so downgrade after a v2
-append is unsupported. The local-only decision and storage details are in
-[proposed ADR 0029](../decisions/0029-local-typed-dead-letter-move-identities.md), with
-the source-backed analysis in the [TD-029 research note](../research/td-029-dead-letter-identity-contract.md).
+block or impersonate a move. RNL3 version-1 records have no provenance; their
+IDs are indexed in the public-ID bucket as a compatibility lookup policy, not
+as proof that they were public. Historical internal moves therefore remain
+addressable through that bucket as under the former shared namespace, while
+new typed move lookup ignores those entries. If a pending old move exists,
+upgrade recovery may append one new typed move before advancing source
+progress. This possible duplicate is the at-least-once-safe recovery path; the
+change does not claim exactly-once movement. Older readers fail closed on
+version 2, so downgrade after a v2 append is unsupported. The local decision
+and storage details are in [accepted ADR 0029](../decisions/0029-local-typed-dead-letter-move-identities.md),
+with the source-backed analysis in the [identity research note](../research/td-029-dead-letter-identity-contract.md).
 
 The current clustered implementation does not use this local move identity.
 It appends the derived record and advances source progress in one replicated
@@ -116,11 +119,12 @@ is stored in an `RNL3` version-2 request-aware target frame and is looked up
 only in the internal-move bucket. Public request IDs use their own bucket, so
 equal text does not collide across kinds. The writer enforces the request-aware
 key, payload, and identity limits. On reopen, complete v1 and v2 request-aware
-frames rebuild the index; v1 identities are treated as public because their
-original kind is unknown. An incomplete trailing frame is discarded, while a
-complete checksum or format failure is reported rather than silently treated
-as a successful move. Older version-1 readers reject version-2 records, so
-downgrade after a v2 append is unsupported under proposed ADR 0029.
+frames rebuild the index; v1 identities use the public-ID bucket for
+compatibility, without asserting original provenance. An incomplete trailing
+frame is discarded, while a complete checksum or format failure is reported
+rather than silently treated as a successful move. Older version-1 readers
+reject version-2 records, so
+downgrade after a v2 append is unsupported under accepted ADR 0029.
 
 The relevant local recovery states and current evidence are:
 
@@ -132,7 +136,7 @@ The relevant local recovery states and current evidence are:
 | The complete source acknowledgement event is written but its sync returns an error | The test filesystem retains the event for reopen; source progress replays and the target remains single. | `dead_letter_move_retries_after_source_event_sync_failure_and_restart` injects the sync error after writing the journal event, drops and reopens the broker, and checks progress and the one target record. It is not a real sync failure or power-loss test. |
 | The public poll response is lost after a completed move | The server has completed the source transition and the response is unavailable to the client; after restart the source poll is empty and the target record is consumable once in the tested case. | `network_protocol_reconciles_dead_letter_after_ambiguous_poll_and_restart` covers this real-server journey. It does not kill the server between target sync and source-event persistence. |
 | A public target record uses the same text as a local move ID | The public record remains at its original offset and the typed move is appended separately, whether the public content matches or differs. Public replay still returns the original public offset, and source progress advances after the move is durable. | `network_protocol_keeps_mismatching_public_dead_letter_id_separate_after_restart` and `network_protocol_does_not_accept_same_content_public_id_as_dead_letter_move` exercise both wire cases and restart. |
-| Upgrade finds a version-1 record with a move ID | Version 1 is read as public because its original identity kind is unavailable. A retry of a pending old move may append one version-2 move and then advance source progress; later retries reconcile the version-2 move. | `legacy_public_move_id_remains_public_and_does_not_satisfy_new_move` and `interrupted_legacy_move_retries_as_typed_move_once_after_restart` cover completed-public and interrupted-move fixtures at the core layer. This compatibility choice permits one duplicate at upgrade. |
+| Upgrade finds a version-1 record with a move ID | Its ID is indexed in the public-ID bucket as a compatibility lookup policy, not as proof of public provenance. The old internal move remains addressable through that bucket as under the shared namespace; a typed version-2 move lookup does not use it. A retry of a pending old move may append one version-2 move and then advance source progress; later retries reconcile that typed move. | `legacy_public_move_id_remains_public_and_does_not_satisfy_new_move` and `interrupted_legacy_move_retries_as_typed_move_once_after_restart` cover completed-public and interrupted-move fixtures at the core layer. This compatibility choice permits one duplicate at upgrade. |
 
 The local target append checks an existing typed move ID's key and payload
 before reusing it. Public IDs and move IDs use separate identity buckets; the
@@ -344,10 +348,12 @@ tests; they are not a retroactive implementation checklist:
   Tests cover partial frame recovery, a complete frame before sync, and a
   source-event sync error on the current test filesystem. Behavior under real
   device errors or power loss, retention, and future format changes remains
-  unverified. RNL3 version-1 move provenance is unavailable, so upgrade reads
-  every version-1 identity as public and can append one duplicate for a pending
-  old move before source acknowledgement. This is bounded at the compatibility
-  boundary; version-2 retries remain typed and deduplicated. The two index
+  unverified. RNL3 version-1 move provenance is unavailable, so upgrade places
+  every version-1 identity in the public-ID bucket as a compatibility lookup
+  policy; old internal moves remain addressable there as before, but cannot
+  satisfy typed move lookup. A pending old move can append one duplicate before
+  source acknowledgement. This is bounded at the compatibility boundary;
+  version-2 retries remain typed and deduplicated. The two index
   buckets retain one offset per identity plus a fixed second-map header and
   separate capacity slack; total identity cardinality and retention remain
   governed by TD-002.

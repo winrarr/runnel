@@ -66,9 +66,9 @@ for the same evidence labels and outcome/evidence gates.
   compares legacy-record allocation policies and records the corpus,
   compatibility, and non-destructive conversion evidence needed before a
   limit is accepted.
-- [TD-029 dead-letter identity contract](td-029-dead-letter-identity-contract.md)
-  compares durable identity domains for public request IDs and local
-  dead-letter moves, including the unresolved RNL3 upgrade ambiguity.
+- [Public request IDs and dead-letter move identity](td-029-dead-letter-identity-contract.md)
+  records the accepted identity contract and the unresolved provenance of
+  legacy RNL3 records.
 - [TD-018 retry-policy source review (2026-10)](td-018-retry-policy-review-2026-10.md) checks the exploratory retry design against current Runnel behavior and current primary broker documentation without accepting new policy semantics.
 - [Systems performance research for Runnel](systems-performance-research.md)
   connects established and recent systems research on durable batching,

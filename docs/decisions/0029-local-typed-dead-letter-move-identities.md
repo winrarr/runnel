@@ -1,8 +1,8 @@
 # ADR 0029: Separate local public and dead-letter move identities
 
-- Status: proposed
+- Status: accepted
 - Date: 2026-10-05
-- Related: [ADR 0014](0014-local-retry-and-dead-letter-policy.md), [TD-017](../tech-debt.md#td-017-dead-letter-movement-spans-separate-durable-records), and [TD-029](../tech-debt.md#td-029-public-request-ids-can-collide-with-local-dead-letter-move-ids)
+- Related: [ADR 0014](0014-local-retry-and-dead-letter-policy.md), [TD-002](../tech-debt.md#td-002-one-file-and-a-startup-scan-per-local-stream), and [TD-017](../tech-debt.md#td-017-dead-letter-movement-spans-separate-durable-records)
 - Research: [Public request IDs and dead-letter move identity](../research/td-029-dead-letter-identity-contract.md)
 - Extends: ADR 0014's local identity and reconciliation details; the append-then-ack order remains unchanged
 
@@ -32,8 +32,9 @@ Advance the request-aware `RNL3` frame version to version 2. Keep its current
 header layout and use the flags byte to identify the variant: zero for a public
 request ID and one for a local dead-letter move. Reject unknown versions or
 flag values as malformed records. The existing checksum covers the version
-and flags. Version 1 continues to require zero flags and is read as a public
-request identity. RNL1 and RNL2 records remain unchanged; new code reads mixed
+and flags. Version 1 continues to require zero flags; recovery places its IDs
+in the public-ID bucket as a compatibility lookup policy, not proof of public
+provenance. RNL1 and RNL2 records remain unchanged; new code reads mixed
 RNL1, RNL2, and RNL3 version-1/version-2 histories.
 
 Public publishes look up only `PublicRequestId`. Reusing a public ID continues
@@ -46,15 +47,19 @@ whether its content matches or differs, remains a separate public record; the
 broker appends the internal move and advances source progress only after that
 append is durable.
 
-Treat every existing RNL3 version-1 ID as public during recovery, including
-historical internal move records. The old frame has no trustworthy identity
-kind, and neither its prefix nor content can establish provenance. If an old
-move's target append is present but its source acknowledgement is not durable
-at upgrade, a retry may append one new typed move before advancing source
-progress. This possible duplicate at the upgrade boundary is accepted to
-preserve at-least-once progress without allowing an ambiguous public record to
-stand in for the move. Once a typed move exists, repeated retry/reopen
-reconciles that move and does not append another record.
+During recovery, index every existing RNL3 version-1 ID in the
+`PublicRequestId` bucket. This is a compatibility lookup policy, not a claim
+about provenance: the old frame has no trustworthy identity kind, and neither
+its prefix nor content can establish origin. Historical internal move records
+therefore remain addressable through the public-ID bucket, as they were under
+the former shared namespace. Version-2-and-later move lookup does not consult
+that bucket. If an old move's target append is present but its source
+acknowledgement is not durable at upgrade, a retry may append one new typed
+move before advancing source progress. This possible duplicate at the upgrade
+boundary is accepted to preserve at-least-once progress without allowing an
+ambiguous legacy record to stand in for a new typed move. Once a typed move
+exists, repeated retry/reopen reconciles that move and does not append another
+record.
 
 This is a forward-read storage change, not a public wire change. The current
 version-1 reader rejects every other RNL3 frame version as invalid data; an
@@ -116,20 +121,21 @@ claim.
   incarnation feature must revisit that key.
 - The clustered path and public wire schema are unchanged.
 
-## Evidence required
+## Verification evidence
 
-Core and real-server tests must cover both same-content and mismatching-content
-public collisions; separate public and internal target offsets and contents;
-public request replay after restart; source acknowledgement failure followed
-by reopen/retry without a second typed move; and legacy RNL3 version-1 recovery
-including the permitted upgrade-boundary duplicate. A completed version-1
-public record with the predictable move-ID text remains the public replay
-result and cannot satisfy a new move. An interrupted version-1 move is treated
-the same way, so retry appends a new typed move once and then advances source
-progress. Parser tests cover valid mixed versions, unsupported versions or
-identity flags failing closed, and incomplete tails. The baseline reader's
-version-1-only guard establishes that it rejects a newly written version-2
-frame; the test suite separately verifies that the new reader does not accept
-unknown versions or flags. The existing target-write, source-event, and
-restart tests for at-least-once ordering remain required. No clustered runtime
-change is part of this evidence claim.
+Core and real-server tests cover same-content and mismatching public
+collisions; separate public and internal target offsets and contents; public
+request replay after restart; source acknowledgement failure followed by
+reopen/retry without a second typed move; and legacy RNL3 version-1 recovery,
+including the permitted upgrade-boundary duplicate. Version-1 IDs are indexed
+in the public-ID bucket as a compatibility lookup policy, not as proof of
+public provenance. Historical internal moves remain addressable through that
+bucket as under the former shared namespace, but cannot satisfy a version-2
+typed move lookup. An interrupted legacy move may therefore append one typed
+move before source progress advances. Parser tests cover valid mixed versions,
+unsupported versions or identity flags failing closed, and incomplete tails.
+The baseline reader's version-1-only guard establishes that it rejects a
+newly written version-2 frame; the test suite separately verifies that the new
+reader does not accept unknown versions or flags. The existing target-write,
+source-event, and restart tests support at-least-once ordering. No clustered
+runtime change is part of this evidence claim.

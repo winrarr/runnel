@@ -1,17 +1,17 @@
-# TD-029: Public request IDs and dead-letter move identity
+# Public request IDs and dead-letter move identity
 
-- Status: source-backed identity contract proposed in [ADR 0029](../decisions/0029-local-typed-dead-letter-move-identities.md); focused core and isolated real-server verification passed
+- Status: identity contract accepted in [ADR 0029](../decisions/0029-local-typed-dead-letter-move-identities.md); this note records the source-backed rationale and alternatives
 - Last reviewed: 2026-10-05
 - Baseline: `f999c1b9ad5d22408bbbe6c6276a42e825cd62ef`
-- Related debt: [TD-002](../tech-debt.md#td-002-one-file-and-a-startup-scan-per-local-stream), [TD-017](../tech-debt.md#td-017-dead-letter-movement-spans-separate-durable-records), and [TD-029](../tech-debt.md#td-029-public-request-ids-can-collide-with-local-dead-letter-move-ids)
+- Related debt: [TD-002](../tech-debt.md#td-002-one-file-and-a-startup-scan-per-local-stream) and [TD-017](../tech-debt.md#td-017-dead-letter-movement-spans-separate-durable-records)
 - Related design: [Dead-letter recovery across durable boundaries](../design/dead-letter-recovery.md)
-- Related decisions: [ADR 0014](../decisions/0014-local-retry-and-dead-letter-policy.md) and [ADR 0016](../decisions/0016-clustered-retry-and-dead-letter-policy.md)
+- Related decisions: [ADR 0014](../decisions/0014-local-retry-and-dead-letter-policy.md), [ADR 0016](../decisions/0016-clustered-retry-and-dead-letter-policy.md), and [ADR 0029](../decisions/0029-local-typed-dead-letter-move-identities.md)
 
 This note compares ways to distinguish a client-supplied publish identity from
-the local engine's identity for one dead-letter move. The source-backed
-recommendation is recorded in proposed ADR 0029. The named baseline describes
-the pre-change behavior; the proposal and implementation sections record the
-resulting local format and compatibility policy for review.
+the local engine's identity for one dead-letter move. The accepted decision is
+recorded in ADR 0029. The named baseline describes the pre-change behavior;
+the implementation and compatibility sections record the resulting local
+format and its consequences.
 
 ## Finding
 
@@ -23,22 +23,25 @@ matching record. PR #346 added baseline core and real-server coverage for this
 same-content case; the tests are updated by this change to assert typed
 identity behavior.
 
-**Recommendation (inference, proposed in ADR 0029):** persist a typed identity
+**Recommendation (inference accepted in ADR 0029):** persist a typed identity
 domain for new local request-aware records. Keep caller-supplied IDs as public
 IDs and local source-to-dead-letter IDs as moves. Keep the public request-ID API
 and replay behavior unchanged. A move retry reconciles only against the same
 typed move identity and still verifies key and payload before source progress
 advances.
 
-Use a new request-aware frame version to persist the identity kind. Read the
-current untyped RNL3 version as `PublicRequestId`, including records whose text
-looks like an old internal move ID. If a pre-upgrade move append exists without
-durable source progress, append one new typed move and then advance the source.
-That can leave one duplicate at the upgrade boundary, but preserves at-least-once
-progress without treating a matching public record as proof of an internal
-operation. The reader must support mixed legacy and new request-aware frames;
-older binaries fail closed on the new frame version, so downgrade after writing
-one is unsupported. The concrete proposal is in [ADR 0029](../decisions/0029-local-typed-dead-letter-move-identities.md).
+The accepted implementation uses a new request-aware frame version to persist
+the identity kind. Recovery indexes every untyped RNL3 version-1 ID in the
+`PublicRequestId` bucket as a compatibility lookup policy, not as proof of
+public provenance. Historical internal move records remain addressable through
+that bucket as under the former shared namespace, while typed move lookup does
+not consult it. If a pre-upgrade move append exists without durable source
+progress, retry appends one new typed move and then advances the source. That
+can leave one duplicate at the upgrade boundary, but preserves at-least-once
+progress without treating an ambiguous legacy record as proof of a new typed
+move. The reader supports mixed legacy and new request-aware frames; older
+binaries fail closed on the new frame version, so downgrade after writing one
+is unsupported. See [ADR 0029](../decisions/0029-local-typed-dead-letter-move-identities.md).
 
 ## Observed Runnel behavior
 
@@ -54,7 +57,7 @@ one is unsupported. The concrete proposal is in [ADR 0029](../decisions/0029-loc
   [`dead_letter_move_id`](../../crates/runnel-core/src/lib.rs#L227).
 - At the baseline, `StreamLog` stored public IDs and move IDs in the same
   `HashMap<String, Offset>`. RNL3 version 1 had a zero flags byte and one
-  request-ID field, with no public/internal discriminator. The proposed
+  request-ID field, with no public/internal discriminator. The accepted
   implementation writes RNL3 version 2 and rebuilds separate public and move
   buckets from its identity-kind flag. See [`StreamLog`](../../crates/runnel-core/src/stream_log.rs),
   [`append_with_move_id`](../../crates/runnel-core/src/stream_log.rs), and
@@ -69,9 +72,10 @@ one is unsupported. The concrete proposal is in [ADR 0029](../decisions/0029-loc
   after recovery, while a matching retry resolves the existing move:
   [`dead_letter_move_identity_rejects_different_content_after_restart`](../../crates/runnel-core/src/lib.rs).
 - Core restart coverage includes a completed RNL3 version-1 public collision
-  and an interrupted legacy move. In the latter case, recovery reads the
-  ambiguous version-1 record as public, appends one typed move, injects a source
-  acknowledgement failure, reopens, and confirms the typed move is reused:
+  and an interrupted legacy move. In the latter case, recovery indexes the
+  ambiguous version-1 record in the public-ID bucket as a compatibility lookup,
+  appends one typed move, injects a source acknowledgement failure, reopens, and
+  confirms the typed move is reused:
   [`legacy_public_move_id_remains_public_and_does_not_satisfy_new_move`](../../crates/runnel-core/src/lib.rs),
   [`interrupted_legacy_move_retries_as_typed_move_once_after_restart`](../../crates/runnel-core/src/lib.rs).
 - Local movement persists the target append before the source acknowledgement.
@@ -159,7 +163,7 @@ This is the current behavior. Strict key/payload matching prevents a
 different-content record from advancing the source, but identical content under
 the same public ID is accepted as the move. A payload hash has the same
 limitation: matching bytes prove content equality, not that the broker created
-the record for this move. **Assessment:** insufficient for the TD-029 goal.
+the record for this move. **Assessment:** insufficient for the accepted identity contract.
 
 ### Reserve the current textual prefix
 
@@ -182,7 +186,7 @@ recovery, the index uses the discriminator as part of its key. Public replay
 continues to look up only public IDs; move reconciliation looks up only move
 identity and then checks key and payload.
 
-The proposed shape is one logical typed identity index implemented with
+The accepted shape is one logical typed identity index implemented with
 separate public and internal buckets. This keeps one offset value per retained
 identity at the cost of a second map header per stream; a same-text cross-kind
 collision stores a key in both buckets. The combined entry count grows with
@@ -194,8 +198,8 @@ metadata would require an explicit retention or expiry contract, changing
 current replay behavior. These resource choices overlap TD-002 and are not
 resolved here.
 
-**Assessment:** strongest fit for the identity separation goal. Proposed ADR
-0029 recommends the frame/upgrade policy and treatment of legacy RNL3 records.
+**Assessment:** strongest fit for the identity separation goal. ADR 0029 adopts
+the frame/upgrade policy and treatment of legacy RNL3 records.
 
 ### Add a local transaction or recovery journal
 
@@ -215,21 +219,23 @@ RNL3 ID with the `runnel-dlq/v1/` shape came from a public publish or an
 internal move. Matching key and payload cannot resolve this because the
 same-content collision is now directly reproduced.
 
-**Proposed policy (ADR 0029):** treat every
-legacy RNL3 version-1 ID as public for new move reconciliation. This preserves
-the old observable public replay result even though some such records were
-written by the old internal path. A new typed move is not satisfied by an
-ambiguous legacy record. If upgrade occurs after an old move append but before
-source progress is durable, retry may append a second dead-letter record before
-advancing the source. This bounded upgrade-boundary duplicate is at-least-once
-safe; accepting a same-content legacy record as proof would preserve
-impersonation ambiguity. No migration can classify every such record without
-trusted provenance that was not persisted.
+**Accepted policy (ADR 0029):** index every legacy RNL3 version-1 ID in the
+public-ID bucket for lookup compatibility. This does not assert public origin:
+some such records were written by the old internal move path and remain
+addressable through public replay as under the former shared namespace. A new
+typed move is not satisfied by an ambiguous legacy record. If upgrade occurs
+after an old move append but before source progress is durable, retry may
+append one new typed move before advancing the source. This bounded
+upgrade-boundary duplicate preserves at-least-once progress; accepting a
+same-content legacy record as proof would preserve impersonation ambiguity. No
+migration can classify every such record without trusted provenance that was
+not persisted.
 
-The proposed new request-aware frame version reuses the existing header layout
-and assigns the current reserved flags byte to the identity kind. Version 1
-continues to require zero flags and is read as public identity; version 2 accepts
-only the defined public and internal-move kinds. The checksum already covers
+RNL3 version 2 reuses the existing request-aware header layout and assigns the
+reserved flags byte to the identity kind. Version 1 continues to require zero
+flags and its IDs use the public-ID bucket as a compatibility lookup policy,
+not as proof of public provenance; version 2 accepts only the defined public
+and internal-move kinds. The checksum already covers
 the full header, so the kind is protected by the existing checksum. New code
 must read mixed version-1/version-2 histories. An older binary rejects the new
 version rather than silently losing the typed identity; downgrade is therefore
@@ -240,7 +246,7 @@ forward-read choice, not a general storage-format compatibility policy; ADR
 
 ## Implementation evidence and remaining boundaries
 
-Focused core tests cover these proposed identity behaviors:
+Focused core tests cover these accepted identity behaviors:
 
 1. Public and internal identities with identical text coexist as separate
    records. Public retry resolves only the original public record (including
@@ -250,9 +256,11 @@ Focused core tests cover these proposed identity behaviors:
    independently, then source progress advances only after move durability.
    A source-ack failure followed by reopen retries the typed move without
    another target append.
-3. Legacy RNL3 version-1 IDs remain public for replay, and an ambiguous pending
-   legacy move can produce one additional target record before source progress
-   advances. RNL1/RNL2 and mixed RNL3 histories remain readable by new code;
+3. Legacy RNL3 version-1 IDs use the public-ID bucket as a compatibility lookup
+   policy, not as proof of public provenance. Old internal moves remain
+   addressable through public replay, and an ambiguous pending legacy move can
+   produce one additional target record before source progress advances.
+   RNL1/RNL2 and mixed RNL3 histories remain readable by new code;
    malformed new frames fail closed and incomplete tails retain current
    truncation behavior.
 4. A version-2 record is not readable by old code; downgrade after such a write
@@ -268,23 +276,24 @@ Real-server tests exercise same-content and mismatching public collisions,
 public replay behavior, source progress, and restart through the wire protocol.
 Core tests cover typed-move content validation, completed-v1-public collision,
 interrupted-v1-move retry, version-2 move deduplication/recovery, invalid
-versions/flags, and checksum protection. The previous version-1-only reader rejects version 2 by its version
-guard, so downgrade after writing a version-2 record is unsupported. These
-tests do not establish actual filesystem/device sync failure or power-loss
-behavior. Clustered behavior remains covered by its existing atomic transition
-and is not a local-identity guarantee.
+versions/flags, and checksum protection. The previous version-1-only reader
+rejects version 2 by its version guard, so downgrade after writing a version-2
+record is unsupported. These tests do not establish actual filesystem/device
+sync failure or power-loss behavior. Clustered behavior remains covered by its
+existing atomic transition and is not a local-identity guarantee.
 
 ## Disposition
 
-This source review informed the proposed typed local identity contract and
-legacy policy in ADR 0029. The runtime implementation is local to runnel-core,
-with real-server coverage in runnel-server; the clustered engine and public
-wire schema are unchanged. No separate resource tracker is warranted because
+This source review informed the accepted typed local identity contract and
+legacy lookup policy in ADR 0029. The runtime implementation is local to
+runnel-core, with real-server coverage in runnel-server; the clustered engine
+and public wire schema are unchanged. No separate resource tracker is warranted because
 the index remains proportional to retained identities under existing
 behavior, a limitation already tracked by TD-002. Two namespace buckets avoid
 increasing the per-identity offset value size, while adding fixed per-stream
 map overhead and possible duplicate string storage for a cross-namespace
-collision. ADR acceptance remains pending review.
+collision. TD-002 remains open for unbounded retained identity cardinality; the
+local move/source-ack boundary remains open under TD-017.
 
 ## References
 

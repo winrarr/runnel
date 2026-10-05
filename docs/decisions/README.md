@@ -32,8 +32,8 @@ Current decisions:
 - 0026-semantic-engine-error-classification.md: classify shared engine failures by semantic kind and safe attempt outcome while retaining diagnostic causes.
 - 0027-consumer-scoped-retry-policy.md: durable per-consumer attempt limits and acknowledgement timeouts with legacy fallback and policy pinning.
 - 0028-consumer-lag-observation-semantics.md: logical cursor-lag definitions and unknown, freshness, coverage, and replica-deduplication rules; runtime exposure remains undecided.
+- 0029-local-typed-dead-letter-move-identities.md: separate local public publish IDs and internal dead-letter move identities, with compatibility lookup for untyped legacy records.
 
 Proposed decisions awaiting review:
 
-- 0029-local-typed-dead-letter-move-identities.md: separate local public publish IDs and internal dead-letter move identities, with forward-read recovery for legacy frames.
 - 0030-consume-batch-contract.md: bounded per-member consume sets with independent per-record acknowledgement outcomes.
