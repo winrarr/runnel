@@ -41,6 +41,9 @@ for the same evidence labels and outcome/evidence gates.
 - [Distributed architecture options](distributed-architecture-options.md)
   compares Multi-Raft, sequenced quorum/copysets, chain replication, and other
   multi-node approaches against Runnel's workload profiles.
+- [Cluster membership evolution](cluster-membership-evolution.md) compares
+  consensus and broker membership mechanisms and records the multi-group
+  safety questions and evidence gates for Runnel.
 - [Message encoding and compression](message-encoding-and-compression.md)
   compares representation and compression choices, competitor behavior, and
   research findings relevant to Runnel's latency, throughput, and storage goals.
