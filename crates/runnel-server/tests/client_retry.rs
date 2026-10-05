@@ -261,7 +261,7 @@ async fn proxy_publish_response_then_sigterm(
         .accept()
         .await
         .expect("proxy should accept the publish caller");
-    let (client_reader, mut client_writer) = client.into_split();
+    let (client_reader, client_writer) = client.into_split();
     let mut client_reader = AsyncBufReader::new(client_reader);
     let mut request = Vec::new();
     client_reader
