@@ -1,11 +1,11 @@
 # Replay time-selector semantics
 
 - Status: exploratory research; no API or compatibility decision
-- Last reviewed: 2026-09-28
-- Baseline: `a5a228e59c2caa19c1a6520cde6a6abdd9e90196`
-- Primary evidence class: correctness/reliability
-- Scope: meanings and operational bounds for the unfinished replay time selector
-- Related: [replay backlog outcome](../backlog.md#make-replay-an-explicit-and-safe-consumer-operation), [ADR 0024](../decisions/0024-explicit-offset-replay-read.md), and [retention and disk-pressure design](../design/retention-disk-pressure-plan.md)
+- Last reviewed: 2026-10-05
+- Baseline: f999c1b9ad5d22408bbbe6c6276a42e825cd62ef
+- Primary evidence class: design/research; secondary: correctness/reliability, storage/recovery
+- Scope: meanings and operational bounds for unfinished time-based replay and durable sessions
+- Related: [replay backlog outcome](../backlog.md#make-replay-an-explicit-and-safe-consumer-operation), [ADR 0024](../decisions/0024-explicit-offset-replay-read.md), [retention and disk-pressure design](../design/retention-disk-pressure-plan.md), and [durable replay sessions](../design/replay-sessions.md)
 
 This note examines the open time-selector semantics in the replay backlog. It
 does not change runtime behavior, propose a compatibility promise, or accept
@@ -75,6 +75,29 @@ are evidence for design tradeoffs, not a Runnel compatibility target.
   future human-facing timestamp syntax, but it does not define replay boundary,
   clock accuracy, or precision policy. Runnel's current stored field is an
   integer millisecond value.
+
+The session-specific comparisons add three useful contrasts:
+
+- [NATS JetStream durable pull consumers](https://docs.nats.io/learn/jetstream/delivery-and-acknowledgment)
+  keep a named consumer position, advance its acknowledgement floor on explicit
+  ack, and redeliver an unacknowledged record after its ack-wait interval. Its
+  [pull API](https://docs.nats.io/learn/jetstream/pull-consumers) bounds one
+  fetch by message count and expiry. This supports an ack-driven, one-record
+  replay-session candidate and bounded polls. It does not directly provide an
+  independent replay cursor beside an unchanged ordinary cursor: the durable
+  consumer itself is the delivery cursor.
+- [Pulsar Readers](https://pulsar.apache.org/docs/client-libraries/readers/)
+  have a caller-selected start message but no broker-maintained cursor or
+  acknowledgement; Pulsar's [consumer model](https://pulsar.apache.org/docs/4.0.x/concepts-clients/)
+  uses a subscription cursor advanced by acknowledgements. This illustrates
+  the separate stateless-reader and durable-subscription designs. Neither
+  alone settles Runnel's durable replay-session lifecycle.
+- The [Raft paper](https://raft.github.io/raft.pdf) describes ordered committed
+  commands applied by replicated state machines and snapshots that preserve
+  state after log compaction. This supports placing clustered session changes
+  and retention-floor decisions in one logical command order, with session
+  metadata included in recoverable state. Raft does not supply time lookup,
+  retention, or lease semantics.
 
 ## Candidate meanings
 
@@ -194,16 +217,18 @@ record while the ordinary consumer processes it may cause the application to
 observe the same logical record through both paths; the replay result is not
 an ordinary delivery and has no delivery token or acknowledgement.
 
-A one-shot selector should be resolved against one captured stream view: its
-retention floor and end (`next`) at the operation's serialization point. The
-local stream lock already gives an individual replay read an append boundary;
-the clustered replay command is submitted through the stream Raft group. A
-multi-record replay session still needs a stable end boundary (or an explicit
+A selector should be resolved against one captured stream view: its retention
+floor and end position at the operation's serialization point. The local
+stream lock already gives an individual replay read an append boundary; the
+clustered replay command is submitted through the stream Raft group. A
+multi-record replay session needs a stable end boundary (or an explicit
 live-follow mode), a cursor, and retention pin/failure behavior. Otherwise a
 session could see new appends inconsistently or lose a record between selector
 resolution and fetch. Ordinary poll/ack activity must not silently reset or
 advance that replay cursor, and replay must not rewrite the ordinary
-checkpoint.
+checkpoint. The [session design](../design/replay-sessions.md) develops a
+fixed-view, separate-cursor candidate and records its open choices for ack
+fencing, retries, lifecycle, and retention.
 
 The public boundary should remain a stream, consumer, logical record, and
 replay scope. Existing logical message offsets are already part of the
@@ -242,14 +267,14 @@ lookup remains meaningful with nonmonotonic timestamps, what “complete” mean
 below a retention floor, and how a multi-record session pins a stable view.
 
 **Disposition:** keep the existing replay backlog outcome open; do not add a
-separate backlog item or edit the shared tracker for this note. The current
-backlog already names time selectors, and the retention design already records
-the first-at-or-after candidate. Treat this note as evidence to refine those
-open semantics. Defer runtime work until a design/ADR resolves timestamp
+separate backlog item or edit unrelated tracker sections. The current backlog
+already names time selectors, and the retention design already records the
+first-at-or-after candidate. This note and the linked session design refine
+those open semantics. Defer runtime work until a design/ADR resolves timestamp
 source, tie and no-match outcomes, retention completeness, bounded lookup,
-and session behavior. This is near-term design work, while a production
-selector with retention-aware sessions depends on the broader replay and
-retention capabilities.
+session fencing, lifetime, and failover behavior. Time selection is a
+near-term design question; a production selector with retention-aware
+sessions still depends on broader replay and retention capabilities.
 
 Evidence needed before implementation includes:
 
@@ -274,5 +299,6 @@ retention design proposal. No runtime or test changes are appropriate in this
 research-only task. No separate safe refactor was identified: consolidating
 timestamp assignment or adding a time index would itself constrain selector
 semantics and should follow the design decision and evidence above. The
-existing replay backlog remains the correct planning record; no backlog or
-tech-debt change is warranted by this exploratory note.
+existing replay backlog remains the correct planning record; its replay
+child now links these notes without changing the outcome or its status. No new
+backlog or tech-debt item is warranted by this exploratory note.

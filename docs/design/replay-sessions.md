@@ -1,9 +1,9 @@
 # Replay selectors and bounded sessions
 
 - Status: exploratory design; no API or compatibility decision
-- Last reviewed: 2026-09-29
-- Baseline: 3d2f2a6a68ef978ed43a0735159f26db332483d9
-- Primary evidence class: design/research
+- Last reviewed: 2026-10-05
+- Baseline: f999c1b9ad5d22408bbbe6c6276a42e825cd62ef
+- Primary evidence class: design/research; secondary: correctness/reliability, storage/recovery
 - Scope: bounded replay selectors, paging, and optional durable replay sessions
 - Related: [replay backlog outcome](../backlog.md#make-replay-an-explicit-and-safe-consumer-operation), [ADR 0024](../decisions/0024-explicit-offset-replay-read.md), [replay time-selector research](../research/replay-time-selector-semantics.md), and [retention and disk-pressure design](retention-disk-pressure-plan.md)
 
@@ -151,9 +151,29 @@ acknowledgement, expiry, explicit end, and retention invalidation must be
 serialized against that generation. An acknowledgement from an expired or
 replaced session must not advance a new session. Session acknowledgements
 advance only the session cursor; they do not change ordinary committed
-progress, attempts, in-flight delivery tokens, or key gates. If a separate
-progress-replacement operation is ever accepted, it must explicitly fence
-ordinary deliveries and define what happens to out-of-order acknowledgements.
+progress, ordinary attempts or retry state, in-flight delivery tokens, or key
+gates. If a separate progress-replacement operation is ever accepted, it must
+explicitly fence ordinary deliveries and define what happens to out-of-order
+acknowledgements.
+
+For the initial one-unacknowledged-page model, a useful candidate transition
+is to reserve the current page and a session-scoped delivery token durably
+before returning it. A concurrent poll, or a retry after a lost response,
+returns that same unacknowledged page and token while its lease is valid; it
+must not reserve a second page. An acknowledgement identifies the session
+generation and reserved page/token. Only a successful durable acknowledgement
+clears the reservation and advances that session's cursor. Repeating that
+acknowledgement is idempotent, while an expired, replaced, or already-fenced
+token cannot advance progress. This keeps uncertain poll and ack outcomes
+retryable without involving ordinary consumer delivery state.
+
+Any reset or seek operation would also need a new generation. Its race with
+acknowledgement is resolved by the same session serialization point: ack first
+means that ack applies before reset; reset first fences the old receipt. The
+smallest initial API can omit reset and require close plus new-session
+creation. Close, expiry, and retention invalidation likewise fence outstanding
+receipts before releasing a pin. These are candidate semantics, not selected
+API operations.
 
 Session creation changes durable state and can time out after commit but before
 the response reaches the client. It therefore needs idempotent creation, such
@@ -161,8 +181,11 @@ as a caller-supplied session key, or another way for a client to recover the
 created identity. Acknowledgements should likewise be retry-safe for a given
 session generation and replay sequence. Session limits, maximum lifetime,
 renewal policy, maximum concurrent sessions per stream/consumer, and cleanup
-work all need hard bounds. A lease by itself is not a total lifetime bound if
-unlimited renewal is allowed.
+work all need hard bounds. Persisted session inventory must be complete for
+retention decisions; a bounded in-memory cache alone cannot prove which
+sessions pin history. Bound per-stream session count and state bytes, returned
+page bytes, and selector work as well as lifetime and concurrent sessions. A
+lease by itself is not a total lifetime bound if unlimited renewal is allowed.
 
 ## Retention and unavailable history
 
@@ -178,12 +201,24 @@ must not advance to a later retained record or report normal end-of-session.
 The retention proposal's <code>protect</code> policy lets active replay sessions
 pin their earliest unread history, while <code>expire</code> can end replay
 eligibility and must expose the new boundary. These are candidate policies,
-not current behavior. A bounded session lease and explicit close can limit
-pins, but cleanup must wait for the durable expiry/fence to win the race with
-a fetch or ack. Physical deletion may lag a committed logical floor without
-making deleted records eligible again. Retention design must decide the policy
-for a session created before a destructive floor advance and must report that
-outcome to its caller.
+not current behavior. The pin follows the earliest unacknowledged offset, not
+the highest delivered or acknowledged offset. Creation and floor advancement
+must share one logical order: under protect, creation first establishes its
+pin before a later floor transition; if the floor transition wins first, a
+session whose start is now unavailable fails explicitly. Under expire, the
+floor transition must durably invalidate the affected session and fence its
+outstanding receipt before reporting expiry. A bounded session lease and
+explicit close can limit pins, but cleanup must wait for the durable
+expiry/fence to win the race with a fetch or ack. Physical deletion may lag a
+committed logical floor without making deleted records eligible again. The
+selected retention policy must report the outcome to the session caller.
+
+For local and clustered engines, these races need the same logical outcome.
+The local engine would serialize transitions with the stream and persist each
+state change before success. The clustered engine would order equivalent
+transitions through the stream's replicated state and include session and
+retention eligibility in snapshots. This is a semantic requirement, not a
+choice of journal layout, command shape, or physical pin representation.
 
 An offset range or checkpoint selection crossing a known deleted prefix is
 unavailable rather than a successful partial replay. For time selection, the

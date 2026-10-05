@@ -208,6 +208,13 @@ durable replay sessions, retention floors and pins, replay acknowledgements,
 failover/replay-session behavior, and replay-specific observability remain
 open.
 
+The exploratory [time-selector research](research/replay-time-selector-semantics.md)
+records timestamp ordering, retention-completeness, and bounded-lookup risks.
+The [durable replay-session design](design/replay-sessions.md) compares
+session models and proposes separate cursor, acknowledgement, fencing,
+snapshot, and retention-pin semantics for further review. Neither note accepts
+a runtime or API decision.
+
 Constraints:
 
 - replay eligibility must follow the selected retention policy;
