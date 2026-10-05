@@ -404,9 +404,14 @@ transport telemetry, including request rates and latency buckets, traffic,
 admission, health failures, logical storage, delivery outcomes, and a
 label-free per-process uptime gauge. Real-server tests verify that uptime
 progresses and that this process-level signal remains scrapeable while the
-engine health dependency is stalled. Consumer lag, reclaimable storage,
-resource pressure, and the remaining security and capacity controls are still
-open.
+engine health dependency is stalled. A real-process characterization also
+shows that when SIGTERM follows a durable publish response reaching a proxy
+but precedes delivery to the caller, the caller observes an unknown outcome;
+after restart on the same data directory, retrying the stable request ID
+returns the original offset and the stream contains one record. This does not
+cover shutdown during engine execution or a hard process stop. Consumer lag,
+reclaimable storage, resource pressure, and the remaining security and
+capacity controls are still open.
 
 Constraints:
 

@@ -39,6 +39,29 @@ impl RunningServer {
         wait_for_http(http_addr);
         Self { child, broker_addr }
     }
+
+    #[cfg(unix)]
+    fn wait_for_successful_exit(&mut self) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            if let Some(status) = self
+                .child
+                .try_wait()
+                .expect("server process status should be readable")
+            {
+                assert!(
+                    status.success(),
+                    "server should exit successfully: {status}"
+                );
+                return;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "server should finish graceful SIGTERM shutdown"
+            );
+            sleep(Duration::from_millis(25));
+        }
+    }
 }
 
 impl Drop for RunningServer {
@@ -134,6 +157,145 @@ async fn request_id_replay_resolves_unknown_outcome_without_duplicate() {
 
     proxy.abort();
     let _ = proxy.await;
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn sigterm_after_publish_response_reaches_proxy_recovers_unknown_retry_after_restart() {
+    let directory = TempDir::new().unwrap();
+    let mut server = RunningServer::start(directory.path());
+    let mut setup = Client::connect(server.broker_addr).await.unwrap();
+    assert!(matches!(
+        setup
+            .request(&Request::CreateStream {
+                stream: "events".to_owned(),
+            })
+            .await
+            .unwrap(),
+        Response::StreamCreated { created: true, .. }
+    ));
+    drop(setup);
+
+    let proxy_listener = AsyncTcpListener::bind("127.0.0.1:0").await.unwrap();
+    let proxy_address = proxy_listener.local_addr().unwrap();
+    let proxy = tokio::spawn(proxy_publish_response_then_sigterm(
+        proxy_listener,
+        server.broker_addr,
+        server.child.id(),
+    ));
+
+    let publish = Request::Publish {
+        stream: "events".to_owned(),
+        key: None,
+        payload: "once".to_owned(),
+        request_id: Some("publish-once".to_owned()),
+    };
+    let mut client = Client::connect(proxy_address).await.unwrap();
+    assert!(matches!(
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            client.request_with_outcome(&publish)
+        )
+        .await
+        .expect("proxy should close the response connection promptly"),
+        AttemptOutcome::Unknown(AttemptFailure::Client(runnel_client::ClientError::Eof))
+    ));
+    drop(client);
+    proxy
+        .await
+        .expect("response proxy should signal shutdown after observing publish success");
+    server.wait_for_successful_exit();
+
+    server = RunningServer::start(directory.path());
+    let mut retry = Client::connect(server.broker_addr).await.unwrap();
+    assert!(matches!(
+        retry.request_with_outcome(&publish).await,
+        AttemptOutcome::Confirmed(Response::Published { offset: 0, .. })
+    ));
+
+    let mut verifier = Client::connect(server.broker_addr).await.unwrap();
+    assert!(matches!(
+        verifier
+            .request(&Request::Poll {
+                stream: "events".to_owned(),
+                consumer: "shutdown-replay-verifier".to_owned(),
+            })
+            .await
+            .unwrap(),
+        Response::Message {
+            offset: 0,
+            payload,
+            ..
+        } if payload == "once"
+    ));
+    assert!(matches!(
+        verifier
+            .request(&Request::Ack {
+                stream: "events".to_owned(),
+                consumer: "shutdown-replay-verifier".to_owned(),
+                offset: 0,
+            })
+            .await
+            .unwrap(),
+        Response::Acknowledged { .. }
+    ));
+    assert!(matches!(
+        verifier
+            .request(&Request::Poll {
+                stream: "events".to_owned(),
+                consumer: "shutdown-replay-verifier".to_owned(),
+            })
+            .await
+            .unwrap(),
+        Response::Empty { .. }
+    ));
+}
+
+#[cfg(unix)]
+async fn proxy_publish_response_then_sigterm(
+    listener: AsyncTcpListener,
+    broker_addr: SocketAddr,
+    server_pid: u32,
+) {
+    let (client, _) = listener
+        .accept()
+        .await
+        .expect("proxy should accept the publish caller");
+    let (client_reader, mut client_writer) = client.into_split();
+    let mut client_reader = AsyncBufReader::new(client_reader);
+    let mut request = Vec::new();
+    client_reader
+        .read_until(b'\n', &mut request)
+        .await
+        .expect("proxy should read the publish request");
+
+    let broker = AsyncTcpStream::connect(broker_addr)
+        .await
+        .expect("proxy should connect to the broker");
+    let (broker_reader, mut broker_writer) = broker.into_split();
+    broker_writer
+        .write_all(&request)
+        .await
+        .expect("proxy should forward the publish request");
+    let mut broker_reader = AsyncBufReader::new(broker_reader);
+    let mut response = Vec::new();
+    broker_reader
+        .read_until(b'\n', &mut response)
+        .await
+        .expect("proxy should receive the publish response");
+    assert!(matches!(
+        serde_json::from_slice::<Response>(&response).expect("broker response should be valid"),
+        Response::Published { offset: 0, .. }
+    ));
+
+    let pid = server_pid.to_string();
+    let status = Command::new("kill")
+        .args(["-TERM", &pid])
+        .status()
+        .expect("kill should be available on Unix");
+    assert!(status.success(), "SIGTERM should be delivered: {status}");
+
+    drop(client_writer);
 }
 
 async fn proxy_connections(
