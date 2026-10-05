@@ -1,14 +1,14 @@
 # TD-009: Clustered snapshot scalability and compatibility evidence
 
 - Status: snapshot-build telemetry and a bounded measurement probe are implemented; representation and recovery changes remain exploratory
-- Last reviewed: 2026-10-02
+- Last reviewed: 2026-10-05
 - Baseline: `821f2c24b6b8feafdc6563cc6eb76746f75c34d1`
 - Scope: OpenRaft state-machine snapshot creation, transfer, installation,
   recovery, and the path toward incremental or streaming snapshots
 - Related debt: [TD-009](../tech-debt.md)
 - Related outcomes: [Make retained-state growth independent of the hot path](../backlog.md), [Make missing-replica replacement safe](../backlog.md), and [Make durable storage upgrades safe](../backlog.md)
 - Related decisions: [ADR 0007](../decisions/0007-snapshot-based-replica-recovery.md), [ADR 0018](../decisions/0018-safe-replica-recovery-boundary.md), and [ADR 0023](../decisions/0023-independent-retained-storage-and-placement.md)
-- Related evidence: [TD-007 storage compatibility](td-007-storage-compatibility-evidence.md), [TD-010 retained-state materialization](td-010-retained-state-evidence.md), and [TD-026 clustered log and snapshot observations](../research/td-026-log-store-persistence-baseline.md)
+- Related evidence: [TD-007 storage compatibility](td-007-storage-compatibility-evidence.md), [TD-010 retained-state materialization](td-010-retained-state-evidence.md), [TD-026 clustered log and snapshot observations](../research/td-026-log-store-persistence-baseline.md), and [bounded snapshot-build hot-path samples](../research/td-009-snapshot-build-hot-path.csv)
 
 This note records what the current clustered backend proves and what it does
 not prove about snapshot cost and compatibility. It is not an implementation
@@ -34,10 +34,10 @@ The immediate conclusion is therefore two-sided:
 - focused tests establish recovery slices and narrow version-1 read-forward
   behavior, but do not prove mixed-release operation, full cross-artifact
   consistency, or safety at every crash point; and
-- current measurements expose snapshot-file growth during one live clustered
-  workload, but do not justify treating the 32-entry snapshot threshold,
-  64 KiB transfer chunk, or JSON representation as production tuning for
-  large retained streams.
+- the current measurements expose snapshot-file growth and bounded build
+  timing under one three-node hot-path matrix, but do not justify treating the
+  32-entry snapshot threshold, 64 KiB transfer chunk, or JSON representation
+  as production tuning for large retained streams.
 
 One candidate consistent with the accepted architectural boundary is a
 versioned snapshot manifest whose immutable retained data can be transferred
@@ -175,9 +175,9 @@ uses a 256 KiB payload to force multiple chunks, kills the receiver during
 three non-final transfer attempts, and verifies recovery after a final retry.
 The receiver retries from byte zero rather than persisting partial transfer
 state. Per-process aggregate metrics expose build/install counts and failures,
-installed bytes, chunks, final chunks, received bytes, and installs in
-progress, but not build/install duration, peak memory, lock wait, transfer
-duration, retry waste, or retained-state size. The replacement test is
+build duration sum/count/max, installed bytes, chunks, final chunks, received
+bytes, and installs in progress, but not install duration, peak memory, lock
+wait, transfer duration, retry waste, or retained-state size. The replacement test is
 experimental: [ADR 0018](../decisions/0018-safe-replica-recovery-boundary.md)
 keeps permissive empty-replica recovery out of the default binary and does not
 make erasing a replica directory with the same voter identity supported.
@@ -345,9 +345,55 @@ No current result should be interpreted as proving that snapshots improve
 hot-path performance. Snapshot builds take a read lock during encoding;
 installs take a write lock across multiple durable operations; and the
 consensus-log benefit can coexist with growing state-machine memory and
-recovery work. The available live measurements observe these paths alongside
-publish and restart work and do not attribute their costs to an individual
-snapshot operation.
+recovery work. The new metric attributes wall duration to each returned build
+call, and the bounded live probe records per-process aggregates alongside
+publish samples. It does not isolate serialization, persistence, compaction,
+or lock-wait costs, or establish a causal publish impact.
+
+### Bounded build and hot-path observation
+
+The corrected real-process matrix ran source revision
+`622eeef204e944f24f2237304e2175f5d4aa894e` (matrix run
+`20261005142017155006`) on 2026-10-05. It used three native broker processes,
+2 CPUs and 2 GiB under a systemd user scope, 256 measured durable publishes,
+two repetitions per cell, and one stream with either 2,048 or 15,000 retained
+records. Payloads were 100 bytes or 1 KiB. Setup publishes were excluded from
+latency; the measured interval ended after 256 public durable publishes, and a
+bounded wait then observed a successful snapshot build and the return to zero
+active builds on all nodes. All eight cases completed and every node reported
+successful builds with zero failures. The 15,000-record, 1-KiB case remained
+under the probe's 16-MiB combined logical-payload cap.
+
+The following are descriptive medians across two scenario repetitions. Build
+means are ranges across the six process observations (three nodes by two
+repetitions). RSS ranges use per-node maxima only where the 100-ms observer
+sampled an active build, so sample coverage differs by cell. “Active RSS
+samples” counts samples across nodes and repetitions that observed at least
+one build while measured publishes were running; the RSS range is the maximum
+process RSS sampled while a build was active across the full measured interval
+and completion wait.
+
+| Payload | Retained records | Publish throughput median | Publish p50 / p99 median | Per-process build mean range | Active RSS lower bound | Active RSS samples during publishes |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 100 B | 2,048 | 1,627/s | 470 / 2,022 µs | 6.4–11.3 ms | 24.9–25.8 MiB | 3 |
+| 100 B | 15,000 | 747/s | 457 / 28,781 µs | 66.8–78.3 ms | 82.0–93.7 MiB | 11 |
+| 1 KiB | 2,048 | 257/s | 1,540 / 59,376 µs | 102.9–122.5 ms | 95.6–150.7 MiB | 45 |
+| 1 KiB | 15,000 | 77/s | 3,036 / 163,515 µs | 865 ms–1.345 s | 423.1–451.0 MiB | 121 |
+
+The sample-level rows are retained in
+[`td-009-snapshot-build-hot-path.csv`](../research/td-009-snapshot-build-hot-path.csv);
+the full per-case JSON and logs were written under
+`benchmark-results/snapshot-build-hot-path-20261005T161956/`. The 100-byte,
+2,048-record cell observed active-build RSS in only one of its two repetitions,
+showing that the 100-ms sampler can miss short builds. The RSS observations
+include the process baseline and retained state: they are lower bounds on
+process RSS while a build was active, not peak or incremental snapshot memory.
+The run had active Chrome/browser desktop load (20 CPUs, preflight load
+1.05/2.70/2.60, about 17 GiB available of 31 GiB), only two repetitions and
+256 latency samples per cell. Treat its latency and throughput numbers as
+workload-specific observations, not stable p99 estimates or evidence of a
+performance win. The run measures neither install cost nor transfer, recovery,
+or isolated lock wait; those gaps remain open.
 
 ## Candidate future directions
 
