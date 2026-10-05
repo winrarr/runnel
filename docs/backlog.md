@@ -208,6 +208,13 @@ durable replay sessions, retention floors and pins, replay acknowledgements,
 failover/replay-session behavior, and replay-specific observability remain
 open.
 
+The exploratory [time-selector research](research/replay-time-selector-semantics.md)
+records timestamp ordering, retention-completeness, and bounded-lookup risks.
+The [durable replay-session design](design/replay-sessions.md) compares
+session models and proposes separate cursor, acknowledgement, fencing,
+snapshot, and retention-pin semantics for further review. Neither note accepts
+a runtime or API decision.
+
 Constraints:
 
 - replay eligibility must follow the selected retention policy;
@@ -228,7 +235,7 @@ Goal: amortize protocol and durability overhead for publish and consume workload
 
 Rationale: batching is necessary for efficient small-message workloads, but an underspecified batch can hide partial success or force unsafe retries.
 
-Current progress: bounded binary-safe publish batches now return ordered per-record outcomes, preserve request-ID deduplication, and use explicit local and clustered durability boundaries. A real-process typed-client check verifies ordered mixed record results, binary payload round-trip, and request-ID replay without duplicates across a local restart. A dropping-proxy batch check observes an accepted batch whose response was discarded, asserts unknown outcomes for every record, and confirms stable-ID retry leaves the records present exactly once. A three-process typed-client test withholds a successful batch response from the probed data-group leader, stops that leader, confirms a different survivor reports leadership, then reconnects and retries with stable IDs and confirms the records are present exactly once. A real-server typed-client response-timeout test captures the complete successful broker response while the proxy withholds it, verifies `ResponseTimeout` and unknown outcomes for every record, then reconnects and retries stable IDs to confirm the original offsets and exactly-once public consumption. An opt-in clustered publish-batch baseline records per-record throughput and batch round-trip latency. The advisory [consume-batch proposal](design/consume-batches.md) now specifies mixed ack-vector outcomes and the local journal versus replicated-command uncertainty boundaries. No consume-batch contract or runtime behavior is accepted; implementation tests and the broader batch-size, failure, recovery, and resource tradeoff matrix remain open.
+Current progress: bounded binary-safe publish batches now return ordered per-record outcomes, preserve request-ID deduplication, and use explicit local and clustered durability boundaries. A real-process typed-client check verifies ordered mixed record results, binary payload round-trip, and request-ID replay without duplicates across a local restart. A dropping-proxy batch check observes an accepted batch whose response was discarded, asserts unknown outcomes for every record, and confirms stable-ID retry leaves the records present exactly once. A three-process typed-client test withholds a successful batch response from the probed data-group leader, stops that leader, confirms a different survivor reports leadership, then reconnects and retries with stable IDs and confirms the records are present exactly once. A real-server typed-client response-timeout test captures the complete successful broker response while the proxy withholds it, verifies `ResponseTimeout` and unknown outcomes for every record, then reconnects and retries stable IDs to confirm the original offsets and exactly-once public consumption. An opt-in clustered publish-batch baseline records per-record throughput and batch round-trip latency. [ADR 0030](decisions/0030-consume-batch-contract.md) proposes the consume-batch semantic contract for review, and the [design](design/consume-batches.md) records implementation gates for per-offset policy snapshots, mixed ack outcomes, dead-letter behavior, journal reconciliation, and the replicated-command boundary. No consume-batch runtime behavior is implemented; implementation tests and the broader batch-size, failure, recovery, and resource tradeoff matrix remain open.
 
 Constraints:
 

@@ -91,6 +91,8 @@ class MatrixBenchmarkTests(unittest.TestCase):
         self.assertIn("25", command)
         self.assertIn("--slow-consumer-timeout-seconds", command)
         self.assertIn("60.0", command)
+        self.assertIn("--raft-log-growth-cycle-timeout-seconds", command)
+        self.assertIn("30.0", command)
         self.assertIn("--output", command)
         self.assertIn("/tmp/matrix/result.json", command)
         self.assertIn("--log-dir", command)
@@ -178,6 +180,125 @@ class MatrixBenchmarkTests(unittest.TestCase):
         )
         batch_index = command.index("--batch-size")
         self.assertEqual(command[batch_index + 1], str(cases[1]["batch_size"]))
+
+    def test_raft_log_growth_expands_size_sampling_payload_and_repetitions(self) -> None:
+        args = self.parse(
+            "--scenarios",
+            "raft_log_growth",
+            "--payload-sizes",
+            "100,1024",
+            "--raft-log-growth-message-values",
+            "64,128",
+            "--raft-log-growth-observation-every-values",
+            "8,32",
+            "--raft-log-growth-cycle-timeout-seconds",
+            "45",
+            "--repetitions",
+            "2",
+        )
+
+        cases = matrix.matrix_cases(args)
+
+        self.assertEqual(len(cases), 16)
+        self.assertEqual(
+            {case["raft_log_growth_messages"] for case in cases}, {64, 128}
+        )
+        self.assertEqual(
+            {case["raft_log_growth_observation_every"] for case in cases}, {8, 32}
+        )
+        self.assertEqual({case["payload_size"] for case in cases}, {100, 1024})
+        self.assertEqual({case["repetition"] for case in cases}, {1, 2})
+        self.assertEqual(args.raft_log_growth_cycle_timeout_seconds, 45)
+        identifiers = [
+            matrix.case_id(index, case) for index, case in enumerate(cases, 1)
+        ]
+        self.assertEqual(len(set(identifiers)), len(cases))
+        self.assertIn("growth-64-observe-8", identifiers[0])
+
+        command = matrix.case_command(
+            args,
+            cases[1],
+            Path("/tmp/matrix/result.json"),
+            Path("/tmp/matrix/logs"),
+            build=False,
+        )
+        growth_index = command.index("--raft-log-growth-messages")
+        observation_index = command.index("--raft-log-growth-observation-every")
+        self.assertEqual(command[growth_index + 1], "64")
+        self.assertEqual(command[observation_index + 1], "8")
+        timeout_index = command.index("--raft-log-growth-cycle-timeout-seconds")
+        self.assertEqual(command[timeout_index + 1], "45.0")
+        self.assertNotIn("retained-2048", identifiers[0])
+
+    def test_raft_log_growth_dimensions_are_bounded_and_scenario_specific(self) -> None:
+        args = self.parse(
+            "--scenarios",
+            "durable_publish",
+            "--payload-sizes",
+            "100",
+            "--raft-log-growth-message-values",
+            "64,128",
+            "--raft-log-growth-observation-every-values",
+            "8,32",
+        )
+        self.assertEqual(len(matrix.matrix_cases(args)), 1)
+
+        invalid_options = (
+            ("--raft-log-growth-message-values", "63"),
+            ("--raft-log-growth-message-values", "4097"),
+            ("--raft-log-growth-observation-every-values", "0"),
+            ("--raft-log-growth-observation-every-values", "1025"),
+            ("--raft-log-growth-cycle-timeout-seconds", "0.5"),
+            ("--raft-log-growth-cycle-timeout-seconds", "300.1"),
+            (
+                "--scenarios",
+                "raft_log_growth",
+                "--payload-sizes",
+                "8192",
+                "--raft-log-growth-message-values",
+                "4096",
+            ),
+        )
+        for options in invalid_options:
+            with self.subTest(options=options), self.assertRaises(SystemExit):
+                self.parse(*options)
+
+    def test_combined_growth_retained_and_batch_cases_stay_factorized(self) -> None:
+        args = self.parse(
+            "--scenarios",
+            "raft_log_growth,retained_hot_path,publish_batch",
+            "--messages",
+            "256",
+            "--payload-sizes",
+            "100,1024",
+            "--retained-message-values",
+            "1025,2048",
+            "--raft-log-growth-message-values",
+            "64,256",
+            "--raft-log-growth-observation-every-values",
+            "8,32",
+            "--batch-size-values",
+            "1,8",
+            "--repetitions",
+            "2",
+            "--max-cases",
+            "32",
+        )
+
+        cases = matrix.matrix_cases(args)
+        case_counts = {
+            scenario: sum(case["scenario"] == scenario for case in cases)
+            for scenario in args.scenarios
+        }
+        identifiers = [
+            matrix.case_id(index, case) for index, case in enumerate(cases, 1)
+        ]
+
+        self.assertEqual(
+            case_counts,
+            {"raft_log_growth": 16, "retained_hot_path": 8, "publish_batch": 8},
+        )
+        self.assertEqual(len(set(identifiers)), 32)
 
     def test_peer_forwarding_expands_bounded_stream_counts_and_records_them(self) -> None:
         args = self.parse(
@@ -297,6 +418,13 @@ class MatrixBenchmarkTests(unittest.TestCase):
         self.assertEqual(envelope["matrix"]["completed_cases"], 2)
         self.assertEqual(len(envelope["cases"]), 2)
         self.assertEqual(envelope["workload"]["batch_size_values"], [32])
+        self.assertEqual(envelope["workload"]["raft_log_growth_message_values"], [256])
+        self.assertEqual(
+            envelope["workload"]["raft_log_growth_observation_every_values"], [8]
+        )
+        self.assertEqual(
+            envelope["workload"]["raft_log_growth_cycle_timeout_seconds"], 30
+        )
 
     def test_case_timeout_is_bounded_and_native_scope_is_explicit(self) -> None:
         args = self.parse(
