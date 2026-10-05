@@ -9,7 +9,7 @@ use axum::routing::get;
 use axum::{Json, Router};
 use runnel_engine::{BrokerError, Engine, PollResult};
 use runnel_protocol::Request;
-use runnel_raft::{GroupManager, SnapshotMetricsSnapshot};
+use runnel_raft::{GroupManager, ReplicationProgressSnapshot, SnapshotMetricsSnapshot};
 use tracing::error;
 
 use crate::protocol::ProtocolAdmission;
@@ -352,11 +352,16 @@ async fn metrics(State(state): State<HttpState>) -> (StatusCode, String) {
                 Some(cluster) => cluster.snapshot_metrics().await,
                 None => SnapshotMetricsSnapshot::default(),
             };
+            let replication_progress = match &state.cluster {
+                Some(cluster) => Some(cluster.replication_progress().await),
+                None => None,
+            };
             (
                 StatusCode::OK,
                 format_metrics(
                     Some(health),
                     Some(snapshot_metrics),
+                    replication_progress,
                     &state.metrics,
                     state.admission,
                 ),
@@ -376,7 +381,7 @@ async fn metrics(State(state): State<HttpState>) -> (StatusCode, String) {
             // engine-derived samples into fresh-looking zeroes or stale values.
             (
                 StatusCode::OK,
-                format_metrics(None, None, &state.metrics, state.admission),
+                format_metrics(None, None, None, &state.metrics, state.admission),
             )
         }
     }
@@ -385,6 +390,7 @@ async fn metrics(State(state): State<HttpState>) -> (StatusCode, String) {
 fn format_metrics(
     health: Option<runnel_engine::HealthSnapshot>,
     snapshot_metrics: Option<SnapshotMetricsSnapshot>,
+    replication_progress: Option<ReplicationProgressSnapshot>,
     metrics: &ServerMetrics,
     admission: ProtocolAdmission,
 ) -> String {
@@ -852,6 +858,36 @@ fn format_metrics(
         writeln!(output, "# TYPE runnel_snapshot_transfer_chunks_received_total counter\nrunnel_snapshot_transfer_chunks_received_total {}", snapshot_metrics.transfer_chunks).unwrap();
         writeln!(output, "# TYPE runnel_snapshot_transfer_final_chunks_received_total counter\nrunnel_snapshot_transfer_final_chunks_received_total {}", snapshot_metrics.transfer_final_chunks).unwrap();
         writeln!(output, "# TYPE runnel_snapshot_transfer_bytes_received_total counter\nrunnel_snapshot_transfer_bytes_received_total {}", snapshot_metrics.transfer_bytes).unwrap();
+    }
+    if let Some(replication_progress) = replication_progress {
+        let available = u8::from(replication_progress.groups_with_local_leadership > 0);
+        writeln!(output, "# HELP runnel_cluster_replication_progress_available Whether any sampled Raft group reports this broker as leader with replication state; zero means no local progress sample is available.").unwrap();
+        writeln!(output, "# TYPE runnel_cluster_replication_progress_available gauge\nrunnel_cluster_replication_progress_available {available}").unwrap();
+        writeln!(output, "# HELP runnel_cluster_replication_groups_total Number of initialized Raft groups held by this broker, including the metadata group.").unwrap();
+        writeln!(output, "# TYPE runnel_cluster_replication_groups_total gauge\nrunnel_cluster_replication_groups_total {}", replication_progress.groups_total).unwrap();
+        writeln!(output, "# HELP runnel_cluster_replication_groups_observed Raft groups sampled for replication progress on this scrape; at most 256 groups are sampled.").unwrap();
+        writeln!(output, "# TYPE runnel_cluster_replication_groups_observed gauge\nrunnel_cluster_replication_groups_observed {}", replication_progress.groups_observed).unwrap();
+        writeln!(output, "# HELP runnel_cluster_replication_groups_with_local_leadership Sampled Raft groups for which this broker is leader.").unwrap();
+        writeln!(output, "# TYPE runnel_cluster_replication_groups_with_local_leadership gauge\nrunnel_cluster_replication_groups_with_local_leadership {}", replication_progress.groups_with_local_leadership).unwrap();
+        writeln!(output, "# HELP runnel_cluster_replication_peers_configured Configured remote cluster peers; at most 32 peer lag series are emitted.").unwrap();
+        writeln!(output, "# TYPE runnel_cluster_replication_peers_configured gauge\nrunnel_cluster_replication_peers_configured {}", replication_progress.configured_replica_peers).unwrap();
+        writeln!(output, "# HELP runnel_cluster_replication_peers_observed Distinct remote peers with a sampled replication position on this scrape.").unwrap();
+        writeln!(output, "# TYPE runnel_cluster_replication_peers_observed gauge\nrunnel_cluster_replication_peers_observed {}", replication_progress.peer_lag_entries.len()).unwrap();
+        if available == 1 {
+            writeln!(output, "# HELP runnel_cluster_replication_lag_entries Maximum sampled Raft log entries by which a follower is behind this broker across groups this broker leads; this is not message or byte lag.").unwrap();
+            writeln!(
+                output,
+                "# TYPE runnel_cluster_replication_lag_entries gauge"
+            )
+            .unwrap();
+            for (peer_id, lag_entries) in replication_progress.peer_lag_entries {
+                writeln!(
+                    output,
+                    "runnel_cluster_replication_lag_entries{{peer_id=\"{peer_id}\"}} {lag_entries}"
+                )
+                .unwrap();
+            }
+        }
     }
     output
 }

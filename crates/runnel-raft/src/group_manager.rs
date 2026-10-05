@@ -1,5 +1,6 @@
 use std::collections::BTreeMap;
 use std::fs;
+use std::ops::Bound::{Excluded, Unbounded};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
@@ -29,6 +30,12 @@ const SNAPSHOT_LOGS_TO_KEEP: u64 = 4;
 // Keep individual peer snapshot RPCs bounded; interrupted transfers restart
 // from the beginning in the current in-memory receiver.
 const SNAPSHOT_CHUNK_SIZE: u64 = 64 * 1024;
+// Keep metrics scrapes independent of an arbitrarily large number of streams
+// and nodes. The static deployment currently uses three nodes; the peer cap
+// also keeps metrics cardinality bounded if a larger static membership is
+// configured.
+const MAX_REPLICATION_PROGRESS_GROUPS: usize = 256;
+const MAX_REPLICATION_PROGRESS_PEERS: usize = 32;
 
 pub(super) async fn build_raft<N>(
     node_id: NodeId,
@@ -100,7 +107,24 @@ pub struct GroupManager {
     max_delivery_attempts: Option<u32>,
     groups: RwLock<BTreeMap<String, Arc<RaftGroup>>>,
     creation_lock: Mutex<()>,
+    replication_progress_cursor: Mutex<Option<String>>,
     peer_transport: Arc<network::PeerTransport>,
+}
+
+/// A bounded aggregate of this node's observed Raft replication progress.
+///
+/// The sample always includes the metadata group and up to 255 data groups.
+/// Data-group sampling rotates through the manager's sorted group IDs across
+/// scrapes. Per-peer lag is the maximum distance, in Raft log entries, between
+/// a sampled locally led group's last appended index and that peer's matched
+/// index. It is not a message, byte, or consumer-offset lag measurement.
+#[derive(Debug, Clone, Default)]
+pub struct ReplicationProgressSnapshot {
+    pub groups_total: usize,
+    pub groups_observed: usize,
+    pub groups_with_local_leadership: usize,
+    pub configured_replica_peers: usize,
+    pub peer_lag_entries: BTreeMap<NodeId, u64>,
 }
 
 impl Drop for GroupManager {
@@ -127,6 +151,7 @@ impl GroupManager {
             max_delivery_attempts,
             groups: RwLock::new(BTreeMap::new()),
             creation_lock: Mutex::new(()),
+            replication_progress_cursor: Mutex::new(None),
             peer_transport: network::PeerTransport::new(),
         });
         let metadata = manager
@@ -646,6 +671,99 @@ impl GroupManager {
             .iter()
             .map(|group| group.state_machine.snapshot_metrics())
             .fold(SnapshotMetricsSnapshot::default(), add_snapshot_metrics)
+    }
+
+    /// Return bounded replication progress for groups that this broker leads.
+    ///
+    /// The metadata group is always sampled. At most 255 data groups are
+    /// sampled per call, with a cursor that rotates the sampled range. At
+    /// most 32 replica IDs are considered per group, bounding the additional
+    /// scrape work to 256 * 32 Raft metric entries regardless of stream or
+    /// membership count.
+    pub async fn replication_progress(&self) -> ReplicationProgressSnapshot {
+        let mut cursor = self.replication_progress_cursor.lock().await;
+        let groups = self.groups.read().await;
+        let groups_total = groups.len();
+        let data_group_limit = MAX_REPLICATION_PROGRESS_GROUPS.saturating_sub(1);
+        let mut sampled = Vec::with_capacity(MAX_REPLICATION_PROGRESS_GROUPS);
+
+        if let Some(metadata) = groups.get(METADATA_GROUP_ID) {
+            sampled.push((METADATA_GROUP_ID.to_owned(), Arc::clone(metadata)));
+        }
+
+        let cursor_before = cursor.as_deref();
+        let mut data_sample = Vec::with_capacity(data_group_limit);
+        if let Some(last_group_id) = cursor_before {
+            for (group_id, group) in groups
+                .range::<str, _>((Excluded(last_group_id), Unbounded))
+                .filter(|(group_id, _)| group_id.as_str() != METADATA_GROUP_ID)
+                .take(data_group_limit)
+            {
+                data_sample.push((group_id.clone(), Arc::clone(group)));
+            }
+            if data_sample.len() < data_group_limit {
+                for (group_id, group) in groups
+                    .range(..=last_group_id.to_owned())
+                    .filter(|(group_id, _)| group_id.as_str() != METADATA_GROUP_ID)
+                    .take(data_group_limit - data_sample.len())
+                {
+                    data_sample.push((group_id.clone(), Arc::clone(group)));
+                }
+            }
+        } else {
+            for (group_id, group) in groups
+                .iter()
+                .filter(|(group_id, _)| group_id.as_str() != METADATA_GROUP_ID)
+                .take(data_group_limit)
+            {
+                data_sample.push((group_id.clone(), Arc::clone(group)));
+            }
+        }
+
+        if let Some((last_group_id, _)) = data_sample.last() {
+            *cursor = Some(last_group_id.clone());
+        }
+        sampled.extend(data_sample);
+        drop(groups);
+        drop(cursor);
+
+        let mut snapshot = ReplicationProgressSnapshot {
+            groups_total,
+            groups_observed: sampled.len(),
+            configured_replica_peers: self
+                .peers
+                .keys()
+                .filter(|peer_id| **peer_id != self.node_id)
+                .count(),
+            ..ReplicationProgressSnapshot::default()
+        };
+
+        for (_, group) in sampled {
+            let raft_metrics = group.raft.metrics();
+            let metrics = raft_metrics.borrow();
+            let Some(replication) = metrics.replication.as_ref() else {
+                continue;
+            };
+            snapshot.groups_with_local_leadership += 1;
+
+            let leader_next_index = metrics
+                .last_log_index
+                .map_or(0, |index| index.saturating_add(1));
+            for (peer_id, matched_log_id) in replication.iter().take(MAX_REPLICATION_PROGRESS_PEERS)
+            {
+                let matched_next_index = matched_log_id
+                    .as_ref()
+                    .map_or(0, |log_id| log_id.index.saturating_add(1));
+                let lag_entries = leader_next_index.saturating_sub(matched_next_index);
+                if let Some(lag) = snapshot.peer_lag_entries.get_mut(peer_id) {
+                    *lag = (*lag).max(lag_entries);
+                } else if snapshot.peer_lag_entries.len() < MAX_REPLICATION_PROGRESS_PEERS {
+                    snapshot.peer_lag_entries.insert(*peer_id, lag_entries);
+                }
+            }
+        }
+
+        snapshot
     }
 }
 
