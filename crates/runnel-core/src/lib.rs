@@ -1047,6 +1047,60 @@ mod tests {
     }
 
     #[test]
+    fn pending_delivery_keeps_pinned_attempt_limit_after_reopen() {
+        let directory = tempdir().unwrap();
+        let broker = Broker::open(directory.path(), BrokerConfig::default()).unwrap();
+        broker.create_stream("events").unwrap();
+        let original_policy = broker
+            .configure_consumer("events", "worker", 0, Some(2))
+            .unwrap();
+        assert_eq!(original_policy.version, 1);
+        broker.publish("events", None, b"poison".to_vec()).unwrap();
+
+        assert!(matches!(
+            broker.poll("events", "worker").unwrap(),
+            PollResult::Message(Message {
+                offset: 0,
+                delivery_attempt: Some(1),
+                ..
+            })
+        ));
+        let updated_policy = broker
+            .configure_consumer("events", "worker", 0, Some(1))
+            .unwrap();
+        assert_eq!(updated_policy.version, 2);
+        assert_eq!(updated_policy.max_delivery_attempts, Some(1));
+        drop(broker);
+
+        let reopened = Broker::open(directory.path(), BrokerConfig::default()).unwrap();
+        assert_eq!(
+            reopened.inspect_consumer("events", "worker").unwrap(),
+            updated_policy
+        );
+        assert!(matches!(
+            reopened.poll("events", "worker").unwrap(),
+            PollResult::Message(Message {
+                offset: 0,
+                delivery_attempt: Some(2),
+                payload,
+                ..
+            }) if payload == b"poison"
+        ));
+        assert_eq!(
+            reopened.poll("events", "worker").unwrap(),
+            PollResult::Empty
+        );
+        assert!(matches!(
+            reopened.poll("events.dead-letter", "inspector").unwrap(),
+            PollResult::Message(Message {
+                delivery_attempt: Some(1),
+                payload,
+                ..
+            }) if payload == b"poison"
+        ));
+    }
+
+    #[test]
     fn maximum_length_dead_letter_target_does_not_recurse() {
         let directory = tempdir().unwrap();
         let config = BrokerConfig {

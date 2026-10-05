@@ -1616,6 +1616,94 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn persistent_raft_pending_delivery_keeps_pinned_attempt_limit_after_reopen() {
+        let directory = tempfile::tempdir().unwrap();
+        let peers = BTreeMap::from([(1, "127.0.0.1:0".to_owned())]);
+        let engine = PersistentEngine::open(
+            1,
+            "runnel-pending-policy-reopen-test".to_owned(),
+            directory.path(),
+            peers.clone(),
+            true,
+        )
+        .await
+        .unwrap();
+        engine.create_stream("events").await.unwrap();
+        let original_policy = Engine::configure_consumer(&engine, "events", "workers", 0, Some(2))
+            .await
+            .unwrap();
+        assert_eq!(original_policy.version, 1);
+        engine
+            .publish("events", None, b"poison".to_vec(), None)
+            .await
+            .unwrap();
+
+        assert!(matches!(
+            engine
+                .poll_group("events", "workers", "member-before-reopen")
+                .await
+                .unwrap(),
+            PollResult::Message(Message {
+                offset: 0,
+                delivery_attempt: Some(1),
+                ..
+            })
+        ));
+        let updated_policy = Engine::configure_consumer(&engine, "events", "workers", 0, Some(1))
+            .await
+            .unwrap();
+        assert_eq!(updated_policy.version, 2);
+        assert_eq!(updated_policy.max_delivery_attempts, Some(1));
+        drop(engine);
+
+        let reopened = PersistentEngine::open(
+            1,
+            "runnel-pending-policy-reopen-test".to_owned(),
+            directory.path(),
+            peers,
+            true,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            Engine::inspect_consumer(&reopened, "events", "workers")
+                .await
+                .unwrap(),
+            updated_policy
+        );
+        assert!(matches!(
+            reopened
+                .poll_group("events", "workers", "member-after-reopen")
+                .await
+                .unwrap(),
+            PollResult::Message(Message {
+                offset: 0,
+                delivery_attempt: Some(2),
+                payload,
+                ..
+            }) if payload == b"poison"
+        ));
+        assert_eq!(
+            reopened
+                .poll_group("events", "workers", "member-after-reopen")
+                .await
+                .unwrap(),
+            PollResult::Empty
+        );
+        assert!(matches!(
+            reopened
+                .poll_group("events.dead-letter", "inspector", "inspector")
+                .await
+                .unwrap(),
+            PollResult::Message(Message {
+                delivery_attempt: Some(1),
+                payload,
+                ..
+            }) if payload == b"poison"
+        ));
+    }
+
+    #[tokio::test]
     async fn three_node_cluster_replicates_a_committed_message() {
         let cluster = InMemoryCluster::new([1, 2, 3]).await.unwrap();
         let leader = cluster.leader().await.unwrap();
