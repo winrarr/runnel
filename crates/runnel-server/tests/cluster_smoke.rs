@@ -3,6 +3,11 @@ use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
+#[cfg(feature = "test-replacement-recovery")]
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+};
 use std::thread::sleep;
 use std::time::{Duration, Instant};
 
@@ -12,9 +17,13 @@ use runnel_client::{
 };
 use runnel_protocol::{PublishBatchRecordResponse, Request, Response};
 use tempfile::TempDir;
+#[cfg(feature = "test-replacement-recovery")]
+use tokio::io::AsyncReadExt;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader as AsyncBufReader};
 use tokio::net::{TcpListener as AsyncTcpListener, TcpStream as AsyncTcpStream};
 use tokio::sync::oneshot;
+#[cfg(feature = "test-replacement-recovery")]
+use tokio::sync::{mpsc, watch};
 
 // Restart and log replay can be substantially slower on contended CI disks;
 // keep the assertion bounded without treating an intermediate empty poll as
@@ -1856,11 +1865,22 @@ fn three_process_cluster_transfers_consumer_policy_and_delivery_snapshot_after_l
 }
 
 #[cfg(feature = "test-replacement-recovery")]
-#[test]
-fn replacement_node_recovers_after_repeated_snapshot_interruptions() {
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn replacement_node_recovers_after_repeated_snapshot_interruptions() {
     let directory = TempDir::new().unwrap();
-    let addresses = (0..9).map(|_| free_addr()).collect::<Vec<_>>();
-    let cluster_nodes = vec![(1, addresses[6]), (2, addresses[7]), (3, addresses[8])];
+    let addresses = (0..10).map(|_| free_addr()).collect::<Vec<_>>();
+    let proxy_used = Arc::new(AtomicBool::new(false));
+    let (snapshot_chunk_sender, mut snapshot_chunk_receiver) = mpsc::unbounded_channel();
+    let (release_snapshot_sender, release_snapshot_receiver) = watch::channel(false);
+    let replacement_proxy = AsyncTcpListener::bind(addresses[9]).await.unwrap();
+    let proxy = tokio::spawn(replacement_snapshot_gate_proxy(
+        replacement_proxy,
+        addresses[7],
+        Arc::clone(&proxy_used),
+        snapshot_chunk_sender,
+        release_snapshot_receiver,
+    ));
+    let cluster_nodes = vec![(1, addresses[6]), (2, addresses[9]), (3, addresses[8])];
     let mut nodes = vec![
         RunningNode::start(
             1,
@@ -1895,6 +1915,7 @@ fn replacement_node_recovers_after_repeated_snapshot_interruptions() {
     }
 
     let leader = create_stream_on_any(&mut nodes, "events");
+    assert_eq!(leader, 0, "the bootstrapped node should lead initially");
     assert!(matches!(
         wait_for_response_at(
             nodes[leader].broker_addr,
@@ -1921,7 +1942,7 @@ fn replacement_node_recovers_after_repeated_snapshot_interruptions() {
         Response::Acknowledged { .. }
     ));
 
-    let replacement = (leader + 1) % nodes.len();
+    let replacement = 1;
     nodes[replacement].stop();
     for index in 1..=48 {
         let payload = if index == 16 {
@@ -1949,8 +1970,34 @@ fn replacement_node_recovers_after_repeated_snapshot_interruptions() {
 
     let snapshot_node = wait_for_snapshot(&nodes, replacement, "events");
     wait_for_purged_log(&nodes[snapshot_node], "events");
+    let transfer_leader = data_group_leader(&nodes, "events");
     nodes[replacement].replace_storage(directory.path().join("empty-replacement"));
-    for attempt in 0..SNAPSHOT_INTERRUPTION_ATTEMPTS {
+
+    tokio::time::timeout(CLUSTER_WAIT_TIMEOUT, snapshot_chunk_receiver.recv())
+        .await
+        .expect("replacement did not receive a non-final events data-group snapshot chunk")
+        .expect("snapshot gate proxy stopped before observing the events data group");
+    assert!(proxy_used.load(Ordering::Acquire));
+    let transfer_leader_response =
+        direct_peer_inspect_consumer(nodes[transfer_leader].peer_addr, "events");
+    assert!(
+        transfer_leader_response["Forward"]["ConsumerPolicy"]["Ok"].is_object(),
+        "the original data-group leader lost authority before the held snapshot chunk: {transfer_leader_response}"
+    );
+    nodes[transfer_leader].stop();
+    release_snapshot_sender
+        .send(true)
+        .expect("snapshot gate proxy should still be waiting for release");
+    let successor_leader = data_group_leader_excluding(&nodes, "events", Some(replacement));
+    assert_ne!(successor_leader, transfer_leader);
+
+    // The receiver accepted a non-final data-group chunk from the failed
+    // leader. Restarting it discards that partial transfer while the successor
+    // is active, then the remaining attempts preserve repeated interruption
+    // coverage.
+    nodes[replacement].stop();
+    nodes[replacement].restart();
+    for attempt in 1..SNAPSHOT_INTERRUPTION_ATTEMPTS {
         wait_for_active_snapshot_transfer(nodes[replacement].http_addr, attempt);
         nodes[replacement].stop();
         if attempt + 1 < SNAPSHOT_INTERRUPTION_ATTEMPTS {
@@ -1964,6 +2011,13 @@ fn replacement_node_recovers_after_repeated_snapshot_interruptions() {
         1,
     );
     wait_for_message_at(nodes[replacement].broker_addr, 1, "snapshot-1");
+    wait_for_message_for_consumer_at(
+        nodes[successor_leader].broker_addr,
+        "events",
+        "worker",
+        1,
+        "snapshot-1",
+    );
     wait_for_message_for_consumer_at(
         nodes[replacement].broker_addr,
         "events",
@@ -2012,9 +2066,18 @@ fn replacement_node_recovers_after_repeated_snapshot_interruptions() {
         "replacement metrics did not report a completed snapshot install:\n{metrics}"
     );
 
-    nodes[leader].stop();
+    nodes[transfer_leader].restart();
+    wait_for_message_for_consumer_at(
+        nodes[transfer_leader].broker_addr,
+        "events",
+        "worker",
+        2,
+        "snapshot-2",
+    );
+    let post_snapshot_failed_leader = data_group_leader(&nodes, "events");
+    nodes[post_snapshot_failed_leader].stop();
     let recovered_leader = wait_for_stream_on_any(&mut nodes, "events");
-    assert_ne!(recovered_leader, leader);
+    assert_ne!(recovered_leader, post_snapshot_failed_leader);
     assert!(matches!(
         wait_for_response_at(
             nodes[recovered_leader].broker_addr,
@@ -2047,15 +2110,17 @@ fn replacement_node_recovers_after_repeated_snapshot_interruptions() {
         ),
         Response::Acknowledged { .. }
     ));
-    nodes[leader].restart();
+    nodes[post_snapshot_failed_leader].restart();
     wait_for_message_for_consumer_at(
-        nodes[leader].broker_addr,
+        nodes[post_snapshot_failed_leader].broker_addr,
         "events",
         "worker",
         3,
         "snapshot-3",
     );
     assert_live_nodes(&mut nodes);
+    proxy.abort();
+    let _ = proxy.await;
 }
 
 // Keep process-launch parameters explicit so the test's process and topology
@@ -2137,11 +2202,19 @@ fn create_stream_on_any(nodes: &mut [RunningNode], stream: &str) -> usize {
 }
 
 fn data_group_leader(nodes: &[RunningNode], stream: &str) -> usize {
+    data_group_leader_excluding(nodes, stream, None)
+}
+
+fn data_group_leader_excluding(
+    nodes: &[RunningNode],
+    stream: &str,
+    excluded_index: Option<usize>,
+) -> usize {
     let deadline = Instant::now() + CLUSTER_WAIT_TIMEOUT;
     while Instant::now() < deadline {
         let mut leader = None;
         for (index, node) in nodes.iter().enumerate() {
-            if node.child.is_none() {
+            if node.child.is_none() || excluded_index == Some(index) {
                 continue;
             }
             let response = direct_peer_inspect_consumer(node.peer_addr, stream);
@@ -2164,7 +2237,7 @@ fn data_group_leader(nodes: &[RunningNode], stream: &str) -> usize {
         }
         sleep(Duration::from_millis(50));
     }
-    panic!("no live process reported itself as the data-group leader for {stream}");
+    panic!("no eligible live process reported itself as the data-group leader for {stream}");
 }
 
 async fn withhold_first_response_proxy(
@@ -2474,23 +2547,141 @@ fn wait_for_purged_log(node: &RunningNode, stream: &str) {
 fn wait_for_active_snapshot_transfer(address: SocketAddr, attempt: usize) {
     let deadline = Instant::now() + CLUSTER_WAIT_TIMEOUT;
     let mut last_metrics = None;
+    let mut last_error = None;
     while Instant::now() < deadline {
-        let metrics = http_metrics(address);
-        let chunks = metric_value(&metrics, "runnel_snapshot_transfer_chunks_received_total");
-        let final_chunks = metric_value(
-            &metrics,
-            "runnel_snapshot_transfer_final_chunks_received_total",
-        );
-        if chunks > final_chunks {
-            return;
+        match try_http_metrics(address) {
+            Ok(metrics) => {
+                let chunks =
+                    metric_value(&metrics, "runnel_snapshot_transfer_chunks_received_total");
+                let final_chunks = metric_value(
+                    &metrics,
+                    "runnel_snapshot_transfer_final_chunks_received_total",
+                );
+                if chunks > final_chunks {
+                    return;
+                }
+                last_metrics = Some(metrics);
+            }
+            Err(error) => last_error = Some(error),
         }
-        last_metrics = Some(metrics);
         sleep(Duration::from_millis(10));
     }
     panic!(
-        "replacement node did not receive a non-final snapshot chunk during interruption attempt {attempt}; last metrics:\n{}",
+        "replacement node did not receive a non-final snapshot chunk during interruption attempt {attempt}; last metrics:\n{}; last scrape error: {last_error:?}",
         last_metrics.as_deref().unwrap_or("<no metrics response>")
     );
+}
+
+#[cfg(feature = "test-replacement-recovery")]
+async fn replacement_snapshot_gate_proxy(
+    listener: AsyncTcpListener,
+    backend_address: SocketAddr,
+    gate_used: Arc<AtomicBool>,
+    gate_sender: mpsc::UnboundedSender<()>,
+    release_receiver: watch::Receiver<bool>,
+) {
+    loop {
+        let (mut client, _) = listener
+            .accept()
+            .await
+            .expect("snapshot proxy should accept peer connections");
+        let Ok(mut backend) = AsyncTcpStream::connect(backend_address).await else {
+            continue;
+        };
+        let gate_used = Arc::clone(&gate_used);
+        let gate_sender = gate_sender.clone();
+        let mut release_receiver = release_receiver.clone();
+        tokio::spawn(async move {
+            loop {
+                let request = match read_peer_frame(&mut client).await {
+                    Ok(request) => request,
+                    Err(_) => return,
+                };
+                let is_target_chunk =
+                    is_non_final_snapshot_for_group(&request, "group/events/data");
+                if write_peer_frame(&mut backend, &request).await.is_err() {
+                    return;
+                }
+                let response = match read_peer_frame(&mut backend).await {
+                    Ok(response) => response,
+                    Err(_) => return,
+                };
+                let accepted_snapshot_chunk = is_successful_snapshot_response(&response);
+                if is_target_chunk
+                    && accepted_snapshot_chunk
+                    && gate_used
+                        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                        .is_ok()
+                {
+                    if gate_sender.send(()).is_err() {
+                        return;
+                    }
+                    while !*release_receiver.borrow() {
+                        if release_receiver.changed().await.is_err() {
+                            return;
+                        }
+                    }
+                }
+                if write_peer_frame(&mut client, &response).await.is_err() {
+                    return;
+                }
+            }
+        });
+    }
+}
+
+#[cfg(feature = "test-replacement-recovery")]
+fn is_non_final_snapshot_for_group(frame: &[u8], group_id: &str) -> bool {
+    let Ok(request) = serde_json::from_slice::<serde_json::Value>(frame) else {
+        return false;
+    };
+    let Some(snapshot) = request.get("InstallSnapshot") else {
+        return false;
+    };
+    snapshot.get("group_id").and_then(serde_json::Value::as_str) == Some(group_id)
+        && snapshot
+            .get("request")
+            .and_then(|request| request.get("done"))
+            .and_then(serde_json::Value::as_bool)
+            == Some(false)
+}
+
+#[cfg(feature = "test-replacement-recovery")]
+fn is_successful_snapshot_response(frame: &[u8]) -> bool {
+    serde_json::from_slice::<serde_json::Value>(frame)
+        .is_ok_and(|response| response.get("InstallSnapshot").is_some())
+}
+
+#[cfg(feature = "test-replacement-recovery")]
+async fn read_peer_frame(stream: &mut AsyncTcpStream) -> Result<Vec<u8>, std::io::Error> {
+    let length = stream.read_u32().await?;
+    if length > 64 * 1024 * 1024 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "peer frame exceeds the test proxy limit",
+        ));
+    }
+    let mut frame = vec![0; length as usize];
+    stream.read_exact(&mut frame).await?;
+    Ok(frame)
+}
+
+#[cfg(feature = "test-replacement-recovery")]
+async fn write_peer_frame(stream: &mut AsyncTcpStream, frame: &[u8]) -> Result<(), std::io::Error> {
+    let length = u32::try_from(frame.len()).map_err(|_| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "peer frame exceeds the test proxy limit",
+        )
+    })?;
+    if length > 64 * 1024 * 1024 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "peer frame exceeds the test proxy limit",
+        ));
+    }
+    stream.write_all(&length.to_be_bytes()).await?;
+    stream.write_all(frame).await
 }
 
 #[cfg(feature = "test-replacement-recovery")]
