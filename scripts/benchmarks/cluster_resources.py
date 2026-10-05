@@ -446,7 +446,11 @@ class ProcessStats(PeriodicSampler):
             elapsed_seconds=(ended_ns - started_ns) / 1_000_000_000,
         )
         result["per_node"] = self._summarize_nodes(node_samples)
-        if any("snapshot_builds_in_progress" in sample for sample in node_samples):
+        if any(
+            "snapshot_builds_in_progress" in node_metrics
+            for sample in node_samples
+            for node_metrics in sample.values()
+        ):
             elapsed_ns = max(0, ended_ns - started_ns)
             result["snapshot_build_memory_observations"] = {
                 "sampling_interval_milliseconds": self.interval_seconds * 1_000,

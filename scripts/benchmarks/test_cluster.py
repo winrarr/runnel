@@ -568,6 +568,33 @@ class ClusterBenchmarkTests(unittest.TestCase):
         self.assertIsNone(summary["2"]["rss_bytes_max_during_observed_build"])
         self.assertIn("lower bound", summary["1"]["rss_scope"])
 
+    def test_process_stats_end_emits_nested_snapshot_build_observations(self) -> None:
+        stats = ProcessStats(SimpleNamespace(nodes=[], runtime="process"))
+        stats.samples.append(
+            {"cpu_seconds": 0.0, "memory_bytes": 100.0, "storage_bytes": 10.0}
+        )
+        stats.node_samples.append(
+            {
+                "1": {
+                    "cpu_seconds": 0.0,
+                    "memory_bytes": 100.0,
+                    "storage_bytes": 10.0,
+                    "snapshot_builds_in_progress": 1.0,
+                    "snapshot_build_publishes_active": 1.0,
+                }
+            }
+        )
+
+        result = stats.end((0, 0, 0.0, 1, 0))
+
+        observations = result["snapshot_build_memory_observations"]
+        self.assertEqual(
+            observations["per_node"]["1"][
+                "samples_with_build_in_progress_during_measured_publishes"
+            ],
+            1,
+        )
+
     def test_snapshot_build_hot_path_dispatches_selected_payload_size(self) -> None:
         with patch.object(
             sys,
