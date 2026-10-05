@@ -630,6 +630,8 @@ Goal: recover a node whose local replica state is missing or inconsistent withou
 
 Rationale: snapshot transfer is useful evidence for recovery, but an empty process with a reused voter identity is not yet a defined production lifecycle and can interact badly with Raft log invariants.
 
+Current progress: the default real-process path covers a stopped follower rejoining from its original data directory while configured peers commit, followed by a leader failure. Startup rejects mismatched storage identity and malformed or unsupported persisted state. A separate test-only experiment uses a new empty directory under the same voter ID, interrupts snapshot installation, then checks selected record and consumer state and a leader failure only after installation. The experiment does not establish learner promotion, serving or quorum gates before catch-up, stale same-ID process fencing, or leader-failure recovery during transfer. The current evidence and reference comparison are in [Raft follower recovery and replacement](research/raft-recovery-and-replacement.md).
+
 Constraints:
 
 - acknowledged messages and durable consumer progress must remain protected by the selected quorum guarantee;
@@ -640,7 +642,8 @@ Constraints:
 
 Acceptance criteria:
 
-- a documented replacement scenario distinguishes ordinary restart, temporary outage, lost local state, and stale process identity;
+- a documented replacement scenario distinguishes preserved-state restart, temporary outage while peers continue, missing or inconsistent local state, configured identity mismatch, and an old or duplicate process returning with the same node ID;
+- storage-identity tests separately reject a configured cluster-name mismatch and a configured node-ID mismatch against the persisted marker before opening groups or rewriting the marker;
 - a replacement cannot serve or affect quorum decisions before the cluster has validated its recovered state;
 - repeated interruption, restart, and leader failure during replacement preserve acknowledged data and consumer progress;
 - process, storage, transport, and consensus failures are distinguishable in tests and diagnostics;
