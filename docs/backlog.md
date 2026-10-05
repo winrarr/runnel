@@ -115,7 +115,11 @@ publish/consume/ack flow that redelivers an unacknowledged binary message after
 restart. Protocol, client, and server-facing code now automatically check that
 their provisional v1 version range and UTF-8 text/base64 payload declarations
 remain aligned. A version-negotiated compatibility contract and evidence from
-an intended external application remain open.
+an intended external application remain open. The source-backed
+[publish request-ID reuse review](research/publish-request-id-content-mismatch.md)
+confirms that both engines currently return the first offset when a retry
+changes key or payload; the clustered mismatch case lacks focused process
+coverage, and the public contract decision remains open.
 
 ## Make message processing complete
 
