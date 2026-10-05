@@ -1,8 +1,8 @@
 # Encoding and compression implementation plan
 
 - Status: exploratory implementation plan; not an accepted compatibility decision
-- Last reviewed: 2026-09-06
-- Baseline inspected: `4b9bba44dd15354248f7157ea903caa6b3fcaabc`
+- Last reviewed: 2026-10-05
+- Baseline inspected: `db86fd2793f4904712a11314a21e149abdcf1897`
 - Evidence class: design/research
 - Related research: [Message encoding and compression study](../research/message-encoding-and-compression.md)
 - Scope: the first bounded implementation slice for the message-encoding and
@@ -38,8 +38,8 @@ request must not cause a replica to persist a representation it cannot decode.
 |---|---|
 | Public protocol | UTF-8 JSON lines. Text uses `payload`; arbitrary bytes use explicit padded-base64 request/response variants. The protocol crate, reusable client, and server share a source-level `runnel-json-lines` v1 support declaration, but there is no runtime handshake or negotiated codec. |
 | Local stream log | One `.log` file per stream. `RNL1` is legacy raw and unchecksummed. `RNL2` is version 1, checksummed, uncompressed, and opt-in through the core API. `RNL3` is version 1, checksummed, and adds request identity without compression metadata. The reader dispatches by magic and truncates an incomplete final suffix. |
-| Peer transport | Big-endian `u32` length prefix around JSON, 64 MiB body limit, persistent/pool connections, and no preface or capability negotiation. The same outer frame carries control RPCs, forwarding, and snapshot chunks. |
-| Clustered persistence | Raft log, state-machine journal, checkpoints, and snapshots are separate JSON formats and recovery paths. They are not part of the first retained-message codec experiment. |
+| Peer transport | Big-endian `u32` length prefix around JSON, 64 MiB body limit, persistent/pool connections, and no preface or capability negotiation. The same outer frame carries control RPCs, forwarding, and snapshot chunks. Peer `Vec<u8>` fields serialize as JSON integer arrays; the outbound frame is materialized before its encoded-size cap is checked. |
+| Clustered persistence | Raft log, state-machine journal, checkpoints, and snapshots are separate JSON formats and recovery paths. `Command::Publish` payloads serialize as JSON integer arrays in those artifacts. They are not part of the first retained-message codec experiment. |
 | Existing planning boundaries | [Storage-upgrade policy](storage-upgrade-policy.md) owns generation, fence, migration, and rollback questions. [TD-003](../tech-debt.md#td-003-provisional-json-lines-protocol-and-limited-payload-compatibility), [TD-007](../tech-debt.md#td-007-storage-format-compatibility-is-not-yet-defined), [TD-011](../tech-debt.md#td-011-end-to-end-benchmark-coverage-is-incomplete), and [TD-012](../tech-debt.md#td-012-peer-rpc-connection-strategy-remains-incomplete) track adjacent open debt. |
 
 The current `RNL2` fields are valuable test material, but its exact 44-byte
@@ -63,9 +63,15 @@ Future implementation work must:
 - use a format-tagged segment/generation and writer-fence design before
   claiming rolling-upgrade or downgrade support; and
 - expose logical, encoded, stored, and wire byte counts plus codec failures so
-  later measurements cannot confuse compression ratio with total cost.
+  later measurements cannot confuse compression ratio with total cost;
+- treat public wire, peer frames, local retained records, and each clustered
+  persistence artifact as independent compression boundaries; and
+- check encoded-size and decoded-size/window limits before allocating or
+  decompressing, including when the codec's own content-size field is absent.
 
-The schema candidates and codec facts are compared in the [research study](../research/message-encoding-and-compression.md#encoding-alternatives),
+Schema candidates, codec facts, and independent compression placements are
+compared in the [research study](../research/message-encoding-and-compression.md#encoding-alternatives)
+and its [boundary comparison](../research/message-encoding-and-compression.md#candidate-placement-across-runnel-boundaries),
 including [Protocol Buffers](https://protobuf.dev/programming-guides/encoding/),
 [CBOR](https://www.rfc-editor.org/rfc/rfc8949.html), [LZ4 frames](https://github.com/lz4/lz4/blob/dev/doc/lz4_Frame_format.md),
 and [Zstandard frames](https://www.rfc-editor.org/rfc/rfc8878.html).
@@ -195,10 +201,10 @@ Measure separately:
 
 | Path | Required evidence |
 |---|---|
-| Local durable publish | publish latency at the durability point, logical/stored bytes, encode CPU, allocations, peak memory, and sync behavior |
+| Local durable publish | publish latency at the durability point, logical/stored bytes, encode CPU, allocation count/bytes, payload/buffer copies where measurable, peak and in-flight memory, and sync behavior |
 | Local replay/restart | recovery time, bytes scanned/replayed, decompression CPU, memory, offset lookup, and corruption classification |
-| Public protocol | JSON/base64 versus candidate binary envelope, logical versus wire bytes, request/response p50/p99/p99.9, and batch wait |
-| Cluster forwarding/replication | follower ingress, peer frame bytes, quorum latency, peer decode CPU, reconnect/unsupported capability behavior, and node resource use |
+| Public protocol | JSON/base64 versus candidate binary envelope, logical versus wire bytes, encode/decode CPU and copies where measurable, request/response p50/p99/p99.9, batch wait, and in-flight buffer memory |
+| Cluster forwarding/replication | follower ingress, peer frame bytes, leader/follower encode/decode CPU and copies where measurable, quorum latency, reconnect/unsupported capability behavior, per-node resources, and concurrent buffer memory |
 | Snapshot transfer | transfer size/time and install/recovery behavior; do not mix these results into retained-record conclusions |
 | Delivery semantics | per-record offsets, grouped ordering, ack/redelivery, request identity, and dead-letter behavior through a physical block |
 
@@ -213,6 +219,25 @@ Do not make shared dictionaries, linked blocks, high compression levels,
 broker-side recompression, or adaptive selection defaults in Day 2. Each adds
 dictionary distribution, memory, recovery, or policy complexity that requires
 its own evidence.
+
+The experiment must keep placement separate from codec choice. Use the same
+logical record corpus to compare, independently: a candidate client/public
+batch, public connection frame, peer RPC frame, local retained block, and—only
+if its separate migration gate is ready—a selected Raft or state-machine
+artifact. For every run, identify which process compresses, which process
+decompresses, which representation reaches durable storage, and whether
+compression is repeated for each peer. A wire-only result cannot support an
+at-rest claim; retained-frame savings cannot support a peer-network claim.
+Where current JSON serializes payload bytes as base64 or integer arrays,
+measure a binary-envelope candidate separately from compression so encoding
+overhead is not attributed to the codec.
+
+Only retain compression for a tested workload when total framed bytes at the
+target boundary fall and CPU, buffer memory, recovery cost, and p99/p99.9 stay
+within an explicit workload budget. Measure this alongside an uncompressed
+fallback for small, random, or already-compressed records. The break-even
+threshold is an outcome of those results; this plan does not set a size or
+ratio in advance.
 
 ## Peer-transport follow-up
 
@@ -284,7 +309,7 @@ slice, so `docs/tech-debt.md` is intentionally unchanged.
 This document-only change is classified as research/design. Run:
 
 ```text
-git diff --check -- docs/research/message-encoding-and-compression.md docs/design/encoding-compression-day1-plan.md
+git diff --check -- docs/backlog.md docs/research/message-encoding-and-compression.md docs/design/encoding-compression-day1-plan.md
 python3 - <<'PY'
 import re
 import urllib.request
@@ -305,7 +330,7 @@ for url in urls:
             raise SystemExit(f"{response.status}: {url}")
 print(f"checked {len(urls)} external links")
 PY
-git status --short -- docs/research/message-encoding-and-compression.md docs/design/encoding-compression-day1-plan.md docs/tech-debt.md
+git status --short -- docs/backlog.md docs/research/message-encoding-and-compression.md docs/design/encoding-compression-day1-plan.md
 ```
 
 No Rust or benchmark run is required for this document-only change. The future
