@@ -94,6 +94,51 @@ python3 scripts/benchmarks/lock.py \
 
 The matrix writes one raw result and runner log per case and retains each child result in the matrix envelope. The growth-message count is the number of measured single-record publishes; it drives log production but is not an exact retained-entry target because snapshot/purge can advance during measurement. The observation interval changes file-sampling frequency, so include its measured observer time/fraction when comparing results. `retained_hot_path` varies preloaded broker-message history and `publish_batch` varies public request batch size in separate cases; the current Raft log-growth probe does not batch commits. These cells are repeatable workload coverage, not an aggregate performance claim. The sampled Raft log byte count is the serialized file's current length; journal, checkpoint, and snapshot values are sampled file lengths, and node storage samples are sampled totals of file lengths. These observations do not count cumulative bytes written, allocated disk blocks, or device writes, and they do not attribute journal or snapshot write work per commit. The snapshot-build counter is aggregate per node, not a byte or per-commit measure.
 
+The opt-in `snapshot_build_hot_path` scenario records build-duration metrics and
+samples process RSS while ordinary durable publishes run against a known
+retained state. Setup preloads one stream through the public protocol and is
+excluded from publish latency. The default is 256 measured publishes over
+2,048 retained records; `--snapshot-build-messages` accepts 64 through 4,096,
+`--retained-messages` accepts 1,025 through 16,384 for this scenario, and
+combined logical payload volume is capped at 16 MiB. The bounded build-cycle
+wait defaults to 30 seconds and accepts 1 through 300 seconds. For example:
+
+```text
+python3 scripts/benchmarks/cluster.py \
+  --scenarios snapshot_build_hot_path \
+  --snapshot-build-messages 256 \
+  --retained-messages 2048 \
+  --snapshot-build-cycle-timeout-seconds 30 \
+  --payload-sizes 100 \
+  --output benchmark-results/snapshot-build-hot-path.json
+```
+
+The metrics endpoint exports per-process aggregates over registered Raft
+groups, with no group, stream, peer, or consumer labels; the local engine omits
+these clustered diagnostics. Started, completed, failed, in-progress, duration
+count/sum, and process-lifetime maximum are reported; duration includes the
+builder's state-lock wait, encoding, snapshot persistence, journal compaction,
+and cache publication. Returned failures contribute to duration count/sum;
+cancelled calls increment `builds_started` and clear the in-progress gauge but
+do not contribute a duration sample or a completed/failure count. Scrape
+aggregation adds four atomic reads per group to the existing `O(groups)`
+snapshot-metric walk. The group count is not capped by this probe.
+
+The result requires a newly completed successful build and records its
+per-process deltas. Its request latency and throughput cover measured publishes
+only; the resource window also includes the bounded completion wait through an
+idle-build boundary. While this scenario is selected, the existing 100 ms
+resource sampler scrapes the active-build gauge alongside per-node RSS and
+separately counts samples taken during the publish loop. Zero overlapping
+samples means the sampler may have missed a shorter build, not that no overlap
+occurred. The maximum RSS at a sampled active-build observation is a lower
+bound, not peak or incremental snapshot memory; observer duration is reported
+because metrics scrapes add load. This is a bounded build probe, not
+snapshot-install, transfer, cold-recovery, or performance-improvement evidence.
+`matrix.py` can sweep `--snapshot-build-message-values` and
+`--retained-message-values` into independent cases, with payload sizes and
+repetitions retained as separate dimensions.
+
 The opt-in `publish_batch` scenario measures the clustered public `publish_batch` protocol path, which is not part of the default workload. Setup creates the stream and publishes the warmup records outside the measured interval. Measured requests contain up to 32 records by default, rotate persistent clients across the cluster nodes, and validate one published outcome and contiguous offset for every input record. Set `--batch-size` from 1 through the protocol's 1,024-record limit for one focused case. To repeat a comparable batch-size matrix with independent artifacts, use `matrix.py --scenarios publish_batch --batch-size-values 1,8,32`; each batch size becomes a separate case and is never combined with another size. The result counts records for throughput and uses one latency sample per batch request, recording `batch_size`, batch count, outcome validation, setup exclusion, and the latency scope in scenario metadata. This is a clustered batching baseline, not evidence that the current engine commits a batch atomically or that it performs one consensus append per request; compare only runs with matching batch size, payload, message count, topology, runtime, and resource limits.
 
 Run the same three-node workload with one bounded Docker container per broker:
@@ -151,7 +196,7 @@ For a rerunnable workload and fault matrix, use:
 just bench-cluster-matrix
 ```
 
-`matrix.py` expands scenarios, payload sizes, relevant concurrency and slow-consumer delay values, retained-history sizes, runtimes, batch sizes for `publish_batch`, Raft log-growth publish counts and observation intervals, and repetitions into independent sequential `cluster.py` invocations. Every case receives a unique result and broker-log directory under the selected artifacts directory. The default matrix covers durable publish, consume/acknowledge, slow-consumer drain, restart/replay, retained-history recovery, and both leader and follower process-stop probes. Select `slow_consumer_backpressure` explicitly to expand each `--slow-consumer-delays-ms` entry into an independent delivery-window case; select `retained_hot_path` explicitly to expand each `--retained-message-values` entry into a separate post-preload publish case; select `publish_batch` with `--batch-size-values` to expand each batch size into a separate publish case; select `raft_log_growth` to expand `--raft-log-growth-message-values` and `--raft-log-growth-observation-every-values` into independent cluster-probe cases. Set `--raft-log-growth-cycle-timeout-seconds` to bound waiting for its snapshot/purge observation; keep the outer `--case-timeout-seconds` long enough for cluster startup, measurement, cycle wait, and recovery. The growth count is a measured workload size, not a promise that the same number of Raft entries remain retained after purge. These opt-in dimensions keep slow-consumer, retained-state, batching, and log-growth coverage visible without changing the existing default matrix. `--batch-size` remains the single-size compatibility option and defaults to 32. Use `--keep-going` to retain later cases after a failure; the command still exits nonzero and records failed or timed-out cases in the matrix envelope. `--case-timeout-seconds` is an outer bound, while each fault scenario keeps its own bounded recovery timeout. Matrix cases are diagnostic coverage and are not combined into an authoritative performance claim.
+`matrix.py` expands scenarios, payload sizes, relevant concurrency and slow-consumer delay values, retained-history sizes, runtimes, batch sizes for `publish_batch`, Raft log-growth publish counts and observation intervals, snapshot-build publish counts, and repetitions into independent sequential `cluster.py` invocations. Every case receives a unique result and broker-log directory under the selected artifacts directory. The default matrix covers durable publish, consume/acknowledge, slow-consumer drain, restart/replay, retained-history recovery, and both leader and follower process-stop probes. Select `slow_consumer_backpressure` explicitly to expand each `--slow-consumer-delays-ms` entry into an independent delivery-window case; select `retained_hot_path` explicitly to expand each `--retained-message-values` entry into a separate post-preload publish case; select `publish_batch` with `--batch-size-values` to expand each batch size into a separate publish case; select `raft_log_growth` to expand `--raft-log-growth-message-values` and `--raft-log-growth-observation-every-values` into independent cluster-probe cases; select `snapshot_build_hot_path` to expand `--snapshot-build-message-values` and `--retained-message-values` across the selected payload sizes. Set `--raft-log-growth-cycle-timeout-seconds` to bound waiting for its snapshot/purge observation and `--snapshot-build-cycle-timeout-seconds` to bound waiting for a successful snapshot build; keep the outer `--case-timeout-seconds` long enough for cluster startup, measurement, and scenario waits. The growth count is a measured workload size, not a promise that the same number of Raft entries remain retained after purge. These opt-in dimensions keep slow-consumer, retained-state, batching, log-growth, and snapshot-build coverage visible without changing the existing default matrix. `--batch-size` remains the single-size compatibility option and defaults to 32. Use `--keep-going` to retain later cases after a failure; the command still exits nonzero and records failed or timed-out cases in the matrix envelope. `--case-timeout-seconds` is an outer bound, while each fault scenario keeps its own bounded recovery timeout. Matrix cases are diagnostic coverage and are not combined into an authoritative performance claim.
 
 The matrix accepts `--runtimes process,container`, `--cpus`, and `--memory` for explicit resource dimensions. Container cases enforce per-broker Docker limits. Add `--native-resource-scope` on Linux to place native broker and client processes in the same bounded systemd user scope. Cluster resource samples include aggregate and per-node CPU, resident memory, and on-disk storage bytes; storage scans are throttled between scenario boundaries so they do not turn the sampler into a hot-path observer. Cases with different dimensions are intentionally not aggregated into a performance ranking; normalize and aggregate matching raw case results when repeated evidence is needed.
 

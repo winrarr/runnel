@@ -8,8 +8,9 @@ import re
 import subprocess
 import sys
 import time
+from contextlib import contextmanager
 from pathlib import Path
-from typing import Any, Protocol
+from typing import Any, Iterator, Protocol
 
 from resources import (
     DEFAULT_PROBE_TIMEOUT_SECONDS,
@@ -371,25 +372,73 @@ class ProcessStats(PeriodicSampler):
     def __init__(self, cluster: ResourceCluster) -> None:
         super().__init__("runnel-cluster-stats", interval_seconds=0.1)
         self.cluster = cluster
-        self.node_samples: list[dict[str, dict[str, float]]] = []
+        self.node_samples: list[dict[str, dict[str, float | None]]] = []
         self._last_storage_scan_ns = 0
         self._storage_bytes: dict[int, int] = {}
+        self._observe_snapshot_builds = False
+        self._snapshot_build_publishes_active = False
+        self._snapshot_metrics_observer_duration_ns = 0
 
-    def begin(self) -> tuple[int, int, float, int]:
+    @contextmanager
+    def observe_snapshot_builds(self) -> Iterator[None]:
+        """Align active-build gauges with the existing per-node RSS samples."""
+        with self.lock:
+            if self._observe_snapshot_builds:
+                raise RuntimeError("snapshot build observation is already enabled")
+            self._observe_snapshot_builds = True
+        try:
+            yield
+        finally:
+            with self.lock:
+                self._snapshot_build_publishes_active = False
+                self._observe_snapshot_builds = False
+
+    @contextmanager
+    def observe_snapshot_build_publishes(self) -> Iterator[None]:
+        """Mark RSS/gauge samples taken while the measured publish loop runs."""
+        with self.lock:
+            if not self._observe_snapshot_builds:
+                raise RuntimeError("snapshot build observation is not enabled")
+            if self._snapshot_build_publishes_active:
+                raise RuntimeError("snapshot build publish observation is already active")
+            self._snapshot_build_publishes_active = True
+        try:
+            yield
+        finally:
+            with self.lock:
+                self._snapshot_build_publishes_active = False
+
+    def begin(self) -> tuple[int, int, float, int, int]:
         self._record(force_storage=True)
         with self.lock:
             sample_index = len(self.samples)
             node_sample_index = max(0, len(self.node_samples) - 1)
             cpu_start = self.samples[-1]["cpu_seconds"] if self.samples else 0.0
-        return sample_index, node_sample_index, cpu_start, time.perf_counter_ns()
+            observer_duration_start = self._snapshot_metrics_observer_duration_ns
+        return (
+            sample_index,
+            node_sample_index,
+            cpu_start,
+            time.perf_counter_ns(),
+            observer_duration_start,
+        )
 
-    def end(self, token: tuple[int, int, float, int]) -> dict[str, Any]:
-        sample_index, node_sample_index, cpu_start, started_ns = token
+    def end(self, token: tuple[int, int, float, int, int]) -> dict[str, Any]:
+        (
+            sample_index,
+            node_sample_index,
+            cpu_start,
+            started_ns,
+            observer_duration_start,
+        ) = token
         ended_ns = time.perf_counter_ns()
         self._record(force_storage=True)
         with self.lock:
             samples = list(self.samples[sample_index:])
             node_samples = list(self.node_samples[node_sample_index:])
+            observer_duration_ns = (
+                self._snapshot_metrics_observer_duration_ns - observer_duration_start
+            )
         cpu_end = samples[-1]["cpu_seconds"] if samples else cpu_start
         result = summarize_stats(
             samples,
@@ -397,6 +446,20 @@ class ProcessStats(PeriodicSampler):
             elapsed_seconds=(ended_ns - started_ns) / 1_000_000_000,
         )
         result["per_node"] = self._summarize_nodes(node_samples)
+        if any(
+            "snapshot_builds_in_progress" in node_metrics
+            for sample in node_samples
+            for node_metrics in sample.values()
+        ):
+            elapsed_ns = max(0, ended_ns - started_ns)
+            result["snapshot_build_memory_observations"] = {
+                "sampling_interval_milliseconds": self.interval_seconds * 1_000,
+                "observer_duration_milliseconds": observer_duration_ns / 1_000_000,
+                "observer_duration_fraction_of_sample_window": (
+                    observer_duration_ns / elapsed_ns if elapsed_ns else 0.0
+                ),
+                "per_node": self._summarize_snapshot_build_memory(node_samples),
+            }
         return result
 
     def summary(self) -> dict[str, Any]:
@@ -409,7 +472,7 @@ class ProcessStats(PeriodicSampler):
 
     @staticmethod
     def _summarize_nodes(
-        samples: list[dict[str, dict[str, float]]],
+        samples: list[dict[str, dict[str, float | None]]],
     ) -> dict[str, dict[str, Any]]:
         node_ids = sorted({node_id for sample in samples for node_id in sample})
         summaries: dict[str, dict[str, Any]] = {}
@@ -444,10 +507,81 @@ class ProcessStats(PeriodicSampler):
             summaries[node_id] = summary
         return summaries
 
+    @staticmethod
+    def _summarize_snapshot_build_memory(
+        samples: list[dict[str, dict[str, float | None]]],
+    ) -> dict[str, dict[str, Any]]:
+        node_ids = sorted(
+            {
+                node_id
+                for sample in samples
+                for node_id, value in sample.items()
+                if "snapshot_builds_in_progress" in value
+            }
+        )
+        summaries: dict[str, dict[str, Any]] = {}
+        for node_id in node_ids:
+            values = [
+                sample[node_id]
+                for sample in samples
+                if node_id in sample
+                and "snapshot_builds_in_progress" in sample[node_id]
+            ]
+            observed = [
+                value
+                for value in values
+                if isinstance(value.get("snapshot_builds_in_progress"), (int, float))
+            ]
+            active = [
+                value
+                for value in observed
+                if value["snapshot_builds_in_progress"] > 0
+                and isinstance(value.get("memory_bytes"), (int, float))
+            ]
+            publish_samples = [
+                value
+                for value in values
+                if value.get("snapshot_build_publishes_active") == 1.0
+            ]
+            active_publish_samples = [
+                value
+                for value in publish_samples
+                if isinstance(value.get("snapshot_builds_in_progress"), (int, float))
+                and value["snapshot_builds_in_progress"] > 0
+                and isinstance(value.get("memory_bytes"), (int, float))
+            ]
+            summaries[node_id] = {
+                "samples": len(values),
+                "samples_with_observed_build_gauge": len(observed),
+                "samples_with_build_in_progress": len(active),
+                "samples_during_measured_publishes": len(publish_samples),
+                "samples_with_build_in_progress_during_measured_publishes": len(
+                    active_publish_samples
+                ),
+                "rss_bytes_max_during_observed_build": (
+                    max(value["memory_bytes"] for value in active)
+                    if active
+                    else None
+                ),
+                "rss_bytes_max_during_observed_build_and_publishes": (
+                    max(value["memory_bytes"] for value in active_publish_samples)
+                    if active_publish_samples
+                    else None
+                ),
+                "rss_scope": (
+                    "sampled process RSS while one or more builds were active; "
+                    "lower bound, not peak or incremental memory"
+                ),
+            }
+        return summaries
+
     def _record(self, *, force_storage: bool = False) -> None:
+        with self.lock:
+            observe_snapshot_builds = self._observe_snapshot_builds
+            snapshot_build_publishes_active = self._snapshot_build_publishes_active
         cpu = 0.0
         memory = 0
-        node_sample: dict[str, dict[str, float]] = {}
+        node_sample: dict[str, dict[str, float | None]] = {}
         now_ns = time.monotonic_ns()
         scan_storage = force_storage or now_ns - self._last_storage_scan_ns >= 1_000_000_000
         if scan_storage:
@@ -457,7 +591,7 @@ class ProcessStats(PeriodicSampler):
                 self._storage_bytes[node.node_id] = directory_size(node.data_dir)
             storage_bytes = self._storage_bytes.get(node.node_id, 0)
             if self.cluster.runtime == "container":
-                node_value: dict[str, float] = {}
+                node_value: dict[str, float | None] = {}
                 if node.container is not None and node.container.created:
                     node_cpu = read_cpu_seconds(node.container.name)
                     sample = read_stats(node.container.name)
@@ -472,7 +606,7 @@ class ProcessStats(PeriodicSampler):
                 if node_value:
                     node_sample[str(node.node_id)] = node_value
                 continue
-            node_value = {}
+            node_value: dict[str, float | None] = {}
             if node.process is not None:
                 sample = process_stats(node.process.pid)
                 if sample is not None:
@@ -484,6 +618,29 @@ class ProcessStats(PeriodicSampler):
                 node_value["storage_bytes"] = float(storage_bytes)
             if node_value:
                 node_sample[str(node.node_id)] = node_value
+        if observe_snapshot_builds:
+            observer_started_ns = time.perf_counter_ns()
+            snapshot_metrics = self.cluster.metrics()
+            observer_duration_ns = time.perf_counter_ns() - observer_started_ns
+            with self.lock:
+                self._snapshot_metrics_observer_duration_ns += observer_duration_ns
+                snapshot_build_publishes_active = (
+                    snapshot_build_publishes_active
+                    and self._snapshot_build_publishes_active
+                )
+            for node in self.cluster.nodes:
+                sample = node_sample.get(str(node.node_id))
+                if sample is None:
+                    continue
+                metric_name = f"node_{node.node_id}.runnel_snapshot_builds_in_progress"
+                sample["snapshot_builds_in_progress"] = (
+                    snapshot_metrics.get(metric_name)
+                    if snapshot_metrics is not None
+                    else None
+                )
+                sample["snapshot_build_publishes_active"] = float(
+                    snapshot_build_publishes_active
+                )
         storage = sum(
             int(value.get("storage_bytes", 0)) for value in node_sample.values()
         )

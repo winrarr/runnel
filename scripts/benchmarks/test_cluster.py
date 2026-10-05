@@ -41,6 +41,8 @@ from cluster_scenarios import (  # noqa: E402
     DEFAULT_PUBLISH_BATCH_SIZE,
     DEFAULT_RAFT_LOG_GROWTH_MESSAGES,
     DEFAULT_RETAINED_RECOVERY_MESSAGES,
+    DEFAULT_SNAPSHOT_BUILD_MESSAGES,
+    DEFAULT_SNAPSHOT_BUILD_TIMEOUT_SECONDS,
     DEFAULT_SLOW_CONSUMER_BACKPRESSURE_TIMEOUT_SECONDS,
     DEFAULT_SCENARIOS,
     HotOrderingObservation,
@@ -54,10 +56,15 @@ from cluster_scenarios import (  # noqa: E402
     MAX_RAFT_LOG_GROWTH_CYCLE_TIMEOUT_SECONDS,
     MAX_RAFT_LOG_GROWTH_LOGICAL_PAYLOAD_BYTES,
     MAX_RAFT_LOG_GROWTH_MESSAGES,
+    MAX_SNAPSHOT_BUILD_LOGICAL_PAYLOAD_BYTES,
+    MAX_SNAPSHOT_BUILD_MESSAGES,
+    MAX_SNAPSHOT_BUILD_RETAINED_MESSAGES,
+    MAX_SNAPSHOT_BUILD_TIMEOUT_SECONDS,
     MAX_SLOW_CONSUMER_BACKPRESSURE_TIMEOUT_SECONDS,
     MIN_RETAINED_RECOVERY_MESSAGES,
     MIN_RAFT_LOG_GROWTH_CYCLE_TIMEOUT_SECONDS,
     MIN_RAFT_LOG_GROWTH_MESSAGES,
+    MIN_SNAPSHOT_BUILD_MESSAGES,
     _hot_ordering_metadata,
     _observed_purge_advanced,
     _raft_data_group_state,
@@ -66,6 +73,7 @@ from cluster_scenarios import (  # noqa: E402
     parse_retained_messages,
     parse_raft_log_growth_messages,
     parse_raft_log_growth_observation_every,
+    parse_snapshot_build_messages,
     parse_scenarios,
     poll_until_redelivered,
     publish_batch_request,
@@ -76,6 +84,9 @@ from cluster_scenarios import (  # noqa: E402
     run_retained_hot_path,
     run_retained_recovery,
     run_raft_log_growth,
+    run_snapshot_build_hot_path,
+    _snapshot_build_metric_deltas,
+    _snapshot_build_metrics,
     run_slow_consumer_backpressure,
 )
 from common import BenchmarkError, metric, parse_nonnegative_int, percentile  # noqa: E402
@@ -223,6 +234,48 @@ class ClusterBenchmarkTests(unittest.TestCase):
             },
         )
 
+    def test_result_builder_records_snapshot_build_boundary_and_limits(self) -> None:
+        with patch.object(
+            sys,
+            "argv",
+            ["cluster.py", "--scenarios", "snapshot_build_hot_path"],
+        ):
+            args = parse_args()
+        cluster = SimpleNamespace(
+            image_id="sha256:test",
+            startup_ns=1_000_000,
+            peer_proxy_summary=lambda: {"enabled": False, "response_delay_ms": 0},
+            stats=SimpleNamespace(summary=lambda: {}),
+        )
+        with (
+            patch.object(cluster_results, "result_metadata", return_value={}),
+            patch.object(cluster_results, "resource_limits", return_value={}),
+        ):
+            result = cluster_results.build_result(
+                args,
+                run_id="run-id",
+                started_at=datetime(2026, 1, 1, tzinfo=UTC),
+                cluster=cluster,
+                scenarios=[],
+            )
+
+        self.assertEqual(
+            result["workload"]["snapshot_build_hot_path"],
+            {
+                "measured_messages": DEFAULT_SNAPSHOT_BUILD_MESSAGES,
+                "minimum_messages": MIN_SNAPSHOT_BUILD_MESSAGES,
+                "maximum_messages": MAX_SNAPSHOT_BUILD_MESSAGES,
+                "maximum_logical_payload_bytes": MAX_SNAPSHOT_BUILD_LOGICAL_PAYLOAD_BYTES,
+                "retained_messages": DEFAULT_RETAINED_RECOVERY_MESSAGES,
+                "minimum_retained_messages": MIN_RETAINED_RECOVERY_MESSAGES,
+                "maximum_retained_messages": MAX_SNAPSHOT_BUILD_RETAINED_MESSAGES,
+                "cycle_timeout_seconds": DEFAULT_SNAPSHOT_BUILD_TIMEOUT_SECONDS,
+                "setup_messages_excluded": True,
+                "retained_state_source": "public durable publishes before measured interval",
+                "measurement_boundary": "public durable publish through snapshot build completion",
+            },
+        )
+
     def test_result_builder_records_peer_forwarding_stream_setup_semantics(self) -> None:
         with patch.object(
             sys,
@@ -329,6 +382,254 @@ class ClusterBenchmarkTests(unittest.TestCase):
 
         self.assertEqual(args.scenarios, ["retained_hot_path"])
         self.assertEqual(args.retained_messages, 2048)
+
+    def test_snapshot_build_hot_path_options_are_bounded_and_opt_in(self) -> None:
+        with patch.object(
+            sys,
+            "argv",
+            [
+                "cluster.py",
+                "--scenarios",
+                "snapshot_build_hot_path",
+                "--snapshot-build-messages",
+                "128",
+                "--snapshot-build-cycle-timeout-seconds",
+                "45",
+            ],
+        ):
+            args = parse_args()
+
+        self.assertEqual(args.scenarios, ["snapshot_build_hot_path"])
+        self.assertEqual(args.snapshot_build_messages, 128)
+        self.assertEqual(args.snapshot_build_cycle_timeout_seconds, 45)
+        self.assertEqual(DEFAULT_SNAPSHOT_BUILD_MESSAGES, 256)
+        self.assertEqual(DEFAULT_SNAPSHOT_BUILD_TIMEOUT_SECONDS, 30)
+        self.assertEqual(
+            parse_snapshot_build_messages(str(MIN_SNAPSHOT_BUILD_MESSAGES)),
+            MIN_SNAPSHOT_BUILD_MESSAGES,
+        )
+        self.assertEqual(
+            parse_snapshot_build_messages(str(MAX_SNAPSHOT_BUILD_MESSAGES)),
+            MAX_SNAPSHOT_BUILD_MESSAGES,
+        )
+        for invalid in (
+            str(MIN_SNAPSHOT_BUILD_MESSAGES - 1),
+            str(MAX_SNAPSHOT_BUILD_MESSAGES + 1),
+            "not-an-integer",
+        ):
+            with self.subTest(messages=invalid), self.assertRaises(
+                argparse.ArgumentTypeError
+            ):
+                parse_snapshot_build_messages(invalid)
+
+    def test_snapshot_build_hot_path_rejects_unbounded_retention(self) -> None:
+        with patch.object(
+            sys,
+            "argv",
+            [
+                "cluster.py",
+                "--scenarios",
+                "snapshot_build_hot_path",
+                "--retained-messages",
+                str(MAX_SNAPSHOT_BUILD_RETAINED_MESSAGES + 1),
+            ],
+        ):
+            with self.assertRaises(SystemExit):
+                parse_args()
+        with patch.object(
+            sys,
+            "argv",
+            [
+                "cluster.py",
+                "--scenarios",
+                "snapshot_build_hot_path",
+                "--payload-sizes",
+                "8192",
+            ],
+        ):
+            with self.assertRaises(SystemExit):
+                parse_args()
+
+    def test_snapshot_build_metric_parser_extracts_per_process_deltas(self) -> None:
+        metric_names = {
+            "builds_started": "runnel_snapshot_builds_started_total",
+            "builds_completed": "runnel_snapshot_builds_completed_total",
+            "build_failures": "runnel_snapshot_build_failures_total",
+            "builds_in_progress": "runnel_snapshot_builds_in_progress",
+            "duration_sum_seconds": "runnel_snapshot_build_duration_seconds_sum",
+            "duration_count": "runnel_snapshot_build_duration_seconds_count",
+            "duration_max_seconds": "runnel_snapshot_build_duration_seconds_max",
+        }
+        before: dict[str, float] = {}
+        after: dict[str, float] = {}
+        initial = {
+            "builds_started": 1,
+            "builds_completed": 1,
+            "build_failures": 0,
+            "builds_in_progress": 0,
+            "duration_sum_seconds": 2.0,
+            "duration_count": 1,
+            "duration_max_seconds": 2.0,
+        }
+        final = {
+            "builds_started": 3,
+            "builds_completed": 3,
+            "build_failures": 0,
+            "builds_in_progress": 0,
+            "duration_sum_seconds": 3.25,
+            "duration_count": 3,
+            "duration_max_seconds": 2.0,
+        }
+        for node_name in ("node_1", "node_2"):
+            for field, metric_name in metric_names.items():
+                before[f"{node_name}.{metric_name}"] = float(initial[field])
+                after[f"{node_name}.{metric_name}"] = float(final[field])
+
+        parsed = _snapshot_build_metrics(after, [1, 2])
+        deltas = _snapshot_build_metric_deltas(before, after, [1, 2])
+
+        self.assertEqual(parsed["node_1"]["builds_completed"], 3)
+        self.assertTrue(deltas["available"])
+        self.assertEqual(
+            deltas["per_node"]["node_1"]["build_duration_count_delta"], 2
+        )
+        self.assertEqual(
+            deltas["per_node"]["node_1"]["build_duration_seconds_sum_delta"], 1.25
+        )
+        self.assertEqual(
+            deltas["per_node"]["node_1"]["build_duration_seconds_mean"], 0.625
+        )
+        self.assertIsNone(
+            deltas["per_node"]["node_1"]["build_duration_seconds_max_in_this_interval"]
+        )
+        self.assertEqual(
+            deltas["per_node"]["node_2"]["builds_completed_delta"], 2
+        )
+        self.assertFalse(
+            _snapshot_build_metric_deltas(before, None, [1, 2])["available"]
+        )
+
+    def test_snapshot_build_memory_summary_is_an_active_sample_lower_bound(self) -> None:
+        samples = [
+            {
+                "1": {
+                    "memory_bytes": 100.0,
+                    "snapshot_builds_in_progress": 0.0,
+                    "snapshot_build_publishes_active": 1.0,
+                },
+                "2": {
+                    "memory_bytes": 200.0,
+                    "snapshot_builds_in_progress": 0.0,
+                    "snapshot_build_publishes_active": 1.0,
+                },
+            },
+            {
+                "1": {
+                    "memory_bytes": 150.0,
+                    "snapshot_builds_in_progress": 1.0,
+                    "snapshot_build_publishes_active": 1.0,
+                },
+                "2": {
+                    "memory_bytes": 220.0,
+                    "snapshot_builds_in_progress": 0.0,
+                    "snapshot_build_publishes_active": 0.0,
+                },
+            },
+            {
+                "1": {
+                    "memory_bytes": 180.0,
+                    "snapshot_builds_in_progress": 1.0,
+                    "snapshot_build_publishes_active": 1.0,
+                },
+                "2": {
+                    "memory_bytes": 240.0,
+                    "snapshot_builds_in_progress": 0.0,
+                    "snapshot_build_publishes_active": 0.0,
+                },
+            },
+        ]
+
+        summary = ProcessStats._summarize_snapshot_build_memory(samples)
+
+        self.assertEqual(summary["1"]["samples_with_build_in_progress"], 2)
+        self.assertEqual(
+            summary["1"]["samples_with_build_in_progress_during_measured_publishes"],
+            2,
+        )
+        self.assertEqual(summary["1"]["rss_bytes_max_during_observed_build"], 180.0)
+        self.assertEqual(
+            summary["1"]["rss_bytes_max_during_observed_build_and_publishes"], 180.0
+        )
+        self.assertEqual(summary["2"]["samples_with_build_in_progress"], 0)
+        self.assertEqual(
+            summary["2"]["samples_with_build_in_progress_during_measured_publishes"],
+            0,
+        )
+        self.assertIsNone(summary["2"]["rss_bytes_max_during_observed_build"])
+        self.assertIn("lower bound", summary["1"]["rss_scope"])
+
+    def test_process_stats_end_emits_nested_snapshot_build_observations(self) -> None:
+        stats = ProcessStats(SimpleNamespace(nodes=[], runtime="process"))
+        stats.samples.append(
+            {"cpu_seconds": 0.0, "memory_bytes": 100.0, "storage_bytes": 10.0}
+        )
+        stats.node_samples.append(
+            {
+                "1": {
+                    "cpu_seconds": 0.0,
+                    "memory_bytes": 100.0,
+                    "storage_bytes": 10.0,
+                    "snapshot_builds_in_progress": 1.0,
+                    "snapshot_build_publishes_active": 1.0,
+                }
+            }
+        )
+
+        result = stats.end((0, 0, 0.0, 1, 0))
+
+        observations = result["snapshot_build_memory_observations"]
+        self.assertEqual(
+            observations["per_node"]["1"][
+                "samples_with_build_in_progress_during_measured_publishes"
+            ],
+            1,
+        )
+
+    def test_snapshot_build_hot_path_dispatches_selected_payload_size(self) -> None:
+        with patch.object(
+            sys,
+            "argv",
+            [
+                "cluster.py",
+                "--scenarios",
+                "snapshot_build_hot_path",
+                "--snapshot-build-messages",
+                "128",
+                "--retained-messages",
+                "1025",
+                "--snapshot-build-cycle-timeout-seconds",
+                "12",
+                "--payload-sizes",
+                "100",
+            ],
+        ):
+            args = parse_args()
+        cluster = SimpleNamespace()
+        expected = {"operation": "cluster_snapshot_build_hot_path"}
+        with patch.object(
+            cluster_cli, "run_snapshot_build_hot_path", return_value=expected
+        ) as run_snapshot_build:
+            results = cluster_cli.run_scenarios(args, cluster, "run-id")
+
+        self.assertEqual(results, [expected])
+        run_snapshot_build.assert_called_once_with(
+            cluster,
+            "cluster_run-id_snapshot_build_hot_path_100",
+            "x" * 100,
+            128,
+            1025,
+            12,
+        )
 
     def test_raft_log_growth_is_opt_in_and_uses_bounded_workload_options(self) -> None:
         with patch.object(

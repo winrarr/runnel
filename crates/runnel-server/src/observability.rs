@@ -850,6 +850,14 @@ fn format_metrics(
         writeln!(output, "# TYPE runnel_snapshot_builds_started_total counter\nrunnel_snapshot_builds_started_total {}", snapshot_metrics.builds_started).unwrap();
         writeln!(output, "# TYPE runnel_snapshot_builds_completed_total counter\nrunnel_snapshot_builds_completed_total {}", snapshot_metrics.builds_completed).unwrap();
         writeln!(output, "# TYPE runnel_snapshot_build_failures_total counter\nrunnel_snapshot_build_failures_total {}", snapshot_metrics.build_failures).unwrap();
+        writeln!(output, "# HELP runnel_snapshot_builds_in_progress Snapshot build operations currently running in this broker process.").unwrap();
+        writeln!(output, "# TYPE runnel_snapshot_builds_in_progress gauge\nrunnel_snapshot_builds_in_progress {}", snapshot_metrics.builds_in_progress).unwrap();
+        writeln!(output, "# HELP runnel_snapshot_build_duration_seconds_sum Cumulative wall-clock duration of snapshot build attempts that returned, including failures.").unwrap();
+        writeln!(output, "# TYPE runnel_snapshot_build_duration_seconds_sum counter\nrunnel_snapshot_build_duration_seconds_sum {:.9}", snapshot_metrics.build_duration_nanos_sum as f64 / 1_000_000_000.0).unwrap();
+        writeln!(output, "# HELP runnel_snapshot_build_duration_seconds_count Snapshot build attempts that returned and contributed to the duration sum.").unwrap();
+        writeln!(output, "# TYPE runnel_snapshot_build_duration_seconds_count counter\nrunnel_snapshot_build_duration_seconds_count {}", snapshot_metrics.build_duration_count).unwrap();
+        writeln!(output, "# HELP runnel_snapshot_build_duration_seconds_max Longest returned snapshot build attempt since this broker process started, including failures.").unwrap();
+        writeln!(output, "# TYPE runnel_snapshot_build_duration_seconds_max gauge\nrunnel_snapshot_build_duration_seconds_max {:.9}", snapshot_metrics.build_duration_nanos_max as f64 / 1_000_000_000.0).unwrap();
         writeln!(output, "# TYPE runnel_snapshot_installs_started_total counter\nrunnel_snapshot_installs_started_total {}", snapshot_metrics.installs_started).unwrap();
         writeln!(output, "# TYPE runnel_snapshot_installs_completed_total counter\nrunnel_snapshot_installs_completed_total {}", snapshot_metrics.installs_completed).unwrap();
         writeln!(output, "# TYPE runnel_snapshot_install_failures_total counter\nrunnel_snapshot_install_failures_total {}", snapshot_metrics.install_failures).unwrap();
@@ -890,4 +898,58 @@ fn format_metrics(
         }
     }
     output
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn snapshot_build_metrics_are_aggregate_and_report_wall_time() {
+        let snapshot = SnapshotMetricsSnapshot {
+            builds_started: 3,
+            builds_completed: 2,
+            build_failures: 1,
+            builds_in_progress: 1,
+            build_duration_nanos_sum: 1_500_000_000,
+            build_duration_count: 3,
+            build_duration_nanos_max: 1_000_000_000,
+            ..SnapshotMetricsSnapshot::default()
+        };
+        let admission = ProtocolAdmission {
+            max_connections: 1,
+            max_request_bytes: 1,
+            max_in_flight_requests: 1,
+            request_timeout: Duration::from_secs(1),
+        };
+        let body = format_metrics(
+            None,
+            Some(snapshot),
+            None,
+            &ServerMetrics::default(),
+            admission,
+        );
+
+        assert!(
+            body.lines()
+                .any(|line| { line == "runnel_snapshot_builds_in_progress 1" })
+        );
+        assert!(
+            body.lines()
+                .any(|line| { line == "runnel_snapshot_build_duration_seconds_sum 1.500000000" })
+        );
+        assert!(
+            body.lines()
+                .any(|line| { line == "runnel_snapshot_build_duration_seconds_count 3" })
+        );
+        assert!(
+            body.lines()
+                .any(|line| { line == "runnel_snapshot_build_duration_seconds_max 1.000000000" })
+        );
+        assert!(
+            body.lines()
+                .filter(|line| line.starts_with("runnel_snapshot_build_"))
+                .all(|line| !line.contains('{'))
+        );
+    }
 }

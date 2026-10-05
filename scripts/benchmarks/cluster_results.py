@@ -11,6 +11,11 @@ from cluster_resources import resource_limits
 from cluster_scenarios import (
     MAX_HOT_ORDERING_MESSAGES,
     MAX_PEER_FORWARDING_STREAM_COUNT,
+    MAX_SNAPSHOT_BUILD_LOGICAL_PAYLOAD_BYTES,
+    MAX_SNAPSHOT_BUILD_MESSAGES,
+    MAX_SNAPSHOT_BUILD_RETAINED_MESSAGES,
+    MIN_SNAPSHOT_BUILD_MESSAGES,
+    MIN_RETAINED_RECOVERY_MESSAGES,
 )
 from cluster_scenarios import (
     MAX_RAFT_LOG_GROWTH_CYCLE_TIMEOUT_SECONDS,
@@ -90,6 +95,20 @@ def build_workload(args: argparse.Namespace) -> dict[str, Any]:
             "setup_messages_excluded": 1,
             "message_history_source": "public protocol; first setup publish is offset 0",
             "consensus_history_source": "per-node data-group raft-log.json",
+        }
+    if "snapshot_build_hot_path" in selected_scenarios:
+        workload["snapshot_build_hot_path"] = {
+            "measured_messages": args.snapshot_build_messages,
+            "minimum_messages": MIN_SNAPSHOT_BUILD_MESSAGES,
+            "maximum_messages": MAX_SNAPSHOT_BUILD_MESSAGES,
+            "maximum_logical_payload_bytes": MAX_SNAPSHOT_BUILD_LOGICAL_PAYLOAD_BYTES,
+            "retained_messages": args.retained_messages,
+            "minimum_retained_messages": MIN_RETAINED_RECOVERY_MESSAGES,
+            "maximum_retained_messages": MAX_SNAPSHOT_BUILD_RETAINED_MESSAGES,
+            "cycle_timeout_seconds": args.snapshot_build_cycle_timeout_seconds,
+            "setup_messages_excluded": True,
+            "retained_state_source": "public durable publishes before measured interval",
+            "measurement_boundary": "public durable publish through snapshot build completion",
         }
     return workload
 

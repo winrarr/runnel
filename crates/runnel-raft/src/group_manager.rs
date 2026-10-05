@@ -778,6 +778,14 @@ fn add_snapshot_metrics(
         builds_started: left.builds_started + right.builds_started,
         builds_completed: left.builds_completed + right.builds_completed,
         build_failures: left.build_failures + right.build_failures,
+        builds_in_progress: left.builds_in_progress + right.builds_in_progress,
+        build_duration_nanos_sum: left
+            .build_duration_nanos_sum
+            .saturating_add(right.build_duration_nanos_sum),
+        build_duration_count: left.build_duration_count + right.build_duration_count,
+        build_duration_nanos_max: left
+            .build_duration_nanos_max
+            .max(right.build_duration_nanos_max),
         installs_started: left.installs_started + right.installs_started,
         installs_completed: left.installs_completed + right.installs_completed,
         install_failures: left.install_failures + right.install_failures,
@@ -886,6 +894,39 @@ mod tests {
         assert_eq!(replication_lag_entries(Some(9), Some(5)), 4);
         assert_eq!(replication_lag_entries(Some(9), None), 10);
         assert_eq!(replication_lag_entries(Some(5), Some(9)), 0);
+    }
+
+    #[test]
+    fn snapshot_build_metrics_aggregate_group_counts_sums_and_maxima() {
+        let left = SnapshotMetricsSnapshot {
+            builds_started: 4,
+            builds_completed: 3,
+            build_failures: 1,
+            builds_in_progress: 2,
+            build_duration_nanos_sum: 1_500_000_000,
+            build_duration_count: 4,
+            build_duration_nanos_max: 1_000_000_000,
+            ..SnapshotMetricsSnapshot::default()
+        };
+        let right = SnapshotMetricsSnapshot {
+            builds_started: 2,
+            builds_completed: 2,
+            builds_in_progress: 1,
+            build_duration_nanos_sum: 3_500_000_000,
+            build_duration_count: 2,
+            build_duration_nanos_max: 2_000_000_000,
+            ..SnapshotMetricsSnapshot::default()
+        };
+
+        let total = add_snapshot_metrics(left, right);
+
+        assert_eq!(total.builds_started, 6);
+        assert_eq!(total.builds_completed, 5);
+        assert_eq!(total.build_failures, 1);
+        assert_eq!(total.builds_in_progress, 3);
+        assert_eq!(total.build_duration_nanos_sum, 5_000_000_000);
+        assert_eq!(total.build_duration_count, 6);
+        assert_eq!(total.build_duration_nanos_max, 2_000_000_000);
     }
 
     fn empty_raft_log() -> Vec<u8> {
