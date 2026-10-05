@@ -2,8 +2,8 @@
 
 - Status: proposed design; not an accepted compatibility contract
 - Date: 2026-09-02
-- Last reviewed: 2026-09-29
-- Baseline reviewed: `9c173ac295bb32cb55336255baa825959ac34d4d`
+- Last reviewed: 2026-10-05
+- Baseline reviewed: `f999c1b9ad5d22408bbbe6c6276a42e825cd62ef`
 - Scope: public client/broker requests and responses
 - Related debt: TD-003, TD-018, TD-023, TD-025, and [Make client interactions dependable and evolvable](../backlog.md#make-client-interactions-dependable-and-evolvable)
 - Related evidence: [clustered outcome contract](clustered-outcome-contract.md), [application-aware retry policy](application-aware-retry-policy.md), [durability and delivery policy](durability-delivery-policy.md), [message encoding and compression research](../research/message-encoding-and-compression.md), [ADR 0022](../decisions/0022-provisional-binary-payloads.md), [ADR 0024](../decisions/0024-explicit-offset-replay-read.md), [ADR 0026](../decisions/0026-semantic-engine-error-classification.md), and [ADR 0027](../decisions/0027-consumer-scoped-retry-policy.md)
@@ -122,15 +122,22 @@ The current wire rules are deliberately narrow:
   response-size overflow, or an unexpected typed response and callers reconnect
   explicitly.
 
-The current [server retry test](../../crates/runnel-server/tests/client_retry.rs)
-demonstrates the important outcome boundary: after a response is lost, the
-client reports an unknown publish attempt, and explicitly replaying the same
-publish identity returns the existing result without a duplicate. The local
-and clustered engine tests also cover persistence of that identity and the
-current per-stream, mismatch-ignoring behavior. A connection failure before
-any request bytes are sent is retryable; a write, timeout, EOF, or cancellation
-after writing may have reached the broker and is unknown. The client
-intentionally leaves retry policy to the caller.
+The [server retry test](../../crates/runnel-server/tests/client_retry.rs)
+demonstrates the single-publish outcome boundary: after a response is lost,
+the client reports an unknown attempt, and replaying the same publish identity
+returns the existing result without a duplicate. Real-process typed-client
+tests now cover the corresponding batch boundary: dropping the response or
+withholding a complete successful response past the client timeout marks every
+record unknown, while retrying the same per-record IDs after reconnect returns
+the original offsets. A three-process test also withholds a successful batch
+response, changes leaders, and confirms stable-ID retry against the survivor
+does not duplicate records. These tests strengthen current-v1 outcome evidence;
+they do not establish cross-release compatibility. The local and clustered
+engine tests cover persistence of publish identity and its current per-stream,
+mismatch-ignoring behavior. A connection failure before any request bytes are
+sent is retryable; a write, timeout, EOF, or cancellation after writing may
+have reached the broker and is unknown. The client intentionally leaves retry
+policy to the caller.
 
 These facts describe the implementation at this baseline. They are not a
 claim that arbitrary v1 clients and future servers interoperate.
@@ -541,21 +548,27 @@ When v2 exists, add the following before calling it compatible:
 - generated-schema or independent-language checks that preserve unknown
   fields/enums and exact binary payloads.
 
-No real-server compatibility test is added in this slice. The server has no
-version negotiation or v2 framing to exercise; a proxy that merely injects an
-unsupported version would test a fake runtime. The existing process-level
-retry test remains the appropriate evidence for current unknown publish
-outcomes, while the replay tests establish the additive read-only operation
-and the clustered outcome tests establish only the engine-level classification.
-Implementing the negotiation boundary, then adding the real-server matrix
-above, is a follow-up required to retire TD-003.
+The current real-server tests include
+[`typed_publish_batch_retries_after_lost_response_without_duplicates`](../../crates/runnel-server/tests/client_path.rs),
+[`typed_publish_batch_response_timeout_reports_unknown_and_retries`](../../crates/runnel-server/tests/client_path.rs),
+and the three-process
+[`typed_batch_retry_after_leader_change_does_not_duplicate_records`](../../crates/runnel-server/tests/cluster_smoke.rs).
+They exercise current-v1 ambiguous outcomes and stable per-record publish
+identity, not protocol compatibility. No real-server compatibility test is
+added in this slice: the server has no version negotiation or v2 framing to
+exercise, and a proxy that merely injects an unsupported version would test a
+fake runtime. The replay tests establish the additive read-only operation and
+the clustered outcome tests establish only their stated engine or operation
+outcomes. Implementing the negotiation boundary, then adding the real-server
+matrix above, remains a follow-up required to retire TD-003.
 
-The current [real-server retry test](../../crates/runnel-server/tests/client_retry.rs)
-proves that a lost publish response is classified as `Unknown` and that the
-same v1 `request_id` can resolve it without appending a duplicate. It does not
-prove generic operation-ID behavior, cross-version negotiation, or that a v1
-error code carries a backend-independent apply stage. Retain that distinction
-in fixture names and compatibility reports.
+The single-publish [real-server retry test](../../crates/runnel-server/tests/client_retry.rs)
+proves that a lost response is classified as `Unknown` and that the same v1
+`request_id` can resolve it without appending a duplicate. The batch tests
+extend that current-v1 evidence to per-record identity and leader change, but
+none proves generic operation-ID behavior, cross-version negotiation, or that
+a v1 error code carries a backend-independent apply stage. Retain that
+distinction in fixture names and compatibility reports.
 
 ## Unresolved decisions
 
@@ -582,9 +595,12 @@ protocol crate, persistent Rust client, listener, and real-process test harness
 provide a bounded starting point for a first negotiated Rust client/server
 slice: one version selection per connection, explicit capability and directional
 frame limits, sequential requests, typed preflight refusal, and an outcome
-class on operation errors. The project has not chosen a maintained non-Rust
-client language, so cross-language fixtures should be required before claiming
-interoperability but need not block the initial Rust runtime experiment.
+class on operation errors. Recent real-process batch retry tests strengthen
+current ambiguous-outcome evidence but do not reduce the need for the
+negotiation, refusal, and reconnect tests listed above. The project has not
+chosen a maintained non-Rust client language, so cross-language fixtures
+should be required before claiming interoperability but need not block the
+initial Rust runtime experiment.
 
 Keep codec selection, generic operation deduplication, compression,
 multiplexing, and indefinite v1 support outside that first slice until their
