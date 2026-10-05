@@ -283,7 +283,8 @@ fn shared_consumer_many_in_flight(c: &mut Criterion) {
                             black_box(message);
                         }
                     },
-                    BatchSize::SmallInput,
+                    // Each broker holds file handles, so bound setup fixtures to one at a time.
+                    BatchSize::PerIteration,
                 );
             },
         );
