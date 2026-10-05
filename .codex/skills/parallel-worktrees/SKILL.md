@@ -84,13 +84,20 @@ never terminate unrelated processes.
   tasks assigned, filling up to N initial slots with eligible work, and starts
   one replacement only after a worker's PR is reviewed, recommended for merge,
   and merged. A worker finishing, opening a PR, or getting green checks does
-  not by itself free the slot.
+  not by itself free the slot. Keep the rolling-pool run active until the user
+  explicitly asks to stop it. After each reviewed-and-merged PR, select the
+  next eligible backlog or tech-debt task and fill the available slot. If no
+  task can responsibly be identified, report why the pool is empty and leave
+  the run open and idle; resume selection when eligible work becomes
+  available. An empty eligible queue is not completion.
 
 Record the requested mode and concurrency. In rolling mode, leave a slot
 unfilled while a PR awaits review or merge, or when its outcome is not
 recommended for merge. If the user asks to stop replacements, start none;
-continue resolving already-started work when practical. Stop replacing after
-five distinct non-merge recommendations. Preserve open PRs and worktrees for
+continue resolving already-started work when practical, then leave the run open
+and idle until the user explicitly stops it. A non-merge recommendation leaves
+its slot open and is not a run-completion condition, regardless of how many
+such recommendations have occurred. Preserve open PRs and worktrees for
 user-directed follow-up.
 For each non-merge recommendation, promptly report the PR, branch/worktree,
 evidence gaps, and recommendation so the user can direct follow-up; leave the
