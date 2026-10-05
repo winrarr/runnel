@@ -1,43 +1,41 @@
 # Consume-batch semantics study
 
-- Status: source-backed exploratory research; no runtime change or accepted API decision
-- Last reviewed: 2026-09-29
-- Repository baseline: `edff28340e063760881d0fe2e81a00c47b9cf4c1`
+- Status: source-backed research; proposed semantic contract recorded in ADR 0030; runtime API and behavior are not implemented
+- Last reviewed: 2026-10-05
+- Repository baseline: `7a20de5f03f6976c3d411f5bdf5f878824c99fc5`
 - Primary evidence class: research/design
 - Scope: bounded consume delivery and acknowledgement contracts for the local and early clustered engines
 - Related outcome: [Make batching preserve per-record outcomes](../backlog.md#make-batching-preserve-per-record-outcomes)
-- Related decisions: [ADR 0013](../decisions/0013-local-shared-consumer-delivery.md), [ADR 0015](../decisions/0015-clustered-shared-consumer-ownership.md), [ADR 0027](../decisions/0027-consumer-scoped-retry-policy.md)
+- Related decisions: [ADR 0013](../decisions/0013-local-shared-consumer-delivery.md), [ADR 0015](../decisions/0015-clustered-shared-consumer-ownership.md), [ADR 0027](../decisions/0027-consumer-scoped-retry-policy.md), [ADR 0030](../decisions/0030-consume-batch-contract.md)
 - Related performance evidence: [Systems performance research for Runnel](systems-performance-research.md)
 
-This note compares consume-batch contracts against the behavior in the code at
-the recorded baseline. It is evidence for later design work, not an API
-proposal or a compatibility promise. It does not select batch acknowledgement,
-delivery limits, or atomicity semantics.
+This note compares consume-batch references with the behavior in the code at
+the recorded baseline. It supports the semantic contract proposed in ADR 0030;
+it does not accept a wire API, implementation, compatibility promise, or
+performance claim.
 
 ## Assessment
 
-One candidate for evaluation is bounded delivery with a distinct receipt and
-acknowledgement outcome for each record. If
-acknowledgement round trips are a measured bottleneck, one acknowledgement
-request could carry multiple receipts while preserving per-record validation
-and outcomes. Neither alternative should silently mean “ack all
-through this offset” or make a partially processed application batch
-all-or-nothing.
+The recommended initial contract is bounded delivery with a distinct receipt
+and acknowledgement outcome for each record. An acknowledgement request can
+carry multiple receipts while preserving per-record validation and outcomes.
+It does not mean “ack all through this offset” or make a partially processed
+application batch all-or-nothing.
 
 The current shared-consumer contract makes batching a semantic extension, not
 just a response wrapper: each member has one outstanding delivery, each
 delivery has a lease and stale-token fence, and an in-flight key blocks another
-delivery with that key. A batch must define which records are assigned together,
-when each lease starts, how an uncertain receive is repeated, and whether a
-member can own multiple simultaneous deliveries. The clustered path also needs
-an explicit replicated transition for assigning or acknowledging several
+delivery with that key. The proposed contract extends this to one bounded live
+set per member, starts each lease at assignment, and resolves uncertain pulls
+by returning the member's still-active set. Runtime work still needs explicit
+local-journal and replicated transitions for assigning or acknowledging several
 records.
 
-The backlog outcome already covers this work and calls out partial outcomes,
-ordering, bounds, failures, recovery, and latency/resource evidence. Keep that
-item open. The near-term next step is a focused design and test matrix; defer a
-runtime batch API until that contract and representative measurements are
-reviewed. The present evidence does not establish a throughput gain for Runnel.
+The backlog outcome covers partial outcomes, ordering, bounds, failures,
+recovery, and latency/resource evidence; keep it open until implementation and
+its evidence gates are complete. The near-term next step is an implementation
+and test matrix against the proposed contract. The present evidence does not
+establish a throughput gain for Runnel.
 
 ## Evidence labels
 
@@ -72,7 +70,7 @@ or durability behavior. See the
 | Clustered delivery | One grouped poll submits a `PollGroup` Raft write and carries the leader-selected absolute lease deadline. One grouped ack submits an `AckGroup` write. The replicated state keeps in-flight deliveries, attempts, policy, and out-of-order ack state; tokens fence reassignment. `apply_group_ack` observes the replicated lease clock and removes expired entries before checking the token, so the old token is rejected as stale even before a replacement poll. The reusable engine assertion covers this, and a state-machine unit test also checks the deadline and backward-clock floor. | One batch command could reduce protocol and consensus operations per record, but changes the replicated state transition and error surface. A commit/response timeout can make all or part of the assigned set uncertain. Batch acknowledgement still needs explicit per-item results and retry behavior. |
 | Progress | Local and clustered consumers track a contiguous committed offset plus out-of-order acknowledged offsets. Grouped acks identify member, offset, and delivery token. The compatibility ordinary ack omits the token. | Prefix acknowledgement is not equivalent to Runnel's existing per-record acknowledgement, especially for shared work that can complete out of order. The ordinary tokenless path also needs an explicit decision if batched deliveries are independently reassigned. |
 | Size and timing | The wire listener has a configurable request-frame limit capped at 64 MiB. The typed client has a configurable response-buffer bound, with a 65 MiB default. Consume currently returns one record; it has no batch count, aggregate response-byte, or collection-wait policy. | Future delivery bounds must apply to encoded response bytes as well as record count and decoded payload bytes. A maximum wait adds queueing latency and must fit within request and lease timeouts. |
-| Durable consumer retry policy | `configure_consumer` and `inspect_consumer` expose a versioned policy for each stream/consumer. Repeating current values is idempotent; changed values advance the version. The acknowledgement timeout is bounded to seven days (zero is allowed), and a configured attempt limit must be positive. Unconfigured consumers retain broker-wide fallback policy. Both engines persist the policy and a snapshot for each offset on its first assignment. That offset continues using its pinned acknowledgement timeout and attempt limit on retries and terminal movement after later policy updates. The local snapshot is in the consumer journal; clustered policy and per-offset snapshots are replicated with consumer state. | A future batch cannot assume one policy version or lease for every item. Batch assignment and retry rules need to preserve each offset's pinned policy; changing the policy must not implicitly alter already assigned records. This is an observed constraint, not a selected batch contract. |
+| Durable consumer retry policy | `configure_consumer` and `inspect_consumer` expose a versioned policy for each stream/consumer. Repeating current values is idempotent; changed values advance the version. The acknowledgement timeout is bounded to seven days (zero is allowed), and a configured attempt limit must be positive. Unconfigured consumers retain broker-wide fallback policy. Both engines persist the policy and a snapshot for each offset on its first assignment. That offset continues using its pinned acknowledgement timeout and attempt limit on retries and terminal movement after later policy updates. The local snapshot is in the consumer journal; clustered policy and per-offset snapshots are replicated with consumer state. | A batch preserves each offset's pinned policy and attempt history; a set may contain different snapshots after retries or policy changes. Updating policy does not change the timeout or attempt limit already pinned to an offset. This carries forward the observed ADR 0027 behavior. |
 
 Relevant code and current semantic decisions are in
 [local poll and ack](../../crates/runnel-core/src/broker.rs),
@@ -107,15 +105,19 @@ does not establish batch outcomes:
   single-record restart and leader-failure delivery paths. They do not define
   mixed per-item results for a batch.
 
-See the [local policy test](../../crates/runnel-core/src/lib.rs#L984),
-[persistent clustered policy test](../../crates/runnel-raft/src/lib.rs#L1443),
-[three-process policy transfer test](../../crates/runnel-server/tests/cluster_smoke.rs#L1243),
-[local shared engine contract](../../crates/runnel-core/tests/engine_contract.rs#L265),
-[clustered expiry contract](../../crates/runnel-raft/src/lib.rs#L1226),
-[shared assertion implementation](../../crates/runnel-test-support/src/lib.rs#L342),
+See `consumer_policy_is_isolated_durable_and_pinned_per_delivery` in the
+[local policy tests](../../crates/runnel-core/src/lib.rs),
+`persistent_raft_consumer_policy_is_durable_and_pins_attempts` in the
+[persistent clustered tests](../../crates/runnel-raft/src/lib.rs), and
+`three_process_cluster_transfers_consumer_policy_and_delivery_snapshot_after_leader_failure`
+in the [cluster process tests](../../crates/runnel-server/tests/cluster_smoke.rs).
+The [local shared-engine contract](../../crates/runnel-core/tests/engine_contract.rs),
+[cluster delivery tests](../../crates/runnel-raft/src/lib.rs), and
+[shared assertion implementation](../../crates/runnel-test-support/src/lib.rs)
+cover stale-ack behavior, along with
 the [local restart test source](../../crates/runnel-server/tests/server_smoke.rs)
 (`network_protocol_reassigns_group_delivery_after_restart`),
-and the [cluster node-failure test](../../crates/runnel-server/tests/cluster_smoke.rs#L928).
+and the [cluster node-failure test](../../crates/runnel-server/tests/cluster_smoke.rs).
 The accepted retry-policy details are in
 [ADR 0027](../decisions/0027-consumer-scoped-retry-policy.md).
 
@@ -141,60 +143,52 @@ These are alternatives for further design work, not selected requirements.
 | Cumulative contiguous-prefix acknowledgement | An acknowledgement of the highest processed offset advances through every earlier delivery in the prefix. An unprocessed gap makes acknowledging a later record unsafe. | Requires one strictly ordered lane and proof that all earlier records in the prefix completed. It conflicts with current shared-consumer out-of-order acknowledgements and unrelated-key parallel progress. | Fewer ack messages and compact state, as in AMQP/RabbitMQ and some stream APIs. Could be explored only as a separately explicit mode with a clear prefix cursor; it must not be inferred from delivery batch order. |
 | Auto-ack on fetch | Receipt itself advances durable progress. Processing failure after response cannot be recovered by normal redelivery. | No per-record stale-ack race because no ack remains, but the crash window moves to between delivery and application processing. | Lower broker acknowledgement work but violates the backlog's at-least-once delivery goal for processing. Exclude from the initial durable-consume contract. |
 
-## Cross-cutting requirements for a future design
+## Proposed contract implications (runtime behavior not implemented)
 
 ### Partial and unknown outcomes
 
-An ordered batch response must carry one stable receipt per record, not only a
+The proposed contract carries one stable receipt per record, not only a
 first/last offset. A transport timeout after assignments commit can leave the
 whole returned set unknown; a disconnect while writing a large response may
-leave the client with only a prefix. A retry must either recover the same
-assignment set using a bounded stable receive-attempt identity, or define that
-the member's current in-flight set is returned until resolved. Choosing a new
-set on every retry could strand work behind leases or give the caller no way to
-identify which deliveries were assigned.
+leave the client with only a prefix. It resolves retries by returning the
+member's current active set until its receipts are acknowledged or expire,
+without adding a separate receive-attempt cache or cross-restart identity.
 
-An acknowledgement vector should validate receipts independently and return a
-result for each record. If the engine instead makes one all-or-none state
-transition, that atomicity must be explicit and retry-safe. A lost ack response
-must not lead a caller to assume no progress: applied entries can be resolved
-as already acknowledged, while unapplied or expired entries need their own
-unambiguous result. In every design, successful ack means durable progress has
-reached the engine's existing local or replicated durability boundary.
+The proposed acknowledgement vector validates receipts independently and
+returns a result for each record. A lost ack response must not lead a caller to
+assume no progress: applied entries can be resolved as already acknowledged,
+while unapplied or expired entries retain their own result. Successful ack
+means durable progress has reached the engine's existing local or replicated
+durability boundary.
 
 ### Ordering, membership, and expiry
 
-For shared consumers, each delivery must retain its member and generation/token
-fence. Acking a batch must reject expired or reassigned tokens item by item, so
-an old member cannot commit a later assignment. Member removal or process
-restart can redeliver any unacknowledged portion; the previously acknowledged
-subset must remain acknowledged.
+For shared consumers, each delivery retains its member and token fence. The
+proposed contract rejects expired or reassigned tokens item by item, so an old
+member cannot commit a later assignment. Local restart can redeliver any
+unacknowledged portion; the previously acknowledged subset remains durable.
 
-The current scheduler blocks another in-flight record with the same key. A
-batch may contain different keys, but it must say whether records are processed
-in response order and whether more than one same-key record can be returned to
-one member. Returning same-key records together is only safe if the API
-guarantees sequential processing and ack behavior that preserves the key's
-order; the broker cannot observe application work that continues after lease
-expiry. A conservative first contract would keep at most one unacknowledged
-record per key for each consumer, even within a response.
+The current scheduler blocks another in-flight record with the same key. The
+proposed contract keeps that exclusion within and across a returned set, while
+allowing different keys to be acknowledged out of order. Response order does
+not promise application execution order; the broker cannot observe application
+work that continues after lease expiry.
 
 ### Bounds, time, and resources
 
 Count, encoded response bytes, decoded payload bytes, and collection wait are
-separate bounds. The contract must define an oversized first record so an
-otherwise valid record cannot become permanently undeliverable. It should
-return fewer than requested when the byte limit or wait expires, with empty
-remaining distinguishable from a transport failure. The server's request
-timeout and the client's response limit also need to accept the batch without
-allocating an unbounded response.
+separate bounds. The proposed contract defines an oversized first record as a
+pre-assignment error and returns a prefix when a later record crosses the byte
+limit. Empty results remain distinguishable from transport failure. The
+server's request timeout and client's response limit must bound the encoded
+batch without an unbounded response allocation.
 
 Leases begin when assignment commits, before all consumers necessarily start
-processing the returned records. Large batches or slow first items can therefore
-expire later items in the same response. Increasing the lease reduces premature
-redelivery but delays recovery after a crashed consumer. Any future heartbeat
-or lease-extension operation is a separate contract and should not be assumed
-by batch receive.
+processing the returned records. Large batches or slow first items can
+therefore expire later items in the same response. Increasing the lease reduces
+premature redelivery but delays recovery after a crashed consumer. Any future
+heartbeat or lease-extension operation is a separate contract and is not
+assumed by batch receive.
 
 **Hypothesis:** a broker-side batch may amortize JSON framing, state lookup,
 local consumer-journal syncs (if acknowledgement persistence is combined), and
@@ -211,8 +205,8 @@ apply/response work. No existing measurement isolates these alternatives.
 The local engine persists delivery attempts before returning each delivery and
 persists acknowledgement state before reporting success. Its active lease map is
 volatile, so restart may redeliver. The cluster replicates assignment and
-acknowledgement state in the stream data group. A future shared contract should
-keep these guarantee differences explicit while requiring both engines to
+acknowledgement state in the stream data group. The proposed shared contract
+keeps these guarantee differences explicit while requiring both engines to
 agree on per-record outcomes, same-key exclusion, stale-token rejection,
 out-of-order progress, and partial batch behavior. A single batch response
 must not imply a stronger all-record durability guarantee than the engine
@@ -234,13 +228,13 @@ the old token after a replacement poll; the cluster unit test
 `grouped_ack_preserves_backward_clock_safety_and_fences_expired_tokens` also
 checks rejection at the exact deadline and preservation of the lease-clock
 floor after a backward time sample. The former local-unit-test ordering is not
-evidence of a current engine difference. For batching, the remaining question
-is how a vector reports one expired receipt alongside other valid receipts,
-not which single-record rule the engines use. See [local delivery tests](../../crates/runnel-core/src/lib.rs),
+evidence of a current engine difference. For batching, the proposed contract
+reports an expired receipt separately from valid siblings; vector tests do not
+yet exist. See [local delivery tests](../../crates/runnel-core/src/lib.rs),
 [shared engine assertion](../../crates/runnel-test-support/src/lib.rs), and
 [cluster delivery tests](../../crates/runnel-raft/src/lib.rs).
 
-## Evidence needed before selecting an implementation
+## Evidence needed before implementation and performance claims
 
 The existing Criterion suite measures local one-record `publish/poll/ack`,
 shared-consumer polling, keyed delivery, and many in-flight members; it has no
@@ -264,15 +258,18 @@ The existing reusable engine assertion already covers a single-record grouped
 ack immediately after lease expiry and before any replacement poll for both
 the local and clustered engines. Batch-specific correctness coverage should
 include empty/partial batches, count and byte limits, one record at the maximum
-supported payload, response loss after assignment, retry of the same receive
-identity, disconnect during response, an ack vector with an expired or
+supported payload, response loss after assignment, retry of the same member
+poll, disconnect during response, an ack vector with an expired or
 reassigned token among valid tokens and an explicit result for each item,
 response loss after ack, restart, leader change, lease expiry while later batch
 entries wait, member replacement, same-key records, out-of-order ack across
 different keys, and multiple per-offset policy snapshots within one batch. A
-policy update between first assignments should also be exercised across local
-restart and clustered leadership transfer before deciding how such a batch
-reports outcomes.
+policy update between first assignments should be exercised across local
+restart and clustered leadership transfer. Tests must also cover the existing
+attempt-limit dead-letter boundary for candidates encountered before and among
+returned records, plus wakeups after publish, acknowledgement, and observed
+expiry. These establish the proposed contract; they do not establish a
+performance gain.
 Network and failure tests should start real broker processes. Reusable engine
 assertions should preserve topology-free semantics where practical.
 
@@ -285,12 +282,12 @@ assertions should preserve topology-free semantics where practical.
   local and clustered ack results after expiry but before reassignment is now
   covered by the reusable engine assertion; vector outcomes and the other
   batch-specific cases remain open.
-- **Near-term vs deferred:** a design note or ADR proposal is reasonable
-  near-term work because the outcome is already committed to product fit and
-  both engines expose the relevant delivery and durability boundaries. Runtime
-  implementation should wait for the receive-retry identity, per-member
-  concurrency, key-ordering, acknowledgement-vector, and lease rules to be
-  resolved and tested.
+- **Near-term vs deferred:** recommend accepting the semantic contract proposed
+  in ADR 0030 because both engines expose the necessary delivery and durability
+  boundaries and the reviewed references support bounded receive and per-entry
+  outcomes. Runtime API shape remains provisional. Implementation must add
+  batch-specific contract, local, cluster, and real-process coverage; the
+  broader benchmark matrix remains the acceptance gate for performance claims.
 - **Performance:** no direct performance change is expected from this research
   note. Throughput improvement is a hypothesis; no magnitude is estimated.
   Batching may improve small-message throughput while increasing tail latency,
@@ -301,15 +298,13 @@ assertions should preserve topology-free semantics where practical.
   0027, and the shared-consumer and batching backlog outcomes were inspected.
   No code refactor is warranted: current code follows the accepted single-record
   fencing and retry-policy decisions, and this update corrects the research
-  record. No backlog, debt, or ADR change is needed: the existing batching
-  acceptance criteria already cover per-record outcomes, partial failure,
-  ordering, bounds, restart/failover, and latency/resource evidence. Policy
-  transfer coverage strengthens the future evidence base but does not complete
-  a batch criterion. No separate actionable refactor or tech-debt item was
-  identified.
+  record. ADR 0030 proposes the selected semantic contract; the backlog remains
+  open because runtime behavior, failure tests, and performance evidence are
+  unfinished. No separate actionable refactor or tech-debt item was identified.
 - **Unresolved evidence:** no workload has established whether network round
   trips, per-record local sync, consensus round trips, JSON/base64 work, or
-  client-side processing dominates; no batch size or ack model is selected.
+  client-side processing dominates; the proposed 1,024-record ceiling is a
+  protocol bound, not an optimal or resource-validated batch size.
 
 ## References
 
