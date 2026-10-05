@@ -746,15 +746,12 @@ impl GroupManager {
             };
             snapshot.groups_with_local_leadership += 1;
 
-            let leader_next_index = metrics
-                .last_log_index
-                .map_or(0, |index| index.saturating_add(1));
             for (peer_id, matched_log_id) in replication.iter().take(MAX_REPLICATION_PROGRESS_PEERS)
             {
-                let matched_next_index = matched_log_id
-                    .as_ref()
-                    .map_or(0, |log_id| log_id.index.saturating_add(1));
-                let lag_entries = leader_next_index.saturating_sub(matched_next_index);
+                let lag_entries = replication_lag_entries(
+                    metrics.last_log_index,
+                    matched_log_id.as_ref().map(|log_id| log_id.index),
+                );
                 if let Some(lag) = snapshot.peer_lag_entries.get_mut(peer_id) {
                     *lag = (*lag).max(lag_entries);
                 } else if snapshot.peer_lag_entries.len() < MAX_REPLICATION_PROGRESS_PEERS {
@@ -765,6 +762,12 @@ impl GroupManager {
 
         snapshot
     }
+}
+
+fn replication_lag_entries(last_log_index: Option<u64>, matched_log_index: Option<u64>) -> u64 {
+    let leader_next_index = last_log_index.map_or(0, |index| index.saturating_add(1));
+    let matched_next_index = matched_log_index.map_or(0, |index| index.saturating_add(1));
+    leader_next_index.saturating_sub(matched_next_index)
 }
 
 fn add_snapshot_metrics(
@@ -877,6 +880,13 @@ pub(super) fn validate_persisted_cluster_storage(data_dir: &Path) -> Result<(), 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn replication_lag_reports_nonzero_distance_between_log_positions() {
+        assert_eq!(replication_lag_entries(Some(9), Some(5)), 4);
+        assert_eq!(replication_lag_entries(Some(9), None), 10);
+        assert_eq!(replication_lag_entries(Some(5), Some(9)), 0);
+    }
 
     fn empty_raft_log() -> Vec<u8> {
         serde_json::to_vec(&serde_json::json!({
