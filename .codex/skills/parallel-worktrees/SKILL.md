@@ -5,21 +5,11 @@ description: Coordinate authorized fixed or rolling pools of independent coding,
 
 # Parallel worktrees
 
-Use this workflow only when the user authorizes parallel delegation. Read the
-repository root `AGENTS.md` and follow its shared engineering, evidence, and
-pull-request policies.
+Use this workflow only when the user authorizes parallel delegation. Read the repository root `AGENTS.md` and follow its shared engineering, evidence, and pull-request policies.
 
 ## Orchestration
 
-At the start of a run, the orchestrator performs the single baseline check
-required by `AGENTS.md`: fetch `origin/main`, record its revision, and inspect
-the latest `ci.yml` run on `main` when GitHub access is available. Record its
-`headSha`, `status`, and `conclusion`, noting that a default-branch run may lag
-the current revision and is periodic health evidence. Passing required checks
-on the exact pull-request head are the merge gate; do not wait for a new
-default-branch run. Share the revision and CI state with workers.
-Workers confirm their worktree `HEAD` matches the supplied revision; they do
-not repeat the run-level fetch or CI check. Inspect the run with:
+At the start of a run, the orchestrator performs the single baseline check required by `AGENTS.md`: fetch `origin/main`, record its revision, and inspect the latest `ci.yml` run on `main` when GitHub access is available. Record its `headSha`, `status`, and `conclusion`, noting that a default-branch run may lag the current revision and is periodic health evidence. Passing required checks on the exact pull-request head are the merge gate; do not wait for a new default-branch run. Share the revision and CI state with workers. Workers confirm their worktree `HEAD` matches the supplied revision; they do not repeat the run-level fetch or CI check. Inspect the run with:
 
 ```text
 gh run list --workflow ci.yml --branch main --limit 1 --json headSha,status,conclusion,url
@@ -27,110 +17,31 @@ gh run list --workflow ci.yml --branch main --limit 1 --json headSha,status,conc
 
 Do not repeat the baseline CI lookup during the run. Required checks must pass on each PR's exact final head before merge. Keep task branches at their supplied baseline as `main` advances; follow `AGENTS.md` for branch-update exceptions. Merge ready PRs against the current base after review and exact-head checks pass; report other repository blockers instead of syncing automatically.
 
-Use the task request, dependencies, risk, and learning value to select work
-from `docs/backlog.md` and `docs/tech-debt.md`. Confirm an item still applies
-to the current code. Split work only where outcomes can be independently
-owned, verified, and reviewed; carry forward the source item's goal,
-acceptance criteria, and dependencies. Assign the work and let workers choose
-how to deliver and verify it within `AGENTS.md` and the applicable testing
-and benchmarking policies. Do not delegate onward unless explicitly
-authorized.
-Base assignments on the recorded commit. If relevant uncommitted changes are
-needed, make them an explicit patch or establish and share a clear local
-baseline.
+Use the task request, dependencies, risk, and learning value to select work from `docs/backlog.md` and `docs/tech-debt.md`. Confirm an item still applies to the current code. Split work only where outcomes can be independently owned, verified, and reviewed; carry forward the source item's goal, acceptance criteria, and dependencies. Assign the work and let workers choose how to deliver and verify it within `AGENTS.md` and the applicable testing and benchmarking policies. Do not delegate onward unless explicitly authorized. Base assignments on the recorded commit. If relevant uncommitted changes are needed, make them an explicit patch or establish and share a clear local baseline.
 
-Workers update backlog or tech-debt records in the same PR when their outcome
-changes them. The orchestrator checks that merged outcomes and tracker status
-remain aligned. Keep the active task on the critical path, and give each worker
-the goal, relevant source item, owned paths, supplied baseline, and coordination
-boundaries. Do not assign edits in the orchestrator's repository worktree.
-Resolve proposed work across ownership or shared boundaries under `AGENTS.md`,
-and update the ownership map and integration plan before expanding a task.
-Ensure workers read the repository `AGENTS.md`, this skill, and `WORKER.md`;
-do not rely on automatic instruction loading.
+Workers update backlog or tech-debt records in the same PR when their outcome changes them. The orchestrator checks that merged outcomes and tracker status remain aligned. Keep the active task on the critical path, and give each worker the goal, relevant source item, owned paths, supplied baseline, and coordination boundaries. Do not assign edits in the orchestrator's repository worktree. Resolve proposed work across ownership or shared boundaries under `AGENTS.md`, and update the ownership map and integration plan before expanding a task. Ensure workers read the repository `AGENTS.md`, this skill, and `WORKER.md`; do not rely on automatic instruction loading.
 
 ## Worktree and resource isolation
 
-Provision one dedicated branch and worktree per task, outside the repository
-directory. Before editing, require each worker to report `pwd`,
-`git rev-parse --show-toplevel`, `git branch --show-current`, and
-`git rev-parse HEAD`. Validate that the path and branch match the assignment
-and that `HEAD` matches the supplied baseline. Record the task-to-path-to-branch
-mapping; do not start another implicit worktree allocation until the prior one
-is validated. Revalidate an existing worktree before resuming a worker.
+Provision one dedicated branch and worktree per task, outside the repository directory. Before editing, require each worker to report `pwd`, `git rev-parse --show-toplevel`, `git branch --show-current`, and `git rev-parse HEAD`. Validate that the path and branch match the assignment and that `HEAD` matches the supplied baseline. Record the task-to-path-to-branch mapping; do not start another implicit worktree allocation until the prior one is validated. Revalidate an existing worktree before resuming a worker.
 
-Use `just isolated <workflow>` for supported concurrent process tests and
-benchmarks. Give other concurrent work unique ports, data and output paths,
-containers, and build targets where needed. Do not share mutable broker data,
-benchmark output paths, or Cargo target directories. Limit concurrent tasks
-requiring authoritative host benchmarks to two, and run those benchmarks with
-the host otherwise idle. Treat measurements made during contention as
-exploratory. Follow `docs/benchmarking.md` for authoritative comparison and
-reporting requirements.
+Use `just isolated <workflow>` for supported concurrent process tests and benchmarks. Give other concurrent work unique ports, data and output paths, containers, and build targets where needed. Do not share mutable broker data, benchmark output paths, or Cargo target directories. Limit concurrent tasks requiring authoritative host benchmarks to two, and run those benchmarks with the host otherwise idle. Treat measurements made during contention as exploratory. Follow `docs/benchmarking.md` for authoritative comparison and reporting requirements.
 
-If worktree allocation is wrong or task changes become mixed, stop affected
-workers and preserve the changes before re-homing verified work. Never reset
-or discard mixed work to repair allocation. Clean up only inactive workers and
-confirm their processes and containers have stopped before removing clean
-temporary worktrees. Retain uncommitted work and work needed for follow-up;
-never terminate unrelated processes.
+If worktree allocation is wrong or task changes become mixed, stop affected workers and preserve the changes before re-homing verified work. Never reset or discard mixed work to repair allocation. Clean up only inactive workers and confirm their processes and containers have stopped before removing clean temporary worktrees. Retain uncommitted work and work needed for follow-up; never terminate unrelated processes.
 
 ## Fixed and rolling pools
 
-- “Run parallel-worktrees with N subagents” starts up to N workers and does
-  not replace them. If fewer eligible tasks exist, use the available tasks
-  and report the shortage.
-- “Run parallel-worktrees with N subagents and rolling pool” keeps at most N
-  active worker assignments, filling up to N initial slots with eligible work.
-  Normally, one replacement starts only after the worker's PR is reviewed, both
-  worker and orchestrator recommend merge, and it is merged. A worker finishing,
-  opening a PR, or getting green checks does not by itself free the slot; the
-  non-merge handoff below is the only exception.
-  Replenish a slot released by a merge or the non-merge handoff below after
-  reviewing the current backlog and tech-debt inventory for eligible independent
-  work. Continue rolling while eligible work remains. If no eligible independent
-  task can be identified, report the shortage and why remaining items are
-  ineligible. Once active assignments are resolved, an empty eligible inventory
-  completes the run. An explicit user request to stop also ends replacement
-  selection; resolve already-assigned work when practical and report the final
-  state.
+- “Run parallel-worktrees with N subagents” starts up to N workers and does not replace them. If fewer eligible tasks exist, use the available tasks and report the shortage.
+- “Run parallel-worktrees with N subagents and rolling pool” keeps at most N active worker assignments, filling up to N initial slots with eligible work. Normally, one replacement starts only after the worker's PR is reviewed, both worker and orchestrator recommend merge, and it is merged. A worker finishing, opening a PR, or getting green checks does not by itself free the slot; the non-merge handoff below is the only exception. Replenish a slot released by a merge or the non-merge handoff below after reviewing the current backlog and tech-debt inventory for eligible independent work. Continue rolling while eligible work remains. If no eligible independent task can be identified, report the shortage and why remaining items are ineligible. Once active assignments are resolved, an empty eligible inventory completes the run. An explicit user request to stop also ends replacement selection; resolve already-assigned work when practical and report the final state.
 
-Record the requested mode and concurrency. In rolling mode, keep a slot assigned
-while its PR awaits review or merge. Merge only when both worker and orchestrator
-recommend merge and exact-head required checks pass. After review, if they do not
-both recommend merge, do not merge: hand the open PR and its evidence to the user
-for review, close the worker assignment, and release that active slot so an
-eligible replacement can start. Preserve the PR and its worktree for user-directed
-follow-up; do not delete or discard them. This non-merge handoff releases a slot
-but does not end the run while eligible work remains, regardless of how many
-such recommendations have occurred. If the user asks to stop replacements,
-start none and continue resolving already-started work when practical. For each
-non-merge recommendation, promptly report the PR, branch/worktree, evidence
-gaps, and recommendation so the user can direct follow-up.
-If the user asks to call it a day after remaining workers finish and requests
-auto-merge, enable it only for PRs that both worker and orchestrator recommend
-for merge; if unsupported, leave them open and report that limitation.
+Record the requested mode and concurrency. In rolling mode, keep a slot assigned while its PR awaits review, required checks, or requested revisions. Merge only when both worker and orchestrator recommend merge and exact-head required checks pass. If failed checks or gates, defects, or unsupported claims are fixable within the task, request worker revisions and keep the assignment active until fixes and affected evidence reruns are complete. After coordinator review is complete and any fixable revisions are resolved, if either still recommends against merge for a substantive unresolved reason, do not merge: hand the open PR and evidence to the user for review, close the worker assignment, and release that active slot so an eligible replacement can start. Preserve the PR and its worktree for user-directed follow-up; do not delete or discard them. This non-merge handoff releases a slot but does not end the run while eligible work remains, regardless of how many such recommendations have occurred. If the user asks to stop replacements, start none and continue resolving already-started work when practical. For each non-merge recommendation, promptly report the PR, branch/worktree, evidence gaps, and recommendation so the user can direct follow-up. If the user asks to call it a day after remaining workers finish and requests auto-merge, enable it only for PRs that both worker and orchestrator recommend for merge; if unsupported, leave them open and report that limitation.
 
 ## Review and merge
 
-Workers own implementation, their evidence approach, testing, and PR readiness.
-They hand off a PR for merge review only when it is ready and all required checks
-pass on its exact final head. If a worker recommends non-merge or a blocker
-remains, they report the open PR, evidence, and gaps to the orchestrator and keep
-it draft when appropriate. The orchestrator reviews the diff, acceptance
-outcome, evidence and stated gaps, tracker updates, mergeability, and applicable
-repository gates. Request revisions when a required check or gate fails, or
-when the outcome or claims lack support. Do not repeat green checks by default.
+Workers own implementation, their evidence approach, testing, and PR readiness. They hand off a PR for merge review only when it is ready and all required checks pass on its exact final head. If a worker recommends non-merge or a blocker remains, they report the open PR, evidence, and gaps to the orchestrator and keep it draft when appropriate. The orchestrator reviews the diff, acceptance outcome, evidence and stated gaps, tracker updates, mergeability, and applicable repository gates. Request worker revisions for fixable failed checks or gates, defects, or unsupported claims, and keep the assignment active until revisions and affected checks are complete. Do not repeat green checks by default.
 
-The orchestrator owns the merge decision. Merge a PR only when review is complete, both worker and orchestrator recommend merge, and exact-head required checks pass. If either does not recommend merge, do not merge; follow the non-merge handoff and slot-release rule above. Auto-merge may be enabled only after both recommend merge, when supported, and must not bypass checks. Coordinate genuinely coupled changes before handoff, follow `AGENTS.md` for branch updates, and report repository blockers instead of syncing automatically.
+The orchestrator owns the merge decision. Merge a PR only when review is complete, both worker and orchestrator recommend merge, and exact-head required checks pass. If, after review and any requested revisions, either still recommends against merge for a substantive reason, do not merge; follow the non-merge handoff and slot-release rule above. Auto-merge may be enabled only after both recommend merge, when supported, and must not bypass checks. Coordinate genuinely coupled changes before handoff, follow `AGENTS.md` for branch updates, and report repository blockers instead of syncing automatically.
 
-For a rolling pool, give each replacement the commit and passing PR checks from
-the latest preceding merge as its baseline; if no merge has completed, use the
-recorded run baseline and its verification state. Do not run a separate
-post-merge CI check. Existing tasks keep their supplied baseline, with branch
-updates governed by `AGENTS.md`.
+For a rolling pool, give each replacement the commit and passing PR checks from the latest preceding merge as its baseline; if no merge has completed, use the recorded run baseline and its verification state. Do not run a separate post-merge CI check. Existing tasks keep their supplied baseline, with branch updates governed by `AGENTS.md`.
 
-Use [`WORKER.md`](WORKER.md) as the worker checklist. Keep shared engineering
-policy in `AGENTS.md` and orchestration policy here. The final status reports
-merged and open PRs, evidence and coverage gaps, recommendations, verification
-state, tracker disposition, and unresolved resource or benchmark concerns.
+Use [`WORKER.md`](WORKER.md) as the worker checklist. Keep shared engineering policy in `AGENTS.md` and orchestration policy here. The final status reports merged and open PRs, evidence and coverage gaps, recommendations, verification state, tracker disposition, and unresolved resource or benchmark concerns.
