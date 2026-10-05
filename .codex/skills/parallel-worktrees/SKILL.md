@@ -84,14 +84,24 @@ never terminate unrelated processes.
   tasks assigned, filling up to N initial slots with eligible work, and starts
   one replacement only after a worker's PR is reviewed, recommended for merge,
   and merged. A worker finishing, opening a PR, or getting green checks does
-  not by itself free the slot.
+  not by itself free the slot. After each reviewed-and-merged PR, carefully
+  review the current backlog and tech-debt inventory for eligible independent
+  work, then fill the available slot when such work exists. Continue rolling
+  while eligible work remains. If no eligible independent task can be
+  identified, do not wait for future inventory changes: report the shortage
+  and why remaining items are ineligible. Once already-assigned work is
+  resolved, an empty eligible inventory completes the run. An explicit user
+  request to stop also ends replacement selection; resolve already-assigned
+  work when practical and report the final state.
 
 Record the requested mode and concurrency. In rolling mode, leave a slot
 unfilled while a PR awaits review or merge, or when its outcome is not
-recommended for merge. If the user asks to stop replacements, start none;
-continue resolving already-started work when practical. Stop replacing after
-five distinct non-merge recommendations. Preserve open PRs and worktrees for
-user-directed follow-up.
+recommended for merge. A non-merge recommendation leaves its slot open and is
+not a run-completion condition by itself, regardless of how many such
+recommendations have occurred; continue using other available slots while
+eligible work remains. If the user asks to stop replacements, start none and
+continue resolving already-started work when practical. Preserve open PRs and
+worktrees for user-directed follow-up.
 For each non-merge recommendation, promptly report the PR, branch/worktree,
 evidence gaps, and recommendation so the user can direct follow-up; leave the
 slot open.
