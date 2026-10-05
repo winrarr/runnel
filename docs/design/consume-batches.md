@@ -1,8 +1,8 @@
-# Consume batches: proposed contract
+# Consume batches: proposed semantic contract
 
-- Status: implementation-ready design proposal; no runtime API or behavior is accepted yet
-- Implementation review baseline: `71631f127665b5086931694ca55ba4adae6e705e`
-- Linked research refreshed at default-branch revision: `1aa210bbd3986a6da25e804e967dc8a37fdfee2f`
+- Status: proposed for acceptance by [ADR 0030](../decisions/0030-consume-batch-contract.md); runtime API and behavior are not implemented
+- Implementation review baseline: `7a20de5f03f6976c3d411f5bdf5f878824c99fc5`
+- Linked research reviewed at baseline: `7a20de5f03f6976c3d411f5bdf5f878824c99fc5`
 - Primary evidence class: design/research
 - Related outcome: [Make batching preserve per-record outcomes](../backlog.md#make-batching-preserve-per-record-outcomes)
 - Source study: [Consume-batch semantics](../research/consume-batch-semantics.md)
@@ -24,44 +24,65 @@ consumer journal sync and acknowledgement after its journal sync. The cluster
 confirms both only after the corresponding data-group Raft command commits.
 Neither boundary makes application work exactly once.
 
-This proposal selects the initial semantics below; it does not accept a wire
-API or claim a performance gain. The names and fields are a concrete protocol
-shape for implementation review, not compatibility promises.
+ADR 0030 proposes these semantic invariants, including the initial
+1,024-record request ceiling, but does not freeze the names or fields below as
+a wire API. No performance gain is established. Implementation remains gated
+on the correctness and performance evidence listed at the end of this design.
 
 ## Proposed protocol shape
 
-Add `poll_batch` and `poll_group_batch`, each with `stream`, `consumer`,
-`max_records`, `max_bytes`, and `max_wait_ms`; the grouped form also carries
-`member`. Add `ack_batch` and `ack_group_batch`, each with the relevant stream,
-consumer, member identity, and a list of `{offset, delivery_token}` receipts.
+The candidate wire shape is `poll_batch` and `poll_group_batch`, each with
+`stream`, `consumer`, `max_records`, `max_bytes`, and `max_wait_ms`; the grouped
+form also carries `member`. Add `ack_batch` and `ack_group_batch`, each with
+the relevant stream, consumer, member identity, and a list of
+`{offset, delivery_token}` receipts.
 The ordinary form uses the consumer name as its member, matching scalar poll.
 Every returned message, including an ordinary-consumer message, carries its
 opaque receipt token. The typed client exposes the same per-entry results as
-the protocol.
+the protocol. Each offset retains its pinned consumer policy and attempt
+history across retries; a batch may therefore contain receipts with different
+policy snapshots. A terminal attempt-limit move continues to follow the
+existing engine-specific dead-letter boundary and is not represented as an
+acknowledgement-vector entry.
 
 Reject an empty ack list, duplicate offsets, invalid names, and over-limit
-lists before changing state. These request-shape errors reject the whole
-request; delivery-specific receipt failures remain per-entry.
+lists before changing state. The first implementation caps both a pull set and
+an acknowledgement vector at 1,024 entries. These request-shape errors reject
+the whole request; delivery-specific receipt failures remain per-entry.
 
 Polling returns messages in increasing offset order, or an empty list. If a
 member already has an active set, the poll returns its remaining active
 deliveries and does not assign more. Retrying the same member before lease
 expiry therefore recovers an uncertain response. After partial acknowledgement,
-only the unacknowledged subset is returned. A request whose lower limits cannot
-hold the existing set is rejected without changing delivery state; retry with
-the original or larger limits. Once the set is empty, a new poll may assign a
-new set. Concurrent polls for one member serialize through the same ledger.
+only the still-active, unacknowledged subset is returned; expired receipts
+follow ordinary reassignment rules. A request whose lower limits cannot
+hold the live set is rejected without creating new assignments; retry with the
+original or larger limits. Expiry is observed using the existing
+demand-driven rules before validating the live set; that normal expiry may
+release leases, but a limit rejection creates no new assignments. Once the set
+is empty, a new poll may assign a new set. Concurrent polls for one member
+serialize through the same ledger.
+
+For a new set, `max_wait_ms = 0` returns currently eligible work immediately.
+With a positive wait, the broker collects until the record cap is reached,
+the next eligible record would exceed the encoded-byte cap, or the deadline is
+reached; it then assigns the collected prefix, or returns empty if none became
+eligible. An existing active set is returned immediately after bound
+validation and is never topped up. The wait is bounded by the request deadline
+and happens before assignment, so a timeout while waiting creates no new
+assignments. Existing expiry and attempt-limit transitions still follow their
+current demand-driven rules. A byte limit too small for the first eligible
+record returns an explicit oversized-record error before assignment.
 
 This expands the accepted scalar rule of one outstanding delivery per member
-to one outstanding *set* per member. It is a semantic change that requires
-review and an ADR update before implementation; no compatibility obligation
-requires preserving the scalar wire shape.
+to one outstanding *set* per member. ADR 0030 proposes this semantic change;
+no compatibility obligation requires preserving the scalar wire shape.
 
 Each ack response preserves input order and reports one of:
 
 | Outcome | Meaning and client action |
 |---|---|
-| `confirmed` | This receipt advanced durable consumer state at the engine's boundary. |
+| `confirmed` | This receipt was durably recorded as acknowledged at the engine's boundary; the contiguous checkpoint may still wait for earlier offsets. |
 | `already_confirmed` | The offset was already durably acknowledged; treat progress as confirmed, even if another valid receipt advanced it. |
 | `rejected` | This receipt is invalid, stale, expired, or not owned by the supplied member; unchanged retry will not help. |
 | `retryable` | The engine can prove this request did not apply, such as a pre-commit routing rejection; retry the same receipts after the condition changes. |
@@ -133,6 +154,16 @@ even before another member polls. The contiguous committed offset advances
 only across the acknowledged prefix; later successful receipts remain in the
 existing out-of-order set.
 
+Use each offset's pinned policy snapshot for its attempt limit and lease
+duration. A policy update affects first assignments made under the new policy;
+it does not change the timeout or attempt limit already pinned to an offset.
+If the scheduler reaches an offset whose attempt limit is exhausted, retain
+the current terminal dead-letter behavior. The move is not a returned batch
+receipt and is not included in the ack-vector atomicity guarantee. Local
+dead-letter movement remains at least once across its separate log and
+consumer-state writes; clustered movement remains within the stream data
+group's replicated transition.
+
 The batch is not a transaction with application work, another consumer, a
 publish, a different ack request, or a downstream database. Mixed batches may
 contain confirmed/already-confirmed entries alongside rejected or unknown
@@ -148,8 +179,8 @@ own side effects.
 
 | Engine | Assignment confirmation | Ack confirmation | Failure/recovery boundary |
 |---|---|---|---|
-| Local | Persist the selected delivery attempts as one bounded consumer-journal event and sync it, then install the tokened leases in memory and return messages. | Validate receipts independently, persist the accepted offsets as one journal event, sync, then advance progress and remove those leases. | A write or sync error after bytes may have reached storage is `unknown`. Reconcile/reload journal state before another mutation. Active lease ownership and tokens are volatile today, so restart may redeliver with new tokens; attempt counts and acknowledged progress remain durable. |
-| Clustered | Submit one `PollBatch` state transition. Return messages only after its Raft entry commits; derive each opaque receipt from the committed entry plus its item identity. | Submit one `AckBatch` state transition that validates each receipt and applies the successful subset. Return its ordered outcomes only after commit. | A known pre-submit `NotLeader` is retryable; a timeout or connection loss after submission is unknown. Committed assignment, lease deadline, attempts, and ack progress survive restart and leader change through the stream data group. A new leader applies the stored deadline and token fence. |
+| Local | Persist selected delivery attempts and their pinned policy snapshots as one bounded consumer-journal event and sync it, then install tokened leases in memory and return messages. | Validate receipts independently against one monotonic-time sample, persist accepted offsets as one journal event, sync, then advance progress and remove those leases. | A write or sync error after bytes may have reached storage is `unknown`. Reconcile/reload journal state before another mutation. Active lease ownership and tokens are volatile today, so restart may redeliver with new tokens; attempt counts, policy snapshots, and acknowledged progress remain durable. Dead-letter movement retains its existing at-least-once boundary. |
+| Clustered | Submit one `PollBatch` state transition. Return messages only after its Raft entry commits; derive each opaque receipt from the committed entry plus its item identity. Preserve each offset's policy snapshot and derive its deadline from the pinned timeout. | Submit one `AckBatch` state transition that validates each receipt at one replicated lease-clock value and applies the successful subset. Return its ordered outcomes only after commit. | A known pre-submit `NotLeader` is retryable; a timeout or connection loss after submission is unknown. Committed assignment, per-offset deadline and policy, attempts, and ack progress survive restart and leader change through the stream data group. A new leader applies the stored deadlines and token fences. |
 
 The local implementation must not update its cache before journal persistence
 succeeds. If a write or sync fails after an append could be visible, it must
@@ -174,10 +205,10 @@ receipt already acknowledged maps to `already_confirmed`; each currently valid
 receipt is independently eligible for acknowledgement. This matches the
 current scalar behavior: the local engine removes expired leases before
 checking a receipt, then returns `StaleDelivery` for a missing or mismatched
-group receipt ([local ack path](../../crates/runnel-core/src/broker.rs#L432));
+group receipt ([local ack path](../../crates/runnel-core/src/broker.rs));
 the clustered state machine observes its lease-clock floor, removes expired
 leases, and returns `GroupStaleDelivery` for that entry
-([cluster ack path](../../crates/runnel-raft/src/delivery.rs#L308)). The
+([cluster ack path](../../crates/runnel-raft/src/delivery.rs)). The
 existing per-receipt results must therefore remain meaningful when siblings
 are accepted. SQS provides a useful API precedent: batch delete reports
 success and failure per entry even when the HTTP request itself succeeds
@@ -207,9 +238,9 @@ whatever acknowledgements replay as applied. This matters because a member poll
 can return its in-flight delivery before consulting cached consumer progress.
 Today the local ack path returns directly when `persist_consumer_event` fails,
 before updating cached progress or removing the in-flight receipt
-([local acknowledgement path](../../crates/runnel-core/src/broker.rs#L480));
+([local acknowledgement path](../../crates/runnel-core/src/broker.rs));
 the journal loader replays complete newline-terminated events and truncates an
-incomplete tail ([journal persistence and replay](../../crates/runnel-core/src/consumer_state.rs#L144)).
+incomplete tail ([journal persistence and replay](../../crates/runnel-core/src/consumer_state.rs)).
 If the vector was evaluated before the failure, return those per-item statuses
 (`rejected` for expired entries plus `retryable` or `unknown` for the otherwise
 valid entries); reserve a whole-request error for failures that prevent item
@@ -257,7 +288,7 @@ rejection.
 | Reference | Relevant fact | Runnel consequence and boundary |
 |---|---|---|
 | [Kafka consumer configuration](https://kafka.apache.org/41/generated/consumer_config.html) | `max.poll.records` limits records returned by one client poll independently of records fetched and cached by the client; fetch bytes and wait are separate controls. | Keep API delivery count/bytes/wait distinct from any future storage prefetch. Kafka's partition assignment and offset commits do not transfer to Runnel receipts or shared keyed work. |
-| [Pulsar batch receive and acknowledgement](https://pulsar.apache.org/docs/client-libraries/consumers/) and [messaging semantics](https://pulsar.apache.org/docs/next/concepts-messaging/) | Batch receive is bounded by count, bytes, or timeout; individual and cumulative ack are different, and cumulative ack is unavailable for Shared and Key_Shared. | Adopt independent bounds and individual ack for shared work. Do not inherit producer-batch storage or Pulsar's subscription model. |
+| [Pulsar batch receive and acknowledgement](https://pulsar.apache.org/docs/client-libraries/consumers/) and [4.1 messaging semantics](https://pulsar.apache.org/docs/4.1.x/concepts-messaging/) | Batch receive is bounded by count, bytes, or timeout; individual and cumulative ack are different, and cumulative ack is unavailable for Shared and Key_Shared. | Adopt independent bounds and individual ack for shared work. Do not inherit producer-batch storage or Pulsar's subscription model. |
 | [Amazon SQS ReceiveMessage](https://docs.aws.amazon.com/AWSSimpleQueueService/latest/APIReference/API_ReceiveMessage.html) and [DeleteMessageBatch](https://docs.aws.amazon.com/AWSSimpleQueueService/latest/APIReference/API_DeleteMessageBatch.html) | Receive can return fewer than requested; FIFO offers a bounded receive-attempt identity for recovering the same set after response loss. Batch delete reports mixed per-entry results even with HTTP success. | Same-member active-set replay is the first Runnel resolution rule; return per-receipt ack outcomes. SQS's FIFO-only five-minute identity and receipt/visibility model are not Runnel guarantees. |
 | [RabbitMQ consumer acknowledgements](https://www.rabbitmq.com/docs/confirms) | A multi-ack acknowledges every outstanding delivery tag through a tag on one channel. | Do not adopt prefix ack: Runnel allows out-of-order completion across keys, so every input receipt is checked separately. |
 
@@ -273,26 +304,32 @@ amortize the existing assignment and ack boundaries while retaining receipt
 semantics.
 
 Unresolved risks are the tail-latency cost of `max_wait_ms`, state and snapshot
-growth from many outstanding receipts, and throughput loss when one slow
-record keeps a member's active set from being replenished. A hot ordering key
-remains intentionally serial. Cluster waiters also need a bounded wake-and-
-recheck mechanism that behaves correctly during leadership changes; polling
-the Raft state machine while holding apply or stream locks is not acceptable.
+growth from outstanding receipts, the work performed when a batch poll crosses
+multiple attempt-limited records, and throughput loss when one slow record
+keeps a member's active set from being replenished. A hot ordering key remains
+intentionally serial. Cluster waiters also need a bounded wake-and-recheck
+mechanism that behaves correctly during leadership changes; polling the Raft
+state machine while holding apply or stream locks is not acceptable.
 
 ## Verification and disposition
 
-Before implementation, add engine-contract and local/cluster tests for ordered
-partial batches, empty and byte/count truncation, oversized first record,
-same-key exclusion within/across batches, out-of-order per-key ack, duplicate
-and stale receipts, the mixed-vector resolution matrix above, lost ack response
-and same-member poll retry after response loss, disconnect during response,
-local journal failure before/after append and restart redelivery, clustered restart and leader
-change around commit, and request timeout during collection. The existing
-shared-engine contract already covers the single-receipt expiry case before
-reassignment. Real-server
-tests must cover wire and client outcome mapping. The relevant end-to-end gate
-is the protocol/restart test and, for clustered behavior, the three-process
-cluster test.
+Before implementation, add reusable engine-contract and focused local/cluster
+tests for ordered partial batches, empty and byte/count truncation, oversized
+first records, lower limits against an existing active set, same-key exclusion
+within/across batches, out-of-order per-key ack, duplicate and stale receipts,
+the mixed-vector resolution matrix above, lost ack response and same-member
+poll retry after response loss, disconnect during response, local journal
+failure before/after append and restart redelivery, clustered restart and
+leader change around commit, and request timeout during collection. Cover
+multiple pinned policy snapshots in one set, policy updates across local
+restart and clustered leadership transfer, and attempt-limit dead-letter
+movement before and among returned records. Verify each engine's existing
+dead-letter crash boundary is preserved. Cover collection wakeups after
+publish, acknowledgement, and lease expiry, while proving waits stay outside
+the local stream lock and Raft apply path. The existing shared-engine contract
+already covers single-receipt expiry before reassignment. Real-server tests
+must cover wire and typed-client outcome mapping; the local protocol/restart
+test and three-process cluster test remain required end-to-end gates.
 
 No performance claim is made by this design. Before recommending an
 optimization implementation, compare the scalar path with count, encoded-byte,
@@ -305,15 +342,15 @@ comparison after commit when it meaningfully covers the changed path, otherwise
 record the targeted benchmark and coverage gap as required by
 [benchmarking policy](../benchmarking.md).
 
-**Near-term disposition:** implementable as a protocol/engine vertical slice
-within the existing local and single-group replicated design, after this
-contract receives review. Defer runtime work until the design is accepted, the
-scalar/batch member state transition is recorded in an ADR, and the ack journal
-reconciliation path is specified in its focused crash tests.
+**Recommendation:** accept the semantic contract proposed in ADR 0030. It is
+implementable as a protocol/engine vertical slice within the existing local
+and single-group replicated design. Runtime work remains gated on the tests
+above, including ack journal reconciliation and the preserved dead-letter
+boundary.
 The existing [batching backlog item](../backlog.md#make-batching-preserve-per-record-outcomes)
-already tracks the intended outcome and broad evidence gate, so this proposal
+already tracks the intended outcome and broad evidence gate, so this decision
 does not change its goal or acceptance criteria; keep it open. No separate
 tech-debt item is warranted: the journal ambiguity case is a required design
 and test gate for this future behavior, not a newly discovered independent
 current shortcut. No runtime or performance effect is expected from this
-documentation-only proposal.
+documentation-only decision and research refresh.
