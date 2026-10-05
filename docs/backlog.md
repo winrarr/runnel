@@ -625,6 +625,8 @@ Acceptance criteria:
 - the documented node-failure and restart scenarios have repeatable integration tests;
 - adding or removing a member has deterministic recovery and rejection behavior.
 
+Current progress: ADRs 0004 and 0006 establish the initial static Multi-Raft topology, while current real-process tests cover preserved-state follower restart and leader failure. The pinned OpenRaft version includes learner and joint-membership APIs, but Runnel does not use them and has no durable coordinator for membership changes across its metadata and per-stream groups. The [cluster membership evolution research](research/cluster-membership-evolution.md) compares the relevant consensus and broker mechanisms, confirms that a restricted group-level experiment is feasible, and records the cross-group, identity, fencing, and recovery evidence still needed. No membership API or policy is accepted; TD-008 remains open for dynamic membership and production fencing.
+
 ### Make missing-replica replacement safe
 
 Goal: recover a node whose local replica state is missing or inconsistent without allowing stale or under-specified state to participate in serving or quorum decisions.
