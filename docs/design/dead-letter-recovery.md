@@ -1,19 +1,19 @@
 # Dead-letter recovery across durable boundaries
 
-- Status: exploratory design note; local reconciliation and both conflicting-content and same-content public-ID wire outcomes are tested, while physical durability, the accepted ID identity contract, and provenance evidence remain open
-- Last reviewed: 2026-10-02
-- Baseline: `6b7178e508c609b4df0a566f8654721f23f36b68` (includes PRs #346 and #348; refreshed across #350, #353, and #359)
+- Status: exploratory design note; local typed identity and legacy RNL3 lookup policy are implemented under accepted [ADR 0029](../decisions/0029-local-typed-dead-letter-move-identities.md); physical durability, retention, provenance, and split-group behavior remain open
+- Last reviewed: 2026-10-05
+- Baseline: `f999c1b9ad5d22408bbbe6c6276a42e825cd62ef` (the pre-change baseline for the local identity contract)
 - Reading guide: [design-note conventions](README.md)
-- Related debt: [TD-017](../tech-debt.md#td-017-dead-letter-movement-spans-separate-durable-records), [TD-018](../tech-debt.md#td-018-retry-policy-and-dead-letter-provenance-are-coarse), and [TD-029](../tech-debt.md#td-029-public-request-ids-can-collide-with-local-dead-letter-move-ids)
-- Related decisions: [ADR 0014](../decisions/0014-local-retry-and-dead-letter-policy.md), [ADR 0016](../decisions/0016-clustered-retry-and-dead-letter-policy.md), [ADR 0026](../decisions/0026-semantic-engine-error-classification.md), and [ADR 0027](../decisions/0027-consumer-scoped-retry-policy.md)
+- Related debt: [TD-017](../tech-debt.md#td-017-dead-letter-movement-spans-separate-durable-records) and [TD-018](../tech-debt.md#td-018-retry-policy-and-dead-letter-provenance-are-coarse)
+- Related decisions: [ADR 0014](../decisions/0014-local-retry-and-dead-letter-policy.md), [ADR 0016](../decisions/0016-clustered-retry-and-dead-letter-policy.md), [ADR 0026](../decisions/0026-semantic-engine-error-classification.md), [ADR 0027](../decisions/0027-consumer-scoped-retry-policy.md), and [ADR 0029](../decisions/0029-local-typed-dead-letter-move-identities.md)
 - Related boundaries: [durability and delivery policy](durability-delivery-policy.md), [application-aware retry policy](application-aware-retry-policy.md), and [clustered outcomes](clustered-outcome-contract.md)
 
 This note separates the observed local append/reconcile behavior from the
-clustered same-group transition and from future cross-group choices. It is a
-design input, not an acceptance of new protocol behavior. Rust code and tests
-at the named baseline remain authoritative; the implementation sketches and
-evidence gates below are not requirements to introduce a particular API,
-storage format, or transaction protocol.
+clustered same-group transition and from future cross-group choices. Accepted
+ADR 0029 records the implemented local identity policy and its RNL3 version-2
+format consequences. The design proposals and open gates below still describe
+other recovery, retention, and cross-group questions; they do not expand the
+accepted local identity scope.
 
 ## Scope and non-goals
 
@@ -26,24 +26,31 @@ the existing no-loss ordering:
    source consumer, and source offset. The consumer name is required because
    independent consumers may legitimately dead-letter the same source record.
 3. Make the derived-stream append idempotent for that identity. A retry after
-   an uncertain append must resolve an existing record with the same identity,
-   rather than append another record.
+   an uncertain append resolves an existing typed move. An ambiguous pending
+   move from an old RNL3 version-1 record may be appended once more during
+   upgrade recovery, then subsequent retries resolve the version-2 move.
 4. Advance the source only after the target append is known to be durable. If
    the target result is uncertain or cannot be reconciled, leave source
    progress unchanged and return a backend failure with the conservative
    `Unknown` outcome; a later poll/recovery attempt retries the same identity.
 
-The local implementation reuses the durable request-aware record identity,
-rebuilt from the target stream log on open, for this internal move identity.
-This is not a new public request contract. A same-ID key/payload mismatch
-returns an explicit invalid-data storage error; the public publish request-ID
-behavior, which intentionally ignores mismatched payloads for compatibility,
-is not sufficient for this internal invariant. Both kinds of ID are held in
-the same per-target-stream request-ID index, and the internal value is
-predictable and within the public ID length limit. A public publish using that
-exact ID could therefore collide with a later move. The key/payload mismatch
-case is reproduced by
-[`dead_letter_move_content_mismatch_is_storage_error_without_acknowledgement`](../../crates/runnel-core/src/lib.rs#L1442): a public publish path reserves the exact move ID with different content, and the later move returns an invalid-data error again after reopen instead of advancing source progress. The real-server test [`network_protocol_preserves_public_record_on_dead_letter_move_id_collision_after_restart`](../../crates/runnel-server/tests/server_smoke.rs#L923) now verifies the same mismatch through the wire path: the poll response is classified as `storage_error`, the conflicting public target record remains unchanged, and polling the source after restart still returns the error rather than showing advanced progress. This at-least-once-safe outcome can leave the source delivery blocked until the target conflict is resolved. Matching-content public-ID reuse is also covered by core test [`dead_letter_move_same_content_public_id_reconciles_after_restart`](../../crates/runnel-core/src/lib.rs#L1481) and real-server test [`network_protocol_reconciles_same_content_public_dead_letter_id_after_restart`](../../crates/runnel-server/tests/server_smoke.rs#L1053): after a public publish uses the move ID with matching key and payload, the local retry treats it as the existing move and source progress completes across restart. These tests establish behavior but not move provenance. The typed-identity alternatives and RNL3 upgrade ambiguity are assessed in the [TD-029 dead-letter identity research note](../research/td-029-dead-letter-identity-contract.md); the accepted identity contract remains open in TD-029.
+The local implementation persists the identity kind in RNL3 version 2 and
+rebuilds separate public and dead-letter move lookup buckets from the target
+log on open. Public retry still returns the first public offset without
+comparing retry content. A move retry looks up only a typed move and checks its
+key and payload before source acknowledgement. Public records with the same
+text, whether same-content or conflicting-content, remain separate and cannot
+block or impersonate a move. RNL3 version-1 records have no provenance; their
+IDs are indexed in the public-ID bucket as a compatibility lookup policy, not
+as proof that they were public. Historical internal moves therefore remain
+addressable through that bucket as under the former shared namespace, while
+new typed move lookup ignores those entries. If a pending old move exists,
+upgrade recovery may append one new typed move before advancing source
+progress. This possible duplicate is the at-least-once-safe recovery path; the
+change does not claim exactly-once movement. Older readers fail closed on
+version 2, so downgrade after a v2 append is unsupported. The local decision
+and storage details are in [accepted ADR 0029](../decisions/0029-local-typed-dead-letter-move-identities.md),
+with the source-backed analysis in the [identity research note](../research/td-029-dead-letter-identity-contract.md).
 
 The current clustered implementation does not use this local move identity.
 It appends the derived record and advances source progress in one replicated
@@ -52,10 +59,12 @@ stream's data group. That co-location is an accepted property of the current
 static-cluster slice, not a general cross-group transaction guarantee.
 
 Neither engine exposes source provenance or a redrive operation. The recovery
-goal is at most one durable local derived record per move identity after
-reconciliation, not exactly-once delivery or exactly-once application
-processing. A dead-letter consumer can still be redelivered, and its external
-side effects remain the consumer's responsibility.
+goal is at most one durable current-format local derived record per typed move
+identity after reconciliation. Upgrade from an ambiguous pending RNL3 v1 move
+may leave one additional record, after which v2 reconciliation is stable. This
+does not provide exactly-once delivery or exactly-once application processing.
+A dead-letter consumer can still be redelivered, and its external side effects
+remain the consumer's responsibility.
 
 ## Observed local append and reconciliation behavior
 
@@ -66,16 +75,19 @@ which reads the source record, appends its key and payload to the derived
 stream, and only then persists a source `Acknowledge` event. Stream appends
 call `sync_data`; source consumer events append to a bounded journal and call
 `sync_all` before the operation continues. Recovery reconstructs consumer
-state from its checkpoint and journal and rebuilds request-aware target
+state from its checkpoint and journal and rebuilds typed request-aware target
 identity by scanning complete target-log frames. The relevant persistence
-boundaries are [`StreamLog::append_with_move_id`](../../crates/runnel-core/src/stream_log.rs#L332)
+boundaries are [`StreamLog::append_with_move_id`](../../crates/runnel-core/src/stream_log.rs#L395)
 and [`persist_consumer_event`](../../crates/runnel-core/src/consumer_state.rs#L144).
 
-Each new move stores its identity in the same request-ID map used by public
-publishes. The map is rebuilt from all complete request-aware frames on open;
-it grows with retained identities, and recovery scans the target file. This
-reconciliation path has no retention bound today, consistent with the broader
-local log/index limitations recorded in [TD-002](../tech-debt.md#td-002-one-file-and-a-startup-scan-per-local-stream).
+Each new move stores its identity in the internal bucket of the typed request-
+identity index, separate from public publishes. The two buckets are rebuilt
+from all complete request-aware frames on open. Each retained identity carries
+one offset value, with a fixed second-map header and separate capacity slack.
+The key is duplicated only when the same text exists in both namespaces. The
+combined index grows with retained identities, and recovery scans the target
+file. This reconciliation path has no retention bound today, consistent with
+the broader local log/index limitations recorded in [TD-002](../tech-debt.md#td-002-one-file-and-a-startup-scan-per-local-stream).
 The broker also pins the consumer policy on first delivery; the attempt limit
 that triggers movement is the policy snapshot recorded for that source offset,
 even if the consumer's configured policy later changes ([ADR 0027](../decisions/0027-consumer-scoped-retry-policy.md)).
@@ -103,12 +115,16 @@ runnel-dlq/v1/<source-stream-length>:<source-stream>/<source-consumer-length>:<s
 
 [`dead_letter_move_id`](../../crates/runnel-core/src/lib.rs#L227) derives it
 from the validated source stream, source consumer, and source offset. The ID
-is stored in an `RNL3` request-aware target frame and is looked up only within
-that target stream's in-memory request-ID index, which also holds public publish
-IDs. The writer enforces the request-aware key, payload, and identity limits.
-On reopen, complete request-aware frames rebuild that index; an incomplete
-trailing frame is discarded, while a complete checksum or format failure is
-reported rather than silently treated as a successful move.
+is stored in an `RNL3` version-2 request-aware target frame and is looked up
+only in the internal-move bucket. Public request IDs use their own bucket, so
+equal text does not collide across kinds. The writer enforces the request-aware
+key, payload, and identity limits. On reopen, complete v1 and v2 request-aware
+frames rebuild the index; v1 identities use the public-ID bucket for
+compatibility, without asserting original provenance. An incomplete trailing
+frame is discarded, while a complete checksum or format failure is reported
+rather than silently treated as a successful move. Older version-1 readers
+reject version-2 records, so
+downgrade after a v2 append is unsupported under accepted ADR 0029.
 
 The relevant local recovery states and current evidence are:
 
@@ -119,10 +135,13 @@ The relevant local recovery states and current evidence are:
 | Target append succeeds before the source acknowledgement event is written | Target contains the copied record and move ID; source progress remains eligible. | `dead_letter_move_reconciles_target_after_restart` creates this state directly, then reopen/poll reconciles it. `dead_letter_move_reconciles_after_source_ack_persistence_failure_and_restart` exercises the same order through a failed source-event append. |
 | The complete source acknowledgement event is written but its sync returns an error | The test filesystem retains the event for reopen; source progress replays and the target remains single. | `dead_letter_move_retries_after_source_event_sync_failure_and_restart` injects the sync error after writing the journal event, drops and reopens the broker, and checks progress and the one target record. It is not a real sync failure or power-loss test. |
 | The public poll response is lost after a completed move | The server has completed the source transition and the response is unavailable to the client; after restart the source poll is empty and the target record is consumable once in the tested case. | `network_protocol_reconciles_dead_letter_after_ambiguous_poll_and_restart` covers this real-server journey. It does not kill the server between target sync and source-event persistence. |
-| A public target record reserves a local move ID with mismatching content | The source poll returns a `storage_error`; after restart, retry returns the same classification and source progress has not advanced. The public target record remains at its original offset with its original content. | `network_protocol_preserves_public_record_on_dead_letter_move_id_collision_after_restart` covers this conflict through the real server process and protocol. Same-content reuse and the accepted identity contract remain open. |
+| A public target record uses the same text as a local move ID | The public record remains at its original offset and the typed move is appended separately, whether the public content matches or differs. Public replay still returns the original public offset, and source progress advances after the move is durable. | `network_protocol_keeps_mismatching_public_dead_letter_id_separate_after_restart` and `network_protocol_does_not_accept_same_content_public_id_as_dead_letter_move` exercise both wire cases and restart. |
+| Upgrade finds a version-1 record with a move ID | Its ID is indexed in the public-ID bucket as a compatibility lookup policy, not as proof of public provenance. The old internal move remains addressable through that bucket as under the shared namespace; a typed version-2 move lookup does not use it. A retry of a pending old move may append one version-2 move and then advance source progress; later retries reconcile that typed move. | `legacy_public_move_id_remains_public_and_does_not_satisfy_new_move` and `interrupted_legacy_move_retries_as_typed_move_once_after_restart` cover completed-public and interrupted-move fixtures at the core layer. This compatibility choice permits one duplicate at upgrade. |
 
-The local target append checks an existing move ID's key and payload before
-reusing it. Core tests cover stable/scoped/bounded identities
+The local target append checks an existing typed move ID's key and payload
+before reusing it. Public IDs and move IDs use separate identity buckets; the
+RNL3 v2 discriminator is covered by checksum and unsupported version/flag
+tests. Core tests cover stable/scoped/bounded identities
 ([identity](../../crates/runnel-core/src/lib.rs#L1133)), repeated append and
 restart reconciliation ([retry](../../crates/runnel-core/src/lib.rs#L1143),
 [restart](../../crates/runnel-core/src/lib.rs#L1179)), source acknowledgement
@@ -130,11 +149,17 @@ failure and injected file states ([source persistence](../../crates/runnel-core/
 [partial target frame](../../crates/runnel-core/src/lib.rs#L1287),
 [complete frame before sync](../../crates/runnel-core/src/lib.rs#L1331),
 [source event sync error](../../crates/runnel-core/src/lib.rs#L1375)), and
-same-ID content mismatch ([mismatch](../../crates/runnel-core/src/lib.rs#L1442)).
+typed-move content validation, identity collisions, and version-1 compatibility
+([mismatching public ID](../../crates/runnel-core/src/lib.rs#L1489),
+[typed-move retry](../../crates/runnel-core/src/lib.rs),
+[same-content public ID](../../crates/runnel-core/src/lib.rs#L1542),
+[completed legacy public ID](../../crates/runnel-core/src/lib.rs#L1617),
+[interrupted legacy move](../../crates/runnel-core/src/lib.rs#L1672)).
 Real-server tests cover movement after the attempt limit and restart recovery
 ([restart](../../crates/runnel-server/tests/server_smoke.rs#L729)) plus a lost
-poll response and restart ([ambiguous response](../../crates/runnel-server/tests/server_smoke.rs#L821)), and a conflicting public target ID through restart and retry
-([ID collision](../../crates/runnel-server/tests/server_smoke.rs)).
+poll response and restart ([ambiguous response](../../crates/runnel-server/tests/server_smoke.rs#L821)), and both same-content and conflicting-content public target IDs through restart and retry
+([mismatching ID](../../crates/runnel-server/tests/server_smoke.rs#L923),
+[same-content ID](../../crates/runnel-server/tests/server_smoke.rs#L1075)).
 Together these tests support reconciliation for the injected and process-level
 states named above; they do not prove behavior under actual filesystem or
 device failures, power loss, or a process kill at the exact inter-log boundary.
@@ -292,46 +317,46 @@ tests; they are not a retroactive implementation checklist:
    prove a single same-content target record and eventual source progress. The
    current real-server test covers restart after the completed move and a lost
    response, not termination inside this interval.
-3. **Corruption and format handling:** a same-ID target record with different
+3. **Corruption and format handling:** an existing typed move ID with different
    content, malformed or torn target data, an unsupported durable format, or
    an unavailable target produces an explicit storage/corruption outcome and
-   does not advance source progress. A test covers same-ID key/payload mismatch
-   and a partial trailing target frame; broader malformed complete-frame,
-   unsupported-format, unavailable-target, and legacy-record reconciliation
-   behavior remains open.
+   does not advance source progress. Tests cover typed-move content validation,
+   partial trailing frames, malformed identity versions/flags, and version-1
+   identity classification; broader malformed complete-frame, unsupported-
+   format, unavailable-target, and complete legacy-record recovery behavior
+   remains open.
 4. **Recovery and retention bounds:** identity lookup and reconciliation use
    bounded or explicitly accounted-for indexes/journals, do not scan unrelated
    streams without a documented bound, and retain move evidence until source
    progress no longer depends on it.
-5. **Identity contract:** define the accepted outcome when a public publish ID
-   equals a computed local move ID. A core test and a real-server wire test
-   prove that conflicting content fails reconciliation, preserves the public
-   target record, and leaves source progress unadvanced across reopen/retry;
-   the wire response is `storage_error`. Same-content reuse and the accepted
-   identity contract remain open and are recorded in [TD-029](../tech-debt.md#td-029-public-request-ids-can-collide-with-local-dead-letter-move-ids).
-6. **Cluster same-group coverage:** retain real-process tests for committed
+5. **Cluster same-group coverage:** retain real-process tests for committed
    same-group movement through reassignment and policy transfer. Describe the
    result as same-data-group atomicity, not general cross-group atomicity.
-7. **Future split-group coverage:** if the target ever moves to another
+6. **Future split-group coverage:** if the target ever moves to another
    durable group, add participant failure, coordinator/retry recovery,
    duplicate-command, retention, and ambiguous-client-outcome tests before
    calling the operation atomic.
-8. **Semantic wording:** tests and protocol documentation say at-least-once
+7. **Semantic wording:** tests and protocol documentation say at-least-once
    for source-to-target and target-consumer delivery. Exactly-once is not
    claimed unless a later decision proves the complete boundary, including
    application side effects.
 
 ## Hypotheses and unresolved risks
 
-- The current request-aware target record and rebuilt ID index provide the
-  focused local deduplication slice without a second pending-move journal.
+- The current version-2 target record and rebuilt typed identity buckets provide
+  the focused local deduplication slice without a second pending-move journal.
   Tests cover partial frame recovery, a complete frame before sync, and a
   source-event sync error on the current test filesystem. Behavior under real
   device errors or power loss, retention, and future format changes remains
-  unverified. The index shares the public request-ID namespace; core and
-  real-server tests demonstrate that a conflicting ID blocks source progress
-  across reopen/retry and preserves the public target record. TD-029 tracks
-  the missing same-content evidence and the unresolved identity contract.
+  unverified. RNL3 version-1 move provenance is unavailable, so upgrade places
+  every version-1 identity in the public-ID bucket as a compatibility lookup
+  policy; old internal moves remain addressable there as before, but cannot
+  satisfy typed move lookup. A pending old move can append one duplicate before
+  source acknowledgement. This is bounded at the compatibility boundary;
+  version-2 retries remain typed and deduplicated. The two index
+  buckets retain one offset per identity plus a fixed second-map header and
+  separate capacity slack; total identity cardinality and retention remain
+  governed by TD-002.
 - **Hypothesis:** lazy reconciliation on the next source poll is sufficient
   for correctness. A background reconciler may be needed for operational
   visibility or to make progress when no consumer polls, but it must not

@@ -920,7 +920,7 @@ fn network_protocol_reconciles_dead_letter_after_ambiguous_poll_and_restart() {
 }
 
 #[test]
-fn network_protocol_preserves_public_record_on_dead_letter_move_id_collision_after_restart() {
+fn network_protocol_keeps_mismatching_public_dead_letter_id_separate_after_restart() {
     let directory = TempDir::new().unwrap();
     let server = RunningServer::start_with_args(
         directory.path(),
@@ -975,7 +975,7 @@ fn network_protocol_preserves_public_record_on_dead_letter_move_id_collision_aft
                 consumer: "worker".to_owned(),
             },
         ),
-        Response::Error { code, .. } if code == "storage_error"
+        Response::Empty { .. }
     ));
     assert!(matches!(
         request(
@@ -1002,7 +1002,12 @@ fn network_protocol_preserves_public_record_on_dead_letter_move_id_collision_aft
                 offset: 1,
             },
         ),
-        Response::Error { code, .. } if code == "history_unavailable"
+        Response::ReplayMessage {
+            offset: 1,
+            key: Some(key),
+            payload,
+            ..
+        } if key == "order-1" && payload == "poison"
     ));
     server.stop();
 
@@ -1018,7 +1023,19 @@ fn network_protocol_preserves_public_record_on_dead_letter_move_id_collision_aft
                 consumer: "worker".to_owned(),
             },
         ),
-        Response::Error { code, .. } if code == "storage_error"
+        Response::Empty { .. }
+    ));
+    assert!(matches!(
+        request(
+            server.broker_addr,
+            Request::Publish {
+                stream: "events.dead-letter".to_owned(),
+                key: Some("replay-key".to_owned()),
+                payload: "replay-payload".to_owned(),
+                request_id: Some("runnel-dlq/v1/6:events/6:worker/0".to_owned()),
+            },
+        ),
+        Response::Published { offset: 0, .. }
     ));
     assert!(matches!(
         request(
@@ -1045,12 +1062,17 @@ fn network_protocol_preserves_public_record_on_dead_letter_move_id_collision_aft
                 offset: 1,
             },
         ),
-        Response::Error { code, .. } if code == "history_unavailable"
+        Response::ReplayMessage {
+            offset: 1,
+            key: Some(key),
+            payload,
+            ..
+        } if key == "order-1" && payload == "poison"
     ));
 }
 
 #[test]
-fn network_protocol_reconciles_same_content_public_dead_letter_id_after_restart() {
+fn network_protocol_does_not_accept_same_content_public_id_as_dead_letter_move() {
     let directory = TempDir::new().unwrap();
     let server = RunningServer::start_with_args(
         directory.path(),
@@ -1132,7 +1154,12 @@ fn network_protocol_reconciles_same_content_public_dead_letter_id_after_restart(
                 offset: 1,
             },
         ),
-        Response::Error { code, .. } if code == "history_unavailable"
+        Response::ReplayMessage {
+            offset: 1,
+            key: Some(key),
+            payload,
+            ..
+        } if key == "order-1" && payload == "poison"
     ));
     server.stop();
 
@@ -1140,6 +1167,18 @@ fn network_protocol_reconciles_same_content_public_dead_letter_id_after_restart(
         directory.path(),
         &["--ack-timeout-ms", "10", "--max-delivery-attempts", "1"],
     );
+    assert!(matches!(
+        request(
+            server.broker_addr,
+            Request::Publish {
+                stream: "events.dead-letter".to_owned(),
+                key: Some("changed-key".to_owned()),
+                payload: "changed payload".to_owned(),
+                request_id: Some("runnel-dlq/v1/6:events/6:worker/0".to_owned()),
+            },
+        ),
+        Response::Published { offset: 0, .. }
+    ));
     assert!(matches!(
         request(
             server.broker_addr,
@@ -1175,7 +1214,12 @@ fn network_protocol_reconciles_same_content_public_dead_letter_id_after_restart(
                 offset: 1,
             },
         ),
-        Response::Error { code, .. } if code == "history_unavailable"
+        Response::ReplayMessage {
+            offset: 1,
+            key: Some(key),
+            payload,
+            ..
+        } if key == "order-1" && payload == "poison"
     ));
 }
 
