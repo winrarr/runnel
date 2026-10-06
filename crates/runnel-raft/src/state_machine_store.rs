@@ -1229,9 +1229,9 @@ mod tests {
         .unwrap();
         fs::write(&snapshot_path, &snapshot).unwrap();
 
-        let error = StateMachineStore::open(&state_directory, GroupKind::Combined)
-            .err()
-            .expect("attempt without a pinned policy must be rejected");
+        let Err(error) = StateMachineStore::open(&state_directory, GroupKind::Combined) else {
+            panic!("attempt without a pinned policy must be rejected");
+        };
 
         assert!(error.to_string().contains("attempts and pinned policies"));
         assert_eq!(fs::read(snapshot_path).unwrap(), snapshot);
