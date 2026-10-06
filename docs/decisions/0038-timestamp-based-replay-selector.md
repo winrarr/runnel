@@ -153,9 +153,10 @@ explicitly and account for late or clock-skewed records.
 - Establish the ADR 0042 timestamp index with a bounded checkpoint search and
   at most 256 record-header checks, including no-match and adversarial
   regression cases. Test rebuild, crash recovery, snapshot installation, and
-  agreement between local and clustered results. Persistence/version migration
-  applies to authoritative state and future retention metadata; the derived
-  index itself is not persisted.
+  agreement between local and clustered results. Recovery must validate the
+  authoritative state and future retention metadata under their current
+  contracts; the derived index is rebuilt and has no separate index-format
+  migration.
 - Exercise real server/process and three-node paths for the eventual public
   operation. Measure selector latency, bytes/records examined, index space,
   recovery cost, and foreground publish/poll latency over increasing histories.

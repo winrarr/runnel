@@ -82,7 +82,8 @@ read using the existing one-record replay path. This does not change any
   loading checkpoint state or replaying the journal. Exclude derived
   checkpoints from persisted state and snapshots; rebuild them when a snapshot
   is installed. This keeps snapshots free of duplicate index bytes and makes
-  old supported snapshot representations rebuildable without migration.
+  the index recoverable from the authoritative state accepted by the current
+  recovery path, without a separate index-format migration.
 - Any detected mismatch between the derived index and the authoritative
   retained messages/log invalidates the index. Rebuild from that source before
   answering a time selector; if recovery cannot establish completeness, fail
