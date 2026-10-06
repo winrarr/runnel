@@ -163,7 +163,7 @@ async fn local_batch_reports_record_rejection_without_losing_later_records() {
         .unwrap();
     assert!(matches!(
         outcomes.first(),
-        Some(Err(BrokerError::Io(error))) if error.kind() == std::io::ErrorKind::InvalidInput
+        Some(Err(BrokerError::InvalidRecord(_)))
     ));
     assert!(matches!(outcomes.get(1), Some(Ok(0))));
     assert!(matches!(

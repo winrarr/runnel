@@ -9,8 +9,9 @@
 ## Context
 
 Runnel has separate local and clustered durable artifacts, each with its own
-format and recovery rules. The local reader recognizes RNL1, RNL2, and RNL3
-stream frames, while local consumer checkpoints and journals do not have a
+format and recovery rules. The current local reader accepts only checksummed
+RNL3 version-2 stream frames and refuses RNL1, RNL2, and RNL3 version 1 before
+recovery mutation, while local consumer checkpoints and journals do not have a
 cross-release writer contract. The clustered engine has strict identity and
 layout checks, versioned Raft logs and journals, and narrow read-forward
 support for selected version-1 checkpoint and snapshot fixtures. These are

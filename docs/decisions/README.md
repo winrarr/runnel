@@ -42,7 +42,7 @@ Current decisions:
 - 0036-retained-history-and-disk-pressure-contract.md: unlimited-by-default history, explicit protected age/size targets, floor-based replay outcomes, unlimited dead-letter output, and separate stage-aware physical-capacity admission.
 - 0037-offline-side-by-side-storage-upgrades.md: require validated offline side-by-side conversion with explicit activation and a first-target-write rollback boundary.
 - 0038-timestamp-based-replay-selector.md: accept inclusive broker-publish-time replay selection by lowest matching logical offset, with explicit no-match and deleted-prefix completeness semantics.
-- 0039-rnl1-write-admission-and-legacy-read-compatibility.md: cap new local RNL1 writes at existing RNL2/RNL3 per-field limits while retaining current eligibility for complete historical RNL1 records.
+- 0039-rnl1-write-admission-and-legacy-read-compatibility.md: use checksummed RNL3 v2 for every local stream record and refuse obsolete local formats before recovery mutation.
 - 0040-bounded-raft-log-persistence.md: replace retained-map rewrites with bounded append-only Raft-log segments and fixed-size durable control state.
 - 0041-first-consumer-lag-observation.md: accept one bounded, operator-authorized exact-consumer lag diagnostic with a local read cap and a leader-authoritative applied Raft revision.
 - 0042-recoverable-replay-time-index.md: use derived 256-record cumulative prefix-maximum checkpoints for exact timestamp replay and rebuild them from authoritative state.

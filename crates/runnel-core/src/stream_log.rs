@@ -8,35 +8,16 @@ use runnel_engine::{
     BrokerError, Message, Offset, PublishRecord, PublishRecordOutcome, ReplayMessage,
 };
 
-use super::DurableFormat;
-
-pub(super) const LEGACY_MAGIC: &[u8; 4] = b"RNL1";
-pub(super) const VERSIONED_MAGIC: &[u8; 4] = b"RNL2";
-pub(super) const REQUEST_ID_MAGIC: &[u8; 4] = b"RNL3";
-pub(super) const LEGACY_HEADER_LEN: usize = 28;
-pub(super) const VERSIONED_HEADER_LEN: usize = 44;
-pub(super) const REQUEST_ID_HEADER_LEN: usize = 48;
-pub(super) const VERSIONED_FORMAT_VERSION: u8 = 1;
-pub(super) const LEGACY_REQUEST_ID_FORMAT_VERSION: u8 = 1;
-pub(super) const REQUEST_ID_FORMAT_VERSION: u8 = 2;
-const VERSIONED_ENCODING_BYTES: u8 = 0;
-const VERSIONED_COMPRESSION_NONE: u8 = 0;
-pub(super) const VERSIONED_MAX_KEY_LEN: u32 = 128;
-pub(super) const VERSIONED_MAX_BODY_LEN: u32 = 64 * 1024 * 1024;
-pub(super) const REQUEST_ID_MAX_LEN: u32 = 1024;
-pub(super) const REQUEST_ID_MAX_KEY_LEN: u32 = 128;
-pub(super) const REQUEST_ID_MAX_BODY_LEN: u32 = 64 * 1024 * 1024;
-pub(super) const LEGACY_WRITE_MAX_KEY_LEN: u32 = 128;
-pub(super) const LEGACY_WRITE_MAX_BODY_LEN: u32 = 64 * 1024 * 1024;
+pub(super) const RECORD_MAGIC: &[u8; 4] = b"RNL3";
+pub(super) const RECORD_HEADER_LEN: usize = 48;
+pub(super) const RECORD_FORMAT_VERSION: u8 = 2;
+const NO_IDENTITY_FLAG: u8 = 2;
+pub(super) const MAX_KEY_LEN: u32 = 128;
+pub(super) const MAX_BODY_LEN: u32 = 64 * 1024 * 1024;
+pub(super) const MAX_REQUEST_ID_LEN: u32 = 1024;
 pub(super) const MAX_IN_MEMORY_RECORDS: usize = 1024;
 const SPARSE_INDEX_STRIDE: Offset = 64;
 const MAX_SPARSE_INDEX_ENTRIES: usize = 1024;
-
-#[derive(Debug, Clone, Copy)]
-struct RequestAwareLimits {
-    max_key_len: u32,
-    max_body_len: u32,
-}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RequestIdentityKind {
@@ -81,6 +62,38 @@ impl RequestIdentityIndex {
     }
 }
 
+#[derive(Debug, Clone)]
+enum RecordIdentity {
+    None,
+    Public(String),
+    DeadLetterMove(String),
+}
+
+impl RecordIdentity {
+    fn flag(&self) -> u8 {
+        match self {
+            Self::None => NO_IDENTITY_FLAG,
+            Self::Public(_) => RequestIdentityKind::Public.flag(),
+            Self::DeadLetterMove(_) => RequestIdentityKind::DeadLetterMove.flag(),
+        }
+    }
+
+    fn request_id(&self) -> Option<&str> {
+        match self {
+            Self::None => None,
+            Self::Public(request_id) | Self::DeadLetterMove(request_id) => Some(request_id),
+        }
+    }
+
+    fn kind(&self) -> Option<RequestIdentityKind> {
+        match self {
+            Self::None => None,
+            Self::Public(_) => Some(RequestIdentityKind::Public),
+            Self::DeadLetterMove(_) => Some(RequestIdentityKind::DeadLetterMove),
+        }
+    }
+}
+
 #[cfg(test)]
 #[derive(Debug, Clone, Copy)]
 pub(super) enum DeadLetterMoveWriteFailure {
@@ -88,30 +101,15 @@ pub(super) enum DeadLetterMoveWriteFailure {
     CompleteFrameBeforeSync,
 }
 
-fn request_aware_limits(durable_format: DurableFormat) -> RequestAwareLimits {
-    match durable_format {
-        // Keep the legacy no-request-id writer and reader unchanged. Request-aware frames have
-        // their own bounded limits so malformed headers cannot force unbounded allocations.
-        DurableFormat::Rnl1 => RequestAwareLimits {
-            max_key_len: REQUEST_ID_MAX_KEY_LEN,
-            max_body_len: REQUEST_ID_MAX_BODY_LEN,
-        },
-        DurableFormat::VersionedV1 => RequestAwareLimits {
-            max_key_len: VERSIONED_MAX_KEY_LEN,
-            max_body_len: VERSIONED_MAX_BODY_LEN,
-        },
-    }
-}
-
-fn legacy_write_lengths(key_len: usize, payload_len: usize) -> Result<(u32, u32), BrokerError> {
+fn record_lengths(key_len: usize, payload_len: usize) -> Result<(u32, u32), BrokerError> {
     let key_len = u32::try_from(key_len).map_err(|_| {
         BrokerError::InvalidRecord(
             "message key length exceeds u32 storage representation".to_owned(),
         )
     })?;
-    if key_len > LEGACY_WRITE_MAX_KEY_LEN {
+    if key_len > MAX_KEY_LEN {
         return Err(BrokerError::InvalidRecord(format!(
-            "message key is {key_len} bytes; RNL1 write limit is {LEGACY_WRITE_MAX_KEY_LEN} bytes"
+            "message key is {key_len} bytes; stream record limit is {MAX_KEY_LEN} bytes"
         )));
     }
 
@@ -120,9 +118,9 @@ fn legacy_write_lengths(key_len: usize, payload_len: usize) -> Result<(u32, u32)
             "message payload length exceeds u32 storage representation".to_owned(),
         )
     })?;
-    if payload_len > LEGACY_WRITE_MAX_BODY_LEN {
+    if payload_len > MAX_BODY_LEN {
         return Err(BrokerError::InvalidRecord(format!(
-            "message payload is {payload_len} bytes; RNL1 write limit is {LEGACY_WRITE_MAX_BODY_LEN} bytes"
+            "message payload is {payload_len} bytes; stream record limit is {MAX_BODY_LEN} bytes"
         )));
     }
 
@@ -131,7 +129,6 @@ fn legacy_write_lengths(key_len: usize, payload_len: usize) -> Result<(u32, u32)
 
 pub(super) struct StreamLog {
     file: File,
-    durable_format: DurableFormat,
     // The durable log retains the complete history; this tail cache keeps normal delivery
     // bounded while older replay requests use the bounded sparse index as a scan starting point.
     records: VecDeque<RecordIndex>,
@@ -145,7 +142,7 @@ pub(super) struct StreamLog {
 }
 
 impl StreamLog {
-    pub(super) fn create(path: &Path, durable_format: DurableFormat) -> Result<Self, BrokerError> {
+    pub(super) fn create(path: &Path) -> Result<Self, BrokerError> {
         let file = OpenOptions::new()
             .create_new(true)
             .read(true)
@@ -153,7 +150,6 @@ impl StreamLog {
             .open(path)?;
         Ok(Self {
             file,
-            durable_format,
             records: VecDeque::with_capacity(MAX_IN_MEMORY_RECORDS),
             sparse_index: SparseIndex::new(),
             request_ids: RequestIdentityIndex::default(),
@@ -163,7 +159,7 @@ impl StreamLog {
         })
     }
 
-    pub(super) fn open(path: &Path, durable_format: DurableFormat) -> Result<Self, BrokerError> {
+    pub(super) fn inspect(path: &Path) -> Result<(Self, Option<u64>), BrokerError> {
         let mut file = OpenOptions::new().read(true).append(true).open(path)?;
         let file_len = file.metadata()?.len();
         let mut records = VecDeque::with_capacity(MAX_IN_MEMORY_RECORDS);
@@ -172,7 +168,7 @@ impl StreamLog {
         let mut cursor = 0;
         let mut next_offset = 0;
         file.seek(SeekFrom::Start(cursor))?;
-        while let Some(parsed) = read_next_record(&mut file, cursor, file_len, durable_format)? {
+        while let Some(parsed) = read_next_record(&mut file, cursor, file_len)? {
             if parsed.index.offset != next_offset {
                 return Err(invalid_record_data("record offsets are not contiguous"));
             }
@@ -190,20 +186,30 @@ impl StreamLog {
             remember_record(&mut records, parsed.index);
         }
 
-        if cursor != file_len {
-            file.set_len(cursor)?;
+        let incomplete_tail = (cursor != file_len).then_some(cursor);
+        Ok((
+            Self {
+                file,
+                records,
+                sparse_index,
+                request_ids,
+                next_offset,
+                #[cfg(test)]
+                dead_letter_move_write_failure: None,
+            },
+            incomplete_tail,
+        ))
+    }
+
+    pub(super) fn finish_recovery(
+        &mut self,
+        incomplete_tail: Option<u64>,
+    ) -> Result<(), BrokerError> {
+        if let Some(cursor) = incomplete_tail {
+            self.file.set_len(cursor)?;
         }
-        file.seek(SeekFrom::End(0))?;
-        Ok(Self {
-            file,
-            durable_format,
-            records,
-            sparse_index,
-            request_ids,
-            next_offset,
-            #[cfg(test)]
-            dead_letter_move_write_failure: None,
-        })
+        self.file.seek(SeekFrom::End(0))?;
+        Ok(())
     }
 
     pub(super) fn request_offset(&self, request_id: &str) -> Option<Offset> {
@@ -294,122 +300,7 @@ impl StreamLog {
         payload: Vec<u8>,
         sync: bool,
     ) -> Result<Offset, BrokerError> {
-        #[cfg(feature = "instrumentation")]
-        let _stage_timer = runnel_engine::StageTimer::new("core.storage_append");
-        if self.durable_format == DurableFormat::VersionedV1 {
-            return self.append_versioned_with_sync(key, payload, sync);
-        }
-
-        let key_bytes = key.as_deref().unwrap_or_default().as_bytes();
-        let (key_len, payload_len) = legacy_write_lengths(key_bytes.len(), payload.len())?;
-        let offset = self.next_offset;
-        let published_at_ms = now_ms();
-
-        let mut header = Vec::with_capacity(LEGACY_HEADER_LEN);
-        header.extend_from_slice(LEGACY_MAGIC);
-        header.extend_from_slice(&offset.to_le_bytes());
-        header.extend_from_slice(&published_at_ms.to_le_bytes());
-        header.extend_from_slice(&key_len.to_le_bytes());
-        header.extend_from_slice(&payload_len.to_le_bytes());
-
-        self.file.write_all(&header)?;
-        self.file.write_all(key_bytes)?;
-        self.file.write_all(&payload)?;
-        if sync {
-            self.file.sync_data()?;
-        }
-
-        let payload_offset = self.file.stream_position()? - payload.len() as u64;
-        let record_cursor = payload_offset - key_bytes.len() as u64 - LEGACY_HEADER_LEN as u64;
-        self.sparse_index.remember(offset, record_cursor);
-        remember_record(
-            &mut self.records,
-            RecordIndex {
-                offset,
-                payload_offset,
-                payload_len,
-                key,
-                request_id: None,
-                request_identity_kind: None,
-                published_at_ms,
-            },
-        );
-        self.next_offset = offset.saturating_add(1);
-        Ok(offset)
-    }
-
-    fn append_versioned_with_sync(
-        &mut self,
-        key: Option<String>,
-        payload: Vec<u8>,
-        sync: bool,
-    ) -> Result<Offset, BrokerError> {
-        let key_bytes = key.as_deref().unwrap_or_default().as_bytes();
-        let key_len = u32::try_from(key_bytes.len()).map_err(|_| {
-            BrokerError::Io(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "message key exceeds u32 length",
-            ))
-        })?;
-        if key_len > VERSIONED_MAX_KEY_LEN {
-            return Err(BrokerError::Io(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "message key exceeds versioned storage limit",
-            )));
-        }
-        let body_len = u32::try_from(payload.len()).map_err(|_| {
-            BrokerError::Io(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "message payload exceeds u32 length",
-            ))
-        })?;
-        if body_len > VERSIONED_MAX_BODY_LEN {
-            return Err(BrokerError::Io(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "message payload exceeds versioned storage limit",
-            )));
-        }
-
-        let offset = self.next_offset;
-        let published_at_ms = now_ms();
-        let mut header = [0; VERSIONED_HEADER_LEN];
-        header[..4].copy_from_slice(VERSIONED_MAGIC);
-        header[4] = VERSIONED_FORMAT_VERSION;
-        header[6..8].copy_from_slice(&(VERSIONED_HEADER_LEN as u16).to_le_bytes());
-        header[8..12].copy_from_slice(&body_len.to_le_bytes());
-        header[12..16].copy_from_slice(&body_len.to_le_bytes());
-        header[16..24].copy_from_slice(&offset.to_le_bytes());
-        header[24..32].copy_from_slice(&published_at_ms.to_le_bytes());
-        header[32..36].copy_from_slice(&key_len.to_le_bytes());
-        header[36] = VERSIONED_ENCODING_BYTES;
-        header[37] = VERSIONED_COMPRESSION_NONE;
-        let checksum = versioned_checksum(&header, key_bytes, &payload);
-        header[40..44].copy_from_slice(&checksum.to_le_bytes());
-
-        self.file.write_all(&header)?;
-        self.file.write_all(key_bytes)?;
-        self.file.write_all(&payload)?;
-        if sync {
-            self.file.sync_data()?;
-        }
-
-        let payload_offset = self.file.stream_position()? - payload.len() as u64;
-        let record_cursor = payload_offset - key_bytes.len() as u64 - VERSIONED_HEADER_LEN as u64;
-        self.sparse_index.remember(offset, record_cursor);
-        remember_record(
-            &mut self.records,
-            RecordIndex {
-                offset,
-                payload_offset,
-                payload_len: body_len,
-                key,
-                request_id: None,
-                request_identity_kind: None,
-                published_at_ms,
-            },
-        );
-        self.next_offset = offset.saturating_add(1);
-        Ok(offset)
+        self.append_record_with_sync(key, payload, RecordIdentity::None, sync)
     }
 
     pub(super) fn append_with_request_id(
@@ -418,13 +309,7 @@ impl StreamLog {
         payload: Vec<u8>,
         request_id: String,
     ) -> Result<Offset, BrokerError> {
-        self.append_with_request_id_sync(
-            key,
-            payload,
-            request_id,
-            RequestIdentityKind::Public,
-            true,
-        )
+        self.append_record_with_sync(key, payload, RecordIdentity::Public(request_id), true)
     }
 
     pub(super) fn append_with_move_id(
@@ -445,80 +330,49 @@ impl StreamLog {
 
         // Move identities are internal request-aware records. Unlike public request IDs, their
         // key and payload are part of the identity invariant and are checked on every retry.
-        self.append_with_request_id_sync(
-            key,
-            payload,
-            move_id,
-            RequestIdentityKind::DeadLetterMove,
-            true,
-        )
+        self.append_record_with_sync(key, payload, RecordIdentity::DeadLetterMove(move_id), true)
     }
 
-    fn append_with_request_id_sync(
+    fn append_record_with_sync(
         &mut self,
         key: Option<String>,
         payload: Vec<u8>,
-        request_id: String,
-        identity_kind: RequestIdentityKind,
+        identity: RecordIdentity,
         sync: bool,
     ) -> Result<Offset, BrokerError> {
-        let limits = request_aware_limits(self.durable_format);
+        #[cfg(feature = "instrumentation")]
+        let _stage_timer = runnel_engine::StageTimer::new("core.storage_append");
         let key_bytes = key.as_deref().unwrap_or_default().as_bytes();
-        let key_len = u32::try_from(key_bytes.len()).map_err(|_| {
-            BrokerError::Io(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "message key exceeds u32 length",
-            ))
-        })?;
-        if key_len > limits.max_key_len {
-            return Err(BrokerError::Io(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "message key exceeds request-aware storage limit",
-            )));
-        }
-        let request_id_bytes = request_id.as_bytes();
+        let (key_len, payload_len) = record_lengths(key_bytes.len(), payload.len())?;
+        let request_id_bytes = identity.request_id().unwrap_or_default().as_bytes();
         let request_id_len = u32::try_from(request_id_bytes.len()).map_err(|_| {
-            BrokerError::Io(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "request ID exceeds u32 length",
-            ))
+            BrokerError::InvalidRecord(
+                "request ID length exceeds u32 storage representation".to_owned(),
+            )
         })?;
-        if request_id_len > REQUEST_ID_MAX_LEN {
-            return Err(BrokerError::Io(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "request ID exceeds request-aware storage limit",
-            )));
-        }
-        let payload_len = u32::try_from(payload.len()).map_err(|_| {
-            BrokerError::Io(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "message payload exceeds u32 length",
-            ))
-        })?;
-        if payload_len > limits.max_body_len {
-            return Err(BrokerError::Io(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "message payload exceeds request-aware storage limit",
+        if request_id_len > MAX_REQUEST_ID_LEN {
+            return Err(BrokerError::InvalidRecord(format!(
+                "request ID is {request_id_len} bytes; stream record limit is {MAX_REQUEST_ID_LEN} bytes"
             )));
         }
         let offset = self.next_offset;
         let published_at_ms = now_ms();
-        let mut header = [0; REQUEST_ID_HEADER_LEN];
-        header[..4].copy_from_slice(REQUEST_ID_MAGIC);
-        header[4] = REQUEST_ID_FORMAT_VERSION;
-        header[5] = identity_kind.flag();
-        header[6..8].copy_from_slice(&(REQUEST_ID_HEADER_LEN as u16).to_le_bytes());
+        let mut header = [0; RECORD_HEADER_LEN];
+        header[..4].copy_from_slice(RECORD_MAGIC);
+        header[4] = RECORD_FORMAT_VERSION;
+        header[5] = identity.flag();
+        header[6..8].copy_from_slice(&(RECORD_HEADER_LEN as u16).to_le_bytes());
         header[8..12].copy_from_slice(&payload_len.to_le_bytes());
         header[12..16].copy_from_slice(&payload_len.to_le_bytes());
         header[16..24].copy_from_slice(&offset.to_le_bytes());
         header[24..32].copy_from_slice(&published_at_ms.to_le_bytes());
         header[32..36].copy_from_slice(&key_len.to_le_bytes());
         header[36..40].copy_from_slice(&request_id_len.to_le_bytes());
-        let checksum = request_id_checksum(&header, key_bytes, request_id_bytes, &payload);
+        let checksum = record_checksum(&header, key_bytes, request_id_bytes, &payload);
         header[44..48].copy_from_slice(&checksum.to_le_bytes());
 
         #[cfg(test)]
-        let move_write_failure = if identity_kind == RequestIdentityKind::DeadLetterMove {
+        let move_write_failure = if identity.kind() == Some(RequestIdentityKind::DeadLetterMove) {
             self.dead_letter_move_write_failure.take()
         } else {
             None
@@ -528,7 +382,7 @@ impl StreamLog {
             move_write_failure,
             Some(DeadLetterMoveWriteFailure::PartialFrame)
         ) {
-            self.file.write_all(&header[..REQUEST_ID_HEADER_LEN / 2])?;
+            self.file.write_all(&header[..RECORD_HEADER_LEN / 2])?;
             return Err(injected_dead_letter_write_failure());
         }
 
@@ -551,7 +405,7 @@ impl StreamLog {
         let record_cursor = payload_offset
             - request_id_bytes.len() as u64
             - key_bytes.len() as u64
-            - REQUEST_ID_HEADER_LEN as u64;
+            - RECORD_HEADER_LEN as u64;
         self.sparse_index.remember(offset, record_cursor);
         remember_record(
             &mut self.records,
@@ -560,12 +414,15 @@ impl StreamLog {
                 payload_offset,
                 payload_len,
                 key,
-                request_id: Some(request_id.clone()),
-                request_identity_kind: Some(identity_kind),
+                request_id: identity.request_id().map(str::to_owned),
+                request_identity_kind: identity.kind(),
                 published_at_ms,
             },
         );
-        self.request_ids.remember(request_id, identity_kind, offset);
+        if let (Some(request_id), Some(identity_kind)) = (identity.request_id(), identity.kind()) {
+            self.request_ids
+                .remember(request_id.to_owned(), identity_kind, offset);
+        }
         self.next_offset = offset.saturating_add(1);
         Ok(offset)
     }
@@ -599,11 +456,10 @@ impl StreamLog {
             }
 
             let outcome = match request_id {
-                Some(request_id) => self.append_with_request_id_sync(
+                Some(request_id) => self.append_record_with_sync(
                     key,
                     payload,
-                    request_id,
-                    RequestIdentityKind::Public,
+                    RecordIdentity::Public(request_id),
                     false,
                 ),
                 None => self.append_with_sync(key, payload, false),
@@ -702,9 +558,7 @@ impl StreamLog {
         let file_len = self.file.metadata()?.len();
         let mut cursor = self.scan_start(committed_offset);
         self.file.seek(SeekFrom::Start(cursor))?;
-        while let Some(parsed) =
-            read_next_record(&mut self.file, cursor, file_len, self.durable_format)?
-        {
+        while let Some(parsed) = read_next_record(&mut self.file, cursor, file_len)? {
             cursor = parsed.next_cursor;
             if parsed.index.offset < committed_offset {
                 continue;
@@ -739,9 +593,7 @@ impl StreamLog {
         let file_len = self.file.metadata()?.len();
         let mut cursor = self.scan_start(offset);
         self.file.seek(SeekFrom::Start(cursor))?;
-        while let Some(parsed) =
-            read_next_record(&mut self.file, cursor, file_len, self.durable_format)?
-        {
+        while let Some(parsed) = read_next_record(&mut self.file, cursor, file_len)? {
             cursor = parsed.next_cursor;
             if parsed.index.offset == offset {
                 return Ok(parsed.index);
@@ -838,14 +690,12 @@ struct ParsedRecord {
     next_cursor: u64,
 }
 
-// The caller seeks to `cursor` once before starting a scan. Each parser consumes exactly one
-// complete record and leaves the file positioned at `next_cursor`; no parser seeks back to the
-// record start. Legacy records still use one forward seek to skip their unchecked payload.
+// The caller seeks to `cursor` once before starting a scan. The parser consumes exactly one
+// complete record and leaves the file positioned at `next_cursor`.
 fn read_next_record(
     file: &mut File,
     cursor: u64,
     file_len: u64,
-    durable_format: DurableFormat,
 ) -> Result<Option<ParsedRecord>, BrokerError> {
     if file_len.saturating_sub(cursor) < 4 {
         return Ok(None);
@@ -853,254 +703,80 @@ fn read_next_record(
 
     let mut magic = [0; 4];
     file.read_exact(&mut magic)?;
-    if &magic == VERSIONED_MAGIC {
-        return read_versioned_record(file, cursor, file_len, magic);
+    if &magic == b"RNL1" {
+        return Err(invalid_record_data(
+            "unsupported RNL1 stream format; this broker requires RNL3",
+        ));
     }
-    if &magic == REQUEST_ID_MAGIC {
-        return read_request_id_record(file, cursor, file_len, durable_format, magic);
+    if &magic == b"RNL2" {
+        return Err(invalid_record_data(
+            "unsupported RNL2 stream format; this broker requires RNL3",
+        ));
     }
-    if &magic != LEGACY_MAGIC {
-        return Err(invalid_record_data("unsupported record magic"));
+    if &magic != RECORD_MAGIC {
+        return Err(invalid_record_data("unsupported stream record magic"));
     }
-    read_legacy_record(file, cursor, file_len, magic)
+    read_record(file, cursor, file_len, magic)
 }
 
-fn read_legacy_record(
+fn read_record(
     file: &mut File,
     cursor: u64,
     file_len: u64,
     magic: [u8; 4],
 ) -> Result<Option<ParsedRecord>, BrokerError> {
-    if file_len.saturating_sub(cursor) < LEGACY_HEADER_LEN as u64 {
+    if file_len.saturating_sub(cursor) < RECORD_HEADER_LEN as u64 {
         return Ok(None);
     }
 
-    let mut header = [0; LEGACY_HEADER_LEN];
+    let mut header = [0; RECORD_HEADER_LEN];
     header[..4].copy_from_slice(&magic);
     file.read_exact(&mut header[4..])?;
-
-    let offset = u64::from_le_bytes(header[4..12].try_into().unwrap());
-    let published_at_ms = u64::from_le_bytes(header[12..20].try_into().unwrap());
-    let key_len = u32::from_le_bytes(header[20..24].try_into().unwrap());
-    let payload_len = u32::from_le_bytes(header[24..28].try_into().unwrap());
-    let record_len = (LEGACY_HEADER_LEN as u64)
-        .checked_add(u64::from(key_len))
-        .and_then(|length| length.checked_add(u64::from(payload_len)))
-        .ok_or_else(|| {
-            BrokerError::Io(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "record length overflows u64",
-            ))
-        })?;
-    if file_len.saturating_sub(cursor) < record_len {
-        return Ok(None);
+    if header[4] != RECORD_FORMAT_VERSION {
+        return Err(invalid_record_data("unsupported RNL3 record version"));
     }
-
-    let mut key_bytes = vec![0; key_len as usize];
-    file.read_exact(&mut key_bytes)?;
-    let key = if key_bytes.is_empty() {
-        None
-    } else {
-        let Ok(key) = std::str::from_utf8(&key_bytes) else {
-            return Err(invalid_record_data("legacy record key is not UTF-8"));
-        };
-        Some(key.to_owned())
-    };
-    let payload_offset = cursor + LEGACY_HEADER_LEN as u64 + u64::from(key_len);
-    file.seek(SeekFrom::Start(payload_offset + u64::from(payload_len)))?;
-    Ok(Some(ParsedRecord {
-        index: RecordIndex {
-            offset,
-            payload_offset,
-            payload_len,
-            key,
-            request_id: None,
-            request_identity_kind: None,
-            published_at_ms,
-        },
-        next_cursor: cursor + record_len,
-    }))
-}
-
-fn read_versioned_record(
-    file: &mut File,
-    cursor: u64,
-    file_len: u64,
-    magic: [u8; 4],
-) -> Result<Option<ParsedRecord>, BrokerError> {
-    if file_len.saturating_sub(cursor) < VERSIONED_HEADER_LEN as u64 {
-        return Ok(None);
-    }
-
-    let mut header = [0; VERSIONED_HEADER_LEN];
-    header[..4].copy_from_slice(&magic);
-    file.read_exact(&mut header[4..])?;
-    if header[4] != VERSIONED_FORMAT_VERSION {
-        return Err(invalid_record_data("unsupported versioned record version"));
-    }
-    if header[5] != 0 {
-        return Err(invalid_record_data("unsupported versioned record flags"));
-    }
-    let header_len = u16::from_le_bytes(header[6..8].try_into().unwrap()) as usize;
-    if header_len != VERSIONED_HEADER_LEN {
-        return Err(invalid_record_data(
-            "invalid versioned record header length",
-        ));
-    }
-    let stored_len = u32::from_le_bytes(header[8..12].try_into().unwrap());
-    let logical_len = u32::from_le_bytes(header[12..16].try_into().unwrap());
-    let key_len = u32::from_le_bytes(header[32..36].try_into().unwrap());
-    if stored_len > VERSIONED_MAX_BODY_LEN || logical_len > VERSIONED_MAX_BODY_LEN {
-        return Err(invalid_record_data(
-            "versioned record exceeds storage limit",
-        ));
-    }
-    if logical_len != stored_len {
-        return Err(invalid_record_data(
-            "compressed versioned records are not supported",
-        ));
-    }
-    if key_len > VERSIONED_MAX_KEY_LEN {
-        return Err(invalid_record_data(
-            "versioned record key exceeds storage limit",
-        ));
-    }
-    if header[36] != VERSIONED_ENCODING_BYTES {
-        return Err(invalid_record_data("unsupported versioned record encoding"));
-    }
-    if header[37] != VERSIONED_COMPRESSION_NONE {
-        return Err(invalid_record_data(
-            "unsupported versioned record compression",
-        ));
-    }
-    if u16::from_le_bytes(header[38..40].try_into().unwrap()) != 0 {
-        return Err(invalid_record_data(
-            "unsupported versioned record header fields",
-        ));
-    }
-
-    let record_len = (VERSIONED_HEADER_LEN as u64)
-        .checked_add(u64::from(key_len))
-        .and_then(|length| length.checked_add(u64::from(stored_len)))
-        .ok_or_else(|| invalid_record_data("versioned record length overflows u64"))?;
-    if file_len.saturating_sub(cursor) < record_len {
-        return Ok(None);
-    }
-
-    let mut key_bytes = vec![0; key_len as usize];
-    file.read_exact(&mut key_bytes)?;
-    let key = if key_bytes.is_empty() {
-        None
-    } else {
-        let key = std::str::from_utf8(&key_bytes)
-            .map_err(|_| invalid_record_data("versioned record key is not UTF-8"))?;
-        Some(key.to_owned())
-    };
-
-    let mut checksum_header = header;
-    let expected_checksum = u32::from_le_bytes(header[40..44].try_into().unwrap());
-    checksum_header[40..44].fill(0);
-    let mut checksum = crc32c_update(!0, &checksum_header);
-    checksum = crc32c_update(checksum, &key_bytes);
-    let mut remaining = u64::from(stored_len);
-    let mut buffer = [0; 8192];
-    while remaining > 0 {
-        let read_len = remaining.min(buffer.len() as u64) as usize;
-        file.read_exact(&mut buffer[..read_len])?;
-        checksum = crc32c_update(checksum, &buffer[..read_len]);
-        remaining -= read_len as u64;
-    }
-    if crc32c_finalize(checksum) != expected_checksum {
-        return Err(invalid_record_data("versioned record checksum mismatch"));
-    }
-
-    let payload_offset = cursor + VERSIONED_HEADER_LEN as u64 + u64::from(key_len);
-    Ok(Some(ParsedRecord {
-        index: RecordIndex {
-            offset: u64::from_le_bytes(header[16..24].try_into().unwrap()),
-            payload_offset,
-            payload_len: stored_len,
-            key,
-            request_id: None,
-            request_identity_kind: None,
-            published_at_ms: u64::from_le_bytes(header[24..32].try_into().unwrap()),
-        },
-        next_cursor: cursor + record_len,
-    }))
-}
-
-fn read_request_id_record(
-    file: &mut File,
-    cursor: u64,
-    file_len: u64,
-    durable_format: DurableFormat,
-    magic: [u8; 4],
-) -> Result<Option<ParsedRecord>, BrokerError> {
-    if file_len.saturating_sub(cursor) < REQUEST_ID_HEADER_LEN as u64 {
-        return Ok(None);
-    }
-
-    let mut header = [0; REQUEST_ID_HEADER_LEN];
-    header[..4].copy_from_slice(&magic);
-    file.read_exact(&mut header[4..])?;
-    let identity_kind = match (header[4], header[5]) {
-        (LEGACY_REQUEST_ID_FORMAT_VERSION, 0) | (REQUEST_ID_FORMAT_VERSION, 0) => {
-            RequestIdentityKind::Public
-        }
-        (REQUEST_ID_FORMAT_VERSION, 1) => RequestIdentityKind::DeadLetterMove,
-        (LEGACY_REQUEST_ID_FORMAT_VERSION, _) | (REQUEST_ID_FORMAT_VERSION, _) => {
-            return Err(invalid_record_data(
-                "unsupported request-aware record flags",
-            ));
-        }
-        _ => {
-            return Err(invalid_record_data(
-                "unsupported request-aware record version",
-            ));
-        }
+    let identity_kind = match header[5] {
+        0 => Some(RequestIdentityKind::Public),
+        1 => Some(RequestIdentityKind::DeadLetterMove),
+        NO_IDENTITY_FLAG => None,
+        _ => return Err(invalid_record_data("unsupported RNL3 record identity flag")),
     };
     let header_len = u16::from_le_bytes(header[6..8].try_into().unwrap()) as usize;
-    if header_len != REQUEST_ID_HEADER_LEN {
-        return Err(invalid_record_data(
-            "invalid request-aware record header length",
-        ));
+    if header_len != RECORD_HEADER_LEN {
+        return Err(invalid_record_data("invalid RNL3 record header length"));
     }
     let stored_len = u32::from_le_bytes(header[8..12].try_into().unwrap());
     let logical_len = u32::from_le_bytes(header[12..16].try_into().unwrap());
     let key_len = u32::from_le_bytes(header[32..36].try_into().unwrap());
     let request_id_len = u32::from_le_bytes(header[36..40].try_into().unwrap());
-    let limits = request_aware_limits(durable_format);
-    if key_len > limits.max_key_len {
-        return Err(invalid_record_data(
-            "request-aware record key exceeds storage limit",
-        ));
+    if key_len > MAX_KEY_LEN {
+        return Err(invalid_record_data("RNL3 record key exceeds storage limit"));
     }
-    if request_id_len > REQUEST_ID_MAX_LEN {
-        return Err(invalid_record_data(
-            "request-aware record ID exceeds storage limit",
-        ));
+    if request_id_len > MAX_REQUEST_ID_LEN {
+        return Err(invalid_record_data("RNL3 record ID exceeds storage limit"));
     }
-    if stored_len > limits.max_body_len || logical_len > limits.max_body_len {
+    if stored_len > MAX_BODY_LEN || logical_len > MAX_BODY_LEN {
+        return Err(invalid_record_data("RNL3 record exceeds storage limit"));
+    }
+    if identity_kind.is_none() && request_id_len != 0 {
         return Err(invalid_record_data(
-            "request-aware record exceeds storage limit",
+            "RNL3 record without identity contains ID bytes",
         ));
     }
     if logical_len != stored_len {
         return Err(invalid_record_data(
-            "compressed request-aware records are not supported",
+            "compressed RNL3 records are not supported",
         ));
     }
     if header[40..44] != [0; 4] {
-        return Err(invalid_record_data(
-            "unsupported request-aware record header fields",
-        ));
+        return Err(invalid_record_data("unsupported RNL3 record header fields"));
     }
 
-    let record_len = (REQUEST_ID_HEADER_LEN as u64)
+    let record_len = (RECORD_HEADER_LEN as u64)
         .checked_add(u64::from(key_len))
         .and_then(|length| length.checked_add(u64::from(request_id_len)))
         .and_then(|length| length.checked_add(u64::from(stored_len)))
-        .ok_or_else(|| invalid_record_data("request-aware record length overflows u64"))?;
+        .ok_or_else(|| invalid_record_data("RNL3 record length overflows u64"))?;
     if file_len.saturating_sub(cursor) < record_len {
         return Ok(None);
     }
@@ -1111,15 +787,19 @@ fn read_request_id_record(
         None
     } else {
         let key = std::str::from_utf8(&key_bytes)
-            .map_err(|_| invalid_record_data("request-aware record key is not UTF-8"))?;
+            .map_err(|_| invalid_record_data("RNL3 record key is not UTF-8"))?;
         Some(key.to_owned())
     };
 
     let mut request_id_bytes = vec![0; request_id_len as usize];
     file.read_exact(&mut request_id_bytes)?;
-    let request_id = std::str::from_utf8(&request_id_bytes)
-        .map_err(|_| invalid_record_data("request-aware record ID is not UTF-8"))?
-        .to_owned();
+    let request_id = identity_kind
+        .map(|_| {
+            std::str::from_utf8(&request_id_bytes)
+                .map(str::to_owned)
+                .map_err(|_| invalid_record_data("RNL3 record ID is not UTF-8"))
+        })
+        .transpose()?;
 
     let expected_checksum = u32::from_le_bytes(header[44..48].try_into().unwrap());
     let mut checksum_header = header;
@@ -1136,21 +816,19 @@ fn read_request_id_record(
         remaining -= read_len as u64;
     }
     if crc32c_finalize(checksum) != expected_checksum {
-        return Err(invalid_record_data(
-            "request-aware record checksum mismatch",
-        ));
+        return Err(invalid_record_data("RNL3 record checksum mismatch"));
     }
 
     let payload_offset =
-        cursor + REQUEST_ID_HEADER_LEN as u64 + u64::from(key_len) + u64::from(request_id_len);
+        cursor + RECORD_HEADER_LEN as u64 + u64::from(key_len) + u64::from(request_id_len);
     Ok(Some(ParsedRecord {
         index: RecordIndex {
             offset: u64::from_le_bytes(header[16..24].try_into().unwrap()),
             payload_offset,
             payload_len: stored_len,
             key,
-            request_id: Some(request_id),
-            request_identity_kind: Some(identity_kind),
+            request_id,
+            request_identity_kind: identity_kind,
             published_at_ms: u64::from_le_bytes(header[24..32].try_into().unwrap()),
         },
         next_cursor: cursor + record_len,
@@ -1203,16 +881,8 @@ fn crc32c_finalize(checksum: u32) -> u32 {
     !checksum
 }
 
-fn versioned_checksum(header: &[u8; VERSIONED_HEADER_LEN], key: &[u8], body: &[u8]) -> u32 {
-    let mut checksum_header = *header;
-    checksum_header[40..44].fill(0);
-    let checksum = crc32c_update(!0, &checksum_header);
-    let checksum = crc32c_update(checksum, key);
-    crc32c_finalize(crc32c_update(checksum, body))
-}
-
-pub(super) fn request_id_checksum(
-    header: &[u8; REQUEST_ID_HEADER_LEN],
+pub(super) fn record_checksum(
+    header: &[u8; RECORD_HEADER_LEN],
     key: &[u8],
     request_id: &[u8],
     body: &[u8],
@@ -1267,57 +937,14 @@ fn now_ms() -> u64 {
 mod tests {
     use super::*;
 
-    fn legacy_record(offset: Offset, payload: &[u8]) -> Vec<u8> {
-        let mut header = [0; LEGACY_HEADER_LEN];
-        header[..4].copy_from_slice(LEGACY_MAGIC);
-        header[4..12].copy_from_slice(&offset.to_le_bytes());
-        header[24..28].copy_from_slice(&(payload.len() as u32).to_le_bytes());
-        let mut record = header.to_vec();
-        record.extend_from_slice(payload);
-        record
-    }
-
     #[test]
-    fn rnl1_write_limits_match_the_selected_per_field_boundaries() {
-        assert_eq!(
-            legacy_write_lengths(
-                LEGACY_WRITE_MAX_KEY_LEN as usize,
-                LEGACY_WRITE_MAX_BODY_LEN as usize
-            )
-            .unwrap(),
-            (LEGACY_WRITE_MAX_KEY_LEN, LEGACY_WRITE_MAX_BODY_LEN)
-        );
-        assert_eq!(
-            legacy_write_lengths("é".repeat(64).len(), 0).unwrap().0,
-            128
-        );
-
-        assert!(matches!(
-            legacy_write_lengths(LEGACY_WRITE_MAX_KEY_LEN as usize + 1, 0),
-            Err(BrokerError::InvalidRecord(_))
-        ));
-        assert!(matches!(
-            legacy_write_lengths("é".repeat(65).len(), 0),
-            Err(BrokerError::InvalidRecord(_))
-        ));
-        assert!(matches!(
-            legacy_write_lengths(0, LEGACY_WRITE_MAX_BODY_LEN as usize + 1),
-            Err(BrokerError::InvalidRecord(_))
-        ));
-    }
-
-    #[test]
-    fn rnl1_writer_rejects_oversized_fields_without_mutating_the_log() {
+    fn record_write_limits_reject_oversized_fields_without_mutating_the_log() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("events.log");
-        let mut log = StreamLog::create(&path, DurableFormat::Rnl1).unwrap();
+        let mut log = StreamLog::create(&path).unwrap();
         assert_eq!(
-            log.append_with_sync(
-                Some("k".repeat(LEGACY_WRITE_MAX_KEY_LEN as usize)),
-                vec![1],
-                false
-            )
-            .unwrap(),
+            log.append_with_sync(Some("k".repeat(MAX_KEY_LEN as usize)), vec![1], false)
+                .unwrap(),
             0
         );
         let bytes_after_valid_boundary_record = std::fs::read(&path).unwrap();
@@ -1325,11 +952,8 @@ mod tests {
         assert_eq!(log.in_memory_record_count(), 1);
         assert_eq!(log.sparse_index_len(), 1);
 
-        let key_error = log.append_with_sync(
-            Some("k".repeat(LEGACY_WRITE_MAX_KEY_LEN as usize + 1)),
-            vec![2],
-            false,
-        );
+        let key_error =
+            log.append_with_sync(Some("k".repeat(MAX_KEY_LEN as usize + 1)), vec![2], false);
         assert!(matches!(key_error, Err(BrokerError::InvalidRecord(_))));
         assert_eq!(
             std::fs::read(&path).unwrap(),
@@ -1339,8 +963,7 @@ mod tests {
         assert_eq!(log.in_memory_record_count(), 1);
         assert_eq!(log.sparse_index_len(), 1);
 
-        let payload_error =
-            log.append_with_sync(None, vec![2; LEGACY_WRITE_MAX_BODY_LEN as usize + 1], false);
+        let payload_error = log.append_with_sync(None, vec![2; MAX_BODY_LEN as usize + 1], false);
         assert!(matches!(payload_error, Err(BrokerError::InvalidRecord(_))));
         assert_eq!(
             std::fs::read(&path).unwrap(),
@@ -1357,12 +980,12 @@ mod tests {
     }
 
     #[test]
-    fn rnl1_writer_accepts_payload_at_selected_boundary() {
+    fn record_writer_accepts_payload_at_selected_boundary() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("events.log");
-        let mut log = StreamLog::create(&path, DurableFormat::Rnl1).unwrap();
+        let mut log = StreamLog::create(&path).unwrap();
         assert_eq!(
-            log.append_with_sync(None, vec![7; LEGACY_WRITE_MAX_BODY_LEN as usize], false)
+            log.append_with_sync(None, vec![7; MAX_BODY_LEN as usize], false)
                 .unwrap(),
             0
         );
@@ -1370,27 +993,40 @@ mod tests {
         assert_eq!(log.in_memory_record_count(), 1);
         assert_eq!(
             std::fs::metadata(&path).unwrap().len(),
-            LEGACY_HEADER_LEN as u64 + u64::from(LEGACY_WRITE_MAX_BODY_LEN)
+            RECORD_HEADER_LEN as u64 + u64::from(MAX_BODY_LEN)
         );
     }
 
     #[test]
-    fn recovery_rejects_noncontiguous_offsets() {
+    fn recovery_refuses_old_frame_magics_without_mutating_the_file() {
         let directory = tempfile::tempdir().unwrap();
-        let path = directory.path().join("events.log");
-        let mut bytes = legacy_record(0, b"first");
-        bytes.extend_from_slice(&legacy_record(2, b"second"));
-        std::fs::write(&path, &bytes).unwrap();
+        for (magic, message) in [
+            (
+                b"RNL1" as &[u8],
+                "unsupported RNL1 stream format; this broker requires RNL3",
+            ),
+            (
+                b"RNL2" as &[u8],
+                "unsupported RNL2 stream format; this broker requires RNL3",
+            ),
+        ] {
+            let path = directory
+                .path()
+                .join(format!("{}.log", std::str::from_utf8(magic).unwrap()));
+            let bytes = [magic, b"old stream bytes"].concat();
+            std::fs::write(&path, &bytes).unwrap();
 
-        let error = match StreamLog::open(&path, DurableFormat::Rnl1) {
-            Ok(_) => panic!("expected recovery to reject a skipped offset"),
-            Err(error) => error,
-        };
-        assert!(matches!(
-            error,
-            BrokerError::Io(error) if error.kind() == io::ErrorKind::InvalidData
-        ));
-        assert_eq!(std::fs::metadata(path).unwrap().len(), bytes.len() as u64);
+            let error = match StreamLog::inspect(&path) {
+                Err(error) => error,
+                Ok(_) => panic!("expected the old stream format to be refused"),
+            };
+            assert!(matches!(
+                error,
+                BrokerError::Io(error)
+                    if error.kind() == io::ErrorKind::InvalidData && error.to_string() == message
+            ));
+            assert_eq!(std::fs::read(&path).unwrap(), bytes);
+        }
     }
 
     #[test]
@@ -1422,7 +1058,7 @@ mod tests {
     fn tail_candidate_lookup_starts_at_committed_offset_after_cache_wrap() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("events.log");
-        let mut log = StreamLog::create(&path, DurableFormat::Rnl1).unwrap();
+        let mut log = StreamLog::create(&path).unwrap();
         for offset in 0..(MAX_IN_MEMORY_RECORDS as Offset + 5) {
             assert_eq!(
                 log.append_with_sync(Some(format!("key-{offset}")), vec![0], false)

@@ -86,7 +86,7 @@ because startup intentionally initializes its identity metadata.
 
 | Artifact | Current observed representation and recovery | Consequence for migration |
 | --- | --- | --- |
-| Stream history | \`streams/<stream>.log\` may contain legacy \`RNL1\` frames, checksummed uncompressed version-1 \`RNL2\` frames, and request-aware checksummed version-1 \`RNL3\` frames. \`RNL1\` has no checksum or configured key/body limit; \`RNL2\` keys/bodies are bounded at 128 bytes/64 MiB; \`RNL3\` keys/bodies use the same bounds and request IDs are bounded at 1 KiB. The reader dispatches by magic, checks logical offset continuity while scanning, and truncates only an incomplete suffix. | A successful parse does not prove corruption absence for \`RNL1\`, unique request IDs, or semantic equivalence. The request-ID map retains the first recovered offset for duplicates. Before ADR 0034, public retries ignored key/payload mismatches; current runtime rejects representable mismatches by comparing against the original record. A converter must preserve these logical fields and the accepted comparison semantics before activation. |
+| Stream history | streams/<stream>.log contains checksummed RNL3 version-2 frames for ordinary records, public request IDs, and dead-letter moves. Keys, payloads, and identities are bounded; recovery validates checksums and contiguous offsets, then repairs an incomplete suffix only after all streams pass validation. RNL1, RNL2, and RNL3 version 1 are explicitly refused without mutation. | A current-format parse establishes neither release-pair compatibility nor a conversion contract. A local-to-cluster migration may use current RNL3 data as its local source; old local frame families are ineligible. Preserve logical fields and current request-ID comparison semantics. |
 | Consumer checkpoint | \`consumers/<stream>/<consumer>.json\` stores the contiguous committed offset, out-of-order acknowledged offsets, and persisted delivery attempts. The JSON shape has no explicit format version, and the current loader does not independently validate serialized stream/consumer identity against its path. | Copy the logical state, not a highest-seen offset. Reject impossible offsets, attempts of zero, and state whose stream/consumer identity does not match its path. Preserve current out-of-order progress and define how a target handles invalid or unknown fields. |
 | Consumer journal | The historical \`<consumer>.json.tmp\` path is a bounded 64 KiB JSON-lines event journal. A partial final line is truncated during recovery; complete malformed events fail. Checkpoint compaction writes a separate \`.checkpoint.tmp\` file, syncs it, and renames it into place. | Journal replay and checkpoint replacement are file-level crash boundaries, not a resumable directory migration. Their cross-file ordering, parent-directory durability, and sync/rename behavior need focused fault evidence. |
 | Volatile delivery state | Local member ownership, delivery tokens, \`Instant\` deadlines, active-delivery indexes, and process-lifetime counters are in memory. The tail record cache and sparse index are bounded, the consumer-state cache is capped at 1,024 entries, and attempts are persisted before delivery is returned; request-ID and active-delivery maps can still grow with retained identities/work. Tokens do not survive restart. | Do not copy tokens or \`Instant\` deadlines. The barrier must define which acknowledgements finish before the fence and which deliveries are redelivered after it. Resource accounting must distinguish bounded lookup structures from durable identity/state that can grow. |
@@ -135,7 +135,7 @@ limits, identities, and test fixtures.
 
 | Artifact | Current read | Current write | Current mixed | Current migrate / downgrade |
 | --- | --- | --- | --- | --- |
-| Local RNL1/RNL2/RNL3 stream frames | The current reader dispatches known magic values, applies the exact versioned header/length/checksum rules to RNL2/RNL3, and checks logical offset continuity; RNL1 has no checksum or configured record-size bound. Known frame families may be mixed in one log. | Default local appends use RNL1; request-aware appends use RNL3; opt-in versioned appends use RNL2. Request IDs are bounded, but the recovered request-ID map is not bounded by a configured count. | The same current reader can read known mixed frames. Cross-release mixed writers, RNL1 corruption detection, and semantic equivalence are not promised. | No root generation marker or converter. Older binaries must not be assumed to understand target-only frames, and a converter must decide how to handle duplicate/conflicting request identities. |
+| Local RNL3 v2 stream frames | The current reader accepts only checksummed RNL3 version-2 frames and checks field bounds and logical offset continuity. Recovery inspects every stream before repairing incomplete suffixes. RNL1, RNL2, and RNL3 version 1 fail explicitly without mutation. | Every local append uses RNL3 v2; ordinary records carry no identity, while public and dead-letter move identities are typed. The request-ID map remains unbounded by retained identity count. | No cross-release mixed-writer or release-pair contract is established. | No old-format conversion path or local format selector exists; old frame families are not eligible current local sources. |
 | Local consumer checkpoint and journal | Current JSON checkpoint and event forms are read; the 64 KiB journal bound and documented partial-tail recovery are enforced. The checkpoint/event forms have no explicit compatibility version, and path identity is not independently checked by the current loader. | Current code writes the current checkpoint/event forms. | No cross-release writer contract; no versioned migration manifest. | No converter. A future converter must preserve contiguous progress, out-of-order acknowledgements, attempts, and identity. |
 | Cluster storage.json | Metadata version 1 with exact cluster/node identity. | Current version 1 only. | No rolling compatibility level. | No generation selection, migration, or downgrade. |
 | Cluster group.json | Current stream/stream-ID/group-ID/path agreement. | Current unversioned shape. | No mixed-generation group contract. | No converter. |
@@ -222,7 +222,7 @@ Read-only preflight MUST happen before conversion mutation and MUST:
    every artifact expected for that layout;
 2. reject missing, extra, malformed, unknown, contradictory, or identity-
    mismatched metadata before opening an empty replacement;
-3. parse every source artifact through a bounded compatibility reader;
+3. parse every eligible source artifact through its current bounded reader; refuse unsupported local frame versions without mutation;
 4. validate checksums, frame lengths, record limits, offset continuity,
    duplicate offsets, and source-boundary agreement;
 5. compare logical records exactly: stream/group identity, offset order,
@@ -247,11 +247,9 @@ Read-only preflight MUST happen before conversion mutation and MUST:
 The implementation MUST distinguish an incomplete crash tail from corruption
 and from an unsupported version. A supported tail-recovery rule may be applied
 only at the documented source boundary; complete malformed or unsupported data
-MUST fail closed without truncating authoritative state. Because legacy RNL1
-records have no checksum or configured size limit, a first migration must
-either impose and validate an explicit source bound or refuse records outside
-the target's safe limits; it must not imply corruption detection that RNL1
-does not provide.
+MUST fail closed without truncating authoritative state. Local migration sources
+are current RNL3 v2 files only. RNL1, RNL2, and RNL3 v1 files are rejected
+before recovery mutation; no legacy audit or conversion route is provided.
 
 ### Local transfer and activation
 

@@ -18,18 +18,16 @@ must distinguish a complete view with no match from a retained suffix whose
 deleted prefix could contain an earlier match, and it must not scan history
 for every request.
 
-The local engine appends records to one file per stream. At this baseline,
-`Broker::open` writes `RNL1` for ordinary appends and `RNL3` for request-ID
-appends; the explicitly selected `VersionedV1` mode writes `RNL2` for ordinary
-appends and `RNL3` for request-ID appends. Opening a stream already scans every
-complete frame to rebuild the recent record cache, bounded sparse offset
-checkpoints, and request-ID index. The recent cache retains 1,024 records;
-sparse offset checkpoints occur every 64 offsets but retain only 1,024
-entries. An old logical offset can therefore require scanning from byte zero.
-There is no timestamp index. The format fixtures below cover currently
-selectable writer paths; they do not create an obligation to support retired
-software versions or additional formats solely because a reader recognizes
-them.
+At the ADR baseline, ordinary local appends used RNL1 by default, with
+request-aware appends using RNL3 and an explicit RNL2 writer mode. That
+historical selection has been superseded by [ADR 0039](0039-rnl1-write-admission-and-legacy-read-compatibility.md):
+the current local log uses only checksummed RNL3 version 2 for all records.
+Its open path rebuilds the recent record cache, bounded sparse offset
+checkpoints, and request-ID index while scanning. The recent cache retains
+1,024 records; sparse offset checkpoints occur every 64 offsets but retain
+only 1,024 entries. An old logical offset can therefore require scanning from
+byte zero. There is no timestamp index. The historical fixtures in this ADR
+do not imply support for the writer paths retired by ADR 0039.
 
 The clustered engine materializes each stream's retained messages in an
 offset-ordered `Vec`. Applied commands are first appended to and synced in the
@@ -206,14 +204,11 @@ tracked by TD-002 and TD-010.
   partially filled final block. Verify exact offset selection, append-order
   continuation, at most 256 header reads for a match, and zero block reads
   for no-match.
-- Verify local checkpoint construction and byte-cursor correctness for each
-  currently selectable writer path: default `RNL1` ordinary append,
-  request-ID `RNL3` append, and opt-in `VersionedV1`/`RNL2` ordinary append.
-  This covers current product behavior rather than compatibility with prior
-  software versions or formats that are only reader-recognized. Also cover
-  batch append ordering, torn final tails, and restart/rebuild. Complete
-  malformed or corrupt log records must still fail recovery rather than
-  produce an index result.
+- Verify local checkpoint construction and byte-cursor correctness over
+  the sole RNL3 version-2 writer. Also cover batch append ordering, torn
+  final tails, restart/rebuild, and explicit non-mutating refusal of
+  RNL1, RNL2, and RNL3 version-1 files. Complete malformed or corrupt log
+  records must still fail recovery rather than produce an index result.
 - Verify clustered index equivalence after journal replay, state checkpoint
   reopen, snapshot build/install, follower restart, and leader change. The
   index must be absent from persisted snapshots and reconstructed from their

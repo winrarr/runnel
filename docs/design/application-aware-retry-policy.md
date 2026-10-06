@@ -669,7 +669,7 @@ unknown poll.
 | Poll assignment | Assignment committed, response lost; the message may already have been processed. | Retry the poll or inspect the consumer. Treat delivery as at least once and use the source identity/token for application deduplication. |
 | Acknowledge | Source progress committed, response lost. | Retry the same acknowledgement; return `acknowledged` or `already_acknowledged`. If it was not committed, expect a later redelivery. |
 | Explicit retry/dead-letter | Retry state or target move may be committed, response lost. | Retry with the current delivery token and an idempotent command ID where supported. Never assume a failed response means no broker state changed. |
-| Automatic local dead letter | Target append may be durable while source progress is not. | Reconcile by `dead_letter_id`; leave source progress eligible until the target is known durable. A duplicate physical write is allowed only for legacy records or an unreconciled old format. |
+| Automatic local dead letter | Target append may be durable while source progress is not. | Reconcile by `dead_letter_id`; leave source progress eligible until the target is known durable. If a retry cannot find a recoverable matching target, another physical append may occur under the at-least-once contract. Old local frame formats are refused at startup. |
 | Clustered same-group move | Raft command may be committed before the client observes its response. | Query/repoll state; committed source progress and provenance record are one logical transition. Do not issue a distinct redrive ID unless a second recovery action is intended. |
 | Redrive | Destination append may be durable while the source DLQ acknowledgement is not. | Retry the same `redrive_id`. A target record with the same ID and content is the prior success; the source remains available until acknowledged. |
 
@@ -731,10 +731,13 @@ extensions; they are not migration rules accepted by this note:
   current `configure_consumer` and `inspect_consumer` operations do not require
   capability negotiation. General v1/v2 evolution belongs in the
   [protocol compatibility design](protocol-compatibility.md).
-- New durable records use a versioned metadata-capable frame or an equivalent
-  bounded sidecar. Existing `RNL1`/versioned records and payload-only
-  dead-letter records remain readable. A failed metadata migration must fail
-  closed before a source checkpoint advances.
+- New durable metadata needs a versioned current-format frame or an equivalent
+  bounded sidecar. RNL1, RNL2, and RNL3 version-1 local stream files are refused
+  without mutation; this proposal adds no old-format read or migration path.
+  Current-format dead-letter records without provenance remain explicit unknown
+  history, and the broker must not invent source offsets or attempts for them.
+  Any future metadata conversion must fail closed before source progress
+  advances.
 - The default derived stream name remains `<source>.dead-letter`. A future
   per-consumer destination or named target is opt-in and must not change where
   existing consumers find current dead letters.
