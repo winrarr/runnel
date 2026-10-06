@@ -191,6 +191,8 @@ class MatrixBenchmarkTests(unittest.TestCase):
             "64,128",
             "--raft-log-growth-observation-every-values",
             "8,32",
+            "--raft-log-growth-batch-size-values",
+            "1,8",
             "--raft-log-growth-cycle-timeout-seconds",
             "45",
             "--repetitions",
@@ -199,12 +201,15 @@ class MatrixBenchmarkTests(unittest.TestCase):
 
         cases = matrix.matrix_cases(args)
 
-        self.assertEqual(len(cases), 16)
+        self.assertEqual(len(cases), 32)
         self.assertEqual(
             {case["raft_log_growth_messages"] for case in cases}, {64, 128}
         )
         self.assertEqual(
             {case["raft_log_growth_observation_every"] for case in cases}, {8, 32}
+        )
+        self.assertEqual(
+            {case["raft_log_growth_batch_size"] for case in cases}, {1, 8}
         )
         self.assertEqual({case["payload_size"] for case in cases}, {100, 1024})
         self.assertEqual({case["repetition"] for case in cases}, {1, 2})
@@ -213,7 +218,7 @@ class MatrixBenchmarkTests(unittest.TestCase):
             matrix.case_id(index, case) for index, case in enumerate(cases, 1)
         ]
         self.assertEqual(len(set(identifiers)), len(cases))
-        self.assertIn("growth-64-observe-8", identifiers[0])
+        self.assertIn("growth-batch-1-64-observe-8", identifiers[0])
 
         command = matrix.case_command(
             args,
@@ -224,8 +229,10 @@ class MatrixBenchmarkTests(unittest.TestCase):
         )
         growth_index = command.index("--raft-log-growth-messages")
         observation_index = command.index("--raft-log-growth-observation-every")
+        batch_size_index = command.index("--raft-log-growth-batch-size")
         self.assertEqual(command[growth_index + 1], "64")
         self.assertEqual(command[observation_index + 1], "8")
+        self.assertEqual(command[batch_size_index + 1], "1")
         timeout_index = command.index("--raft-log-growth-cycle-timeout-seconds")
         self.assertEqual(command[timeout_index + 1], "45.0")
         self.assertNotIn("retained-2048", identifiers[0])
@@ -240,6 +247,8 @@ class MatrixBenchmarkTests(unittest.TestCase):
             "64,128",
             "--raft-log-growth-observation-every-values",
             "8,32",
+            "--raft-log-growth-batch-size-values",
+            "1,8",
         )
         self.assertEqual(len(matrix.matrix_cases(args)), 1)
 
@@ -248,6 +257,8 @@ class MatrixBenchmarkTests(unittest.TestCase):
             ("--raft-log-growth-message-values", "4097"),
             ("--raft-log-growth-observation-every-values", "0"),
             ("--raft-log-growth-observation-every-values", "1025"),
+            ("--raft-log-growth-batch-size-values", "0"),
+            ("--raft-log-growth-batch-size-values", "1025"),
             ("--raft-log-growth-cycle-timeout-seconds", "0.5"),
             ("--raft-log-growth-cycle-timeout-seconds", "300.1"),
             (

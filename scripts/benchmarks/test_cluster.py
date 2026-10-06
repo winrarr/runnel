@@ -39,6 +39,7 @@ from cluster_scenarios import (  # noqa: E402
     DEFAULT_HOT_ORDERING_CONCURRENCY,
     DEFAULT_HOT_ORDERING_TIMEOUT_SECONDS,
     DEFAULT_PUBLISH_BATCH_SIZE,
+    DEFAULT_RAFT_LOG_GROWTH_BATCH_SIZE,
     DEFAULT_RAFT_LOG_GROWTH_MESSAGES,
     DEFAULT_RETAINED_RECOVERY_MESSAGES,
     DEFAULT_SNAPSHOT_BUILD_MESSAGES,
@@ -54,6 +55,7 @@ from cluster_scenarios import (  # noqa: E402
     MAX_PEER_FORWARDING_STREAM_COUNT,
     MAX_PUBLISH_BATCH_SIZE,
     MAX_RAFT_LOG_GROWTH_CYCLE_TIMEOUT_SECONDS,
+    MAX_RAFT_LOG_GROWTH_BATCH_SIZE,
     MAX_RAFT_LOG_GROWTH_LOGICAL_PAYLOAD_BYTES,
     MAX_RAFT_LOG_GROWTH_MESSAGES,
     MAX_SNAPSHOT_BUILD_LOGICAL_PAYLOAD_BYTES,
@@ -72,6 +74,7 @@ from cluster_scenarios import (  # noqa: E402
     hot_ordering_records,
     parse_retained_messages,
     parse_raft_log_growth_messages,
+    parse_raft_log_growth_batch_size,
     parse_raft_log_growth_observation_every,
     parse_snapshot_build_messages,
     parse_scenarios,
@@ -221,6 +224,9 @@ class ClusterBenchmarkTests(unittest.TestCase):
             result["workload"]["raft_log_growth"],
             {
                 "measured_messages": DEFAULT_RAFT_LOG_GROWTH_MESSAGES,
+                "batch_size": DEFAULT_RAFT_LOG_GROWTH_BATCH_SIZE,
+                "minimum_batch_size": 1,
+                "maximum_batch_size": MAX_RAFT_LOG_GROWTH_BATCH_SIZE,
                 "minimum_messages": MIN_RAFT_LOG_GROWTH_MESSAGES,
                 "maximum_messages": MAX_RAFT_LOG_GROWTH_MESSAGES,
                 "maximum_logical_payload_bytes": MAX_RAFT_LOG_GROWTH_LOGICAL_PAYLOAD_BYTES,
@@ -229,6 +235,7 @@ class ClusterBenchmarkTests(unittest.TestCase):
                 "minimum_cycle_timeout_seconds": MIN_RAFT_LOG_GROWTH_CYCLE_TIMEOUT_SECONDS,
                 "maximum_cycle_timeout_seconds": MAX_RAFT_LOG_GROWTH_CYCLE_TIMEOUT_SECONDS,
                 "setup_messages_excluded": 1,
+                "publish_operation": "publish_batch",
                 "message_history_source": "public protocol; first setup publish is offset 0",
                 "consensus_history_source": "per-node data-group raft-log.json",
             },
@@ -641,6 +648,8 @@ class ClusterBenchmarkTests(unittest.TestCase):
                 "raft_log_growth",
                 "--raft-log-growth-messages",
                 "128",
+                "--raft-log-growth-batch-size",
+                "8",
                 "--raft-log-growth-observation-every",
                 "2",
                 "--raft-log-growth-cycle-timeout-seconds",
@@ -651,9 +660,16 @@ class ClusterBenchmarkTests(unittest.TestCase):
 
         self.assertEqual(args.scenarios, ["raft_log_growth"])
         self.assertEqual(args.raft_log_growth_messages, 128)
+        self.assertEqual(args.raft_log_growth_batch_size, 8)
         self.assertEqual(args.raft_log_growth_observation_every, 2)
         self.assertEqual(args.raft_log_growth_cycle_timeout_seconds, 45)
         self.assertEqual(DEFAULT_RAFT_LOG_GROWTH_MESSAGES, 256)
+        self.assertEqual(DEFAULT_RAFT_LOG_GROWTH_BATCH_SIZE, 1)
+        self.assertEqual(parse_raft_log_growth_batch_size("1"), 1)
+        self.assertEqual(
+            parse_raft_log_growth_batch_size(str(MAX_RAFT_LOG_GROWTH_BATCH_SIZE)),
+            MAX_RAFT_LOG_GROWTH_BATCH_SIZE,
+        )
         self.assertEqual(
             parse_raft_log_growth_messages(str(MIN_RAFT_LOG_GROWTH_MESSAGES)),
             MIN_RAFT_LOG_GROWTH_MESSAGES,
@@ -676,6 +692,11 @@ class ClusterBenchmarkTests(unittest.TestCase):
                 parse_raft_log_growth_messages(invalid)
         with self.assertRaises(argparse.ArgumentTypeError):
             parse_raft_log_growth_observation_every("0")
+        for invalid in ("0", str(MAX_RAFT_LOG_GROWTH_BATCH_SIZE + 1), "bad"):
+            with self.subTest(batch_size=invalid), self.assertRaises(
+                argparse.ArgumentTypeError
+            ):
+                parse_raft_log_growth_batch_size(invalid)
         with patch.object(
             sys,
             "argv",
@@ -716,7 +737,15 @@ class ClusterBenchmarkTests(unittest.TestCase):
         with patch.object(
             sys,
             "argv",
-            ["cluster.py", "--scenarios", "raft_log_growth", "--payload-sizes", "100"],
+            [
+                "cluster.py",
+                "--scenarios",
+                "raft_log_growth",
+                "--raft-log-growth-batch-size",
+                "7",
+                "--payload-sizes",
+                "100",
+            ],
         ):
             args = parse_args()
         cluster = SimpleNamespace()
@@ -731,6 +760,7 @@ class ClusterBenchmarkTests(unittest.TestCase):
             "cluster_run-id_raft_log_growth_100",
             "x" * 100,
             args.raft_log_growth_messages,
+            args.raft_log_growth_batch_size,
             args.raft_log_growth_observation_every,
             args.raft_log_growth_cycle_timeout_seconds,
         )
@@ -801,6 +831,164 @@ class ClusterBenchmarkTests(unittest.TestCase):
         self.assertFalse(_observed_purge_advanced(before, snapshot_without_purge))
         self.assertFalse(_observed_purge_advanced(before, purged_without_snapshot))
         self.assertTrue(_observed_purge_advanced(before, snapshot_and_purge))
+
+    def test_raft_log_growth_batches_records_and_preserves_cycle_and_recovery(self) -> None:
+        def state(*, purged: bool) -> dict[str, dict[str, object]]:
+            per_node: dict[str, dict[str, object]] = {}
+            for node_id in range(1, 4):
+                per_node[f"node_{node_id}"] = {
+                    "node_id": node_id,
+                    "paths": {
+                        "raft_log": {
+                            "file_bytes": 100 if purged else 500,
+                            "retained_log_entries": 4 if purged else 12,
+                            "first_log_index": 33 if purged else 1,
+                            "last_log_index": 36 if purged else 12,
+                            "last_purged_log_index": 32 if purged else None,
+                        },
+                        "state_machine_journal": {"file_bytes": 10},
+                        "state_machine_checkpoint": {"file_bytes": 20},
+                        "snapshot": {"file_bytes": 50 if purged else 0},
+                    },
+                }
+            return per_node
+
+        clients = [SimpleNamespace(close=lambda: None) for _ in range(3)]
+        nodes = [
+            SimpleNamespace(node_id=node_id, data_dir=f"node-{node_id}")
+            for node_id in range(1, 4)
+        ]
+        cluster = SimpleNamespace(
+            node_count=3,
+            nodes=nodes,
+            stats=object(),
+            metrics=lambda: None,
+            client=lambda index: clients[index],
+            restart_node=lambda _index: 10_000,
+        )
+        batch_calls: list[tuple[int, int]] = []
+
+        def publish_batch_message(
+            _client: object,
+            _stream: str,
+            _payload: str,
+            batch_size: int,
+            expected_offset: int,
+        ) -> tuple[int, int]:
+            batch_calls.append((batch_size, expected_offset))
+            return batch_size, 1_000
+
+        observed_states = [state(purged=False)] + [
+            state(purged=True) for _ in range(4)
+        ]
+        with (
+            patch("cluster_scenarios.create_stream"),
+            patch("cluster_scenarios.publish", return_value=(0, 1_000)),
+            patch(
+                "cluster_scenarios._data_group_directories",
+                return_value={
+                    node_id: Path(f"node-{node_id}") for node_id in range(1, 4)
+                },
+            ),
+            patch(
+                "cluster_scenarios._cluster_raft_data_group_state",
+                side_effect=observed_states,
+            ),
+            patch(
+                "cluster_scenarios.publish_batch_request",
+                side_effect=publish_batch_message,
+            ),
+            patch(
+                "cluster_scenarios.measure_scenario",
+                side_effect=lambda _stats, operation, **_kwargs: operation(),
+            ),
+            patch(
+                "cluster_scenarios.poll",
+                return_value=({"payload": "payload"}, 2_000),
+            ),
+            patch("cluster_scenarios.acknowledge", return_value=3_000),
+        ):
+            result = run_raft_log_growth(
+                cluster,
+                "events",
+                "payload",
+                messages=5,
+                batch_size=2,
+                observation_every=2,
+                cycle_timeout_seconds=1,
+            )
+
+        self.assertEqual(batch_calls, [(2, 1), (2, 3), (1, 5)])
+        self.assertEqual(result["messages"], 5)
+        self.assertEqual(result["latency_sample_count"], 3)
+        self.assertEqual(result["metadata"]["batch_size_counts"], {"2": 2, "1": 1})
+        self.assertEqual(result["metadata"]["final_batch_size"], 1)
+        self.assertEqual(
+            [sample["message_index"] for sample in result["metadata"]["observations"]],
+            [2, 4, 5, 5],
+        )
+        self.assertIn(
+            "offset 0 is setup", result["metadata"]["message_history_boundary"]
+        )
+        self.assertIn(
+            "not inferred from batch or message count",
+            result["metadata"]["consensus_history_boundary"],
+        )
+        self.assertTrue(result["metadata"]["snapshot_purge_cycle_observed"])
+        self.assertEqual(result["recovery"]["metadata"]["replayed_offset"], 0)
+        self.assertTrue(result["recovery"]["metadata"]["earliest_payload_verified"])
+
+    def test_raft_log_growth_does_not_retry_an_ambiguous_batch(self) -> None:
+        clients = [SimpleNamespace(close=lambda: None) for _ in range(3)]
+        nodes = [
+            SimpleNamespace(node_id=node_id, data_dir=f"node-{node_id}")
+            for node_id in range(1, 4)
+        ]
+        cluster = SimpleNamespace(
+            node_count=3,
+            nodes=nodes,
+            stats=object(),
+            metrics=lambda: None,
+            client=lambda index: clients[index],
+        )
+        initial_state = {f"node_{node_id}": {} for node_id in range(1, 4)}
+        with (
+            patch("cluster_scenarios.create_stream"),
+            patch("cluster_scenarios.publish", return_value=(0, 1_000)),
+            patch(
+                "cluster_scenarios._data_group_directories",
+                return_value={
+                    node_id: Path(f"node-{node_id}") for node_id in range(1, 4)
+                },
+            ),
+            patch(
+                "cluster_scenarios._cluster_raft_data_group_state",
+                return_value=initial_state,
+            ),
+            patch(
+                "cluster_scenarios.measure_scenario",
+                side_effect=lambda _stats, operation, **_kwargs: operation(),
+            ),
+            patch(
+                "cluster_scenarios.publish_batch_request",
+                side_effect=BenchmarkError("broker closed after request write"),
+            ) as publish_batch,
+        ):
+            with self.assertRaisesRegex(
+                BenchmarkError,
+                r"offsets 1-8; the request was not retried and may have committed some records",
+            ):
+                run_raft_log_growth(
+                    cluster,
+                    "events",
+                    "payload",
+                    messages=64,
+                    batch_size=8,
+                    observation_every=8,
+                    cycle_timeout_seconds=1,
+                )
+
+        publish_batch.assert_called_once()
 
     def test_hot_ordering_options_are_opt_in_and_bounded(self) -> None:
         with patch.object(
