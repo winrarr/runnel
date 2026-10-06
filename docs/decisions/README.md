@@ -43,5 +43,6 @@ Current decisions:
 - 0037-offline-side-by-side-storage-upgrades.md: require validated offline side-by-side conversion with explicit activation and a first-target-write rollback boundary.
 - 0038-timestamp-based-replay-selector.md: accept inclusive broker-publish-time replay selection by lowest matching logical offset, with explicit no-match and deleted-prefix completeness semantics.
 - 0040-bounded-raft-log-persistence.md: replace retained-map rewrites with bounded append-only Raft-log segments and fixed-size durable control state.
+- 0041-first-consumer-lag-observation.md: accept one bounded, operator-authorized exact-consumer lag diagnostic with a local read cap and a leader-authoritative applied Raft revision.
 
 Proposed decisions awaiting review: none.
