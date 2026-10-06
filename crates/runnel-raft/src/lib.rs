@@ -45,7 +45,7 @@ pub use engine::{InMemoryCluster, PersistentEngine, RaftGroup, SingleNodeEngine}
 #[cfg(test)]
 use group_manager::DataGroupManifest;
 pub use group_manager::{GroupManager, ReplicationProgressSnapshot};
-pub use peer_tls::{PeerTlsConfig, PeerTlsHandshakePermit};
+pub use peer_tls::PeerTlsConfig;
 #[cfg(feature = "persistence-write-counters")]
 pub use persistence_write::{
     PersistenceWriteCounterSnapshot, PersistenceWriteMetricsSnapshot, PersistenceWriteOperation,

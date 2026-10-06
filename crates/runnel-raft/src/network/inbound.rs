@@ -7,15 +7,24 @@ use tokio::sync::watch;
 use super::{
     ForwardError, ForwardedBatchMessage, ForwardedOperation, ForwardedResponse, PeerRequest,
     PeerResponse,
-    framing::{read_frame, write_frame},
+    framing::{read_frame_bounded, write_frame_bounded},
 };
-use crate::{GroupManager, StreamMetadata};
+use crate::peer_tls::{PeerTlsConnectionPermit, PeerTlsHandshakePermit};
+use crate::{GroupManager, PeerTlsConfig, StreamMetadata};
+
+const FRAME_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
 pub(crate) async fn serve(
     listener: TcpListener,
     manager: Arc<GroupManager>,
     mut shutdown: watch::Receiver<bool>,
 ) -> Result<(), io::Error> {
+    let peer_tls = manager.peer_tls().cloned().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "peer TLS configuration is required before serving the peer listener",
+        )
+    })?;
     loop {
         tokio::select! {
             changed = shutdown.changed() => {
@@ -24,12 +33,28 @@ pub(crate) async fn serve(
                 }
             }
             accepted = listener.accept() => {
-                let (stream, peer) = accepted?;
+                let (stream, _) = accepted?;
                 stream.set_nodelay(true)?;
+                let Some(connection_permit) = peer_tls.try_acquire_inbound_connection() else {
+                    continue;
+                };
+                let Some(handshake_permit) = peer_tls.try_acquire_inbound_handshake() else {
+                    drop(connection_permit);
+                    continue;
+                };
                 let manager = Arc::clone(&manager);
+                let peer_tls = Arc::clone(&peer_tls);
                 tokio::spawn(async move {
-                    if let Err(error) = handle_connection(stream, manager).await {
-                        tracing::warn!(%peer, %error, "raft peer connection failed");
+                    if let Err(error) = handle_connection(
+                        stream,
+                        manager,
+                        peer_tls,
+                        handshake_permit,
+                        connection_permit,
+                    )
+                    .await
+                    {
+                        tracing::warn!(%error, "raft peer connection failed");
                     }
                 });
             }
@@ -38,15 +63,35 @@ pub(crate) async fn serve(
 }
 
 async fn handle_connection(
-    mut stream: TcpStream,
+    stream: TcpStream,
     manager: Arc<GroupManager>,
+    peer_tls: Arc<PeerTlsConfig>,
+    handshake_permit: PeerTlsHandshakePermit,
+    connection_permit: PeerTlsConnectionPermit,
 ) -> Result<(), io::Error> {
+    let (mut stream, _peer_id) = peer_tls.accept(stream, handshake_permit).await?;
+    let _connection_permit = connection_permit;
     let mut read_buffer = Vec::new();
+    let frame_memory = peer_tls.frame_memory();
+    let frame_write_slots = peer_tls.frame_write_slots();
     loop {
-        let request: PeerRequest = match read_frame(&mut stream, &mut read_buffer).await {
-            Ok(request) => request,
-            Err(error) if error.kind() == io::ErrorKind::UnexpectedEof => return Ok(()),
-            Err(error) => return Err(error),
+        let request: PeerRequest = match tokio::time::timeout(
+            FRAME_READ_TIMEOUT,
+            read_frame_bounded(&mut stream, &mut read_buffer, &frame_memory),
+        )
+        .await
+        {
+            Err(_) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "peer frame read timed out",
+                ));
+            }
+            Ok(result) => match result {
+                Ok(request) => request,
+                Err(error) if error.kind() == io::ErrorKind::UnexpectedEof => return Ok(()),
+                Err(error) => return Err(error),
+            },
         };
         let response = match request {
             PeerRequest::AppendEntries { group_id, request } => {
@@ -101,7 +146,12 @@ async fn handle_connection(
                 Err(error) => PeerResponse::Error(error.to_string()),
             },
         };
-        write_frame(&mut stream, &response).await?;
+        tokio::time::timeout(
+            FRAME_READ_TIMEOUT,
+            write_frame_bounded(&mut stream, &response, &frame_write_slots),
+        )
+        .await
+        .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "peer frame write timed out"))??;
     }
 }
 

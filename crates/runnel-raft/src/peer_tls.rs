@@ -20,21 +20,35 @@ use tokio_rustls::server::TlsStream as ServerTlsStream;
 use x509_parser::extensions::GeneralName;
 
 const MAX_SIMULTANEOUS_HANDSHAKES: usize = 32;
+// Keep accepted and opened peer sessions finite even when many Raft groups
+// address the same broker. Admission waits are bounded by the RPC TTL.
+const MAX_ACTIVE_PEER_CONNECTIONS: usize = 256;
+const FRAME_MEMORY_QUANTUM: usize = 1024 * 1024;
+// At most 256 MiB of peer frame payloads can be buffered per broker process.
+const MAX_CONCURRENT_PEER_FRAME_MEMORY: usize = 256 * 1024 * 1024;
+const MAX_CONCURRENT_FRAME_WRITES: usize = 4;
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Static peer TLS credentials and identity policy for one broker process.
 ///
 /// Its debug representation intentionally omits file paths, certificate
-/// material, and private-key material.
+/// material, and private-key material. It uses TLS 1.3 only, trusts only the
+/// configured bundle, disables early data, and reads credentials at startup;
+/// credential changes require a process restart.
 pub struct PeerTlsConfig {
     local_node_id: u64,
     cluster_name: Arc<str>,
     identities: HashMap<String, u64>,
     client: Arc<ClientConfig>,
+    #[cfg(test)]
     server: Arc<ServerConfig>,
     acceptor: TlsAcceptor,
     inbound_handshakes: Arc<Semaphore>,
     outbound_handshakes: Arc<Semaphore>,
+    inbound_connections: Arc<Semaphore>,
+    outbound_connections: Arc<Semaphore>,
+    frame_memory: Arc<Semaphore>,
+    frame_writes: Arc<Semaphore>,
 }
 
 impl fmt::Debug for PeerTlsConfig {
@@ -50,13 +64,19 @@ impl fmt::Debug for PeerTlsConfig {
 /// An inbound handshake slot acquired before a peer socket is spawned.
 /// Keeping admission separate from the async handshake prevents an unbounded
 /// queue of accepted sockets waiting for TLS capacity.
-pub struct PeerTlsHandshakePermit(OwnedSemaphorePermit);
+pub(crate) struct PeerTlsHandshakePermit(OwnedSemaphorePermit);
+
+/// A peer-session slot held for the lifetime of a stream.
+pub(crate) struct PeerTlsConnectionPermit {
+    _permit: OwnedSemaphorePermit,
+}
 
 impl PeerTlsConfig {
     /// Load explicit cluster trust and this process's leaf identity.
     ///
     /// The peer map must contain this node and must not map two node IDs to
-    /// the same dial address. Only the supplied trust bundle is used.
+    /// the same dial address. Only the supplied trust bundle is used. These
+    /// paths should refer to operator-managed secret files and are not logged.
     pub fn from_files(
         local_node_id: u64,
         cluster_name: &str,
@@ -136,14 +156,40 @@ impl PeerTlsConfig {
             identities,
             client: Arc::new(client),
             acceptor: TlsAcceptor::from(Arc::clone(&server)),
+            #[cfg(test)]
             server,
             inbound_handshakes: Arc::new(Semaphore::new(MAX_SIMULTANEOUS_HANDSHAKES)),
             outbound_handshakes: Arc::new(Semaphore::new(MAX_SIMULTANEOUS_HANDSHAKES)),
+            inbound_connections: Arc::new(Semaphore::new(MAX_ACTIVE_PEER_CONNECTIONS)),
+            outbound_connections: Arc::new(Semaphore::new(MAX_ACTIVE_PEER_CONNECTIONS)),
+            frame_memory: Arc::new(Semaphore::new(
+                MAX_CONCURRENT_PEER_FRAME_MEMORY / FRAME_MEMORY_QUANTUM,
+            )),
+            frame_writes: Arc::new(Semaphore::new(MAX_CONCURRENT_FRAME_WRITES)),
         })
     }
 
+    /// Ensure the engine and network map use the same node IDs and cluster.
+    pub(crate) fn validate_for(
+        &self,
+        local_node_id: u64,
+        cluster_name: &str,
+        peers: &BTreeMap<u64, String>,
+    ) -> io::Result<()> {
+        validate_peer_map(local_node_id, peers)?;
+        if self.local_node_id != local_node_id
+            || self.cluster_name.as_ref() != cluster_name
+            || self.identities != peer_identities(local_node_id, cluster_name, peers)
+        {
+            return Err(invalid_config(
+                "peer TLS credentials do not match configured cluster membership",
+            ));
+        }
+        Ok(())
+    }
+
     /// Refuse excess accepted sockets before a task is spawned.
-    pub fn try_acquire_inbound_handshake(&self) -> Option<PeerTlsHandshakePermit> {
+    pub(crate) fn try_acquire_inbound_handshake(&self) -> Option<PeerTlsHandshakePermit> {
         self.inbound_handshakes
             .clone()
             .try_acquire_owned()
@@ -151,9 +197,42 @@ impl PeerTlsConfig {
             .map(PeerTlsHandshakePermit)
     }
 
+    /// Refuse excess peer sessions before their connection tasks are spawned.
+    pub(crate) fn try_acquire_inbound_connection(&self) -> Option<PeerTlsConnectionPermit> {
+        self.inbound_connections
+            .clone()
+            .try_acquire_owned()
+            .ok()
+            .map(|_permit| PeerTlsConnectionPermit { _permit })
+    }
+
+    pub(crate) async fn acquire_outbound_connection(
+        &self,
+        timeout: Duration,
+    ) -> io::Result<PeerTlsConnectionPermit> {
+        tokio::time::timeout(timeout, self.outbound_connections.clone().acquire_owned())
+            .await
+            .map_err(|_| {
+                io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "peer connection admission timed out",
+                )
+            })?
+            .map(|_permit| PeerTlsConnectionPermit { _permit })
+            .map_err(|_| invalid_config("peer TLS connection admission is closed"))
+    }
+
+    pub(crate) fn frame_memory(&self) -> Arc<Semaphore> {
+        Arc::clone(&self.frame_memory)
+    }
+
+    pub(crate) fn frame_write_slots(&self) -> Arc<Semaphore> {
+        Arc::clone(&self.frame_writes)
+    }
+
     /// Complete mutual TLS and bind the client certificate to one configured
     /// remote node. Call this before reading any peer-protocol frame.
-    pub async fn accept(
+    pub(crate) async fn accept(
         &self,
         stream: TcpStream,
         permit: PeerTlsHandshakePermit,
@@ -162,7 +241,7 @@ impl PeerTlsConfig {
         let stream = tokio::time::timeout(HANDSHAKE_TIMEOUT, self.acceptor.accept(stream))
             .await
             .map_err(|_| handshake_timeout())?
-            .map_err(|_| invalid_peer("peer TLS authentication failed"))?;
+            .map_err(peer_handshake_error)?;
         let certificate = stream
             .get_ref()
             .1
@@ -181,7 +260,7 @@ impl PeerTlsConfig {
 
     /// Open a TLS connection to an address while validating the configured
     /// peer's expected node identity, independent of the dial address.
-    pub async fn connect(
+    pub(crate) async fn connect(
         &self,
         target_node_id: u64,
         address: &str,
@@ -213,7 +292,7 @@ impl PeerTlsConfig {
         )
         .await
         .map_err(|_| handshake_timeout())?
-        .map_err(|_| invalid_peer("peer TLS authentication failed"))?;
+        .map_err(peer_handshake_error)?;
         let certificate = tls
             .get_ref()
             .1
@@ -223,10 +302,6 @@ impl PeerTlsConfig {
         require_exact_peer_identity(certificate, &expected)?;
         drop(permit);
         Ok(tls)
-    }
-
-    pub fn local_node_id(&self) -> u64 {
-        self.local_node_id
     }
 }
 
@@ -354,8 +429,25 @@ fn handshake_timeout() -> io::Error {
     io::Error::new(io::ErrorKind::TimedOut, "peer TLS handshake timed out")
 }
 
+fn peer_handshake_error(error: io::Error) -> io::Error {
+    let message = match error
+        .get_ref()
+        .and_then(|source| source.downcast_ref::<rustls::Error>())
+    {
+        Some(rustls::Error::InvalidCertificate(
+            rustls::CertificateError::NotValidForName
+            | rustls::CertificateError::NotValidForNameContext { .. },
+        )) => "peer TLS certificate identity does not match the expected node",
+        Some(rustls::Error::InvalidCertificate(_))
+        | Some(rustls::Error::NoCertificatesPresented) => "peer TLS certificate validation failed",
+        Some(rustls::Error::PeerIncompatible(_)) => "peer TLS protocol version is incompatible",
+        _ => "peer TLS handshake failed",
+    };
+    invalid_peer(message)
+}
+
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use rcgen::{
         BasicConstraints, CertificateParams, ExtendedKeyUsagePurpose, IsCa, Issuer, KeyPair,
@@ -476,6 +568,18 @@ mod tests {
         }
     }
 
+    pub(crate) fn peer_pair_configs(
+        peers: &BTreeMap<u64, String>,
+    ) -> (Arc<PeerTlsConfig>, Arc<PeerTlsConfig>) {
+        let authority = TestAuthority::new();
+        let node_zero = authority.issue(vec![identity_for(0, "events")]);
+        let node_one = authority.issue(vec![identity_for(1, "events")]);
+        (
+            Arc::new(node_zero.config(0, peers)),
+            Arc::new(node_one.config(1, peers)),
+        )
+    }
+
     #[test]
     fn identity_has_canonical_node_and_cluster_encoding() {
         assert_eq!(
@@ -529,6 +633,31 @@ mod tests {
             client_stream.get_ref().1.protocol_version(),
             Some(rustls::ProtocolVersion::TLSv1_3)
         );
+    }
+
+    #[tokio::test]
+    async fn outbound_tls_rejects_a_valid_certificate_for_the_wrong_target_node() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap().to_string();
+        let peers = BTreeMap::from([
+            (0, "127.0.0.1:7000".to_owned()),
+            (1, "127.0.0.1:7001".to_owned()),
+            (2, address.clone()),
+        ]);
+        let authority = TestAuthority::new();
+        let node_zero = authority.issue(vec![identity_for(0, "events")]);
+        let node_two = authority.issue(vec![identity_for(2, "events")]);
+        let client = Arc::new(node_zero.config(0, &peers));
+        let server = Arc::new(node_two.config(2, &peers));
+
+        let server_handshake = async {
+            let (stream, _) = listener.accept().await.unwrap();
+            let permit = server.try_acquire_inbound_handshake().unwrap();
+            server.accept(stream, permit).await
+        };
+        let client_handshake = client.connect(1, &address);
+        let (_server_result, client_result) = tokio::join!(server_handshake, client_handshake);
+        assert!(client_result.is_err());
     }
 
     #[test]
@@ -634,11 +763,51 @@ mod tests {
     }
 
     #[test]
+    fn inbound_peer_session_admission_is_bounded() {
+        let peers = BTreeMap::from([
+            (0, "127.0.0.1:7000".to_owned()),
+            (1, "127.0.0.1:7001".to_owned()),
+        ]);
+        let config = CredentialFiles::new(0, "events").config(0, &peers);
+        let permits = (0..MAX_ACTIVE_PEER_CONNECTIONS)
+            .map(|_| config.try_acquire_inbound_connection().unwrap())
+            .collect::<Vec<_>>();
+        assert!(config.try_acquire_inbound_connection().is_none());
+        drop(permits);
+        assert!(config.try_acquire_inbound_connection().is_some());
+    }
+
+    #[test]
     fn duplicate_dial_addresses_are_rejected() {
         let peers = BTreeMap::from([(0, "peer:7000".to_owned()), (1, "peer:7000".to_owned())]);
         assert_eq!(
             validate_peer_map(0, &peers).unwrap_err().kind(),
             io::ErrorKind::InvalidInput
+        );
+    }
+
+    #[test]
+    fn engine_membership_must_match_the_loaded_tls_identity_map() {
+        let peers = BTreeMap::from([
+            (0, "127.0.0.1:7000".to_owned()),
+            (1, "127.0.0.1:7001".to_owned()),
+        ]);
+        let config = CredentialFiles::new(0, "events").config(0, &peers);
+
+        assert!(config.validate_for(0, "events", &peers).is_ok());
+        assert!(config.validate_for(1, "events", &peers).is_err());
+        assert!(config.validate_for(0, "other-cluster", &peers).is_err());
+        assert!(
+            config
+                .validate_for(
+                    0,
+                    "events",
+                    &BTreeMap::from([
+                        (0, "127.0.0.1:7000".to_owned()),
+                        (2, "127.0.0.1:7002".to_owned()),
+                    ])
+                )
+                .is_err()
         );
     }
 }

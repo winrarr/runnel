@@ -3,14 +3,19 @@ use std::mem::size_of;
 
 use serde::Serialize;
 use serde::de::DeserializeOwned;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::TcpStream;
+use std::sync::Arc;
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use tokio::sync::Semaphore;
+
+const FRAME_MEMORY_QUANTUM: usize = 1024 * 1024;
+const MAX_BUFFERED_FRAME_MEMORY: usize = 256 * 1024 * 1024;
+const FRAME_ADMISSION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
 pub(super) const MAX_FRAME_SIZE: u32 = 66 * 1024 * 1024;
 pub(super) const MAX_REUSABLE_FRAME_BUFFER_SIZE: usize = 1024 * 1024;
 
 pub(super) async fn write_frame<T: Serialize>(
-    stream: &mut TcpStream,
+    stream: &mut (impl AsyncWrite + Unpin),
     value: &T,
 ) -> Result<(), io::Error> {
     let mut frame = Vec::with_capacity(size_of::<u32>());
@@ -42,7 +47,23 @@ pub(super) async fn write_frame<T: Serialize>(
         ));
     }
     frame[..size_of::<u32>()].copy_from_slice(&length.to_be_bytes());
-    stream.write_all(&frame).await
+    stream.write_all(&frame).await?;
+    stream.flush().await
+}
+
+pub(super) async fn write_frame_bounded<T: Serialize, S: AsyncWrite + Unpin>(
+    stream: &mut S,
+    value: &T,
+    write_slots: &Arc<Semaphore>,
+) -> Result<(), io::Error> {
+    let _permit =
+        tokio::time::timeout(FRAME_ADMISSION_TIMEOUT, write_slots.clone().acquire_owned())
+            .await
+            .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "peer frame admission timed out"))?
+            .map_err(|_| {
+                io::Error::new(io::ErrorKind::BrokenPipe, "peer frame admission is closed")
+            })?;
+    write_frame(stream, value).await
 }
 
 struct BoundedFrameWriter<'a> {
@@ -83,9 +104,26 @@ impl Write for BoundedFrameWriter<'_> {
     }
 }
 
+#[cfg(test)]
 pub(super) async fn read_frame<T: DeserializeOwned>(
-    stream: &mut TcpStream,
+    stream: &mut (impl AsyncRead + Unpin),
     payload: &mut Vec<u8>,
+) -> Result<T, io::Error> {
+    read_frame_inner(stream, payload, None).await
+}
+
+pub(super) async fn read_frame_bounded<T: DeserializeOwned, S: AsyncRead + Unpin>(
+    stream: &mut S,
+    payload: &mut Vec<u8>,
+    memory_budget: &Arc<Semaphore>,
+) -> Result<T, io::Error> {
+    read_frame_inner(stream, payload, Some(memory_budget)).await
+}
+
+async fn read_frame_inner<T: DeserializeOwned, S: AsyncRead + Unpin>(
+    stream: &mut S,
+    payload: &mut Vec<u8>,
+    memory_budget: Option<&Arc<Semaphore>>,
 ) -> Result<T, io::Error> {
     let length = stream.read_u32().await?;
     if length > MAX_FRAME_SIZE {
@@ -94,6 +132,28 @@ pub(super) async fn read_frame<T: DeserializeOwned>(
             "peer RPC exceeds the frame limit",
         ));
     }
+    let _memory_permit = if let Some(memory_budget) = memory_budget {
+        let units = (length as usize).div_ceil(FRAME_MEMORY_QUANTUM).max(1);
+        if units > MAX_BUFFERED_FRAME_MEMORY / FRAME_MEMORY_QUANTUM {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "peer RPC exceeds the buffered frame memory limit",
+            ));
+        }
+        Some(
+            tokio::time::timeout(
+                FRAME_ADMISSION_TIMEOUT,
+                memory_budget.clone().acquire_many_owned(units as u32),
+            )
+            .await
+            .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "peer frame admission timed out"))?
+            .map_err(|_| {
+                io::Error::new(io::ErrorKind::BrokenPipe, "peer frame admission is closed")
+            })?,
+        )
+    } else {
+        None
+    };
     payload.resize(length as usize, 0);
     stream.read_exact(payload).await?;
     let value = serde_json::from_slice(payload).map_err(io::Error::other)?;
