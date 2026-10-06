@@ -74,9 +74,9 @@ The current persistent artifacts have separate roles:
 | --- | --- | --- |
 | `storage.json` | Version-1 cluster and node identity metadata | Prevents accidental reuse of a directory for another configured identity; it is not a membership or incarnation record. |
 | `groups/<group>/raft-log.json` | Version-1 JSON Raft log containing vote, committed progress, purge boundary, and retained consensus entries | Consensus history; it may be compacted after a state-machine snapshot and is not the retained broker stream log. |
-| `groups/<group>/state-machine/state-machine.json` | Version-2 JSON materialized checkpoint; version 1 is read forward in memory | Checkpoint for applied broker state and membership. |
-| `groups/<group>/state-machine/state-machine.log` | Version-1 length-prefixed JSON apply journal with a 64 MiB record limit | Write-ahead apply history replayed after the selected checkpoint or snapshot; an incomplete final frame is truncated during normal open. |
-| `groups/<group>/state-machine/snapshot.json` | OpenRaft snapshot metadata plus a versioned JSON materialized-state payload | State-machine recovery image used after consensus-log compaction or lag beyond the retained suffix. |
+| `groups/<group>/state-machine/state-machine.json` | Version-3 JSON materialized checkpoint; older versions fail closed without mutation | Checkpoint for applied broker state and membership. |
+| `groups/<group>/state-machine/state-machine.log` | Version-2 length-prefixed JSON apply journal with a 64 MiB record limit; older record versions fail closed | Write-ahead apply history replayed after the selected checkpoint or snapshot; an incomplete final frame is truncated during normal open. |
+| `groups/<group>/state-machine/snapshot.json` | OpenRaft snapshot metadata plus a version-3 JSON materialized-state payload; older payload versions fail closed | State-machine recovery image used after consensus-log compaction or lag beyond the retained suffix. |
 
 The Raft log's committed pointer and entry indexes are checked for impossible
 or contradictory combinations, including gaps, entry/index mismatches,

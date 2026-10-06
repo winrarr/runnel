@@ -5,7 +5,7 @@
 
 ## Decision
 
-The local engine uses the acknowledgement timeout as the initial retry delay. It persists a delivery-attempt count with each durable consumer before returning the message. A local deployment may configure a maximum number of attempts; the default remains unlimited redelivery.
+The local engine uses the acknowledgement timeout as the active lease and redelivers after the lease expires. It persists a delivery-attempt count with each durable consumer before returning the message. A local deployment may configure a maximum number of attempts; the default remains unlimited redelivery. [ADR 0033](0033-fixed-consumer-retry-delay.md) adds a separate fixed per-consumer retry delay that begins at the first durable observation of lease expiry.
 
 When a message reaches the configured limit, the broker appends its original key and payload to an automatically created stream named <source-stream>.dead-letter, with a bounded hashed fallback for long source names, then advances the source consumer past the message. New moves persist an internal source-stream/source-consumer/source-offset identity in the target log. Retrying or reopening can reconcile a completed target append with the same key and payload before persisting source progress; mismatched content fails instead of acknowledging the source. The source consumer state is persisted only after the durable target append or reconciliation succeeds.
 
@@ -19,7 +19,7 @@ The append-then-checkpoint order favors no loss. Stable move identity adds recon
 
 ## Consequences
 
-- broker-wide retry settings remain the legacy fallback; bounded per-consumer timeout and attempt overrides are defined by [ADR 0027](0027-consumer-scoped-retry-policy.md), while there is no exponential backoff, jitter, or redrive operation;
+- broker-wide retry settings remain the legacy fallback; bounded per-consumer timeout and attempt overrides are defined by [ADR 0027](0027-consumer-scoped-retry-policy.md), and the fixed retry delay is defined by [ADR 0033](0033-fixed-consumer-retry-delay.md); exponential backoff, jitter, and redrive remain future work;
 - dead-letter streams preserve the original key and payload but do not yet include source consumer, source offset, or attempt provenance;
 - dead-letter streams are not recursively dead-lettered;
 - a dead-letter stream counts as a normal stream and can be consumed and acknowledged through the existing protocol;

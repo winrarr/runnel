@@ -549,10 +549,11 @@ impl RaftGroup {
         consumer: String,
         ack_timeout_ms: u64,
         max_delivery_attempts: Option<u32>,
+        retry_delay_ms: u64,
     ) -> Result<ConsumerPolicy, BrokerError> {
         validate_name("stream", &stream)?;
         validate_name("consumer", &consumer)?;
-        validate_consumer_policy(ack_timeout_ms, max_delivery_attempts)?;
+        validate_consumer_policy(ack_timeout_ms, max_delivery_attempts, retry_delay_ms)?;
         let response = self
             .raft
             .client_write(Command::ConfigureConsumer {
@@ -560,6 +561,7 @@ impl RaftGroup {
                 consumer,
                 ack_timeout_ms,
                 max_delivery_attempts,
+                retry_delay_ms,
             })
             .await
             .map_err(map_client_write_error)?;
@@ -816,7 +818,7 @@ impl RaftGroup {
                 policy_version: policy.configured.then_some(policy.version),
                 transition_only: false,
             };
-            let (preview, next_expiry_ms) = self
+            let (preview, next_expiry_ms, needs_retry_schedule) = self
                 .state_machine
                 .preview_group_batch(request.clone())
                 .await?;
@@ -831,7 +833,7 @@ impl RaftGroup {
                 }
             };
 
-            if terminal_transitions > 0 {
+            if needs_retry_schedule || terminal_transitions > 0 {
                 let mut transition_request = request;
                 transition_request.transition_only = true;
                 self.submit_group_batch_poll(transition_request).await?;
@@ -1030,6 +1032,7 @@ impl Engine for SingleNodeEngine {
         consumer: &'a str,
         ack_timeout_ms: u64,
         max_delivery_attempts: Option<u32>,
+        retry_delay_ms: u64,
     ) -> EngineFuture<'a, ConsumerPolicy> {
         Box::pin(async move {
             self.group
@@ -1038,6 +1041,7 @@ impl Engine for SingleNodeEngine {
                     consumer.to_owned(),
                     ack_timeout_ms,
                     max_delivery_attempts,
+                    retry_delay_ms,
                 )
                 .await
         })
@@ -1502,6 +1506,7 @@ impl Engine for PersistentEngine {
         consumer: &'a str,
         ack_timeout_ms: u64,
         max_delivery_attempts: Option<u32>,
+        retry_delay_ms: u64,
     ) -> EngineFuture<'a, ConsumerPolicy> {
         Box::pin(async move {
             let stream_name = stream.to_owned();
@@ -1511,6 +1516,7 @@ impl Engine for PersistentEngine {
                 consumer: consumer_name.clone(),
                 ack_timeout_ms,
                 max_delivery_attempts,
+                retry_delay_ms,
             };
             match self
                 .manager
@@ -1519,6 +1525,7 @@ impl Engine for PersistentEngine {
                     consumer_name,
                     ack_timeout_ms,
                     max_delivery_attempts,
+                    retry_delay_ms,
                 )
                 .await
             {

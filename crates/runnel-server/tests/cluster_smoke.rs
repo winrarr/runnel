@@ -380,6 +380,7 @@ fn three_process_cluster_replicates_and_recovers_after_failures() {
                 consumer: "workers".to_owned(),
                 ack_timeout_ms: 60_000,
                 max_delivery_attempts: None,
+                retry_delay_ms: 0,
             },
             |response| matches!(response, Response::ConsumerPolicy { .. }),
         ),
@@ -2162,7 +2163,8 @@ fn three_process_cluster_transfers_consumer_policy_and_delivery_snapshot_after_l
                 stream: "policy-transfer-jobs".to_owned(),
                 consumer: "workers".to_owned(),
                 ack_timeout_ms: 0,
-                max_delivery_attempts: Some(1),
+                max_delivery_attempts: Some(3),
+                retry_delay_ms: 2_500,
             },
             |response| matches!(
                 response,
@@ -2170,7 +2172,8 @@ fn three_process_cluster_transfers_consumer_policy_and_delivery_snapshot_after_l
                     version: 1,
                     configured: true,
                     ack_timeout_ms: 0,
-                    max_delivery_attempts: Some(1),
+                    max_delivery_attempts: Some(3),
+                    retry_delay_ms: 2_500,
                     ..
                 }
             ),
@@ -2179,7 +2182,8 @@ fn three_process_cluster_transfers_consumer_policy_and_delivery_snapshot_after_l
             version: 1,
             configured: true,
             ack_timeout_ms: 0,
-            max_delivery_attempts: Some(1),
+            max_delivery_attempts: Some(3),
+            retry_delay_ms: 2_500,
             ..
         }
     ));
@@ -2232,6 +2236,7 @@ fn three_process_cluster_transfers_consumer_policy_and_delivery_snapshot_after_l
                 consumer: "workers".to_owned(),
                 ack_timeout_ms: 10_000,
                 max_delivery_attempts: Some(3),
+                retry_delay_ms: 0,
             },
             |response| matches!(
                 response,
@@ -2240,6 +2245,7 @@ fn three_process_cluster_transfers_consumer_policy_and_delivery_snapshot_after_l
                     configured: true,
                     ack_timeout_ms: 10_000,
                     max_delivery_attempts: Some(3),
+                    retry_delay_ms: 0,
                     ..
                 }
             ),
@@ -2249,8 +2255,25 @@ fn three_process_cluster_transfers_consumer_policy_and_delivery_snapshot_after_l
             configured: true,
             ack_timeout_ms: 10_000,
             max_delivery_attempts: Some(3),
+            retry_delay_ms: 0,
             ..
         }
+    ));
+    // A poll durably observes the first delivery's immediate lease expiry and
+    // starts the retry delay pinned to policy version 1 before this leader is
+    // stopped. The later policy version has a zero delay, so the interval
+    // across leadership change also verifies that delivery-policy pinning and
+    // the replicated not-before deadline survive replay.
+    assert!(matches!(
+        request(
+            nodes[initial_leader].broker_addr,
+            Request::PollGroup {
+                stream: "policy-transfer-jobs".to_owned(),
+                consumer: "workers".to_owned(),
+                member: "member-after-expiry".to_owned(),
+            },
+        ),
+        Ok(Response::Empty { .. })
     ));
     sleep(Duration::from_millis(10));
     nodes[initial_leader].stop();
@@ -2284,9 +2307,7 @@ fn three_process_cluster_transfers_consumer_policy_and_delivery_snapshot_after_l
         }
     ));
 
-    // Version 1's immediate expiry and one-attempt budget terminally move the
-    // first delivery. Version 2 would allow a second attempt, so this Empty
-    // response distinguishes the delivery snapshot from current consumer state.
+    // A new leader still honors the not-before deadline pinned to version 1.
     assert!(matches!(
         request(
             nodes[new_leader].broker_addr,
@@ -2298,19 +2319,20 @@ fn three_process_cluster_transfers_consumer_policy_and_delivery_snapshot_after_l
         ),
         Ok(Response::Empty { .. })
     ));
+    sleep(Duration::from_millis(2_600));
     assert!(matches!(
         request(
             nodes[new_leader].broker_addr,
             Request::PollGroup {
-                stream: "policy-transfer-jobs.dead-letter".to_owned(),
-                consumer: "inspector".to_owned(),
-                member: "inspector-1".to_owned(),
+                stream: "policy-transfer-jobs".to_owned(),
+                consumer: "workers".to_owned(),
+                member: "member-after-delay".to_owned(),
             },
         ),
         Ok(Response::Message {
             offset: 0,
             payload,
-            delivery_attempt: Some(1),
+            delivery_attempt: Some(2),
             delivery_token: Some(_),
             ..
         }) if payload == "use-pinned-policy"

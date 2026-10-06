@@ -22,11 +22,12 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::{Notify, RwLock, futures::Notified};
 
 use super::delivery::{
-    GroupBatchPollRequest, GroupConsumerState, dead_letter_stream_name, preview_group_batch,
+    GroupBatchPollRequest, GroupConsumerState, dead_letter_stream_name, group_policy_for_offset,
+    preview_group_batch,
 };
 use super::state_machine::{
     CommandResponse, GroupKind, SnapshotState, StateMachineData, StoredMessage, StreamLifecycle,
-    StreamMetadata, StreamState, apply_command, stream_identity,
+    StreamMetadata, StreamState, apply_command,
 };
 use super::state_machine_journal::{
     FILE as STATE_MACHINE_JOURNAL_FILE, JournalEntryRef as StateMachineJournalEntryRef,
@@ -45,76 +46,44 @@ struct PersistedState {
     version: u32,
     last_applied_log: Option<LogId<NodeId>>,
     last_membership: StoredMembership<NodeId, BasicNode>,
-    streams: BTreeMap<String, PersistedStreamData>,
+    streams: BTreeMap<String, PersistedStream>,
     consumers: Vec<PersistedConsumer>,
-    #[serde(default)]
     group_consumers: Vec<PersistedGroupConsumer>,
-    #[serde(default)]
     lease_clock_ms: u64,
-    #[serde(default)]
     dedup: BTreeMap<String, BTreeMap<String, Offset>>,
-    #[serde(default)]
     redeliveries: u64,
-    #[serde(default)]
     dead_letters: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(super) struct PersistedSnapshotState {
-    #[serde(default = "legacy_format_version")]
     pub(super) version: u32,
-    pub(super) streams: BTreeMap<String, PersistedStreamData>,
+    pub(super) streams: BTreeMap<String, PersistedStream>,
     pub(super) consumers: Vec<PersistedConsumer>,
-    #[serde(default)]
     pub(super) group_consumers: Vec<PersistedGroupConsumer>,
-    #[serde(default)]
     pub(super) lease_clock_ms: u64,
-    #[serde(default)]
     pub(super) dedup: BTreeMap<String, BTreeMap<String, Offset>>,
-    #[serde(default)]
     pub(super) redeliveries: u64,
-    #[serde(default)]
     pub(super) dead_letters: u64,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(untagged)]
-pub(super) enum PersistedStreamData {
-    Legacy(Vec<StoredMessage>),
-    Current(PersistedStream),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(super) struct PersistedStream {
-    #[serde(default)]
     stream_id: String,
-    #[serde(default)]
     group_id: String,
-    #[serde(default)]
-    lifecycle: Option<StreamLifecycle>,
+    lifecycle: StreamLifecycle,
     pub(super) messages: Vec<StoredMessage>,
 }
 
-impl PersistedStreamData {
-    fn into_state(self, stream: &str) -> StreamState {
-        match self {
-            Self::Legacy(messages) => {
-                let (stream_id, group_id) = stream_identity(stream);
-                StreamState {
-                    stream_id,
-                    group_id,
-                    lifecycle: StreamLifecycle::Active,
-                    messages,
-                }
-            }
-            Self::Current(stream_state) => StreamState {
-                stream_id: stream_state.stream_id,
-                group_id: stream_state.group_id,
-                lifecycle: stream_state.lifecycle.unwrap_or_default(),
-                messages: stream_state.messages,
-            },
+impl PersistedStream {
+    fn into_state(self) -> StreamState {
+        StreamState {
+            stream_id: self.stream_id,
+            group_id: self.group_id,
+            lifecycle: self.lifecycle,
+            messages: self.messages,
         }
     }
 }
@@ -394,15 +363,39 @@ fn read_persisted_state(path: &Path) -> Result<Option<PersistedState>, BrokerErr
             path.display()
         ))
     })?;
-    if !matches!(persisted.version, 1 | FORMAT_VERSION) {
+    if persisted.version != FORMAT_VERSION {
         return Err(BrokerError::Cluster(format!(
-            "unsupported state-machine format version {} in '{}' (checkpoint; supported versions: 1 and {})",
+            "unsupported state-machine format version {} in '{}' (checkpoint; supported version {})",
             persisted.version,
             path.display(),
             FORMAT_VERSION
         )));
     }
+    validate_group_consumer_entries(persisted.group_consumers.iter().map(|consumer| {
+        (
+            consumer.stream.as_str(),
+            consumer.consumer.as_str(),
+            &consumer.state,
+        )
+    }))
+    .map_err(|error| {
+        BrokerError::Cluster(format!(
+            "invalid persisted state-machine '{}': {error}",
+            path.display()
+        ))
+    })?;
     Ok(Some(persisted))
+}
+
+fn validate_group_consumer_entries<'a>(
+    entries: impl IntoIterator<Item = (&'a str, &'a str, &'a GroupConsumerState)>,
+) -> Result<(), String> {
+    for (stream, consumer, state) in entries {
+        state
+            .validate_pinned_policies()
+            .map_err(|error| format!("consumer '{stream}/{consumer}': {error}"))?;
+    }
+    Ok(())
 }
 
 fn state_machine_data_from_persisted(persisted: PersistedState) -> StateMachineData {
@@ -413,10 +406,7 @@ fn state_machine_data_from_persisted(persisted: PersistedState) -> StateMachineD
             streams: persisted
                 .streams
                 .into_iter()
-                .map(|(stream, persisted)| {
-                    let state = persisted.into_state(&stream);
-                    (stream, state)
-                })
+                .map(|(stream, persisted)| (stream, persisted.into_state()))
                 .collect(),
             consumers: persisted
                 .consumers
@@ -489,6 +479,19 @@ impl StateMachineStore {
         let journal_path = path.join(STATE_MACHINE_JOURNAL_FILE);
         let journal_entries = read_state_machine_journal(&journal_path)?;
         replay_state_machine_journal(&mut state, journal_entries, &kind)?;
+        validate_group_consumer_entries(
+            state
+                .state
+                .group_consumers
+                .iter()
+                .map(|((stream, consumer), state)| (stream.as_str(), consumer.as_str(), state)),
+        )
+        .map_err(|error| {
+            BrokerError::Cluster(format!(
+                "invalid recovered state-machine '{}': {error}",
+                path.display()
+            ))
+        })?;
         fs::create_dir_all(&path)?;
         let journal = fs::OpenOptions::new()
             .create(true)
@@ -516,23 +519,61 @@ impl StateMachineStore {
     pub(super) async fn preview_group_batch(
         &self,
         request: GroupBatchPollRequest,
-    ) -> Result<(CommandResponse, Option<u64>), BrokerError> {
+    ) -> Result<(CommandResponse, Option<u64>, bool), BrokerError> {
         let state = self.state.read().await;
         let effective_now_ms = state.state.lease_clock_ms.max(request.now_ms);
-        let next_expiry_ms = state
+        let consumer = state
             .state
             .group_consumers
-            .get(&(request.stream.clone(), request.consumer.clone()))
-            .and_then(|consumer| {
-                consumer
-                    .in_flight
-                    .values()
-                    .map(|delivery| delivery.deadline_ms)
-                    .filter(|deadline| *deadline > effective_now_ms)
-                    .min()
-            });
+            .get(&(request.stream.clone(), request.consumer.clone()));
+        let next_lease_expiry_ms = consumer.and_then(|consumer| {
+            consumer
+                .in_flight
+                .values()
+                .map(|delivery| delivery.deadline_ms)
+                .filter(|deadline| *deadline > effective_now_ms)
+                .min()
+        });
+        let next_retry_ms = consumer.and_then(|consumer| {
+            consumer
+                .retry_not_before
+                .values()
+                .map(|schedule| schedule.retry_not_before_ms)
+                .filter(|deadline| *deadline > effective_now_ms)
+                .min()
+        });
+        let next_expiry_ms = next_lease_expiry_ms.into_iter().chain(next_retry_ms).min();
+        let legacy_policy = ConsumerPolicy::legacy(
+            request.legacy_ack_timeout_ms.unwrap_or_default(),
+            request.max_delivery_attempts,
+        );
+        let needs_retry_schedule = consumer.is_some_and(|consumer| {
+            consumer.in_flight.iter().any(|(offset, delivery)| {
+                if delivery.deadline_ms > effective_now_ms
+                    || consumer.retry_not_before.contains_key(offset)
+                {
+                    return false;
+                }
+                let attempts = consumer
+                    .delivery_attempts
+                    .get(offset)
+                    .copied()
+                    .unwrap_or_default();
+                let policy = group_policy_for_offset(
+                    consumer,
+                    *offset,
+                    attempts,
+                    &legacy_policy,
+                    request.policy_version,
+                );
+                policy.retry_delay_ms > 0
+                    && !policy
+                        .max_delivery_attempts
+                        .is_some_and(|maximum| attempts >= maximum)
+            })
+        });
         let response = preview_group_batch(&state.state, request, &self.kind);
-        Ok((response, next_expiry_ms))
+        Ok((response, next_expiry_ms, needs_retry_schedule))
     }
 
     fn persist_journal(&self, entries: &[Entry<TypeConfig>]) -> Result<(), StorageError<NodeId>> {
@@ -1045,15 +1086,23 @@ pub(super) fn validate_snapshot_data(
 ) -> Result<PersistedSnapshotState, std::io::Error> {
     let persisted: PersistedSnapshotState = serde_json::from_slice(data)
         .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
-    if !matches!(persisted.version, 1 | FORMAT_VERSION) {
+    if persisted.version != FORMAT_VERSION {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
             format!(
-                "unsupported snapshot format version {} (supported versions: 1 and {})",
+                "unsupported snapshot format version {} (supported version {})",
                 persisted.version, FORMAT_VERSION
             ),
         ));
     }
+    validate_group_consumer_entries(persisted.group_consumers.iter().map(|consumer| {
+        (
+            consumer.stream.as_str(),
+            consumer.consumer.as_str(),
+            &consumer.state,
+        )
+    }))
+    .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
     Ok(persisted)
 }
 
@@ -1062,10 +1111,7 @@ pub(super) fn snapshot_state_from_persisted(persisted: PersistedSnapshotState) -
         streams: persisted
             .streams
             .into_iter()
-            .map(|(stream, persisted)| {
-                let state = persisted.into_state(&stream);
-                (stream, state)
-            })
+            .map(|(stream, persisted)| (stream, persisted.into_state()))
             .collect(),
         consumers: persisted
             .consumers
@@ -1082,10 +1128,6 @@ pub(super) fn snapshot_state_from_persisted(persisted: PersistedSnapshotState) -
         redeliveries: persisted.redeliveries,
         dead_letters: persisted.dead_letters,
     }
-}
-
-fn legacy_format_version() -> u32 {
-    1
 }
 
 #[cfg(test)]
@@ -1167,6 +1209,36 @@ mod tests {
         serde_json::to_vec(&PersistedSnapshotStateRef::new(&state)).unwrap()
     }
 
+    #[test]
+    fn attempted_offset_without_pinned_policy_fails_closed_without_mutation() {
+        let directory = tempfile::tempdir().unwrap();
+        let state_directory = directory.path().join("state-machine");
+        fs::create_dir_all(&state_directory).unwrap();
+        let mut state = SnapshotState::default();
+        let mut consumer_state = GroupConsumerState::default();
+        consumer_state.delivery_attempts.insert(0, 1);
+        state
+            .group_consumers
+            .insert(("events".to_owned(), "workers".to_owned()), consumer_state);
+        let data = serde_json::to_vec(&PersistedSnapshotStateRef::new(&state)).unwrap();
+        let snapshot_path = state_directory.join("snapshot.json");
+        let snapshot = serde_json::to_vec(&StoredSnapshot {
+            meta: snapshot_meta(1, "missing-pinned-policy"),
+            data,
+        })
+        .unwrap();
+        fs::write(&snapshot_path, &snapshot).unwrap();
+
+        let Err(error) = StateMachineStore::open(&state_directory, GroupKind::Combined) else {
+            panic!("attempt without a pinned policy must be rejected");
+        };
+
+        assert!(error.to_string().contains("attempts and pinned policies"));
+        assert_eq!(fs::read(snapshot_path).unwrap(), snapshot);
+        assert!(!state_directory.join("state-machine.json").exists());
+        assert!(!state_directory.join(STATE_MACHINE_JOURNAL_FILE).exists());
+    }
+
     #[tokio::test]
     async fn failed_snapshot_persistence_keeps_previous_state_and_recovers_checkpoint() {
         let directory = tempfile::tempdir().unwrap();
@@ -1214,6 +1286,153 @@ mod tests {
         let state = reopened.state.read().await;
         let message = &state.state.streams["events"].messages[0];
         assert_eq!(message.payload, b"first");
+    }
+
+    #[tokio::test]
+    async fn retry_deadline_survives_cluster_snapshot_recovery() {
+        let directory = tempfile::tempdir().unwrap();
+        let state_directory = directory.path().join("state-machine");
+        let store =
+            Arc::new(StateMachineStore::open(&state_directory, GroupKind::Combined).unwrap());
+        let mut state_machine = store.clone();
+        state_machine
+            .install_snapshot(
+                &snapshot_meta(1, "retry-delay-seed"),
+                Box::new(Cursor::new(snapshot_data(b"retry-me"))),
+            )
+            .await
+            .unwrap();
+
+        let configured = state_machine
+            .apply(std::iter::once(Entry {
+                log_id: LogId {
+                    leader_id: openraft::CommittedLeaderId::new(1, 1),
+                    index: 2,
+                },
+                payload: EntryPayload::Normal(crate::Command::ConfigureConsumer {
+                    stream: "events".to_owned(),
+                    consumer: "workers".to_owned(),
+                    ack_timeout_ms: 0,
+                    max_delivery_attempts: None,
+                    retry_delay_ms: 100,
+                }),
+            }))
+            .await
+            .unwrap();
+        assert!(matches!(
+            configured.as_slice(),
+            [CommandResponse::ConsumerPolicy { policy }]
+                if policy.version == 1 && policy.retry_delay_ms == 100
+        ));
+
+        let first = state_machine
+            .apply(std::iter::once(Entry {
+                log_id: LogId {
+                    leader_id: openraft::CommittedLeaderId::new(1, 1),
+                    index: 3,
+                },
+                payload: EntryPayload::Normal(crate::Command::PollGroup {
+                    stream: "events".to_owned(),
+                    consumer: "workers".to_owned(),
+                    member: "member-a".to_owned(),
+                    now_ms: 100,
+                    lease_deadline_ms: 100,
+                    max_delivery_attempts: None,
+                    legacy_ack_timeout_ms: Some(0),
+                    policy_version: Some(1),
+                }),
+            }))
+            .await
+            .unwrap();
+        let token = match &first[0] {
+            CommandResponse::GroupPoll {
+                result: PollResult::Message(message),
+            } => message.delivery_token.clone().unwrap(),
+            response => panic!("unexpected first delivery: {response:?}"),
+        };
+        let stale_ack = state_machine
+            .apply(std::iter::once(Entry {
+                log_id: LogId {
+                    leader_id: openraft::CommittedLeaderId::new(1, 1),
+                    index: 4,
+                },
+                payload: EntryPayload::Normal(crate::Command::AckGroup {
+                    stream: "events".to_owned(),
+                    consumer: "workers".to_owned(),
+                    member: "member-a".to_owned(),
+                    offset: 0,
+                    delivery_token: token,
+                    now_ms: 100,
+                }),
+            }))
+            .await
+            .unwrap();
+        assert!(matches!(
+            stale_ack.as_slice(),
+            [CommandResponse::GroupStaleDelivery { offset: 0, .. }]
+        ));
+
+        let deadline = store.state.read().await.state.group_consumers
+            [&("events".to_owned(), "workers".to_owned())]
+            .retry_not_before[&0]
+            .retry_not_before_ms;
+        assert_eq!(deadline, 200);
+
+        let mut snapshot_builder = store.clone();
+        snapshot_builder.build_snapshot().await.unwrap();
+        drop(snapshot_builder);
+        drop(state_machine);
+        drop(store);
+
+        let recovered =
+            Arc::new(StateMachineStore::open(&state_directory, GroupKind::Combined).unwrap());
+        let mut recovered_machine = recovered.clone();
+        let recovered_deadline = recovered.state.read().await.state.group_consumers
+            [&("events".to_owned(), "workers".to_owned())]
+            .retry_not_before[&0]
+            .retry_not_before_ms;
+        assert_eq!(recovered_deadline, deadline);
+
+        for (index, now_ms, expected_attempt) in [(5, 199, None), (6, 200, Some(2))] {
+            let responses = recovered_machine
+                .apply(std::iter::once(Entry {
+                    log_id: LogId {
+                        leader_id: openraft::CommittedLeaderId::new(1, 1),
+                        index,
+                    },
+                    payload: EntryPayload::Normal(crate::Command::PollGroup {
+                        stream: "events".to_owned(),
+                        consumer: "workers".to_owned(),
+                        member: format!("member-{index}"),
+                        now_ms,
+                        lease_deadline_ms: now_ms,
+                        max_delivery_attempts: None,
+                        legacy_ack_timeout_ms: Some(0),
+                        policy_version: Some(1),
+                    }),
+                }))
+                .await
+                .unwrap();
+            match (&responses[0], expected_attempt) {
+                (
+                    CommandResponse::GroupPoll {
+                        result: PollResult::Empty,
+                    },
+                    None,
+                ) => {}
+                (
+                    CommandResponse::GroupPoll {
+                        result: PollResult::Message(message),
+                    },
+                    Some(expected),
+                ) => assert_eq!(message.delivery_attempt, Some(expected)),
+                (response, expected) => {
+                    panic!(
+                        "unexpected response before/at retry deadline {expected:?}: {response:?}"
+                    )
+                }
+            }
+        }
     }
 
     #[tokio::test]
@@ -1279,208 +1498,5 @@ mod tests {
             .expect("reopen must select the complete newer persisted snapshot");
         assert_eq!(recovered_snapshot.meta, second_meta);
         assert_eq!(recovered_snapshot.snapshot.into_inner(), second_data);
-    }
-
-    #[tokio::test]
-    async fn legacy_snapshot_defaults_lease_floor_and_applied_commands_advance_it() {
-        let directory = tempfile::tempdir().unwrap();
-        let state_directory = directory.path().join("state-machine");
-        let kind = GroupKind::Data {
-            stream: "events".to_owned(),
-            stream_id: "stream/events".to_owned(),
-            group_id: "group/events/data".to_owned(),
-        };
-        let store = Arc::new(StateMachineStore::open(&state_directory, kind.clone()).unwrap());
-        let legacy_snapshot_value = serde_json::json!({
-            "version": 1,
-            "streams": {
-                "events": [{
-                    "key": null,
-                    "payload": [108, 101, 103, 97, 99, 121],
-                    "published_at_ms": 1
-                }]
-            },
-            "consumers": []
-        });
-        assert_eq!(legacy_snapshot_value["version"], 1);
-        assert!(legacy_snapshot_value.get("lease_clock_ms").is_none());
-        let legacy_snapshot = serde_json::to_vec(&legacy_snapshot_value).unwrap();
-        let snapshot_meta = snapshot_meta(1, "legacy-lease-floor");
-
-        let mut state_machine = store.clone();
-        state_machine
-            .install_snapshot(
-                &snapshot_meta,
-                Box::new(Cursor::new(legacy_snapshot.clone())),
-            )
-            .await
-            .unwrap();
-
-        assert_eq!(store.state.read().await.state.lease_clock_ms, 0);
-
-        let poll_responses = state_machine
-            .apply(std::iter::once(Entry {
-                log_id: LogId {
-                    leader_id: openraft::CommittedLeaderId::new(1, 1),
-                    index: 2,
-                },
-                payload: EntryPayload::Normal(crate::Command::PollGroup {
-                    stream: "events".to_owned(),
-                    consumer: "workers".to_owned(),
-                    member: "member-a".to_owned(),
-                    now_ms: 125,
-                    lease_deadline_ms: 250,
-                    max_delivery_attempts: None,
-                    legacy_ack_timeout_ms: None,
-                    policy_version: None,
-                }),
-            }))
-            .await
-            .unwrap();
-        let delivery_token = match &poll_responses[0] {
-            CommandResponse::GroupPoll {
-                result: PollResult::Message(message),
-            } => message
-                .delivery_token
-                .clone()
-                .expect("poll should create a lease"),
-            response => panic!("unexpected poll response: {response:?}"),
-        };
-        assert_eq!(store.state.read().await.state.lease_clock_ms, 125);
-
-        let stale_ack = state_machine
-            .apply(std::iter::once(Entry {
-                log_id: LogId {
-                    leader_id: openraft::CommittedLeaderId::new(1, 1),
-                    index: 3,
-                },
-                payload: EntryPayload::Normal(crate::Command::AckGroup {
-                    stream: "events".to_owned(),
-                    consumer: "workers".to_owned(),
-                    member: "member-b".to_owned(),
-                    offset: 0,
-                    delivery_token,
-                    now_ms: 175,
-                }),
-            }))
-            .await
-            .unwrap();
-        assert_eq!(
-            stale_ack,
-            vec![CommandResponse::GroupStaleDelivery {
-                consumer: "workers".to_owned(),
-                offset: 0,
-            }]
-        );
-        assert_eq!(store.state.read().await.state.lease_clock_ms, 175);
-
-        drop(state_machine);
-        drop(store);
-        let recovered = StateMachineStore::open(&state_directory, kind).unwrap();
-        let state = recovered.state.read().await;
-        assert_eq!(state.state.lease_clock_ms, 175);
-        let delivery = state.state.group_consumers[&("events".to_owned(), "workers".to_owned())]
-            .in_flight
-            .get(&0)
-            .expect("stale member acknowledgement must leave the live lease intact");
-        assert_eq!(delivery.member, "member-a");
-        assert_eq!(delivery.deadline_ms, 250);
-    }
-
-    #[tokio::test]
-    async fn legacy_checkpoint_defaults_lease_floor_and_group_poll_survives_replay() {
-        let directory = tempfile::tempdir().unwrap();
-        let state_directory = directory.path().join("state-machine");
-        fs::create_dir_all(&state_directory).unwrap();
-        let kind = GroupKind::Data {
-            stream: "events".to_owned(),
-            stream_id: "stream/events".to_owned(),
-            group_id: "group/events/data".to_owned(),
-        };
-        let checkpoint_log_id = LogId {
-            leader_id: openraft::CommittedLeaderId::new(1, 1),
-            index: 1,
-        };
-        let legacy_checkpoint = serde_json::json!({
-            "version": 1,
-            "last_applied_log": serde_json::to_value(checkpoint_log_id).unwrap(),
-            "last_membership": serde_json::to_value(
-                StoredMembership::<NodeId, BasicNode>::default()
-            )
-            .unwrap(),
-            "streams": {
-                "events": [{
-                    "key": null,
-                    "payload": [108, 101, 103, 97, 99, 121],
-                    "published_at_ms": 1
-                }]
-            },
-            "consumers": []
-        });
-        assert_eq!(legacy_checkpoint["version"], 1);
-        assert!(legacy_checkpoint.get("lease_clock_ms").is_none());
-        fs::write(
-            state_directory.join("state-machine.json"),
-            serde_json::to_vec(&legacy_checkpoint).unwrap(),
-        )
-        .unwrap();
-
-        let store = Arc::new(StateMachineStore::open(&state_directory, kind.clone()).unwrap());
-        {
-            let state = store.state.read().await;
-            assert_eq!(state.last_applied_log, Some(checkpoint_log_id));
-            assert_eq!(state.state.lease_clock_ms, 0);
-            assert_eq!(state.state.streams["events"].messages[0].payload, b"legacy");
-        }
-
-        let log_id = LogId {
-            leader_id: openraft::CommittedLeaderId::new(1, 1),
-            index: 2,
-        };
-        let mut state_machine = store.clone();
-        let responses = state_machine
-            .apply(std::iter::once(Entry {
-                log_id,
-                payload: EntryPayload::Normal(crate::Command::PollGroup {
-                    stream: "events".to_owned(),
-                    consumer: "workers".to_owned(),
-                    member: "member-a".to_owned(),
-                    now_ms: 125,
-                    lease_deadline_ms: 250,
-                    max_delivery_attempts: None,
-                    legacy_ack_timeout_ms: None,
-                    policy_version: None,
-                }),
-            }))
-            .await
-            .unwrap();
-        let delivery_token = match &responses[0] {
-            CommandResponse::GroupPoll {
-                result: PollResult::Message(message),
-            } => message
-                .delivery_token
-                .clone()
-                .expect("poll should create a lease"),
-            response => panic!("unexpected poll response: {response:?}"),
-        };
-        {
-            let state = store.state.read().await;
-            assert_eq!(state.state.lease_clock_ms, 125);
-            assert_eq!(state.last_applied_log, Some(log_id));
-        }
-
-        drop(state_machine);
-        drop(store);
-        let recovered = StateMachineStore::open(&state_directory, kind).unwrap();
-        let state = recovered.state.read().await;
-        assert_eq!(state.state.lease_clock_ms, 125);
-        assert_eq!(state.last_applied_log, Some(log_id));
-        let delivery = state.state.group_consumers[&("events".to_owned(), "workers".to_owned())]
-            .in_flight
-            .get(&0)
-            .expect("journal replay must retain the grouped poll lease");
-        assert_eq!(delivery.member, "member-a");
-        assert_eq!(delivery.deadline_ms, 250);
-        assert_eq!(delivery.delivery_token, delivery_token);
     }
 }

@@ -226,9 +226,16 @@ async fn handle_forwarded(
             consumer,
             ack_timeout_ms,
             max_delivery_attempts,
+            retry_delay_ms,
         } => ForwardedResponse::ConsumerPolicy(
             manager
-                .configure_consumer_local(stream, consumer, ack_timeout_ms, max_delivery_attempts)
+                .configure_consumer_local(
+                    stream,
+                    consumer,
+                    ack_timeout_ms,
+                    max_delivery_attempts,
+                    retry_delay_ms,
+                )
                 .await
                 .map_err(forward_error),
         ),

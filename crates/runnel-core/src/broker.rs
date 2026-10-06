@@ -3,7 +3,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::sync::Notify;
 
 #[cfg(feature = "instrumentation")]
@@ -20,7 +20,9 @@ use std::io;
 #[cfg(test)]
 use std::sync::atomic::AtomicBool;
 
-use super::consumer_state::{ConsumerState, ConsumerStateEvent, persist_consumer_event};
+use super::consumer_state::{
+    ConsumerState, ConsumerStateEvent, RetryScheduleEvent, persist_consumer_event,
+};
 use super::delivery_state::{DeliveryState, DeliveryTokenGenerator, InFlight};
 use super::storage::StorageExecutor;
 use super::stream_log::{RecordIndex, StreamLog};
@@ -69,17 +71,6 @@ impl StreamState {
             delivery: DeliveryState::new(),
             availability: Arc::new(Notify::new()),
         }
-    }
-
-    fn find_candidate(
-        &mut self,
-        consumer: &str,
-        committed_offset: Offset,
-        acknowledged_offsets: &BTreeSet<Offset>,
-    ) -> Result<Option<RecordIndex>, BrokerError> {
-        let in_flight = self.delivery.in_flight_filter(consumer);
-        self.log
-            .find_candidate(committed_offset, acknowledged_offsets, in_flight)
     }
 
     fn find_candidate_excluding(
@@ -308,10 +299,11 @@ impl Broker {
         consumer: &str,
         ack_timeout_ms: u64,
         max_delivery_attempts: Option<u32>,
+        retry_delay_ms: u64,
     ) -> Result<ConsumerPolicy, BrokerError> {
         validate_name("stream", stream)?;
         validate_name("consumer", consumer)?;
-        validate_consumer_policy(ack_timeout_ms, max_delivery_attempts)?;
+        validate_consumer_policy(ack_timeout_ms, max_delivery_attempts, retry_delay_ms)?;
         let stream_state = self.get_stream(stream)?;
         let mut stream_state = self.lock_stream(&stream_state)?;
         let root = self.inner.root.clone();
@@ -321,6 +313,7 @@ impl Broker {
         if let Some(current) = consumer_state.policy.as_ref()
             && current.ack_timeout_ms == ack_timeout_ms
             && current.max_delivery_attempts == max_delivery_attempts
+            && current.retry_delay_ms == retry_delay_ms
         {
             return Ok(current.clone());
         }
@@ -334,7 +327,12 @@ impl Broker {
                 "consumer policy version exhausted".to_owned(),
             ));
         }
-        let policy = ConsumerPolicy::configured(version, ack_timeout_ms, max_delivery_attempts);
+        let policy = ConsumerPolicy::configured(
+            version,
+            ack_timeout_ms,
+            max_delivery_attempts,
+            retry_delay_ms,
+        );
         if let Err(error) = persist_consumer_event(
             &root,
             stream,
@@ -412,10 +410,23 @@ impl Broker {
         let mut stream_state = self.lock_stream(&stream_state)?;
         let root = self.inner.root.clone();
         let now = Instant::now();
-        if stream_state.delivery.expire(now) {
-            stream_state.availability.notify_waiters();
-        }
-
+        let legacy_policy = ConsumerPolicy::legacy(
+            self.inner.ack_timeout.as_millis().min(u128::from(u64::MAX)) as u64,
+            self.inner.max_delivery_attempts,
+        );
+        let mut consumer_state = stream_state
+            .delivery
+            .load_consumer_state_for_request(&root, stream, consumer)?;
+        let now_ms = wall_clock_ms();
+        observe_expired_deliveries(
+            &mut stream_state,
+            &root,
+            stream,
+            consumer,
+            &mut consumer_state,
+            &legacy_policy,
+            now,
+        )?;
         if let Some(in_flight) = stream_state.delivery.member_delivery(consumer, member)? {
             let mut message = stream_state.log.read_message(stream, in_flight.offset())?;
             message.delivery_token = Some(in_flight.delivery_token().to_owned());
@@ -423,18 +434,14 @@ impl Broker {
             return Ok(PollResult::Message(message));
         }
 
-        let mut consumer_state = stream_state
-            .delivery
-            .load_consumer_state_for_request(&root, stream, consumer)?;
-        let legacy_policy = ConsumerPolicy::legacy(
-            self.inner.ack_timeout.as_millis().min(u128::from(u64::MAX)) as u64,
-            self.inner.max_delivery_attempts,
-        );
+        let (mut retry_offsets, mut retry_keys) = consumer_state.retry_filter(now_ms);
         loop {
-            let candidate = stream_state.find_candidate(
+            let candidate = stream_state.find_candidate_excluding(
                 consumer,
                 consumer_state.committed_offset,
                 &consumer_state.acknowledged_offsets,
+                &retry_offsets,
+                &retry_keys,
             )?;
             let Some(candidate) = candidate else {
                 return Ok(PollResult::Empty);
@@ -445,7 +452,37 @@ impl Broker {
                 .get(&candidate.offset)
                 .copied()
                 .unwrap_or(0);
-            let policy = consumer_state.policy_for_offset(candidate.offset, &legacy_policy);
+            let policy = consumer_state.policy_for_offset(candidate.offset, &legacy_policy)?;
+            if attempts > 0
+                && !consumer_state
+                    .retry_not_before
+                    .contains_key(&candidate.offset)
+                && stream_state
+                    .delivery
+                    .get_in_flight(consumer, candidate.offset)
+                    .is_none()
+            {
+                let delayed = schedule_orphan_retry(
+                    &mut stream_state,
+                    &root,
+                    stream,
+                    consumer,
+                    &mut consumer_state,
+                    &legacy_policy,
+                    candidate.offset,
+                )?;
+                if delayed {
+                    retry_offsets.insert(candidate.offset);
+                    if let Some(key) = consumer_state
+                        .retry_not_before
+                        .get(&candidate.offset)
+                        .and_then(|schedule| schedule.key.as_ref())
+                    {
+                        retry_keys.insert(key.clone());
+                    }
+                    continue;
+                }
+            }
             if policy
                 .max_delivery_attempts
                 .is_some_and(|max_attempts| attempts >= max_attempts)
@@ -484,7 +521,7 @@ impl Broker {
                 ConsumerStateEvent::DeliveryAttempt {
                     offset: candidate.offset,
                     attempt: delivery_attempt,
-                    policy: Some(policy.clone()),
+                    policy: policy.clone(),
                 },
             ) {
                 stream_state
@@ -495,6 +532,7 @@ impl Broker {
             consumer_state
                 .delivery_attempts
                 .insert(candidate.offset, delivery_attempt);
+            consumer_state.retry_not_before.remove(&candidate.offset);
             consumer_state
                 .delivery_policies
                 .entry(candidate.offset)
@@ -619,13 +657,24 @@ impl Broker {
         let stream_state = self.get_stream(stream)?;
         let mut stream_state = self.lock_stream(&stream_state)?;
         let now = Instant::now();
-        if stream_state.delivery.expire(now) {
-            stream_state.availability.notify_waiters();
-        }
         let root = self.inner.root.clone();
+        let legacy_policy = ConsumerPolicy::legacy(
+            self.inner.ack_timeout.as_millis().min(u128::from(u64::MAX)) as u64,
+            self.inner.max_delivery_attempts,
+        );
         let mut consumer_state = stream_state
             .delivery
             .load_consumer_state_for_request(&root, stream, consumer)?;
+        let now_ms = wall_clock_ms();
+        observe_expired_deliveries(
+            &mut stream_state,
+            &root,
+            stream,
+            consumer,
+            &mut consumer_state,
+            &legacy_policy,
+            now,
+        )?;
 
         let existing = stream_state.delivery.member_deliveries(consumer, member)?;
         if !existing.is_empty() {
@@ -652,12 +701,9 @@ impl Broker {
             return Ok(PollBatchStep::Complete(messages));
         }
 
-        let legacy_policy = ConsumerPolicy::legacy(
-            self.inner.ack_timeout.as_millis().min(u128::from(u64::MAX)) as u64,
-            self.inner.max_delivery_attempts,
-        );
-        let mut extra_offsets = HashSet::with_capacity(limits.max_records);
-        let mut extra_keys = HashSet::with_capacity(limits.max_records);
+        let (mut extra_offsets, mut extra_keys) = consumer_state.retry_filter(now_ms);
+        extra_offsets.reserve(limits.max_records);
+        extra_keys.reserve(limits.max_records);
         let mut pending = Vec::with_capacity(limits.max_records);
         let mut sizer = PollBatchResponseSizer::new(stream, consumer, response_member);
         let is_waiting = limits.max_wait_ms > 0 && deadline.is_none_or(|deadline| now < deadline);
@@ -680,7 +726,35 @@ impl Broker {
                 .get(&candidate.offset)
                 .copied()
                 .unwrap_or_default();
-            let policy = consumer_state.policy_for_offset(candidate.offset, &legacy_policy);
+            let policy = consumer_state.policy_for_offset(candidate.offset, &legacy_policy)?;
+            if attempts > 0
+                && !consumer_state
+                    .retry_not_before
+                    .contains_key(&candidate.offset)
+                && stream_state
+                    .delivery
+                    .get_in_flight(consumer, candidate.offset)
+                    .is_none()
+            {
+                let delayed = schedule_orphan_retry(
+                    &mut stream_state,
+                    &root,
+                    stream,
+                    consumer,
+                    &mut consumer_state,
+                    &legacy_policy,
+                    candidate.offset,
+                )?;
+                if delayed {
+                    if let Some(schedule) = consumer_state.retry_not_before.get(&candidate.offset) {
+                        extra_offsets.insert(candidate.offset);
+                        if let Some(key) = schedule.key.as_ref() {
+                            extra_keys.insert(key.clone());
+                        }
+                    }
+                    continue;
+                }
+            }
             if policy
                 .max_delivery_attempts
                 .is_some_and(|maximum| attempts >= maximum)
@@ -743,7 +817,12 @@ impl Broker {
         let byte_limit_reached = stopped_at_byte_limit || sizer.encoded_len() >= limits.max_bytes;
         if is_waiting && !deadline_reached && !record_limit_reached && !byte_limit_reached {
             return Ok(PollBatchStep::Waiting {
-                next_expiry: stream_state.delivery.next_deadline_for_consumer(consumer),
+                next_expiry: next_consumer_wake(
+                    &stream_state.delivery,
+                    consumer,
+                    &consumer_state,
+                    now_ms,
+                ),
             });
         }
         if pending.is_empty() {
@@ -777,6 +856,9 @@ impl Broker {
             consumer_state
                 .delivery_attempts
                 .insert(delivery.message.offset, delivery.attempt);
+            consumer_state
+                .retry_not_before
+                .remove(&delivery.message.offset);
             consumer_state
                 .delivery_policies
                 .entry(delivery.message.offset)
@@ -834,13 +916,41 @@ impl Broker {
         let mut consumer_state = stream_state
             .delivery
             .load_consumer_state_for_request(&root, stream, consumer)?;
-        if stream_state.delivery.expire(Instant::now()) {
-            stream_state.availability.notify_waiters();
-        }
+        let legacy_policy = ConsumerPolicy::legacy(
+            self.inner.ack_timeout.as_millis().min(u128::from(u64::MAX)) as u64,
+            self.inner.max_delivery_attempts,
+        );
+        observe_expired_deliveries(
+            &mut stream_state,
+            &root,
+            stream,
+            consumer,
+            &mut consumer_state,
+            &legacy_policy,
+            Instant::now(),
+        )?;
 
         let mut valid_offsets = Vec::new();
         let mut outcomes = Vec::with_capacity(receipts.len());
         for receipt in receipts {
+            if consumer_state
+                .delivery_attempts
+                .contains_key(&receipt.offset)
+                && stream_state
+                    .delivery
+                    .get_in_flight(consumer, receipt.offset)
+                    .is_none()
+            {
+                schedule_orphan_retry(
+                    &mut stream_state,
+                    &root,
+                    stream,
+                    consumer,
+                    &mut consumer_state,
+                    &legacy_policy,
+                    receipt.offset,
+                )?;
+            }
             let outcome = if receipt.offset < consumer_state.committed_offset
                 || consumer_state
                     .acknowledged_offsets
@@ -942,10 +1052,20 @@ impl Broker {
         let mut consumer_state = stream_state
             .delivery
             .load_consumer_state_for_request(&root, stream, consumer)?;
+        let legacy_policy = ConsumerPolicy::legacy(
+            self.inner.ack_timeout.as_millis().min(u128::from(u64::MAX)) as u64,
+            self.inner.max_delivery_attempts,
+        );
         // An acknowledgement observes lease expiry even before reassignment.
-        if stream_state.delivery.expire(Instant::now()) {
-            stream_state.availability.notify_waiters();
-        }
+        observe_expired_deliveries(
+            &mut stream_state,
+            &root,
+            stream,
+            consumer,
+            &mut consumer_state,
+            &legacy_policy,
+            Instant::now(),
+        )?;
         if offset < consumer_state.committed_offset {
             return Ok(AckResult::AlreadyAcknowledged);
         }
@@ -953,6 +1073,17 @@ impl Broker {
             return Ok(AckResult::AlreadyAcknowledged);
         }
         let Some(in_flight) = stream_state.delivery.get_in_flight(consumer, offset) else {
+            if consumer_state.delivery_attempts.contains_key(&offset) {
+                schedule_orphan_retry(
+                    &mut stream_state,
+                    &root,
+                    stream,
+                    consumer,
+                    &mut consumer_state,
+                    &legacy_policy,
+                    offset,
+                )?;
+            }
             if !delivery_token.is_empty() {
                 return Err(BrokerError::StaleDelivery {
                     consumer: consumer.to_owned(),
@@ -1237,4 +1368,178 @@ impl Broker {
             .fail_next_consumer_batch_event_partial_append
             .store(true, Ordering::Release);
     }
+}
+
+fn observe_expired_deliveries(
+    stream_state: &mut StreamState,
+    root: &Path,
+    stream: &str,
+    consumer: &str,
+    consumer_state: &mut ConsumerState,
+    legacy_policy: &ConsumerPolicy,
+    now: Instant,
+) -> Result<(), BrokerError> {
+    let expired = stream_state.delivery.expired_deliveries(consumer, now);
+    if expired.is_empty() {
+        return Ok(());
+    }
+
+    let observed_at_ms = wall_clock_ms();
+
+    let mut schedules = Vec::with_capacity(expired.len());
+    for delivery in &expired {
+        let offset = delivery.offset();
+        if consumer_state.retry_not_before.contains_key(&offset) {
+            continue;
+        }
+        let attempts = consumer_state
+            .delivery_attempts
+            .get(&offset)
+            .copied()
+            .unwrap_or_default();
+        let policy = consumer_state.policy_for_offset(offset, legacy_policy)?;
+        if policy
+            .max_delivery_attempts
+            .is_some_and(|maximum| attempts >= maximum)
+            || policy.retry_delay_ms == 0
+        {
+            continue;
+        }
+        schedules.push(RetryScheduleEvent {
+            offset,
+            retry_not_before_ms: observed_at_ms.saturating_add(policy.retry_delay_ms),
+            key: delivery.key().map(str::to_owned),
+        });
+    }
+
+    if !schedules.is_empty() {
+        if let Err(error) = persist_consumer_event(
+            root,
+            stream,
+            consumer,
+            consumer_state,
+            ConsumerStateEvent::RetrySchedules {
+                schedules: schedules
+                    .iter()
+                    .map(|schedule| RetryScheduleEvent {
+                        offset: schedule.offset,
+                        retry_not_before_ms: schedule.retry_not_before_ms,
+                        key: schedule.key.clone(),
+                    })
+                    .collect(),
+            },
+        ) {
+            stream_state
+                .delivery
+                .mark_consumer_needs_reconcile(consumer);
+            return Err(error);
+        }
+        for schedule in schedules {
+            consumer_state
+                .retry_not_before
+                .entry(schedule.offset)
+                .or_insert(super::consumer_state::RetrySchedule {
+                    retry_not_before_ms: schedule.retry_not_before_ms,
+                    key: schedule.key,
+                });
+        }
+        stream_state
+            .delivery
+            .cache_consumer_state(consumer.to_owned(), consumer_state.clone());
+    }
+
+    for delivery in expired {
+        stream_state.delivery.remove(consumer, delivery.offset());
+    }
+    stream_state.availability.notify_waiters();
+    Ok(())
+}
+
+fn schedule_orphan_retry(
+    stream_state: &mut StreamState,
+    root: &Path,
+    stream: &str,
+    consumer: &str,
+    consumer_state: &mut ConsumerState,
+    legacy_policy: &ConsumerPolicy,
+    offset: Offset,
+) -> Result<bool, BrokerError> {
+    if consumer_state.retry_not_before.contains_key(&offset) {
+        return Ok(false);
+    }
+    let attempts = consumer_state
+        .delivery_attempts
+        .get(&offset)
+        .copied()
+        .unwrap_or_default();
+    if attempts == 0 {
+        return Ok(false);
+    }
+    let policy = consumer_state.policy_for_offset(offset, legacy_policy)?;
+    if policy
+        .max_delivery_attempts
+        .is_some_and(|maximum| attempts >= maximum)
+        || policy.retry_delay_ms == 0
+    {
+        return Ok(false);
+    }
+    let key = stream_state.log.find_record(offset)?.into_key();
+    let observed_at_ms = wall_clock_ms();
+    let retry_not_before_ms = observed_at_ms.saturating_add(policy.retry_delay_ms);
+    let schedule = RetryScheduleEvent {
+        offset,
+        retry_not_before_ms,
+        key: key.clone(),
+    };
+    if let Err(error) = persist_consumer_event(
+        root,
+        stream,
+        consumer,
+        consumer_state,
+        ConsumerStateEvent::RetrySchedules {
+            schedules: vec![schedule],
+        },
+    ) {
+        stream_state
+            .delivery
+            .mark_consumer_needs_reconcile(consumer);
+        return Err(error);
+    }
+    consumer_state.retry_not_before.insert(
+        offset,
+        super::consumer_state::RetrySchedule {
+            retry_not_before_ms,
+            key,
+        },
+    );
+    stream_state
+        .delivery
+        .cache_consumer_state(consumer.to_owned(), consumer_state.clone());
+    stream_state.availability.notify_waiters();
+    Ok(retry_not_before_ms > observed_at_ms)
+}
+
+fn next_consumer_wake(
+    delivery: &DeliveryState,
+    consumer: &str,
+    consumer_state: &ConsumerState,
+    now_ms: u64,
+) -> Option<Instant> {
+    let next_lease = delivery.next_deadline_for_consumer(consumer);
+    let next_retry = consumer_state
+        .retry_not_before
+        .values()
+        .map(|schedule| schedule.retry_not_before_ms)
+        .filter(|deadline| *deadline > now_ms)
+        .min()
+        .map(|deadline| Instant::now() + Duration::from_millis(deadline - now_ms));
+    next_lease.into_iter().chain(next_retry).min()
+}
+
+fn wall_clock_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+        .min(u128::from(u64::MAX)) as u64
 }

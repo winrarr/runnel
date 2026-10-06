@@ -570,10 +570,17 @@ impl GroupManager {
         consumer: String,
         ack_timeout_ms: u64,
         max_delivery_attempts: Option<u32>,
+        retry_delay_ms: u64,
     ) -> Result<ConsumerPolicy, BrokerError> {
         self.data_group_for_stream(&stream)
             .await?
-            .configure_consumer(stream, consumer, ack_timeout_ms, max_delivery_attempts)
+            .configure_consumer(
+                stream,
+                consumer,
+                ack_timeout_ms,
+                max_delivery_attempts,
+                retry_delay_ms,
+            )
             .await
     }
 

@@ -141,12 +141,19 @@ impl Engine for Broker {
         consumer: &'a str,
         ack_timeout_ms: u64,
         max_delivery_attempts: Option<u32>,
+        retry_delay_ms: u64,
     ) -> EngineFuture<'a, ConsumerPolicy> {
         let broker = self.clone();
         let stream = stream.to_owned();
         let consumer = consumer.to_owned();
         Arc::clone(&self.inner.storage_executor).dispatch_stream(stream, move |stream| {
-            broker.configure_consumer(stream, &consumer, ack_timeout_ms, max_delivery_attempts)
+            broker.configure_consumer(
+                stream,
+                &consumer,
+                ack_timeout_ms,
+                max_delivery_attempts,
+                retry_delay_ms,
+            )
         })
     }
 
@@ -1165,7 +1172,7 @@ mod tests {
         let broker = Broker::open(directory.path(), BrokerConfig::default()).unwrap();
         broker.create_stream("events").unwrap();
         let policy = broker
-            .configure_consumer("events", "worker-a", 0, Some(2))
+            .configure_consumer("events", "worker-a", 0, Some(2), 0)
             .unwrap();
         assert_eq!(policy.version, 1);
         assert!(policy.configured);
@@ -1191,7 +1198,7 @@ mod tests {
         ));
         // Updating a policy does not change the attempt budget of an in-flight record.
         broker
-            .configure_consumer("events", "worker-a", 0, Some(1))
+            .configure_consumer("events", "worker-a", 0, Some(1), 0)
             .unwrap();
         std::thread::sleep(Duration::from_millis(100));
         let second = broker.poll("events", "worker-a").unwrap();
@@ -1231,7 +1238,7 @@ mod tests {
         let broker = Broker::open(directory.path(), BrokerConfig::default()).unwrap();
         broker.create_stream("events").unwrap();
         let original_policy = broker
-            .configure_consumer("events", "worker", 0, Some(2))
+            .configure_consumer("events", "worker", 0, Some(2), 0)
             .unwrap();
         assert_eq!(original_policy.version, 1);
         broker.publish("events", None, b"poison".to_vec()).unwrap();
@@ -1245,7 +1252,7 @@ mod tests {
             })
         ));
         let updated_policy = broker
-            .configure_consumer("events", "worker", 0, Some(1))
+            .configure_consumer("events", "worker", 0, Some(1), 0)
             .unwrap();
         assert_eq!(updated_policy.version, 2);
         assert_eq!(updated_policy.max_delivery_attempts, Some(1));
@@ -2155,6 +2162,45 @@ mod tests {
 
         let broker = Broker::open(directory.path(), BrokerConfig::default()).unwrap();
         assert_eq!(broker.poll("events", "worker").unwrap(), PollResult::Empty);
+    }
+
+    #[test]
+    fn unsupported_consumer_checkpoint_fails_closed_without_mutation() {
+        let directory = tempdir().unwrap();
+        let checkpoint_path = directory.path().join("consumers/events/worker.json");
+        fs::create_dir_all(checkpoint_path.parent().unwrap()).unwrap();
+        let unsupported = br#"{"stream":"events","consumer":"worker","committed_offset":0,"acknowledged_offsets":[],"delivery_attempts":{},"policy":null,"delivery_policies":{}}"#;
+        fs::write(&checkpoint_path, unsupported).unwrap();
+
+        assert!(load_consumer_state(directory.path(), "events", "worker").is_err());
+        assert_eq!(fs::read(&checkpoint_path).unwrap(), unsupported);
+        assert!(!checkpoint_path.with_extension("json.tmp").exists());
+    }
+
+    #[test]
+    fn unsupported_consumer_journal_checkpoint_fails_closed_without_mutation() {
+        let directory = tempdir().unwrap();
+        let journal_path = directory.path().join("consumers/events/worker.json.tmp");
+        fs::create_dir_all(journal_path.parent().unwrap()).unwrap();
+        let unsupported = br#"{"stream":"events","consumer":"worker","committed_offset":0,"acknowledged_offsets":[],"delivery_attempts":{},"policy":null,"delivery_policies":{}}"#;
+        fs::write(&journal_path, unsupported).unwrap();
+
+        assert!(load_consumer_state(directory.path(), "events", "worker").is_err());
+        assert_eq!(fs::read(&journal_path).unwrap(), unsupported);
+        assert!(!journal_path.with_extension("checkpoint.tmp").exists());
+    }
+
+    #[test]
+    fn consumer_attempt_without_pinned_policy_fails_closed_without_mutation() {
+        let directory = tempdir().unwrap();
+        let checkpoint_path = directory.path().join("consumers/events/worker.json");
+        fs::create_dir_all(checkpoint_path.parent().unwrap()).unwrap();
+        let unsupported = br#"{"stream":"events","consumer":"worker","committed_offset":0,"acknowledged_offsets":[],"delivery_attempts":{"0":1},"policy":null,"delivery_policies":{},"retry_not_before":{}}"#;
+        fs::write(&checkpoint_path, unsupported).unwrap();
+
+        assert!(load_consumer_state(directory.path(), "events", "worker").is_err());
+        assert_eq!(fs::read(&checkpoint_path).unwrap(), unsupported);
+        assert!(!checkpoint_path.with_extension("json.tmp").exists());
     }
 
     #[tokio::test]
