@@ -54,6 +54,15 @@ identity-mismatched state fails closed before the affected scope serves or
 mutates. Read-forward parsing by itself does not authorize an older binary to
 write or operate against that state.
 
+This policy does not create support for old broker binaries or reader-only
+historical formats. A conversion source must be produced by the currently
+supported writer and accepted by the currently supported reader for that
+artifact. For local stream logs, the migration-aware current format is `RNL3`;
+`RNL1` and `RNL2` stores are refused unchanged even if a historical reader can
+decode them. Extending a conversion to another source generation requires an
+explicitly accepted artifact-specific decision; parser compatibility alone is
+not eligibility.
+
 For a conversion, recovery selects exactly one complete source or target
 generation. It never chooses by directory order, timestamps, or the first
 parsable file, and never treats an invalid store as empty. A generation
@@ -87,9 +96,11 @@ The first supported format or layout conversion is offline and side-by-side:
    Activation requires an explicit operator action and a durable, deterministic
    selector change. Keep service stopped until the target is reopened through
    its normal recovery path and reports one unambiguous active generation.
-   Resume service only with a binary that declares and proves read, write, and
-   semantic support for the target generation; an incompatible binary fails
-   closed even while source rollback remains eligible.
+   Resume service only with the currently supported binary that declares and
+   proves read, write, and semantic support for the target generation; no
+   previous-binary startup or rollback compatibility is implied. An
+   incompatible binary fails closed even while source rollback remains
+   eligible.
 6. Retain the source and migration evidence after activation. Cleanup is an
    explicit later operation; it may not remove the selected generation or the
    recovery artifact required by the operator's retention policy.
@@ -107,7 +118,8 @@ about the selected generation or target readiness. Until a cluster-wide
 activation mechanism and its failure tests exist, the clustered path remains
 unsupported; the contract does not imply per-node rolling conversion or
 rolling binary compatibility. Moving local state to the clustered engine is a
-separate engine-migration decision and is not covered here.
+separate decision under [ADR 0043](0043-offline-local-to-cluster-migration.md)
+and is not covered by this generic artifact-conversion contract.
 
 ### Rollback boundary
 

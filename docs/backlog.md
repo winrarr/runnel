@@ -571,28 +571,43 @@ Acceptance criteria:
 
 Goal: let an application move its retained streams and durable consumer progress from a supported single-node deployment to a supported cluster without changing its messaging model or silently losing acknowledged state.
 
-Rationale: the promise of a credible path from one node to a distributed system is incomplete if only source compatibility exists and operators must invent a risky data migration.
+Rationale: the promise of a credible path from one node to a distributed system is incomplete if applications and operators must invent a risky state transfer. The first safe path may require a maintenance window; “non-disruptive” means preserving the messaging model and acknowledged state, not zero downtime.
 
-Current progress: no supported local-to-cluster migration exists. Local stream
-logs and consumer state use durable representations that the clustered engine
-cannot import. Clustered identity checks reject unsupported or ambiguous
-layouts instead of converting them. The [migration boundary design](design/single-node-to-cluster-migration.md)
-explores a candidate side-by-side logical export/import. The [storage upgrade safety plan](design/storage-upgrade-safety-plan.md)
-records related validation, fencing, rollback, and interruption requirements.
+Current progress: no migration procedure is implemented. Local stream logs and
+consumer state use durable representations that the clustered engine cannot
+import. Clustered identity checks reject unsupported or ambiguous layouts
+instead of converting them. [ADR 0043](decisions/0043-offline-local-to-cluster-migration.md)
+accepts the first behavior: stop and durably fence the whole local deployment,
+then perform bounded logical export/import into a fresh three-voter target,
+validate all target voters, activate read-only, and switch the external
+endpoint. The maintenance window lasts through copying and validation; live
+tailing and dual writes are deferred. The source remains rollback-eligible
+after target activation only until the first target-only durable mutation
+crosses ADR 0037's `write-pending` gate. The [migration design](design/single-node-to-cluster-migration.md)
+records the evidence and implementation gates. The supported source is the
+current migration-aware `RNL3` writer/reader and consumer-state schema;
+`RNL1`, `RNL2`, mixed histories, old binaries, and obsolete state schemas are
+refused without source mutation. This product capability preserves the
+acknowledged state of the supported broker and does not promise backward
+compatibility. The [storage upgrade safety plan](design/storage-upgrade-safety-plan.md)
+owns shared offline conversion and recovery boundaries.
 
 Constraints:
 
-- migration must preserve documented offsets, ordering, replay eligibility, producer retry identity, and consumer progress;
-- cutover must have explicit writer fencing and rollback boundaries;
-- migration work and additional storage must remain bounded and observable for large retained streams;
+- the migration-aware current source format and consumer state must preserve logical offsets, ordering, timestamps, replay eligibility, producer request identity, acknowledged progress, attempts, and pinned policy snapshots; unsupported formats or records fail before source mutation;
+- cutover must have a durable whole-source fence, all-voter target validation, explicit endpoint authority, and the first-target-write rollback boundary;
+- transfer memory, concurrent work, queues, temporary storage, and target reserve must be bounded and observable; the full maintenance-window cost must be measured before publishing an operational size or duration range;
 - applications must not need to learn Raft groups, replica placement, or storage paths.
 
 Acceptance criteria:
 
-- a documented procedure migrates representative retained data and active consumer state from the local engine to the clustered engine;
-- interrupted transfer, failed validation, process restart, and cutover races leave one clearly authoritative serving deployment;
-- post-migration conformance tests demonstrate the same public delivery behavior and resolve pre-cutover publish retry identities correctly;
-- diagnostics report migration progress, validation failures, fencing state, and rollback availability.
+- a documented, versioned procedure migrates representative supported current-source history and active consumer state to a fresh static cluster without old-binary or legacy-format compatibility promises;
+- preflight accepts only the current migration-aware source writer/reader and consumer-state schemas, and proves `RNL1`, `RNL2`, mixed histories, obsolete schemas, and unsupported records fail closed without source mutation;
+- real-process tests show that interrupted transfer, failed validation, restart, endpoint ambiguity, and cutover races resume safely or leave one explicit authority, with source-start refusal while fenced;
+- post-migration conformance tests preserve the current public delivery semantics, resolve exact pre-cutover request-ID retries, reject changed-content reuse, preserve consumer state, and prove timestamp/offset replay behavior;
+- tests prove read-only target activation, successful/proven-no-effect/ambiguous first-write outcomes, and the exact rollback closure point;
+- diagnostics report migration progress, validation failures, all-voter readiness, fence/endpoint authority, backup/reserve status, and rollback availability; and
+- a sequential resource-scoped benchmark reports the full source-unavailable interval, copy and validation cost, peak memory, temporary space, and per-node target cost before any supported workload range is claimed.
 
 ### Make placement scale independently of stream identity
 
