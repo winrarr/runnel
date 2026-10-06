@@ -87,6 +87,8 @@ Acceptance criteria:
 - the contract has a documented compatibility policy;
 - behavior is covered by interoperability and compatibility tests.
 
+Decision progress: [ADR 0031](decisions/0031-protocol-v2-contract.md) accepts the first v2 handshake, Protobuf schema policy, directional bounds, rollout boundary, publish-ID mismatch behavior, and outcome/stage vocabulary. This closes contract selection only. Runtime negotiation, generated-client fixtures, real-server mismatch/reconnect/outcome tests, and interoperability evidence remain open; v1 and v2 are not yet a cross-release compatibility promise.
+
 ### Provide a production-usable client path
 
 Goal: let the initial audience integrate Runnel without implementing protocol framing, connection management, retries, and error classification themselves.
@@ -676,6 +678,8 @@ Acceptance criteria:
 - documentation states what acknowledged data survives for each supported node-failure scenario;
 - clients can distinguish confirmed success, confirmed rejection, retryable failure, and unknown outcome;
 - safe retries do not create unintended duplicate messages when deduplication is requested.
+
+Decision progress: [ADR 0031](decisions/0031-protocol-v2-contract.md) accepts the public v2 outcome/stage vocabulary and its topology-neutral durability boundary. The server/client fields, local and clustered engine mapping, response-loss resolution, ID-conflict tests, and broader supported-node failure evidence remain unimplemented, so this outcome stays open.
 
 ### Make the clustered deployment operable
 
