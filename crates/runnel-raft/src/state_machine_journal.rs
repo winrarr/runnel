@@ -1,5 +1,4 @@
 use std::fs;
-use std::io::Write;
 use std::mem::size_of;
 use std::path::Path;
 
@@ -8,7 +7,9 @@ use runnel_engine::BrokerError;
 use serde::{Deserialize, Serialize};
 
 use super::state_machine::{GroupKind, StateMachineData, apply_command};
-use super::{NodeId, TypeConfig};
+use super::{
+    NodeId, PersistenceWriteOperation, PersistenceWriteRole, TypeConfig, persistence_write,
+};
 
 pub(super) const FORMAT_VERSION: u32 = 1;
 pub(super) const FILE: &str = "state-machine.log";
@@ -110,8 +111,14 @@ fn parse(path: &Path) -> Result<(Vec<JournalEntry>, Option<usize>), BrokerError>
     Ok((entries, truncated_at))
 }
 
-pub(super) fn append<T: Serialize>(file: &mut fs::File, entry: &T) -> std::io::Result<()> {
-    let bytes = serde_json::to_vec(entry).map_err(std::io::Error::other)?;
+pub(super) fn append<T: Serialize>(
+    file: &mut fs::File,
+    entry: &T,
+    role: PersistenceWriteRole,
+) -> std::io::Result<()> {
+    let bytes =
+        persistence_write::serialize_json(role, PersistenceWriteOperation::Serialize, entry)
+            .map_err(std::io::Error::other)?;
     if bytes.len() > MAX_RECORD_SIZE as usize {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
@@ -124,8 +131,8 @@ pub(super) fn append<T: Serialize>(file: &mut fs::File, entry: &T) -> std::io::R
             "state-machine journal record exceeds u32 length",
         )
     })?;
-    file.write_all(&length.to_le_bytes())?;
-    file.write_all(&bytes)
+    persistence_write::write_all(file, role, &length.to_le_bytes())?;
+    persistence_write::write_all(file, role, &bytes)
 }
 
 pub(super) fn replay(
@@ -177,7 +184,12 @@ mod tests {
             payload: EntryPayload::Blank,
         };
         let mut file = fs::File::create(&path).unwrap();
-        append(&mut file, &entry).unwrap();
+        append(
+            &mut file,
+            &entry,
+            PersistenceWriteRole::StateMachineJournalAppend,
+        )
+        .unwrap();
         file.sync_all().unwrap();
         let valid_length = file.metadata().unwrap().len();
         file.write_all(&[0x01, 0x02, 0x03]).unwrap();

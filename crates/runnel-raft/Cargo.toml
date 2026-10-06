@@ -5,6 +5,7 @@ edition.workspace = true
 
 [features]
 instrumentation = ["runnel-engine/instrumentation"]
+persistence-write-counters = []
 test-replacement-recovery = ["openraft/loosen-follower-log-revert"]
 
 [dependencies]

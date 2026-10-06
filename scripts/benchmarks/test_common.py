@@ -53,6 +53,23 @@ class CommonBenchmarkTests(unittest.TestCase):
             {"metric": 2.0, 'metric{operation="publish"}': 3.0},
         )
 
+    def test_prometheus_metrics_only_requests_write_counters_explicitly(self) -> None:
+        with patch.object(
+            common.urllib.request,
+            "urlopen",
+            side_effect=lambda *_args, **_kwargs: io.BytesIO(b"metric 1\n"),
+        ) as urlopen:
+            common.prometheus_metrics(8080)
+            default_url = urlopen.call_args.args[0]
+            common.prometheus_metrics(8080, persistence_write_counters=True)
+            opted_in_url = urlopen.call_args.args[0]
+
+        self.assertTrue(default_url.endswith("/metrics"))
+        self.assertFalse("persistence_write_counters" in default_url)
+        self.assertTrue(
+            opted_in_url.endswith("/metrics?persistence_write_counters=true")
+        )
+
     def test_metric_delta_records_counter_and_reset_changes(self) -> None:
         delta = common.metric_delta(
             {"requests": 5.0, "restarted": 2.0},

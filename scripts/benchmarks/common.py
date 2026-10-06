@@ -74,11 +74,18 @@ def request_ok(
     return response, elapsed
 
 
-def prometheus_metrics(http_port: int) -> dict[str, float] | None:
+def prometheus_metrics(
+    http_port: int, *, persistence_write_counters: bool = False
+) -> dict[str, float] | None:
     """Read a bounded Prometheus snapshot from one broker endpoint."""
+    path = (
+        "/metrics?persistence_write_counters=true"
+        if persistence_write_counters
+        else "/metrics"
+    )
     try:
         with urllib.request.urlopen(
-            f"http://127.0.0.1:{http_port}/metrics", timeout=1
+            f"http://127.0.0.1:{http_port}{path}", timeout=1
         ) as response:
             body = response.read().decode("utf-8")
     except (urllib.error.URLError, TimeoutError, OSError):

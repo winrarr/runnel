@@ -31,7 +31,10 @@ use super::state_machine_journal::{
     append as append_state_machine_journal_entry, is_log_after, read as read_state_machine_journal,
     replay as replay_state_machine_journal, validate as validate_state_machine_journal,
 };
-use super::{FORMAT_VERSION, TypeConfig, atomic_write};
+use super::{
+    FORMAT_VERSION, PersistenceWriteOperation, PersistenceWriteRole, TypeConfig,
+    atomic_write_with_role, persistence_write,
+};
 use crate::NodeId;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -515,12 +518,20 @@ impl StateMachineStore {
         })?;
         for entry in entries {
             let journal_entry = StateMachineJournalEntryRef::from_entry(entry);
-            append_state_machine_journal_entry(&mut journal, &journal_entry)
-                .map_err(|error| StorageIOError::write_state_machine(&error))?;
-        }
-        journal
-            .sync_data()
+            append_state_machine_journal_entry(
+                &mut journal,
+                &journal_entry,
+                PersistenceWriteRole::StateMachineJournalAppend,
+            )
             .map_err(|error| StorageIOError::write_state_machine(&error))?;
+        }
+        persistence_write::measure_io(
+            PersistenceWriteRole::StateMachineJournalAppend,
+            PersistenceWriteOperation::SyncData,
+            0,
+            || journal.sync_data(),
+        )
+        .map_err(|error| StorageIOError::write_state_machine(&error))?;
         Ok(())
     }
 
@@ -534,8 +545,12 @@ impl StateMachineStore {
         // serde_json performs the same traversal. The caller holds the state lock while this
         // function runs, so the checkpoint remains a coherent image of the applied state.
         let persisted = PersistedStateRef::new(state);
-        let bytes = serde_json::to_vec(&persisted)
-            .map_err(|error| StorageIOError::write_state_machine(&error))?;
+        let bytes = persistence_write::serialize_json(
+            PersistenceWriteRole::StateMachineCheckpoint,
+            PersistenceWriteOperation::Serialize,
+            &persisted,
+        )
+        .map_err(|error| StorageIOError::write_state_machine(&error))?;
         #[cfg(test)]
         if self
             .fail_next_checkpoint_persist
@@ -546,8 +561,12 @@ impl StateMachineStore {
                 source: StorageIOError::write_state_machine(&error),
             });
         }
-        atomic_write(&path.join("state-machine.json"), &bytes)
-            .map_err(|error| StorageIOError::write_state_machine(&error))?;
+        atomic_write_with_role(
+            &path.join("state-machine.json"),
+            &bytes,
+            PersistenceWriteRole::StateMachineCheckpoint,
+        )
+        .map_err(|error| StorageIOError::write_state_machine(&error))?;
         Ok(())
     }
 
@@ -578,20 +597,37 @@ impl StateMachineStore {
         let mut temporary = fs::File::create(&temporary_path)
             .map_err(|error| StorageIOError::write_state_machine(&error))?;
         for entry in &retained {
-            append_state_machine_journal_entry(&mut temporary, entry)
-                .map_err(|error| StorageIOError::write_state_machine(&error))?;
+            append_state_machine_journal_entry(
+                &mut temporary,
+                entry,
+                PersistenceWriteRole::StateMachineJournalCompaction,
+            )
+            .map_err(|error| StorageIOError::write_state_machine(&error))?;
         }
-        temporary
-            .sync_all()
-            .map_err(|error| StorageIOError::write_state_machine(&error))?;
-        fs::rename(&temporary_path, &journal_path)
-            .map_err(|error| StorageIOError::write_state_machine(&error))?;
+        persistence_write::measure_io(
+            PersistenceWriteRole::StateMachineJournalCompaction,
+            PersistenceWriteOperation::SyncAll,
+            0,
+            || temporary.sync_all(),
+        )
+        .map_err(|error| StorageIOError::write_state_machine(&error))?;
+        persistence_write::measure_io(
+            PersistenceWriteRole::StateMachineJournalCompaction,
+            PersistenceWriteOperation::Rename,
+            0,
+            || fs::rename(&temporary_path, &journal_path),
+        )
+        .map_err(|error| StorageIOError::write_state_machine(&error))?;
         let parent = journal_path.parent().unwrap_or_else(|| Path::new("."));
         let directory =
             fs::File::open(parent).map_err(|error| StorageIOError::write_state_machine(&error))?;
-        directory
-            .sync_all()
-            .map_err(|error| StorageIOError::write_state_machine(&error))?;
+        persistence_write::measure_io(
+            PersistenceWriteRole::StateMachineJournalCompaction,
+            PersistenceWriteOperation::DirectorySync,
+            0,
+            || directory.sync_all(),
+        )
+        .map_err(|error| StorageIOError::write_state_machine(&error))?;
         *journal = fs::OpenOptions::new()
             .create(true)
             .read(true)
@@ -608,10 +644,18 @@ impl StateMachineStore {
         let Some(path) = &self.path else {
             return Ok(());
         };
-        let bytes = serde_json::to_vec(snapshot)
-            .map_err(|error| StorageIOError::write_snapshot(None, &error))?;
-        atomic_write(&path.join("snapshot.json"), &bytes)
-            .map_err(|error| StorageIOError::write_snapshot(None, &error))?;
+        let bytes = persistence_write::serialize_json(
+            PersistenceWriteRole::StateMachineSnapshot,
+            PersistenceWriteOperation::Serialize,
+            snapshot,
+        )
+        .map_err(|error| StorageIOError::write_snapshot(None, &error))?;
+        atomic_write_with_role(
+            &path.join("snapshot.json"),
+            &bytes,
+            PersistenceWriteRole::StateMachineSnapshot,
+        )
+        .map_err(|error| StorageIOError::write_snapshot(None, &error))?;
         Ok(())
     }
 
@@ -793,8 +837,12 @@ impl RaftSnapshotBuilder<TypeConfig> for Arc<StateMachineStore> {
                 // Keep the read guard through encoding so the snapshot is coherent without
                 // materializing a second copy of every retained message.
                 let snapshot_state = PersistedSnapshotStateRef::new(&state.state);
-                let data = serde_json::to_vec(&snapshot_state)
-                    .map_err(|error| StorageIOError::read_state_machine(&error))?;
+                let data = persistence_write::serialize_json(
+                    PersistenceWriteRole::StateMachineSnapshot,
+                    PersistenceWriteOperation::SnapshotStateSerialize,
+                    &snapshot_state,
+                )
+                .map_err(|error| StorageIOError::read_state_machine(&error))?;
                 (data, state.last_applied_log, state.last_membership.clone())
             };
             let meta = SnapshotMeta {
