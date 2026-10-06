@@ -168,11 +168,22 @@ chosen peer boundary as directly as static mTLS.
 
 ## Verification basis
 
-This is a design decision, not a runtime change. The source-backed research
-inspected Runnel's inbound dispatch, outbound direct and pooled connections,
-static node map, deployment assumptions, OpenRaft network interfaces, etcd
-peer-security guidance, RFC 9525 service identity, RFC 9846 TLS behavior,
-SPIFFE identity lifecycle, and Kubernetes network-policy and Secret guidance.
-Implementation is not complete and the current peer listener remains
-plaintext; the cluster must not be described as secured until the backlog
-outcome and its real-process tests are complete.
+This decision is implemented for the current static Raft server path. Startup
+loads explicit per-node trust, certificate, and key files before binding the
+peer listener. The runnel-raft transport uses rustls TLS 1.3 with early data
+disabled, binds the exact certificate SAN to configured node and cluster
+identity, and bounds handshakes, active peer sessions, frame memory, and
+concurrent writes. Focused certificate tests cover expiry and identity/trust
+failures; real three-process tests cover peer transport during consensus,
+recovery, forwarding, plaintext rejection, and unconfigured identity rejection.
+
+This implementation status does not mean the full operational outcome is
+complete: trust-overlap rotation is not process-tested or automated, the
+Kubernetes example requires an operator-provided per-pod credential overlay,
+and representative clustered measurements have not been collected. The
+backlog remains open for those rollout and evidence requirements. The
+source-backed research inspected Runnel's inbound dispatch, outbound direct
+and pooled connections, static node map, deployment assumptions, OpenRaft
+network interfaces, etcd peer-security guidance, RFC 9525 service identity,
+RFC 9846 TLS behavior, SPIFFE identity lifecycle, and Kubernetes network-policy
+and Secret guidance.

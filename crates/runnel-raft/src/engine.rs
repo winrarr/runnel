@@ -1191,6 +1191,7 @@ pub struct PersistentEngine {
 }
 
 impl PersistentEngine {
+    #[cfg(test)]
     pub async fn open(
         node_id: NodeId,
         cluster_name: String,
@@ -1209,6 +1210,7 @@ impl PersistentEngine {
         .await
     }
 
+    #[cfg(test)]
     pub async fn open_with_ack_timeout(
         node_id: NodeId,
         cluster_name: String,
@@ -1229,6 +1231,7 @@ impl PersistentEngine {
         .await
     }
 
+    #[cfg(test)]
     pub async fn open_with_config(
         node_id: NodeId,
         cluster_name: String,
@@ -1253,8 +1256,6 @@ impl PersistentEngine {
 
     /// Open a clustered engine with static peer TLS credentials. Production
     /// Raft listeners and all outbound peer operations use this constructor.
-    // Keep the same explicit configuration arguments as open_with_config and
-    // add the credential object as the final peer-transport boundary.
     #[allow(clippy::too_many_arguments)]
     pub async fn open_with_peer_tls(
         node_id: NodeId,

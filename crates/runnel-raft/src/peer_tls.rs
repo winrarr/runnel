@@ -451,7 +451,7 @@ pub(crate) mod tests {
     use super::*;
     use rcgen::{
         BasicConstraints, CertificateParams, ExtendedKeyUsagePurpose, IsCa, Issuer, KeyPair,
-        KeyUsagePurpose,
+        KeyUsagePurpose, date_time_ymd,
     };
     use std::fs;
     use tempfile::TempDir;
@@ -482,9 +482,21 @@ pub(crate) mod tests {
         }
 
         fn issue(&self, sans: Vec<String>) -> CredentialFiles {
+            self.issue_with_validity(sans, false)
+        }
+
+        fn issue_expired(&self, sans: Vec<String>) -> CredentialFiles {
+            self.issue_with_validity(sans, true)
+        }
+
+        fn issue_with_validity(&self, sans: Vec<String>, expired: bool) -> CredentialFiles {
             let leaf_directory = tempfile::tempdir().unwrap();
             let issuer = Issuer::from_params(&self.ca_params, &self.ca_key);
             let mut leaf_params = CertificateParams::new(sans).unwrap();
+            if expired {
+                leaf_params.not_before = date_time_ymd(2000, 1, 1);
+                leaf_params.not_after = date_time_ymd(2001, 1, 1);
+            }
             leaf_params.extended_key_usages = vec![
                 ExtendedKeyUsagePurpose::ClientAuth,
                 ExtendedKeyUsagePurpose::ServerAuth,
@@ -697,6 +709,30 @@ pub(crate) mod tests {
             valid_leaf
                 .config_trusting(0, &peers, &unrelated_root.ca)
                 .is_err()
+        );
+    }
+
+    #[test]
+    fn startup_rejects_expired_local_leaf() {
+        let peers = BTreeMap::from([
+            (0, "127.0.0.1:7000".to_owned()),
+            (1, "127.0.0.1:7001".to_owned()),
+        ]);
+        let authority = TestAuthority::new();
+        let expired = authority.issue_expired(vec![identity_for(0, "events")]);
+
+        assert_eq!(
+            PeerTlsConfig::from_files(
+                0,
+                "events",
+                &peers,
+                &expired.ca,
+                &expired.cert,
+                &expired.key,
+            )
+            .unwrap_err()
+            .kind(),
+            io::ErrorKind::InvalidInput
         );
     }
 
