@@ -42,5 +42,6 @@ Current decisions:
 - 0036-retained-history-and-disk-pressure-contract.md: unlimited-by-default history, explicit protected age/size targets, floor-based replay outcomes, unlimited dead-letter output, and separate stage-aware physical-capacity admission.
 - 0037-offline-side-by-side-storage-upgrades.md: require validated offline side-by-side conversion with explicit activation and a first-target-write rollback boundary.
 - 0038-timestamp-based-replay-selector.md: accept inclusive broker-publish-time replay selection by lowest matching logical offset, with explicit no-match and deleted-prefix completeness semantics.
+- 0040-bounded-raft-log-persistence.md: replace retained-map rewrites with bounded append-only Raft-log segments and fixed-size durable control state.
 
 Proposed decisions awaiting review: none.

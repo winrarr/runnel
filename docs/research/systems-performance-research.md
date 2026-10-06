@@ -1,11 +1,11 @@
 # Systems performance research for Runnel
 
-- Status: source-backed assessment; no runtime change or architecture decision accepted
-- Last reviewed: 2026-09-28
+- Status: source-backed assessment; no runtime change; [ADR 0040](../decisions/0040-bounded-raft-log-persistence.md) accepts a first Raft-log persistence behavior
+- Last reviewed: 2026-10-06
 - Repository baseline: `4f10777d155d529c6a93f855b4f36c6c58519cc8` (`origin/main`)
 - Scope: durable-write batching, queueing and tail latency, replicated-log write amplification, cache-line contention, storage and network I/O
 
-This note extends the [distributed architecture](distributed-architecture-options.md), [encoding and compression](message-encoding-and-compression.md), and existing TD-002, TD-010, TD-011, TD-019, and TD-022 evidence. It compares established systems work with recent research and maps the useful mechanisms to Runnel's current code. It records research and measurement hypotheses only; it does not select a new executor, storage format, durability mode, or replication engine.
+This note extends the [distributed architecture](distributed-architecture-options.md), [encoding and compression](message-encoding-and-compression.md), and existing TD-002, TD-010, TD-011, TD-019, and TD-022 evidence. It compares established systems work with recent research and maps the useful mechanisms to Runnel's current code. [ADR 0040](../decisions/0040-bounded-raft-log-persistence.md) accepts one first storage behavior for retained Raft-log persistence; the remaining assessment records hypotheses and does not select a new executor, durability mode, replication engine, or cross-layer payload format.
 
 ## Assessment
 
@@ -46,7 +46,7 @@ The 2026 NSDI paper [XLL: Cross-Layer Logging for Data Deduplication in Consensu
 
 The recent [BtrLog preprint](https://arxiv.org/abs/2606.27051) explores a different cloud setting: quorum-replicated SSD log nodes for low-latency durable append, followed by asynchronous large-segment archival to object storage. It assumes a common single-writer architecture and ephemeral local cloud storage. This is a useful frontier reference for Runnel's longer-term storage and placement explorations, not a drop-in alternative to current Multi-Raft semantics.
 
-**Runnel inference:** the current clustered log entry and state-machine apply journal both encode the committed command, including a publish payload, before the payload is retained in state. This makes cross-layer write amplification a concrete measurement question that is more specific than the existing retained-vector and snapshot concerns. First quantify encoded bytes, sync calls, bytes rewritten in the retained Raft log, and payload copies per committed record across payload sizes and snapshot/purge cycles. Only then consider references, key/value separation, or log sharing; any such change would need to preserve quorum commit, replay, deduplication, crash recovery, and snapshot replacement. This belongs alongside [TD-010](../design/td-010-retained-state-evidence.md), [TD-009](../design/td-009-snapshot-evidence.md), and [TD-019](../design/td-019-delivery-bookkeeping.md), not in a new accepted design yet.
+**Runnel inference:** the current clustered log entry and state-machine apply journal both encode the committed command, including a publish payload, before the payload is retained in state. This makes cross-layer write amplification a concrete measurement question that is more specific than the existing retained-vector and snapshot concerns. [ADR 0040](../decisions/0040-bounded-raft-log-persistence.md) addresses the independent full-retained-map rewrite without sharing payload ownership. Quantify encoded bytes, sync calls, bytes written to each layer, and payload copies per committed record across payload sizes and snapshot/purge cycles before considering references, key/value separation, or shared logging. Any such change would need a separate decision that preserves quorum commit, replay, deduplication, crash recovery, and snapshot replacement. This remains alongside [TD-010](../design/td-010-retained-state-evidence.md), [TD-009](../design/td-009-snapshot-evidence.md), and [TD-019](../design/td-019-delivery-bookkeeping.md).
 
 ### Background storage work: keep foreground tails visible during compaction and cleanup
 
@@ -73,7 +73,7 @@ The Linux kernel's current [`io_uring` zero-copy receive guide](https://docs.ker
 | Opportunity | Potential relevance to Runnel | Main risk or unknown | Current record |
 | --- | --- | --- | --- |
 | Amortize local publish, delivery, and acknowledgement syncs with bounded server-side batching | High when many operations share a stream and durability sync dominates | Added queue wait, memory bounds, partial outcomes, and unknown results after response loss | TD-019, TD-022, batching backlog |
-| Measure clustered cross-layer payload writes and full retained-log rewrites | Potentially high for larger payloads or frequent commits; no Runnel attribution exists yet | Shared log/value references change recovery, compaction, deduplication, and snapshot invariants | TD-009, TD-010, TD-019, TD-026; clustered commit-cost backlog outcome |
+| Measure clustered cross-layer payload writes and validate the retained-log persistence contract | Potentially high for larger payloads or frequent commits; no supported end-to-end cost bound exists | Shared log/value references change recovery, compaction, deduplication, and snapshot invariants | TD-009, TD-010, TD-019, TD-026, ADR 0040; clustered commit-cost backlog outcome |
 | Improve queue visibility and fairness under hot-stream and resource pressure | High for predictable p99 and explicit overload behavior | More metrics do not themselves improve capacity; global bounds may still couple unrelated work | TD-022, TD-023, TD-011 |
 | Remove avoidable payload/encoding copies | Plausible for large payloads and high message rates | Copies may be small beside JSON parsing, fsync, or quorum latency | Encoding/compression study; code findings above |
 | Change mutexes, pad atomics, or use lock-free structures | Conditional on measured CPU or cache-line contention | More complex memory ordering, ownership, and memory footprint without fixing durable serialization | No current bottleneck evidence; profile first |
@@ -83,7 +83,7 @@ The first comparison should separate serial and concurrent producers, one hot st
 
 ## Planning disposition
 
-Most findings reinforce existing outcomes and technical-debt items; they do not justify an ADR or separate work items for cache-line, lock-free, `io_uring`, RDMA, or zero-copy experiments. The full retained Raft-log rewrite is a distinct current persistence gap, so [TD-026](../tech-debt.md#td-026-raft-log-persistence-rewrites-retained-entries) and a focused [clustered commit-cost backlog outcome](../backlog.md#keep-clustered-commit-cost-predictable-as-consensus-history-grows) now track measurement and bounded-cost criteria. Prioritize evidence for local durable batching, clustered cross-layer writes, and queue-stage latency. Any implementation that changes which operations are durable, their ordering, or what a timeout means must first update the relevant design and accepted decision record.
+Most findings reinforce existing outcomes and technical-debt items; they do not justify an ADR or separate work items for cache-line, lock-free, `io_uring`, RDMA, or zero-copy experiments. The full retained Raft-log rewrite is a distinct current persistence gap, so [ADR 0040](../decisions/0040-bounded-raft-log-persistence.md) accepts its first bounded-work contract while [TD-026](../tech-debt.md#td-026-raft-log-persistence-rewrites-retained-entries) and the [clustered commit-cost backlog outcome](../backlog.md#keep-clustered-commit-cost-predictable-as-consensus-history-grows) retain implementation and measurement criteria. Shared payload ownership remains unaccepted because it changes recovery semantics. Prioritize evidence for local durable batching, clustered cross-layer writes, and queue-stage latency. Any implementation that changes which operations are durable, their ordering, or what a timeout means must follow the relevant design and accepted decision record.
 
 ## Sources
 
