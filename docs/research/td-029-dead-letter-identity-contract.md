@@ -1,17 +1,19 @@
 # Public request IDs and dead-letter move identity
 
-- Status: identity contract accepted in [ADR 0029](../decisions/0029-local-typed-dead-letter-move-identities.md); this note records the source-backed rationale and alternatives
-- Last reviewed: 2026-10-05
+- Status: typed identity and local storage policy accepted in [ADR 0029](../decisions/0029-local-typed-dead-letter-move-identities.md); public request-ID content behavior is accepted in [ADR 0034](../decisions/0034-publish-request-id-content-contract.md), while its runtime implementation and verification remain open
+- Last reviewed: 2026-10-06
 - Baseline: `f999c1b9ad5d22408bbbe6c6276a42e825cd62ef`
 - Related debt: [TD-002](../tech-debt.md#td-002-one-file-and-a-startup-scan-per-local-stream) and [TD-017](../tech-debt.md#td-017-dead-letter-movement-spans-separate-durable-records)
 - Related design: [Dead-letter recovery across durable boundaries](../design/dead-letter-recovery.md)
-- Related decisions: [ADR 0014](../decisions/0014-local-retry-and-dead-letter-policy.md), [ADR 0016](../decisions/0016-clustered-retry-and-dead-letter-policy.md), and [ADR 0029](../decisions/0029-local-typed-dead-letter-move-identities.md)
+- Related decisions: [ADR 0014](../decisions/0014-local-retry-and-dead-letter-policy.md), [ADR 0016](../decisions/0016-clustered-retry-and-dead-letter-policy.md), [ADR 0029](../decisions/0029-local-typed-dead-letter-move-identities.md), and [ADR 0034](../decisions/0034-publish-request-id-content-contract.md)
 
 This note compares ways to distinguish a client-supplied publish identity from
-the local engine's identity for one dead-letter move. The accepted decision is
-recorded in ADR 0029. The named baseline describes the pre-change behavior;
-the implementation and compatibility sections record the resulting local
-format and its consequences.
+the local engine's identity for one dead-letter move. The accepted typed
+identity and storage decision is recorded in ADR 0029. Public request-ID
+content equality is a separate contract accepted later in ADR 0034; runtime
+mismatch behavior and cross-engine verification remain open. The named
+baseline describes the pre-change identity behavior; the implementation and
+compatibility sections record the resulting local format and its consequences.
 
 ## Finding
 
@@ -25,10 +27,12 @@ identity behavior.
 
 **Recommendation (inference accepted in ADR 0029):** persist a typed identity
 domain for new local request-aware records. Keep caller-supplied IDs as public
-IDs and local source-to-dead-letter IDs as moves. Keep the public request-ID API
-and replay behavior unchanged. A move retry reconciles only against the same
-typed move identity and still verifies key and payload before source progress
-advances.
+IDs and local source-to-dead-letter IDs as moves. Keep the public request-ID
+field and namespace distinct from internal move identity. The accepted
+content-equivalence and mismatch outcomes are now defined by ADR 0034; current
+runtime mismatch behavior remains first-use-wins pending implementation and
+verification. A move retry reconciles only against the same typed move identity
+and still verifies key and payload before source progress advances.
 
 The accepted implementation uses a new request-aware frame version to persist
 the identity kind. Recovery indexes every untyped RNL3 version-1 ID in the
@@ -45,9 +49,11 @@ is unsupported. See [ADR 0029](../decisions/0029-local-typed-dead-letter-move-id
 
 ## Observed Runnel behavior
 
-- Public publish IDs are scoped to one stream. Reusing an ID returns its
-  original offset even when the retry supplies a different key or payload; the
-  behavior is covered by
+- Public publish IDs are scoped to one stream. ADR 0034 records that runtime
+  behavior at its revalidated baseline: the original offset is returned even
+  when the retry supplies a different key or payload. This is existing
+  behavior, not the accepted contract in ADR 0034, and remains to be changed
+  and verified. The current behavior is covered by
   [`repeated_request_id_returns_original_offset_without_appending`](../../crates/runnel-core/src/lib.rs#L451)
   and
   [`request_id_deduplication_survives_restart`](../../crates/runnel-core/src/lib.rs#L551).
@@ -249,9 +255,11 @@ forward-read choice, not a general storage-format compatibility policy; ADR
 Focused core tests cover these accepted identity behaviors:
 
 1. Public and internal identities with identical text coexist as separate
-   records. Public retry resolves only the original public record (including
-   the established mismatched-content replay behavior); move retry resolves
-   only the typed move and verifies its content.
+   records. Existing runtime tests show public retry resolving only the
+   original public record, including for mismatched content; that mismatch
+   assertion reflects current first-use-wins behavior and is superseded by
+   ADR 0034. The accepted content-conflict behavior is not yet implemented or
+   verified. Move retry resolves only the typed move and verifies its content.
 2. Mismatching and same-content public IDs both allow the source move to append
    independently, then source progress advances only after move durability.
    A source-ack failure followed by reopen retries the typed move without
@@ -273,10 +281,13 @@ Focused core tests cover these accepted identity behaviors:
    incarnation feature needs to extend the key before it is introduced.
 
 Real-server tests exercise same-content and mismatching public collisions,
-public replay behavior, source progress, and restart through the wire protocol.
-Core tests cover typed-move content validation, completed-v1-public collision,
-interrupted-v1-move retry, version-2 move deduplication/recovery, invalid
-versions/flags, and checksum protection. The previous version-1-only reader
+public replay behavior, source progress, and restart through the wire protocol;
+their mismatched public retry expectation remains legacy first-use-wins
+coverage and does not verify ADR 0034. Runtime work must revise it and add
+cross-engine conformance coverage. Core tests cover typed-move content
+validation, completed-v1-public collision, interrupted-v1-move retry, version-2
+move deduplication/recovery, invalid versions/flags, and checksum protection.
+The previous version-1-only reader
 rejects version 2 by its version guard, so downgrade after writing a version-2
 record is unsupported. These tests do not establish actual filesystem/device
 sync failure or power-loss behavior. Clustered behavior remains covered by its
@@ -284,16 +295,21 @@ existing atomic transition and is not a local-identity guarantee.
 
 ## Disposition
 
-This source review informed the accepted typed local identity contract and
-legacy lookup policy in ADR 0029. The runtime implementation is local to
-runnel-core, with real-server coverage in runnel-server; the clustered engine
-and public wire schema are unchanged. No separate resource tracker is warranted because
-the index remains proportional to retained identities under existing
-behavior, a limitation already tracked by TD-002. Two namespace buckets avoid
-increasing the per-identity offset value size, while adding fixed per-stream
-map overhead and possible duplicate string storage for a cross-namespace
-collision. TD-002 remains open for unbounded retained identity cardinality; the
-local move/source-ack boundary remains open under TD-017.
+TD-029's typed local identity and legacy lookup outcome is selected in ADR
+0029 and implemented in the local storage path. The identity separation
+remains distinct from public request-ID content semantics: ADR 0034 now accepts
+content-equivalent retries and confirmed rejection for representable changed
+content, but current runtime behavior and its conformance evidence remain open
+under [the client-contract backlog outcome](../backlog.md#make-client-interactions-dependable-and-evolvable).
+The existing tests that assert first-use-wins for mismatched public content
+must be updated as part of that runtime work. No separate tracker is needed for
+the already-selected typed identity policy. The index remains proportional to
+retained identities under existing behavior, a limitation already tracked by
+TD-002. Two namespace buckets avoid increasing the per-identity offset value
+size, while adding fixed per-stream map overhead and possible duplicate string
+storage for a cross-namespace collision. TD-002 remains open for unbounded
+retained identity cardinality; the local move/source-ack boundary remains open
+under TD-017.
 
 ## References
 

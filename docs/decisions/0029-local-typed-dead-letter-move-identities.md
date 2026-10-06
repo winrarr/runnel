@@ -2,7 +2,7 @@
 
 - Status: accepted
 - Date: 2026-10-05
-- Related: [ADR 0014](0014-local-retry-and-dead-letter-policy.md), [TD-002](../tech-debt.md#td-002-one-file-and-a-startup-scan-per-local-stream), and [TD-017](../tech-debt.md#td-017-dead-letter-movement-spans-separate-durable-records)
+- Related: [ADR 0014](0014-local-retry-and-dead-letter-policy.md), [ADR 0034](0034-publish-request-id-content-contract.md), [TD-002](../tech-debt.md#td-002-one-file-and-a-startup-scan-per-local-stream), and [TD-017](../tech-debt.md#td-017-dead-letter-movement-spans-separate-durable-records)
 - Research: [Public request IDs and dead-letter move identity](../research/td-029-dead-letter-identity-contract.md)
 - Extends: ADR 0014's local identity and reconciliation details; the append-then-ack order remains unchanged
 
@@ -37,9 +37,17 @@ in the public-ID bucket as a compatibility lookup policy, not proof of public
 provenance. RNL1 and RNL2 records remain unchanged; new code reads mixed
 RNL1, RNL2, and RNL3 version-1/version-2 histories.
 
-Public publishes look up only `PublicRequestId`. Reusing a public ID continues
-to return its first public record's offset, including when the retry supplies
-a different key or payload. A public ID whose text equals a move ID does not
+Public publishes look up only `PublicRequestId`. The typed lookup separation
+does not determine content-equivalence behavior for a reused public ID. ADR
+0034 supersedes this ADR's former mismatch-specific rule: its accepted contract
+returns the original offset for a content-equivalent retry and confirms
+rejection without appending for a difference in representable key bytes or
+payload bytes. Request-ID comparison treats absent and empty keys as
+equivalent because the current local durable representation cannot distinguish
+them; this does not equate their ordering intent. ADR 0034 defines the full
+comparison rule. The runtime still has the earlier first-use-wins behavior for
+mismatched content, so implementation and conformance verification remain
+open under that decision. A public ID whose text equals a move ID does not
 match an internal move record. Move reconciliation looks up only
 `DeadLetterMove`, and it still requires the stored key and payload to match
 before source progress advances. A public target record with the same text,
@@ -109,8 +117,10 @@ claim.
 
 - Equal public and internal ID text can coexist in one target stream without
   impersonation or a source-blocking content conflict.
-- A public retry still resolves to the first public record after restart and
-  preserves the existing mismatched-content replay behavior.
+- Public and internal move retries remain in separate identity buckets. Public
+  content-equivalence behavior is governed by ADR 0034; current runtime
+  mismatch behavior remains first-use-wins until that contract is implemented
+  and verified.
 - One extra dead-letter record may be appended for an interrupted move from
   pre-upgrade RNL3 data; new typed retries remain duplicate-safe under the
   existing append-then-checkpoint ordering.
@@ -127,15 +137,20 @@ Core and real-server tests cover same-content and mismatching public
 collisions; separate public and internal target offsets and contents; public
 request replay after restart; source acknowledgement failure followed by
 reopen/retry without a second typed move; and legacy RNL3 version-1 recovery,
-including the permitted upgrade-boundary duplicate. Version-1 IDs are indexed
-in the public-ID bucket as a compatibility lookup policy, not as proof of
-public provenance. Historical internal moves remain addressable through that
-bucket as under the former shared namespace, but cannot satisfy a version-2
-typed move lookup. An interrupted legacy move may therefore append one typed
-move before source progress advances. Parser tests cover valid mixed versions,
-unsupported versions or identity flags failing closed, and incomplete tails.
-The baseline reader's version-1-only guard establishes that it rejects a
-newly written version-2 frame; the test suite separately verifies that the new
-reader does not accept unknown versions or flags. The existing target-write,
-source-event, and restart tests support at-least-once ordering. No clustered
-runtime change is part of this evidence claim.
+including the permitted upgrade-boundary duplicate. Tests that currently
+assert first-use-wins for mismatched public content establish existing runtime
+behavior only; they do not verify the accepted content-conflict contract in
+ADR 0034 and must be updated with that implementation. Version-1 IDs are
+indexed in the public-ID bucket as a compatibility lookup policy, not as proof
+of public provenance. Historical internal moves remain addressable through
+that bucket as under the former shared namespace, but cannot satisfy a
+version-2 typed move lookup. An interrupted legacy move may therefore append
+one typed move before source progress advances. Parser tests cover valid mixed
+versions, unsupported versions or identity flags failing closed, and
+incomplete tails. The baseline reader's version-1-only guard establishes that
+it rejects a newly written version-2 frame; the test suite separately verifies
+that the new reader does not accept unknown versions or flags. The existing
+target-write, source-event, and restart tests support at-least-once ordering.
+Cross-engine request-ID mismatch behavior and its runtime verification remain
+open under ADR 0034. No clustered runtime change is part of this evidence
+claim.
