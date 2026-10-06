@@ -341,12 +341,13 @@ This is intentionally a first baseline built around native benchmark clients. Ru
 
 The comparison entrypoint is kept stable at `compare.py`; its shared lifecycle and resource cleanup, semantic result policy, backend execution, and CLI/result-envelope responsibilities have focused private ownership in `compare_lifecycle.py`, `compare_results.py`, `compare_backends.py`, and `compare_cli.py`. This is a maintainability extraction only: it does not make the native workloads equivalent or change the comparison guardrails.
 
-The bounded three-node slice measures only replicated durable publish for the three external competitors:
+The bounded three-node slice measures replicated durable publish for each selected backend. Runnel uses its existing three-node cluster harness; Kafka, Redpanda, and NATS retain their native performance clients. For a run that also builds the Runnel image:
 
 ```text
 python3 scripts/benchmarks/compare.py \
   --nodes 3 \
-  --backends kafka,redpanda,nats \
+  --backends runnel,kafka,redpanda,nats \
+  --build-runnel \
   --messages 1000 \
   --payload-sizes 100 \
   --cpus 2 \
@@ -355,17 +356,17 @@ python3 scripts/benchmarks/compare.py \
   --client-memory 2g
 ```
 
-Run the replicated three-node competitor baseline with:
+Run the replicated three-node comparison baseline with:
 
 ```text
 just bench-compare-cluster
 ```
 
-This records one publish scenario per payload size for Kafka, Redpanda, and NATS JetStream with replication factor three. It is deliberately a separate `cluster-comparison` history suite: the current Runnel cluster runner measures the public protocol and consumer acknowledgement paths, while this first competitor slice has only equivalent durable-publish adapters. The weekly competitor workflow repeats and aggregates this suite independently from the Runnel optimization history.
+This records one publish scenario per payload size for Runnel, Kafka, Redpanda, and NATS JetStream with three broker nodes. It is deliberately a separate `cluster-comparison` history suite from the Runnel optimization history. The weekly competitor workflow retains its explicitly selected competitor subset and aggregates it independently.
 
-`--nodes 3` starts three Kafka KRaft brokers/controllers, three Redpanda brokers, or three NATS servers with JetStream clustering. Kafka topics use one partition, replication factor 3, `min.insync.replicas=3`, `acks=all`, and producer idempotence. JetStream streams use file storage and `--replicas=3`; the native synchronous publisher measures the PubAck boundary. Each broker container receives the broker limits and the short-lived native client receives the client limits, so a three-node run consumes up to three times the per-container broker budget plus the client budget. The result keeps per-node resource summaries and aggregate CPU/memory fields.
+`--nodes 3` starts three Runnel brokers with static Multi-Raft, three Kafka KRaft brokers/controllers, three Redpanda brokers, or three NATS servers with JetStream clustering. Kafka topics use one partition, replication factor 3, `min.insync.replicas=3`, `acks=all`, and producer idempotence. JetStream streams use file storage and `--replicas=3`; the native synchronous publisher measures the PubAck boundary. Runnel's adapter calls the existing cluster runner with one in-flight public publish request per record, rotates persistent host Python clients across the three nodes, and measures the quorum response. Its host-side client has no cgroup limit; the declared client limits apply to the native competitor clients. Backend runs are sequential, so peak broker-container allocation is three per-node budgets plus the applicable client budget. The result keeps per-node resource summaries and aggregate CPU/memory fields where available.
 
-The three-node mode rejects Runnel because this comparison runner has no distributed Runnel adapter, and it omits consumers because Kafka and Redpanda's native consumer performance client does not perform application-level acknowledgements. It therefore establishes a useful RF=3 publish baseline, not a complete end-to-end or failure-tolerance comparison. The broker modes also differ in their exact persistence and acknowledgement implementation: `acks=all`/`min.insync.replicas=3` and synchronous JetStream PubAck are recorded as client-visible boundaries, not a claim that every broker performs identical filesystem flushes. Fault injection, common client code, partitioning/concurrency parity, and replicated consume/ack remain follow-up work.
+The three-node mode omits consumers because Kafka and Redpanda's native consumer performance client does not perform application-level acknowledgements. It establishes an RF=3 publish baseline, not a complete end-to-end or failure-tolerance comparison. The broker modes differ in their clients, batching, persistence, and acknowledgement implementation: Runnel's public quorum response, `acks=all`/`min.insync.replicas=3`, and synchronous JetStream PubAck are recorded as separate client-visible boundaries, not as identical guarantees. All three-node results remain experimental, `apples_to_apples: false`, and ineligible for ranking. Fault injection, common client code, partitioning/concurrency parity, and replicated consume/ack remain follow-up work.
 
 Examples:
 

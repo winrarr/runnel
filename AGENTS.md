@@ -112,7 +112,7 @@ Run these from the repository root:
 - just profile-cluster captures optional Linux `perf` samples and reports for all clustered broker processes.
 - just profile-cluster-instrumented builds the opt-in Rust timing instrumentation and records internal stage timings without requiring `perf` permissions; it uses the exclusive host benchmark lock.
 - just bench-compare builds Runnel and runs the documented first-pass comparison against Kafka, Redpanda, and JetStream.
-- just bench-compare-cluster runs the documented RF=3 durable-publish comparison against three-node Kafka, Redpanda, and JetStream clusters.
+- just bench-compare-cluster builds the Runnel image and runs the documented RF=3 durable-publish comparison against Runnel, Kafka, Redpanda, and JetStream clusters; results remain experimental and non-ranking.
 - just bench-dashboard builds local history data from JSON files under benchmark-results/.
 - just bench-test runs the benchmark normalization and dashboard tests.
 - python3 scripts/benchmarks/pr_report.py renders a pull-request benchmark JSON artifact as a Markdown report.

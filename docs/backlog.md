@@ -904,7 +904,7 @@ Goal: rerun representative Runnel and competing-broker workloads under controlle
 
 Rationale: performance leadership is meaningful only when message semantics, durability, resource limits, workload shape, and measurement boundaries are equivalent.
 
-Current progress: comparison results now declare operation-specific acknowledgement, durability, replication, delivery, batching, client, latency, topology, and resource boundaries, reject inconsistent metadata, and mark mismatched comparisons as experimental and non-ranking. The [TD-013 semantics note](research/td-013-native-competitor-semantics.md) records the current native boundaries and a candidate common workload envelope without making a client or protocol decision. A common equivalent client and fully comparable consume, recovery, and resource workloads remain open.
+Current progress: comparison results now declare operation-specific acknowledgement, durability, replication, delivery, batching, client, latency, topology, and resource boundaries, reject inconsistent metadata, and mark mismatched comparisons as experimental and non-ranking. The three-node profile now includes a Runnel static-cluster publish adapter alongside the competitor-native clients, with the Runnel host-client resource scope called out explicitly. The [TD-013 semantics note](research/td-013-native-competitor-semantics.md) records the measured boundaries and a candidate common workload envelope without making a client or protocol decision. A common equivalent client and fully comparable consume, recovery, and resource workloads remain open.
 
 Constraints:
 

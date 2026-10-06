@@ -202,9 +202,105 @@ class ComparisonBenchmarkTests(unittest.TestCase):
                         semantic["scenario_boundaries"][comparison_class],
                     )
 
+    def test_runnel_three_node_metadata_declares_cluster_publish_boundaries(self) -> None:
+        record = compare.backend_metadata("runnel", compare.THREE_NODE_COUNT)
+        semantic = record["semantic_metadata"]
+
+        self.assertEqual(
+            record["replication"], "three-node static Multi-Raft; one data group per stream"
+        )
+        self.assertEqual(semantic["scenario_classes"], ["publish-only"])
+        self.assertEqual(
+            semantic["scenario_boundaries"]["publish-only"]["durability_boundary"],
+            "current three-node Raft quorum commit and local durable state; "
+            "filesystem flush behavior is not claimed equivalent",
+        )
+        self.assertEqual(
+            record["client_resource_limits"],
+            {"scope": "host process", "cpu": "unbounded", "memory": "unbounded"},
+        )
+
+    def test_runnel_cluster_adapter_uses_the_existing_container_cluster_runner(self) -> None:
+        def run(command: list[str], **_: object) -> SimpleNamespace:
+            output = Path(command[command.index("--output") + 1])
+            output.write_text(
+                json.dumps(
+                    {
+                        "backends": {
+                            "runnel-cluster": {
+                                "image": "runnel:bench",
+                                "image_id": "sha256:test",
+                                "runtime": "container",
+                                "startup_seconds": 1.25,
+                                "resource_samples": {
+                                    "per_node": {
+                                        str(node): {
+                                            "cpu_seconds": 0.5,
+                                            "memory_bytes_max": 1_024,
+                                        }
+                                        for node in range(1, 4)
+                                    }
+                                },
+                                "scenarios": [
+                                    {
+                                        "operation": "cluster_durable_publish",
+                                        "messages": 7,
+                                        "message_size_bytes": 100,
+                                        "throughput_messages_per_second": 50.0,
+                                        "throughput_megabytes_per_second": 0.005,
+                                        "elapsed_seconds": 0.14,
+                                        "elapsed_milliseconds": 140.0,
+                                        "latency_sample_count": 7,
+                                        "latency_microseconds": {
+                                            "p50": 100.0,
+                                            "p99": 200.0,
+                                            "p999": 200.0,
+                                            "max": 200.0,
+                                        },
+                                        "metadata": {"nodes": 3, "any_node_routing": True},
+                                        "resource_samples": {"cpu_seconds": 0.5},
+                                        "server_metrics": {"available": False},
+                                    }
+                                ],
+                            }
+                        }
+                    }
+                ),
+                encoding="utf-8",
+            )
+            return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+        with patch.object(compare.subprocess, "run", side_effect=run) as run_command:
+            result = compare.run_runnel_cluster(
+                image="runnel:bench",
+                cpus="2",
+                memory="2g",
+                messages=7,
+                sizes=[100],
+            )
+
+        command = run_command.call_args.args[0]
+        self.assertIn("cluster.py", command[1])
+        self.assertEqual(command[command.index("--runtime") + 1], "container")
+        self.assertEqual(command[command.index("--nodes") + 1], "3")
+        self.assertEqual(command[command.index("--scenarios") + 1], "durable_publish")
+        self.assertEqual(result["measurement_client"], "host Python clustered benchmark client")
+        self.assertEqual(len(result["nodes"]), 3)
+        self.assertTrue(all(node["resource_observation_available"] for node in result["nodes"]))
+        self.assertEqual(result["scenarios"][0]["operation"], "publish")
+        self.assertEqual(
+            result["scenarios"][0]["metadata"]["source_operation"],
+            "cluster_durable_publish",
+        )
+
+        backend = {**compare.backend_metadata("runnel", 3), **result}
+        compare.annotate_scenario_metadata(backend)
+        compare.validate_backend_record("runnel", backend, expected_nodes=3)
+
     def test_semantic_validation_accepts_complete_backend_records(self) -> None:
         cases = (
             ("runnel", 1),
+            ("runnel", 3),
             ("kafka", 1),
             ("redpanda", 1),
             ("nats", 1),
@@ -336,19 +432,35 @@ class ComparisonBenchmarkTests(unittest.TestCase):
         self.assertEqual(compare.benchmark_suite(1, ["kafka", "redpanda", "nats"]), "native-comparison")
         self.assertEqual(compare.benchmark_suite(3, ["kafka", "redpanda", "nats"]), "cluster-comparison")
 
-    def test_three_node_arguments_select_competitor_only_publish_mode(self) -> None:
+    def test_three_node_arguments_default_to_all_publish_adapters(self) -> None:
         with patch.object(
             sys,
             "argv",
-            ["compare.py", "--nodes", "3", "--backends", "kafka,redpanda,nats"],
+            ["compare.py", "--nodes", "3"],
         ):
             args = compare.parse_args()
 
         self.assertEqual(args.nodes, 3)
-        self.assertEqual(args.backends, ["kafka", "redpanda", "nats"])
+        self.assertEqual(args.backends, ["runnel", "kafka", "redpanda", "nats"])
 
-    def test_three_node_arguments_reject_runnel(self) -> None:
-        with patch.object(sys, "argv", ["compare.py", "--nodes", "3", "--backends", "runnel"]):
+    def test_three_node_arguments_allow_runnel_and_build(self) -> None:
+        with patch.object(
+            sys,
+            "argv",
+            ["compare.py", "--nodes", "3", "--backends", "runnel", "--build-runnel"],
+        ):
+            args = compare.parse_args()
+
+        self.assertEqual(args.nodes, 3)
+        self.assertEqual(args.backends, ["runnel"])
+        self.assertTrue(args.build_runnel)
+
+    def test_build_runnel_requires_the_runnel_backend(self) -> None:
+        with patch.object(
+            sys,
+            "argv",
+            ["compare.py", "--backends", "kafka", "--build-runnel"],
+        ):
             with self.assertRaises(SystemExit):
                 compare.parse_args()
 

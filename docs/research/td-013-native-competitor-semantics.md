@@ -79,9 +79,10 @@ The current comparison is intentionally a native-tool baseline:
   through a durable pull consumer with explicit acknowledgement, a batch limit
   of one, and synchronous double acknowledgement. Its publish and consume
   paths are therefore not equivalent to the Kafka-family consumer path.
-- The three-node mode measures only durable publish for Kafka, Redpanda, and
-  NATS JetStream. It uses one partition or stream with replication factor
-  three, but it does not include Runnel or any consume/recovery scenario.
+- At the reviewed 2026-09-06 baseline, the three-node mode measured only
+  durable publish for Kafka, Redpanda, and NATS JetStream. It used one
+  partition or stream with replication factor three and did not include Runnel
+  or any consume/recovery scenario.
 - Results carry operation-specific semantic metadata and are validated as
   `apples_to_apples: false`, `ranking_eligible: false`, and `experimental: true`.
   This is the correct disposition for the current evidence.
@@ -91,7 +92,26 @@ The measured scenario classes are intentionally asymmetric:
 | Mode | Runnel | Kafka/Redpanda | NATS JetStream |
 | --- | --- | --- | --- |
 | Single node | `publish-only`, `consume-with-ack` | `publish-only`, `consume-without-ack` | `publish-only`, `consume-with-ack` |
-| Three nodes | unsupported by this runner | `publish-only` | `publish-only` |
+| Three nodes | `publish-only` through the clustered public-protocol runner | `publish-only` | `publish-only` |
+
+## Runnel RF=3 follow-up
+
+The three-node profile now adapts the existing `cluster.py` container runner
+for Runnel's one-record-at-a-time durable-publish scenario. It starts three
+Runnel broker containers, rotates persistent host-side Python client
+connections across the public endpoints, and records the current static
+Multi-Raft acknowledgement boundary, per-node broker resource samples, and
+scenario latency. The adapter makes no change to Runnel runtime behavior.
+
+This closes the topology omission for a first Runnel cluster baseline; it does
+not establish semantic equivalence. The Runnel driver is host-side and
+unbounded by the competitor-client container limits. It uses one in-flight
+request per record and the current public JSON protocol, while Kafka and NATS
+use their native tools and batching behavior. The summary therefore remains
+`apples_to_apples: false`, `ranking_eligible: false`, and `experimental: true`.
+The current filesystem-flush details and client-side work also differ or are
+not observed consistently. Interpret this as a separate engineering baseline,
+not a product-speed ranking.
 
 The result validator checks the declared scenario classes, operation-specific
 boundaries, node records, and resource limits before writing an artifact. That
@@ -235,13 +255,15 @@ into a misleading leaderboard:
 
 ## Recommendation and open questions
 
-**Recommendation:** retain the native comparison exactly as a non-ranking
-baseline. Treat the envelope and four workload classes above as outcome gates
-for future work. Do not spend implementation effort on a common client until
-the Runnel client compatibility contract, clustered application
-acknowledgement behavior, and response-loss recovery path are stable enough
-that adapters can be tested against durable outcomes rather than moving
-semantics.
+**Recommendation:** retain the single-node and three-node suites as
+non-ranking engineering baselines, with backend-specific clients and their
+boundaries visible in each artifact. The three-node Runnel adapter fills a
+topology gap but does not satisfy the common-workload envelope or retire
+TD-013. Treat the envelope and four workload classes above as outcome gates
+for future work. Defer a common client until the Runnel client compatibility
+contract, clustered application acknowledgement behavior, and response-loss
+recovery path are stable enough that adapters can be tested against durable
+outcomes rather than moving semantics.
 
 The following questions remain unresolved:
 

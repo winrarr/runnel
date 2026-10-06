@@ -30,6 +30,11 @@ def comparison_result() -> dict:
                 "replication": "single node",
                 "measurement_boundary": "test protocol",
                 "measurement_client": "test client",
+                "client_resource_limits": {
+                    "scope": "host process",
+                    "cpu": "unbounded",
+                    "memory": "unbounded",
+                },
                 "startup_seconds": 0.1,
                 "resource_samples": {
                     "samples": 1,
@@ -72,6 +77,10 @@ class HistoryTests(unittest.TestCase):
         self.assertEqual(
             normalized["backends"]["runnel"]["scenarios"][0]["resource_samples"]["cpu_seconds"],
             0.25,
+        )
+        self.assertEqual(
+            normalized["backends"]["runnel"]["client_resource_limits"],
+            {"scope": "host process", "cpu": "unbounded", "memory": "unbounded"},
         )
 
     def test_normalization_preserves_canonical_provenance_and_server_metrics(self) -> None:
@@ -232,6 +241,14 @@ class HistoryTests(unittest.TestCase):
         second = normalize_result(second_raw, source_name="second.json")
 
         with self.assertRaisesRegex(AggregationError, "workload"):
+            aggregate_results([first, second])
+
+    def test_aggregation_rejects_mixed_client_resource_limits(self) -> None:
+        first = normalize_result(comparison_result(), source_name="first.json")
+        second = copy.deepcopy(first)
+        second["backends"]["runnel"]["client_resource_limits"]["cpu"] = "2"
+
+        with self.assertRaisesRegex(AggregationError, "client_resource_limits"):
             aggregate_results([first, second])
 
     def test_legacy_aggregate_without_samples_remains_readable(self) -> None:
