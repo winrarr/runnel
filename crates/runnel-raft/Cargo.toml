@@ -10,13 +10,21 @@ test-replacement-recovery = ["openraft/loosen-follower-log-revert"]
 
 [dependencies]
 base64 = "0.23"
+data-encoding.workspace = true
 openraft.workspace = true
+rustls.workspace = true
+rustls-pemfile.workspace = true
 runnel-engine = { path = "../runnel-engine" }
 serde.workspace = true
 serde_json.workspace = true
+sha2.workspace = true
 tokio.workspace = true
+tokio-rustls.workspace = true
 tracing.workspace = true
+x509-parser.workspace = true
 
 [dev-dependencies]
+rustls = { workspace = true, features = ["tls12"] }
 runnel-test-support = { path = "../runnel-test-support" }
+rcgen = "0.14"
 tempfile = "3.15"

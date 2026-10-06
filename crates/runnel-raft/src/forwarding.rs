@@ -106,6 +106,7 @@ impl<'a> ClientForwarder<'a> {
                 };
                 let response = match network::forward(
                     self.manager.peer_transport(),
+                    target,
                     address,
                     operation.clone(),
                     timeout,

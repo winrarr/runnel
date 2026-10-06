@@ -15,11 +15,15 @@ use serde::Serialize;
 use serde::de::DeserializeOwned;
 use tokio::net::TcpStream;
 use tokio::sync::{Mutex, Semaphore};
+use tokio_rustls::client::TlsStream as ClientTlsStream;
 
-use crate::{METADATA_GROUP_ID, TypeConfig};
+use crate::peer_tls::PeerTlsConnectionPermit;
+use crate::{METADATA_GROUP_ID, PeerTlsConfig, TypeConfig};
 #[cfg(feature = "instrumentation")]
 use runnel_engine::StageTimer;
 
+use super::framing::{BoundedFrame, read_frame_bounded, write_frame_bounded};
+#[cfg(test)]
 use super::framing::{read_frame, write_frame};
 use super::{ForwardedOperation, ForwardedResponse, PeerRequest, PeerResponse};
 
@@ -72,7 +76,9 @@ impl RaftNetworkFactory<TypeConfig> for TcpNetwork {
             address,
             group_id: self.group_id.clone(),
             stream: None,
+            connection_permit: None,
             read_buffer: Vec::new(),
+            peer_tls: self.transport.peer_tls.clone(),
             transport: Some(Arc::clone(&self.transport)),
         }
     }
@@ -82,19 +88,100 @@ pub struct TcpConnection {
     target: u64,
     address: Option<String>,
     group_id: String,
-    stream: Option<TcpStream>,
+    stream: Option<PeerStream>,
+    connection_permit: Option<PeerTlsConnectionPermit>,
     read_buffer: Vec<u8>,
+    peer_tls: Option<Arc<PeerTlsConfig>>,
     transport: Option<Arc<PeerTransport>>,
 }
 
+enum PeerStream {
+    Tls(Box<ClientTlsStream<TcpStream>>),
+    #[cfg(test)]
+    Plain(TcpStream),
+}
+
+async fn write_peer_frame<T: Serialize>(
+    stream: &mut PeerStream,
+    request: &T,
+    peer_tls: Option<&Arc<PeerTlsConfig>>,
+) -> io::Result<()> {
+    match stream {
+        PeerStream::Tls(stream) => {
+            let tls = peer_tls.ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "peer TLS configuration is missing",
+                )
+            })?;
+            write_frame_bounded(stream.as_mut(), request, &tls.frame_write_slots()).await
+        }
+        #[cfg(test)]
+        PeerStream::Plain(stream) => write_frame(stream, request).await,
+    }
+}
+
+async fn read_peer_frame<Res: DeserializeOwned>(
+    stream: &mut PeerStream,
+    read_buffer: &mut Vec<u8>,
+    peer_tls: Option<&Arc<PeerTlsConfig>>,
+) -> io::Result<BoundedFrame<Res>> {
+    match stream {
+        PeerStream::Tls(stream) => {
+            let tls = peer_tls.ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "peer TLS configuration is missing",
+                )
+            })?;
+            read_frame_bounded(stream.as_mut(), read_buffer, &tls.frame_memory()).await
+        }
+        #[cfg(test)]
+        PeerStream::Plain(stream) => read_frame(stream, read_buffer)
+            .await
+            .map(BoundedFrame::unbounded),
+    }
+}
+
+async fn connect_peer(
+    target: u64,
+    address: &str,
+    timeout: Duration,
+    peer_tls: Option<&Arc<PeerTlsConfig>>,
+) -> io::Result<(PeerStream, Option<PeerTlsConnectionPermit>)> {
+    if let Some(peer_tls) = peer_tls {
+        let permit = peer_tls.acquire_outbound_connection(timeout).await?;
+        let stream = peer_tls.connect(target, address).await?;
+        return Ok((PeerStream::Tls(Box::new(stream)), Some(permit)));
+    }
+    #[cfg(test)]
+    {
+        let stream = tokio::time::timeout(timeout, TcpStream::connect(address))
+            .await
+            .map_err(|_| timed_out_error())??;
+        stream.set_nodelay(true)?;
+        Ok((PeerStream::Plain(stream), None))
+    }
+    #[cfg(not(test))]
+    {
+        let _ = (target, address, timeout);
+        Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "peer TLS configuration is required",
+        ))
+    }
+}
+
 impl TcpConnection {
-    fn new(address: impl Into<String>) -> Self {
+    fn new(target: u64, address: impl Into<String>, peer_tls: Option<Arc<PeerTlsConfig>>) -> Self {
         Self {
-            target: 0,
+            target,
             address: Some(address.into()),
             group_id: METADATA_GROUP_ID.to_owned(),
             stream: None,
+            connection_permit: None,
             read_buffer: Vec::new(),
+            peer_tls,
             transport: None,
         }
     }
@@ -121,7 +208,7 @@ impl TcpConnection {
                     "peer RPC connection has no transport owner",
                 )
             })?
-            .request(&address, request, ttl)
+            .request_to(self.target, &address, request, ttl)
             .await
     }
 
@@ -139,34 +226,38 @@ impl TcpConnection {
             )
         })?;
         let stream = self.stream.take();
+        let connection_permit = self.connection_permit.take();
         let mut read_buffer = std::mem::take(&mut self.read_buffer);
+        let target = self.target;
+        let peer_tls = self.peer_tls.clone();
         let result = tokio::time::timeout(ttl, async move {
-            let mut stream = match stream {
-                Some(stream) => stream,
+            let (mut stream, connection_permit) = match stream {
+                Some(stream) => (stream, connection_permit),
                 None => {
                     #[cfg(feature = "instrumentation")]
                     let _connect_timer = StageTimer::new("raft.peer_rpc.connect");
-                    let stream = TcpStream::connect(address).await?;
-                    stream.set_nodelay(true)?;
-                    stream
+                    connect_peer(target, &address, ttl, peer_tls.as_ref()).await?
                 }
             };
             #[cfg(feature = "instrumentation")]
             let _write_timer = StageTimer::new("raft.peer_rpc.write");
-            write_frame(&mut stream, &request).await?;
+            write_peer_frame(&mut stream, &request, peer_tls.as_ref()).await?;
             #[cfg(feature = "instrumentation")]
             drop(_write_timer);
             #[cfg(feature = "instrumentation")]
             let _read_timer = StageTimer::new("raft.peer_rpc.read");
-            let response = read_frame(&mut stream, &mut read_buffer).await?;
-            Ok::<_, io::Error>((stream, response, read_buffer))
+            let response_frame =
+                read_peer_frame(&mut stream, &mut read_buffer, peer_tls.as_ref()).await?;
+            Ok::<_, io::Error>((stream, connection_permit, response_frame, read_buffer))
         })
         .await;
 
         match result {
-            Ok(Ok((stream, response, read_buffer))) => {
+            Ok(Ok((stream, connection_permit, response_frame, read_buffer))) => {
                 self.stream = Some(stream);
+                self.connection_permit = connection_permit;
                 self.read_buffer = read_buffer;
+                let (response, _frame_memory_permit) = response_frame.into_parts();
                 Ok(response)
             }
             Ok(Err(error)) => Err(error),
@@ -175,7 +266,7 @@ impl TcpConnection {
     }
 }
 
-/// Owns all compatibility peer connections for one broker engine lifetime.
+/// Owns all pooled peer connections for one broker engine lifetime.
 ///
 /// OpenRaft retains one lazy network client per replication target and group,
 /// while forwarding and setup requests do not receive such an owner. Keeping
@@ -186,18 +277,20 @@ pub(crate) struct PeerTransport {
     closed: AtomicBool,
     pools: StdMutex<PeerPoolRegistry>,
     fallback_permits: PeerPoolPermits,
+    peer_tls: Option<Arc<PeerTlsConfig>>,
 }
 
 impl PeerTransport {
-    pub(crate) fn new() -> Arc<Self> {
+    pub(crate) fn new(peer_tls: Option<Arc<PeerTlsConfig>>) -> Arc<Self> {
         Arc::new(Self {
             closed: AtomicBool::new(false),
             pools: StdMutex::new(PeerPoolRegistry::default()),
             fallback_permits: PeerPoolPermits::default(),
+            peer_tls,
         })
     }
 
-    fn pool(&self, address: &str) -> Option<Arc<PeerConnectionPool>> {
+    fn pool(&self, target: u64, address: &str) -> Option<Arc<PeerConnectionPool>> {
         let mut pools = self
             .pools
             .lock()
@@ -205,10 +298,10 @@ impl PeerTransport {
         if self.is_closed() {
             return None;
         }
-        pools.pool(address)
+        pools.pool(target, address)
     }
 
-    /// Stop new requests and close all idle compatibility sockets. Requests
+    /// Stop new requests and close all idle pooled sockets. Requests
     /// already in flight finish under their existing TTL, then discard their
     /// sockets instead of returning them to a closed pool.
     pub(crate) fn shutdown(&self) {
@@ -236,8 +329,9 @@ impl PeerTransport {
         self.closed.load(Ordering::Acquire)
     }
 
-    async fn request<Res>(
+    async fn request_to<Res>(
         &self,
+        target: u64,
         address: &str,
         request: PeerRequest,
         ttl: Duration,
@@ -248,13 +342,42 @@ impl PeerTransport {
         if self.is_closed() {
             return Err(transport_closed_error());
         }
-        self.request_with_pool(self.pool(address), address, request, ttl)
+        self.request_with_pool_to(self.pool(target, address), target, address, request, ttl)
             .await
     }
 
+    #[cfg(test)]
+    async fn request<Res>(
+        &self,
+        address: &str,
+        request: PeerRequest,
+        ttl: Duration,
+    ) -> Result<Res, io::Error>
+    where
+        Res: DeserializeOwned,
+    {
+        self.request_to(1, address, request, ttl).await
+    }
+
+    #[cfg(test)]
     async fn request_with_pool<Res>(
         &self,
         pool: Option<Arc<PeerConnectionPool>>,
+        address: &str,
+        request: PeerRequest,
+        ttl: Duration,
+    ) -> Result<Res, io::Error>
+    where
+        Res: DeserializeOwned,
+    {
+        self.request_with_pool_to(pool, 1, address, request, ttl)
+            .await
+    }
+
+    async fn request_with_pool_to<Res>(
+        &self,
+        pool: Option<Arc<PeerConnectionPool>>,
+        target: u64,
         address: &str,
         request: PeerRequest,
         ttl: Duration,
@@ -266,7 +389,9 @@ impl PeerTransport {
             return Err(transport_closed_error());
         }
         if let Some(pool) = pool {
-            return pool.request(address, request, ttl).await;
+            return pool
+                .request(target, address, request, ttl, self.peer_tls.clone())
+                .await;
         }
 
         let started = tokio::time::Instant::now();
@@ -284,7 +409,7 @@ impl PeerTransport {
             return Err(transport_closed_error());
         }
         let remaining = ttl.saturating_sub(started.elapsed());
-        let mut connection = TcpConnection::new(address);
+        let mut connection = TcpConnection::new(target, address, self.peer_tls.clone());
         let result = connection.request(request, remaining).await;
         drop(permit);
         result
@@ -311,8 +436,14 @@ enum PeerRequestLane {
 
 #[derive(Default)]
 struct PeerPoolRegistry {
-    pools: HashMap<String, PeerPoolEntry>,
+    pools: HashMap<PeerPoolKey, PeerPoolEntry>,
     access_counter: u64,
+}
+
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+struct PeerPoolKey {
+    node_id: u64,
+    address: String,
 }
 
 struct PeerPoolEntry {
@@ -321,9 +452,13 @@ struct PeerPoolEntry {
 }
 
 impl PeerPoolRegistry {
-    fn pool(&mut self, address: &str) -> Option<Arc<PeerConnectionPool>> {
+    fn pool(&mut self, node_id: u64, address: &str) -> Option<Arc<PeerConnectionPool>> {
         let access = self.next_access();
-        if let Some(entry) = self.pools.get_mut(address) {
+        let key = PeerPoolKey {
+            node_id,
+            address: address.to_owned(),
+        };
+        if let Some(entry) = self.pools.get_mut(&key) {
             entry.last_used = access;
             return Some(Arc::clone(&entry.pool));
         }
@@ -348,7 +483,7 @@ impl PeerPoolRegistry {
         }
         let pool = Arc::new(PeerConnectionPool::new());
         self.pools.insert(
-            address.to_owned(),
+            key,
             PeerPoolEntry {
                 pool: Arc::clone(&pool),
                 last_used: access,
@@ -387,9 +522,11 @@ impl PeerConnectionPool {
 
     async fn request<Res>(
         &self,
+        target: u64,
         address: &str,
         request: PeerRequest,
         ttl: Duration,
+        peer_tls: Option<Arc<PeerTlsConfig>>,
     ) -> Result<Res, io::Error>
     where
         Res: DeserializeOwned,
@@ -407,7 +544,9 @@ impl PeerConnectionPool {
             drop(permit);
             return Err(pool_closed_error());
         }
-        let mut connection = self.take_connection(address, ttl, started).await?;
+        let mut connection = self
+            .take_connection(target, address, ttl, started, peer_tls)
+            .await?;
         if self.is_closed() {
             drop(permit);
             return Err(pool_closed_error());
@@ -423,9 +562,11 @@ impl PeerConnectionPool {
 
     async fn take_connection(
         &self,
+        target: u64,
         address: &str,
         ttl: Duration,
         started: tokio::time::Instant,
+        peer_tls: Option<Arc<PeerTlsConfig>>,
     ) -> Result<TcpConnection, io::Error> {
         let remaining = ttl.saturating_sub(started.elapsed());
         let mut idle = tokio::time::timeout(remaining, self.idle.lock())
@@ -437,7 +578,7 @@ impl PeerConnectionPool {
         let now = Instant::now();
         let connection = loop {
             let Some(idle_connection) = idle.pop() else {
-                break TcpConnection::new(address);
+                break TcpConnection::new(target, address, peer_tls);
             };
             if now.duration_since(idle_connection.last_used) <= MAX_IDLE_CONNECTION_AGE {
                 break idle_connection.connection;
@@ -511,12 +652,13 @@ fn pool_closed_error() -> io::Error {
 
 pub(crate) async fn forward(
     transport: &PeerTransport,
+    target: u64,
     address: &str,
     operation: ForwardedOperation,
     timeout: Duration,
 ) -> Result<ForwardedResponse, io::Error> {
     let response = transport
-        .request(address, PeerRequest::Forward(operation), timeout)
+        .request_to(target, address, PeerRequest::Forward(operation), timeout)
         .await?;
     match response {
         PeerResponse::Forward(response) => Ok(response),
@@ -630,6 +772,7 @@ impl PeerRequest {
 
 pub(crate) async fn ensure_data_group(
     transport: &PeerTransport,
+    target: u64,
     address: &str,
     stream: String,
     stream_id: String,
@@ -637,7 +780,8 @@ pub(crate) async fn ensure_data_group(
     timeout: Duration,
 ) -> Result<(), io::Error> {
     match transport
-        .request(
+        .request_to(
+            target,
             address,
             PeerRequest::EnsureDataGroup {
                 stream,
@@ -669,7 +813,10 @@ fn unreachable_snapshot_error(
 
 #[cfg(test)]
 mod tests {
-    use super::super::framing::MAX_REUSABLE_FRAME_BUFFER_SIZE;
+    use super::super::framing::{
+        MAX_REUSABLE_FRAME_BUFFER_SIZE, read_frame_bounded, write_frame_bounded,
+    };
+    use crate::peer_tls::tests::peer_pair_configs;
 
     use std::mem::size_of;
     use std::sync::Arc;
@@ -795,7 +942,9 @@ mod tests {
                 address: Some(self.address.clone()),
                 group_id: "test".to_owned(),
                 stream: None,
+                connection_permit: None,
                 read_buffer: Vec::new(),
+                peer_tls: None,
                 transport: None,
             }
         }
@@ -827,7 +976,7 @@ mod tests {
     fn capped_registry() -> PeerPoolRegistry {
         let mut registry = PeerPoolRegistry::default();
         for index in 0..MAX_POOLED_PEERS {
-            assert!(registry.pool(&format!("test-peer-{index}")).is_some());
+            assert!(registry.pool(1, &format!("test-peer-{index}")).is_some());
         }
         registry
     }
@@ -836,35 +985,97 @@ mod tests {
         let mut registry = PeerPoolRegistry::default();
         let mut pools = Vec::with_capacity(MAX_POOLED_PEERS);
         for index in 0..MAX_POOLED_PEERS {
-            pools.push(registry.pool(&format!("test-peer-{index}")).unwrap());
+            pools.push(registry.pool(1, &format!("test-peer-{index}")).unwrap());
         }
         (registry, pools)
+    }
+
+    fn pool_key(address: &str) -> PeerPoolKey {
+        PeerPoolKey {
+            node_id: 1,
+            address: address.to_owned(),
+        }
     }
 
     #[test]
     fn full_registry_evicts_the_oldest_idle_pool_deterministically() {
         let mut registry = capped_registry();
 
-        assert!(registry.pool("new-peer-1").is_some());
+        assert!(registry.pool(1, "new-peer-1").is_some());
         assert_eq!(registry.pools.len(), MAX_POOLED_PEERS);
-        assert!(!registry.pools.contains_key("test-peer-0"));
+        assert!(!registry.pools.contains_key(&pool_key("test-peer-0")));
 
-        assert!(registry.pool("test-peer-1").is_some());
-        assert!(registry.pool("new-peer-2").is_some());
+        assert!(registry.pool(1, "test-peer-1").is_some());
+        assert!(registry.pool(1, "new-peer-2").is_some());
         assert_eq!(registry.pools.len(), MAX_POOLED_PEERS);
-        assert!(!registry.pools.contains_key("test-peer-2"));
+        assert!(!registry.pools.contains_key(&pool_key("test-peer-2")));
     }
 
     #[test]
     fn full_registry_keeps_busy_pools_for_bounded_fallback() {
         let (mut registry, held_pools) = busy_registry();
 
-        assert!(registry.pool("busy-overflow-peer").is_none());
+        assert!(registry.pool(1, "busy-overflow-peer").is_none());
         assert_eq!(registry.pools.len(), MAX_POOLED_PEERS);
 
         drop(held_pools);
-        assert!(registry.pool("busy-overflow-peer").is_some());
+        assert!(registry.pool(1, "busy-overflow-peer").is_some());
         assert_eq!(registry.pools.len(), MAX_POOLED_PEERS);
+    }
+
+    #[test]
+    fn peer_pool_key_retains_node_identity_when_addresses_match() {
+        let mut registry = PeerPoolRegistry::default();
+        let first = registry.pool(1, "shared-address").unwrap();
+        let second = registry.pool(2, "shared-address").unwrap();
+        assert!(!Arc::ptr_eq(&first, &second));
+        assert_eq!(registry.pools.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn peer_transport_uses_mutual_tls_before_exchange_and_pins_node_identity() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap().to_string();
+        let peers = BTreeMap::from([(0, "127.0.0.1:7000".to_owned()), (1, address.clone())]);
+        let (client_tls, server_tls) = peer_pair_configs(&peers);
+        let server_task = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let connection_permit = server_tls.try_acquire_inbound_connection().unwrap();
+            let handshake_permit = server_tls.try_acquire_inbound_handshake().unwrap();
+            let (mut stream, peer_id) = server_tls.accept(stream, handshake_permit).await.unwrap();
+            let _connection_permit = connection_permit;
+            assert_eq!(peer_id, 0);
+            let mut payload = Vec::new();
+            let request_frame =
+                read_frame_bounded(&mut stream, &mut payload, &server_tls.frame_memory())
+                    .await
+                    .unwrap();
+            assert!(matches!(request_frame.value, PeerRequest::Forward(_)));
+            write_frame_bounded(
+                &mut stream,
+                &PeerResponse::Forward(ForwardedResponse::CreateStream(Ok(true))),
+                &server_tls.frame_write_slots(),
+            )
+            .await
+            .unwrap();
+        });
+
+        let transport = PeerTransport::new(Some(client_tls));
+        let response = forward(
+            &transport,
+            1,
+            &address,
+            forwarded_operation(),
+            Duration::from_secs(1),
+        )
+        .await
+        .unwrap();
+        assert!(matches!(
+            response,
+            ForwardedResponse::CreateStream(Ok(true))
+        ));
+        server_task.await.unwrap();
+        transport.shutdown();
     }
 
     #[tokio::test]
@@ -929,11 +1140,12 @@ mod tests {
         const REQUESTS: usize = 64;
 
         let peer = TestPeer::start(None).await;
-        let transport = PeerTransport::new();
+        let transport = PeerTransport::new(None);
         let started = Instant::now();
         for _ in 0..REQUESTS {
             let response = forward(
                 &transport,
+                1,
                 &peer.address,
                 forwarded_operation(),
                 Duration::from_secs(1),
@@ -954,12 +1166,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn compatibility_connections_follow_transport_lifetime() {
+    async fn pooled_connections_follow_transport_lifetime() {
         let peer = TestPeer::start(None).await;
 
-        let transport = PeerTransport::new();
+        let transport = PeerTransport::new(None);
         forward(
             &transport,
+            1,
             &peer.address,
             forwarded_operation(),
             Duration::from_secs(1),
@@ -968,9 +1181,10 @@ mod tests {
         .unwrap();
         drop(transport);
 
-        let transport = PeerTransport::new();
+        let transport = PeerTransport::new(None);
         forward(
             &transport,
+            1,
             &peer.address,
             forwarded_operation(),
             Duration::from_secs(1),
@@ -984,10 +1198,11 @@ mod tests {
     #[tokio::test]
     async fn transport_shutdown_closes_idle_connections_and_rejects_new_requests() {
         let peer = TestPeer::start(None).await;
-        let transport = PeerTransport::new();
+        let transport = PeerTransport::new(None);
 
         forward(
             &transport,
+            1,
             &peer.address,
             forwarded_operation(),
             Duration::from_secs(1),
@@ -1014,6 +1229,7 @@ mod tests {
 
         let error = forward(
             &retained_transport,
+            1,
             &peer.address,
             forwarded_operation(),
             Duration::from_secs(1),
@@ -1027,8 +1243,8 @@ mod tests {
     #[tokio::test]
     async fn transport_shutdown_does_not_retain_a_completed_pooled_connection() {
         let peer = TestPeer::start_with_delay(None, Some(Duration::from_millis(25))).await;
-        let transport = PeerTransport::new();
-        let pool = transport.pool(&peer.address).unwrap();
+        let transport = PeerTransport::new(None);
+        let pool = transport.pool(1, &peer.address).unwrap();
         let address = peer.address.clone();
         let request_task = tokio::spawn({
             let transport = Arc::clone(&transport);
@@ -1055,7 +1271,7 @@ mod tests {
         ));
         assert!(pool.idle.lock().await.is_empty());
         let error = pool
-            .request::<PeerResponse>(&peer.address, request(), Duration::from_secs(1))
+            .request::<PeerResponse>(1, &peer.address, request(), Duration::from_secs(1), None)
             .await
             .unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::BrokenPipe);
@@ -1067,7 +1283,7 @@ mod tests {
         let pool = PeerConnectionPool::new();
 
         let response: PeerResponse = pool
-            .request(&peer.address, request(), Duration::from_secs(1))
+            .request(1, &peer.address, request(), Duration::from_secs(1), None)
             .await
             .unwrap();
         assert!(matches!(
@@ -1082,7 +1298,7 @@ mod tests {
         }
 
         let response: PeerResponse = pool
-            .request(&peer.address, request(), Duration::from_secs(1))
+            .request(1, &peer.address, request(), Duration::from_secs(1), None)
             .await
             .unwrap();
         assert!(matches!(
@@ -1099,7 +1315,7 @@ mod tests {
         let idle = pool.idle.lock().await;
 
         let error = pool
-            .request::<PeerResponse>(&peer.address, request(), Duration::from_millis(1))
+            .request::<PeerResponse>(1, &peer.address, request(), Duration::from_millis(1), None)
             .await
             .unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::TimedOut);
@@ -1107,7 +1323,7 @@ mod tests {
 
         drop(idle);
         let response: PeerResponse = pool
-            .request(&peer.address, request(), Duration::from_secs(1))
+            .request(1, &peer.address, request(), Duration::from_secs(1), None)
             .await
             .unwrap();
         assert!(matches!(
@@ -1125,7 +1341,7 @@ mod tests {
         let mut network = TcpNetwork::with_transport(
             BTreeMap::from([(1, peer.address.clone())]),
             "test",
-            PeerTransport::new(),
+            PeerTransport::new(None),
         );
         let started = Instant::now();
         for request_number in 0..REQUESTS {
@@ -1174,7 +1390,7 @@ mod tests {
         let mut network = TcpNetwork::with_transport(
             BTreeMap::from([(1, peer.address.clone())]),
             "test",
-            PeerTransport::new(),
+            PeerTransport::new(None),
         );
 
         let mut client = network.new_client(1, &BasicNode::new(&peer.address)).await;
@@ -1214,7 +1430,7 @@ mod tests {
         const REQUESTS: usize = 32;
 
         let peer = TestPeer::start_with_delay(None, Some(Duration::from_millis(50))).await;
-        let transport = PeerTransport::new();
+        let transport = PeerTransport::new(None);
         let started = Instant::now();
         let mut tasks = Vec::with_capacity(REQUESTS);
         for _ in 0..REQUESTS {
@@ -1223,6 +1439,7 @@ mod tests {
             tasks.push(tokio::spawn(async move {
                 forward(
                     &transport,
+                    1,
                     &address,
                     forwarded_operation(),
                     Duration::from_secs(1),
@@ -1255,7 +1472,7 @@ mod tests {
         peer: &TestPeer,
         pool: Option<Arc<PeerConnectionPool>>,
     ) {
-        let transport = PeerTransport::new();
+        let transport = PeerTransport::new(None);
         let mut data_tasks = Vec::with_capacity(MAX_SHARED_CONNECTIONS_PER_POOLED_PEER);
         for _ in 0..MAX_SHARED_CONNECTIONS_PER_POOLED_PEER {
             let address = peer.address.clone();
@@ -1338,8 +1555,8 @@ mod tests {
 
         let (mut registry, _held_pools) = busy_registry();
         let peer = TestPeer::start_with_delay(None, Some(Duration::from_millis(50))).await;
-        let transport = PeerTransport::new();
-        let fallback_pool = registry.pool(&peer.address);
+        let transport = PeerTransport::new(None);
+        let fallback_pool = registry.pool(1, &peer.address);
         assert!(fallback_pool.is_none());
         let frame_size = serde_json::to_vec(&request()).unwrap().len() + size_of::<u32>();
 
@@ -1380,10 +1597,10 @@ mod tests {
     async fn capped_peer_fallback_timeout_drops_connection_before_next_request() {
         let (mut registry, _held_pools) = busy_registry();
         let peer = TestPeer::start_with_delay(None, Some(Duration::from_millis(50))).await;
-        let transport = PeerTransport::new();
+        let transport = PeerTransport::new(None);
         let error = transport
             .request_with_pool::<PeerResponse>(
-                registry.pool(&peer.address),
+                registry.pool(1, &peer.address),
                 &peer.address,
                 request(),
                 Duration::from_millis(1),
@@ -1394,7 +1611,7 @@ mod tests {
 
         let response: PeerResponse = transport
             .request_with_pool(
-                registry.pool(&peer.address),
+                registry.pool(1, &peer.address),
                 &peer.address,
                 request(),
                 Duration::from_secs(1),
@@ -1422,12 +1639,12 @@ mod tests {
                 drop(stream);
             }
         });
-        let transport = PeerTransport::new();
+        let transport = PeerTransport::new(None);
 
         for _ in 0..2 {
             let error = transport
                 .request_with_pool::<PeerResponse>(
-                    registry.pool(&address),
+                    registry.pool(1, &address),
                     &address,
                     request(),
                     Duration::from_secs(1),
@@ -1449,10 +1666,11 @@ mod tests {
     #[tokio::test]
     async fn failed_forward_connection_is_replaced_before_next_request() {
         let peer = TestPeer::start(Some(1)).await;
-        let transport = PeerTransport::new();
+        let transport = PeerTransport::new(None);
 
         forward(
             &transport,
+            1,
             &peer.address,
             forwarded_operation(),
             Duration::from_secs(1),
@@ -1462,6 +1680,7 @@ mod tests {
         assert!(
             forward(
                 &transport,
+                1,
                 &peer.address,
                 forwarded_operation(),
                 Duration::from_secs(1),
@@ -1471,6 +1690,7 @@ mod tests {
         );
         forward(
             &transport,
+            1,
             &peer.address,
             forwarded_operation(),
             Duration::from_secs(1),
@@ -1484,10 +1704,11 @@ mod tests {
     #[tokio::test]
     async fn timed_out_forward_request_drops_connection_before_reconnect() {
         let peer = TestPeer::start_with_delay(None, Some(Duration::from_millis(50))).await;
-        let transport = PeerTransport::new();
+        let transport = PeerTransport::new(None);
 
         let error = forward(
             &transport,
+            1,
             &peer.address,
             forwarded_operation(),
             Duration::from_millis(1),
@@ -1497,6 +1718,7 @@ mod tests {
         assert_eq!(error.kind(), io::ErrorKind::TimedOut);
         forward(
             &transport,
+            1,
             &peer.address,
             forwarded_operation(),
             Duration::from_secs(1),

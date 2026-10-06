@@ -20,8 +20,8 @@ use super::forwarding::forward_error_to_broker;
 use super::state_machine::{GroupKind, StreamLifecycle, StreamMetadata, stream_identity};
 use super::state_machine_store::{StateMachineStore, validate_state_machine_storage};
 use super::{
-    METADATA_GROUP_ID, NodeId, Raft, SnapshotMetricsSnapshot, TypeConfig, atomic_write, log_store,
-    network, path_component, validate_name,
+    METADATA_GROUP_ID, NodeId, PeerTlsConfig, Raft, SnapshotMetricsSnapshot, TypeConfig,
+    atomic_write, log_store, network, path_component, validate_name,
 };
 
 // These defaults keep the consensus log bounded while the snapshot format is
@@ -111,6 +111,7 @@ pub struct GroupManager {
     groups: RwLock<BTreeMap<String, Arc<RaftGroup>>>,
     creation_lock: Mutex<()>,
     replication_progress_cursor: Mutex<Option<String>>,
+    peer_tls: Option<Arc<PeerTlsConfig>>,
     peer_transport: Arc<network::PeerTransport>,
 }
 
@@ -144,7 +145,9 @@ impl GroupManager {
         peers: BTreeMap<NodeId, String>,
         ack_timeout: Duration,
         max_delivery_attempts: Option<u32>,
+        peer_tls: Option<Arc<PeerTlsConfig>>,
     ) -> Result<Arc<Self>, BrokerError> {
+        let peer_transport = network::PeerTransport::new(peer_tls.clone());
         let manager = Arc::new(Self {
             node_id,
             cluster_name,
@@ -155,7 +158,8 @@ impl GroupManager {
             groups: RwLock::new(BTreeMap::new()),
             creation_lock: Mutex::new(()),
             replication_progress_cursor: Mutex::new(None),
-            peer_transport: network::PeerTransport::new(),
+            peer_tls,
+            peer_transport,
         });
         let metadata = manager
             .open_group(
@@ -303,6 +307,10 @@ impl GroupManager {
         &self.peer_transport
     }
 
+    pub(crate) fn peer_tls(&self) -> Option<&Arc<PeerTlsConfig>> {
+        self.peer_tls.as_ref()
+    }
+
     pub(crate) fn node_id(&self) -> NodeId {
         self.node_id
     }
@@ -418,6 +426,7 @@ impl GroupManager {
             }
             network::ensure_data_group(
                 &self.peer_transport,
+                *node_id,
                 address,
                 stream.to_owned(),
                 metadata.stream_id.clone(),
@@ -485,6 +494,7 @@ impl GroupManager {
                 })?;
                 let response = network::forward(
                     &self.peer_transport,
+                    target,
                     address,
                     network::ForwardedOperation::InitializeDataStream {
                         stream: stream.to_owned(),

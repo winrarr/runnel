@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import json
+import ssl
 import socket
 import socketserver
 import threading
@@ -11,6 +12,7 @@ import time
 from typing import Any
 
 from common import BenchmarkError, DEFAULT_TIMEOUT_SECONDS
+from peer_tls import PeerCredentials, peer_identity
 
 
 def _receive_exact(sock: socket.socket, size: int) -> bytes | None:
@@ -52,7 +54,16 @@ class _PeerDelayProxyServer(socketserver.ThreadingTCPServer):
     allow_reuse_address = True
     daemon_threads = True
 
-    def __init__(self, target_port: int, response_delay_ms: int) -> None:
+    def __init__(
+        self,
+        target_port: int,
+        response_delay_ms: int,
+        peer_credentials: PeerCredentials | None,
+        target_node_id: int | None,
+    ) -> None:
+        if (peer_credentials is None) != (target_node_id is None):
+            raise ValueError("TLS credentials and target node ID must be configured together")
+
         self.target_port = target_port
         self.response_delay_ms = response_delay_ms
         self.response_delay_seconds = response_delay_ms / 1_000
@@ -63,7 +74,42 @@ class _PeerDelayProxyServer(socketserver.ThreadingTCPServer):
         self.request_count = 0
         self.response_count = 0
         self.delayed_response_count = 0
+        self.peer_credentials = peer_credentials
+        self.target_node_id = target_node_id
+        self.server_tls_context = None
+        self.client_tls_contexts: dict[int, ssl.SSLContext] = {}
+        if peer_credentials is not None and target_node_id is not None:
+            node = peer_credentials.node(target_node_id)
+            server_tls_context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+            server_tls_context.minimum_version = ssl.TLSVersion.TLSv1_3
+            server_tls_context.maximum_version = ssl.TLSVersion.TLSv1_3
+            server_tls_context.verify_mode = ssl.CERT_REQUIRED
+            server_tls_context.load_verify_locations(cafile=str(node.trust_bundle))
+            server_tls_context.load_cert_chain(
+                certfile=str(node.certificate_chain),
+                keyfile=str(node.private_key),
+            )
+            self.server_tls_context = server_tls_context
         super().__init__(("127.0.0.1", 0), _PeerDelayProxyHandler)
+
+    def client_tls_context(self, source_node_id: int) -> ssl.SSLContext:
+        context = self.client_tls_contexts.get(source_node_id)
+        if context is not None:
+            return context
+        assert self.peer_credentials is not None
+        node = self.peer_credentials.node(source_node_id)
+        context = ssl.create_default_context(
+            ssl.Purpose.SERVER_AUTH,
+            cafile=str(node.trust_bundle),
+        )
+        context.minimum_version = ssl.TLSVersion.TLSv1_3
+        context.maximum_version = ssl.TLSVersion.TLSv1_3
+        context.load_cert_chain(
+            certfile=str(node.certificate_chain),
+            keyfile=str(node.private_key),
+        )
+        self.client_tls_contexts[source_node_id] = context
+        return context
 
 
 class _PeerDelayProxyHandler(socketserver.BaseRequestHandler):
@@ -77,39 +123,95 @@ class _PeerDelayProxyHandler(socketserver.BaseRequestHandler):
                 server.max_active_connections, server.active_connections
             )
         try:
-            with socket.create_connection(
-                ("127.0.0.1", server.target_port), timeout=DEFAULT_TIMEOUT_SECONDS
-            ) as target:
-                self.request.settimeout(DEFAULT_TIMEOUT_SECONDS)
-                while True:
-                    frame = _read_proxy_frame(self.request)
-                    if frame is None:
-                        return
-                    target.sendall(frame)
-                    with server.stats_lock:
-                        server.request_count += 1
-                    response = _read_proxy_frame(target)
-                    if response is None:
-                        return
-                    if server.response_delay_seconds and _is_forward_response(response):
-                        time.sleep(server.response_delay_seconds)
-                        with server.stats_lock:
-                            server.delayed_response_count += 1
-                    self.request.sendall(response)
-                    with server.stats_lock:
-                        server.response_count += 1
-        except (BenchmarkError, ConnectionError, OSError):
+            self.request.settimeout(DEFAULT_TIMEOUT_SECONDS)
+            if server.server_tls_context is None:
+                self._handle_plaintext(server)
+            else:
+                self._handle_tls(server)
+        except (BenchmarkError, ConnectionError, OSError, ssl.SSLError):
             return
         finally:
             with server.stats_lock:
                 server.active_connections -= 1
 
+    def _handle_plaintext(self, server: _PeerDelayProxyServer) -> None:
+        with socket.create_connection(
+            ("127.0.0.1", server.target_port), timeout=DEFAULT_TIMEOUT_SECONDS
+        ) as target:
+            self._proxy_frames(server, self.request, target)
+
+    def _handle_tls(self, server: _PeerDelayProxyServer) -> None:
+        assert server.server_tls_context is not None
+        assert server.peer_credentials is not None
+        assert server.target_node_id is not None
+        with server.server_tls_context.wrap_socket(
+            self.request,
+            server_side=True,
+        ) as client:
+            peer_certificate = client.getpeercert()
+            dns_identities = [
+                identity
+                for name_type, identity in peer_certificate.get("subjectAltName", ())
+                if name_type == "DNS"
+            ]
+            if len(dns_identities) != 1:
+                return
+            source_node_id = server.peer_credentials.node_id_for_identity(dns_identities[0])
+            if source_node_id is None or source_node_id == server.target_node_id:
+                return
+            with socket.create_connection(
+                ("127.0.0.1", server.target_port), timeout=DEFAULT_TIMEOUT_SECONDS
+            ) as target_socket:
+                with server.client_tls_context(source_node_id).wrap_socket(
+                    target_socket,
+                    server_hostname=peer_identity(
+                        server.target_node_id,
+                        server.peer_credentials.cluster_name,
+                    ),
+                ) as target:
+                    self._proxy_frames(server, client, target)
+
+    def _proxy_frames(
+        self,
+        server: _PeerDelayProxyServer,
+        client: socket.socket,
+        target: socket.socket,
+    ) -> None:
+        while True:
+            frame = _read_proxy_frame(client)
+            if frame is None:
+                return
+            target.sendall(frame)
+            with server.stats_lock:
+                server.request_count += 1
+            response = _read_proxy_frame(target)
+            if response is None:
+                return
+            if server.response_delay_seconds and _is_forward_response(response):
+                time.sleep(server.response_delay_seconds)
+                with server.stats_lock:
+                    server.delayed_response_count += 1
+            client.sendall(response)
+            with server.stats_lock:
+                server.response_count += 1
+
 
 class PeerResponseDelayProxy:
     """Delay framed peer responses while preserving the real TCP peer path."""
 
-    def __init__(self, target_port: int, response_delay_ms: int) -> None:
-        self.server = _PeerDelayProxyServer(target_port, response_delay_ms)
+    def __init__(
+        self,
+        target_port: int,
+        response_delay_ms: int,
+        peer_credentials: PeerCredentials | None = None,
+        target_node_id: int | None = None,
+    ) -> None:
+        self.server = _PeerDelayProxyServer(
+            target_port,
+            response_delay_ms,
+            peer_credentials,
+            target_node_id,
+        )
         self.started = False
         self.thread = threading.Thread(
             target=self.server.serve_forever,

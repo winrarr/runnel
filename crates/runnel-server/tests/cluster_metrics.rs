@@ -7,6 +7,10 @@ use std::time::{Duration, Instant};
 use runnel_protocol::{Request, Response};
 use tempfile::TempDir;
 
+#[path = "support/peer_tls.rs"]
+mod peer_tls;
+use peer_tls::PeerCredentials;
+
 const CLUSTER_WAIT_TIMEOUT: Duration = Duration::from_secs(90);
 
 struct RunningNode {
@@ -25,6 +29,20 @@ impl RunningNode {
         cluster_nodes: &[(u64, SocketAddr)],
         bootstrap: bool,
     ) -> Self {
+        let peer_map = cluster_nodes
+            .iter()
+            .map(|(id, address)| (*id, address.to_string()))
+            .collect();
+        let peer_credentials = PeerCredentials::for_cluster(
+            data_dir
+                .parent()
+                .expect("cluster node data directory should have a common parent"),
+            "runnel",
+            &peer_map,
+        );
+        let trust_bundle = peer_credentials.trust_bundle();
+        let cert_chain = peer_credentials.certificate_chain(node_id);
+        let private_key = peer_credentials.private_key(node_id);
         let mut command = Command::new(env!("CARGO_BIN_EXE_runnel"));
         command
             .args([
@@ -40,6 +58,16 @@ impl RunningNode {
                 &peer_addr.to_string(),
                 "--data-dir",
                 data_dir.to_str().expect("temporary path should be UTF-8"),
+                "--peer-trust-bundle",
+                trust_bundle
+                    .to_str()
+                    .expect("temporary path should be UTF-8"),
+                "--peer-cert-chain",
+                cert_chain.to_str().expect("temporary path should be UTF-8"),
+                "--peer-private-key",
+                private_key
+                    .to_str()
+                    .expect("temporary path should be UTF-8"),
             ])
             .stdout(Stdio::null())
             .stderr(Stdio::null());
