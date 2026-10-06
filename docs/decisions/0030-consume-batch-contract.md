@@ -1,8 +1,8 @@
 # ADR 0030: Define per-record semantics for consume batches
 
-- Status: proposed
-- Date: 2026-10-05
-- Revalidated against baseline: `8fae2d1f81da9146a26cfb20d190214eab370a71`
+- Status: accepted
+- Date: 2026-10-06
+- Revalidated against baseline: `c3a894b6d88a40245c1116e2c5006b94f5573aee`
 - Primary evidence class: design/research
 
 ## Context
@@ -25,9 +25,9 @@ tradeoffs explicit. Their partition, subscription, receipt, and storage
 semantics do not transfer to Runnel. The references and current code support a
 semantic contract, but establish no Runnel performance gain.
 
-## Proposed decision
+## Decision
 
-Propose accepting a bounded pull batch with independently fenced, per-record
+Accept a bounded pull batch with independently fenced, per-record
 acknowledgements under the following contract:
 
 - A new pull returns messages in increasing offset order, bounded by a request

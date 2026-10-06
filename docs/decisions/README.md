@@ -33,7 +33,6 @@ Current decisions:
 - 0027-consumer-scoped-retry-policy.md: durable per-consumer attempt limits and acknowledgement timeouts with legacy fallback and policy pinning.
 - 0028-consumer-lag-observation-semantics.md: logical cursor-lag definitions and unknown, freshness, coverage, and replica-deduplication rules; runtime exposure remains undecided.
 - 0029-local-typed-dead-letter-move-identities.md: separate local public publish IDs and internal dead-letter move identities, with compatibility lookup for untyped legacy records.
+- 0030-consume-batch-contract.md: bounded pull batches with one active set per member, per-record opaque receipts, independent acknowledgement outcomes, and explicit local and clustered durability boundaries.
 
-Proposed decisions awaiting review:
-
-- 0030-consume-batch-contract.md: bounded per-member consume sets with independent per-record acknowledgement outcomes.
+Proposed decisions awaiting review: none.
