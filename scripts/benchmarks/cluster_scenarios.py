@@ -94,6 +94,8 @@ DEFAULT_RETAINED_RECOVERY_MESSAGES = 2_048
 DEFAULT_RAFT_LOG_GROWTH_MESSAGES = 256
 MIN_RAFT_LOG_GROWTH_MESSAGES = 64
 MAX_RAFT_LOG_GROWTH_MESSAGES = 4_096
+DEFAULT_RAFT_LOG_GROWTH_BATCH_SIZE = 1
+MAX_RAFT_LOG_GROWTH_BATCH_SIZE = MAX_PUBLISH_BATCH_SIZE
 MAX_RAFT_LOG_GROWTH_LOGICAL_PAYLOAD_BYTES = 16 * 1024 * 1024
 DEFAULT_RAFT_LOG_GROWTH_OBSERVATION_EVERY = 8
 MAX_RAFT_LOG_GROWTH_OBSERVATION_EVERY = 1_024
@@ -662,6 +664,21 @@ def parse_raft_log_growth_messages(value: str) -> int:
     return messages
 
 
+def parse_raft_log_growth_batch_size(value: str) -> int:
+    try:
+        batch_size = int(value)
+    except ValueError as error:
+        raise argparse.ArgumentTypeError(
+            "Raft log growth batch size must be an integer"
+        ) from error
+    if not 1 <= batch_size <= MAX_RAFT_LOG_GROWTH_BATCH_SIZE:
+        raise argparse.ArgumentTypeError(
+            "Raft log growth batch size must be between "
+            f"1 and {MAX_RAFT_LOG_GROWTH_BATCH_SIZE} records"
+        )
+    return batch_size
+
+
 def parse_raft_log_growth_observation_every(value: str) -> int:
     try:
         every = int(value)
@@ -884,10 +901,11 @@ def run_raft_log_growth(
     stream: str,
     payload: str,
     messages: int,
+    batch_size: int,
     observation_every: int,
     cycle_timeout_seconds: float,
 ) -> dict[str, Any]:
-    """Measure durable public commits through a real snapshot and purge."""
+    """Measure durable public batch commits through a real snapshot and purge."""
     setup = cluster.client(0)
     try:
         create_stream(setup, stream)
@@ -936,30 +954,66 @@ def run_raft_log_growth(
         nonlocal measured_started_ns
         client = cluster.client(0)
         measured_started_ns = time.perf_counter_ns()
-        latencies: list[int] = []
+        batch_latencies: list[int] = []
+        batch_sizes: list[int] = []
+        measured_messages = 0
+        next_observation_message = observation_every
         try:
-            for message_index in range(messages):
-                offset, latency_ns = publish(client, stream, payload)
-                expected_offset = message_index + 1
-                if offset != expected_offset:
-                    raise BenchmarkError(
-                        f"Raft log growth expected offset {expected_offset}, got {offset}"
+            while measured_messages < messages:
+                current_batch_size = min(batch_size, messages - measured_messages)
+                expected_offset = measured_messages + 1
+                try:
+                    published, latency_ns = publish_batch_request(
+                        client,
+                        stream,
+                        payload,
+                        current_batch_size,
+                        expected_offset,
                     )
-                latencies.append(latency_ns)
-                if (message_index + 1) % observation_every == 0:
-                    observe(message_index + 1)
-            if not observations or observations[-1]["message_index"] != messages:
-                observe(messages)
+                except (BenchmarkError, OSError, TimeoutError) as error:
+                    offset_end = expected_offset + current_batch_size - 1
+                    raise BenchmarkError(
+                        "Raft log growth publish_batch did not produce a fully "
+                        f"validated outcome for offsets {expected_offset}-{offset_end}; "
+                        "the request was not retried and may have committed some records: "
+                        f"{error}"
+                    ) from error
+                measured_messages += published
+                batch_sizes.append(published)
+                batch_latencies.append(latency_ns)
+                if measured_messages >= next_observation_message:
+                    observe(measured_messages)
+                    while next_observation_message <= measured_messages:
+                        next_observation_message += observation_every
+            if not observations or observations[-1]["message_index"] != measured_messages:
+                observe(measured_messages)
         finally:
             client.close()
         elapsed_ns = time.perf_counter_ns() - measured_started_ns
-        return metric(
+        batch_size_counts: dict[str, int] = {}
+        for actual_batch_size in batch_sizes:
+            key = str(actual_batch_size)
+            batch_size_counts[key] = batch_size_counts.get(key, 0) + 1
+        return batch_metric(
             "cluster_raft_log_growth",
-            latencies,
+            batch_latencies,
             elapsed_ns,
+            messages=measured_messages,
             message_size=len(payload),
             metadata={
-                "measured_publishes": messages,
+                "measured_messages": measured_messages,
+                "measured_batches": len(batch_sizes),
+                "requested_batch_size": batch_size,
+                "batch_size_counts": batch_size_counts,
+                "final_batch_size": batch_sizes[-1],
+                "publish_operation": "publish_batch",
+                "outcome_validation": (
+                    "every returned record was published at its expected contiguous offset"
+                ),
+                "ambiguous_outcome_policy": (
+                    "failed or incomplete responses abort without retry; some records "
+                    "in the request may have committed"
+                ),
                 "setup_messages_excluded": 1,
                 "observation_every_publishes": observation_every,
                 "observer_io_seconds": observer_duration_ns / 1_000_000_000,
@@ -968,10 +1022,18 @@ def run_raft_log_growth(
                 ),
                 "observed_state_samples": len(observations),
                 "consensus_history_source": "per-node data-group raft-log.json",
-                "broker_message_history_is_not_inferred_from_raft_entry_count": True,
+                "message_history_boundary": (
+                    "public stream offsets 0 through measured_messages; offset 0 is setup"
+                ),
+                "consensus_history_boundary": (
+                    "per-node data-group Raft entries and purge indices; entry count is "
+                    "not inferred from batch or message count"
+                ),
                 "path_size_semantics": (
                     "persisted file sizes and net footprint deltas; not bytes written"
                 ),
+                "latency_scope": "one public publish_batch roundtrip per latency sample",
+                "latency_sample_scope": "batch_requests",
                 "observations": observations,
             },
         )

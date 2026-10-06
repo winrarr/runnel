@@ -21,6 +21,7 @@ from cluster_scenarios import (
     MAX_RAFT_LOG_GROWTH_CYCLE_TIMEOUT_SECONDS,
     MAX_RAFT_LOG_GROWTH_LOGICAL_PAYLOAD_BYTES,
     MAX_RAFT_LOG_GROWTH_MESSAGES,
+    MAX_RAFT_LOG_GROWTH_BATCH_SIZE,
     MIN_RAFT_LOG_GROWTH_CYCLE_TIMEOUT_SECONDS,
     MIN_RAFT_LOG_GROWTH_MESSAGES,
 )
@@ -85,6 +86,9 @@ def build_workload(args: argparse.Namespace) -> dict[str, Any]:
     if "raft_log_growth" in selected_scenarios:
         workload["raft_log_growth"] = {
             "measured_messages": args.raft_log_growth_messages,
+            "batch_size": args.raft_log_growth_batch_size,
+            "minimum_batch_size": 1,
+            "maximum_batch_size": MAX_RAFT_LOG_GROWTH_BATCH_SIZE,
             "minimum_messages": MIN_RAFT_LOG_GROWTH_MESSAGES,
             "maximum_messages": MAX_RAFT_LOG_GROWTH_MESSAGES,
             "maximum_logical_payload_bytes": MAX_RAFT_LOG_GROWTH_LOGICAL_PAYLOAD_BYTES,
@@ -93,6 +97,7 @@ def build_workload(args: argparse.Namespace) -> dict[str, Any]:
             "minimum_cycle_timeout_seconds": MIN_RAFT_LOG_GROWTH_CYCLE_TIMEOUT_SECONDS,
             "maximum_cycle_timeout_seconds": MAX_RAFT_LOG_GROWTH_CYCLE_TIMEOUT_SECONDS,
             "setup_messages_excluded": 1,
+            "publish_operation": "publish_batch",
             "message_history_source": "public protocol; first setup publish is offset 0",
             "consensus_history_source": "per-node data-group raft-log.json",
         }

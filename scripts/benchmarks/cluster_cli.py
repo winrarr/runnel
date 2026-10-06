@@ -31,6 +31,7 @@ from cluster_scenarios import (
     DEFAULT_PEER_FORWARDING_TIMEOUT_SECONDS,
     DEFAULT_PEER_RESPONSE_DELAY_MS,
     DEFAULT_PUBLISH_BATCH_SIZE,
+    DEFAULT_RAFT_LOG_GROWTH_BATCH_SIZE,
     DEFAULT_RAFT_LOG_GROWTH_CYCLE_TIMEOUT_SECONDS,
     DEFAULT_RAFT_LOG_GROWTH_MESSAGES,
     DEFAULT_RAFT_LOG_GROWTH_OBSERVATION_EVERY,
@@ -50,6 +51,7 @@ from cluster_scenarios import (
     MAX_PEER_FORWARDING_TIMEOUT_SECONDS,
     MAX_PEER_RESPONSE_DELAY_MS,
     MAX_PUBLISH_BATCH_SIZE,
+    MAX_RAFT_LOG_GROWTH_BATCH_SIZE,
     MAX_RAFT_LOG_GROWTH_CYCLE_TIMEOUT_SECONDS,
     MAX_RAFT_LOG_GROWTH_LOGICAL_PAYLOAD_BYTES,
     MAX_SNAPSHOT_BUILD_LOGICAL_PAYLOAD_BYTES,
@@ -62,6 +64,7 @@ from cluster_scenarios import (
     parse_retained_messages,
     parse_snapshot_build_messages,
     parse_raft_log_growth_messages,
+    parse_raft_log_growth_batch_size,
     parse_raft_log_growth_observation_every,
     parse_scenarios,
     run_consume_ack,
@@ -214,6 +217,15 @@ def parse_args() -> argparse.Namespace:
         type=parse_raft_log_growth_messages,
         default=DEFAULT_RAFT_LOG_GROWTH_MESSAGES,
         help="bounded measured durable publishes for the opt-in Raft log growth scenario",
+    )
+    parser.add_argument(
+        "--raft-log-growth-batch-size",
+        type=parse_raft_log_growth_batch_size,
+        default=DEFAULT_RAFT_LOG_GROWTH_BATCH_SIZE,
+        help=(
+            "records per public publish_batch request in the opt-in Raft log growth "
+            f"scenario (maximum: {MAX_RAFT_LOG_GROWTH_BATCH_SIZE})"
+        ),
     )
     parser.add_argument(
         "--raft-log-growth-observation-every",
@@ -501,6 +513,7 @@ def run_scenarios(
                     f"cluster_{run_id}_raft_log_growth_{size}",
                     payload,
                     args.raft_log_growth_messages,
+                    args.raft_log_growth_batch_size,
                     args.raft_log_growth_observation_every,
                     args.raft_log_growth_cycle_timeout_seconds,
                 )

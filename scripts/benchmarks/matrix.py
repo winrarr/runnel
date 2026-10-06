@@ -50,10 +50,12 @@ from cluster import (  # noqa: E402
     parse_sizes,
 )
 from cluster_scenarios import (  # noqa: E402
+    DEFAULT_RAFT_LOG_GROWTH_BATCH_SIZE,
     DEFAULT_RAFT_LOG_GROWTH_CYCLE_TIMEOUT_SECONDS,
     DEFAULT_RAFT_LOG_GROWTH_MESSAGES,
     DEFAULT_RAFT_LOG_GROWTH_OBSERVATION_EVERY,
     MAX_RAFT_LOG_GROWTH_CYCLE_TIMEOUT_SECONDS,
+    MAX_RAFT_LOG_GROWTH_BATCH_SIZE,
     MAX_RAFT_LOG_GROWTH_LOGICAL_PAYLOAD_BYTES,
     MAX_RAFT_LOG_GROWTH_MESSAGES,
     MAX_RAFT_LOG_GROWTH_OBSERVATION_EVERY,
@@ -192,6 +194,17 @@ def parse_args() -> argparse.Namespace:
         help=(
             "comma-separated publish intervals for sampling persisted Raft and "
             "state-machine paths during raft_log_growth"
+        ),
+    )
+    parser.add_argument(
+        "--raft-log-growth-batch-size-values",
+        type=lambda value: parse_integer_values(
+            value, minimum=1, label="Raft log growth batch sizes"
+        ),
+        default=[DEFAULT_RAFT_LOG_GROWTH_BATCH_SIZE],
+        help=(
+            "comma-separated records per publish_batch request for raft_log_growth; "
+            "each size is a separate fixed-message-count case"
         ),
     )
     parser.add_argument(
@@ -343,6 +356,14 @@ def parse_args() -> argparse.Namespace:
             "Raft log growth observation intervals must not exceed "
             f"{MAX_RAFT_LOG_GROWTH_OBSERVATION_EVERY}"
         )
+    if any(
+        value > MAX_RAFT_LOG_GROWTH_BATCH_SIZE
+        for value in args.raft_log_growth_batch_size_values
+    ):
+        parser.error(
+            "Raft log growth batch sizes must not exceed "
+            f"{MAX_RAFT_LOG_GROWTH_BATCH_SIZE} records"
+        )
     if not (
         MIN_RAFT_LOG_GROWTH_CYCLE_TIMEOUT_SECONDS
         <= args.raft_log_growth_cycle_timeout_seconds
@@ -481,6 +502,11 @@ def matrix_cases(args: argparse.Namespace) -> list[dict[str, Any]]:
             if scenario == "raft_log_growth"
             else args.raft_log_growth_observation_every_values[:1]
         )
+        raft_log_growth_batch_size_values = (
+            args.raft_log_growth_batch_size_values
+            if scenario == "raft_log_growth"
+            else args.raft_log_growth_batch_size_values[:1]
+        )
         stream_count_values = (
             args.peer_forwarding_stream_count_values
             if scenario == "peer_forwarding"
@@ -500,6 +526,7 @@ def matrix_cases(args: argparse.Namespace) -> list[dict[str, Any]]:
             batch_size,
             growth_messages,
             observation_every,
+            growth_batch_size,
             stream_count,
             snapshot_build_messages,
         ) in product(
@@ -511,6 +538,7 @@ def matrix_cases(args: argparse.Namespace) -> list[dict[str, Any]]:
             batch_size_values,
             raft_log_growth_message_values,
             raft_log_growth_observation_values,
+            raft_log_growth_batch_size_values,
             stream_count_values,
             snapshot_build_message_values,
         ):
@@ -527,6 +555,7 @@ def matrix_cases(args: argparse.Namespace) -> list[dict[str, Any]]:
                         "stream_count": stream_count,
                         "raft_log_growth_messages": growth_messages,
                         "raft_log_growth_observation_every": observation_every,
+                        "raft_log_growth_batch_size": growth_batch_size,
                         "snapshot_build_messages": snapshot_build_messages,
                         "repetition": repetition,
                     }
@@ -585,6 +614,8 @@ def case_command(
             str(case["raft_log_growth_messages"]),
             "--raft-log-growth-observation-every",
             str(case["raft_log_growth_observation_every"]),
+            "--raft-log-growth-batch-size",
+            str(case["raft_log_growth_batch_size"]),
             "--raft-log-growth-cycle-timeout-seconds",
             str(args.raft_log_growth_cycle_timeout_seconds),
             "--snapshot-build-messages",
@@ -629,7 +660,8 @@ def case_id(index: int, case: dict[str, Any]) -> str:
         else ""
     )
     growth = (
-        f"growth-{case['raft_log_growth_messages']}-observe-"
+        f"growth-batch-{case['raft_log_growth_batch_size']}-"
+        f"{case['raft_log_growth_messages']}-observe-"
         f"{case['raft_log_growth_observation_every']}-"
         if case["scenario"] == "raft_log_growth"
         else ""
@@ -804,6 +836,7 @@ def run_matrix(
         "retained_message_values": args.retained_message_values,
         "batch_size_values": args.batch_size_values,
         "raft_log_growth_message_values": args.raft_log_growth_message_values,
+        "raft_log_growth_batch_size_values": args.raft_log_growth_batch_size_values,
         "raft_log_growth_observation_every_values": (
             args.raft_log_growth_observation_every_values
         ),
