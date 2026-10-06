@@ -1,8 +1,8 @@
 # Safe durable storage upgrades
 
-- Status: exploratory design proposal; not an accepted compatibility decision
-- Last reviewed: 2026-09-06
-- Baseline: `ff987fe19b28c3a3640615d742d4ea7c5df8824c`
+- Status: accepted behavioral contract; implementation deferred by [ADR 0037](../decisions/0037-offline-side-by-side-storage-upgrades.md)
+- Last reviewed: 2026-10-06
+- Baseline: `9f64146169bb525221f99b231b0c3deee784cc59`
 - Reading guide: [design-note conventions](README.md)
 - Scope: backlog outcome “Make durable storage upgrades safe” and TD-007
 - Related policy: [Durable storage upgrade policy](storage-upgrade-policy.md)
@@ -15,20 +15,19 @@
 
 ## Purpose and non-claims
 
-This document is a detailed, evidence-led contract for the storage upgrade
-backlog outcome. It records proposed invariants, compatibility relations,
-migration phases, failure oracles, and evidence gates. The words MUST, MUST
-NOT, and MAY describe outcome requirements for a future implementation; they
-do not describe behavior that exists today. The proposed records, selectors,
-phases, and procedures are illustrative mechanisms rather than a required
-API, module layout, or file layout.
+This document is the detailed implementation contract accepted by [ADR 0037](../decisions/0037-offline-side-by-side-storage-upgrades.md).
+Its MUST, MUST NOT, and MAY statements govern a future supported conversion;
+they do not describe runtime behavior that exists today. The records,
+selectors, phase names, and procedures are illustrative mechanisms rather
+than a required API, module layout, or file layout.
 
-This proposal does not accept a public administration API, a final storage
-schema, an online migration protocol, local-to-cluster movement, or general
-downgrade support. No migration, generation selector, writer epoch, rollback
-command, or rolling-upgrade test is implemented at this baseline. A later ADR
-is required before any proposed contract becomes a release compatibility
-promise.
+ADR 0037 does not accept a public administration API, a final storage schema,
+an online migration protocol, local-to-cluster movement, or general downgrade
+support. No migration, generation selector, writer epoch, rollback command,
+or rolling-upgrade test is implemented at this baseline. Implementation must
+pass the applicable acceptance gates before any release compatibility promise
+is made. A later ADR is needed to change the accepted behavioral boundary,
+not to authorize implementation of this contract.
 
 The safety objective is:
 
@@ -42,7 +41,7 @@ The safety objective is:
 These terms keep binary replacement, format conversion, and engine migration
 separate:
 
-| Term | Meaning in this proposal |
+| Term | Meaning in this accepted contract |
 | --- | --- |
 | Source generation | The validated durable image currently selected for serving. It remains authoritative until activation commits. |
 | Target generation | An immutable, side-by-side image being built from one source boundary. It is never served while it is incomplete or merely staged. |
@@ -50,7 +49,7 @@ separate:
 | Migration record | Durable state for one migration ID, its source/target descriptors, phase, fence epoch, progress, validation result, and rollback/cleanup state. |
 | Activation | The durable transition that changes the selected generation after target validation. It is not the same as writing target bytes. |
 | Writer fence | A durable generation/epoch check on every mutating operation that prevents a stale process or migration owner from committing after the barrier. |
-| Rollback | Returning to a source generation before target state is active, or using a tested inverse/recovery artifact after activation. |
+| Rollback | Returning to the source only before any target-only durable mutation is accepted; after that boundary, recovery uses a target-aware binary, tested inverse, or verified recovery artifact. |
 | Downgrade | Starting software that cannot read the active representation. It is unsupported after target-only active state unless a reverse conversion or recovery procedure explicitly proves safety. |
 | Source boundary | The exact logical record/checkpoint/Raft apply boundary copied into the target. It MUST be recorded and validated rather than inferred from a file length. |
 
@@ -151,9 +150,9 @@ layouts and the tested read-forward checkpoint/snapshot cases. It does not
 include a binary-to-binary rolling upgrade, a directory rewrite, or a
 local-to-cluster move.
 
-### Proposed compatibility classes
+### Accepted compatibility classes
 
-The following vocabulary is a proposal for future matrix entries:
+Use this vocabulary for future per-artifact matrix entries:
 
 | Class | Reader/writer rule | Serving and rollback rule |
 | --- | --- | --- |
@@ -167,27 +166,30 @@ boundaries, and contradictory version combinations MUST fail before serving or
 mutating existing state. Serde defaults and parseability do not establish
 semantic compatibility.
 
-## Proposed first migration contract
+## Accepted first migration contract
 
-The first supported physical rewrite should be deliberately narrow:
+The first supported physical rewrite is deliberately narrow:
 
-- one local stream or one independently addressable clustered data group;
-- offline conversion with a short per-stream maintenance fence;
+- one local stream and its durable consumer state when tested isolation proves
+  that scope is complete; otherwise the entire local broker;
+- a whole-cluster maintenance window for any clustered physical conversion;
+- offline conversion with writes fenced for the selected scope;
 - side-by-side immutable target units and bounded copy batches;
 - a durable migration record and active selector;
 - full logical-image validation before activation; and
 - retained source state until explicit cleanup eligibility.
 
 This slice does not include local-to-cluster movement, live dual writes,
-dynamic placement, automatic downgrade, or a public operation that exposes
-physical paths and offsets. Unrelated local streams MAY continue only if their
-writer ownership cannot observe or bypass the affected stream’s fence; if that
-cannot be proven, the implementation MUST fence the whole broker for the
-operation.
+rolling mixed-binary upgrades, dynamic placement, automatic downgrade, or a
+public operation that exposes physical paths and offsets. Unrelated local
+streams MAY continue only if tests prove their writer ownership cannot observe
+or bypass the affected stream's fence; otherwise the implementation MUST stop
+the whole broker. A clustered conversion MUST stop every node and must not
+permit service until all nodes select the same validated target.
 
 ### Durable migration record
 
-The exact serialization is open, but the record MUST bind:
+The exact serialization is open, but the migration record MUST bind:
 
 - migration ID, source and target generation IDs, and format/layout/schema
   descriptors;
@@ -203,7 +205,8 @@ The exact serialization is open, but the record MUST bind:
 
 Use these phases or an equivalent state machine:
 
-planned → copying → validating → ready → activating → activated → complete
+planned → copying → validating → ready → activating → active-reversible →
+write-pending → active-committed → complete
 
 failed and aborted are durable terminal outcomes. Each transition MUST be
 idempotent and must identify the migration and source/target generations. A
@@ -252,13 +255,14 @@ does not provide.
 
 ### Local transfer and activation
 
-The proposed local sequence is:
+The accepted local sequence is:
 
 1. **Preflight:** validate source, compatibility, identity, backup, free
    space, and absence of an ambiguous active migration. Do not rewrite source.
 2. **Fence:** acquire exclusive migration ownership, advance the durable epoch,
-   and stop new publish, acknowledge, and other mutating operations for the
-   affected stream. An operation already at its durable commit point either
+   and stop service for the affected scope. Per-stream downtime is allowed only
+   after tests prove every mutating path observes that fence; otherwise stop
+   the whole broker. An operation already at its durable commit point either
    completes before the barrier or receives an explicit retryable/fenced
    outcome; it must not be reported as successful after the epoch changes.
 3. **Resolve deliveries:** let durable consumer-state writes cross the barrier
@@ -276,15 +280,21 @@ The proposed local sequence is:
    tested, sync the selector parent, and persist activation completion. Keep
    the fence until the target is reopened through its normal recovery path.
 7. **Reopen and release:** verify diagnostics and serving health, then release
-   the fence. Keep source and migration evidence until the recorded rollback
-   condition permits cleanup.
+   the migration fence but keep target mutation disabled while source rollback
+   remains eligible. Resume service only with a binary that declares and proves
+   read, write, and semantic support for the target; an incompatible binary
+   fails closed. Before the first target-only mutation can commit, durably
+   enter `write-pending` or record it atomically with the mutation. A successful
+   commit becomes `active-committed`; a proven no-effect failure returns to
+   `active-reversible`; an ambiguous result remains pending and blocks rollback.
+   Keep source and migration evidence.
 
 The selector recovery rule MUST be deterministic:
 
 - source selector plus ready/activating: source remains authoritative; target
   is staged and may be retried or abandoned after validation;
 - target selector plus a valid matching target: target is authoritative;
-  recovery completes activation before serving;
+  recovery completes activation and serves only after normal target reopen;
 - selector and migration record disagree, either selected image is invalid, or
   both images claim authority: refuse to serve and report the identities; and
 - no selector or an unmarked directory: do not choose by directory order,
@@ -293,30 +303,37 @@ The selector recovery rule MUST be deterministic:
 The exact use of temporary files, rename, and directory synchronization needs
 an implementation experiment on each supported filesystem. The invariant is
 that recovery sees a valid old or valid new image, never a half-written
-selector and empty fallback.
+selector and empty fallback. An ambiguous selector or disagreement with the
+migration record blocks service until an operator completes activation or
+proves rollback is still eligible.
 
-### Clustered rolling and physical migration
+### Clustered physical migration
 
-Rolling binary replacement and physical format conversion are separate gates:
+The accepted first clustered conversion requires a whole-cluster maintenance
+window; rolling binary replacement and mixed-version serving are outside ADR
+0037. The clustered path remains unsupported until its all-node activation and
+failure-recovery gates pass:
 
-1. Replace nodes one at a time while every node reads/writes the old
-   compatible peer, command, snapshot, and state representation.
-2. Keep the lowest common protocol/format capability as the cluster serving
-   level. A node version is not sufficient evidence of capability.
-3. Before enabling a target representation, verify every voter and the
-   controlled replacement path supports it. Record a cluster-wide compatibility
-   level as a committed metadata fact.
-4. For a physical rewrite, build each group target from a committed source
-   boundary. Every replica independently validates target identity and content
-   and reports readiness keyed by migration ID and group ID.
-5. Commit an activation epoch only after the required replicas are ready. A
-   replica with no validated target MUST not serve the group or become leader
-   for the target representation; it must finish activation or rejoin through
-   the controlled replacement workflow.
-6. After activation, every command and snapshot written during the declared
-   compatibility window MUST remain applicable by every serving binary.
-7. Retain source generations and recovery artifacts until cluster-wide
-   rollback eligibility has passed and restart/failover evidence is complete.
+1. Stop every broker and verify that no node can accept client or peer
+   mutations. Keep every source generation selected and unchanged.
+2. Validate common cluster identity, membership, committed source boundaries,
+   and a restorable recovery artifact. Build side-by-side targets for all
+   required nodes and groups under one migration identity.
+3. Independently validate every target and cross-artifact agreement. Keep all
+   nodes stopped while any target is missing, invalid, or selected differently.
+4. Activate only after every target is ready. If selector updates are
+   interrupted, keep all nodes offline until each selects the same validated
+   target, or each is explicitly restored to the source while rollback remains
+   eligible.
+5. Start only binaries that declare read/write support for the selected
+   generation. A stale binary or a node with a mismatched generation or
+   identity fails closed and cannot lead or serve.
+6. The first target-only durable mutation enters `write-pending` cluster-wide.
+   A successful commit closes source rollback for every node. A proven no-effect
+   failure may restore eligibility; an ambiguous result keeps the cluster
+   stopped and blocks rollback until reconciled.
+7. Retain source generations and recovery artifacts until the documented
+   rollback/recovery condition permits cleanup.
 
 OpenRaft snapshot transfer remains a separate recovery workflow. Its current
 bounded chunks and retry-from-zero behavior do not provide resumable migration.
@@ -327,41 +344,56 @@ boundary.
 The public JSON-lines v1 declaration is source-level alignment between the
 protocol, client, and server crates; it is not a runtime handshake or a
 cluster-wide capability gate. The peer transport has no preface or capability
-negotiation at all. A future compatibility level must therefore be an explicit
-committed fact, independent of the binary version and independent of the
-physical migration record. See [protocol compatibility](protocol-compatibility.md)
-for the proposed public-v2 boundary.
+negotiation at all. This is why ADR 0037 rejects rolling mixed-version
+conversion. Any later decision to permit that behavior must establish an
+explicit committed compatibility gate. See [protocol
+compatibility](protocol-compatibility.md) for the separate proposed public-v2
+boundary.
 
 ## Interruption and rollback contract
 
 | Interruption or fault | Required result after restart |
 | --- | --- |
-| Preflight, missing space, or before copy | Source remains active and unchanged. Migration is failed or aborted with a diagnostic; no empty target is created as authority. |
-| During copy/checkpoint | Source remains active. Resume only from a checksummed bounded checkpoint, or discard unreferenced target bytes and restart from the recorded source boundary. |
-| During validation | Source remains active. Target is not served; a mismatch is durable failed evidence, not a reason to guess or repair source bytes. |
-| After ready, before activation | Source remains active. The validated target can be retried after identity/checksum checks or explicitly aborted. |
-| During selector replacement/sync | Recovery validates the selector and both generation descriptors. It serves a valid old or new generation deterministically; disagreement or invalidity fails closed. |
-| After target activation, before fence release | Target remains authoritative. Recovery completes target activation, redelivers volatile in-flight work as required, and does not accept stale source writes. |
-| During cleanup | Target remains authoritative. Source/orphan bytes remain for a bounded cleanup pass and are visible in diagnostics; cleanup never removes the selected generation. |
-| Process restart at any phase | The durable migration record and selector are the only authority. Directory order, timestamps, and parseability alone are not recovery decisions. |
-| Corrupt source/target or mismatched identity | Refuse to serve the affected scope, preserve bytes, and report the observed and expected identities. Do not silently rebuild empty state. |
+| Preflight, missing space, or before copy | Source remains selected and unchanged. Record a refusal/failure; never create an empty target as authority. |
+| During copy/checkpoint | Source remains selected. Resume only from checksummed bounded progress whose source boundary and target prefix still match; otherwise quarantine/discard only unreferenced staging. |
+| During validation or after a mismatch | Source remains selected. Do not serve the target, repair source bytes, or infer validity from counts or successful parsing alone. |
+| Ready, before activation | Source remains authoritative. The target may be revalidated and activated explicitly or the migration may be aborted. |
+| During selector replacement/sync | Keep service stopped. Resolve to one valid source or target from durable selector and migration identity; disagreement or invalidity fails closed. |
+| Activated, before a target write | Target is selected but read-only; the source remains eligible for explicit offline rollback. |
+| Before a target mutation can commit | Durably enter `write-pending`, or atomically record it with the mutation. Block source rollback while the result is unresolved. |
+| Target mutation succeeds durably | Persist `active-committed`; source rollback is permanently closed. |
+| Target mutation is proven not to have committed | Durably return to `active-reversible`; explicit offline source rollback remains available. |
+| Target mutation outcome is ambiguous | Keep `write-pending`, refuse source rollback, and fail closed until target state is reconciled. |
+| During cleanup | Target remains authoritative. Source and orphan bytes remain visible; cleanup cannot delete the selected target or required recovery artifact. |
+| Process restart at any phase | The durable migration record and selector determine recovery. Directory order, timestamps, and parseability are not authority. |
+| Corrupt source/target or mismatched identity | Refuse service for the affected scope, preserve bytes, and report expected/observed identity. Never silently rebuild empty state. |
 
-Rollback and downgrade are intentionally different:
+Rollback and downgrade are different operations:
 
-| State | Supported action in the first proposal |
+| State | Supported action |
 | --- | --- |
-| Binary rollout, old representation still active | Stop the new process and restore the previous binary after normal identity/preflight checks. |
-| planned through ready, source selected | Abort migration or discard unreferenced staging after stopping its owner. This is migration abort, not downgrade. |
-| activating with an unambiguous source selector | Keep source selected and resolve/abort the migration; do not start an old binary against an ambiguous directory. |
-| Target activated | Keep target selected. An old binary fails closed unless it has a tested target reader. Use a target-aware binary, reverse converter, or verified recovery artifact. |
-| Source retained after target writes | Retention alone does not make pointer rollback safe. All acknowledged writes, progress, attempts, request IDs, retention effects, and semantic changes must be representable by the rollback target. |
+| Before activation, source selected | Abort migration; source remains active. Remove target bytes only after proving they are unreferenced staging. |
+| Selector activation is ambiguous | Do not serve either generation or start an old binary. Resolve the durable selector/record disagreement or restore a verified source state. |
+| Target active, no target-only mutation, reversible state | Stop every target process, verify the migration record proves no target-only mutation, explicitly select the unchanged source, reopen it with its compatible binary, and check identity and logical state before serving. |
+| Write pending | Keep service stopped and target selected; reconcile the operation. Return to reversible only with durable proof of no mutation, otherwise close rollback or remain fail-closed if uncertain. |
+| Target mutation committed | Keep target authoritative. Older binaries that do not declare support fail closed. Restore from a verified recovery artifact or use a separately tested reverse conversion. |
+| Source retained after target-only writes | Retention is not rollback: selecting the stale source would hide acknowledged or otherwise durable state. |
+
+Before a target-only mutation can commit, durably record `write-pending`, or
+atomically record it with that mutation. If the mutation commits, durably mark
+the migration `active-committed`. If it is proven not to have committed,
+durably restore `active-reversible`. A crash or ambiguous outcome leaves the
+operation pending and blocks source rollback until recovery resolves it. Every
+mutation counts, including message publishes, acknowledgements, delivery
+attempts, consumer-policy changes, deduplication state, and clustered Raft or
+state-machine writes. Recovery must never infer no mutation from a missing
+client response or a retained source directory.
 
 Automatic downgrade is unsupported. Editing version fields, removing selectors,
 renaming directories, or starting an older binary against target-only active
-state is forbidden because it can hide acknowledged writes or move progress
-backward. A verified backup must include enough metadata and logical state to
-restore identity, offsets, consumer state, attempts, and producer retry
-identity, not just message bytes.
+state can hide acknowledged writes or move progress backward. A verified
+recovery artifact must include identity, offsets, consumer state, attempts,
+and producer retry identity, not just message bytes.
 
 ## Writer fencing and ownership
 
@@ -380,8 +412,16 @@ to serve. An old process that retains an open file descriptor must not gain
 authority from that descriptor. Cleanup ownership must also be epoch-bound so
 it cannot delete a generation selected by a later migration.
 
-For the clustered path, the activation epoch and compatibility level must be
-committed facts in the metadata/data-group protocol. A stale leader, delayed
+Before any target-only durable mutation is attempted, persist `write-pending`
+or atomically commit it with the mutation. If that state cannot be confirmed,
+do not accept the mutation. After a successful commit, persist
+`active-committed`; after a proven no-effect failure, persist
+`active-reversible`. An unresolved `write-pending` state keeps service stopped
+and blocks rollback. No process may infer rollback eligibility from the absence
+of a client response or from a retained source directory.
+
+For the clustered path, the active migration identity and generation must be
+consistently recorded by the metadata and data groups. A stale leader, delayed
 forwarded request, duplicate migration owner, or unready replica must receive
 a fencing/retryable result before it can append or acknowledge. Replica
 replacement is separate: matching node identity alone does not make an empty
@@ -397,13 +437,13 @@ must expose these facts without requiring file inspection:
 - migration ID, source/target generations, phase/outcome, source boundary,
   start/last-progress times, records/bytes copied, validated, and remaining;
 - validation result, last failure reason, backup/recovery-artifact identity,
-  rollback eligibility and its expiry/retention condition;
+  first-write state and whether source selection is still eligible;
 - writer-fence owner/epoch, stale-owner rejections, activation attempts/result,
   serving/recovering/blocked state, and cleanup/orphan bytes; and
 - for clusters, per-group target readiness, lagging replicas, snapshot source
-  boundary, compatibility level, and leader/serving eligibility.
+  boundary, generation agreement, and leader/serving eligibility.
 
-Candidate metrics may use bounded labels such as engine, phase, outcome, and
+Metrics may use bounded labels such as engine, phase, outcome, and
 reason. Stream, group, consumer, and migration identifiers belong in
 structured logs or an explicitly bounded diagnostic response, not unbounded
 Prometheus labels. Counters must state whether they reset on process restart.
@@ -415,7 +455,7 @@ validated, a replica lacks the active representation, or recovery has not
 established a unique authoritative generation. “Started successfully” is not
 a recovery result.
 
-## Acceptance matrix
+## Implementation acceptance matrix
 
 The following matrix is the merge gate for a future implementation. “Current”
 means existing evidence at the baseline; “future” means required work and is
@@ -434,21 +474,23 @@ not implemented by this document.
 | FENCE-02 | Cluster stale owner | Delay old leader, forwarded request, duplicate migration owner, and unready replica across committed activation. | Only the committed active epoch can append/ack or lead; unready replica cannot serve; no split-brain generation. | Existing leader/follower tests are not migration evidence; future. |
 | ROLL-01 | Pre-activation rollback | Abort or restart a migration in planned through ready; retain staged target. | Source remains readable and authoritative; abort is idempotent; target can be safely discarded without source mutation. | Future. |
 | ROLL-02 | Post-activation downgrade | Start an old binary against target-only active state; test version edit, selector removal, and path rename attempts. | Old binary fails closed; no acknowledged target state is hidden; documented reverse conversion or recovery-artifact path is required. | Future. |
+| ROLL-03 | First target mutation boundary | Interrupt before, during, and after the first mutation; inject proven pre-commit failure and ambiguous outcomes. | `write-pending` blocks rollback; committed mutation closes it; only durable proof of no effect restores reversibility. | Future. |
 | OBS-01 | Diagnostics and metrics | Exercise every phase, failure reason, fence rejection, cleanup orphan, restart, and process-counter reset. | Versions, identities, progress, outcome, rollback eligibility, readiness, and orphan state are visible with bounded labels and no secret/path leakage. | Future; current startup and snapshot metrics are partial evidence. |
 | E2E-01 | Local real process | Publish/consume/ack representative records, migrate, kill/restart at each phase, then use the public protocol. | Same logical records and acknowledged state are observable before/after; redeliveries are allowed only where the contract says; health/readiness recover. | Future; just smoke does not exercise migration. |
-| E2E-02 | Cluster rolling binary | Three real broker processes, old-compatible representation, one-node-at-a-time restart, then compatibility gate. | Mixed phase serves with old format; gate is durable; unsupported node/binary refuses rather than serving incompatible state. | Future; just cluster-test is current recovery evidence only. |
-| E2E-03 | Cluster physical activation | Three nodes with leader loss, follower restart, snapshot install, target readiness, and replacement identity checks. | Activation epoch survives failover; every serving replica validates target; acknowledged records/progress and request identities remain intact. | Future. |
+| E2E-02 | No mixed clustered conversion | Three real broker processes; stop all nodes, stage and validate all targets, interrupt activation, and attempt stale-binary and mismatched-generation restarts. | No node serves with a mismatched generation; all nodes resume only after uniform target activation, or all return to source while rollback remains eligible. | Future; current cluster tests do not exercise storage conversion. |
+| E2E-03 | Cluster physical activation | Three nodes with leader/follower failures, snapshot install, target readiness, and replacement identity checks after whole-cluster outage. | Activation and first-write rollback state survive restart; every node validates the same target before serving; acknowledged records/progress and request identities remain intact. | Future. |
 | RES-01 | Migration headroom | Large retained stream, bounded batch sizes, temporary-space reserve, and no-reserve condition. | Admission pauses/throttles/rejects explicitly; memory, temporary bytes, and recovery work remain bounded; no false durable success. | Future targeted resource test. |
 
-The implementation must not be called complete until all future rows have
-tests or operational evidence at the appropriate layer. A later ADR may
-reduce or extend the matrix only by recording the evidence and consequence.
+The implementation must not be called supported until the applicable future
+rows have tests or operational evidence at the appropriate layer. A later ADR
+is required for online conversion, rolling mixed-version compatibility,
+downgrade, or any change to the accepted rollback and activation boundary.
 
-## Candidate evidence sequence and exit gates
+## Implementation evidence sequence and exit gates
 
-The following order is a risk-reduction proposal, not a prescribed module, API,
-or file-layout decomposition. A future implementation may satisfy a gate with
-different mechanisms while preserving the same outcome.
+The following order is a risk-reduction guide, not a prescribed module, API,
+or file-layout decomposition. An implementation may satisfy a gate with
+different mechanisms while preserving the accepted outcome.
 
 1. **Compatibility descriptors and fixtures:** establish Runnel-owned artifact
    descriptors, version ranges, identities, limits, and state-image equality.
@@ -462,13 +504,15 @@ different mechanisms while preserving the same outcome.
 4. **Fence and activation hardening:** demonstrate stale publish/ack/owner
    rejection, filesystem sync/rename fault behavior, target reopen, and
    diagnostics. Exit when no stale operation can commit across cutover.
-5. **Cluster compatibility gate:** demonstrate negotiated/committed capability,
-   per-replica readiness, old-binary refusal, leader/follower/replacement
-   behavior, and explicit separation from snapshot recovery.
+5. **Cluster maintenance conversion:** demonstrate all-node shutdown,
+   per-node target readiness, uniform activation recovery, stale-binary
+   refusal, leader/follower/replacement behavior, and separation from snapshot
+   recovery. Do not permit mixed-version serving.
 6. **Operational and resource acceptance:** expose bounded diagnostics/metrics,
    run large-stream headroom tests, and document backup/cleanup workflow.
-7. **Decision review:** only after all required rows pass should an ADR accept
-   a named format, command, rollback window, or release guarantee.
+7. **Operational support review:** expose bounded diagnostics and recovery
+   instructions, name tested filesystems and the verified recovery artifact,
+   and keep any unsupported artifact or cluster path explicitly unavailable.
 
 ## References and design evidence
 
@@ -478,14 +522,14 @@ Runnel.
 
 | Source | Relevant fact | Difference and Runnel implication |
 | --- | --- | --- |
-| [Apache Kafka rolling upgrades](https://kafka.apache.org/42/getting-started/upgrade/) and [protocol design](https://kafka.apache.org/42/design/protocol/) | Kafka upgrades binaries while holding the old inter-broker/message representation, verifies behavior, then advances an explicit protocol version gate; clients negotiate API versions. | Runnel needs a binary-versus-format gate, but its state includes consumer progress and producer request identity. The current static cluster has no negotiated compatibility level, so this remains proposed work. |
-| [PostgreSQL `pg_upgrade`](https://www.postgresql.org/docs/current/pgupgrade.html) | Preflight runs before mutation. Copy/clone modes keep a separate old cluster; link mode saves space but moves or removes the old-cluster rollback property earlier. | Side-by-side conversion is the safer first Runnel model. In-place or shared-file conversion would need a separate decision and filesystem evidence. |
-| [etcd 3.5→3.6 upgrade](https://etcd.io/docs/v3.6/upgrades/upgrade_3_6/) and [downgrade procedure](https://etcd.io/docs/v3.7/downgrades/downgrading-etcd/) | etcd documents mixed-version operation, snapshots, cluster-wide downgrade state, schema-aware handling, and status reporting; replacing one binary is not a downgrade procedure. | Runnel should require a verified recovery artifact and target validation, but must not imply etcd-like online migration until protocol and failure evidence exist. |
+| [Apache Kafka 4.3 upgrade](https://kafka.apache.org/43/getting-started/upgrade/) and [protocol design](https://kafka.apache.org/43/design/protocol/) | Kafka separates a rolling binary phase from finalizing a feature/metadata version; its upgrade guide disallows metadata downgrade when metadata changes. | The distinction between binary rollout and durable-format activation is relevant. Runnel's peer protocol has no negotiated compatibility level, and its consumer and producer identities add state Kafka's procedure does not define; ADR 0037 therefore rejects rolling conversion. |
+| [PostgreSQL `pg_upgrade`](https://www.postgresql.org/docs/current/pgupgrade.html) | `--check` performs preflight; copy is the default. Copy/clone retain the old cluster, while link/swap can make it unusable or destructive once the new cluster starts or transfer begins. Both servers are stopped for upgrade. | This supports the accepted offline, side-by-side source boundary. Unlike PostgreSQL copy mode, Runnel must close rollback once any target-only durable state is accepted, because reselecting a stale source would hide acknowledged writes. |
+| [etcd 3.5→3.6 upgrade](https://etcd.io/docs/v3.6/upgrades/upgrade_3_6/) and [downgrade procedure](https://etcd.io/docs/v3.7/downgrades/downgrading-etcd/) | etcd requires a snapshot, operates during a mixed-version phase at the lowest common version, and permits binary rollback only during that phase; after all members upgrade, recovery requires snapshot restore or the formal downgrade procedure. | This supports visible phases and verified recovery evidence. Runnel lacks the protocol gate and cluster failure evidence needed for rolling upgrades, so its first clustered conversion requires whole-cluster maintenance. |
 | [OpenRaft snapshot replication](https://docs.rs/openraft/0.9.25/openraft/docs/protocol/replication/snapshot_replication/) and [storage traits](https://docs.rs/openraft/0.9.25/openraft/storage/) | Snapshot metadata and storage interfaces carry committed/applied boundaries, membership, log persistence, state-machine persistence, and installation as separate concerns. | Runnel must validate application-state schema, group identity, consumer state, attempts, and deduplication in addition to consensus boundaries. Snapshot replacement is not format migration. The repository currently pins OpenRaft 0.9.25. |
-| [RocksDB MANIFEST](https://github.com/facebook/rocksdb/wiki/MANIFEST) | A transactional version-edit log and CURRENT pointer select complete referenced file sets, while obsolete files may remain until safe cleanup. | This motivates a small active selector and retained source generations, but Runnel needs explicit delivery semantics, identity, bounded validation, and writer fencing. |
-| [Online asynchronous schema change in F1](https://research.google/pubs/online-asynchronous-schema-change-in-f1/) | Online readers/writers require compatibility between transition states; asynchronous schema assumptions can corrupt data even when parsing succeeds. | A future live-tail migration requires operation-level proofs for publish, ack, replay, and recovery. The first slice avoids that risk with a maintenance fence. |
-| [Linux rename(2)](https://man7.org/linux/man-pages/man2/rename.2.html) and [fsync(2)](https://man7.org/linux/man-pages/man2/fsync.2.html) | Rename and file synchronization have distinct durability and filesystem semantics; syncing a file does not automatically establish directory-entry durability. | The selector protocol and supported-filesystem crash evidence must be specified before claiming atomic recovery. |
-| [Runnel Raft recovery research](../research/raft-recovery-and-replacement.md), [ADR 0007](../decisions/0007-snapshot-based-replica-recovery.md), [ADR 0019](../decisions/0019-clustered-storage-identity.md), [ADR 0023](../decisions/0023-independent-retained-storage-and-placement.md), [ADR 0024](../decisions/0024-explicit-offset-replay-read.md), and [ADR 0026](../decisions/0026-semantic-engine-error-classification.md) | Current accepted decisions separate snapshot-based replica recovery from retained state, keep public replay topology-free, establish a hidden future placement identity, and classify engine outcomes without exposing backend details. | This proposal extends neither those decisions into migration or downgrade nor the public outcome boundary into stage-aware migration results; it uses them as boundaries and keeps replica replacement separate. |
+| [RocksDB MANIFEST](https://github.com/facebook/rocksdb/wiki/MANIFEST) | A transactional version-edit log and `CURRENT` pointer select complete referenced file sets, while obsolete files may remain until no live version references them. | This supports a single explicit active-generation selector and delayed cleanup, but does not supply Runnel's identity, delivery semantics, source/target validation, or first-write rollback fence. |
+| [Online asynchronous schema change in F1](https://research.google/pubs/online-asynchronous-schema-change-in-f1/) | Online readers/writers require compatibility between transition states; asynchronous schema assumptions can corrupt data even when parsing succeeds. | A future live-tail migration would need operation-level proofs for publish, acknowledgement, replay, and recovery. ADR 0037 avoids that transition with a write fence and maintenance window. |
+| [Linux `rename(2)`](https://man7.org/linux/man-pages/man2/rename.2.html) and [`fsync(2)`](https://man7.org/linux/man-pages/man2/fsync.2.html) | Rename and file synchronization have distinct durability and filesystem semantics; syncing a file does not automatically establish directory-entry durability. | Selector replacement must be tested on each supported filesystem; a successful rename alone is not accepted evidence of crash-safe activation. |
+| [Runnel Raft recovery research](../research/raft-recovery-and-replacement.md), [ADR 0007](../decisions/0007-snapshot-based-replica-recovery.md), [ADR 0019](../decisions/0019-clustered-storage-identity.md), [ADR 0023](../decisions/0023-independent-retained-storage-and-placement.md), [ADR 0024](../decisions/0024-explicit-offset-replay-read.md), and [ADR 0026](../decisions/0026-semantic-engine-error-classification.md) | Current accepted decisions separate snapshot-based replica recovery from retained state, keep public replay topology-free, establish a hidden future placement identity, and classify engine outcomes without exposing backend details. | ADR 0037 adds offline physical-format upgrade semantics without redefining replica replacement, local-to-cluster movement, or public engine outcomes. |
 
 ### Alternatives considered
 
@@ -517,8 +561,8 @@ Runnel.
   on every supported filesystem.
 - Bounded, checksummed batches keep migration memory and recovery work bounded,
   but side-by-side space amplification may require explicit admission policy.
-- A committed cluster compatibility level can protect rolling upgrade without
-  exposing Raft placement in the public engine contract.
+- A whole-cluster maintenance gate and one durable migration identity can make
+  activation deterministic without changing the public engine contract.
 
 ### Unresolved risks and evidence required
 
@@ -537,9 +581,9 @@ Runnel.
 - **Cluster divergence:** metadata activation and per-replica installation may
   diverge on a crash. Model recovery and prove an unready replica cannot serve
   or lead with an incompatible target.
-- **Peer compatibility:** current peer frames have no version handshake.
-  Rolling tests may require protocol negotiation before physical migration can
-  be enabled.
+- **Peer compatibility:** current peer frames have no version handshake. This
+  supports the decision to prohibit rolling mixed-version conversion; any
+  future exception requires a separate compatibility decision and evidence.
 - **Backup freshness:** a backup is useful only if it includes all logical
   state and its identity can be verified. Test restore, not merely backup
   creation.
@@ -552,7 +596,7 @@ Runnel.
 
 ## Evidence classification and benchmark applicability
 
-Primary evidence class: correctness/recovery. Secondary tags: design/research,
+Primary evidence class: design/research. Secondary tags: correctness/recovery,
 storage/recovery, compatibility/migration, operability, and resource safety.
 
 No runtime benchmark is required for this documentation-only change. It changes
@@ -565,7 +609,7 @@ limits, temporary-space budget, recovery work, and failure state recorded.
 ## Repository evidence and handoff boundary
 
 Current startup refusal, legacy read-forward, journal, snapshot, identity, and
-real-process recovery evidence remains in the linked source/tests. This design
-change does not alter those behaviors, add a compatibility promise, or add an
-ADR. The backlog should describe this as a completed design milestone with
-migration implementation and end-to-end gates still open.
+real-process recovery evidence remains in the linked source/tests. ADR 0037
+accepts an operational behavior contract but adds no runtime compatibility
+promise. The backlog records that accepted design milestone; migration
+implementation and end-to-end gates remain open.

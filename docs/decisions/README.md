@@ -39,5 +39,6 @@ Current decisions:
 - 0033-fixed-consumer-retry-delay.md: accept a bounded fixed per-consumer retry delay, separate from the acknowledgement lease, pinned per offset, and started at the first durable expiry observation.
 - 0034-publish-request-id-content-contract.md: equivalent-content publish retries return the original offset; changed content for a retained stream-scoped request ID is a confirmed rejection.
 - 0035-first-application-client-security.md: broker-terminated TLS 1.3, static bearer credentials, fixed application/operator roles, and a deployment-isolation requirement for the separate cleartext HTTP operations listener.
+- 0037-offline-side-by-side-storage-upgrades.md: require validated offline side-by-side conversion with explicit activation and a first-target-write rollback boundary.
 
 Proposed decisions awaiting review: none.
