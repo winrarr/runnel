@@ -714,6 +714,25 @@ fn three_process_cluster_replicates_and_recovers_after_failures() {
         ),
         Response::Published { offset: 0, .. }
     ));
+    let mismatch_through_follower = wait_for_response_at(
+        nodes[follower].broker_addr,
+        || Request::Publish {
+            stream: "events".to_owned(),
+            key: None,
+            payload: "changed-content".to_owned(),
+            request_id: Some("first-message".to_owned()),
+        },
+        |response| {
+            matches!(
+                response,
+                Response::Error { code, .. } if code == "request_id_content_conflict"
+            )
+        },
+    );
+    assert!(matches!(
+        mismatch_through_follower,
+        Response::Error { code, .. } if code == "request_id_content_conflict"
+    ));
     assert!(matches!(
         wait_for_response_at(
             nodes[(follower + 1) % nodes.len()].broker_addr,
@@ -778,6 +797,38 @@ fn three_process_cluster_replicates_and_recovers_after_failures() {
             );
         }
     }
+    assert!(matches!(
+        wait_for_response_at(
+            nodes[1].broker_addr,
+            || Request::Publish {
+                stream: "events".to_owned(),
+                key: None,
+                payload: "first".to_owned(),
+                request_id: Some("first-message".to_owned()),
+            },
+            |response| matches!(response, Response::Published { offset: 0, .. }),
+        ),
+        Response::Published { offset: 0, .. }
+    ));
+    let mismatch_after_follower_restart = wait_for_response_at(
+        nodes[1].broker_addr,
+        || Request::Publish {
+            stream: "events".to_owned(),
+            key: None,
+            payload: "changed-after-restart".to_owned(),
+            request_id: Some("first-message".to_owned()),
+        },
+        |response| {
+            matches!(
+                response,
+                Response::Error { code, .. } if code == "request_id_content_conflict"
+            )
+        },
+    );
+    assert!(matches!(
+        mismatch_after_follower_restart,
+        Response::Error { code, .. } if code == "request_id_content_conflict"
+    ));
 
     nodes[leader].stop();
     let new_leader = wait_for_stream_on_any(&mut nodes, "events");
@@ -804,9 +855,28 @@ fn three_process_cluster_replicates_and_recovers_after_failures() {
     let post_failure_node = nodes
         .iter()
         .enumerate()
-        .find(|(_, node)| node.child.is_some())
+        .find(|(index, node)| *index != new_leader && node.child.is_some())
         .expect("a follower should remain available")
         .0;
+    let mismatch_after_leader_change = wait_for_response_at(
+        nodes[post_failure_node].broker_addr,
+        || Request::Publish {
+            stream: "events".to_owned(),
+            key: None,
+            payload: "changed-after-leader-change".to_owned(),
+            request_id: Some("first-message".to_owned()),
+        },
+        |response| {
+            matches!(
+                response,
+                Response::Error { code, .. } if code == "request_id_content_conflict"
+            )
+        },
+    );
+    assert!(matches!(
+        mismatch_after_leader_change,
+        Response::Error { code, .. } if code == "request_id_content_conflict"
+    ));
     let publish_response = wait_for_response_at(
         nodes[post_failure_node].broker_addr,
         || Request::Publish {

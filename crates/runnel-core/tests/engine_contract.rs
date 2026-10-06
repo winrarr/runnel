@@ -208,13 +208,13 @@ async fn local_batch_request_id_deduplication_survives_restart() {
             "events",
             vec![
                 runnel_engine::PublishRecord {
-                    key: Some("changed".to_owned()),
-                    payload: b"changed-first".to_vec(),
+                    key: Some("first".to_owned()),
+                    payload: b"original-first".to_vec(),
                     request_id: Some("batch-first".to_owned()),
                 },
                 runnel_engine::PublishRecord {
                     key: None,
-                    payload: b"changed-second".to_vec(),
+                    payload: b"original-second".to_vec(),
                     request_id: Some("batch-second".to_owned()),
                 },
             ],

@@ -278,6 +278,7 @@ fn forward_error(error: crate::BrokerError) -> ForwardError {
         crate::BrokerError::StaleDelivery { consumer, offset } => {
             ForwardError::StaleDelivery { consumer, offset }
         }
+        crate::BrokerError::RequestIdContentConflict => ForwardError::RequestIdContentConflict,
         crate::BrokerError::HistoryUnavailable {
             stream,
             requested_offset,

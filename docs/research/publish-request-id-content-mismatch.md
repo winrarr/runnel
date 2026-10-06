@@ -1,38 +1,34 @@
 # Reusing a publish request ID with changed content
 
-- Status: contract accepted in [ADR 0034](../decisions/0034-publish-request-id-content-contract.md); runtime implementation remains open
+- Status: contract accepted in [ADR 0034](../decisions/0034-publish-request-id-content-contract.md) and implemented across local and clustered engines; the wire vocabulary remains provisional
 - Last reviewed: 2026-10-06
 - Baseline: `ebcf6624809caa784aed7823d69886dc133f8c64`
 - Related outcome: [Make client interactions dependable and evolvable](../backlog.md#make-client-interactions-dependable-and-evolvable)
 - Related decisions: [ADR 0004](../decisions/0004-multi-raft-first-distributed-engine.md), [ADR 0026](../decisions/0026-semantic-engine-error-classification.md), and [ADR 0029](../decisions/0029-local-typed-dead-letter-move-identities.md)
 
-This note compares the current local and clustered behavior with two
-reference approaches. The accepted Runnel contract is recorded in ADR 0034;
-this note does not change runtime behavior or make a compatibility promise.
+This note compares local and clustered behavior at the recorded baseline with
+two reference approaches, then records the implementation. The accepted
+Runnel contract is recorded in ADR 0034; its implementation does not make a
+compatibility promise.
 
-## Current Runnel behavior
+## Behavior at research baseline
 
-**Local engine:** [`Broker::publish_with_request_id`](../../crates/runnel-core/src/broker.rs#L171)
+**Local engine:** at the supplied baseline, [`Broker::publish_with_request_id`](../../crates/runnel-core/src/broker.rs#L171)
 looks up the public ID in the stream's request index and returns its stored
 offset before comparing the incoming key or payload. The request-aware log
 stores the ID, key bytes, and payload. Its record reader represents a
 zero-byte key as `None`, so it does not distinguish an absent key from
-`Some("")`. The local tests
-[`repeated_request_id_returns_original_offset_without_appending`](../../crates/runnel-core/src/lib.rs#L451)
-and [`request_id_deduplication_survives_restart`](../../crates/runnel-core/src/lib.rs#L551)
-assert that even changed key and payload return the original offset, both
-before and after restart.
+`Some("")`. At that baseline, local tests asserted that changed key and
+payload returned the original offset, before and after restart.
 
-**Clustered engine:** replicated state maps `dedup[stream][request_id]` to an
-offset and stores each message's key, payload, and generated timestamp in
-stream state. [`Command::Publish`](../../crates/runnel-raft/src/state_machine.rs#L301)
-returns the mapped offset before comparing incoming message fields. The dedup
-map and stream messages are persisted in state-machine and snapshot state.
-The real-process test
-[`three_process_cluster_replicates_and_recovers_after_failures`](../../crates/runnel-server/tests/cluster_smoke.rs#L175)
-retries identical content from another node; it does not exercise a mismatch.
-The mismatch behavior follows from the state-machine branch, but lacks
-focused cluster process coverage.
+**Clustered engine:** at the supplied baseline, replicated state mapped
+`dedup[stream][request_id]` to an offset and stored each message's key,
+payload, and generated timestamp in stream state.
+[`Command::Publish`](../../crates/runnel-raft/src/state_machine.rs#L301)
+returned the mapped offset before comparing incoming message fields. The
+dedup map and stream messages were persisted in state-machine and snapshot
+state. Its real-process coverage retried identical content from another node
+but did not exercise a mismatch.
 
 In both engines, public request IDs are scoped per stream and have no
 time-based window. The current local log and clustered state retain request
@@ -40,12 +36,12 @@ identity with message history; no message-retention policy defines an expiry
 boundary. ADR 0029 separately distinguishes local public IDs from internal
 dead-letter move IDs.
 
-The [client README](../../crates/runnel-client/README.md#run-the-application-example)
-guides callers to reuse one ID for a logical publish and retry with the same
-bytes. ADR 0004 says a stable ID returns the original offset but leaves changed
-inputs undefined. Existing local tests and a code comment intentionally
-preserve first-use-wins behavior. These are evidence of implementation
-intent, not a prior cross-engine contract decision.
+The client README at the baseline guided callers to reuse one ID for a logical
+publish and retry with the same bytes. ADR 0004 said a stable ID returns the
+original offset but left changed inputs undefined. Existing baseline local
+tests and a code comment intentionally preserved first-use-wins behavior.
+These were evidence of implementation intent, not a prior cross-engine
+contract decision.
 
 ## Reference behavior
 
@@ -97,6 +93,38 @@ retention policy is accepted. Any retention change must keep enough original
 input to compare a retained identity or remove its message and identity
 coherently.
 
+## Runtime implementation evidence
+
+The accepted contract is implemented in the local engine's request-aware log
+lookup and the clustered engine's replicated publish transition. Both compare
+the stored key representation and exact payload bytes before returning the
+original offset. A mismatch produces the engine kind
+`RequestIdContentConflict`, classified as `Rejected`, and maps through the
+provisional v1 wire code `request_id_content_conflict`. The clustered mapping
+is preserved when a follower forwards a publish to the leader. If the
+comparison record cannot be read locally, or a clustered dedup entry has no
+corresponding retained message, the operation fails closed as an error rather
+than accepting a new publish or claiming an exact retry.
+
+The shared engine contract checks exact retry and absent/empty-key comparison,
+key-only and payload-only conflicts, stream scope, no offset allocation or
+consumer-state change, per-record ordered publish-batch outcomes, and
+concurrent conflicting reuse. A typed-client real-server test checks rejected
+classification, batch outcomes, and persistence across restart. The
+three-process test sends a mismatch through a follower and repeats it after a
+leader change; the expected next ordinary publish confirms that the conflict
+did not consume an offset. These checks establish semantic behavior at the
+tested broker boundaries; they do not establish power-loss behavior or a
+cross-release compatibility promise.
+
+The local duplicate path reads the original payload to establish equality.
+That adds work to repeated-ID publishes, but no performance claim is made and
+the cost has not been measured. The request-ID retention lifetime remains
+unresolved until a message-retention policy is selected. No separate backlog
+or tech-debt item is needed: this implementation fulfills the accepted child
+contract under the existing client-interactions outcome, while those broader
+compatibility and retention questions remain tracked there.
+
 No persistent-format conversion is needed for currently retained messages:
 the local request-aware record has the content fields used by the contract,
 with zero-byte keys canonicalized as described above; clustered persisted
@@ -108,24 +136,18 @@ and is not a performance claim.
 
 ## Remaining evidence and planning disposition
 
-- Local and clustered engines need shared exact-retry and mismatch tests for
-  representable key-only and payload-only differences, the absent/empty key
-  comparison edge, binary bytes, stream scope, and IDs that survive restart.
-  The tests must keep the distinct ordering-key intent visible.
-- Clustered real-process coverage needs a mismatch through a follower and
-  after leader change or restart. State-machine and snapshot recovery checks
-  must prove the retained message remains available for comparison.
-- Publish-batch tests need duplicate IDs in one ordered batch, mixed exact and
-  conflicting records, per-record rejection, and continued outcomes for
-  independent records. Typed clients need to classify this as a rejected
-  result. Existing timeout and lost-response tests should continue to resolve
-  exact retries to the original offset.
-- Update client documentation to say that retry preserves the original key
-  and payload bytes. Wire vocabulary, storage compatibility, and the ID's
-  lifetime under future retention remain open implementation or planning work.
+The focused engine, local persistence, typed-client, and real-process cluster
+checks cover the accepted behavior. Existing ambiguous-outcome coverage still
+needs to remain green so a conflict is never substituted for an unresolved
+publish result. Snapshot-installation and state-machine corruption paths are
+fail-closed by construction but do not each have a new conflict-specific
+real-process scenario. Actual storage/device failure and power-loss behavior
+are outside these checks.
 
-The client-interactions backlog outcome remains open. Its progress now records
-that the semantic contract is accepted while the old first-use-wins runtime,
-wire mapping, and end-to-end mismatch tests remain unimplemented. No tracker
-item was added: this decision clarifies an existing child outcome rather than
-establishing a separate product outcome or implementation shortcut.
+The client-interactions backlog outcome remains open for a versioned
+interoperability contract, external-application evidence, and a retention
+lifetime decision. No additional tracker item was added: the accepted child
+behavior is implemented, and the remaining questions are already in scope of
+that parent outcome. The provisional wire code and lack of a compatibility
+promise should be revisited with protocol versioning, not treated as stable
+client API.

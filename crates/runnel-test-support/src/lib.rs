@@ -697,6 +697,180 @@ pub async fn assert_consume_batch_contract(engine: &dyn Engine) {
     );
 }
 
+/// Verify public request-ID content matching across local and distributed engines.
+pub async fn assert_publish_request_id_contract(engine: &dyn Engine) {
+    let stream = "contract.publish-id";
+    assert!(engine.create_stream(stream).await.unwrap());
+
+    let payload = vec![0, 1, 255];
+    assert_eq!(
+        engine
+            .publish(stream, None, payload.clone(), Some("same-id".to_owned()))
+            .await
+            .unwrap(),
+        0
+    );
+    assert_eq!(
+        engine
+            .publish(
+                stream,
+                Some(String::new()),
+                payload.clone(),
+                Some("same-id".to_owned()),
+            )
+            .await
+            .unwrap(),
+        0,
+        "absent and empty keys are equivalent for request-ID comparison"
+    );
+
+    for (key, changed_payload) in [
+        (Some("ordering-key".to_owned()), payload.clone()),
+        (None, b"changed payload".to_vec()),
+    ] {
+        let error = engine
+            .publish(stream, key, changed_payload, Some("same-id".to_owned()))
+            .await
+            .expect_err("changed representable content must conflict");
+        assert_eq!(error.kind(), BrokerErrorKind::RequestIdContentConflict);
+        assert_eq!(error.outcome(), BrokerErrorOutcome::Rejected);
+    }
+
+    assert_eq!(
+        engine
+            .publish(stream, Some("next".to_owned()), b"next".to_vec(), None)
+            .await
+            .unwrap(),
+        1,
+        "conflicts must not append or allocate an offset"
+    );
+    let first = engine.poll(stream, "reader").await.unwrap();
+    assert!(matches!(
+        first,
+        PollResult::Message(message)
+            if message.offset == 0 && message.key.is_none() && message.payload == payload
+    ));
+    engine.ack(stream, "reader", 0).await.unwrap();
+    assert!(
+        matches!(
+            engine.poll(stream, "reader").await.unwrap(),
+            PollResult::Message(message) if message.offset == 1 && message.payload == b"next"
+        ),
+        "rejected retries must leave consumer progress and the original record unchanged"
+    );
+
+    for (name, expected_payload) in [
+        ("contract.publish-id.scope-a", b"a".as_slice()),
+        ("contract.publish-id.scope-b", b"b".as_slice()),
+    ] {
+        assert!(engine.create_stream(name).await.unwrap());
+        assert_eq!(
+            engine
+                .publish(
+                    name,
+                    None,
+                    expected_payload.to_vec(),
+                    Some("scoped".to_owned())
+                )
+                .await
+                .unwrap(),
+            0
+        );
+    }
+
+    let batch = "contract.publish-id-batch";
+    assert!(engine.create_stream(batch).await.unwrap());
+    let outcomes = engine
+        .publish_batch(
+            batch,
+            vec![
+                PublishRecord {
+                    key: Some("batch-key".to_owned()),
+                    payload: b"first".to_vec(),
+                    request_id: Some("batch-id".to_owned()),
+                },
+                PublishRecord {
+                    key: Some("batch-key".to_owned()),
+                    payload: b"first".to_vec(),
+                    request_id: Some("batch-id".to_owned()),
+                },
+                PublishRecord {
+                    key: Some("batch-key".to_owned()),
+                    payload: b"changed".to_vec(),
+                    request_id: Some("batch-id".to_owned()),
+                },
+                PublishRecord {
+                    key: None,
+                    payload: b"independent".to_vec(),
+                    request_id: Some("other-id".to_owned()),
+                },
+                PublishRecord {
+                    key: None,
+                    payload: b"without-id".to_vec(),
+                    request_id: None,
+                },
+            ],
+        )
+        .await
+        .unwrap();
+    assert_eq!(outcomes.len(), 5);
+    assert!(matches!(outcomes[0], Ok(0)));
+    assert!(matches!(outcomes[1], Ok(0)));
+    assert!(matches!(
+        &outcomes[2],
+        Err(error)
+            if error.kind() == BrokerErrorKind::RequestIdContentConflict
+                && error.outcome() == BrokerErrorOutcome::Rejected
+    ));
+    assert!(matches!(outcomes[3], Ok(1)));
+    assert!(matches!(outcomes[4], Ok(2)));
+
+    for (offset, expected) in [
+        (0, b"first".as_slice()),
+        (1, b"independent"),
+        (2, b"without-id"),
+    ] {
+        assert!(matches!(
+            engine.poll(batch, "reader").await.unwrap(),
+            PollResult::Message(message) if message.offset == offset && message.payload == expected
+        ));
+        engine.ack(batch, "reader", offset).await.unwrap();
+    }
+    assert_eq!(
+        engine.poll(batch, "reader").await.unwrap(),
+        PollResult::Empty
+    );
+
+    let concurrent = "contract.publish-id-concurrent";
+    assert!(engine.create_stream(concurrent).await.unwrap());
+    let left = engine.publish(
+        concurrent,
+        Some("left-key".to_owned()),
+        b"left".to_vec(),
+        Some("racing-id".to_owned()),
+    );
+    let right = engine.publish(
+        concurrent,
+        Some("right-key".to_owned()),
+        b"right".to_vec(),
+        Some("racing-id".to_owned()),
+    );
+    let (left, right) = tokio::join!(left, right);
+    let accepted_payload = match (left, right) {
+        (Ok(0), Err(error)) if error.kind() == BrokerErrorKind::RequestIdContentConflict => {
+            b"left".as_slice()
+        }
+        (Err(error), Ok(0)) if error.kind() == BrokerErrorKind::RequestIdContentConflict => {
+            b"right".as_slice()
+        }
+        outcomes => panic!("one concurrent content must win and the other conflict: {outcomes:?}"),
+    };
+    assert!(matches!(
+        engine.poll(concurrent, "reader").await.unwrap(),
+        PollResult::Message(message) if message.offset == 0 && message.payload == accepted_payload
+    ));
+}
+
 pub async fn assert_shared_delivery_contract(engine: &dyn Engine) {
     assert!(engine.create_stream("contract.work").await.unwrap());
     for payload in [

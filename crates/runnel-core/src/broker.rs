@@ -259,10 +259,11 @@ impl Broker {
         let stream_state = self.get_or_create_stream(stream)?;
         let mut stream_state = self.lock_stream(&stream_state)?;
         if let Some(request_id) = request_id.as_ref()
-            && let Some(offset) = stream_state.log.request_offset(request_id)
+            && let Some(offset) =
+                stream_state
+                    .log
+                    .request_offset_for_content(request_id, key.as_deref(), &payload)?
         {
-            // As with the clustered engine, a repeated identity resolves to its original
-            // offset; payload and key mismatches are intentionally ignored for compatibility.
             return Ok(offset);
         }
         let offset = match request_id {

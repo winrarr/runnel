@@ -87,7 +87,7 @@ Acceptance criteria:
 - the contract has a documented compatibility policy;
 - behavior is covered by interoperability and compatibility tests.
 
-Decision progress: [ADR 0031](decisions/0031-protocol-v2-contract.md) accepts the first v2 handshake, Protobuf schema policy, directional bounds, rollout boundary, publish-ID mismatch behavior, and outcome/stage vocabulary. This closes contract selection only. Runtime negotiation, generated-client fixtures, real-server mismatch/reconnect/outcome tests, and interoperability evidence remain open; v1 and v2 are not yet a cross-release compatibility promise.
+Decision progress: [ADR 0031](decisions/0031-protocol-v2-contract.md) accepts the first v2 handshake, Protobuf schema policy, directional bounds, rollout boundary, publish-ID mismatch behavior, and outcome/stage vocabulary. [ADR 0034](decisions/0034-publish-request-id-content-contract.md) now implements the content-conflict behavior in the current provisional v1 engines and server mapping. V2 runtime negotiation, generated-client fixtures, v2-specific real-server mismatch/reconnect/outcome tests, and interoperability evidence remain open; v1 and v2 are not yet a cross-release compatibility promise.
 
 ### Provide a production-usable client path
 
@@ -124,11 +124,17 @@ bytes or payload bytes for a retained `(stream, request_id)` are rejected
 without appending a message. For request-ID comparison only, absent and empty
 keys compare as equivalent because the current local durable record cannot
 distinguish them; this does not equate their ordering intent. Runtime
-behavior is still first-use-wins in both engines; the semantic rejection, its
-provisional wire mapping, client guidance, and focused local/batch/cluster
-tests remain unimplemented. The
+behavior now follows that contract in both engines. Exact retries return the
+original offset; changed representable content produces a confirmed
+`request_id_content_conflict` rejection. Shared engine tests cover stream
+scope, binary payloads, concurrency, key comparison, and ordered per-record
+publish batches. Real-server tests cover typed client classification and
+restart recovery; the three-process test covers follower forwarding and a
+post-leader-change conflict. The wire code remains provisional. Versioned
+interoperability evidence, an intended external application, and the
+request-ID lifetime under future retention remain open. The
 [source-backed review](research/publish-request-id-content-mismatch.md)
-records the reference comparison and remaining retention-lifetime question.
+records the implementation evidence and these remaining questions.
 
 ## Make message processing complete
 
@@ -712,7 +718,7 @@ Acceptance criteria:
 - clients can distinguish confirmed success, confirmed rejection, retryable failure, and unknown outcome;
 - safe retries do not create unintended duplicate messages when deduplication is requested.
 
-Decision progress: [ADR 0031](decisions/0031-protocol-v2-contract.md) accepts the public v2 outcome/stage vocabulary and its topology-neutral durability boundary. The server/client fields, local and clustered engine mapping, response-loss resolution, ID-conflict tests, and broader supported-node failure evidence remain unimplemented, so this outcome stays open.
+Decision progress: [ADR 0031](decisions/0031-protocol-v2-contract.md) accepts the public v2 outcome/stage vocabulary and its topology-neutral durability boundary. The current provisional v1 engine classification, error mapping, and focused ID-conflict tests are implemented under ADR 0034. V2 server/client fields, v2 response-loss resolution, broader supported-node failure evidence, and a compatibility promise remain open, so this outcome stays open.
 
 ### Make the clustered deployment operable
 

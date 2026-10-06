@@ -279,7 +279,7 @@ for `connection_limit`, `request_saturated`, and `stream_not_ready` are also
 static response-code rules rather than a general wire outcome field. Only a negotiated v2 response can carry the accepted authoritative outcome
 class and processing stage; runtime support remains unimplemented.
 
-ADR 0031 accepts v2 outcome and stage fields, the publish-only request-ID fingerprint/mismatch rule, and the connection-scoped compatibility boundary. It does not add a correlation ID while requests remain sequential or a generic identity for other operations. The accepted names and rules apply only to negotiated v2; they do not silently change current v1. No storage path, offset layout, Raft term, or node placement becomes public.
+ADR 0031 accepts v2 outcome and stage fields, the publish-only request-ID fingerprint/mismatch rule, and the connection-scoped compatibility boundary. It does not add a correlation ID while requests remain sequential or a generic identity for other operations. The v2 outcome fields and selected error vocabulary apply only to negotiated v2. ADR 0034 separately implements content-conflict semantics in the current provisional v1 runtime with a provisional v1 error code; this does not promise cross-release compatibility. No storage path, offset layout, Raft term, or node placement becomes public.
 
 ## Alternatives and reference comparison
 

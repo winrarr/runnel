@@ -115,9 +115,10 @@ pub enum ClientError {
 
 /// Optional fields for a text publish.
 ///
-/// `request_id` is an application-provided identity. Reuse the same identity
-/// when explicitly resolving an ambiguous publish against a broker that
-/// supports request deduplication. This client never generates identities or
+/// `request_id` is an application-provided identity. Reuse it with the same
+/// key and payload bytes when explicitly resolving an ambiguous publish. A
+/// changed-content reuse of a retained ID is rejected by brokers implementing
+/// the current request-ID contract. This client never generates identities or
 /// retries publishes automatically.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct PublishOptions {
@@ -638,8 +639,8 @@ impl Client {
     ///
     /// This operation is never retried automatically. A stable
     /// `PublishOptions::request_id` lets an application explicitly retry an
-    /// unknown publish against the current engines' deduplication path; use
-    /// the same identity for that retry.
+    /// unknown publish. Reuse the same identity, key, and payload bytes; a
+    /// changed-content reuse of a retained ID is a confirmed rejection.
     pub async fn publish_with_options(
         &mut self,
         stream: impl Into<String>,
@@ -713,7 +714,9 @@ impl Client {
     ///
     /// Records are sent and processed in input order. The broker does not
     /// make the batch atomic: a completed response can contain both confirmed
-    /// and rejected records. A transport, timeout, or leader-change failure
+    /// and rejected records. Reuse each record ID only with equivalent key
+    /// and payload bytes; changed content is rejected independently. A
+    /// transport, timeout, or leader-change failure
     /// returns one retry classification for every record because the broker
     /// may have processed a prefix. Reuse each record's `request_id` when
     /// resolving an unknown result.
@@ -1660,6 +1663,7 @@ enum BatchFailureKind {
 
 fn classify_error_code(code: &str) -> BatchFailureKind {
     match code {
+        "request_id_content_conflict" => BatchFailureKind::Rejected,
         "connection_limit"
         | "request_saturated"
         | "stream_not_ready"

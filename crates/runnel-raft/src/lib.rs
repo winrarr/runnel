@@ -1036,6 +1036,7 @@ mod tests {
     async fn single_node_raft_implements_shared_delivery_contract() {
         let engine = SingleNodeEngine::new(1).await.unwrap();
         runnel_test_support::assert_error_classification_contract(&engine).await;
+        runnel_test_support::assert_publish_request_id_contract(&engine).await;
         runnel_test_support::assert_publish_batch_contract(&engine).await;
         runnel_test_support::assert_consume_batch_contract(&engine).await;
         runnel_test_support::assert_shared_delivery_contract(&engine).await;
@@ -1068,6 +1069,7 @@ mod tests {
         .unwrap();
         runnel_test_support::assert_publish_batch_contract(&engine).await;
         runnel_test_support::assert_consume_batch_contract(&engine).await;
+        runnel_test_support::assert_publish_request_id_contract(&engine).await;
         runnel_test_support::assert_shared_delivery_contract(&engine).await;
         runnel_test_support::assert_independent_consumers_contract(&engine).await;
         runnel_test_support::assert_key_ordering_contract(&engine).await;
