@@ -1,11 +1,11 @@
 # Replay selectors and bounded sessions
 
-- Status: exploratory design; no API or compatibility decision
-- Last reviewed: 2026-10-05
-- Baseline: f999c1b9ad5d22408bbbe6c6276a42e825cd62ef
+- Status: exploratory design for pages and sessions; ADR 0038 accepts one-shot time-selector semantics; runtime and wire shape remain open
+- Last reviewed: 2026-10-06
+- Baseline: `5dc76270a46690fce074fcaf61b5a8cda9838cd0`
 - Primary evidence class: design/research; secondary: correctness/reliability, storage/recovery
 - Scope: bounded replay selectors, paging, and optional durable replay sessions
-- Related: [replay backlog outcome](../backlog.md#make-replay-an-explicit-and-safe-consumer-operation), [ADR 0024](../decisions/0024-explicit-offset-replay-read.md), [replay time-selector research](../research/replay-time-selector-semantics.md), and [retention and disk-pressure design](retention-disk-pressure-plan.md)
+- Related: [replay backlog outcome](../backlog.md#make-replay-an-explicit-and-safe-consumer-operation), [ADR 0024](../decisions/0024-explicit-offset-replay-read.md), [ADR 0038](../decisions/0038-timestamp-based-replay-selector.md), [replay time-selector research](../research/replay-time-selector-semantics.md), and [retention and disk-pressure design](retention-disk-pressure-plan.md)
 
 This note explores how to extend the accepted one-record offset read into
 bounded replay without coupling replay to a consumer's ordinary checkpoint. It
@@ -76,64 +76,42 @@ never be accepted as an ordinary consumer acknowledgement.
 
 ### Selector semantics
 
-An eventual selector set could include an inclusive offset, the earliest
-retained offset, a snapshot of the named consumer's current committed offset,
-or broker-published time. Each selector resolves to one logical start offset
-against the captured view. A checkpoint selector reads the ordinary committed
-offset once at session/page creation; subsequent poll or acknowledgement
-activity does not change that replay position. It does not create a second
-checkpoint meaning or rewind ordinary progress.
+The current inclusive offset selector is accepted in ADR 0024, and the
+one-shot broker-publish-time selector is accepted in ADR 0038. Earliest
+retained offset and a snapshot of the named consumer's current committed
+checkpoint remain possible future selectors. Each selector resolves to one
+logical start offset against the captured view. A checkpoint selector would
+read ordinary committed offset once at session/page creation; subsequent poll
+or acknowledgement activity would not change that replay position or rewind
+ordinary progress.
 
-For published time, the most implementable candidate is the lowest logical
-offset in the captured retained view whose stored <code>published_at_ms</code>
-is greater than or equal to T. Equal timestamps select the lowest matching
-offset. After selecting a start, replay follows logical append order; it is not
-a filter that excludes later records whose timestamp is less than T. This is
-an inclusive lower-bound start selector, not event-time range semantics. The
-candidate follows the existing retention design and resembles Kafka's
-<code>offsetsForTimes</code>, but it remains an inference, not an accepted
-contract.
+[ADR 0038](../decisions/0038-timestamp-based-replay-selector.md) accepts a
+one-shot timestamp selector for the lowest logical offset in the captured
+retained view whose stored <code>published_at_ms</code> is greater than or
+equal to T. The comparison is inclusive; ties resolve to the lowest offset.
+After selection, traversal follows logical append order, so a later record may
+have a timestamp below T. This is a replay start selector, not an event-time
+filter. The source is the existing broker-assigned Unix-millisecond field, not
+caller event time, commit time, or a globally ordered clock.
 
-The candidate has material edge cases:
+The accepted outcomes distinguish a complete view with no matching record
+(including an empty stream or T later than all visible records) from a view
+whose deleted prefix could contain an earlier match. The first is
+<code>no_match</code>; the latter is <code>history_unavailable</code>. For
+contiguous-prefix deletion, complete metadata for the maximum timestamp in the
+deleted prefix proves completeness when that maximum is less than T. If the
+maximum is at least T, or the summary is missing or untrustworthy, the earliest
+match cannot be established. A retention design with deletion holes needs an
+equivalent completeness proof.
 
-- **Equal timestamps:** choose the lowest logical offset satisfying the
-  predicate, so retries over the same view resolve identically.
-- **Backward timestamps:** later logical records may be returned with times
-  below T. A time-sorted index alone cannot implement lowest-offset lookup
-  when timestamps are nonmonotonic.
-- **No match at the captured end:** return a distinct <code>no_match</code> or
-  empty-scope outcome, not <code>history_unavailable</code>. A one-shot lookup
-  does not wait for future publishes.
-- **Before or within deleted history:** return <code>history_unavailable</code>
-  if the requested scope cannot be proven complete. Returning only a retained
-  suffix would silently truncate the caller's requested replay.
-- **Precision and range:** the stored unit is integer milliseconds. A numeric
-  selector should define negative and out-of-range validation. A textual
-  representation would need a UTC-offset requirement and a rule for
-  sub-millisecond precision; RFC 3339 defines timestamp syntax, not these
-  replay semantics.
-- **Clock source:** the selector means broker-assigned publish time only. It
-  must not imply event time, global ordering, or a clock uncertainty bound.
-
-Retention complicates completeness because the current timestamps can move
-backwards. The timestamp of the first retained record is not enough to prove
-that deleted records did not satisfy <code>published_at_ms &gt;= T</code>.
-Candidate directions include rejecting ambiguous time requests, persisting a
-prefix summary such as the maximum deleted publish timestamp, or accepting a
-monotonic timestamp invariant with its clock and migration costs. A maximum
-deleted timestamp could prove that no deleted record matches a threshold
-when it is below T; it cannot locate a matching deleted record, so requests
-for which it is at least T must still fail as unavailable. This is an
-illustrative bound, not a selected retention format.
-
-If a time lookup scans records to find the lowest matching offset, it may
-inspect history proportional to retained stream size. A sorted-by-time index
-does not preserve lowest-offset semantics under clock regressions; an index
-that does preserve that semantic can have memory, recovery, and consistency
-costs. Before exposing a time selector, bound the scan or establish an index
-whose consistency and recovery are tested. The read itself must also be
-limited by the server's serialized response size, not only by logical payload
-bytes.
+The semantic contract is accepted, but runtime lookup remains gated. The local
+sparse index orders records by offset and old reads may scan; the clustered
+engine stores an offset-ordered vector. A timestamp-sorted index alone cannot
+find the minimum matching offset under clock regressions. Before exposing the
+selector, provide a recoverable lookup structure that preserves lowest-offset
+semantics with explicit work bounds and test restart, snapshot, and rebuild
+behavior. The design does not mandate a physical index layout. See ADR 0038
+for the implementation evidence gates and source comparison.
 
 ## Fencing and concurrency
 
@@ -193,10 +171,11 @@ The logical retained range is half-open [earliest, next). Offset selection
 below earliest is unavailable; an offset at or above captured next is not
 present in that view. The current protocol's offset replay uses
 <code>history_unavailable</code> for absent offsets and returns the available
-offset range. A future time selector also needs to distinguish no current
-match from unavailable history. A session whose next required offset falls
-below the retention floor must report explicit unavailability or expiry; it
-must not advance to a later retained record or report normal end-of-session.
+offset range. The time-selector outcomes for no current match and incomplete
+deleted-prefix history are accepted by ADR 0038. A session whose next required
+offset falls below the retention floor must report explicit unavailability or
+expiry; it must not advance to a later retained record or report normal
+end-of-session.
 
 The retention proposal's <code>protect</code> policy lets active replay sessions
 pin their earliest unread history, while <code>expire</code> can end replay
@@ -265,24 +244,22 @@ one-record contract.
 
 ## Staged recommendation and evidence gates
 
-These are outcome gates, not an accepted implementation sequence.
+The timestamp selector semantics are accepted by ADR 0038. These are
+implementation and later session gates, not open selector choices.
 
-1. **Accept selector and outcome semantics.** Decide whether earliest and a
-   snapshot of the ordinary committed checkpoint are useful first selectors.
-   If accepting time, explicitly choose inclusive >= T, lowest logical
-   matching offset, subsequent append-order traversal, the broker-publish-time
-   meaning, tie/no-match outcomes, and the deleted-prefix completeness rule.
-   Keep selectors read-only with respect to ordinary progress.
-2. **Prefer bounded stateless pages as the next runtime slice if sufficient.**
-   Start with selectors whose lookup is bounded by current state, such as an
-   offset, earliest retained position, or captured consumer checkpoint. Keep a
-   time selector gated on a bounded lookup strategy and a completeness rule
-   for deleted prefixes. Capture selector resolution and [earliest, next)
-   once. Bound returned records and serialized bytes, return a resumable
-   logical cursor, and make repeated page reads safe. Preserve the current
-   single-offset API until an explicit protocol decision replaces or subsumes
-   it. A page does not pin history and must surface a retention race as
-   unavailable.
+1. **Implement the accepted one-shot time selector.** Preserve the current
+   offset operation. Resolve one time-selected record against a single
+   `[earliest, next)` view, distinguish `no_match` from
+   `history_unavailable`, and never touch the ordinary checkpoint. Build or
+   derive a recoverable lookup structure that returns the minimum logical
+   matching offset under equal and regressing timestamps without a history-
+   proportional query scan. Add the deleted-prefix maximum timestamp summary
+   when retention is implemented; until its completeness is known, fail closed.
+2. **Add stateless bounded pages only after selector resolution is stable.**
+   Capture selector resolution and `[earliest, next)` once. Bound returned
+   records and serialized bytes, return a resumable logical cursor, and make
+   repeated page reads safe. A page does not pin history and must surface a
+   retention race as unavailable.
 3. **Add durable sessions only for a demonstrated resume/pinning requirement.**
    Specify idempotent creation, separate session-generation fencing,
    acknowledgement and retry behavior, lease and maximum lifetime, quotas,
@@ -290,36 +267,36 @@ These are outcome gates, not an accepted implementation sequence.
    implementing session state. Replicate all eligibility-affecting facts and
    include them in recovery snapshots.
 4. **Establish resource and failure evidence.** Test equal/backward/forward
-   timestamps; offset/time/checkpoint boundaries; no match versus unavailable
-   history; deleted nonmonotonic prefixes; concurrent ordinary poll/ack and
-   replay; unknown session-create/ack responses; local restart; and clustered
-   leader change and snapshot recovery. Bound timestamp lookup work and page
-   size. Measure lookup and foreground poll/publish impact over increasing
-   retained histories before claiming the index or scan strategy is
-   acceptable. Add replay-specific metrics without high-cardinality labels.
+   timestamps; selector boundaries; no match versus unavailable history;
+   deleted nonmonotonic prefixes; concurrent ordinary poll/ack and replay;
+   local restart; and clustered leader change and snapshot recovery. Verify
+   the index's worst-case work for sparse matches and no match. Measure lookup,
+   index space/rebuild, and foreground poll/publish impact over increasing
+   histories before deployment. Add replay-specific metrics without
+   high-cardinality labels only when operationally justified.
 
-The selector/page slice is reasonably implementable in the near term because
-both engines already expose logical offsets, record timestamps, a read-only
-replay boundary, and explicit unavailable-history outcomes. A durable session
-is a larger follow-on: safe pins depend on retention floors and cleanup, and
-cluster failover requires versioned replicated state plus snapshot coverage.
-The current one-file local log and materialized clustered message vectors
-also mean this design does not select a physical lookup or storage strategy.
+The selected one-shot timestamp behavior is a near-term outcome, but not a
+scrape-time scan: bounded lookup requires an offset-order-preserving timestamp
+index and recovery evidence in each engine. A durable session remains a
+larger follow-on because safe pins depend on retention floors and cleanup,
+and cluster failover requires versioned replicated state plus snapshot
+coverage. The current one-file local log and materialized clustered message
+vectors remain relevant scalability constraints under TD-002 and TD-010.
 
 ## Planning and refactor disposition
 
 The [replay backlog outcome](../backlog.md#make-replay-an-explicit-and-safe-consumer-operation)
-already covers time, offset, and checkpoint scopes, deterministic fencing,
-restart/failover behavior, and observability. The [retention and disk-pressure
-design](retention-disk-pressure-plan.md) already identifies replay sessions,
-protected pins, expiry, and unavailable-history behavior as coupled open
-questions. This note sharpens those boundaries but does not change the intended
-outcome or acceptance criteria, so no backlog or tech-debt edit is warranted.
-The current single-offset replay is an accepted first slice, not a newly
-identified implementation shortcut. No code refactor is appropriate in a
-design-only change; consolidating timestamp assignment or adding an index
-would constrain semantics and requires a separate decision and recovery
-evidence.
+now links the accepted selector semantics and carries their bounded lookup
+and recovery gates. [ADR 0038](../decisions/0038-timestamp-based-replay-selector.md)
+settles the previously open timestamp source, comparison, tie, regression,
+no-match, and deleted-prefix behavior. Replay sessions, protected pins,
+expiry, and page semantics remain open in the [retention and disk-pressure
+design](retention-disk-pressure-plan.md). Existing [TD-002](../tech-debt.md#td-002-one-file-and-a-startup-scan-per-local-stream)
+and [TD-010](../tech-debt.md#td-010-clustered-state-materializes-complete-retained-history)
+cover local cold scans and clustered full-history traversal; no separate debt
+item is warranted. No runtime refactor belongs in this documentation-only
+change; index shape and timestamp assignment remain implementation choices
+within the accepted semantic constraints.
 
 No runtime performance change is expected. This document neither implements
 an API nor claims lookup or throughput improvement. Runtime tests and
@@ -328,17 +305,18 @@ and later implementation evidence remain open.
 
 ## Unresolved decisions
 
-- Is a stateless bounded page enough for the initial multi-record replay
-  capability, or does a user-facing first release require durable resumability?
-- Does the ordinary consumer checkpoint selector snapshot the first
+- Is a stateless bounded page enough for multi-record replay, or does a
+  user-facing release require durable resumability?
+- Should a future consumer-checkpoint selector snapshot the first
   uncommitted offset only, including grouped consumers with out-of-order
   acknowledgements?
-- Can the broker maintain enough bounded timestamp summary/index state to
-  prove time-selector completeness after prefix deletion without assuming
-  monotonic timestamps?
-- What exact offset outcome distinguishes an offset at captured next from
-  history below earliest, and which result fields expose a retained time
-  boundary without implying clock certainty?
+- What recoverable local and replicated index representation gives bounded
+  lowest-offset lookup under timestamp regressions without excessive update,
+  memory, or rebuild cost?
+- When retention is implemented, how will complete deleted-prefix timestamp
+  maxima be persisted, migrated, and included in snapshots?
+- What exact offset outcome should distinguish an offset at captured `next`
+  from history below `earliest` for future multi-record pages?
 - If a session can pin history, what duration, renewal limit, administrative
   expiry, and quota prevent abandoned or high-cardinality sessions from
   exhausting retention or disk capacity?

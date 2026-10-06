@@ -4,7 +4,7 @@
 - Date: 2026-09-02
 - Baseline: `origin/main` `51ba190205e66c37a9daf7176e02c58020ae519c`
 - Scope: the first local, clustered, and provisional protocol replay operation
-- Related: [replay backlog](../backlog.md#make-replay-an-explicit-and-safe-consumer-operation), [retention and disk-pressure plan](../design/retention-disk-pressure-plan.md), [ADR 0004](0004-multi-raft-first-distributed-engine.md), and [ADR 0023](0023-independent-retained-storage-and-placement.md)
+- Related: [replay backlog](../backlog.md#make-replay-an-explicit-and-safe-consumer-operation), [retention and disk-pressure plan](../design/retention-disk-pressure-plan.md), [ADR 0004](0004-multi-raft-first-distributed-engine.md), [ADR 0023](0023-independent-retained-storage-and-placement.md), and [ADR 0038](0038-timestamp-based-replay-selector.md)
 
 ## Context
 
@@ -85,13 +85,15 @@ retry attempts, delivery metrics, or acknowledgements. The operation is
 bounded to one record, so it cannot monopolize a stream's ordinary delivery
 lane through a large historical scan or response.
 
-This slice does not provide time selectors, earliest selectors, ranges,
-durable replay cursors, replay acknowledgements, progress replacement,
+This runtime slice does not provide time selectors, earliest selectors,
+ranges, durable replay cursors, replay acknowledgements, progress replacement,
 retention cleanup, replay pins, replay lag metrics, or replay-specific
-backpressure metrics. It also does not claim that an unavailable offset is
-recoverable. A client that receives a transport timeout or disconnect must
-apply the existing unknown-outcome rule, even though the operation itself is
-read-only.
+backpressure metrics. [ADR 0038](0038-timestamp-based-replay-selector.md)
+accepts the semantics for a future time selector, but no time-selector runtime
+or wire field is implemented by this decision. This ADR also does not claim
+that an unavailable offset is recoverable. A client that receives a transport
+timeout or disconnect must apply the existing unknown-outcome rule, even
+though the operation itself is read-only.
 
 ## Verification
 
@@ -103,5 +105,6 @@ read-only.
 - Real-server tests cover replay before and after local restart and replay
   through a three-process clustered deployment.
 
-The full replay backlog item remains open until session, selector, retention,
-failover, and observability acceptance evidence exists.
+The full replay backlog item remains open until the time selector and other
+supported selectors are implemented with bounded lookup, and sessions,
+retention, failover, and observability have their required acceptance evidence.

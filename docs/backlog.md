@@ -231,20 +231,22 @@ Goal: let an application deliberately reprocess a documented portion of retained
 
 Rationale: replay is part of the stated public model and a core reason to use durable streams, but the current poll contract only follows one forward checkpoint.
 
-Current progress: local and clustered engines now expose an additive,
-bounded, read-only replay operation for one inclusive logical offset. The
-protocol, typed client, CLI, and real-server tests preserve ordinary consumer
-progress and return explicit `history_unavailable` outcomes. Time selectors,
-durable replay sessions, retention floors and pins, replay acknowledgements,
+Current progress: local and clustered engines expose an additive, bounded,
+read-only replay operation for one inclusive logical offset. The protocol,
+typed client, CLI, and real-server tests preserve ordinary consumer progress
+and return explicit `history_unavailable` outcomes. [ADR 0038](decisions/0038-timestamp-based-replay-selector.md)
+now accepts the semantics for a one-record time selector over stored broker
+publish timestamps, including equal/regressing timestamp order, no-match, and
+deleted-prefix completeness. The selector is not implemented. Durable replay
+sessions, retention floors and pins, replay acknowledgements,
 failover/replay-session behavior, and replay-specific observability remain
 open.
 
-The exploratory [time-selector research](research/replay-time-selector-semantics.md)
-records timestamp ordering, retention-completeness, and bounded-lookup risks.
-The [durable replay-session design](design/replay-sessions.md) compares
-session models and proposes separate cursor, acknowledgement, fencing,
-snapshot, and retention-pin semantics for further review. Neither note accepts
-a runtime or API decision.
+The [time-selector research](research/replay-time-selector-semantics.md)
+records source behavior and index/recovery risks. The
+[durable replay-session design](design/replay-sessions.md) compares session
+models and records separate cursor, acknowledgement, fencing, snapshot, and
+retention-pin questions; its time-selector semantics now follow ADR 0038.
 
 Constraints:
 
@@ -255,8 +257,11 @@ Constraints:
 
 Acceptance criteria:
 
-- a consumer can request replay from supported time, offset, or checkpoint scopes with explicit validation and outcome semantics;
-- concurrent polls, acknowledgements, retries, and replay changes have deterministic fencing behavior;
+- a consumer can request replay by inclusive logical offset and, after implementation of a bounded index, by the lowest logical offset whose stored broker `published_at_ms` is at least the requested Unix-millisecond threshold; ties select the lowest offset and later traversal stays in append order;
+- a complete view with no timestamp match returns explicit `no_match`; incomplete deleted-prefix history returns `history_unavailable`, using complete prefix timestamp metadata when retention is introduced;
+- replay reads never change the ordinary consumer checkpoint, acknowledgement set, attempts, leases, or delivery tokens; any future progress replacement remains a separate fenced operation;
+- selector lookup work, result bytes, and concurrency are bounded, with index update, restart/rebuild, crash, snapshot-installation, and real-process local/cluster evidence;
+- concurrent polls, acknowledgements, retries, and future replay-session changes have deterministic fencing behavior;
 - restart and failover tests preserve the selected replay position and original durable progress as documented;
 - lag, replay progress, unavailable history, and replay-induced resource pressure are observable.
 

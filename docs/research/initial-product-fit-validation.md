@@ -288,9 +288,9 @@ clustered tests check replay and ordinary progress independently across restart
 explicit and safe consumer operation](../backlog.md), [Make retained data
 operationally scalable](../backlog.md), and the initial product-fit outcome.
 Current evidence covers a bounded offset replay, not a complete retention
-policy: time selectors, durable replay sessions, retention floors or pins,
-replay-specific observability, and replay-induced resource pressure remain
-open. The current tests therefore cannot establish a supported retained-data
+policy. ADR 0038 accepts time-selector semantics, but bounded runtime lookup,
+durable replay sessions, retention floors or pins, replay-specific
+observability, and replay-induced resource pressure remain open. The current tests therefore cannot establish a supported retained-data
 operating envelope or prove that a participant understands replay versus
 ordinary consumption.
 
