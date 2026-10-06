@@ -1,11 +1,14 @@
 import argparse
+import json
 import socket
 import socketserver
+import struct
 import subprocess
 import sys
 import tempfile
 import threading
 import unittest
+import zlib
 from datetime import UTC, datetime
 from pathlib import Path
 from types import SimpleNamespace
@@ -99,6 +102,66 @@ from cluster_scenarios import (  # noqa: E402
 )
 from common import BenchmarkError, metric, parse_nonnegative_int, percentile  # noqa: E402
 from profile import summarize_timing_logs  # noqa: E402
+
+
+def _write_v2_raft_log_fixture(
+    group: Path,
+    indexes: list[int],
+    *,
+    last_purged: int | None = 10,
+    committed: int | None = 12,
+) -> tuple[Path, Path, Path | None]:
+    family = group / "raft-log.segments"
+    family.mkdir(parents=True)
+    marker = group / "raft-log.json"
+    marker.write_text(
+        json.dumps(
+            {"version": 2, "artifact": "runnel-raft-log-segments"},
+            separators=(",", ":"),
+        ),
+        encoding="utf-8",
+    )
+
+    def log_id(index: int | None) -> dict[str, object] | None:
+        if index is None:
+            return None
+        return {"leader_id": {"term": 1, "node_id": 1}, "index": index}
+    state = {
+        "generation": 0,
+        "truncation_pending_from": None,
+        "last_purged_log_id": log_id(last_purged),
+        "committed": log_id(committed),
+        "vote": None,
+    }
+    checksum = zlib.crc32(
+        json.dumps(state, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+    ) & 0xFFFFFFFF
+    control = family / "control.json"
+    control.write_text(
+        json.dumps({"state": state, "checksum": checksum}, separators=(",", ":")),
+        encoding="utf-8",
+    )
+
+    if not indexes:
+        return marker, control, None
+    entries = [
+        json.dumps(
+            {
+                "log_id": {"leader_id": {"term": 1, "node_id": 1}, "index": index},
+                "payload": {"Blank": None},
+            },
+            separators=(",", ":"),
+        ).encode("utf-8")
+        for index in indexes
+    ]
+    payload = b"".join(struct.pack("<I", len(entry)) + entry for entry in entries)
+    header = b"BAT2" + struct.pack("<QQIQ", 0, indexes[0], len(entries), len(payload))
+    frame = header + struct.pack("<I", zlib.crc32(header) & 0xFFFFFFFF) + payload
+    checksum = zlib.crc32(frame) & 0xFFFFFFFF
+    frame += struct.pack("<I", checksum) + b"END2"
+    segment = family / f"segment-{indexes[0]:020d}.rlog"
+    segment.write_bytes(b"RSG2" + struct.pack("<IQ", 2, indexes[0]) + frame)
+    return marker, control, segment
 
 
 class _ClientsContext:
@@ -860,6 +923,130 @@ class ClusterBenchmarkTests(unittest.TestCase):
             observed["paths"]["state_machine_checkpoint"]["file_bytes"], 10
         )
         self.assertEqual(observed["paths"]["snapshot"]["file_bytes"], 8)
+
+    def test_raft_data_group_observation_reads_v2_segments_and_sums_store_footprint(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            group = Path(temporary) / "groups" / "data" / "stream-id"
+            group.mkdir(parents=True)
+            state = group / "state-machine"
+            state.mkdir()
+            marker, control, segment = _write_v2_raft_log_fixture(
+                group, [9, 10, 11, 12]
+            )
+            assert segment is not None
+            (state / "state-machine.log").write_bytes(b"journal")
+            (state / "state-machine.json").write_bytes(b"checkpoint")
+            (state / "snapshot.json").write_bytes(b"snapshot")
+            marker_bytes = marker.stat().st_size
+            control_bytes = control.stat().st_size
+            segment_bytes = segment.stat().st_size
+
+            observed = _raft_data_group_state(3, group)
+
+        raft_log = observed["paths"]["raft_log"]
+        self.assertEqual(raft_log["format_version"], 2)
+        self.assertEqual(raft_log["retained_log_entries"], 2)
+        self.assertEqual(raft_log["first_log_index"], 11)
+        self.assertEqual(raft_log["last_log_index"], 12)
+        self.assertEqual(raft_log["last_purged_log_index"], 10)
+        self.assertEqual(raft_log["committed_log_index"], 12)
+        self.assertEqual(raft_log["segment_count"], 1)
+        self.assertEqual(raft_log["segment_file_bytes"], segment_bytes)
+        self.assertEqual(raft_log["control_file_bytes"], control_bytes)
+        self.assertEqual(raft_log["file_bytes"], marker_bytes + control_bytes + segment_bytes)
+        self.assertEqual(observed["paths"]["state_machine_journal"]["file_bytes"], 7)
+        self.assertEqual(
+            observed["paths"]["state_machine_checkpoint"]["file_bytes"], 10
+        )
+        self.assertEqual(observed["paths"]["snapshot"]["file_bytes"], 8)
+
+    def test_v2_raft_log_observation_ignores_only_recognized_regular_temporary_files(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            group = Path(temporary) / "groups" / "data" / "valid"
+            group.mkdir(parents=True)
+            marker, control, segment = _write_v2_raft_log_fixture(group, [11, 12])
+            assert segment is not None
+            family = group / "raft-log.segments"
+            (family / "control.tmp-123").write_bytes(b"temporary control")
+            (family / "segment-00000000000000000099.tmp-456").write_bytes(
+                b"temporary segment"
+            )
+
+            observed = _raft_data_group_state(3, group)
+
+            self.assertEqual(
+                observed["paths"]["raft_log"]["file_bytes"],
+                marker.stat().st_size + control.stat().st_size + segment.stat().st_size,
+            )
+            (family / "segment-00000000000000000099.tmp-not-a-pid").write_bytes(
+                b"unknown artifact"
+            )
+            with self.assertRaisesRegex(BenchmarkError, "unexpected Raft-log artifact"):
+                _raft_data_group_state(3, group)
+
+    def test_v2_raft_log_observation_rejects_noncanonical_or_oversized_temporary_names(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            group = Path(temporary) / "groups" / "data" / "invalid-temp-name"
+            group.mkdir(parents=True)
+            _write_v2_raft_log_fixture(group, [11, 12])
+            family = group / "raft-log.segments"
+            for name in (
+                "control.tmp-0",
+                "control.tmp-0123",
+                "control.tmp-4294967296",
+                "control.tmp-12345678901",
+            ):
+                with self.subTest(name=name):
+                    artifact = family / name
+                    artifact.write_bytes(b"unrecognized")
+                    with self.assertRaisesRegex(BenchmarkError, "unexpected Raft-log artifact"):
+                        _raft_data_group_state(3, group)
+                    artifact.unlink()
+
+    def test_v2_raft_log_observation_rejects_symlink_artifacts(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            group = Path(temporary) / "groups" / "data" / "symlink"
+            group.mkdir(parents=True)
+            _write_v2_raft_log_fixture(group, [11, 12])
+            family = group / "raft-log.segments"
+            target = family / "target.tmp"
+            target.write_bytes(b"temporary")
+            (family / "control.tmp-123").symlink_to(target)
+
+            with self.assertRaisesRegex(BenchmarkError, "unexpected Raft-log artifact"):
+                _raft_data_group_state(3, group)
+
+    def test_v2_raft_log_observation_fails_closed_on_checksum_and_partial_frame_errors(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            group = Path(temporary) / "checksum"
+            group.mkdir()
+            _, control, segment = _write_v2_raft_log_fixture(group, [11, 12])
+            assert segment is not None
+            record = json.loads(control.read_bytes())
+            record["checksum"] ^= 1
+            control.write_text(json.dumps(record, separators=(",", ":")), encoding="utf-8")
+            with self.assertRaisesRegex(BenchmarkError, "control checksum mismatch"):
+                _raft_data_group_state(3, group)
+
+        with tempfile.TemporaryDirectory() as temporary:
+            group = Path(temporary) / "frame-checksum"
+            group.mkdir()
+            _, _, segment = _write_v2_raft_log_fixture(group, [11, 12])
+            assert segment is not None
+            corrupted = bytearray(segment.read_bytes())
+            corrupted[-8] ^= 1
+            segment.write_bytes(corrupted)
+            with self.assertRaisesRegex(BenchmarkError, "batch checksum mismatch"):
+                _raft_data_group_state(3, group)
+
+        with tempfile.TemporaryDirectory() as temporary:
+            group = Path(temporary) / "partial"
+            group.mkdir()
+            _, _, segment = _write_v2_raft_log_fixture(group, [11, 12])
+            assert segment is not None
+            segment.write_bytes(segment.read_bytes()[:-1])
+            with self.assertRaisesRegex(BenchmarkError, "incomplete trailing Raft-log batch"):
+                _raft_data_group_state(3, group)
 
     def test_raft_log_growth_cycle_requires_new_snapshot_and_purged_index(self) -> None:
         before = {
