@@ -26,6 +26,8 @@ pub(super) const VERSIONED_MAX_BODY_LEN: u32 = 64 * 1024 * 1024;
 pub(super) const REQUEST_ID_MAX_LEN: u32 = 1024;
 pub(super) const REQUEST_ID_MAX_KEY_LEN: u32 = 128;
 pub(super) const REQUEST_ID_MAX_BODY_LEN: u32 = 64 * 1024 * 1024;
+pub(super) const LEGACY_WRITE_MAX_KEY_LEN: u32 = 128;
+pub(super) const LEGACY_WRITE_MAX_BODY_LEN: u32 = 64 * 1024 * 1024;
 pub(super) const MAX_IN_MEMORY_RECORDS: usize = 1024;
 const SPARSE_INDEX_STRIDE: Offset = 64;
 const MAX_SPARSE_INDEX_ENTRIES: usize = 1024;
@@ -99,6 +101,36 @@ fn request_aware_limits(durable_format: DurableFormat) -> RequestAwareLimits {
             max_body_len: VERSIONED_MAX_BODY_LEN,
         },
     }
+}
+
+fn legacy_write_lengths(key_len: usize, payload_len: usize) -> Result<(u32, u32), BrokerError> {
+    let key_len = u32::try_from(key_len).map_err(|_| {
+        BrokerError::Io(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "message key exceeds u32 length",
+        ))
+    })?;
+    if key_len > LEGACY_WRITE_MAX_KEY_LEN {
+        return Err(BrokerError::Io(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "message key exceeds RNL1 write limit",
+        )));
+    }
+
+    let payload_len = u32::try_from(payload_len).map_err(|_| {
+        BrokerError::Io(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "message payload exceeds u32 length",
+        ))
+    })?;
+    if payload_len > LEGACY_WRITE_MAX_BODY_LEN {
+        return Err(BrokerError::Io(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "message payload exceeds RNL1 write limit",
+        )));
+    }
+
+    Ok((key_len, payload_len))
 }
 
 pub(super) struct StreamLog {
@@ -273,18 +305,7 @@ impl StreamLog {
         }
 
         let key_bytes = key.as_deref().unwrap_or_default().as_bytes();
-        let key_len = u32::try_from(key_bytes.len()).map_err(|_| {
-            BrokerError::Io(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "message key exceeds u32 length",
-            ))
-        })?;
-        let payload_len = u32::try_from(payload.len()).map_err(|_| {
-            BrokerError::Io(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "message payload exceeds u32 length",
-            ))
-        })?;
+        let (key_len, payload_len) = legacy_write_lengths(key_bytes.len(), payload.len())?;
         let offset = self.next_offset;
         let published_at_ms = now_ms();
 
@@ -1257,6 +1278,83 @@ mod tests {
         let mut record = header.to_vec();
         record.extend_from_slice(payload);
         record
+    }
+
+    #[test]
+    fn rnl1_write_limits_match_the_selected_per_field_boundaries() {
+        assert_eq!(
+            legacy_write_lengths(
+                LEGACY_WRITE_MAX_KEY_LEN as usize,
+                LEGACY_WRITE_MAX_BODY_LEN as usize
+            )
+            .unwrap(),
+            (LEGACY_WRITE_MAX_KEY_LEN, LEGACY_WRITE_MAX_BODY_LEN)
+        );
+
+        assert!(matches!(
+            legacy_write_lengths(LEGACY_WRITE_MAX_KEY_LEN as usize + 1, 0),
+            Err(BrokerError::Io(error)) if error.kind() == io::ErrorKind::InvalidInput
+        ));
+        assert!(matches!(
+            legacy_write_lengths(0, LEGACY_WRITE_MAX_BODY_LEN as usize + 1),
+            Err(BrokerError::Io(error)) if error.kind() == io::ErrorKind::InvalidInput
+        ));
+    }
+
+    #[test]
+    fn rnl1_writer_rejects_oversized_fields_without_mutating_the_log() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("events.log");
+        let mut log = StreamLog::create(&path, DurableFormat::Rnl1).unwrap();
+        assert_eq!(
+            log.append_with_sync(
+                Some("k".repeat(LEGACY_WRITE_MAX_KEY_LEN as usize)),
+                vec![1],
+                false
+            )
+            .unwrap(),
+            0
+        );
+        let bytes_after_valid_boundary_record = std::fs::read(&path).unwrap();
+        assert_eq!(log.next_offset(), 1);
+        assert_eq!(log.in_memory_record_count(), 1);
+        assert_eq!(log.sparse_index_len(), 1);
+
+        let key_error = log.append_with_sync(
+            Some("k".repeat(LEGACY_WRITE_MAX_KEY_LEN as usize + 1)),
+            vec![2],
+            false,
+        );
+        assert!(matches!(
+            key_error,
+            Err(BrokerError::Io(error)) if error.kind() == io::ErrorKind::InvalidInput
+        ));
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            bytes_after_valid_boundary_record
+        );
+        assert_eq!(log.next_offset(), 1);
+        assert_eq!(log.in_memory_record_count(), 1);
+        assert_eq!(log.sparse_index_len(), 1);
+
+        let payload_error =
+            log.append_with_sync(None, vec![2; LEGACY_WRITE_MAX_BODY_LEN as usize + 1], false);
+        assert!(matches!(
+            payload_error,
+            Err(BrokerError::Io(error)) if error.kind() == io::ErrorKind::InvalidInput
+        ));
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            bytes_after_valid_boundary_record
+        );
+        assert_eq!(log.next_offset(), 1);
+        assert_eq!(log.in_memory_record_count(), 1);
+        assert_eq!(log.sparse_index_len(), 1);
+        assert_eq!(
+            log.append_with_sync(None, vec![3], false).unwrap(),
+            1,
+            "a rejected append must not consume a logical offset"
+        );
     }
 
     #[test]
