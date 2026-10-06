@@ -1,23 +1,23 @@
 # TD-007: Storage compatibility evidence
 
-- Status: exploratory evidence note; no migration implementation authorized
-- Last reviewed: 2026-09-29
+- Status: source and test evidence only; runtime conversion remains unimplemented
+- Last reviewed: 2026-10-06
 - Baseline: `6b53cc0ed3a83017e59d42319ce696f825fb388f`
 - Scope: local durable files, clustered durable artifacts, and the boundary
   between same-binary recovery and supported release upgrades
-- Related debt: [TD-007](../tech-debt.md#td-007-storage-format-compatibility-is-not-yet-defined)
+- Related debt: [TD-007](../tech-debt.md#td-007-storage-conversion-and-artifact-compatibility-remain-open)
 - Related outcome: [Make durable storage upgrades safe](../backlog.md#make-durable-storage-upgrades-safe)
 - Related designs: [Durable storage upgrade policy](storage-upgrade-policy.md)
   and [safe durable storage upgrades](storage-upgrade-safety-plan.md)
 - Related decisions: [ADR 0007](../decisions/0007-snapshot-based-replica-recovery.md),
   [ADR 0018](../decisions/0018-safe-replica-recovery-boundary.md), and
-  [ADR 0019](../decisions/0019-clustered-storage-identity.md)
+  [ADR 0019](../decisions/0019-clustered-storage-identity.md), with the
+  accepted behavior in [ADR 0037](../decisions/0037-offline-side-by-side-storage-upgrades.md)
 
-This note records what the current source and tests establish. A current
-binary's ability to read selected older bytes is same-binary recovery evidence;
-it does not promise that different releases can read, write, or operate on the
-same active store. This note does not authorize a migration command, a rolling
-upgrade, a downgrade, or a new storage format.
+This note records what the source and tests at the stated baseline establish.
+ADR 0037 separately accepts the first operational upgrade behavior; this note
+does not describe a migration command or claim that conversion, rolling
+upgrade, downgrade, or new-format runtime support has been implemented.
 
 ## Current conclusion
 
@@ -125,27 +125,31 @@ the following gates for each affected artifact and supported release pair:
    activation, restart, cleanup, and process/node failure. A verified source
    or target remains authoritative; downgrade requires a tested inverse or
    recovery artifact.
-7. **Mixed-version operation:** use real old/new binaries to exercise peer,
-   command, snapshot, checkpoint, journal, publish, acknowledgement, replay,
-   deduplication, failover, recovery, and response-loss behavior.
+7. **Mixed-version operation:** outside the first behavior accepted by ADR
+   0037. Any later decision to permit rolling or mixed-version serving must
+   establish a separate compatibility contract and use real old/new binaries
+   to test peer, command, snapshot, checkpoint, journal, publish,
+   acknowledgement, replay, deduplication, failover, recovery, and response
+   loss.
 8. **Operational evidence:** expose bounded phase, identity, progress, failure,
    rollback, and orphan/cleanup diagnostics, and measure transfer workspace
    and recovery cost for representative retained streams.
 
 The [storage-upgrade safety plan](storage-upgrade-safety-plan.md) contains the
-fuller proposed migration state machine and acceptance matrix. These gates are
-a classification aid for future work; they do not accept the proposed API or
-layout.
+accepted operational migration contract and its implementation acceptance
+matrix. These gates describe evidence needed before runtime conversion is
+supported; they do not define a required API or layout.
 
 ## Refactor and planning assessment
 
-No runtime refactor is included in this evidence-only review. Adding generation
-selection, migration ownership, or shared format abstractions before a policy
-is accepted would add runtime surface without retiring TD-007. The RNL1
+No runtime refactor is included in this documentation update. Generation
+selection, migration ownership, and format conversion are governed by ADR 0037
+and remain unimplemented until their evidence gates pass. The RNL1
 allocation-bound gap is recorded as a specific resource-policy debt in
 [TD-028](../tech-debt.md#td-028-rnl1-materialization-lacks-an-operational-allocation-budget).
 That item does not set a new cap or authorize a migration. Existing TD-007 debt
-and storage-upgrade backlog records remain open. The adjacent `DurableFormat`
+and storage-upgrade backlog records remain open for runtime implementation.
+The adjacent `DurableFormat`
 source comment now names the request-aware RNL3 reader path, matching the parser
 and its restart-recovery test.
 

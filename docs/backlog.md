@@ -326,7 +326,7 @@ Goal: let supported broker upgrades preserve or deliberately transform acknowled
 
 Rationale: the storage layout now has separate metadata and stream data groups, so future format and placement changes need an explicit recovery and migration contract.
 
-Current progress: unsupported versions, identities, and layouts in existing clustered storage now fail closed before recovery opens groups or mutates authoritative state; empty-directory startup may still initialize `storage.json` by design. The [TD-007 storage compatibility evidence note](design/td-007-storage-compatibility-evidence.md) records the exact read-forward fixtures, refusal tests, and compatibility gates. The [durable storage upgrade policy proposal](design/storage-upgrade-policy.md) records the observed compatibility boundary, while the [storage-upgrade safety plan](design/storage-upgrade-safety-plan.md) provides the proposed per-artifact compatibility matrix, validation rules, bounded side-by-side transfer, activation and writer-fencing invariants, rollback boundary, observability requirements, and end-to-end acceptance matrix. This is a design milestone only: no migration command, generation selector, writer fence, supported downgrade, interrupted-transfer recovery, or rolling-upgrade path is implemented.
+Current progress: unsupported versions, identities, and layouts in existing clustered storage fail closed before recovery opens groups or mutates authoritative state; empty-directory startup may still initialize `storage.json` by design. The [TD-007 storage compatibility evidence note](design/td-007-storage-compatibility-evidence.md) records current read-forward fixtures and refusal tests. [ADR 0037](decisions/0037-offline-side-by-side-storage-upgrades.md) accepts the first upgrade behavior: offline side-by-side conversion, immutable source until validated target activation, and explicit offline rollback only while no target-only durable mutation has been accepted. A durable `write-pending` state blocks rollback during an unresolved first mutation; successful writes close rollback, proven no-effect failures may restore eligibility, and ambiguous outcomes fail closed. The [policy](design/storage-upgrade-policy.md) summarizes artifact boundaries and the [safety plan](design/storage-upgrade-safety-plan.md) defines implementation gates. This policy does not add runtime support: no migration command, generation selector, writer fence, supported downgrade, interrupted-transfer recovery, or rolling-upgrade path is implemented.
 
 Constraints:
 
@@ -336,22 +336,25 @@ Constraints:
 
 Acceptance criteria:
 
-- the current reopen/read-forward behavior and the proposed supported
-  side-by-side migration and unsupported downgrade boundary are documented per
-  artifact;
+- the current reopen/read-forward behavior and accepted per-artifact
+  compatibility and migration boundaries are documented, including the
+  offline side-by-side contract and unsupported rolling conversion;
 - representative old and new layouts have automated recovery or migration
   tests that preserve logical records, consumer progress, attempts, and
   producer request identity;
-- interrupted transfer, activation, restart, and cleanup tests either resume
-  from verified bounded progress or leave the source generation usable;
+- interrupted transfer, activation, first-write resolution, restart, and
+  cleanup tests either resume from verified bounded progress or leave one
+  unambiguous generation authoritative; unresolved first-write outcomes block
+  source rollback;
 - writer/activation fencing prevents stale publish and acknowledgement
   mutations across cutover;
 - storage version, format, identity, migration phase/outcome, progress,
   rollback eligibility, validation failure, and cleanup/orphan state are
   visible through bounded diagnostics and metrics; and
-- real-process local and three-node clustered upgrade tests cover mixed
-  compatibility, leader/follower recovery, snapshot/replacement boundaries,
-  and old-binary refusal after target-only state becomes active.
+- real-process local conversion and whole-cluster maintenance tests cover
+  recovery, leader/follower and snapshot/replacement boundaries, mismatched
+  generation refusal, and old-binary refusal after target-only state becomes
+  active; mixed-version serving is outside the accepted first path.
 
 ### Make message encoding and compression evolvable
 
