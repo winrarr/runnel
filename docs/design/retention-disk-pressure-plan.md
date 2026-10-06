@@ -1,12 +1,12 @@
 # Retention and disk-pressure design
 
-- Status: exploratory design; implementation sequence is illustrative
-- Last reviewed: 2026-10-05
-- Baseline: `959565214725760b77e71ae876865dff8444dbc9`
+- Status: exploratory implementation design; semantic policy accepted by [ADR 0036](../decisions/0036-retained-history-and-disk-pressure-contract.md)
+- Last reviewed: 2026-10-06
+- Baseline: `2fa8c95252a2f323495e6ffc1336ab25ce5bf272`
 - Reading guide: [design-note conventions](README.md)
 - Scope: safe retained-history policy, bounded cleanup, and durable-write admission
 - Related outcome: [Make retention and disk-pressure behavior safe](../backlog.md#make-retention-and-disk-pressure-behavior-safe)
-- Related decision: [ADR 0028: consumer-lag observation semantics](../decisions/0028-consumer-lag-observation-semantics.md)
+- Related decisions: [ADR 0028: consumer-lag observation semantics](../decisions/0028-consumer-lag-observation-semantics.md) and [ADR 0036: retained-history and disk-pressure contract](../decisions/0036-retained-history-and-disk-pressure-contract.md)
 - Related research: [Retention and disk-pressure semantics](../research/retention-disk-pressure-semantics.md),
   [Distributed architecture exploration](../research/distributed-architecture-options.md),
   [Raft follower recovery and replacement](../research/raft-recovery-and-replacement.md),
@@ -14,11 +14,12 @@
   and [Systems performance research for Runnel](../research/systems-performance-research.md)
 - Related design evidence: [Durability and delivery policy](durability-delivery-policy.md), [clustered durability and outcomes](clustered-outcome-contract.md), and [dead-letter recovery](dead-letter-recovery.md)
 
-This is a design proposal, not an accepted ADR. It turns the retention and
-disk-pressure backlog outcome into a candidate policy and evidence boundary
-while preserving the current stream, record, consumer, acknowledgement,
-replay, and ordering model. It does not change runtime code, the backlog,
-deployment files, or the current compatibility policy.
+ADR 0036 accepts the retained-history and physical-capacity semantics below.
+This note records the supporting evidence and remaining implementation
+hypotheses; it is not itself an accepted storage or API design. The accepted
+contract preserves the current stream, record, consumer, acknowledgement,
+replay, and ordering model. This documentation update does not change runtime
+code, deployment files, or the current compatibility policy.
 
 The current technical boundaries are authoritative in [architecture](../architecture.md)
 and the accepted decisions linked from this note. Proposed policies, state
@@ -27,14 +28,16 @@ stages below are outcome/evidence gates, not a prescribed module or API plan.
 
 ## Outcome and boundaries
 
-Runnel should be able to retain a bounded amount of stream history without
-silently losing a message that a configured policy still promises to deliver,
-and without accepting a publish that cannot reach its selected durable point.
+Runnel should let operators set finite logical history targets without
+silently losing data protected by durable consumer progress, and should keep
+that policy separate from physical capacity admission. Protected data may
+exceed a target; writes may be refused when safe physical headroom is gone.
 The implementation must make the following visible to an operator and, where
 it affects an application operation, to the client:
 
 - which time and size rules are configured;
-- whether a consumer or replay session is pinning history;
+- whether durable consumer progress or an active delivery protects history;
+  replay-session pins are outside the accepted contract;
 - how much storage is retained, reclaimable, over budget, and reserved;
 - whether a publish is accepted, explicitly rejected, retryable, or ambiguous;
 - whether cleanup, recovery, or replication is preventing normal progress.
@@ -65,11 +68,11 @@ following observations are the starting point for this plan.
 | --- | --- | --- |
 | Local storage | `runnel-core` uses one append-only log per stream with legacy `RNL1`, checksummed uncompressed `RNL2`, and request-aware checksummed `RNL3` frames. Normal server appends use `RNL1` for ordinary records and `RNL3` when a request or move identity is present; `RNL2` is an explicit core/test format path. Request-aware IDs are bounded at 1 KiB and request-aware keys/bodies at 128 bytes/64 MiB. Appends call `sync_data` before reporting success and open scans the complete log. The newest 1,024 record locations and up to 1,024 sparse checkpoints are cached; the request-ID map is rebuilt from all `RNL3` frames and grows with distinct retained IDs. An incomplete trailing frame is truncated on recovery, while malformed complete records fail closed without rewriting the file. | Retention cannot safely delete a prefix of one mutable file. Segmentation, format metadata, and a durable retained-history floor are prerequisites; the current frames have no segment generation or retention metadata. Bounded record-location caches do not bound all retained metadata; see [TD-002](../tech-debt.md#td-002-one-file-and-a-startup-scan-per-local-stream). |
 | Local consumers | Durable consumer state is a JSON checkpoint plus an append-only event journal capped at 64 KiB. It records the contiguous committed offset, out-of-order acknowledgements, delivery attempts, an optional versioned consumer policy, and the policy pinned to assigned offsets. The in-memory consumer-state cache holds at most 1,024 entries and is not a complete catalogue; active deliveries and deadlines are also in memory. Checkpoint files are not size-bounded. A restart may redeliver an unacknowledged message. | A safe deletion watermark must use durable contiguous progress, not the highest acknowledged offset, and must fence active deliveries. Neither the bounded cache nor transient deliveries can establish a complete durable-consumer inventory; any retention query needs a bounded source and explicit coverage. |
-| Local replay | A new consumer starts at offset zero and ordinary polling follows its checkpoint. The additive `replay` operation reads one inclusive logical offset without creating delivery state or changing ordinary progress. All history is currently retained, so the floor is zero and `history_unavailable` applies only outside the available `[0, next)` range; there is still no retention policy or replay session. | A future replay cursor/session must remain distinct from ordinary consumer progress. When a retention floor is introduced, unavailable history must remain explicit rather than turning a gap into `Empty`. |
+| Local replay | A new consumer starts at offset zero and ordinary polling follows its checkpoint. The additive `replay` operation reads one inclusive logical offset without creating delivery state or changing ordinary progress. All history is currently retained, so the floor is zero and `history_unavailable` applies only outside the available `[0, next)` range; there is still no runtime retention policy or replay session. | Once the accepted floor is implemented, below-floor history remains explicitly unavailable rather than turning a gap into `Empty`. No replay cursor/session is selected; any later one must remain distinct from ordinary consumer progress. |
 | Local dead letters | The source record is appended to a derived dead-letter stream before the source checkpoint advances. New local moves use a bounded source-stream/consumer/offset identity and same-content reconciliation, so a known completed target append is not appended again after source-state failure or reopen. Since the previous review, test-scoped recovery checks cover partial target frames, complete frames reported failed before sync, and a source-event sync failure; a real-server test also drops the poll response and verifies recovery after restart. These do not reproduce device/power-loss failures or resolve legacy records; see [TD-017](../tech-debt.md#td-017-dead-letter-movement-spans-separate-durable-records). | Retention must preserve this at-least-once ordering and move-identity fence, and define whether derived streams inherit or override source retention. A future policy must not delete target evidence while source progress still depends on reconciliation. |
 | Clustered storage | `runnel-raft` keeps complete message vectors in each stream data group's replicated state, writes a state-machine journal before applying committed entries, and creates complete materialized snapshots. Snapshot transfer uses bounded 64 KiB chunks and retries from byte zero after interruption. Data-group membership comes from the configured peer map; the three-process setup is an evidence profile, not a universal topology. Raft log compaction is independent from broker history. | The clustered path needs replicated logical retention state but local, interruptible physical cleanup. A snapshot must not resurrect history below the committed retention floor, and capacity claims must be stated for configured membership rather than assumed three-voter behavior. |
 | Clustered consumers | Progress, out-of-order acknowledgements, versioned consumer policy, attempts, in-flight ownership, deadlines, and fencing state are in the stream data-group state. Grouped polls and acknowledgements are leader-authorized writes. | Retention decisions affecting a cluster must be deterministic state-machine facts; local filesystem inspection cannot itself decide a replicated watermark. Consumer-lag observation must follow [ADR 0028](../decisions/0028-consumer-lag-observation-semantics.md) and cannot be inferred by summing replica copies. |
-| Admission | The server bounds connections, request frames, in-flight requests, and request duration. The JSON-lines request limit defaults to 1 MiB and can be configured up to 64 MiB, including JSON/base64 representation; publish batches are capped at 1,024 records and 64 MiB of encoded request bytes, with per-record outcomes rather than atomicity. Local storage work has a bounded executor. The real-server [`sustained_storage_pressure_is_bounded_observable_and_recovers` test](../../crates/runnel-server/tests/admission.rs#L850) repeats same-stream FIFO-induced executor saturation and checks rejection, health/readiness/metrics, recovery, and subsequent durable traffic. This is synthetic execution-path pressure, not filesystem-capacity or `ENOSPC` evidence. `BrokerError::kind()` and `BrokerError::outcome()` provide an engine-level semantic boundary, while the server still maps failures to provisional codes and the reusable client conservatively classifies post-write timeout/disconnect cases as unknown. | Disk admission must be checked before append, but races and `ENOSPC` still require an authoritative stage-aware retry/unknown outcome and resolution contract at the protocol boundary. Existing frame, record-count, and storage-executor limits must remain separate from a physical disk reserve. |
+| Admission | The server bounds connections, request frames, in-flight requests, and request duration. The JSON-lines request limit defaults to 1 MiB and can be configured up to 64 MiB, including JSON/base64 representation; publish batches are capped at 1,024 records and 64 MiB of encoded request bytes, with per-record outcomes rather than atomicity. Local storage work has a bounded executor. The real-server [`sustained_storage_pressure_is_bounded_observable_and_recovers` test](../../crates/runnel-server/tests/admission.rs#L850) repeats same-stream FIFO-induced executor saturation and checks rejection, health/readiness/metrics, recovery, and subsequent durable traffic. This is synthetic execution-path pressure, not filesystem-capacity or `ENOSPC` evidence. `BrokerError::kind()` and `BrokerError::outcome()` provide an engine-level semantic boundary. The server still maps failures to provisional v1 codes, and the reusable client conservatively classifies post-write timeout/disconnect cases as unknown. ADR 0031 accepts a v2 outcome/stage contract; its runtime encoding and enforcement are not implemented. | Disk admission must be checked before append, but races and `ENOSPC` still require the accepted stage-aware outcome contract from ADR 0031 to be implemented and validated. Existing frame, record-count, and storage-executor limits remain separate from a physical disk reserve. |
 | Metrics and health | `/metrics` exposes request/admission counters, request latency, process-lifetime delivery counters, storage bytes, health failures, and clustered snapshot activity. Local `storage_bytes` sums `.log` file lengths; clustered `storage_bytes` sums logical stored keys and payloads. Neither includes every journal/checkpoint/snapshot byte or filesystem availability. The engine health query is subject to a one-second HTTP timeout; a failed/timed-out scrape omits engine-derived samples. There is no capacity provider or complete durable-consumer catalogue/source revision. [ADR 0028](../decisions/0028-consumer-lag-observation-semantics.md) accepts cursor-lag semantics only, not a runtime metric or bounded query. | Existing storage bytes are not a disk budget or a cross-engine physical-usage comparison. New lag and retention signals must keep coverage/freshness separate and must not represent unknown, stale, incomplete, or expired observations as zero. Do not silently change the existing gauge definition. |
 | Deployment | The illustrative Kubernetes deployment gives each of three static-cluster pods an independent 10 GiB claim, 1 GiB memory limit, 1 CPU limit, five-minute startup-probe window, and 30-second termination grace period. A `minAvailable: 2` PodDisruptionBudget protects Ready-count availability for Eviction API requests, but readiness does not establish quorum margin, replication progress, or disk capacity. It has no broker retention or capacity settings. | A broker capacity policy must work without Kubernetes, use detected available capacity conservatively, and document that PVC size is not by itself free space available to the broker. The PDB does not establish a durable-write or storage-capacity guarantee. |
 
@@ -106,19 +109,82 @@ explicitly versioned decision changes them:
 - storage identity checks and the conservative replacement boundary from
   [ADR 0018](../decisions/0018-safe-replica-recovery-boundary.md) and [ADR 0019](../decisions/0019-clustered-storage-identity.md) remain in force.
 
-## Proposed policy
+## Accepted semantic contract
+
+The following outcomes are accepted by [ADR 0036](../decisions/0036-retained-history-and-disk-pressure-contract.md):
+
+- New and existing streams default to unlimited history. A finite time or size
+  target is an explicit data-lifecycle choice and is never enabled implicitly
+  by an upgrade or storage migration.
+- Finite age and size targets are independent eligibility triggers, not hard
+  caps. `max_age` uses broker-assigned publish time. `max_bytes` counts UTF-8
+  key bytes, when present, plus payload bytes; it does not count record
+  framing, compression, metadata, or physical replica copies.
+- An absent target means unlimited, while an explicitly configured zero is
+  finite. With `max_age=0`, a record becomes eligible on the first evaluation
+  after broker time advances beyond its publish time; `max_bytes=0` targets
+  zero retained logical message bytes. Neither zero is a per-message admission
+  rejection rule.
+- Age makes a record eligible only when its publish time is strictly before
+  the broker-selected cutoff. Size makes the oldest contiguous prefix
+  eligible until the retained logical key-plus-payload bytes are at or below
+  the target, if protection allows. Either configured target can advance the
+  floor; a protected cursor can leave either target exceeded. A new consumer
+  without durable progress starts at the current floor, so its replay range is
+  the remaining retained suffix. A finite policy does not reserve history for
+  future consumers: without a protecting durable cursor or active delivery,
+  a record larger than `max_bytes` may itself be removed once eligible.
+- The logical retained floor may advance only over an eligible contiguous
+  prefix and may not pass the smallest durable contiguous consumer cursor or
+  an active delivery still requiring that history. Out-of-order acknowledgments
+  do not move the cursor fence. If a complete bounded durable-consumer
+  inventory is unavailable, retention does not advance the floor.
+- Protected lag may leave a stream above its configured targets. The broker
+  does not expire consumers, reset cursors, or switch to destructive retention
+  under disk pressure. A new consumer with no durable state starts at the
+  current floor; an existing cursor is never silently clamped.
+- The existing offset-based replay read does not pin history. A request below
+  the floor returns `history_unavailable` with the available half-open range;
+  it never returns `Empty` or a later record. Durable replay sessions and
+  replay pins remain outside this contract.
+- Broker-managed dead-letter output remains unlimited until durable
+  reconciliation no longer depends on its retained move identity. Finite
+  source retention cannot delete protected source history before source
+  progress is durable.
+- A public request ID remains in the deduplication horizon for the lifetime of
+  its retained record. Floor advancement retires the ID mapping with the
+  record; reusing that ID afterward is a new publish. Retries after expiry are
+  outside the accepted replay-safety guarantee in ADR 0031.
+- Logical retention and physical write admission remain separate. Capacity
+  pressure cannot change the retention policy or delete committed protected
+  history. When capacity enforcement is configured, reserve and pressure
+  reporting must account for the selected durable operations; stale or
+  incomplete capacity evidence is unknown, and a write whose durable stage is
+  uncertain is not reported as a confirmed rejection.
+- Logical retained bytes, eligible/reclaimable bytes, protected overage,
+  physical availability, reserved headroom, and source freshness are distinct
+  observations. `runnel_storage_bytes` keeps its existing engine-specific
+  meaning, and consumer attribution follows ADR 0028's bounded coverage rules.
+
+The contract does not select a public configuration schema, on-disk layout,
+numeric capacity reserve, cleanup schedule, metric names, readiness policy, or
+cluster quorum policy. It also does not make the backlog outcome complete:
+runtime behavior, operator controls, failure evidence, and measurements remain
+open.
+
+## Evidence and implementation hypotheses
 
 ### Direct competitor and research comparison
 
-The proposal is informed by the following direct comparisons. These systems
-solve related but different problems; their behavior is evidence for tradeoffs,
-not a compatibility target for Runnel.
+The proposal is informed by the following direct comparisons, rechecked on
+2026-10-06. These systems solve related but different problems; their behavior
+is evidence for tradeoffs, not a compatibility target for Runnel.
 
 | System | Relevant design | Implication for Runnel |
 | --- | --- | --- |
 | [Apache Kafka topic configuration](https://kafka.apache.org/42/configuration/topic-configs/) | The default `delete` policy removes old log segments when time or size retention is reached. `retention.bytes` is enforced per partition, and retention/cleaning is file-granular; `segment.ms` can roll an active segment so it becomes eligible for cleanup. | Segment-granular cleanup and independent time/size triggers are well-established, but Runnel also needs consumer-progress and active-delivery fences because its public contract exposes replay and acknowledgements. A physical disk reserve must remain separate from the logical topic limit. |
-| [Redpanda topic properties](https://docs.redpanda.com/streaming/current/reference/properties/topic-properties/) and [tiered-storage space management](https://docs.redpanda.com/streaming/26.1/manage/tiered-storage/) | Redpanda exposes per-partition `retention.ms` and `retention.bytes`, rolls segments with `segment.ms`, and, with tiered storage, separates local targets from topic-wide retention. Its local tier can purge using actual available volume space to avoid disk-full conditions caused by skew. | Keep logical retained-history policy distinct from physical local capacity. Runnel should reserve space for durable writes, snapshots, and cleanup even without tiered storage, and should measure pressure from effective free space rather than claim size alone. |
-| [NATS JetStream retention policies](https://docs.nats.io/learn/jetstream/retention-policies) | `Limits` retains messages until `MaxMsgs`, `MaxBytes`, or `MaxAge` is reached. `Interest` removes a message after every interested consumer acknowledges it, while `WorkQueue` removes it after the first consumer acknowledgement. The limits remain a backstop; a stalled interested consumer can still let storage grow. | Keep bounded-history retention and acknowledgement-driven work-queue semantics separate. Runnel's proposed `protect`/`expire` choice is narrower: it controls whether lagging consumers fence deletion, while explicit replay-unavailable outcomes avoid silently turning a gap into `Empty`. |
+| [Redpanda topic properties](https://docs.redpanda.com/streaming/current/reference/properties/topic-properties/) and [tiered-storage space management](https://docs.redpanda.com/streaming/current/manage/tiered-storage/) | Redpanda exposes per-partition `retention.ms` and `retention.bytes`, rolls segments with `segment.ms`, and, with tiered storage, separates local targets from topic-wide retention. Its local tier can purge using actual available volume space to avoid disk-full conditions caused by skew. | Keep logical retained-history policy distinct from physical local capacity. Runnel should reserve space for durable writes, snapshots, and cleanup even without tiered storage, and should measure pressure from effective free space rather than claim size alone. |
+| [NATS JetStream retention policies](https://docs.nats.io/learn/jetstream/retention-policies) | `Limits` retains messages until `MaxMsgs`, `MaxBytes`, or `MaxAge` is reached. `Interest` removes a message after every interested consumer acknowledges it, while `WorkQueue` removes it after the first consumer acknowledgement. Limits remain a backstop, so a stalled consumer can lose backlog. NATS also separates per-message `MaxMsgSize` from stream `MaxBytes`, exposes `DiscardOld` versus `DiscardNew`, and its .NET client defines `MaxAge = 0` as unlimited ([source](https://github.com/nats-io/nats.net/blob/main/src/NATS.Client.JetStream/Models/StreamConfig.cs)). | Keep bounded-history retention and acknowledgement-driven work-queue semantics separate. Runnel selects protected durable progress for its first policy; a future expiry mode would be a distinct destructive contract, and replay gaps remain explicit rather than becoming `Empty`. Unlike NATS's zero sentinel, an explicit Runnel zero-age value is finite; absence alone means unlimited, so a configuration surface must preserve that distinction. |
 
 The storage research supports the physical boundaries in this plan. The
 original [log-structured file-system design](https://web.stanford.edu/~ouster/cgi-bin/papers/lfs.pdf)
@@ -126,13 +192,13 @@ uses segments as the unit of cleaning and relies on a cleaner to preserve
 large free areas for future writes. [Lomet and Luo's analysis of reclaiming
 space in log-structured stores](https://arxiv.org/abs/2005.00044) shows that
 cleaning consumes I/O and that the available slack space and cleaning order
-materially affect write amplification. Together these results support
-immutable segment deletion, bounded cleanup work, an explicit capacity reserve,
-and measurements of cleanup amplification. They do not establish Runnel's
-consumer fencing or client outcomes, which remain design hypotheses requiring
-failure tests and a future ADR.
+materially affect write amplification. If an implementation uses segments,
+these results support bounded cleanup work, an explicit capacity reserve, and
+measurements of cleanup amplification; they do not require that storage layout.
+They do not establish Runnel's consumer fencing or client outcomes, now
+selected in ADR 0036 and still requiring runtime failure tests.
 
-The comparison leaves three deliberate differences from the reference systems:
+The accepted contract leaves three deliberate differences from the reference systems:
 
 - Runnel's retention floor is a logical, durable fact in the clustered state
   machine and is constrained by contiguous consumer progress and active
@@ -146,25 +212,23 @@ The comparison leaves three deliberate differences from the reference systems:
   mode with its own compatibility and recovery decision.
 
 The source review [Retention and disk-pressure semantics](../research/retention-disk-pressure-semantics.md)
-maps the remaining choices across history eligibility, consumer/replay state,
-age/size/lag/reserve precedence, `ENOSPC` outcomes, deletion recovery, and
-bounded operator signals. The policy below is one candidate for discussion;
-it is not selected by the comparison or accepted for implementation.
-
-The following policy is an illustrative candidate. It is deliberately not
-accepted until the implementation, failure tests, and measurements below exist
-and a dedicated ADR records the compatibility consequences.
+maps the alternatives and evidence needs across history eligibility,
+consumer/replay state, age/size/lag/reserve precedence, `ENOSPC` outcomes,
+deletion recovery, and bounded operator signals. ADR 0036 resolves the public
+semantic choices; the following configuration and storage mechanisms remain
+hypotheses until implementation evidence supports them.
 
 ### Configuration vocabulary
 
-Each stream should have a durable, versioned retention policy with these
-intent-level fields:
+The following is an illustrative schema only; ADR 0036 accepts the semantics
+but not these field names or an administrative operation. The first supported
+retention mode is protected. There is no selectable `expire` mode in the
+accepted contract.
 
 ```text
 RetentionPolicy {
     max_age: optional duration,
-    max_bytes: optional bytes,
-    lag_policy: protect | expire
+    max_bytes: optional logical bytes
 }
 ```
 
@@ -186,150 +250,120 @@ stream or through a separate administrative operation are unresolved API
 choices. The semantics and validation rules should not vary between local and
 clustered engines.
 
-Absent `max_age` and `max_bytes` mean unlimited automatic retention. This is
-the compatibility-safe default for existing streams. Enabling finite
-retention is an explicit data-lifecycle choice, not an incidental consequence
-of a new storage format.
+Absent `max_age` and `max_bytes` mean unlimited automatic retention for both
+existing and new streams. Enabling either finite target is an explicit
+data-lifecycle choice, not an incidental consequence of a new storage format.
+When both are set, either target may make the oldest contiguous prefix
+eligible. Protection can prevent the floor from satisfying either target, so
+these values are not hard caps.
 
 ### Time and size retention
 
-Time and size are independent triggers. A complete immutable segment becomes a
-retention candidate when either condition is true:
+Time and size are independent triggers. In this segment-based implementation
+hypothesis, a complete immutable segment becomes a candidate when either
+condition is true:
 
 - its newest record is older than the age cutoff; or
-- retained record bytes exceed `max_bytes`.
+- logical message bytes exceed `max_bytes`.
 
-The broker deletes the oldest eligible complete segments until neither limit
-is exceeded, or until no safe segment remains. Thus, when both limits are set,
-the stricter trigger wins. A record at the exact time cutoff remains retained
-until it is strictly older than the cutoff. Size overage caused by the active
-segment, segment granularity, an active delivery, or a protected consumer is
-reported rather than hidden.
+The broker deletes the oldest eligible complete segments until the targets
+are met or no safe segment remains. Thus, when both limits are set, either
+trigger may advance the floor; protection can leave either target exceeded. A
+record at the exact time cutoff remains retained until it is strictly older
+than the cutoff. Size overage caused by segment granularity, an active delivery,
+or a protected consumer is reported rather than hidden.
 
-The age cutoff is based on the broker-assigned `published_at_ms` already
-present in the logical message. A cleanup decision carries a monotonic cutoff
-or an equivalent committed timestamp; a wall-clock jump backwards may delay
-deletion but must never make a previously protected record disappear early.
-The implementation must reject or clearly handle timestamps that would make a
-segment's metadata inconsistent rather than using an unbounded per-record
-timer.
+The accepted age semantics use the broker-assigned `published_at_ms` already
+present in the logical message. A clustered cleanup decision uses a
+deterministic committed cutoff; a local backward wall-clock adjustment may
+delay eligibility but must never make a record disappear early. The concrete
+clock and metadata mechanism remains an implementation choice.
 
-`max_bytes` should count encoded record bytes owned by the stream, including
-record framing and key bytes, but not temporary cleanup files or consensus
-logs. The metrics must also expose logical payload bytes and total physical
-broker usage because an encoded-byte retention budget is not a filesystem
-quota. The exact treatment of compression and metadata is an ADR decision
-shared with the [encoding and compression plan](encoding-compression-day1-plan.md).
+The accepted `max_bytes` unit is logical key-plus-payload bytes, independent of
+compression and record framing. Physical storage usage and the bytes needed
+for cleanup or consensus remain separate measurements. The accounting index
+and cleanup mechanism are implementation choices and need bounded resource
+evidence.
 
-Retention is segment-granular. Cleanup first seals or rolls the active segment,
-then considers old segments. It never removes individual records from a
-segment in place. A segment may remain above a target because deleting it would
-cross the retention boundary, violate a safety fence, or consume the reserved
-cleanup workspace.
+If segment storage is selected, cleanup is segment-granular: it first seals or
+rolls the active segment and never removes individual records from a segment in
+place. The accepted public contract requires a contiguous logical floor, not
+segments. Physical storage may remain above a target because its deletion unit
+would cross the boundary, violate a safety fence, or consume cleanup workspace.
 
 ### Precedence
 
-The order below is a candidate, not an accepted precedence rule. In particular,
-it does not decide whether a configured age/size limit may override consumer or
-replay protection; that choice is mapped in the [source review](../research/retention-disk-pressure-semantics.md).
-If this candidate is retained, a retention cycle and publish would be handled
-in this order:
+The accepted precedence is semantic; exact scheduling is an implementation
+choice. A retention cycle and durable write must preserve this order:
 
 1. Validate the request and preserve durable-write, checkpoint, active-lease,
    corruption, and identity safety. Disk pressure never authorizes an
    unconfigured destructive policy.
-2. Apply the stream's `lag_policy` and replay fences. `protect` can block
-   deletion; `expire` can make an explicitly permitted history boundary
-   unavailable. Neither policy silently advances a checkpoint.
+2. Apply the durable contiguous consumer and active-delivery fences. The
+   current read-only replay operation does not pin history. A complete
+   bounded inventory is required; incomplete coverage blocks floor advance.
 3. Evaluate `max_age` and `max_bytes` as independent triggers, selecting the
    oldest complete segments that are allowed by the first two steps.
 4. Publish a logical floor only through the durable local manifest or
    replicated state-machine boundary, then reclaim physical bytes.
-5. Check reserved capacity for the proposed durable write. If cleanup did not
-   leave the required headroom, reject or return a retryable/unknown outcome;
-   do not delete protected data merely to make the write fit.
+5. Check reserved physical capacity for the proposed durable write. If
+   cleanup did not leave required headroom, refuse before mutation when
+   non-application is known; if the durable stage is uncertain, report
+   `unknown`. Do not delete protected data merely to make the write fit.
 
-This ordering means a configured `expire` policy may trade replay eligibility
-for bounded history, but low space cannot silently change `protect` into
-`expire`. If no policy permits safe reclamation, admission is the safety valve.
+If no policy permits safe reclamation, admission is the safety valve. Disk
+pressure never changes protected retention into expiry.
 
 ### Lagging consumers and replay eligibility
 
 The safe prefix for a normal consumer is its contiguous committed offset. A
 group consumer's highest out-of-order acknowledgement does not free earlier
 history until the gap is closed. A consumer with no persisted state does not
-pin history merely by potentially existing; it can replay only the history
-that remains when it explicitly starts.
+pin history merely by potentially existing; its first ordinary poll starts at
+the current retained floor. A complete durable inventory is required before
+any floor advance; an unknown or incomplete consumer source is not evidence of
+absence.
 
-`lag_policy` determines how an existing consumer interacts with retention:
+The accepted policy protects existing durable consumer progress. Destructive
+expiry is not selectable:
 
-| Policy | Retention behavior | Lagging-consumer outcome | Disk-pressure consequence |
+| Status | Retention behavior | Lagging-consumer outcome | Disk-pressure consequence |
 | --- | --- | --- | --- |
-| `protect` | A durable consumer's committed offset, an active delivery, and an active protected replay session constrain the deletion watermark. A lagging consumer may keep the stream above its time or size target. | The consumer retains its normal at-least-once/replay eligibility while the history is retained. No implicit skip or checkpoint advance is allowed. | If no safe history can be reclaimed before the reserve is reached, new publishes are explicitly rejected or made retryable; polls, acknowledgements, health, and cleanup remain schedulable. |
-| `expire` | Time/size retention may advance the logical floor past a lagging consumer once the record is not protected by an active delivery. It is an explicit opt-in loss of replay eligibility. | Polling below the floor returns `history_unavailable` with the earliest eligible boundary. It must not return `Empty`, redeliver a different offset, or silently move the checkpoint. The client must explicitly reset/skip or use a new replay scope. | The stream can converge toward its configured bound, subject to segment granularity and active leases. Pressure is handled by admission if physical cleanup still cannot keep up. |
+| Protected (accepted) | A durable contiguous cursor and every active delivery fence the floor. A lagging consumer may keep history above either target. Durable consumer state must be complete before the fence is used. | The consumer retains normal delivery eligibility for unacknowledged history. No implicit skip, checkpoint advance, inactivity expiry, or replay pin is allowed. | If no safe history can be reclaimed before the reserve is reached, new durable writes are refused with stage-aware outcomes. |
+| Expiry (deferred) | No age/size rule may advance the floor beyond a durable consumer or active delivery. | Any future destructive mode needs a separate decision defining explicit unavailability and acknowledgement fencing; it is not selectable under this contract. | Disk pressure cannot opt a stream into destructive expiry. |
 
-An unexpired active delivery always protects its segment until the lease
-expires, even under `expire`; deleting it while its acknowledgement could
-still arrive would make the delivery outcome ambiguous in a way the policy did
-not disclose. Once the lease expires, the configured `expire` policy may end
-the retry opportunity at the retention floor. An acknowledgement after that
-boundary is stale or already unavailable, never a successful acknowledgement
-of a missing record.
+An active delivery remains a fence until it is no longer valid. The first
+contract has no expiry mode, so lease expiry can make a record eligible only
+when all durable consumer cursors and other protections also permit the floor
+to pass it. A late acknowledgement cannot succeed for history that is no
+longer retained.
 
-`protect` must not have an accidental infinite pin from an abandoned consumer.
-The first implementation should retain consumer state indefinitely unless the
-operator explicitly deletes it or selects an inactivity-expiry policy. An
-inactivity expiry is destructive to replay eligibility and therefore must be
-visible, durable, and separately confirmed. The exact consumer lifecycle API
-is unresolved.
+There is no inactivity expiry. Durable consumer state continues to protect
+its cursor until progress advances. Any future consumer deletion or reset
+operation that releases that protection must be explicit and must report the
+resulting replay boundary; no such lifecycle API is selected here.
 
 ### Replay
 
-Replay should be an explicit operation over an existing consumer identity or a
-bounded replay session, not a request to invent a special consumer name. A
-future public operation should support at least:
+The accepted replay behavior remains the bounded, read-only `replay` operation
+from ADR 0024: it accepts one inclusive logical offset, returns one record with
+no delivery token or attempt, and never changes ordinary consumer progress.
+The local and clustered engines return `history_unavailable` with the available
+half-open offset range when the requested offset is not present. Current
+storage retains all records from offset zero, so the earliest boundary is
+currently zero. Under the accepted retention contract, an offset below the
+floor also returns `history_unavailable`; the broker neither clamps the
+request nor substitutes a later record. A read racing a floor advance resolves
+against one authoritative view and returns either the requested record or
+that unavailable-history outcome.
 
-- an inclusive offset selector;
-- a published-time selector resolved to the first retained record at or after
-  that time; and
-- the earliest currently retained boundary.
-
-The first accepted slice resolves only the offset case as a bounded,
-read-only `replay` operation. It accepts a stream/consumer identity
-and one inclusive logical offset, returns one record with no delivery token or
-attempt, and never changes ordinary consumer progress. The local and clustered
-engines return the same `history_unavailable` outcome with the available
-half-open offset range when the offset is not present. Current storage retains
-all records from offset zero, so the earliest boundary is currently zero.
-This does not define a durable cursor, replay acknowledgement, time selector,
-range, retention pin, or session lifetime; those remain part of the full
-session decision below.
-
-Starting before the retained floor must return `history_unavailable` and the
-available offset/time boundary. A time or offset request that spans a deleted
-gap must fail as a whole; silently replaying only the suffix would make the
-requested scope unknowable to the caller.
-
-A replay cursor is separate from the ordinary durable consumer checkpoint.
-Replay acknowledgements do not move ordinary progress unless a later explicit
-operation asks to replace that progress. Replay delivery uses the same
-at-least-once, key-ordering, attempt, and stale-token rules as ordinary
-delivery. The cursor/session, its generation, and its last delivered position
-must be durable before a success response if a client expects replay to resume
-after restart.
-
-Under `protect`, an active replay session contributes its earliest unread
-position to the deletion fence. It needs a bounded lease, renewal, or explicit
-end operation so a crashed client cannot hold a stream forever; expiry must
-produce a durable session outcome and a subsequent `history_unavailable` rather
-than a silent reset. Under `expire`, the session remains valid only while its
-requested records remain retained and reports the same explicit unavailable
-boundary when cleanup wins the race.
-
-The exact replay wire schema, session lifetime, and whether replay is read-only
-or acknowledgement-driven require a later protocol decision. These
-uncertainties must not be resolved by exposing offsets as physical locations or
-by overloading the existing poll checkpoint.
+The first contract has no durable replay cursor, session, acknowledgement,
+range/time selector, or retention pin. A successful read-only replay returns
+one record from the history available at its authoritative read point and does
+not promise that the record remains stored. Any later session or multi-record
+replay feature needs a separate decision for its lifecycle and any pinning; it
+must not be inferred from this bounded operation or overload the ordinary
+consumer checkpoint.
 
 ### Reserved capacity and storage accounting
 
@@ -379,19 +413,21 @@ below.
 
 ### Low-space and full-disk admission
 
-The proposed pressure states are operational states, not public topology:
+The following pressure states are implementation vocabulary, not accepted
+public state names or topology. Their outcomes must follow ADR 0036:
 
 | State | Entry condition | New publish behavior | Other behavior |
 | --- | --- | --- | --- |
 | `normal` | Available space is above reserve plus cleanup/write hysteresis. | Accept only if the projected durable write stays above reserve. | Run cleanup at its normal interval. |
-| `low` | Available space is below the low-water mark or reclaimable backlog is growing. | Run one bounded cleanup attempt, then accept only when headroom remains. Otherwise return confirmed `storage_pressure` or a retryable pressure outcome. | Keep health, metrics, polls, and acknowledgements responsive; bound cleanup work so it cannot occupy all foreground capacity. |
-| `critical` | Available space is at or below reserve, capacity inspection fails conservatively, or cleanup cannot make progress. | Reject new publishes and stream-creating writes before append. Do not silently wait for space. | Continue reads and health where possible. Acknowledgements may proceed only if their durable state update fits the reserve; otherwise return an explicit retryable storage outcome without advancing progress. |
-| `full` | The operating system reports `ENOSPC`, quota exhaustion, or an equivalent durable-write failure. | No new publish is accepted until a fresh capacity check succeeds. A write that may have reached the durable boundary is an ambiguous outcome, not a confirmed rejection. | Preserve the old manifest/checkpoint, surface the failure, and retry cleanup/recovery with bounded work. |
+| `low` | Available space is below a measured low-water mark or reclaimable backlog is growing. | Run one bounded cleanup attempt, then accept only if required headroom remains. A proven refusal before mutation is retryable if capacity may recover; reject if the request cannot fit the fixed configured limit. | Keep diagnostic work bounded; operations that write durable state still require their own reserve and durability boundary. |
+| `critical` | Available space is at or below a measured reserve, capacity evidence is unavailable/stale, or cleanup cannot make progress. | Refuse new capacity-consuming operations before mutation when enforcement is configured and the check cannot establish safe headroom. | Do not advance a checkpoint without a successful durable update. Keep health/metrics reads independent of writes to the pressured data volume where possible. |
+| `full` | The operating system reports `ENOSPC`, quota exhaustion, or an equivalent durable-write failure. | Do not claim non-application when a write or sync may have started; report the stage-aware outcome and require intent resolution where available. | Preserve the prior committed floor/checkpoint. Bounded cleanup or recovery may retry after capacity returns. |
 
-The pressure state should have hysteresis so a broker does not oscillate around
-one block boundary. It must not make liveness depend on a successful write.
-Metrics and a topology-free administrative description should remain scrapeable
-while the data volume is full.
+The pressure state should have measured hysteresis so a broker does not
+oscillate around one allocation boundary. It must not make liveness depend on
+a successful write. Metrics and a topology-free administrative description
+should remain scrapeable while the data volume is full; exact surfaces and
+numeric thresholds are implementation evidence, not policy decisions.
 
 For clustered durability, a future selected durability profile may allow the
 leader to commit a publish when the required quorum can persist it. If one
@@ -410,18 +446,21 @@ force.
 A client request with a stable request identity can resolve an ambiguous
 publish after restart or a retry. A request without such identity cannot
 reliably distinguish “not appended” from “appended but response lost”; the
-future protocol must expose `unknown` rather than encourage an unsafe blind
-retry. Existing provisional clients may continue to see a generic storage
-error until the versioned outcome contract is accepted.
+accepted v2 outcome contract in ADR 0031 requires `unknown` rather than an
+unsafe blind retry. Existing provisional v1 clients may continue to see a
+generic storage error; v2 outcome encoding and runtime behavior remain
+unimplemented.
 
 ### Interrupted cleanup
 
-The storage layer should use immutable, format-tagged segments and a durable
-manifest or equivalent metadata describing the retained logical floor. A
-cleanup transaction has this shape:
+The accepted safety rule is that the logical floor becomes authoritative before
+physical deletion can remove history that it declares unavailable. One
+candidate cleanup mechanism uses immutable, format-tagged segments and a
+durable manifest or equivalent metadata with this shape:
 
 1. stop or rotate the active append target at a record boundary;
-2. select a monotonic candidate floor using time, size, consumer/replay fences,
+2. select a monotonic candidate floor using time, size, durable-consumer and
+   active-delivery fences,
    and the stream policy;
 3. write and sync a new manifest/state record that makes the candidate floor
    authoritative;
@@ -430,8 +469,9 @@ cleanup transaction has this shape:
    manifest, in bounded batches; and
 6. sync the directory and record completion or failure metrics.
 
-The logical floor becomes authoritative only after step 4. If the process
-stops before then, the old manifest and all old records remain valid. If it
+With this candidate, the logical floor becomes authoritative only after step
+4. If the process stops before then, the old manifest and all old records
+remain valid. If it
 stops after then, unreferenced old segments may remain as reclaimable orphans,
 but no referenced segment may have been deleted first. Startup must reconcile
 orphaned temporary files and old unreferenced segments idempotently. It must
@@ -467,9 +507,10 @@ Recovery must distinguish these cases:
   authoritative floor plus reclaimable orphans.
 - A failed manifest, checkpoint, or directory sync never reports the logical
   retention advance or acknowledgement as complete.
-- A consumer checkpoint remains monotonic. A record that was not durably
-  acknowledged is either redelivered while retained or reported as explicitly
-  unavailable under `expire`; it is never silently skipped.
+- A consumer checkpoint remains monotonic. Under the accepted protected
+  policy, a record that was not durably acknowledged remains behind the
+  protected cursor fence and is never silently skipped. A future expiry mode
+  would need a separate decision and an explicit unavailable-history result.
 - A request-aware publish with a stable identity can be resolved from durable
   request identity after an ambiguous response. A request without identity
   remains unknown to the broker's caller after a possible durable write.
@@ -485,11 +526,12 @@ process appear healthy while it performs unbounded work.
 
 ### Cluster restart, leader failure, and replacement
 
-Retention configuration, policy changes, logical floors, and any replay/session
-state that affects eligibility must be part of the durable replicated state
-covered by the data group's applied log and snapshot. Leader-selected time
-cutoffs and retention decisions must be carried in commands; followers must
-not independently choose wall-clock values.
+Retention configuration, policy changes, and logical floors must be part of
+the durable replicated state covered by the data group's applied log and
+snapshot. The first contract has no replay/session state; if a later decision
+adds state that affects eligibility, it must also be replicated. Leader-
+selected time cutoffs and retention decisions must be carried in commands;
+followers must not independently choose wall-clock values.
 
 After a leader crash:
 
@@ -502,28 +544,29 @@ After a leader crash:
   cleanup must not turn a stale acknowledgement into a valid one.
 
 Snapshots must include the retained floor, policy version, segment/extent
-manifest metadata, durable consumer progress, replay state, and producer
-deduplication state needed to interpret the retained prefix. Snapshot
-installation remains staged and validated. An interrupted transfer may restart
+manifest metadata, durable consumer progress, and producer deduplication state
+needed to interpret the retained prefix. The first contract has no replay
+session state to snapshot. Snapshot installation remains staged and validated.
+An interrupted transfer may restart
 from byte zero under the current mechanism; partial receiver state must never
 be exposed as a serving stream. An empty or inconsistent replica is not a
 normal replacement path, as recorded in [Raft recovery and replacement research](../research/raft-recovery-and-replacement.md).
 
-### Accepted behavior versus proposed behavior
+### Current runtime versus accepted contract versus implementation hypotheses
 
-| Concern | Accepted at this baseline | Proposed in this plan |
+| Concern | Current runtime at the supplied baseline | Accepted target contract | Remaining implementation hypothesis |
 | --- | --- | --- |
-| Retention | All complete broker history remains; no automatic time/size deletion. | Explicit per-stream time/size policy, segment-granular cleanup, and a durable logical floor. |
-| Lagging consumers | They can replay from their durable offset as long as the one-file history exists. | `protect` pins history; opt-in `expire` reports `history_unavailable` after an explicit floor advance. |
-| Replay | The bounded offset-based `replay` read is available and returns explicit `history_unavailable` for a missing offset; it does not create delivery state, advance ordinary progress, or provide a session. | Extend the bounded read into a replay cursor/session only after selector, pinning, expiry, acknowledgement, and unavailable-history semantics are accepted. |
-| Disk admission | Bounded protocol admission exists, but no disk reserve or preflight. | Reserved capacity, pressure states, bounded cleanup, and explicit pre-append rejection/unknown outcomes. |
-| Cleanup | No cleanup operation exists. | Crash-safe manifest publication followed by idempotent orphan deletion. |
-| Local recovery | Incomplete tails are truncated or discarded at the current frame boundary; complete history is scanned at open, bounded lookup metadata is rebuilt, and request-aware IDs are rebuilt from complete `RNL3` frames. | Versioned segments, bounded recovery, manifest validation, and cleanup recovery. |
-| Cluster recovery | Raft snapshots compact consensus history while snapshots/checkpoints still materialize complete retained state; transfer uses bounded chunks and retries from byte zero. Empty-replica replacement is test-only, while preserved-state restart and identity/layout validation are the supported evidence boundary. | Replicated retention facts with local cleanup; no weakening of the replacement boundary or assumption that consensus compaction removes broker history. |
-| Observability | Storage bytes and general request/snapshot metrics. ADR 0028 accepts consumer cursor-lag semantics but no runtime source, catalogue, metrics family, or complete-scope query. | Retention, lag, pressure, admission, cleanup, recovery, and unavailable-history signals, with lag freshness/coverage handled under ADR 0028 and no identity labels in default metrics. |
+| Retention | All complete broker history remains; no automatic time/size deletion. | Unlimited by default; explicit age/size targets are eligibility rules, with a monotonic logical floor and protected durable progress. | Whether cleanup uses segments, extents, or another recoverable representation. |
+| Lagging consumers | Durable contiguous progress and out-of-order acknowledgements are persisted; no retention inventory exists. | Lagging progress or an active delivery may hold the floor above target; incomplete inventory blocks deletion. No expiry, implicit reset, or cursor clamp. | A complete bounded source for local and clustered durable consumer state. |
+| Replay | The bounded offset read is explicit, read-only, and returns `history_unavailable` for a missing offset; it does not provide a session. | A request below the floor returns `history_unavailable` with the retained range. The read does not pin history or alter ordinary progress. | Whether a future durable replay session or multi-record operation should exist; neither is part of the first contract. |
+| Dead-letter history | Local movement appends or reconciles the target record before source progress; clustered movement is atomic in its data group. | Broker-managed dead-letter output remains unlimited until move reconciliation no longer depends on target history. | A durable move ledger or other bounded representation, if finite dead-letter retention is later needed. |
+| Disk admission | Bounded protocol/executor admission exists, but no physical reserve or capacity provider. | Logical retention cannot overrule protected history. Configured physical enforcement reserves required headroom and refuses before mutation when safe admission cannot be established; stage uncertainty remains explicit. | Capacity provider, measured reserve, pressure thresholds, and cluster-local reporting. |
+| Cleanup | No cleanup operation exists. | The logical floor becomes authoritative before physical deletion can remove history it declares unavailable; cleanup lag remains visible. | Manifests/segments, directory-sync sequence, orphan cleanup, and scheduling. |
+| Observability | `storage_bytes` and general request/snapshot metrics; no complete consumer catalogue or capacity measurement. | Distinguish logical retained/reclaimable/protected overage from physical availability/reserve. Unknown freshness or coverage is not zero; existing `storage_bytes` keeps its meaning. | Bounded administrative descriptions, metric names, freshness deadlines, and scrape-cost evidence under ADR 0028. |
 
-Nothing in the proposed column is a current guarantee or an authorization to
-change the runtime in this documentation-only change.
+The accepted target-contract column records ADR 0036, not current runtime
+behavior. The implementation column is not a required file layout or module
+plan. Nothing in this design authorizes a runtime change by itself.
 
 ## Outcome and evidence gates
 
@@ -534,19 +577,19 @@ mechanisms if it preserves the stated invariants and evidence boundary. Each
 gate should leave the repository runnable and should stop if its exit evidence
 is incomplete.
 
-### Gate 0: accept policy and measurement boundaries
+### Gate 0: establish implementation evidence boundaries
 
-- Retention, replay, size-accounting, and unknown-outcome choices are
-  reconciled with the encoding/segmentation work.
-- An ADR records the public policy, retention-floor semantics, capacity
-  accounting, and compatibility/version boundaries.
+- ADR 0036 accepts unlimited defaults, protected consumer progress, logical
+  size accounting, replay-floor outcomes, and stage-aware physical admission.
+- Implementation architecture still needs a bounded capacity provider and a
+  complete durable-consumer inventory without changing the public contract.
 - Deterministic unit evidence has a test-clock and capacity-provider boundary,
   while real filesystem/process tests cover actual failure behavior.
 - A baseline artifact captures local and clustered startup, replay, cleanup
   (not present), publish, poll, acknowledgement, memory, and storage behavior.
 
-Exit evidence: accepted policy ADR, documented public errors/outcomes, and a
-baseline artifact whose workload and durability boundaries are explicit.
+Exit evidence: bounded evidence interfaces and a baseline artifact whose
+workload and durability boundaries are explicit.
 
 ### Gate 1: introduce segmented retained storage without deleting history
 
@@ -566,8 +609,8 @@ tail index.
 ### Gate 2: implement local logical retention and crash-safe cleanup
 
 - Retention policy and a monotonic retained floor are persisted per stream.
-- Time and size candidate selection uses `protect` as the first safe policy if
-  `expire` semantics are not yet fully tested.
+- Time and size candidate selection obeys the accepted protection rule; a
+  complete inventory is mandatory before the floor can advance.
 - Rotation precedes deletion; manifests publish atomically; old segments are
   deleted in bounded, restartable batches.
 - Unavailable-history errors distinguish logical floor advancement from
@@ -577,16 +620,17 @@ Exit evidence: local time/size, lag, active-delivery, restart, interrupted
 cleanup, and no-silent-gap tests pass with real process coverage where a
 filesystem or socket boundary is involved.
 
-### Gate 3: extend replay and define consumer lifecycle semantics
+### Gate 3: validate retained-floor replay and consumer lifecycle semantics
 
-- The accepted bounded offset read remains compatible while a versioned replay
-  cursor or session is introduced; existing poll/ack semantics remain
-  unchanged.
-- Replay progress and fencing state persist at the selected durability point.
-- Protected replay pins, bounded session lifetime, explicit reset/skip
-  behavior, and `history_unavailable` boundaries are defined.
-- Opt-in `expire` is considered only after tests prove explicit outcomes for
-  lagging/unacknowledged work and reject acknowledgements for later generations.
+- The accepted bounded offset read returns the requested record or an explicit
+  `history_unavailable` result from one authoritative view; it does not create
+  delivery state or pin history. Existing poll/ack semantics remain unchanged.
+- No replay progress or session state is introduced by this gate. If a durable
+  replay session or multi-record operation is proposed later, its lifecycle
+  and any retention pin require a separate decision.
+- No expiry mode is implemented by this contract. Any future destructive
+  expiry requires a separate decision and tests for lagging/unacknowledged
+  work and acknowledgement fencing.
 
 Exit evidence: conformance tests cover local replay, normal delivery, grouped
 delivery, key ordering, concurrent acknowledgement, restart, and retention
@@ -597,16 +641,18 @@ policy changes.
 - Versioned retention policy and floor state live in the appropriate
   metadata/data-group state, with leader-selected cutoffs carried in
   deterministic commands.
-- Snapshot serialization includes the retention and replay metadata needed to
-  interpret retained state.
+- Snapshot serialization includes the retention floor and policy metadata
+  needed to interpret retained state; there is no replay-session state in the
+  first contract.
 - Replica cleanup occurs locally only after the committed floor is applied;
   failed deletion is reported without diverging logical eligibility.
-- Quorum capacity behavior is explicit for a full follower, loss of quorum,
-  leader change during cleanup, and controlled future replacement.
+- Capacity behavior is tested for a full follower, loss of quorum, leader
+  change during cleanup, and controlled future replacement without weakening
+  the selected commit boundary.
 
 Exit evidence: three real broker processes demonstrate time/size retention,
-lag policy, follower/leader failure, snapshot recovery, interrupted cleanup,
-and no observation of an uncommitted or logically expired record.
+  protected lag, follower/leader failure, snapshot recovery, interrupted cleanup,
+  and no observation of an uncommitted or logically expired record.
 
 ### Gate 5: add reserved-capacity admission and operator surfaces
 
@@ -626,8 +672,8 @@ and recovery after capacity returns.
 ### Gate 6: migration, hardening, and performance acceptance
 
 - Upgrade, downgrade, retention-policy transition, and local-to-clustered
-  migration boundaries are documented before finite retention is enabled by
-  default.
+  migration boundaries are documented before finite retention is enabled in
+  production.
 - The full failure and process-level matrix below covers fault injection at
   every manifest and durable-write boundary.
 - The retention benchmark matrix follows the repository's authoritative
@@ -647,16 +693,17 @@ conformance, and process-level tests.
 ### Safety and semantics
 
 - A committed durable publish remains readable until the selected retention
-  policy makes it ineligible; `protect` never deletes a record still entitled
-  to replay by a consumer or protected replay session.
+  policy makes it ineligible. The accepted protected policy never deletes a
+  record at or after durable contiguous progress or an active delivery.
 - Retention floor offsets and policy generations are monotonic. No restart,
   leader change, or cleanup retry may lower a floor or reinterpret a policy
   generation.
-- Only complete, validated, unreferenced segments are deleted. An active
-  segment and any segment containing an unexpired delivery remain available.
-- A lagging `expire` consumer receives an explicit unavailable-history result;
-  the broker never converts a gap into `Empty`, silently advances its
-  checkpoint, or delivers a later offset as a substitute.
+- Only complete, validated history no longer referenced by the authoritative
+  floor can be physically reclaimed. A specific segment or extent format is
+  not part of the accepted contract.
+- A poll or replay request below the floor receives an explicit
+  `history_unavailable` result; the broker never converts a gap into `Empty`,
+  silently advances a checkpoint, or delivers a later offset as a substitute.
 - Acknowledgement persistence precedes an acknowledgement success. A failed
   checkpoint leaves the previous durable progress authoritative.
 - An acknowledgement token from an expired, deleted, or superseded delivery
@@ -671,8 +718,9 @@ conformance, and process-level tests.
 
 ### Resource and operational safety
 
-- Physical writes, cleanup work, manifest temporary space, replay sessions,
-  recovery scans, and in-flight requests have explicit bounds.
+- Physical writes, cleanup work, manifest temporary space, recovery scans, and
+  in-flight requests have explicit bounds. Future replay sessions, if accepted,
+  need their own bound.
 - The reserved capacity remains available for the largest configured legal
   durable operation and its required metadata/sync work; a cleanup attempt
   cannot consume the entire foreground execution budget.
@@ -701,8 +749,9 @@ range, and manifest generation must be self-describing.
 Existing consumer checkpoints map to a retained floor of zero and retain their
 committed offset and attempt state. Existing request-identity mappings must be
 rebuilt or migrated before a publish can be acknowledged as idempotently
-resolved. A missing or invalid checkpoint is a startup/storage error, not a new
-consumer at offset zero.
+resolved, and recovery must exclude IDs whose records are below the committed
+retained floor. A missing or invalid checkpoint is a startup/storage error, not
+a new consumer at offset zero.
 
 The clustered state-machine, journal, and snapshot formats need an explicit
 version bump or additive migration for policy, floor, and replay fields.
@@ -717,20 +766,20 @@ stream identity does not match.
   explicit operator acknowledgement. It cannot be an automatic upgrade step.
 - Tightening a policy may delete eligible history but never restores it when
   the policy is later relaxed. A relaxed policy applies only to future data.
-- Changing `protect` to `expire`, deleting a consumer, or expiring a replay
-  session can remove an application's replay entitlement and needs an
-  explicit, auditable operation.
+- Any future expiry policy, deleting a consumer, or expiring a replay session
+  can remove an application's replay entitlement and needs a separate
+  explicit, auditable decision and operation.
 - The broker must reject an unknown policy version or field combination rather
   than choosing a more destructive fallback.
 
 ### Clients, engines, and deployment
 
-Existing provisional publish, poll, grouped poll, and acknowledgement requests
-retain their current meaning when no new retention/replay feature is used.
-New errors and replay/configuration operations require an additive protocol
-version or capability negotiation. Older clients may receive a generic error
-for a new operation, but they must not see an unavailable-history result as an
-ordinary empty poll.
+The JSON-lines listener remains provisional v1 without a cross-release
+compatibility promise. ADR 0031 accepts the negotiated v2 framing and outcome
+contract; its runtime negotiation and encoding remain unimplemented. Any new
+replay or retention-configuration operation must be defined under that
+version/capability contract. An unavailable-history result must never be
+presented as an ordinary empty poll.
 
 Local-to-cluster migration remains unsupported until a separate, versioned
 migration workflow fences writers, transfers retained data and consumer state,
@@ -771,15 +820,14 @@ At minimum expose:
 - detected available capacity, configured capacity limit, reserved bytes,
   required headroom, and current pressure state;
 - retained bytes, reclaimable bytes, retention overage, logical floor offset,
-  logical floor time, and the number of consumers/replay sessions constraining
-  each stream through a bounded stream inspection that can establish complete
-  coverage; do not encode stream identity in default metric labels;
+  logical floor time, and the number of durable consumers constraining each
+  stream through a bounded inspection that can establish complete coverage.
+  Do not encode stream identity in default metric labels;
 - cursor lag for a complete declared consumer scope, with separate freshness
   and coverage signals; any byte-lag or per-stream constrained-consumer count
   needs a bounded source and explicit measurement definition;
 - cleanup in progress, selected cleanup budget, last successful cleanup time,
   and pending orphan bytes;
-- replay sessions in progress and their bounded resource usage; and
 - clustered redundancy that is below reserve, unable to clean, or not caught
   up sufficiently to satisfy the selected durability mode.
 
@@ -792,7 +840,7 @@ fixed labels belong in the implementation ADR and metrics tests. The existing
 Add counters for cleanup attempts, successful segment/extent deletion, bytes
 reclaimed, cleanup failures by fixed reason, pressure transitions, publish
 rejections by fixed reason, ambiguous durable writes, unavailable-history
-responses, policy changes, replay expiry, and recovery failures. Add bounded
+responses, policy changes, and recovery failures. Add bounded
 histograms for cleanup duration, bytes reclaimed per cycle, recovery duration,
 time spent in low/critical pressure, and durable append/checkpoint failures.
 
@@ -820,28 +868,29 @@ server, and cluster behavior. Network cases must use the real server, as in
 | Scenario | Engine/scope | Fault or setup | Required result |
 | --- | --- | --- | --- |
 | Time-only retention | Local, then clustered | Controlled broker time; records before/after the cutoff; active segment present. | Only complete segments strictly older than the cutoff are candidates; boundary records remain; floor and metrics are correct. |
-| Size-only retention | Local, then clustered | Small segment/byte budget with records of different encoded sizes. | Oldest eligible complete segments are removed until within budget or a documented granularity/fence prevents it; no partial record disappears. |
+| Size-only retention | Local, then clustered | Small logical-byte target with records of different key and payload sizes. | Oldest eligible complete segments are removed until within target or a documented granularity/fence prevents it; no partial record disappears. |
+| Durable publish versus future visibility | Local, then clustered | In separate size-only and age-only cases with no consumer, publish one record larger than `max_bytes` or explicitly set `max_age=0`; advance the deterministic broker clock past the publish time in the age case. | Publish first reports confirmed at the durable point. Once eligible, cleanup may advance the floor past the record; replay then returns `history_unavailable`, and a new consumer starts at the new floor. There is no newest-record grace or promise that the response means a future consumer can read it. |
+| Request-ID retention horizon | Local, then clustered | Publish with a stable ID; retry before retention removes the record, then expire its record and retry the same ID. | Before expiry, retry returns the original receipt without append. Floor advancement retires the ID mapping with the record; after expiry, reusing the ID creates a new record at a new offset, consistent with ADR 0031's end of the deduplication horizon. |
 | Both limits | Local | One limit violated before the other and then both violated. | Either trigger can select deletion; cleanup converges toward both targets and reports overage when it cannot. |
-| Protected lagger | Local process | Consumer remains at an old contiguous offset while publishes continue. | Consumer pins the floor; reclaimable/pinned/overage bytes are visible; publish rejects only at reserve pressure, never by deleting its history. |
-| Expiring lagger | Local process | Opt-in `expire`, consumer below the floor, then poll/replay. | History is deleted only under policy; the client gets `history_unavailable` with the boundary; checkpoint is not silently advanced. |
-| Active delivery fence | Local process | Retention becomes due while a delivery lease is unexpired. | Its segment remains; old acknowledgement retains current stale-token behavior; after expiry the selected policy determines the explicit outcome. |
+| Protected lagger and new consumer | Local process | Consumer remains below the age/size target while publishes continue; a new consumer and replay request start below the floor. | Floor does not pass durable progress; overage is visible; a new consumer starts at the floor; replay or an inconsistent old cursor receives `history_unavailable`; publish refuses only at reserve pressure and never by deleting protected history. |
+| Active delivery fence | Local process | Retention becomes due while a delivery lease is unexpired. | Its history remains protected; old acknowledgement retains current stale-token behavior after lease expiry; durable progress still fences the floor. |
 | Dead-letter move and cleanup race | Local process, then clustered | A target append completes while source acknowledgement or retention cleanup is interrupted; repeat after restart. | A local move identity reconciles the same-content target before source progress advances; retention does not delete target evidence needed for reconciliation. Clustered same-group movement remains one replicated transition; a future split-group target needs separate evidence. |
 | Grouped out-of-order acknowledgement | Local and cluster | A later grouped offset is acknowledged while an earlier one is in flight. | Deletion uses contiguous progress only; the earlier message/key cannot be reclaimed prematurely. |
-| Replay pin and expiry | Local process | Start replay, block progress, restart/expire the session while cleanup runs. | `protect` pins within its bounded lifetime; session expiry is durable and subsequent access is explicit, never an accidental reset. |
-| Preflight low space | Local process | Constrain free space or use a capacity-provider test double, then publish. | Cleanup is bounded; a publish that cannot preserve reserve is rejected before append; unrelated health/poll work continues. |
-| Full disk between checks | Local process | Consume headroom after preflight, fail append or sync with `ENOSPC`. | No false success; old manifest/checkpoint remains authoritative; response is confirmed rejection only when known, otherwise unknown/retryable with metrics. |
-| Full disk during ack | Local process | Fail the consumer-state replacement or directory sync. | Acknowledgement is not reported; durable progress remains at the prior state; retry can succeed after capacity returns. |
+| Read-only replay during floor advance | Local process | Race one offset read with a committed floor advance. | The read returns either the requested record or `history_unavailable` from one authoritative view; it never returns a later offset or pins history. |
+| Preflight low space | Local process | Constrain free space or use a capacity-provider test double, then publish. | Cleanup is bounded; a publish that cannot preserve reserve is refused before append; read-only health/replay work continues. |
+| Full disk between checks | Local process | Consume headroom after preflight, fail append or sync with `ENOSPC`. | No false success; response is `unknown` if the write may have crossed its durable stage, otherwise a proven pre-write refusal is retryable or rejected according to configuration. |
+| Full disk during ack | Local process | Fail the consumer-state replacement or directory sync. | No acknowledgement success is reported before persistence; if application is uncertain, expose `unknown` and resolve from durable state instead of assuming that progress stayed unchanged. |
 | Cleanup crash before manifest | Local process | Kill the real broker after temporary manifest write and before publish. | Old manifest and all referenced history recover; temporary state is discarded or retried. |
 | Cleanup crash after manifest | Local process | Kill after manifest publication but during segment deletion. | New floor remains; old unreferenced segments are reclaimable orphans; restart does not resurrect the floor. |
 | Cleanup deletion failure | Local process | Make one segment undeletable or return an I/O error. | Logical policy remains deterministic; physical reclaimable bytes and failure are visible; later cleanup retries. |
 | Torn/corrupt segment | Local process | Kill during append; separately corrupt a complete frame or manifest. | Torn tail follows the accepted recovery rule; complete corruption fails closed with a diagnostic; no empty-stream recovery. |
 | Restart after retention | Local process | Close/restart with retained and deleted prefixes plus old consumers. | Retained records and consumer progress match the policy; deleted prefixes return explicit unavailable history. |
 | Leader failure during floor command | Three processes | Kill leader before response and during local cleanup. | Only committed floor affects eligibility; a retry/new leader is idempotent; no uncommitted history is hidden. |
-| Full follower with writable quorum | Three processes | Exhaust one replica's capacity while two can persist. | Quorum durability behavior is explicit; cluster exposes degraded redundancy and does not call the follower repaired. |
+| Full follower with writable quorum | Three processes | Exhaust one replica's capacity while the existing commit boundary may still be writable. | The existing commit boundary remains authoritative; cluster reports local pressure and does not call the follower repaired. This test does not authorize a smaller quorum. |
 | Loss of writable quorum | Three processes | Exhaust or stop enough replicas to prevent durable commit. | New publishes reject/retry without becoming visible; reads/health behavior follows the selected degraded policy. |
 | Cluster snapshot after retention | Three processes | Advance floor, compact, restart, and install a snapshot on a test replacement. | Snapshot contains policy/floor/consumer state; no expired record is resurrected; replacement remains within the accepted recovery boundary. |
 | Interrupted snapshot transfer | Three processes | Interrupt transfer at multiple chunks. | Receiver never serves partial state; retry from the current supported boundary is safe and metrics count the interruption. |
-| Policy migration | Local and cluster | Upgrade old state; apply unlimited-to-finite and protect-to-expire changes. | Old state means unlimited retention; destructive transitions require explicit confirmation and are durable/auditable. |
+| Policy migration | Local and cluster | Upgrade old state; apply unlimited-to-finite changes. | Old state means unlimited retention; the finite transition is explicit and durable/auditable. |
 | Process shutdown under pressure | Real server | SIGTERM during cleanup, publish, ack, and full-disk handling. | Admission stops, bounded work drains within the existing shutdown contract, and restart recovers a valid state. |
 
 The process tests must assert child-process liveness and preserve broker logs
@@ -862,11 +911,10 @@ Run local and real three-node clustered workloads for 100-byte and 1-KiB
 payloads, with and without ordering keys, using:
 
 - retention disabled (compatibility baseline), time-only, size-only, and both;
-- `protect` with a fully caught-up consumer, a slow consumer, and a stopped
-  consumer;
-- `expire` with lagging independent and grouped consumers;
+- protected retention with a fully caught-up consumer, a slow consumer, and a
+  stopped consumer;
 - continuous publish while cleanup catches up, including a cleanup backlog;
-- replay from earliest retained, offset, and time boundaries;
+- replay at, above, and below the retained offset boundary;
 - low-space headroom, cleanup failure, restart, leader failure, and recovery;
 - local durable publish and publish/poll/ack; clustered quorum publish and
   follower-forwarded delivery; and
@@ -922,15 +970,16 @@ this plan rather than treated as launch defaults. The evidence needed to set
 them is described in [Retention and disk-pressure semantics](../research/retention-disk-pressure-semantics.md)
 and the benchmark plan below.
 
-The remaining hypotheses are decision prompts, not defaults:
+The remaining hypotheses are implementation prompts, not alternate defaults:
 
-- Preserve unlimited retention for existing data unless a versioned,
-  operator-visible transition establishes a finite policy. Whether new streams
-  default to unlimited retention or require an explicit limit remains open.
-- If `protect` is offered, determine how a complete durable consumer/replay
-  inventory bounds its pins and how publish admission behaves when a pin
-  prevents reclamation. If `expire` is offered, define the explicit unavailable
-  history and acknowledgement-fencing outcomes first.
+- New and existing streams default to unlimited history; a finite age or size
+  target must be explicitly configured. Determine how the durable consumer
+  inventory is made complete and bounded before enabling cleanup. Durable
+  replay sessions are not part of the selected first policy.
+- The selected protected policy permits target overage. Measure how often
+  protected lag prevents reclamation and how physical admission should expose
+  the resulting write refusals. Any destructive expiry mode remains a separate
+  product decision, not a fallback.
 - Derive reserve and cleanup budgets from the largest legal durable mutation,
   bounded concurrency, manifest/checkpoint/snapshot work, filesystem behavior,
   and actual recovery needs. Measure them on supported deployment storage.
@@ -948,40 +997,35 @@ documentation must explain the relationship between those values, detected
 capacity, reserve, snapshot working space, and the broker's startup recovery
 budget. Kubernetes must not be required for the policy to be safe.
 
-## Unresolved decisions
+## Unresolved implementation and future-policy decisions
 
-The following require explicit resolution before implementation is treated as
-an accepted product behavior. The [source review](../research/retention-disk-pressure-semantics.md)
-organizes their alternatives and evidence needs by decision:
+The semantic policy is accepted; the following choices still require evidence
+or a separate decision before implementation is considered complete. The
+[source review](../research/retention-disk-pressure-semantics.md) organizes
+their alternatives and evidence needs:
 
-1. What exact versioned public operation configures retention and starts,
-   polls, acknowledges, resets, and ends a replay session? The accepted v1
-   offset read is intentionally read-only and has no session lifecycle.
-2. Should a replay session pin history by default, and what durable lease,
-   renewal, or operator-expiry semantics bound a crashed session?
-3. Is deleting an unacknowledged but no-longer-active message under `expire`
-   acceptable, or must such messages always remain until a retry/dead-letter
-   outcome completes?
-4. Should dead-letter streams inherit the source policy, have an independent
-   policy, or default to protected unlimited retention?
-5. Should `max_bytes` count encoded record bytes, logical payload/key bytes, or
-   both as separate configurable limits, especially when compression arrives?
-6. How should a clustered leader determine quorum headroom when a follower is
-   full, slow, or unable to report capacity, while preserving the selected
-   durability guarantee without exposing replica topology?
-7. What filesystem capacity source and failure policy apply when the data
-   volume is shared, quota-limited, or does not provide reliable statfs data?
-8. Should the first local implementation use rename-and-delete manifests,
-   immutable extent manifests, or a transactional embedded store, and what
-   snapshot representation avoids copying all retained history?
-9. What is the supported downgrade boundary after a new segment, floor,
-   replay, or policy version has been written?
-10. What operator action explicitly releases a protected abandoned consumer,
-    and how is its lost replay entitlement reported to applications?
-11. Which readiness status and alerts distinguish safe degraded reads from an
-    inability to accept the selected durable writes?
-12. What stable numeric resource and p99/p99.9 thresholds are appropriate for
-    each supported workload after the first measurements exist?
+1. What exact versioned operation configures finite retention, and how is the
+   policy change authenticated, inspected, and made durable?
+2. Should the public contract ever add a durable replay session or an
+   explicitly destructive expiry policy, and what evidence would justify one?
+3. Can dead-letter move reconciliation be made durable independently of the
+   target record before a future policy permits finite dead-letter retention?
+4. How should a clustered engine report local pressure on a follower while
+   preserving the existing selected commit boundary and avoiding a new quorum
+   promise?
+5. Which capacity provider can report usable bytes and relevant quotas for the
+   supported filesystems, and how should platform-specific unknown coverage be
+   surfaced?
+6. Which storage representation and snapshot format can provide bounded
+   recovery and idempotent cleanup without exposing physical layout?
+7. What downgrade boundary applies after a floor or finite retention policy
+   has been persisted?
+8. Which explicit operator operation, if any, may remove an abandoned durable
+   consumer's protection and expose an unavailable-history boundary?
+9. Which readiness state and alerts distinguish a protected-lag write refusal
+   from an inability to accept the selected durable writes?
+10. What measured reserve, hysteresis, cleanup budget, and p99/p99.9 limits
+    fit the supported workloads and deployment storage?
 
 ## References
 
@@ -1006,6 +1050,7 @@ exploratory records:
 - [ADR 0026: semantic engine error classification](../decisions/0026-semantic-engine-error-classification.md)
 - [ADR 0027: consumer-scoped retry policy](../decisions/0027-consumer-scoped-retry-policy.md)
 - [ADR 0028: consumer-lag observation semantics](../decisions/0028-consumer-lag-observation-semantics.md)
+- [ADR 0036: retained-history and disk-pressure contract](../decisions/0036-retained-history-and-disk-pressure-contract.md)
 - [Local engine storage and delivery implementation](../../crates/runnel-core/src/lib.rs)
 - [Clustered state-machine and group manager](../../crates/runnel-raft/src/lib.rs)
 - [Server admission and metrics](../../crates/runnel-server/src/main.rs)

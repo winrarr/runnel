@@ -303,7 +303,7 @@ Goal: bound retained storage and define what happens as consumers lag or usable 
 
 Rationale: an append-only broker without enforceable retention and admission policy eventually turns ordinary consumer lag into an availability or data-loss incident.
 
-Current progress: a real-server test now repeats synthetic same-stream storage-executor saturation and verifies bounded rejection, health/readiness/metrics behavior, recovery, and subsequent durable traffic. The [source-backed retention and disk-pressure review](research/retention-disk-pressure-semantics.md) separates history eligibility, consumer/replay entitlement, and physical write admission; it compares time/size limits, acknowledgement-driven retention, filesystem preflight and `ENOSPC`, cleanup ordering, and bounded observability without selecting a policy or API. It identifies that the local consumer cache is not a complete retention inventory and that existing `storage_bytes` is not filesystem capacity. It does not exercise filesystem-capacity admission, `ENOSPC`, retention cleanup, or interrupted deletion; those outcomes remain unimplemented and the acceptance criteria remain open.
+Current progress: a real-server test now repeats synthetic same-stream storage-executor saturation and verifies bounded rejection, health/readiness/metrics behavior, recovery, and subsequent durable traffic. [ADR 0036](decisions/0036-retained-history-and-disk-pressure-contract.md) accepts unlimited history by default, explicit age/size eligibility targets protected by durable contiguous consumer progress and active delivery, explicit `history_unavailable` below the retained floor, unlimited broker-managed dead-letter history, and physical admission separate from logical retention. A finite target, including a zero-age target, may make unprotected history unavailable before a future consumer starts; durable publish confirmation is not a promise of permanent replay availability. Publish-ID deduplication lasts with the retained record under ADR 0031; when the record leaves the retained range, its ID mapping is retired and reusing the ID is a new publish. Protected lag may exceed a configured target and can eventually cause new durable writes to be refused. Disk pressure never changes the retention policy or deletes protected committed history. The [source-backed retention review](research/retention-disk-pressure-semantics.md) and [design plan](design/retention-disk-pressure-plan.md) record the evidence, rejected alternatives, and remaining implementation hypotheses. No runtime retention, capacity provider, filesystem `ENOSPC`, or interrupted-deletion behavior is implemented or tested, so the backlog outcome and its acceptance criteria remain open.
 
 Constraints:
 
@@ -315,9 +315,10 @@ Constraints:
 Acceptance criteria:
 
 - operators can configure and inspect time- and size-based retention and disk-usage limits;
-- documentation defines whether lagging consumers block deletion, lose replay eligibility, or cause new publishes to be rejected for each supported policy;
+- documentation defines that the first protected policy lets durable lag block deletion and allows physical pressure to refuse new durable writes; any future policy that expires lag requires a separate accepted decision and explicit unavailable-history behavior;
 - low-space, full-disk, deletion, restart, and interrupted-cleanup tests preserve the documented outcomes;
-- metrics and diagnostics expose retained bytes, reclaimable bytes, consumer lag that constrains retention, rejected writes, and cleanup progress;
+- retention tests verify that an oversized record or zero-age target can become eligible without a minimum visibility grace after durable publish, explicit replay unavailability, new-consumer start at the retained floor, and request-ID deduplication only while its record remains logically retained;
+- metrics and diagnostics distinguish logical retained/reclaimable bytes and protected overage from physical capacity, reserve, consumer progress, rejected writes, and cleanup progress without treating incomplete observations as zero;
 - sustained workloads demonstrate bounded disk and memory use with predictable foreground tail latency.
 
 ### Make durable storage upgrades safe
