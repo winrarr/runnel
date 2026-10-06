@@ -44,7 +44,8 @@ metadata downgrade when a release changed metadata; its
 [MirrorMaker 2 documentation](https://kafka.apache.org/43/operations/geo-replication-cross-cluster-data-mirroring/)
 also treats consumer-group checkpointing as a separate part of cross-cluster
 replication. [etcd's learner design](https://etcd.io/docs/v3.6/learning/design-learner/)
-keeps an incompletely caught-up member out of client service and voting, while
+keeps a new member non-voting, rejects ordinary client reads and writes until
+promotion, and permits promotion only after catch-up, while
 [RocksDB's MANIFEST/CURRENT design](https://github.com/facebook/rocksdb/wiki/MANIFEST)
 selects a complete durable generation explicitly. Runnel does not need an
 old-format bridge for an existing deployed population, so its first
@@ -266,8 +267,8 @@ must logically translate data and consumer state between different engines.
 Kafka MirrorMaker demonstrates separate record and consumer-checkpoint
 transfer, but its source and target share Kafka's topic/partition and offset
 vocabulary; Runnel has to preserve logical offsets and attempt/policy state
-across dissimilar local and Raft schemas. etcd learners and RocksDB's manifest
-inform not-serving-before-caught-up and explicit-generation selection, but
+across dissimilar local and Raft schemas. etcd learners inform readiness before
+promotion, while RocksDB's manifest informs explicit-generation selection, but
 Runnel's target also needs an all-stream activation record and broker-level
 first-write fence. Raft snapshots cannot serve as source interchange because
 the local engine has no Raft log index, term, membership, or committed
