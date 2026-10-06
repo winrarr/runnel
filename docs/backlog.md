@@ -687,7 +687,7 @@ Goal: provide the health, security, observability, persistence, and upgrade beha
 
 Rationale: a cluster that is correct only during normal traffic is not a dependable deployment.
 
-Current progress: clustered snapshot lifecycle, peer transport, forwarding, storage, health, and in-flight delivery signals are now visible through existing diagnostics and metrics. Cluster replication progress is exposed as a bounded per-broker aggregate: maximum sampled Raft log-entry lag by numeric peer ID across groups this broker leads, with sampled/total group counts and an explicit unavailable signal when no sampled group is locally led. This is not message or byte lag. The illustrative three-node Kubernetes deployment now has a two-Ready-pod disruption budget for voluntary Eviction API requests, aligned with the static cluster's two-member quorum requirement; Ready status does not itself prove quorum health, and the budget does not cover direct deletion or controller updates and cannot prevent involuntary failures. The [cluster peer transport security research](research/cluster-peer-transport-security.md) records that the current Raft, forwarding, and data-group setup listener uses unauthenticated plain TCP and compares static mutual TLS, workload identity, and network filtering boundaries. This is a research milestone only: peer identity, TLS configuration, credential rotation, version compatibility, failure behavior, and deployment tests remain undecided or unimplemented. Broader cluster leadership, resource pressure, security, upgrade, and deployment-level operational behavior remain incomplete.
+Current progress: clustered snapshot lifecycle, peer transport, forwarding, storage, health, and in-flight delivery signals are now visible through existing diagnostics and metrics. Cluster replication progress is exposed as a bounded per-broker aggregate: maximum sampled Raft log-entry lag by numeric peer ID across groups this broker leads, with sampled/total group counts and an explicit unavailable signal when no sampled group is locally led. This is not message or byte lag. The illustrative three-node Kubernetes deployment now has a two-Ready-pod disruption budget for voluntary Eviction API requests, aligned with the static cluster's two-member quorum requirement; Ready status does not itself prove quorum health, and the budget does not cover direct deletion or controller updates and cannot prevent involuntary failures. The [cluster peer transport security research](research/cluster-peer-transport-security.md) records that the current Raft, forwarding, and data-group setup listener uses unauthenticated plain TCP and compares static mutual TLS, workload identity, and network filtering boundaries. [ADR 0032](decisions/0032-static-cluster-peer-mutual-tls.md) now accepts static mutual TLS, per-node identities bound to the configured cluster and node IDs, fail-closed behavior, coordinated initial cutover, and restart-based trust overlap. Runtime TLS, credentials, bounded handshake handling, safe diagnostics, rotation tests, and performance evidence remain unimplemented; the current cluster is still plaintext and must not be described as secured. Broader cluster leadership, resource pressure, security, upgrade, and deployment-level operational behavior remain incomplete.
 
 Constraints:
 
@@ -700,6 +700,29 @@ Acceptance criteria:
 - readiness, liveness, disruption, persistence, and upgrade assumptions are documented beside the deployment;
 - metrics expose cluster health, leadership, replication progress, forwarding, storage, and resource pressure;
 - security and graceful shutdown behavior are covered by repeatable deployment tests.
+
+### Authenticate static cluster peers
+
+Goal: protect every inter-node consensus, forwarding, snapshot, and data-group setup connection with mutual TLS tied to the configured static peer and cluster identities.
+
+Rationale: the current plain TCP peer listener exposes internal broker operations to any reachable caller and does not distinguish a configured member from another process on the network. A trusted certificate chain alone is not membership; the authenticated identity must match the static node map.
+
+Constraints:
+
+- follow [ADR 0032](decisions/0032-static-cluster-peer-mutual-tls.md) for the accepted certificate identity profile, trust boundary, fail-closed policy, and rotation sequence;
+- require operator-supplied runtime trust and per-node credentials; do not put private-key contents in images, command-line values, or broker data;
+- secure the entire peer socket before frame parsing, with no plaintext fallback or mixed plaintext/TLS operation;
+- keep public client and HTTP authentication/TLS, NetworkPolicy, dynamic membership, and mixed-binary rolling upgrades outside this outcome;
+- retain the current same-build static membership boundary and do not claim TLS fixes compromised peers, duplicate processes, or membership fencing.
+
+Acceptance criteria:
+
+- Raft mode requires a peer trust bundle and the local node's matching certificate/key; startup fails closed on absent or invalid credentials, and each outbound and inbound path validates the expected configured node ID and cluster identity before peer requests are sent or dispatched;
+- consensus RPCs, snapshot transfer, forwarding, and data-group setup all use the same authenticated encrypted transport; untrusted, expired, wrong-node, wrong-cluster, unconfigured, and plaintext attempts fail before a peer request reaches a group manager;
+- operational documentation defines coordinated initial cutover and leaf/CA rotation with trust overlap, required process restarts, and one-node-at-a-time sequencing that preserves a two-voter majority; it does not promise online revocation or mixed-version compatibility;
+- focused TLS tests and real three-process tests cover valid members, the negative identity/trust cases, all peer request paths, no downgrade, and restart-based CA overlap; public client and HTTP behavior remains unchanged;
+- peer authentication failures are distinguishable from ordinary reachability failures without logging keys or untrusted high-cardinality identities, and handshakes, sockets, frame reads, CPU, and memory remain bounded;
+- controlled clustered measurements report handshake/reconnect and steady-state transport cost, per-node CPU/memory, and commit tail latency before any production performance claim.
 
 ### Make broker and peer communication efficient and evolvable
 
