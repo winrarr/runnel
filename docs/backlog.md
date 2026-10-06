@@ -584,25 +584,27 @@ endpoint. The maintenance window lasts through copying and validation; live
 tailing and dual writes are deferred. The source remains rollback-eligible
 after target activation only until the first target-only durable mutation
 crosses ADR 0037's `write-pending` gate. The [migration design](design/single-node-to-cluster-migration.md)
-records the evidence and implementation gates. The supported source is the
-current migration-aware `RNL3` writer/reader and consumer-state schema;
-`RNL1`, `RNL2`, mixed histories, old binaries, and obsolete state schemas are
-refused without source mutation. This product capability preserves the
-acknowledged state of the supported broker and does not promise backward
+records the evidence and implementation gates. No migration runtime or
+source is eligible at the recorded baseline, whose local writer still emits
+ordinary records as `RNL1`. The future migration-aware release must write and
+read only its single `RNL3` local stream format and supported consumer-state
+schema; `RNL1`, `RNL2`, mixed histories, old binaries, and obsolete state
+schemas are refused without source mutation. This product capability preserves
+the acknowledged state of the supported broker and does not promise backward
 compatibility. The [storage upgrade safety plan](design/storage-upgrade-safety-plan.md)
 owns shared offline conversion and recovery boundaries.
 
 Constraints:
 
-- the migration-aware current source format and consumer state must preserve logical offsets, ordering, timestamps, replay eligibility, producer request identity, acknowledged progress, attempts, and pinned policy snapshots; unsupported formats or records fail before source mutation;
+- when implemented, the migration-aware source release's single `RNL3` local format and supported consumer-state schema must preserve logical offsets, ordering, timestamps, replay eligibility, producer request identity, acknowledged progress, attempts, and pinned policy snapshots; unsupported formats or records fail before source mutation;
 - cutover must have a durable whole-source fence, all-voter target validation, explicit endpoint authority, and the first-target-write rollback boundary;
 - transfer memory, concurrent work, queues, temporary storage, and target reserve must be bounded and observable; the full maintenance-window cost must be measured before publishing an operational size or duration range;
 - applications must not need to learn Raft groups, replica placement, or storage paths.
 
 Acceptance criteria:
 
-- a documented, versioned procedure migrates representative supported current-source history and active consumer state to a fresh static cluster without old-binary or legacy-format compatibility promises;
-- preflight accepts only the current migration-aware source writer/reader and consumer-state schemas, and proves `RNL1`, `RNL2`, mixed histories, obsolete schemas, and unsupported records fail closed without source mutation;
+- a documented, versioned procedure migrates representative history from the future supported `RNL3`-only source release and active consumer state to a fresh static cluster without old-binary or legacy-format compatibility promises;
+- preflight accepts only the future migration-aware source release's single `RNL3` local format and supported consumer-state schema, and proves `RNL1`, `RNL2`, mixed histories, obsolete schemas, and unsupported records fail closed without source mutation;
 - real-process tests show that interrupted transfer, failed validation, restart, endpoint ambiguity, and cutover races resume safely or leave one explicit authority, with source-start refusal while fenced;
 - post-migration conformance tests preserve the current public delivery semantics, resolve exact pre-cutover request-ID retries, reject changed-content reuse, preserve consumer state, and prove timestamp/offset replay behavior;
 - tests prove read-only target activation, successful/proven-no-effect/ambiguous first-write outcomes, and the exact rollback closure point;

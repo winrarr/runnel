@@ -57,11 +57,14 @@ write or operate against that state.
 This policy does not create support for old broker binaries or reader-only
 historical formats. A conversion source must be produced by the currently
 supported writer and accepted by the currently supported reader for that
-artifact. For local stream logs, the migration-aware current format is `RNL3`;
-`RNL1` and `RNL2` stores are refused unchanged even if a historical reader can
-decode them. Extending a conversion to another source generation requires an
-explicitly accepted artifact-specific decision; parser compatibility alone is
-not eligibility.
+artifact. At the supplied baseline, local writes still emit ordinary `RNL1`
+records, so no source is eligible for the not-yet-implemented local-to-cluster
+migration. The accepted future migration source is a release whose single
+local stream format is `RNL3` and whose consumer-state schema is supported by
+that migration implementation; `RNL1` and `RNL2` stores are refused unchanged
+even if a historical reader can decode them. Extending a conversion to
+another source generation requires an explicitly accepted artifact-specific
+decision; parser compatibility alone is not eligibility.
 
 For a conversion, recovery selects exactly one complete source or target
 generation. It never chooses by directory order, timestamps, or the first

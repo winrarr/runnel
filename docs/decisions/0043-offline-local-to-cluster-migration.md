@@ -18,18 +18,22 @@ accepts offline side-by-side storage conversion and a durable first-write
 rollback boundary, but leaves engine migration to a separate decision.
 
 At the supplied baseline, the local reader recognizes `RNL1`, `RNL2`, and
-`RNL3`; that observed parser range is not the accepted migration source range.
-The supported migration source is the current migration-aware broker and its
-current `RNL3` writer/reader format. Stores containing `RNL1` or `RNL2` frames,
-including mixed histories, are refused unchanged even if a binary can decode
+`RNL3`, and the baseline writer still emits `RNL1` ordinary records. No source
+or migration runtime is eligible yet: this baseline has no migration fence or
+export/import path, and its writer format is outside the accepted source
+boundary. The future migration-aware release must use `RNL3` as its single
+local stream format and emit the state schema accepted by that release's
+migration implementation. Stores containing `RNL1` or `RNL2` frames, including
+mixed histories, are refused unchanged even if a historical reader can decode
 them. There is no deployed user base or backward-compatibility goal that
 justifies extending this first product capability to old binaries or
-reader-only on-disk formats. The current source also stores consumer progress,
-out-of-order acknowledgements, attempts, configured policy, and per-offset
-policy snapshots. Active delivery tokens and local lease deadlines are
-volatile. A clustered target stores logical messages in per-stream data
-groups, with replicated consumer state and request-ID deduplication. Current
-evidence covers recovery within each engine, not conversion between them.
+reader-only on-disk formats. The migration-aware source will also store
+consumer progress, out-of-order acknowledgements, attempts, configured policy,
+and per-offset policy snapshots. Active delivery tokens and local lease
+deadlines are volatile. A clustered target stores logical messages in
+per-stream data groups, with replicated consumer state and request-ID
+deduplication. Current evidence covers recovery within each engine, not
+conversion between them.
 
 Relevant reference systems establish different parts of the boundary. The
 versioned [PostgreSQL 18 `pg_upgrade` procedure](https://www.postgresql.org/docs/18/pgupgrade.html)
@@ -44,7 +48,8 @@ keeps an incompletely caught-up member out of client service and voting, while
 [RocksDB's MANIFEST/CURRENT design](https://github.com/facebook/rocksdb/wiki/MANIFEST)
 selects a complete durable generation explicitly. Runnel does not need an
 old-format bridge for an existing deployed population, so its first
-migration source boundary is intentionally the current writer format. The [Raft paper](https://raft.github.io/raft.pdf)
+migration source boundary is intentionally the future supported `RNL3`-only
+writer format. The [Raft paper](https://raft.github.io/raft.pdf)
 explains why a local append log is not a committed replicated-log prefix, and
 Google's [F1 asynchronous schema-change paper](https://research.google/pubs/online-asynchronous-schema-change-in-f1/)
 is evidence that live mixed-version reads and writes need explicit transition
@@ -119,8 +124,9 @@ activation. Unknown or corrupt complete source data, invalid names, consumer
 state outside the stream range, conflicting request identities, obsolete
 source formats, or any record or state the target schema cannot represent
 causes a non-destructive preflight refusal. `RNL1` and `RNL2` are outside the
-supported source boundary regardless of historical parser support. A current
-`RNL3` record outside target limits is also refused. Migration must not
+supported source boundary regardless of historical parser support. An
+`RNL3` record from the future supported source outside target limits is also
+refused. Migration must not
 truncate, skip, rewrite, or make the local source unreadable. The accepted
 contract does not turn current parser compatibility into a cross-release
 migration promise.
@@ -135,7 +141,7 @@ lease deadline are not portable. Fencing invalidates local receipts. Their
 attempt count and pinned policy remain, and the target applies its normal
 post-recovery expiry/redelivery rule before issuing a fresh target receipt.
 Source and target broker-wide fallbacks must match wherever a source consumer
-or legacy attempt has no explicit/pinned policy, unless the importer can
+or an attempt without a pinned policy depends on them, unless the importer can
 preserve the effective values in verified durable target state. A policy
 mismatch is a preflight refusal, not a silent policy change.
 
@@ -291,8 +297,8 @@ current source and target engines remain unchanged, and the backlog item stays
 open until the following evidence exists:
 
 - versioned source/target schema compatibility and read-only preflight accept
-  current `RNL3` source stores and reject `RNL1`, `RNL2`, mixed histories,
-  obsolete consumer-state schemas, corrupt, mismatched, and oversized state
+  stores from the future `RNL3`-only source release and reject `RNL1`, `RNL2`,
+  mixed histories, obsolete consumer-state schemas, corrupt, mismatched, and oversized state
   without source mutation; fixtures cover request identities, timestamp
   regressions, consumer progress, attempts, and pinned policies;
 - migration preserves logical bytes, exact offsets/order/timestamps, retained

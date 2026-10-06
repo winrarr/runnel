@@ -26,12 +26,14 @@ forward-only. The frozen source is retained as a rollback candidate only until
 that boundary and as a stale recovery artifact afterward. See [ADR 0043](../decisions/0043-offline-local-to-cluster-migration.md)
 for the accepted authority and preservation contract.
 
-The migration is an engine boundary, not a durable-format upgrade. The
-supported source is the migration-aware current broker using the current
-`RNL3` writer/reader format and consumer-state schema. `RNL1`, `RNL2`, mixed
-histories, old binaries, and obsolete state schemas are refused without source
-mutation, even if an observed historical reader can decode them. Copying a
-local file into a clustered directory,
+The migration is an engine boundary, not a durable-format upgrade. No source
+or migration runtime is eligible at the recorded baseline: it has no
+fence/import path and still writes ordinary records as `RNL1`. The future
+migration-aware release must use `RNL3` as its single local stream format and
+emit the consumer-state schema supported by its migration implementation.
+`RNL1`, `RNL2`, mixed histories, old binaries, and obsolete state schemas are
+refused without source mutation, even if an observed historical reader can
+decode them. Copying a local file into a clustered directory,
 republishing through the public API, or installing local files as an OpenRaft
 snapshot is not a supported migration.
 
@@ -50,7 +52,7 @@ boundary; it does not turn the current engines into a migration service.
 
 | Classification | Evidence in the current repository | Consequence for this note |
 | --- | --- | --- |
-| Observed local behavior | At the recorded baseline, the local broker selects one durable writer format at startup, scans known `RNL1`, `RNL2`, and `RNL3` frame magics, truncates an incomplete trailing frame during normal recovery, and persists consumer checkpoints/journal events. Consumer state includes the configured versioned policy and policy snapshots pinned to attempted offsets; process-local delivery members, tokens, and `Instant` deadlines are not durable. See [`BrokerState::open`](../../crates/runnel-core/src/broker.rs), [`ConsumerState`](../../crates/runnel-core/src/consumer_state.rs), [`StreamLog::open`](../../crates/runnel-core/src/stream_log.rs), and the recovery tests in [`runnel-core`](../../crates/runnel-core/src/lib.rs). | This is baseline reader evidence, not the migration eligibility rule. The accepted source is the current migration-aware broker and `RNL3` store; `RNL1` and `RNL2` are refused unchanged, including mixed histories. Preserve durable policies, snapshots, progress, and attempts, not volatile ownership. |
+| Observed local behavior | At the recorded baseline, the local broker writes ordinary records as `RNL1`, can select another durable writer format, scans known `RNL1`, `RNL2`, and `RNL3` frame magics, truncates an incomplete trailing frame during normal recovery, and persists consumer checkpoints/journal events. Consumer state includes the configured versioned policy and policy snapshots pinned to attempted offsets; process-local delivery members, tokens, and `Instant` deadlines are not durable. See [`BrokerState::open`](../../crates/runnel-core/src/broker.rs), [`ConsumerState`](../../crates/runnel-core/src/consumer_state.rs), [`StreamLog::open`](../../crates/runnel-core/src/stream_log.rs), and the recovery tests in [`runnel-core`](../../crates/runnel-core/src/lib.rs). | No source is migration-eligible at this baseline. A future migration-aware release must write and read only its single `RNL3` local stream format and supported consumer-state schema; `RNL1`, `RNL2`, and mixed histories are refused unchanged. Preserve durable policies, snapshots, progress, and attempts, not volatile ownership. |
 | Observed clustered behavior | The clustered engine selects the Raft backend at process startup. Startup validates clustered storage identity and persisted artifacts before opening groups; stream creation reconciles metadata `Creating`/`Active` state with one data group per stream and the configured peer set. The current layout uses `storage.json`, `groups/metadata`, and `groups/data/<hex-stream>` with an identity-bearing `group.json`. Grouped consumer state includes configured policy and per-offset policy snapshots along with durable progress and attempts; delivery ownership and deadlines are replicated. See [`PersistentEngine::open_with_config`](../../crates/runnel-raft/src/engine.rs), [`GroupConsumerState`](../../crates/runnel-raft/src/delivery.rs), [`GroupManager`](../../crates/runnel-raft/src/group_manager.rs), [`StateMachineStore`](../../crates/runnel-raft/src/state_machine_store.rs), and [`SnapshotState`](../../crates/runnel-raft/src/state_machine.rs). The detailed current artifact/version evidence is in the [TD-007 compatibility note](td-007-storage-compatibility-evidence.md) and [TD-009 snapshot note](td-009-snapshot-evidence.md). | A fresh target can be populated only through a future logical import path. The existing public `Publish`, `CreateStream`, and snapshot-recovery paths are not a local-to-cluster interchange format. |
 | Observed absence | There is no migration command, import/export schema, durable migration phase, writer-fence epoch, endpoint-generation owner, or migration-specific status/metric in the current code. ADR 0031 accepts negotiated v2 outcomes, but its runtime remains incomplete. Existing clustered identity checks intentionally reject ambiguous state; they do not convert it. Current snapshot and peer metrics describe recovery activity only. Existing tests cover local recovery and clustered restart/failure, not cross-engine migration. | Fence, import, activation, rollback, and migration-status behavior are accepted for future implementation under ADR 0043; none is current support. |
 | Accepted first supported boundary | Offline, all-stream logical export/import into an empty, fresh three-voter target. The whole source deployment is durably fenced before export and remains unavailable through validation and explicit endpoint cutover; target is read-only until its first-write gate. | [ADR 0043](../decisions/0043-offline-local-to-cluster-migration.md) accepts the behavior but does not implement it. It preserves the messaging model, not availability during transfer, zero downtime, or automatic downgrade. |
@@ -111,7 +113,7 @@ explicitly defers mixed engines and live engine migration.
 
 | State | Current representation | Migration consequence |
 | --- | --- | --- |
-| Stream history | At the recorded baseline, `streams/<stream>.log` may contain `RNL1`, `RNL2`, and request-aware `RNL3` record families. Each frame carries a logical offset, publish timestamp, optional UTF-8 key, and payload; `RNL3` also carries typed request identity. Current request-aware writers bound keys to 128 bytes, payloads to 64 MiB, and request IDs to 1 KiB. | The migration-aware source must contain only current `RNL3` frames. `RNL1`, `RNL2`, and mixed histories are rejected before source mutation regardless of historical parser support. Preserve fields and bytes in an explicitly versioned import representation, not local frame layout or file name. |
+| Stream history | At the recorded baseline, `streams/<stream>.log` may contain `RNL1`, `RNL2`, and request-aware `RNL3` record families. Each frame carries a logical offset, publish timestamp, optional UTF-8 key, and payload; `RNL3` also carries typed request identity. Baseline request-aware writes bound keys to 128 bytes, payloads to 64 MiB, and request IDs to 1 KiB. | The future migration-aware source must contain only its single `RNL3` local format. `RNL1`, `RNL2`, and mixed histories are rejected before source mutation regardless of historical parser support. Preserve fields and bytes in an explicitly versioned import representation, not local frame layout or file name. |
 | Recovery/index state | The local log scans complete frames on open, truncates only an incomplete trailing frame, retains a bounded recent index, and uses a bounded sparse index for older reads. The async engine dispatches this synchronous work through bounded per-stream storage lanes; those lanes are execution isolation, not a migration boundary. | Export only after normal recovery has established a complete source boundary. A malformed complete frame is a validation failure; it must not be skipped or turned into a gap. |
 | Producer retry identity | The local `request_ids` map is rebuilt from request-aware frames. Under [ADR 0034](../decisions/0034-publish-request-id-content-contract.md), an exact public retry returns its first offset and changed representable key or payload is a confirmed conflict. | Import each identity kind, original offset, and comparison content. Reject a conflicting mapping and preserve exact-retry/conflict semantics. Records without an ID remain non-deduplicated; internal dead-letter move identities remain distinct under ADR 0029. |
 | Ordinary and grouped consumer state | Local `consumers/<stream>/<consumer>.json` stores `committed_offset`, out-of-order `acknowledged_offsets`, `delivery_attempts`, optional versioned `policy`, and per-offset `delivery_policies` pinned on first assignment and reused on retries. The adjacent `.json.tmp` path is an append-only event journal with a bounded size; checkpoint compaction writes a separate `.checkpoint.tmp` file and renames it into place. Older checkpoints/journal events default absent policy fields. | Convert this logical state into the clustered consumer-state schema. Preserve the configured policy version and values plus every persisted per-offset policy snapshot with its attempt; these snapshots keep an in-progress record's retry budget stable across a later policy update. Do not copy the JSON file or either temporary path as if it were a clustered snapshot. Validate every offset and policy against the imported stream and accepted policy limits. |
@@ -281,11 +283,12 @@ formats merely readable for historical compatibility.
 
 ### Source
 
-- A cleanly recoverable store produced by the currently supported,
-  migration-aware source-broker binary, using only current `RNL3` stream
-  frames and its current consumer-state schema. `RNL1`, `RNL2`, mixed histories,
-  old software generations, and obsolete state schemas fail preflight without
-  mutation; reader support alone never makes them eligible.
+- A cleanly recoverable store produced by a future supported,
+  migration-aware source-broker binary, using only its single `RNL3` local
+  stream format and its supported consumer-state schema. No source qualifies
+  at the recorded baseline. `RNL1`, `RNL2`, mixed histories, old software
+  generations, and obsolete state schemas fail preflight without mutation;
+  reader support alone never makes them eligible.
 - Valid stream and consumer names, complete logical offsets, and consumer
   states whose offsets, attempt entries, configured policy, and per-offset
   policy snapshots can be checked against their stream and supported bounds.
@@ -296,10 +299,10 @@ formats merely readable for historical compatibility.
   to the target or explicitly covered by a compatibility rule. The first
   implementation should preserve each configured consumer policy and its
   version, plus the policy snapshot pinned to each outstanding attempt. For
-  consumers without an explicit policy, and attempts whose old journal event
-  has no policy snapshot, require equivalent source and target broker-wide
-  acknowledgement-timeout, attempt-limit, and retry-delay fallbacks unless the importer can
-  preserve their effective behavior another verified way.
+  consumers without an explicit policy, and attempts without a pinned policy,
+  require equivalent source and target broker-wide acknowledgement-timeout,
+  attempt-limit, and retry-delay fallbacks unless the importer can preserve
+  their effective behavior another verified way.
 
 ### Target
 
@@ -344,7 +347,8 @@ backup, and transfer begin. The implementation should:
    drain admitted work at one deployment-wide boundary, and persist the source
    migration ID and monotonically increasing fence epoch before declaring the
    source fenced;
-3. recover and scan each stream through its declared current source reader,
+3. recover and scan each stream through the declared reader from that source
+   release,
    checking offset
    continuity, frame checksums where applicable, key UTF-8 validity, payload
    lengths, timestamp fields, and request-ID mappings;
@@ -355,8 +359,8 @@ backup, and transfer begin. The implementation should:
 5. record source configuration and compatibility descriptors, including
    broker-wide fallback timeout, attempt limit, retry delay, configured
    consumer policies and pinned snapshots, retention/replay policy, current
-   protocol and schema versions, declared source writer formats, and migration
-   tool version;
+   protocol and schema versions, the future source release's single `RNL3`
+   writer format, and migration tool version;
 6. create and independently verify a restorable recovery artifact from the
    frozen source boundary, separate from the target and from source-only
    rollback state; and
@@ -444,8 +448,8 @@ For every `(stream, consumer)` pair, import:
 - any durably scheduled retry-not-before state, represented as remaining
   bounded delay at the fence and rebased against the target clock;
 - for attempted offsets with no persisted policy snapshot, the same effective
-  source fallback policy, including legacy events whose attempt record predates
-  per-offset policy snapshots;
+  source fallback policy, including any current-schema attempt without a pinned
+  policy;
 - the consumer’s stream/name identity and a state digest; and
 - no local delivery token, `Instant` deadline, or transient member ownership.
 
@@ -668,7 +672,7 @@ small compatibility matrix:
 | Dimension | Supported first slice | Refused or deferred |
 | --- | --- | --- |
 | Public protocol | The target implements the negotiated application protocol accepted by [ADR 0031](../decisions/0031-protocol-v2-contract.md). Migration adds no previous-version compatibility or automatic client reconnection promise. | Provisional v1 declaration, mixed-version operation, or topology fields as migration evidence. |
-| Local record encoding | Current `RNL3` stream frames and consumer-state schemas emitted by the migration-aware current source, subject to target representability. | `RNL1`, `RNL2`, mixed histories, old software generations, obsolete state schemas, unknown or malformed complete records, unbounded lengths, and guessed conversion. Historical reader support creates no compatibility promise. |
+| Local record encoding | A future migration-aware source release that writes and reads only its single `RNL3` local stream format and supported consumer-state schema, subject to target representability. No source is eligible at the recorded baseline. | `RNL1`, `RNL2`, mixed histories, old software generations, obsolete state schemas, unknown or malformed complete records, unbounded lengths, and guessed conversion. Historical reader support creates no compatibility promise. |
 | Cluster representation | Current target metadata/data-group layout: `storage.json` and the Raft log use version 1, the state-machine journal uses record version 1, checkpoint and snapshot payloads emit version 2 with narrow version-1 read-forward support, and the current `group.json` manifest shape binds stream/group identity. | Import into an older target, unknown target schema, or arbitrary OpenRaft on-disk layout. |
 | Consumer semantics | Local committed and out-of-order acknowledged progress, attempts, configured policy/version including retry delay, durable retry scheduling, and per-offset policy snapshots convert into coherent clustered state. Outstanding local tokens/deadlines are dropped and redelivered under target rules. | Transferring local receipts or monotonic deadlines, dropping a pinned policy or scheduled delay, or changing retry/ack semantics. |
 | Producer identity | Public IDs preserve original offsets and exact comparison content under ADR 0034; internal dead-letter identities remain distinct under ADR 0029. | Deduplicating requests without IDs, inventing IDs, merging identity kinds, or changing key/payload conflict behavior. |
@@ -841,9 +845,10 @@ when they satisfy that contract.
 1. **Schema and preflight outcome.** Evidence establishes a versioned logical
    export/import schema, source/target identity tuple, digest rules,
    compatibility matrix, and a read-only source scanner. Fixtures cover
-   current `RNL3` source records, explicit `RNL1`/`RNL2` and mixed-history
-   refusals, request identities, out-of-order acknowledgements, attempts and
-   pinned policies, malformed state, invalid names, and unavailable history.
+   source records from the future single-format `RNL3` release, explicit
+   `RNL1`/`RNL2` and mixed-history refusals, request identities,
+   out-of-order acknowledgements, attempts and pinned policies, malformed
+   state, invalid names, and unavailable history.
    Historical formats or records outside the declared migration matrix are
    proven to refuse without mutation.
 2. **Fresh-target logical import outcome.** Evidence establishes an internal
@@ -882,15 +887,16 @@ are the starting points for a future named migration workflow.
 
 ### Baseline and data fixture
 
-Start a migration-aware current local source process and use the supported
-client to create multiple streams, including a dead-letter stream, then
+Start the future migration-aware, `RNL3`-only local source release and use the
+supported client to create multiple streams, including a dead-letter stream, then
 publish:
 
 - empty and non-empty keys;
 - binary and UTF-8 payloads;
 - records with and without stable request IDs, including exact retries and a
   changed-content conflict;
-- every writer format the source binary declares eligible for migration; and
+- its single `RNL3` writer format, plus refusal fixtures for `RNL1`, `RNL2`,
+  and mixed histories; and
 - enough history to cross the local bounded tail index.
 
 Create independent consumers and a shared consumer. Acknowledge records in and
@@ -1028,8 +1034,8 @@ validation, endpoint reconciliation, first-write resolution, and real-process
 recovery gates pass. The [backlog outcome](../backlog.md#make-growth-from-one-node-to-a-cluster-non-disruptive)
 and [TD-007](../tech-debt.md#td-007-storage-conversion-and-artifact-compatibility-remain-open)
 remain open for that runtime work. Old software generations and historical
-formats not emitted by an eligible current source are explicitly outside the
-acceptance matrix. Online migration, dynamic placement, and segmented storage
+formats not emitted by the future eligible source release are explicitly
+outside the acceptance matrix. Online migration, dynamic placement, and segmented storage
 remain separate outcomes; no additional tech-debt entry is warranted because
 these are not current implementation shortcuts.
 
