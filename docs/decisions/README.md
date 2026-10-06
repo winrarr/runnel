@@ -37,5 +37,6 @@ Current decisions:
 - 0031-protocol-v2-contract.md: accept a Protobuf v3, connection-negotiated public v2 contract with explicit directional frame limits and stage-aware outcomes.
 - 0032-static-cluster-peer-mutual-tls.md: require mutual TLS and bind peer certificates to configured static node and cluster identities.
 - 0033-fixed-consumer-retry-delay.md: accept a bounded fixed per-consumer retry delay, separate from the acknowledgement lease, pinned per offset, and started at the first durable expiry observation.
+- 0034-publish-request-id-content-contract.md: equivalent-content publish retries return the original offset; changed content for a retained stream-scoped request ID is a confirmed rejection.
 
 Proposed decisions awaiting review: none.
