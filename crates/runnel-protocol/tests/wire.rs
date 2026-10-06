@@ -137,6 +137,7 @@ fn consumer_policy_response_round_trips() {
         configured: true,
         ack_timeout_ms: 250,
         max_delivery_attempts: Some(3),
+        retry_delay_ms: 500,
     };
     let decoded: Response =
         serde_json::from_str(&serde_json::to_string(&response).unwrap()).unwrap();
@@ -144,6 +145,11 @@ fn consumer_policy_response_round_trips() {
         decoded,
         Response::ConsumerPolicy { version: 1, .. }
     ));
+
+    assert!(serde_json::from_str::<Response>(
+        r#"{"type":"consumer_policy","stream":"events","consumer":"worker","version":1,"configured":true,"ack_timeout_ms":250,"max_delivery_attempts":3}"#,
+    )
+    .is_err());
 }
 
 #[test]
@@ -530,13 +536,15 @@ fn current_request_fixtures_pin_v1_tags_and_fields() {
                 consumer: "worker".to_owned(),
                 ack_timeout_ms: 250,
                 max_delivery_attempts: Some(3),
+                retry_delay_ms: 0,
             },
             serde_json::json!({
                 "op": "configure_consumer",
                 "stream": "events",
                 "consumer": "worker",
                 "ack_timeout_ms": 250,
-                "max_delivery_attempts": 3
+                "max_delivery_attempts": 3,
+                "retry_delay_ms": 0
             }),
         ),
         (
@@ -604,8 +612,9 @@ fn consumer_policy_request_fixtures_pin_serialization_and_deserialization() {
                 consumer: "worker".to_owned(),
                 ack_timeout_ms: 250,
                 max_delivery_attempts: Some(3),
+                retry_delay_ms: 0,
             },
-            r#"{"op":"configure_consumer","stream":"events","consumer":"worker","ack_timeout_ms":250,"max_delivery_attempts":3}"#,
+            r#"{"op":"configure_consumer","stream":"events","consumer":"worker","ack_timeout_ms":250,"max_delivery_attempts":3,"retry_delay_ms":0}"#,
         ),
         (
             "inspect_consumer",
@@ -634,14 +643,18 @@ fn consumer_policy_request_fixtures_pin_serialization_and_deserialization() {
         );
     }
 
-    let omitted_optional_field: Request = serde_json::from_str(
-        r#"{"op":"configure_consumer","stream":"events","consumer":"worker","ack_timeout_ms":250}"#,
+    let omitted_optional_max_attempts: Request = serde_json::from_str(
+        r#"{"op":"configure_consumer","stream":"events","consumer":"worker","ack_timeout_ms":250,"retry_delay_ms":0}"#,
     )
     .unwrap();
     assert_eq!(
-        serde_json::to_string(&omitted_optional_field).unwrap(),
-        r#"{"op":"configure_consumer","stream":"events","consumer":"worker","ack_timeout_ms":250,"max_delivery_attempts":null}"#
+        serde_json::to_string(&omitted_optional_max_attempts).unwrap(),
+        r#"{"op":"configure_consumer","stream":"events","consumer":"worker","ack_timeout_ms":250,"max_delivery_attempts":null,"retry_delay_ms":0}"#
     );
+    assert!(serde_json::from_str::<Request>(
+        r#"{"op":"configure_consumer","stream":"events","consumer":"worker","ack_timeout_ms":250,"max_delivery_attempts":null}"#
+    )
+    .is_err());
 }
 
 #[test]

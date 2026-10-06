@@ -93,6 +93,76 @@ impl Drop for RunningServer {
 }
 
 #[test]
+fn server_refuses_rnl3_v1_streams_without_modifying_them() {
+    let directory = TempDir::new().unwrap();
+    let stream_directory = directory.path().join("streams");
+    std::fs::create_dir_all(&stream_directory).unwrap();
+
+    let mut old_frame = vec![0; 48];
+    old_frame[..4].copy_from_slice(b"RNL3");
+    old_frame[4] = 1;
+    old_frame[6..8].copy_from_slice(&48_u16.to_le_bytes());
+    let stream_path = stream_directory.join("events.log");
+    std::fs::write(&stream_path, &old_frame).unwrap();
+
+    let broker_addr = free_addr();
+    let http_addr = free_addr();
+    let mut child = Command::new(server_binary())
+        .args([
+            "--data-dir",
+            directory.path().to_str().unwrap(),
+            "--listen",
+            &broker_addr.to_string(),
+            "--http-listen",
+            &http_addr.to_string(),
+        ])
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("runnel server process should start");
+    let mut stderr = child.stderr.take().expect("stderr should be piped");
+    let stderr_reader = std::thread::spawn(move || {
+        let mut output = Vec::new();
+        stderr
+            .read_to_end(&mut output)
+            .expect("server stderr should be readable");
+        output
+    });
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let status = loop {
+        if let Some(status) = child.try_wait().expect("server status should be readable") {
+            break status;
+        }
+        if Instant::now() >= deadline {
+            child
+                .kill()
+                .expect("unexpectedly running server should stop");
+            child.wait().expect("timed-out server should be reaped");
+            let _ = stderr_reader.join();
+            panic!("server should refuse an unsupported stream format during startup");
+        }
+        sleep(Duration::from_millis(10));
+    };
+    let stderr = String::from_utf8(stderr_reader.join().expect("stderr reader should finish"))
+        .expect("server stderr should be UTF-8");
+
+    assert!(
+        !status.success(),
+        "server unexpectedly opened an RNL3 v1 stream"
+    );
+    assert!(
+        stderr.contains("unsupported RNL3 record version"),
+        "server should report the unsupported stream format clearly: {stderr}"
+    );
+    assert_eq!(
+        std::fs::read(stream_path).unwrap(),
+        old_frame,
+        "server startup must preserve the unsupported stream artifact"
+    );
+}
+
+#[test]
 fn network_protocol_persists_acknowledgements_across_restart() {
     let directory = TempDir::new().unwrap();
     let server = RunningServer::start(directory.path());
@@ -1463,6 +1533,73 @@ fn network_protocol_returns_partial_publish_batch_outcomes() {
                 PublishBatchRecordResponse::Error { code, .. },
                 PublishBatchRecordResponse::Published { offset: 0 },
             ] if code == "invalid_record")
+    ));
+}
+
+#[test]
+fn network_protocol_rejects_oversized_rnl1_records_without_consuming_offsets() {
+    let directory = TempDir::new().unwrap();
+    let server = RunningServer::start(directory.path());
+    assert!(matches!(
+        request(
+            server.broker_addr,
+            Request::CreateStream {
+                stream: "events".to_owned(),
+            },
+        ),
+        Response::StreamCreated { created: true, .. }
+    ));
+
+    assert!(matches!(
+        request(
+            server.broker_addr,
+            Request::Publish {
+                stream: "events".to_owned(),
+                key: Some("k".repeat(129)),
+                payload: "rejected".to_owned(),
+                request_id: None,
+            },
+        ),
+        Response::Error { code, message }
+            if code == "invalid_record" && message.contains("129 bytes")
+    ));
+    assert!(matches!(
+        request(
+            server.broker_addr,
+            Request::Publish {
+                stream: "events".to_owned(),
+                key: None,
+                payload: "accepted".to_owned(),
+                request_id: None,
+            },
+        ),
+        Response::Published { offset: 0, .. }
+    ));
+
+    assert!(matches!(
+        request(
+            server.broker_addr,
+            Request::PublishBatch {
+                stream: "events".to_owned(),
+                records: vec![
+                    PublishBatchRecord {
+                        key: Some("k".repeat(129)),
+                        payload_base64: BinaryPayload::new(b"rejected".to_vec()),
+                        request_id: None,
+                    },
+                    PublishBatchRecord {
+                        key: None,
+                        payload_base64: BinaryPayload::new(b"accepted".to_vec()),
+                        request_id: None,
+                    },
+                ],
+            },
+        ),
+        Response::PublishBatch { outcomes, .. }
+            if matches!(outcomes.as_slice(), [
+                PublishBatchRecordResponse::Error { code, message },
+                PublishBatchRecordResponse::Published { offset: 1 },
+            ] if code == "invalid_record" && message.contains("129 bytes"))
     ));
 }
 

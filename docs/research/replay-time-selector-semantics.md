@@ -1,18 +1,19 @@
 # Replay time-selector semantics
 
-- Status: source research; selector semantics accepted by ADR 0038, runtime and API remain open
+- Status: source research; selector semantics accepted by ADR 0038 and index/recovery contract accepted by ADR 0042; runtime and API remain open
 - Last reviewed: 2026-10-06
-- Baseline inspected: `5dc76270a46690fce074fcaf61b5a8cda9838cd0`
+- Baseline inspected: `da6b14e72ce75317ad0fa3fe05f91a28026b67b2`
 - Primary evidence class: design/research; secondary: correctness/reliability, storage/recovery
 - Scope: meanings and operational bounds for unfinished time-based replay and durable sessions
 - Related: [replay backlog outcome](../backlog.md#make-replay-an-explicit-and-safe-consumer-operation), [ADR 0024](../decisions/0024-explicit-offset-replay-read.md), [ADR 0038](../decisions/0038-timestamp-based-replay-selector.md), [retention and disk-pressure design](../design/retention-disk-pressure-plan.md), and [durable replay sessions](../design/replay-sessions.md)
 
 This note records the current timestamp source, relevant reference behavior,
 and lookup constraints for the replay selector. [ADR 0038](../decisions/0038-timestamp-based-replay-selector.md)
-now accepts the selector semantics; this note does not add runtime behavior or
-select an API representation, index layout, or replay-session contract. The
-inspected baseline is code evidence, not a claim that a timestamp selector is
-already implemented.
+accepts the selector semantics, and [ADR 0042](../decisions/0042-recoverable-replay-time-index.md)
+selects its derived prefix-maximum index and recovery boundary. Neither adds
+runtime behavior or selects an API representation or replay-session contract.
+The inspected baseline is code evidence, not a claim that a timestamp selector
+is already implemented.
 
 ## Current Runnel behavior
 
@@ -58,6 +59,18 @@ are evidence for design tradeoffs, not a Runnel compatibility target.
   [`message.timestamp.type`](https://kafka.apache.org/42/configuration/topic-configs/).
   This makes the selector boundary and timestamp source explicit, but it does
   not settle Runnel's retention completeness or replay-session behavior.
+  Kafka's accepted [KIP-33 time-index proposal](https://cwiki.apache.org/confluence/display/KAFKA/KIP-33+-+Add+a+time+based+log+index)
+  records a sparse maximum-timestamp/offset index and scans the log around the
+  selected entry. It notes that indexes are monotone only within a segment and
+  allows earlier-timestamp records in a lookup result. This is useful evidence
+  for sparse summaries and scan bounds, but its result allowance is weaker
+  than Runnel's exact lowest-offset selector.
+- [PostgreSQL BRIN indexes](https://www.postgresql.org/docs/current/brin.html)
+  summarize adjacent physical block ranges and recheck candidate tuples;
+  min/max range summaries can be compact, with range size trading index size
+  against false-positive scans. Runnel borrows the compact-block idea but
+  needs an ordered prefix summary so one binary search identifies the first
+  possible matching block under arbitrary timestamp regressions.
 - [Pulsar's Reader API](https://pulsar.apache.org/api/client/4.2.x/org/apache/pulsar/client/api/Reader.html)
   accepts a Unix-millisecond timestamp to reposition a reader by message
   publish time. The public API describes a reader position reset; it does not
@@ -210,21 +223,25 @@ IDs, Raft log IDs, node placement, or other physical storage coordinates.
 
 ## Bounds and operational implications
 
-There is no time lookup operation or timestamp index in the current replay
-contract. The local log keeps logical-offset lookup structures, while the
-clustered state machine holds retained messages in an offset-ordered vector.
-The minimum matching offset under timestamp regressions may require examining
-the retained range. That could turn a one-record read into history-proportional
-work, hold the local per-stream lock, or consume clustered state-machine work.
-No cost has yet been measured for such a query.
+No time lookup operation is implemented. The local log keeps logical-offset
+lookup structures, while the clustered state machine holds retained messages
+in an offset-ordered vector. The minimum matching offset under timestamp
+regressions cannot be found by binary-searching record timestamps. A plain
+timestamp-sorted index also does not preserve logical-offset order.
 
-ADR 0038 therefore gates runtime support on a recoverable index that preserves
-logical-order selection without scanning history per request. The exact data
-layout remains open. Verify bounded work for no-match, sparse-match, equal-time,
-and regressing-time cases; index update/rebuild cost; and impact on concurrent
-publish/poll paths. The local index and clustered replicated state must agree
-after restart and snapshot recovery. The selector must not starve foreground
-consumers.
+[ADR 0042](../decisions/0042-recoverable-replay-time-index.md) selects an
+offset-ordered index with one cumulative prefix maximum per 256-record block.
+The checkpoint values are monotone even when record timestamps regress, so a
+lower-bound search finds the first block that can contain a match; scanning
+that block in logical order finds the exact earliest match. This bounds a
+request to logarithmic checkpoint comparisons plus at most 256 record-header
+checks. Local byte cursors are stored with checkpoints; clustered block
+offsets follow from the retained floor. The index is derived from the local
+log or committed clustered state, rebuilt on open/recovery, and reconstructed
+after snapshot installation. It adds a deterministic sparse metadata cost of
+one compact summary per 256 retained records, which still grows with retained
+history. Startup, resident-memory, and foreground publish/poll effects need
+measurement; the decision makes no performance claim.
 
 ## Disposition
 
@@ -236,10 +253,10 @@ prefix could contain an earlier match. This selects broker-assigned publish
 time, not event time or a globally ordered physical clock.
 
 Runtime work is next within the replay backlog, not deferred pending another
-semantic decision. The first slice is a bounded one-record time selector. It
-must include a recoverable lookup index that is correct under timestamp
-regression; implementing an unbounded scan would not satisfy the backlog's
-resource constraint. Pages and durable sessions remain follow-on decisions
+semantic decision. The first slice is a bounded one-record time selector
+using the index contract in ADR 0042; implementing a history-proportional
+request scan would not satisfy the backlog's resource constraint. Pages and
+durable sessions remain follow-on decisions
 because they add cursor, fencing, failover, and retention-pin lifecycle state.
 
 Evidence needed before implementation includes:
@@ -253,18 +270,21 @@ Evidence needed before implementation includes:
   above the selector threshold, including missing/corrupt summary metadata;
 - local and clustered tests that capture the same logical view during
   concurrent publish, poll, acknowledgement, and replay;
-- restart and leader-change coverage for any persisted replay session, cursor,
-  retention pin, or timestamp index;
+- restart and leader-change coverage for derived-index rebuild, plus snapshot
+  installation and future persisted retention-floor metadata;
 - bounded-work and resource evidence over increasing retained-history sizes,
   including impact on foreground poll/publish latency.
 
 ## Code and planning assessment
 
 The inspection covered the current local and clustered replay paths, the
-shared replay contract, the timestamp creation paths, ADR 0024, and the
-retention design proposal. This documentation run changes no runtime or tests. No separate refactor is
-selected: timestamp-index format and update mechanics must follow the accepted
-semantics and storage recovery evidence. The existing replay backlog remains
-the correct tracker. TD-002 and TD-010 already cover local cold scans and
-clustered retained-history traversal; they are updated to link this accepted
-selector and its implementation gate. No new debt identifier is warranted.
+shared replay contract, the timestamp creation paths, ADRs 0024, 0036, and
+0038, the retention proposal, Kafka KIP-33, and PostgreSQL BRIN behavior.
+This documentation run changes no runtime or tests. [ADR 0042](../decisions/0042-recoverable-replay-time-index.md)
+selects the routine index and recovery details: cumulative prefix-maximum
+checkpoints, a 256-record scan bound, deterministic rebuild, and a
+fail-closed contiguous-prefix retention boundary. The existing replay backlog
+remains the correct tracker. TD-002 and TD-010 already cover local cold scans
+and clustered retained-state growth; their retirement conditions remain open
+for implementation, measurement, and failure evidence. No new debt identifier
+is warranted.

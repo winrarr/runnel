@@ -75,6 +75,8 @@ class DockerContainer:
     data_dir: Path
     data_target: str
     command: list[str] = field(default_factory=list)
+    extra_mounts: tuple[tuple[Path, str], ...] = ()
+    user: str | None = None
     environment: dict[str, str] = field(default_factory=dict)
     entrypoint: str | None = None
     published_ports: tuple[int, ...] = ()
@@ -184,6 +186,10 @@ class DockerContainer:
         for port in self.published_ports:
             command.extend(["--publish", f"127.0.0.1::{port}"])
         command.extend(["--volume", f"{self.data_dir}:{self.data_target}"])
+        for source, target in self.extra_mounts:
+            command.extend(["--volume", f"{source}:{target}:ro"])
+        if self.user is not None:
+            command.extend(["--user", self.user])
         if self.entrypoint:
             command.extend(["--entrypoint", self.entrypoint])
         for key, value in self.environment.items():

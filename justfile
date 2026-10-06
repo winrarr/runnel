@@ -102,7 +102,7 @@ bench-compare:
     python3 scripts/benchmarks/lock.py --path {{benchmark_lock}} --mode exclusive -- python3 scripts/benchmarks/compare.py --build-runnel
 
 bench-compare-cluster:
-    python3 scripts/benchmarks/lock.py --path {{benchmark_lock}} --mode exclusive -- python3 scripts/benchmarks/compare.py --nodes 3 --backends kafka,redpanda,nats --messages 1000 --payload-sizes 100,1024 --cpus 2 --memory 2g --client-cpus 1 --client-memory 512m
+    python3 scripts/benchmarks/lock.py --path {{benchmark_lock}} --mode exclusive -- python3 scripts/benchmarks/compare.py --nodes 3 --backends runnel,kafka,redpanda,nats --build-runnel --messages 1000 --payload-sizes 100,1024 --cpus 2 --memory 2g --client-cpus 1 --client-memory 512m
 
 bench-dashboard:
     python3 scripts/benchmarks/build_history.py --runs benchmark-results --output benchmark-results/site

@@ -1,11 +1,11 @@
 # ADR 0038: Define timestamp-based replay selection
 
-- Status: accepted for selector semantics; runtime and protocol representation remain open
+- Status: selector semantics accepted; [ADR 0042](0042-recoverable-replay-time-index.md) accepts the index/recovery contract; runtime and protocol representation remain open
 - Date: 2026-10-06
 - Baseline: `5dc76270a46690fce074fcaf61b5a8cda9838cd0`
 - Primary evidence class: design/research; secondary: correctness/reliability, storage/recovery
 - Related outcome: [Make replay an explicit and safe consumer operation](../backlog.md#make-replay-an-explicit-and-safe-consumer-operation)
-- Related decisions: [ADR 0024](0024-explicit-offset-replay-read.md), [ADR 0023](0023-independent-retained-storage-and-placement.md), and [ADR 0031](0031-protocol-v2-contract.md)
+- Related decisions: [ADR 0024](0024-explicit-offset-replay-read.md), [ADR 0023](0023-independent-retained-storage-and-placement.md), [ADR 0031](0031-protocol-v2-contract.md), and [ADR 0042](0042-recoverable-replay-time-index.md)
 - Design: [replay selectors and bounded sessions](../design/replay-sessions.md)
 - Research: [replay time-selector semantics](../research/replay-time-selector-semantics.md)
 
@@ -88,16 +88,14 @@ consistent stream view:
    equivalent completeness proof.
 
 Before exposing the selector, implementation must resolve it without an
-unbounded history scan. The lookup structure must preserve the lowest logical
-offset semantics even when timestamps regress, have explicit work and result
-bounds, and rebuild/recover consistently in both engines. One candidate is an
-offset-ordered hierarchy of fixed-size chunks with a maximum timestamp per
-chunk: descend to the leftmost chunk whose maximum is at least T, then scan
-that bounded chunk in logical order. This illustrates the requirement; it
-does not mandate a storage layout. Clustered state must make lookup consistent
-with the committed stream view, and snapshots/recovery must retain or
-deterministically rebuild the index. When prefix retention is introduced,
-recovery must also preserve or rebuild the complete deleted-prefix maximum.
+unbounded history scan. [ADR 0042](0042-recoverable-replay-time-index.md)
+selects an offset-ordered cumulative prefix-maximum checkpoint index with
+256-record blocks. Monotone prefix summaries remain searchable under timestamp
+regressions; the first qualifying block is scanned in logical order. The index
+is derived from the authoritative log/state and rebuilt on recovery and
+snapshot installation. When prefix retention is introduced, recovery must
+also preserve or rebuild the complete deleted-prefix maximum. See ADR 0042
+for work, memory, result, and runtime acceptance bounds.
 
 ## Alternatives considered
 
@@ -152,10 +150,13 @@ explicitly and account for late or clock-skewed records.
   retention, test `D < T`, `D = T`, `D > T`, absent/corrupt summary, and a
   retained matching record after deleted matching history; only the first case
   may safely continue to retained lookup.
-- Establish a timestamp lookup structure whose work is bounded independent of
-  retained message count, including the no-match and adversarial regression
-  cases. Test index rebuild, persistence/version migration, crash recovery,
-  snapshot installation, and agreement between local and clustered results.
+- Establish the ADR 0042 timestamp index with a bounded checkpoint search and
+  at most 256 record-header checks, including no-match and adversarial
+  regression cases. Test rebuild, crash recovery, snapshot installation, and
+  agreement between local and clustered results. Recovery must validate the
+  authoritative state and future retention metadata under their current
+  contracts; the derived index is rebuilt and has no separate index-format
+  migration.
 - Exercise real server/process and three-node paths for the eventual public
   operation. Measure selector latency, bytes/records examined, index space,
   recovery cost, and foreground publish/poll latency over increasing histories.

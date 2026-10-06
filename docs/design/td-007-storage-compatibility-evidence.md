@@ -24,23 +24,7 @@ upgrade, downgrade, or new-format runtime support has been implemented.
 Local and clustered engines have separate persistent artifacts and different
 version boundaries:
 
-- The local stream reader dispatches recognized `RNL1`, `RNL2`, and `RNL3`
-  frames by magic. `RNL2` is a versioned, checksummed record; `RNL3` carries a
-  request identity. The mixed-format test covers `RNL1` followed by `RNL2`;
-  request-ID persistence and restart recovery are tested separately. A
-  complete record with an invalid legacy key, unsupported magic, checksum
-  mismatch in formats that carry one, or offset gap fails recovery; an
-  incomplete trailing frame is discarded. The initial `RNL1` writer encoded a
-  28-byte header (magic, little-endian `u64` offset and timestamp, and
-  independent little-endian `u32` key and payload lengths) followed by UTF-8
-  key bytes and opaque payload bytes, with no lower format or application cap.
-  Each field could therefore be as large as `u32::MAX` bytes, for a maximum
-  encoded record of `28 + 2 × u32::MAX` (8,589,934,618) bytes, subject to
-  physical storage and process addressability. This establishes the historical
-  encoded envelope, not that near-limit records exist or that such allocations
-  are operationally safe.
-  The current reader has no smaller `RNL1` allocation limit; see the evidence
-  matrix and [TD-028](../tech-debt.md#td-028-rnl1-materialization-lacks-an-operational-allocation-budget).
+- The local stream writer emits only checksummed RNL3 version-2 frames, including ordinary records with no request ID. Flags distinguish public IDs, dead-letter move IDs, and no identity; keys, payloads, and identities are bounded. Startup inspects all stream files before repairing incomplete tails. Tests verify that RNL1, RNL2, and RNL3 version 1 fail explicitly without changing their files or truncating another stream, and cover current-format round trips, checksums, bounded lengths, and incomplete-tail recovery. See the [core recovery tests](../../crates/runnel-core/src/lib.rs) and [local frame implementation](../../crates/runnel-core/src/stream_log.rs).
 - Local consumer checkpoints and their bounded JSON-lines event journal
   recover progress and delivery attempts on reopen. These artifacts do not
   carry an explicit format version, so those tests establish same-binary
@@ -50,17 +34,16 @@ version boundaries:
   and snapshots before `GroupManager` opens groups. Invalid known state is
   refused in the tested cases. The standalone layout validator has a
   read-only fixture test; this does not make all engine startup read-only.
-- The current clustered Raft log uses a version-2 marker, bounded entry
-  segments, and a bounded control record. Version-1 whole-map Raft-log
-  artifacts fail without mutation; no v1 reader, writer, or conversion is
-  retained. Focused tests cover v2 reopen, vote/commit recovery, truncation,
-  purge, incomplete-tail repair, completed-batch corruption, and explicit v1
-  refusal. Real-process follower/snapshot/purge interaction and the complete
-  storage fault matrix remain open. The state-machine journal retains its
-  separate strict version-1 format. State-machine checkpoints and snapshot
-  payloads are written as version 2 and accept a narrow set of version-1
-  fields through defaults and legacy stream shapes. Those fixture tests do
-  not establish a release compatibility promise.
+- Clustered Raft logs use a version-2 marker, bounded entry segments, and a
+  bounded control record. Version-1 whole-map artifacts fail without mutation;
+  no v1 reader, writer, or conversion is retained. Focused tests cover v2
+  reopen, vote/commit recovery, truncation, purge, incomplete-tail repair,
+  completed-batch corruption, and explicit v1 refusal. Real-process
+  follower/snapshot/purge interaction and the complete storage fault matrix
+  remain open. The state-machine journal uses version 2; checkpoints and
+  snapshot payloads use version 3. Those readers require the current version
+  and every current field, with no pre-retry format read-forward. Tests reject
+  prior and future checkpoint, snapshot, and journal versions without mutation.
 - Snapshot installation and the test-only empty-replica experiment establish
   recovery mechanisms under their tested conditions. [ADR 0018](../decisions/0018-safe-replica-recovery-boundary.md)
   explicitly excludes empty-replica replacement from the production
@@ -71,21 +54,21 @@ clustered artifacts: it rejects unsupported or contradictory input before
 groups are opened, and the current-layout fixture verifies that validation
 does not rewrite its files or create state-machine directories. Normal startup
 creates the data directory, and a new store may write `storage.json`; that
-initialization is not a migration. Snapshot read-forward likewise means the
-current binary can materialize a tested older payload in memory, not that
-startup converts the source artifact into a new generation.
+initialization is not a migration. Pre-retry checkpoint, snapshot, and
+state-machine journal schemas are rejected; no in-memory read-forward or
+startup conversion is provided for those state artifacts.
 
 ## Evidence matrix
 
 | Boundary | Current evidence | What remains unproven |
 | --- | --- | --- |
-| Local stream history | Reader dispatches `RNL1`, `RNL2`, and `RNL3`; it checks record-length arithmetic and completeness, contiguous offsets, and format-specific fields/checksums. `RNL2` and `RNL3` have explicit key/body limits. Tests cover incomplete tails, one malformed complete legacy key, mixed `RNL1`/`RNL2` history, `RNL2` checksum failure, request-ID restart recovery, and bounded request-ID parsing. [`lib.rs`](../../crates/runnel-core/src/lib.rs#L45) [`stream_log.rs`](../../crates/runnel-core/src/stream_log.rs#L13) [`stream_log.rs`](../../crates/runnel-core/src/stream_log.rs#L101) [`stream_log.rs`](../../crates/runnel-core/src/stream_log.rs#L727) [`stream_log.rs`](../../crates/runnel-core/src/stream_log.rs#L751) [`stream_log.rs`](../../crates/runnel-core/src/stream_log.rs#L769) [`stream_log.rs`](../../crates/runnel-core/src/stream_log.rs#L782) [`stream_log.rs`](../../crates/runnel-core/src/stream_log.rs#L556) [`stream_log.rs`](../../crates/runnel-core/src/stream_log.rs#L807) [`stream_log.rs`](../../crates/runnel-core/src/stream_log.rs#L913) [`lib.rs`](../../crates/runnel-core/src/lib.rs#L1824) [`lib.rs`](../../crates/runnel-core/src/lib.rs#L1850) [`lib.rs`](../../crates/runnel-core/src/lib.rs#L1888) [`lib.rs`](../../crates/runnel-core/src/lib.rs#L1967) [`lib.rs`](../../crates/runnel-core/src/lib.rs#L2000) [`lib.rs`](../../crates/runnel-core/src/lib.rs#L2046) [`lib.rs`](../../crates/runnel-core/src/lib.rs#L2086) [`lib.rs`](../../crates/runnel-core/src/lib.rs#L2148) [`lib.rs`](../../crates/runnel-core/src/lib.rs#L551) [initial writer and reader](https://github.com/winrarr/runnel/blob/b47d9df4bb6b7675c2f3eba9fc8e5e8f1c273ce7/crates/runnel-core/src/lib.rs#L294-L396) [initial TCP input path](https://github.com/winrarr/runnel/blob/b47d9df4bb6b7675c2f3eba9fc8e5e8f1c273ce7/crates/runnel-server/src/main.rs#L217-L245) | The mixed-format test does not mix `RNL3` with the other families. The historical writer accepted any key/body byte lengths that fit `u32` (`u32::MAX` each); this is an encoded ceiling, not proof that near-limit files exist. The initial reader also loaded the whole log into memory. The current reader verifies completeness before allocation, allocates a complete key during recovery, and allocates a complete payload on delivery, with no smaller `RNL1` cap. Tests do not cover valid near-limit `RNL1` data or resource behavior at a policy boundary. Do not apply `RNL2`/`RNL3` limits retroactively without an accepted compatibility path for existing data. There is no root generation marker, cross-release writer/reader matrix, proof an older binary can interpret newer frames, or conversion path. |
-| Local consumer state | JSON checkpoints persist committed and out-of-order acknowledgement progress, delivery attempts, and policy; a bounded JSON-lines journal replays events and discards an incomplete final line. Tests cover reopen after an acknowledgement journal failure, partial-tail recovery, the journal bound, and rejection of oversized journal data. [`consumer_state.rs`](../../crates/runnel-core/src/consumer_state.rs#L13) [`consumer_state.rs`](../../crates/runnel-core/src/consumer_state.rs#L120) [`consumer_state.rs`](../../crates/runnel-core/src/consumer_state.rs#L228) [`lib.rs`](../../crates/runnel-core/src/lib.rs#L1515) [`lib.rs`](../../crates/runnel-core/src/lib.rs#L1574) [`lib.rs`](../../crates/runnel-core/src/lib.rs#L1624) [`lib.rs`](../../crates/runnel-core/src/lib.rs#L1664) | Checkpoint and journal records have no explicit schema version or release-pair writer contract. Delivery tokens and deadlines are volatile. No old-binary/new-state reopen test exists. |
+| Local stream history | The sole writer emits checksummed RNL3 v2 frames for every record. Recovery validates exact version, identity flag, field bounds, checksums, and contiguous offsets; all stream files are inspected before incomplete-tail repair. Tests cover ordinary and request-ID records, non-mutating refusal of RNL1/RNL2/RNL3 v1, checksum and length failures, and crash-tail recovery. [Core tests](../../crates/runnel-core/src/lib.rs) [Frame implementation](../../crates/runnel-core/src/stream_log.rs) | These tests establish current-format same-binary recovery, not release-pair compatibility. The request-identity map still grows with distinct retained IDs, and per-record limits do not establish an aggregate memory budget. Conversion and local-to-cluster migration are outside this evidence row. |
+| Local consumer state | JSON checkpoints persist committed and out-of-order acknowledgement progress, delivery attempts, and policy; a bounded JSON-lines journal replays events and discards an incomplete final line. Tests cover reopen after an acknowledgement journal failure, partial-tail recovery, the journal bound, and rejection of oversized journal data. [`consumer_state.rs`](../../crates/runnel-core/src/consumer_state.rs#L13) [`consumer_state.rs`](../../crates/runnel-core/src/consumer_state.rs#L120) [`consumer_state.rs`](../../crates/runnel-core/src/consumer_state.rs#L228) [`lib.rs`](../../crates/runnel-core/src/lib.rs#L1882) [`lib.rs`](../../crates/runnel-core/src/lib.rs#L1941) [`lib.rs`](../../crates/runnel-core/src/lib.rs#L2155) [`lib.rs`](../../crates/runnel-core/src/lib.rs#L2253) | Checkpoint and journal records have no explicit schema version or release-pair writer contract. Delivery tokens and deadlines are volatile. No old-binary/new-state reopen test exists. |
 | Cluster storage identity | `storage.json` records metadata version 1, cluster name, and node ID. Existing mismatched, malformed, or unsupported metadata and unmarked grouped state fail before group open in covered cases. [`engine.rs`](../../crates/runnel-raft/src/engine.rs#L29) [`engine.rs`](../../crates/runnel-raft/src/engine.rs#L48) [`engine.rs`](../../crates/runnel-raft/src/engine.rs#L901) [`lib.rs`](../../crates/runnel-raft/src/lib.rs#L1639) [`lib.rs`](../../crates/runnel-raft/src/lib.rs#L1859) [`lib.rs`](../../crates/runnel-raft/src/lib.rs#L2093) | The marker identifies cluster and node ownership; it is not a generation selector, migration record, or downgrade authority. New-store initialization may write it. |
 | Clustered layout preflight | Startup rejects recognized old single-group paths. Validation checks the metadata group, data-group directory names, stream/group identity in `group.json`, Raft logs, checkpoints, journals, and snapshots before `GroupManager` opens groups. `group.json` has no explicit schema-version field. Tests cover old root layouts, missing metadata group, unsupported data-group log, contradictory manifest, and an unchanged current-layout fixture. [`engine.rs`](../../crates/runnel-raft/src/engine.rs#L32) [`engine.rs`](../../crates/runnel-raft/src/engine.rs#L901) [`group_manager.rs`](../../crates/runnel-raft/src/group_manager.rs#L86) [`group_manager.rs`](../../crates/runnel-raft/src/group_manager.rs#L671) [`group_manager.rs`](../../crates/runnel-raft/src/group_manager.rs#L686) [`group_manager.rs`](../../crates/runnel-raft/src/group_manager.rs#L816) [`lib.rs`](../../crates/runnel-raft/src/lib.rs#L1797) [`lib.rs`](../../crates/runnel-raft/src/lib.rs#L1893) [`lib.rs`](../../crates/runnel-raft/src/lib.rs#L1954) | The fixture verifies the validator on a known current layout. It is not an end-to-end migration from the old layout, proof against arbitrary filesystem contents, or crash-safe activation evidence. The manifest shape is an identity check, not a release compatibility contract. |
-| Cluster Raft log and state-machine journal | The Raft log is now a v2 marker plus checksummed segment family and bounded control record; it rejects v1 and unsupported versions without mutation or empty-store fallback. Tests cover current-format reopen and control recovery, truncation, purge, incomplete-tail recovery, completed-batch corruption, and v1 refusal. The separate length-framed state-machine journal validates its strict version-1 records, rejects unsupported versions, and discards an incomplete final record. [`log_store.rs`](../../crates/runnel-raft/src/log_store.rs#L57) [`raft_log_segments.rs`](../../crates/runnel-raft/src/raft_log_segments.rs#L14) [`raft_log_segments.rs`](../../crates/runnel-raft/src/raft_log_segments.rs#L588) [`log_store.rs`](../../crates/runnel-raft/src/log_store.rs#L653) [`log_store.rs`](../../crates/runnel-raft/src/log_store.rs#L685) [`log_store.rs`](../../crates/runnel-raft/src/log_store.rs#L740) [`log_store.rs`](../../crates/runnel-raft/src/log_store.rs#L783) [`log_store.rs`](../../crates/runnel-raft/src/log_store.rs#L822) [`log_store.rs`](../../crates/runnel-raft/src/log_store.rs#L882) [`lib.rs`](../../crates/runnel-raft/src/lib.rs#L2185) [`state_machine_journal.rs`](../../crates/runnel-raft/src/state_machine_journal.rs#L13) [`state_machine_journal.rs`](../../crates/runnel-raft/src/state_machine_journal.rs#L57) | Current-format recovery tests do not establish all real-process follower/snapshot interactions or the full storage fault matrix. No cross-release OpenRaft log or command compatibility is established by these parser checks. Version labels do not promise release compatibility. |
-| Cluster state-machine checkpoint | Current writer emits version 2. The reader accepts versions 1 and 2; optional fields default, and legacy stream arrays are materialized with derived current stream identity. Tests cover a specific version-1 checkpoint with messages and consumer progress, plus a version-1 checkpoint whose omitted lease clock defaults and then survives journal replay/reopen. [`lib.rs`](../../crates/runnel-raft/src/lib.rs#L86) [`state_machine_store.rs`](../../crates/runnel-raft/src/state_machine_store.rs#L34) [`state_machine_store.rs`](../../crates/runnel-raft/src/state_machine_store.rs#L310) [`state_machine_store.rs`](../../crates/runnel-raft/src/state_machine_store.rs#L460) [`lib.rs`](../../crates/runnel-raft/src/lib.rs#L2324) [`state_machine_store.rs`](../../crates/runnel-raft/src/state_machine_store.rs#L1119) | Tests do not prove all version-1 field combinations, every historical producer, cross-release writes, or that a previous binary can safely open a checkpoint after current-version state has been written. |
-| Cluster snapshot payload and install | Current snapshot payload writer emits version 2; the reader accepts version 1 or 2 and defaults omitted fields. A version-1 snapshot fixture reopens without the fixture bytes changing. Installation validates before publishing in-memory state and persists the snapshot/checkpoint before replacing the in-memory image; failure tests retain the prior state. [`state_machine_store.rs`](../../crates/runnel-raft/src/state_machine_store.rs#L192) [`state_machine_store.rs`](../../crates/runnel-raft/src/state_machine_store.rs#L881) [`state_machine_store.rs`](../../crates/runnel-raft/src/state_machine_store.rs#L810) [`lib.rs`](../../crates/runnel-raft/src/lib.rs#L2368) [`state_machine_store.rs`](../../crates/runnel-raft/src/state_machine_store.rs#L964) | Read-forward and install ordering are not a general migration, a resumable transfer, or proof that old and new snapshot writers/readers can coexist. |
+| Cluster Raft log and state-machine journal | The Raft log uses a version-2 marker, checksummed segment family, and bounded control record; it rejects v1 without mutation or empty-store fallback. Tests cover current-format reopen and control recovery, truncation, purge, incomplete-tail recovery, completed-batch corruption, and v1 refusal. The separate state-machine journal uses strict version-2 frames, rejects other versions, and discards an incomplete final record. [`log_store.rs`](../../crates/runnel-raft/src/log_store.rs) [`raft_log_segments.rs`](../../crates/runnel-raft/src/raft_log_segments.rs) [`state_machine_journal.rs`](../../crates/runnel-raft/src/state_machine_journal.rs) [`lib.rs`](../../crates/runnel-raft/src/lib.rs) | Current-format recovery tests do not establish all real-process follower/snapshot interactions or the complete storage fault matrix. No cross-release OpenRaft log or command compatibility is established; current envelope versions do not promise release stability. |
+| Cluster state-machine checkpoint | Current writer emits version 3 and the reader accepts only version 3. Required fields and current stream shapes must be present. Tests reject versions 1 and 2 and a future version without rewriting the checkpoint or creating a journal. [`lib.rs`](../../crates/runnel-raft/src/lib.rs#L94) [`state_machine_store.rs`](../../crates/runnel-raft/src/state_machine_store.rs#L44) [`state_machine_store.rs`](../../crates/runnel-raft/src/state_machine_store.rs#L374) [`lib.rs`](../../crates/runnel-raft/src/lib.rs#L2298) | No old-format migration or cross-release state compatibility is provided. |
+| Cluster snapshot payload and install | Current snapshot payload writer emits version 3 and the reader accepts only version 3 with all required fields and current stream shapes. Tests reject versions 1 and 2 and a future version without changing the snapshot or creating a journal. Installation validates before publishing in-memory state and persists the snapshot/checkpoint before replacing the in-memory image; current-format failure tests retain the prior state. [`state_machine_store.rs`](../../crates/runnel-raft/src/state_machine_store.rs#L56) [`state_machine_store.rs`](../../crates/runnel-raft/src/state_machine_store.rs#L175) [`state_machine_store.rs`](../../crates/runnel-raft/src/state_machine_store.rs#L863) [`lib.rs`](../../crates/runnel-raft/src/lib.rs#L2360) [`state_machine_store.rs`](../../crates/runnel-raft/src/state_machine_store.rs#L964) | No old-format migration, resumable transfer, or proof that different binary versions can exchange snapshots is provided. |
 | Peer protocol boundary | Peer requests are a set of operation variants carried in bounded, length-prefixed JSON frames; the request enum has no explicit protocol version or handshake. [`network.rs`](../../crates/runnel-raft/src/network.rs#L17) [`framing.rs`](../../crates/runnel-raft/src/network/framing.rs#L9) | No old/new peer interoperability matrix establishes that mixed binaries can exchange Raft entries, commands, forwarded operations, or snapshots safely. |
 | Empty-replica snapshot replacement | A real three-process scenario exists behind the explicit `test-replacement-recovery` feature. It erases one node's local state, retries interrupted snapshot transfer, and verifies recovery. ADR 0018 keeps this permissive OpenRaft path test-only. [`cluster_smoke.rs`](../../crates/runnel-server/tests/cluster_smoke.rs#L1242) [`cluster_smoke.rs`](../../crates/runnel-server/tests/cluster_smoke.rs#L1334) [ADR 0018](../decisions/0018-safe-replica-recovery-boundary.md) | This experiment does not authorize erasing/reusing a voter directory in production and does not establish a storage compatibility or release-upgrade policy. |
 
@@ -94,7 +77,7 @@ startup converts the source artifact into a new generation.
 | Relation | Supported today? | Evidence boundary |
 | --- | --- | --- |
 | Current-binary reopen of tested local or clustered artifacts | Yes, within the reader and layout checks described above | Focused same-binary recovery tests; the ordinary three-process cluster recovery workflow covers preserved-state restart, not binary version changes. |
-| Local recognized-frame read | Yes for `RNL1`, `RNL2`, and `RNL3` records recognized by this reader | The test suite separately covers mixed `RNL1`/`RNL2` records and `RNL3` request-ID recovery; it does not test a cross-release writer pair or every possible mixture. |
+| Local stream frame | Yes for RNL3 version 2; old local frame versions are explicitly refused | Current-format restart and crash-tail tests plus non-mutating refusal tests cover the implemented reader. No cross-release writer/reader guarantee is claimed. |
 | Clustered version-1 checkpoint/snapshot read-forward | Observed for specific version-1 fixtures | Current code reads those fields into its current in-memory representation. It does not imply a general schema guarantee or a startup migration. |
 | Older binary opening state written by a newer binary | No | No release-pair tests; read-forward support in the current binary proves only the opposite reader direction for listed fixtures. |
 | Clustered rolling binary upgrade or mixed-version operation | No | No real old/new binary matrix or peer compatibility handshake is established here. |
@@ -148,21 +131,15 @@ supported; they do not define a required API or layout.
 
 ## Refactor and planning assessment
 
-No runtime refactor is included in this documentation update. Generation
-selection, migration ownership, and format conversion are governed by ADR 0037
-and remain unimplemented until their evidence gates pass. The RNL1
-allocation-bound gap is recorded as a specific resource-policy debt in
-[TD-028](../tech-debt.md#td-028-rnl1-materialization-lacks-an-operational-allocation-budget).
-That item does not set a new cap or authorize a migration. Existing TD-007 debt
-and storage-upgrade backlog records remain open for runtime implementation.
-The adjacent `DurableFormat`
-source comment now names the request-aware RNL3 reader path, matching the parser
-and its restart-recovery test.
+The local log now has one RNL3 v2 writer and no format selector. The
+implementation inspects every stream before repairing an incomplete tail and
+refuses obsolete local files without mutation. Aggregate local materialization
+remains open under [TD-028](../tech-debt.md#td-028-aggregate-local-record-materialization-lacks-a-memory-budget).
+This local-format change does not alter the separate clustered artifact
+boundaries, storage-upgrade contract, or local-to-cluster migration work.
 
 ## Verification
 
-This update changes documentation only. Runtime tests and benchmarks do not
-apply. `git diff --check` and the local Markdown link/line-anchor check cover
-the change. The existing focused recovery tests and real-process clustered
-test remain the runtime evidence referenced above; no migration or
-rolling-upgrade benchmark is implied.
+The local runtime evidence is the focused core recovery test set
+referenced above. This note does not imply release-pair tests, a migration
+benchmark, or changes to clustered recovery behavior.

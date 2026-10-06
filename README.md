@@ -21,11 +21,11 @@ This repository currently provides the first vertical slice:
 - an early three-node Multi-Raft development backend with any-node client routing;
 - Docker and Kubernetes starting points.
 
-The workspace also contains `runnel-engine`, the shared semantic engine contract, and `runnel-raft`, an early static Multi-Raft backend. `--engine raft` enables versioned durable Raft/state-machine files, framed TCP peer transport, topology-free client forwarding, replicated shared-consumer ownership, clustered attempt limits and dead-letter streams, and a three-node development cluster. The backend is not yet production-complete: dynamic membership, scalable placement, backoff and dead-letter provenance, security policy, and broader failure semantics remain unfinished.
+The workspace also contains `runnel-engine`, the shared semantic engine contract, and `runnel-raft`, an early static Multi-Raft backend. `--engine raft` enables versioned durable Raft/state-machine files, TLS-protected peer transport, topology-free client forwarding, replicated shared-consumer ownership, clustered attempt limits and dead-letter streams, and a three-node development cluster. The backend is not yet production-complete: dynamic membership, scalable placement, backoff and dead-letter provenance, public-listener security, deployment automation, and broader failure semantics remain unfinished.
 
 The workspace includes reusable `runnel-client` and `runnel-test-support` crates. The client provides persistent sequential request/response transport with bounded connection, write, response-size, and response timeouts for the provisional protocol; the test-support crate contains storage- and topology-independent assertions for the Engine contract.
 
-Retention, consume batching, compression, authentication, and TLS remain planned product work. Publish batches already provide independent per-record outcomes without batch atomicity. The current line-delimited JSON protocol is a development protocol and is not yet a compatibility promise. Broker-wide retry settings remain the fallback for local and clustered delivery; `configure_consumer` and `inspect_consumer` provide durable per-consumer acknowledgement timeouts and attempt limits while the early static Raft backend preserves replicated ownership, expiry fencing, and dead-letter recovery without exposing its internal consumer state.
+Retention and compression remain planned product work. Bounded publish and consume batches preserve per-record outcomes without batch atomicity. Static-cluster peer traffic now uses mutual TLS with explicit per-node credentials; application-client authentication and TLS for the public broker and HTTP listeners remain separate work. The current line-delimited JSON protocol is a development protocol and is not yet a compatibility promise. Broker-wide retry settings remain the fallback for local and clustered delivery; `configure_consumer` and `inspect_consumer` provide durable per-consumer acknowledgement timeouts, attempt limits, and fixed retry delays while the early static Raft backend preserves replicated ownership, expiry fencing, and dead-letter recovery without exposing its internal consumer state.
 
 ## Quick start
 
@@ -48,7 +48,7 @@ To share work between local worker processes, use one consumer name and a distin
 
 Configure and inspect a durable policy for one stream and consumer pair:
 
-    cargo run -p runnel-cli -- configure-consumer events worker 5000 --max-delivery-attempts 5
+    cargo run -p runnel-cli -- configure-consumer events worker 5000 --max-delivery-attempts 5 --retry-delay-ms 1000
     cargo run -p runnel-cli -- inspect-consumer events worker
 
 Both commands return a `consumer_policy` JSON response. For these values, it includes:
@@ -60,10 +60,11 @@ Both commands return a `consumer_policy` JSON response. For these values, it inc
       "version": 1,
       "configured": true,
       "ack_timeout_ms": 5000,
-      "max_delivery_attempts": 5
+      "max_delivery_attempts": 5,
+      "retry_delay_ms": 1000
     }
 
-`version` advances when the values change; repeating the same configuration is idempotent. An unconfigured consumer reports `configured: false` and `version: 0`, with `ack_timeout_ms` and `max_delivery_attempts` showing the broker-wide fallback values. Omitting `--max-delivery-attempts` when configuring sets that consumer's attempt limit to `null` (no limit), rather than inheriting the broker-wide attempt limit. The timeout is in milliseconds; zero is allowed, its maximum is seven days, and a specified attempt limit must be positive. Configuration applies only to an existing stream and the named consumer; other consumers on the stream are unaffected. See [ADR 0027](docs/decisions/0027-consumer-scoped-retry-policy.md) for the policy semantics.
+`version` advances when any value changes; repeating the same configuration is idempotent. An unconfigured consumer reports `configured: false` and `version: 0`, with policy values showing the broker-wide timeout and attempt-limit fallback and a zero retry delay. Omitting `--max-delivery-attempts` when configuring sets that consumer's attempt limit to `null` (no limit), rather than inheriting the broker-wide attempt limit. The timeout and retry delay are in milliseconds; each accepts zero through seven days, independently. A specified attempt limit must be positive. Configuration applies only to an existing stream and the named consumer; other consumers on the stream are unaffected. After a lease expires, the retry delay starts when a poll or stale acknowledgement first durably observes that expiry. While waiting, the offset's ordering key stays reserved; unrelated eligible work can proceed. See [ADR 0027](docs/decisions/0027-consumer-scoped-retry-policy.md) and [ADR 0033](docs/decisions/0033-fixed-consumer-retry-delay.md) for the policy semantics.
 
 The broker listens on 127.0.0.1:4222. Health endpoints and metrics listen on 127.0.0.1:8080:
 
@@ -123,6 +124,8 @@ Useful workflows:
 
 The existing scripts/verify.sh command remains as a thin compatibility wrapper around just verify.
 
+`just bench-compare-cluster` builds the Runnel image and runs an opt-in three-node durable-publish comparison for Runnel, Kafka, Redpanda, and JetStream. It is an engineering baseline, not a cross-product ranking; Runnel's host-side benchmark client is not cgroup-limited by the configured client budget.
+
 The required pull-request CI gate is a two-branch DAG: `Verify` and `Integration`
 run in parallel and both must pass. `Verify` owns the real three-node
 `cluster_smoke` test; `Integration` owns the process smoke and container smoke
@@ -145,7 +148,7 @@ The current protocol accepts one JSON request per TCP line. For example:
     {"op":"poll","stream":"events","consumer":"worker"}
     {"op":"ack","stream":"events","consumer":"worker","offset":0}
     {"op":"replay","stream":"events","consumer":"worker","offset":0}
-    {"op":"configure_consumer","stream":"events","consumer":"worker","ack_timeout_ms":5000,"max_delivery_attempts":5}
+    {"op":"configure_consumer","stream":"events","consumer":"worker","ack_timeout_ms":5000,"max_delivery_attempts":5,"retry_delay_ms":1000}
     {"op":"inspect_consumer","stream":"events","consumer":"worker"}
 
 Grouped delivery uses `poll_group` and `ack_group` requests with a consumer name, member name, and delivery token. These are provisional development-protocol operations.
@@ -173,4 +176,4 @@ Build and run a local image:
     docker volume create runnel-data
     docker run --rm -p 4222:4222 -p 8080:8080 -v runnel-data:/var/lib/runnel runnel:dev
 
-The Kubernetes manifest in deploy/kubernetes/runnel.yaml starts a three-node static Multi-Raft development cluster with independent persistent volumes. It does not provide TLS, authentication, upgrades, or production policy by itself; see [deploy/kubernetes/README.md](deploy/kubernetes/README.md).
+The Kubernetes manifest in deploy/kubernetes/runnel.yaml starts a three-node static Multi-Raft development cluster with independent persistent volumes. With an operator-supplied per-pod credential overlay, peer traffic uses mutual TLS; the manifest does not provide public client or HTTP TLS/authentication, upgrades, or production policy by itself. See [deploy/kubernetes/README.md](deploy/kubernetes/README.md).

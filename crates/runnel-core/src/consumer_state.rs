@@ -18,14 +18,17 @@ pub(super) struct ConsumerState {
     pub(super) stream: String,
     pub(super) consumer: String,
     pub(super) committed_offset: Offset,
-    #[serde(default)]
     pub(super) acknowledged_offsets: BTreeSet<Offset>,
-    #[serde(default)]
     pub(super) delivery_attempts: BTreeMap<Offset, u32>,
-    #[serde(default)]
     pub(super) policy: Option<ConsumerPolicy>,
-    #[serde(default)]
     pub(super) delivery_policies: BTreeMap<Offset, ConsumerPolicy>,
+    pub(super) retry_not_before: BTreeMap<Offset, RetrySchedule>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(super) struct RetrySchedule {
+    pub(super) retry_not_before_ms: u64,
+    pub(super) key: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -33,11 +36,13 @@ pub(super) enum ConsumerStateEvent {
     DeliveryAttempt {
         offset: Offset,
         attempt: u32,
-        #[serde(default)]
-        policy: Option<ConsumerPolicy>,
+        policy: ConsumerPolicy,
     },
     DeliveryAttempts {
         attempts: Vec<DeliveryAttempt>,
+    },
+    RetrySchedules {
+        schedules: Vec<RetryScheduleEvent>,
     },
     Acknowledge {
         offset: Offset,
@@ -51,6 +56,13 @@ pub(super) enum ConsumerStateEvent {
 }
 
 #[derive(Debug, Serialize, Deserialize)]
+pub(super) struct RetryScheduleEvent {
+    pub(super) offset: Offset,
+    pub(super) retry_not_before_ms: u64,
+    pub(super) key: Option<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
 pub(super) struct DeliveryAttempt {
     pub(super) offset: Offset,
     pub(super) attempt: u32,
@@ -58,12 +70,34 @@ pub(super) struct DeliveryAttempt {
 }
 
 impl ConsumerState {
+    pub(super) fn retry_filter(
+        &self,
+        now_ms: u64,
+    ) -> (
+        std::collections::HashSet<Offset>,
+        std::collections::HashSet<String>,
+    ) {
+        let mut offsets = std::collections::HashSet::new();
+        let mut keys = std::collections::HashSet::new();
+        for (&offset, schedule) in &self.retry_not_before {
+            if schedule.retry_not_before_ms <= now_ms {
+                continue;
+            }
+            offsets.insert(offset);
+            if let Some(key) = schedule.key.as_ref() {
+                keys.insert(key.clone());
+            }
+        }
+        (offsets, keys)
+    }
+
     pub(super) fn acknowledge(&mut self, offset: Offset) {
         if offset < self.committed_offset || self.acknowledged_offsets.contains(&offset) {
             return;
         }
         self.delivery_attempts.remove(&offset);
         self.delivery_policies.remove(&offset);
+        self.retry_not_before.remove(&offset);
         if offset == self.committed_offset {
             self.committed_offset += 1;
             while self.acknowledged_offsets.remove(&self.committed_offset) {
@@ -94,9 +128,8 @@ impl ConsumerState {
                         .entry(offset)
                         .and_modify(|current| *current = (*current).max(attempt))
                         .or_insert(attempt);
-                    if let Some(policy) = policy {
-                        self.delivery_policies.entry(offset).or_insert(policy);
-                    }
+                    self.retry_not_before.remove(&offset);
+                    self.delivery_policies.entry(offset).or_insert(policy);
                 }
             }
             ConsumerStateEvent::DeliveryAttempts { attempts } => {
@@ -119,8 +152,25 @@ impl ConsumerState {
                             .entry(offset)
                             .and_modify(|current| *current = (*current).max(attempt))
                             .or_insert(attempt);
+                        self.retry_not_before.remove(&offset);
                         self.delivery_policies.entry(offset).or_insert(policy);
                     }
+                }
+            }
+            ConsumerStateEvent::RetrySchedules { schedules } => {
+                for schedule in schedules {
+                    if schedule.offset < self.committed_offset
+                        || self.acknowledged_offsets.contains(&schedule.offset)
+                        || !self.delivery_attempts.contains_key(&schedule.offset)
+                    {
+                        continue;
+                    }
+                    self.retry_not_before
+                        .entry(schedule.offset)
+                        .or_insert(RetrySchedule {
+                            retry_not_before_ms: schedule.retry_not_before_ms,
+                            key: schedule.key,
+                        });
                 }
             }
             ConsumerStateEvent::Acknowledge { offset } => self.acknowledge(offset),
@@ -141,14 +191,39 @@ impl ConsumerState {
         &self,
         offset: Offset,
         legacy_policy: &ConsumerPolicy,
-    ) -> ConsumerPolicy {
+    ) -> Result<ConsumerPolicy, BrokerError> {
         if let Some(policy) = self.delivery_policies.get(&offset) {
-            return policy.clone();
+            return Ok(policy.clone());
         }
         if self.delivery_attempts.contains_key(&offset) {
-            return legacy_policy.clone();
+            return Err(BrokerError::Io(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "persisted delivery attempt is missing its pinned consumer policy",
+            )));
         }
-        self.policy.clone().unwrap_or_else(|| legacy_policy.clone())
+        Ok(self.policy.clone().unwrap_or_else(|| legacy_policy.clone()))
+    }
+
+    fn validate(&self) -> Result<(), BrokerError> {
+        if self
+            .delivery_attempts
+            .iter()
+            .any(|(offset, attempt)| *attempt == 0 || !self.delivery_policies.contains_key(offset))
+            || self
+                .delivery_policies
+                .keys()
+                .any(|offset| !self.delivery_attempts.contains_key(offset))
+            || self
+                .retry_not_before
+                .keys()
+                .any(|offset| !self.delivery_attempts.contains_key(offset))
+        {
+            return Err(BrokerError::Io(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "persisted consumer retry state is inconsistent",
+            )));
+        }
+        Ok(())
     }
 }
 
@@ -159,7 +234,11 @@ fn validate_policy(policy: &ConsumerPolicy) -> Result<(), BrokerError> {
             "persisted consumer policy must be configured with a positive version",
         )));
     }
-    runnel_engine::validate_consumer_policy(policy.ack_timeout_ms, policy.max_delivery_attempts)
+    runnel_engine::validate_consumer_policy(
+        policy.ack_timeout_ms,
+        policy.max_delivery_attempts,
+        policy.retry_delay_ms,
+    )
 }
 
 pub(super) fn load_consumer_state(
@@ -180,9 +259,11 @@ pub(super) fn load_consumer_state(
             delivery_attempts: BTreeMap::new(),
             policy: None,
             delivery_policies: BTreeMap::new(),
+            retry_not_before: BTreeMap::new(),
         }
     };
     replay_consumer_state_journal(root, stream, consumer, &mut state)?;
+    state.validate()?;
     Ok(state)
 }
 
@@ -274,7 +355,9 @@ fn persist_consumer_event_with_sync(
 ) -> Result<(), BrokerError> {
     let batch_event = matches!(
         &event,
-        ConsumerStateEvent::DeliveryAttempts { .. } | ConsumerStateEvent::AcknowledgeBatch { .. }
+        ConsumerStateEvent::DeliveryAttempts { .. }
+            | ConsumerStateEvent::RetrySchedules { .. }
+            | ConsumerStateEvent::AcknowledgeBatch { .. }
     );
     #[cfg(feature = "instrumentation")]
     let _stage_timer = StageTimer::new("core.consumer_state_persist");
@@ -397,11 +480,6 @@ fn replay_consumer_state_journal(
     }
 
     let bytes = fs::read(&path)?;
-    if serde_json::from_slice::<ConsumerState>(&bytes).is_ok() {
-        // A pre-journal process may have left a fully written checkpoint temporary behind. It
-        // was never authoritative, so retain the old recovery behavior and ignore it.
-        return Ok(());
-    }
     if bytes.len() as u64 > MAX_CONSUMER_STATE_JOURNAL_BYTES {
         return Err(BrokerError::Io(io::Error::new(
             io::ErrorKind::InvalidData,
@@ -409,19 +487,20 @@ fn replay_consumer_state_journal(
         )));
     }
     let mut valid_length = 0;
-    for (line_index, line) in bytes.split_inclusive(|byte| *byte == b'\n').enumerate() {
+    for line in bytes.split_inclusive(|byte| *byte == b'\n') {
         if !line.ends_with(b"\n") {
+            if serde_json::from_slice::<serde_json::Value>(line).is_ok()
+                && serde_json::from_slice::<ConsumerStateEvent>(line).is_err()
+            {
+                return Err(BrokerError::Io(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "consumer state journal contains a complete unsupported record",
+                )));
+            }
             break;
         }
         let line = &line[..line.len() - 1];
-        let event = match serde_json::from_slice::<ConsumerStateEvent>(line) {
-            Ok(event) => event,
-            Err(_) if line_index == 0 && serde_json::from_slice::<ConsumerState>(line).is_ok() => {
-                valid_length += line.len() + 1;
-                continue;
-            }
-            Err(error) => return Err(error.into()),
-        };
+        let event = serde_json::from_slice::<ConsumerStateEvent>(line)?;
         state.apply_event(event)?;
         valid_length += line.len() + 1;
     }
@@ -476,6 +555,7 @@ mod tests {
             delivery_attempts: BTreeMap::new(),
             policy: None,
             delivery_policies: BTreeMap::new(),
+            retry_not_before: BTreeMap::new(),
         }
     }
 
@@ -486,10 +566,10 @@ mod tests {
         state.delivery_attempts.insert(1, 1);
         state
             .delivery_policies
-            .insert(0, ConsumerPolicy::configured(1, 0, Some(2)));
+            .insert(0, ConsumerPolicy::configured(1, 0, Some(2), 0));
         state
             .delivery_policies
-            .insert(1, ConsumerPolicy::configured(1, 0, Some(2)));
+            .insert(1, ConsumerPolicy::configured(1, 0, Some(2), 0));
 
         state.acknowledge(1);
         assert_eq!(state.committed_offset, 0);
@@ -509,14 +589,14 @@ mod tests {
             .apply_event(ConsumerStateEvent::DeliveryAttempt {
                 offset: 0,
                 attempt: 3,
-                policy: None,
+                policy: ConsumerPolicy::legacy(0, None),
             })
             .unwrap();
         state
             .apply_event(ConsumerStateEvent::DeliveryAttempt {
                 offset: 0,
                 attempt: 2,
-                policy: None,
+                policy: ConsumerPolicy::legacy(0, None),
             })
             .unwrap();
         assert_eq!(state.delivery_attempts.get(&0), Some(&3));
@@ -524,7 +604,7 @@ mod tests {
         let error = state.apply_event(ConsumerStateEvent::DeliveryAttempt {
             offset: 1,
             attempt: 0,
-            policy: None,
+            policy: ConsumerPolicy::legacy(0, None),
         });
         assert!(
             matches!(error, Err(BrokerError::Io(error)) if error.kind() == io::ErrorKind::InvalidData)

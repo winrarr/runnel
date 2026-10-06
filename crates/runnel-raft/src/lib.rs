@@ -33,6 +33,7 @@ mod forwarding;
 mod group_manager;
 mod log_store;
 mod network;
+mod peer_tls;
 mod persistence_write;
 mod raft_log_segments;
 mod state_machine;
@@ -45,6 +46,7 @@ pub use engine::{InMemoryCluster, PersistentEngine, RaftGroup, SingleNodeEngine}
 #[cfg(test)]
 use group_manager::DataGroupManifest;
 pub use group_manager::{GroupManager, ReplicationProgressSnapshot};
+pub use peer_tls::PeerTlsConfig;
 #[cfg(feature = "persistence-write-counters")]
 pub use persistence_write::{
     PersistenceWriteCounterSnapshot, PersistenceWriteMetricsSnapshot, PersistenceWriteOperation,
@@ -67,7 +69,7 @@ pub use state_machine_store::SnapshotMetricsSnapshot;
 use state_machine_store::StateMachineStore;
 #[cfg(test)]
 use state_machine_store::{
-    PersistedSnapshotState, PersistedSnapshotStateRef, PersistedStreamData, StoredSnapshot,
+    PersistedSnapshotState, PersistedSnapshotStateRef, StoredSnapshot,
     snapshot_state_from_persisted, validate_snapshot_data,
 };
 
@@ -92,7 +94,7 @@ pub async fn serve_peer(
     network::serve(listener, manager, shutdown).await
 }
 
-const FORMAT_VERSION: u32 = 2;
+const FORMAT_VERSION: u32 = 3;
 
 #[cfg(test)]
 use engine::{
@@ -1585,7 +1587,7 @@ mod tests {
         .await
         .unwrap();
         engine.create_stream("events").await.unwrap();
-        let configured = Engine::configure_consumer(&engine, "events", "workers", 0, Some(2))
+        let configured = Engine::configure_consumer(&engine, "events", "workers", 0, Some(2), 0)
             .await
             .unwrap();
         assert_eq!(configured.version, 1);
@@ -1609,7 +1611,7 @@ mod tests {
                 ..
             })
         ));
-        Engine::configure_consumer(&engine, "events", "workers", 0, Some(1))
+        Engine::configure_consumer(&engine, "events", "workers", 0, Some(1), 0)
             .await
             .unwrap();
         assert!(matches!(
@@ -1661,9 +1663,10 @@ mod tests {
         .await
         .unwrap();
         engine.create_stream("events").await.unwrap();
-        let original_policy = Engine::configure_consumer(&engine, "events", "workers", 0, Some(2))
-            .await
-            .unwrap();
+        let original_policy =
+            Engine::configure_consumer(&engine, "events", "workers", 0, Some(2), 0)
+                .await
+                .unwrap();
         assert_eq!(original_policy.version, 1);
         engine
             .publish("events", None, b"poison".to_vec(), None)
@@ -1681,9 +1684,10 @@ mod tests {
                 ..
             })
         ));
-        let updated_policy = Engine::configure_consumer(&engine, "events", "workers", 0, Some(1))
-            .await
-            .unwrap();
+        let updated_policy =
+            Engine::configure_consumer(&engine, "events", "workers", 0, Some(1), 0)
+                .await
+                .unwrap();
         assert_eq!(updated_policy.version, 2);
         assert_eq!(updated_policy.max_delivery_attempts, Some(1));
         drop(engine);
@@ -2296,90 +2300,106 @@ mod tests {
     }
 
     #[test]
-    fn unsupported_state_machine_checkpoint_is_rejected_without_creating_journal() {
-        let directory = tempfile::tempdir().unwrap();
-        let state_directory = directory.path().join("state-machine");
-        fs::create_dir_all(&state_directory).unwrap();
-        let state_path = state_directory.join("state-machine.json");
-        let state_before = serde_json::to_vec(&serde_json::json!({
-            "version": FORMAT_VERSION + 1,
-            "last_applied_log": null,
-            "last_membership": serde_json::to_value(
-                StoredMembership::<NodeId, BasicNode>::default()
-            )
-            .unwrap(),
-            "streams": {},
-            "consumers": [],
-        }))
-        .unwrap();
-        fs::write(&state_path, &state_before).unwrap();
-
-        let error = StateMachineStore::open(&state_directory, GroupKind::Metadata)
-            .unwrap_err()
-            .to_string();
-        assert!(error.contains("unsupported state-machine format version"));
-        assert!(error.contains(state_path.to_str().unwrap()));
-        assert_eq!(fs::read(&state_path).unwrap(), state_before);
-        assert!(!state_directory.join(STATE_MACHINE_JOURNAL_FILE).exists());
-    }
-
-    #[test]
-    fn unsupported_state_machine_journal_is_rejected_without_truncating() {
-        let directory = tempfile::tempdir().unwrap();
-        let state_directory = directory.path().join("state-machine");
-        fs::create_dir_all(&state_directory).unwrap();
-        let journal_path = state_directory.join(STATE_MACHINE_JOURNAL_FILE);
-        let record = serde_json::to_vec(&StateMachineJournalEntry {
-            version: STATE_MACHINE_JOURNAL_FORMAT_VERSION + 1,
-            log_id: LogId {
-                leader_id: openraft::CommittedLeaderId::new(1, 1),
-                index: 0,
-            },
-            payload: EntryPayload::Blank,
-        })
-        .unwrap();
-        let mut journal_before = (record.len() as u32).to_le_bytes().to_vec();
-        journal_before.extend_from_slice(&record);
-        fs::write(&journal_path, &journal_before).unwrap();
-
-        let error = StateMachineStore::open(&state_directory, GroupKind::Metadata)
-            .unwrap_err()
-            .to_string();
-        assert!(error.contains("unsupported state-machine journal format version"));
-        assert!(error.contains(journal_path.to_str().unwrap()));
-        assert_eq!(fs::read(&journal_path).unwrap(), journal_before);
-        assert!(!state_directory.join("state-machine.json").exists());
-    }
-
-    #[test]
-    fn unsupported_snapshot_version_is_rejected_without_creating_journal() {
-        let directory = tempfile::tempdir().unwrap();
-        let state_directory = directory.path().join("state-machine");
-        fs::create_dir_all(&state_directory).unwrap();
-        let snapshot_path = state_directory.join("snapshot.json");
-        let snapshot = StoredSnapshot {
-            meta: SnapshotMeta {
-                last_log_id: None,
-                last_membership: StoredMembership::default(),
-                snapshot_id: "unsupported".to_owned(),
-            },
-            data: serde_json::to_vec(&serde_json::json!({
-                "version": FORMAT_VERSION + 1,
+    fn unsupported_state_machine_checkpoints_are_rejected_without_mutation() {
+        for version in [1, 2, FORMAT_VERSION + 1] {
+            let directory = tempfile::tempdir().unwrap();
+            let state_directory = directory.path().join("state-machine");
+            fs::create_dir_all(&state_directory).unwrap();
+            let state_path = state_directory.join("state-machine.json");
+            let state_before = serde_json::to_vec(&serde_json::json!({
+                "version": version,
+                "last_applied_log": null,
+                "last_membership": serde_json::to_value(
+                    StoredMembership::<NodeId, BasicNode>::default()
+                )
+                .unwrap(),
                 "streams": {},
                 "consumers": [],
+                "group_consumers": [],
+                "lease_clock_ms": 0,
+                "dedup": {},
+                "redeliveries": 0,
+                "dead_letters": 0,
             }))
-            .unwrap(),
-        };
-        let snapshot_before = serde_json::to_vec(&snapshot).unwrap();
-        fs::write(&snapshot_path, &snapshot_before).unwrap();
+            .unwrap();
+            fs::write(&state_path, &state_before).unwrap();
 
-        let error = StateMachineStore::open(&state_directory, GroupKind::Metadata)
-            .unwrap_err()
-            .to_string();
-        assert!(error.contains("unsupported snapshot format version"));
-        assert!(error.contains(snapshot_path.to_str().unwrap()));
-        assert_eq!(fs::read(&snapshot_path).unwrap(), snapshot_before);
-        assert!(!state_directory.join(STATE_MACHINE_JOURNAL_FILE).exists());
+            let error = StateMachineStore::open(&state_directory, GroupKind::Metadata)
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains("unsupported state-machine format version"));
+            assert!(error.contains(state_path.to_str().unwrap()));
+            assert_eq!(fs::read(&state_path).unwrap(), state_before);
+            assert!(!state_directory.join(STATE_MACHINE_JOURNAL_FILE).exists());
+        }
+    }
+
+    #[test]
+    fn unsupported_state_machine_journals_are_rejected_without_mutation() {
+        for version in [1, STATE_MACHINE_JOURNAL_FORMAT_VERSION + 1] {
+            let directory = tempfile::tempdir().unwrap();
+            let state_directory = directory.path().join("state-machine");
+            fs::create_dir_all(&state_directory).unwrap();
+            let journal_path = state_directory.join(STATE_MACHINE_JOURNAL_FILE);
+            let record = serde_json::to_vec(&StateMachineJournalEntry {
+                version,
+                log_id: LogId {
+                    leader_id: openraft::CommittedLeaderId::new(1, 1),
+                    index: 0,
+                },
+                payload: EntryPayload::Blank,
+            })
+            .unwrap();
+            let mut journal_before = (record.len() as u32).to_le_bytes().to_vec();
+            journal_before.extend_from_slice(&record);
+            fs::write(&journal_path, &journal_before).unwrap();
+
+            let error = StateMachineStore::open(&state_directory, GroupKind::Metadata)
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains("unsupported state-machine journal format version"));
+            assert!(error.contains(journal_path.to_str().unwrap()));
+            assert_eq!(fs::read(&journal_path).unwrap(), journal_before);
+            assert!(!state_directory.join("state-machine.json").exists());
+        }
+    }
+
+    #[test]
+    fn unsupported_snapshots_are_rejected_without_mutation() {
+        for version in [1, 2, FORMAT_VERSION + 1] {
+            let directory = tempfile::tempdir().unwrap();
+            let state_directory = directory.path().join("state-machine");
+            fs::create_dir_all(&state_directory).unwrap();
+            let snapshot_path = state_directory.join("snapshot.json");
+            let snapshot = StoredSnapshot {
+                meta: SnapshotMeta {
+                    last_log_id: None,
+                    last_membership: StoredMembership::default(),
+                    snapshot_id: "unsupported".to_owned(),
+                },
+                data: serde_json::to_vec(&serde_json::json!({
+                    "version": version,
+                    "streams": {},
+                    "consumers": [],
+                    "group_consumers": [],
+                    "lease_clock_ms": 0,
+                    "dedup": {},
+                    "redeliveries": 0,
+                    "dead_letters": 0,
+                }))
+                .unwrap(),
+            };
+            let snapshot_before = serde_json::to_vec(&snapshot).unwrap();
+            fs::write(&snapshot_path, &snapshot_before).unwrap();
+
+            let error = StateMachineStore::open(&state_directory, GroupKind::Metadata)
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains("unsupported snapshot format version"));
+            assert!(error.contains(snapshot_path.to_str().unwrap()));
+            assert_eq!(fs::read(&snapshot_path).unwrap(), snapshot_before);
+            assert!(!state_directory.join(STATE_MACHINE_JOURNAL_FILE).exists());
+        }
     }
 
     #[tokio::test]
@@ -2513,10 +2533,7 @@ mod tests {
         let snapshot = snapshot_builder.build_snapshot().await.unwrap();
         let snapshot_state =
             validate_snapshot_data(&snapshot.snapshot.clone().into_inner()).unwrap();
-        let snapshot_messages = match snapshot_state.streams.get("events").unwrap() {
-            PersistedStreamData::Current(stream) => &stream.messages,
-            PersistedStreamData::Legacy(_) => panic!("new snapshots must use current streams"),
-        };
+        let snapshot_messages = &snapshot_state.streams.get("events").unwrap().messages;
         assert_eq!(snapshot_messages.len(), RETAINED_MESSAGES as usize);
         assert_eq!(
             snapshot_messages.last().unwrap().payload,
@@ -2610,99 +2627,6 @@ mod tests {
         assert_eq!(metrics.installs_started, 1);
         assert_eq!(metrics.install_failures, 1);
         assert_eq!(metrics.installs_in_progress, 0);
-    }
-
-    #[tokio::test]
-    async fn legacy_state_machine_format_recovers_metadata_messages_and_progress() {
-        let directory = tempfile::tempdir().unwrap();
-        let state_directory = directory.path().join("state-machine");
-        fs::create_dir_all(&state_directory).unwrap();
-        let legacy = serde_json::json!({
-            "version": 1,
-            "last_applied_log": null,
-            "last_membership": serde_json::to_value(
-                StoredMembership::<NodeId, BasicNode>::default()
-            )
-            .unwrap(),
-            "streams": {"events": [
-                {"key": null, "payload": [115, 107, 105, 112], "published_at_ms": 1},
-                {"key": "key", "payload": [114, 101, 99, 111, 118, 101, 114], "published_at_ms": 2}
-            ]},
-            "consumers": [{"stream": "events", "consumer": "worker", "offset": 1}]
-        });
-        fs::write(
-            state_directory.join("state-machine.json"),
-            serde_json::to_vec(&legacy).unwrap(),
-        )
-        .unwrap();
-
-        let store = StateMachineStore::open(&state_directory, GroupKind::Metadata).unwrap();
-        assert_eq!(
-            store.metadata("events").await.unwrap(),
-            StreamMetadata {
-                stream_id: "stream/events".to_owned(),
-                group_id: "group/events/data".to_owned(),
-                lifecycle: StreamLifecycle::Active,
-            }
-        );
-        assert!(matches!(
-            store.poll("events", "worker").await.unwrap(),
-            PollResult::Message(Message {
-                offset: 1,
-                key: Some(key),
-                payload,
-                ..
-            }) if key == "key" && payload == b"recover"
-        ));
-    }
-
-    #[tokio::test]
-    async fn legacy_snapshot_format_recovers_metadata_messages_and_progress() {
-        let directory = tempfile::tempdir().unwrap();
-        let state_directory = directory.path().join("state-machine");
-        fs::create_dir_all(&state_directory).unwrap();
-        let snapshot_path = state_directory.join("snapshot.json");
-        let snapshot = StoredSnapshot {
-            meta: SnapshotMeta {
-                last_log_id: Some(LogId {
-                    leader_id: openraft::CommittedLeaderId::new(1, 1),
-                    index: 1,
-                }),
-                last_membership: StoredMembership::default(),
-                snapshot_id: "legacy".to_owned(),
-            },
-            data: serde_json::to_vec(&serde_json::json!({
-                "version": 1,
-                "streams": {"events": [
-                    {"key": null, "payload": [115, 107, 105, 112], "published_at_ms": 1},
-                    {"key": "key", "payload": [114, 101, 99, 111, 118, 101, 114], "published_at_ms": 2}
-                ]},
-                "consumers": [{"stream": "events", "consumer": "worker", "offset": 1}]
-            }))
-            .unwrap(),
-        };
-        let snapshot_before = serde_json::to_vec(&snapshot).unwrap();
-        fs::write(&snapshot_path, &snapshot_before).unwrap();
-
-        let store = StateMachineStore::open(&state_directory, GroupKind::Metadata).unwrap();
-        assert_eq!(fs::read(&snapshot_path).unwrap(), snapshot_before);
-        assert_eq!(
-            store.metadata("events").await.unwrap(),
-            StreamMetadata {
-                stream_id: "stream/events".to_owned(),
-                group_id: "group/events/data".to_owned(),
-                lifecycle: StreamLifecycle::Active,
-            }
-        );
-        assert!(matches!(
-            store.poll("events", "worker").await.unwrap(),
-            PollResult::Message(Message {
-                offset: 1,
-                key: Some(key),
-                payload,
-                ..
-            }) if key == "key" && payload == b"recover"
-        ));
     }
 
     #[test]

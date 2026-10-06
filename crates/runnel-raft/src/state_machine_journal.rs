@@ -11,7 +11,7 @@ use super::{
     NodeId, PersistenceWriteOperation, PersistenceWriteRole, TypeConfig, persistence_write,
 };
 
-pub(super) const FORMAT_VERSION: u32 = 1;
+pub(super) const FORMAT_VERSION: u32 = 2;
 pub(super) const FILE: &str = "state-machine.log";
 pub(super) const MAX_RECORD_SIZE: u32 = 64 * 1024 * 1024;
 

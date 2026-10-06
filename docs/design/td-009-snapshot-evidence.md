@@ -31,8 +31,8 @@ snapshot and in the in-memory message vectors.
 
 The immediate conclusion is therefore two-sided:
 
-- focused tests establish recovery slices and narrow version-1 read-forward
-  behavior, but do not prove mixed-release operation, full cross-artifact
+- focused tests establish current-format recovery slices and explicit refusal
+  of pre-retry state-machine formats, but do not prove mixed-release operation, full cross-artifact
   consistency, or safety at every crash point; and
 - the current measurements expose snapshot-file growth and bounded build
   timing under one three-node hot-path matrix, but do not justify treating the
@@ -54,16 +54,16 @@ the group directory:
 | Artifact | Current representation | Recovery role |
 | --- | --- | --- |
 | `raft-log.json` | Version-1 JSON Raft log with committed, vote, purge, and retained entries | Consensus history; may be purged after a snapshot. It is not retained broker history. |
-| `state-machine/state-machine.json` | Version-2 JSON checkpoint containing applied log, membership, and materialized state; version 1 is read forward in memory | Full checkpoint fallback and restart recovery. |
-| `state-machine/state-machine.log` | Length-prefixed JSON apply journal, record version 1, with a 64 MiB per-record limit | Durable apply record replayed after the selected checkpoint or snapshot. Only an incomplete final frame is truncated. |
+| `state-machine/state-machine.json` | Version-3 JSON checkpoint containing applied log, membership, and materialized state; only version 3 is accepted | Full checkpoint fallback and restart recovery. |
+| `state-machine/state-machine.log` | Length-prefixed JSON apply journal, record version 2, with a 64 MiB per-record limit | Durable apply record replayed after the selected checkpoint or snapshot. Only an incomplete final frame is truncated; old and unknown complete record versions fail startup. |
 | `state-machine/snapshot.json` | JSON `StoredSnapshot` wrapper containing OpenRaft `SnapshotMeta` and a JSON snapshot payload | Current snapshot cache and persisted recovery image. The atomic replacement syncs the file and parent directory. |
 
 On [`StateMachineStore::open`](../../crates/runnel-raft/src/state_machine_store.rs#L391-L442), recovery loads the checkpoint, validates and selects the snapshot only when its applied log boundary is newer, then reads the journal and replays entries strictly after the selected boundary. Journal reading materializes its contents before replay; only a partial final frame is truncated, while a complete malformed or unsupported record fails startup. Cluster identity, group manifest, and persisted-artifact preflight are owned by the surrounding clustered storage layer. The [TD-007 evidence note](td-007-storage-compatibility-evidence.md) records that preflight validates artifact shapes and identities but does not prove mixed-release compatibility or every cross-file boundary.
 
-The checkpoint and snapshot payload are version 2 on write and accept version
-1 on read; an omitted snapshot version defaults to version 1. Missing legacy
-fields such as grouped-consumer state and the lease-clock floor receive their
-declared defaults. The version-2 snapshot materialized body includes:
+The checkpoint and snapshot payload are version 3 on write and accept only
+version 3 on read. All current fields are required. Pre-retry checkpoint,
+snapshot, and journal formats fail closed without a migration path. The
+version-3 snapshot materialized body includes:
 
 - stream IDs, group IDs, lifecycle state, and every retained message's
   timestamp, key, and opaque payload;
@@ -84,18 +84,16 @@ group manifests; compatibility preflight validates persisted artifacts, but
 payload parsing alone does not prove cross-artifact agreement. See the
 [TD-007 compatibility evidence](td-007-storage-compatibility-evidence.md).
 
-The exact reader boundary is narrow rather than a release guarantee: version
-checks accept only 1 and 2, and current writers emit version 2. Top-level
-checkpoint/snapshot envelopes and several stream/consumer wrappers reject
-unknown fields, while nested retained-message and grouped-delivery structs do
-not uniformly declare that restriction. Legacy stream arrays are mapped to
-generated stream/group identity and active lifecycle in memory. Snapshot
-payload validation checks JSON shape and version; it does not attach a
+The state-machine checkpoint and snapshot readers accept only version 3, and
+the current journal reader accepts only version 2. All persisted state fields
+and current stream shapes are required; pre-retry checkpoint, snapshot, and
+journal schemas are rejected. Nested retained-message and grouped-delivery
+structs do not uniformly reject unknown fields. Snapshot payload validation
+checks JSON shape and version; it does not attach a
 checksum or bind payload contents to the outer group/cluster identity. Peer
 group resolution and startup storage checks provide that surrounding context,
-but parsing a snapshot alone does not prove those identities agree. The
-version-1 journal has no read-forward path. No mixed-version writer, rolling
-upgrade, or downgrade matrix is established.
+but parsing a snapshot alone does not prove those identities agree. No
+mixed-version writer, rolling upgrade, or downgrade matrix is established.
 
 Sources: [`PersistedSnapshotState`, stream adapters, and snapshot wrapper](../../crates/runnel-raft/src/state_machine_store.rs#L58-L250), [`GroupConsumerState`](../../crates/runnel-raft/src/delivery.rs#L21-L33), [checkpoint version validation](../../crates/runnel-raft/src/state_machine_store.rs#L314-L339), and [snapshot format validation](../../crates/runnel-raft/src/state_machine_store.rs#L897-L912).
 
@@ -213,11 +211,11 @@ The current tests establish these properties:
    state-machine image at that checked failure point; it does not establish
    OpenRaft log-store interaction, process-crash or device-failure behavior,
    journal-compaction failure recovery, or every install boundary.
-5. **Legacy read-forward is narrow.** Version-1 snapshot payloads and legacy
-   stream arrays are converted in memory to current stream identity/lifecycle
-   state; missing grouped-delivery and lease-clock fields use defaults.
-   Current writers emit version 2. This is not a mixed-version writer
-   contract or a downgrade guarantee.
+5. **Pre-retry schemas fail closed.** Checkpoints and snapshot payloads before
+   version 3, and state-machine journal records before version 2, are not
+   decoded or migrated. Current-format restart, replay, and snapshot recovery
+   remain covered; this is not a mixed-version writer contract or a downgrade
+   guarantee.
 6. **Consensus compaction is separate from broker retention.** Purging
    `raft-log.json` does not remove messages from the materialized snapshot.
 7. **Transfer interruption is safe but not resumable.** A receiver that is
@@ -248,7 +246,7 @@ The direct state-machine tests are in
 | `rejected_snapshot_install_preserves_existing_state` | Invalid transfer bytes are rejected without changing the current polled state; install-failure counters return to an idle gauge. | Filesystem or process failures after persistence begins. |
 | `failed_snapshot_persistence_keeps_previous_state_and_recovers_checkpoint` | Forces the initial `snapshot.json` write to fail, checks the previous in-memory snapshot/state, then reopens the previous checkpoint. | Later persistence failures, journal compaction, or cache publication. |
 | `checkpoint_failure_after_snapshot_persist_recovers_new_snapshot` | Injects a test-only checkpoint-persist error after the new `snapshot.json` is durably replaced and checkpoint encoding completes but before checkpoint replacement; checks the old checkpoint bytes and running state/cache, then reopens and verifies selection of the complete newer snapshot. | Actual checkpoint file-write failure, abrupt process/device failure, the surrounding OpenRaft log-store interaction, journal-compaction failure, and other install boundaries. |
-| `legacy_snapshot_format_recovers_metadata_messages_and_progress` and `legacy_snapshot_defaults_lease_floor_and_applied_commands_advance_it` | Exercise version-1 legacy stream arrays, consumer offset, absent lease-clock default, and current replay after read-forward. | Mixed-version writers, old/new binary interoperability, or downgrade. |
+| `unsupported_state_machine_checkpoints_are_rejected_without_mutation` and `unsupported_snapshots_are_rejected_without_mutation` | Reject prior and future state versions without rewriting checkpoint/snapshot files or creating a journal. | A storage migration, mixed-version writers, old/new binary interoperability, or downgrade. |
 | `grouped_lease_clock_floor_survives_snapshot_recovery_and_backward_time` and related grouped-delivery state-machine tests | Round-trip the current payload while checking lease-clock floor, in-flight delivery, attempts, and token fencing. | Snapshot filesystem install/recovery of every grouped-policy transition or crash timing. |
 | `unsupported_snapshot_version_is_rejected_without_creating_journal` and `invalid_persisted_snapshot_is_rejected_before_startup` | Unsupported or malformed persisted snapshot data fails startup; the unsupported-version test also checks that no state-machine journal is created. | Identity/boundary agreement across otherwise parseable checkpoint, snapshot, journal, and Raft-log files. |
 
@@ -456,8 +454,9 @@ gates are satisfied:
 ### Compatibility and operations evidence
 
 - The snapshot payload, metadata, manifest, and peer transport each have
-  explicit version and compatibility rules. Read-forward support is tested
-  separately from mixed-version writer interoperability and downgrade.
+  explicit version boundaries. The state-machine reader rejects old schemas;
+  no read-forward path, mixed-version writer interoperability, or downgrade
+  is promised.
 - A future format migration preserves the current source image until the
   target is complete, validated, and activated under the storage-upgrade
   safety contract. Snapshot transfer is not reused as an implicit migration

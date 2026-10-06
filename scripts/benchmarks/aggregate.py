@@ -232,6 +232,7 @@ def aggregate_results(results: list[dict[str, Any]]) -> dict[str, Any]:
                 "measurement_boundary",
                 "measurement_client",
                 "client_image",
+                "client_resource_limits",
                 "semantic_metadata",
             ):
                 if result["backends"][backend_name].get(field) != reference[

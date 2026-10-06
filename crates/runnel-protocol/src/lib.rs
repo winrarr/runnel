@@ -220,6 +220,7 @@ pub enum Request {
         ack_timeout_ms: u64,
         #[serde(default)]
         max_delivery_attempts: Option<u32>,
+        retry_delay_ms: u64,
     },
     InspectConsumer {
         stream: String,
@@ -425,6 +426,7 @@ pub enum Response {
         configured: bool,
         ack_timeout_ms: u64,
         max_delivery_attempts: Option<u32>,
+        retry_delay_ms: u64,
     },
     Health {
         status: String,

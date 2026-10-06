@@ -1,52 +1,61 @@
 # Single-node to clustered migration boundary
 
-- Status: exploratory design note; not an accepted compatibility decision
-- Last reviewed: 2026-09-29
-- Baseline: `4cb11ab3ef0b4ff956c729d1ada1a21066bd0cfd`
+- Status: accepted migration boundary; runtime implementation deferred by [ADR 0043](../decisions/0043-offline-local-to-cluster-migration.md)
+- Last reviewed: 2026-10-06
+- Baseline: `66cacafc8545f010dc710b49a1947c65e8dad53d`
 - Reading guide: [design-note conventions](README.md)
 - Scope: backlog outcome [Make growth from one node to a cluster non-disruptive](../backlog.md#make-growth-from-one-node-to-a-cluster-non-disruptive)
 
 ## Summary
 
-The candidate first supportable local-to-cluster migration is a side-by-side,
-logical export/import into a fresh three-node clustered deployment. It should
-preserve logical stream offsets, record bytes, publish timestamps, ordering
-keys, producer request identities, consumer progress, and durable delivery
-attempts. It should use a short, explicit source fence for the final consistent
-boundary, then activate the target through a durable generation record and an
-external endpoint change.
+The accepted first local-to-cluster migration is an offline, all-stream,
+side-by-side logical export/import from one supported local deployment into a
+fresh three-voter static cluster. It preserves logical stream offsets, order,
+timestamps, key and payload bytes, request identities, durable consumer
+progress, attempts, configured policies, and pinned policy snapshots. The
+source is stopped and durably fenced before export, and stays fenced throughout
+copy, import, validation, activation, and endpoint cutover. Outage duration is
+therefore proportional to transfer and validation; the first slice does not
+promise a short fence or zero downtime.
 
-This is non-disruptive to the application model and to acknowledged state. It
-is not a promise of zero downtime in the first slice: the initial supported
-procedure has a bounded maintenance window while the source is fenced and the
-target is verified. A live copy with a replicated tail or dual writes is a
-separate design and remains outside the first supportable boundary until its
-ordering, acknowledgement, and fencing proof exists.
+The target remains a non-serving staging generation until every imported
+stream, consumer state, request identity, and configured voter is validated.
+After explicit activation and endpoint cutover, it is read-only until a
+durable `write-pending` boundary makes the first target-only mutation
+forward-only. The frozen source is retained as a rollback candidate only until
+that boundary and as a stale recovery artifact afterward. See [ADR 0043](../decisions/0043-offline-local-to-cluster-migration.md)
+for the accepted authority and preservation contract.
 
-The migration is an engine boundary, not a durable-format upgrade. Local log
-files must be read through the local compatibility reader and converted into
-cluster data-group state. Copying a local file into a clustered directory,
+The migration is an engine boundary, not a durable-format upgrade. No source
+or migration runtime is eligible at the recorded baseline: it has no
+fence/import path and still writes ordinary records as `RNL1`. The future
+migration-aware release must use `RNL3` as its single local stream format and
+emit the consumer-state schema supported by its migration implementation.
+`RNL1`, `RNL2`, mixed histories, old binaries, and obsolete state schemas are
+refused without source mutation, even if an observed historical reader can
+decode them. Copying a local file into a clustered directory,
 republishing through the public API, or installing local files as an OpenRaft
 snapshot is not a supported migration.
 
-This note is an exploratory boundary, not a migration implementation plan or
-compatibility promise. Current engine and protocol behavior is authoritative in
-[architecture](../architecture.md), the current code/tests, and the ADRs in
-the references. The proposed generations, phases, schemas, and procedures are
-illustrative mechanisms; the staged section below records outcome/evidence
-gates that a different implementation may satisfy another way.
+This note records the evidence and implementation gates behind the accepted
+behavior; it is not a runtime-support claim or a file/API implementation plan.
+Current behavior remains defined by [architecture](../architecture.md), code
+and tests, and accepted ADRs. The authority, preservation, and rollback
+outcomes in ADR 0043 are binding; proposed bundle fields, phase names, schemas,
+and command shapes below remain illustrative mechanisms unless that ADR
+requires their outcome.
 
 ## Boundary at the recorded baseline
 
-The following distinction is important: this note defines a candidate future
-boundary; it does not turn the current engine into a migration service.
+The following distinction is important: this note records an accepted future
+boundary; it does not turn the current engines into a migration service.
 
 | Classification | Evidence in the current repository | Consequence for this note |
 | --- | --- | --- |
-| Observed local behavior | The local broker selects one durable writer format at startup, scans known `RNL1`, `RNL2`, and `RNL3` frame magics, truncates an incomplete trailing frame during normal recovery, and persists consumer checkpoints/journal events. Consumer state includes the configured versioned policy and policy snapshots pinned to attempted offsets; process-local delivery members, tokens, and `Instant` deadlines are not durable. See [`BrokerState::open`](../../crates/runnel-core/src/broker.rs), [`ConsumerState`](../../crates/runnel-core/src/consumer_state.rs), [`StreamLog::open`](../../crates/runnel-core/src/stream_log.rs), and the recovery tests in [`runnel-core`](../../crates/runnel-core/src/lib.rs). | A converter can preserve logical records and durable consumer state only after a normal source recovery boundary. It must preserve configured policy and per-offset policy snapshots as well as progress and attempts; it cannot copy volatile delivery ownership. |
+| Observed local behavior | At the recorded baseline, the local broker writes ordinary records as `RNL1`, can select another durable writer format, scans known `RNL1`, `RNL2`, and `RNL3` frame magics, truncates an incomplete trailing frame during normal recovery, and persists consumer checkpoints/journal events. Consumer state includes the configured versioned policy and policy snapshots pinned to attempted offsets; process-local delivery members, tokens, and `Instant` deadlines are not durable. See [`BrokerState::open`](../../crates/runnel-core/src/broker.rs), [`ConsumerState`](../../crates/runnel-core/src/consumer_state.rs), [`StreamLog::open`](../../crates/runnel-core/src/stream_log.rs), and the recovery tests in [`runnel-core`](../../crates/runnel-core/src/lib.rs). | No source is migration-eligible at this baseline. A future migration-aware release must write and read only its single `RNL3` local stream format and supported consumer-state schema; `RNL1`, `RNL2`, and mixed histories are refused unchanged. Preserve durable policies, snapshots, progress, and attempts, not volatile ownership. |
 | Observed clustered behavior | The clustered engine selects the Raft backend at process startup. Startup validates clustered storage identity and persisted artifacts before opening groups; stream creation reconciles metadata `Creating`/`Active` state with one data group per stream and the configured peer set. The current layout uses `storage.json`, `groups/metadata`, and `groups/data/<hex-stream>` with an identity-bearing `group.json`. Grouped consumer state includes configured policy and per-offset policy snapshots along with durable progress and attempts; delivery ownership and deadlines are replicated. See [`PersistentEngine::open_with_config`](../../crates/runnel-raft/src/engine.rs), [`GroupConsumerState`](../../crates/runnel-raft/src/delivery.rs), [`GroupManager`](../../crates/runnel-raft/src/group_manager.rs), [`StateMachineStore`](../../crates/runnel-raft/src/state_machine_store.rs), and [`SnapshotState`](../../crates/runnel-raft/src/state_machine.rs). The detailed current artifact/version evidence is in the [TD-007 compatibility note](td-007-storage-compatibility-evidence.md) and [TD-009 snapshot note](td-009-snapshot-evidence.md). | A fresh target can be populated only through a future logical import path. The existing public `Publish`, `CreateStream`, and snapshot-recovery paths are not a local-to-cluster interchange format. |
-| Observed absence | There is no migration command, import/export schema, durable migration phase, writer-fence epoch, endpoint-generation owner, or migration-specific status/metric in the current code. The engine now exposes backend-independent failure kind and safe attempt-outcome classification, but the provisional server still emits its existing error codes and has no migration or stage-aware outcome vocabulary. Existing clustered identity checks intentionally reject ambiguous state; they do not convert it. Current snapshot and peer metrics describe recovery activity only. The current tests cover local recovery and clustered restart/failure, not cross-engine migration. | Any phase, fence, activation, rollback, or migration-status behavior below is proposed work and must not be described as current support. |
-| Proposed first supported slice | Side-by-side logical export/import into an empty target using the configured static voter set (the initial supported shape is three nodes), with a source fence for the final boundary, validation before serving, external endpoint cutover, and source retention until the recovery window ends. | This is the proposed first supported slice for the backlog outcome. It preserves the application messaging model, not zero downtime or automatic downgrade. |
+| Observed absence | There is no migration command, import/export schema, durable migration phase, writer-fence epoch, endpoint-generation owner, or migration-specific status/metric in the current code. ADR 0031 accepts negotiated v2 outcomes, but its runtime remains incomplete. Existing clustered identity checks intentionally reject ambiguous state; they do not convert it. Current snapshot and peer metrics describe recovery activity only. Existing tests cover local recovery and clustered restart/failure, not cross-engine migration. | Fence, import, activation, rollback, and migration-status behavior are accepted for future implementation under ADR 0043; none is current support. |
+| Accepted first supported boundary | Offline, all-stream logical export/import into an empty, fresh three-voter target. The whole source deployment is durably fenced before export and remains unavailable through validation and explicit endpoint cutover; target is read-only until its first-write gate. | [ADR 0043](../decisions/0043-offline-local-to-cluster-migration.md) accepts the behavior but does not implement it. It preserves the messaging model, not availability during transfer, zero downtime, or automatic downgrade. |
 
 The current evidence is useful but deliberately weaker than migration evidence.
 Local tests cover request-ID recovery, mixed legacy/versioned frame replay,
@@ -68,7 +77,7 @@ representation throughout ([`client_path.rs`](../../crates/runnel-server/tests/c
 
 The later storage and engine evidence notes refine this boundary without
 changing it: [TD-007](td-007-storage-compatibility-evidence.md) records the
-tested read-forward and fail-closed storage cases, [TD-008](td-008-static-cluster-evidence.md)
+tested current-format recovery and fail-closed storage cases, [TD-008](td-008-static-cluster-evidence.md)
 separates static-cluster evidence from replacement support, [TD-009](td-009-snapshot-evidence.md)
 and [TD-010](td-010-retained-state-evidence.md) document snapshot and retained-state
 cost boundaries, and the [clustered outcome contract](clustered-outcome-contract.md)
@@ -87,7 +96,7 @@ The test-to-claim mapping is:
 | Cluster delivery and process failures have a correctness baseline | `three_process_cluster_preserves_group_delivery_through_replica_restart`, `three_process_cluster_reassigns_group_delivery_after_node_failure`, and `three_process_cluster_replicates_and_recovers_after_failures` in [`cluster_smoke.rs`](../../crates/runnel-server/tests/cluster_smoke.rs). | Any cross-engine cutover, stale local writer rejection, or rollback after target writes. |
 | Cluster consumer policy and an attempted record's pinned policy survive leadership change | `persistent_raft_consumer_policy_is_durable_and_pins_attempts` in [`runnel-raft/src/lib.rs`](../../crates/runnel-raft/src/lib.rs) and `three_process_cluster_transfers_consumer_policy_and_delivery_snapshot_after_leader_failure` in [`cluster_smoke.rs`](../../crates/runnel-server/tests/cluster_smoke.rs). | Importing local configured policies/snapshots into clustered state or migrating a policy update that races with the source fence. |
 | Engine failures have a backend-independent retry boundary | `classifies_failures_without_exposing_backend_details` and `retains_diagnostic_sources_for_backend_failures` in [`runnel-engine/src/lib.rs`](../../crates/runnel-engine/src/lib.rs), with shared local and clustered assertions in [`engine_contract.rs`](../../crates/runnel-core/tests/engine_contract.rs) and [`runnel-raft/src/lib.rs`](../../crates/runnel-raft/src/lib.rs). | The classification does not identify a migration phase, writer-fence epoch, commit/apply stage, or endpoint authority; a future migration surface still needs explicit evidence for those boundaries. |
-| Provisional protocol support is declared consistently | `protocol_support_stays_aligned_across_wire_client_and_server` in [`runnel-server/src/protocol.rs`](../../crates/runnel-server/src/protocol.rs) checks the shared `runnel-json-lines` v1 and UTF-8/base64 declarations. | The declaration is source-level only: the listener has no runtime handshake or cross-version migration guarantee. |
+| Provisional protocol support is declared consistently | `protocol_support_stays_aligned_across_wire_client_and_server` in [`runnel-server/src/protocol.rs`](../../crates/runnel-server/src/protocol.rs) checks the shared `runnel-json-lines` v1 declarations. | This source-level declaration is not the target protocol for migration; ADR 0031 accepts negotiated v2, but runtime negotiation and cross-version compatibility remain unimplemented. |
 
 ## Current evidence and the boundary it creates
 
@@ -104,10 +113,11 @@ explicitly defers mixed engines and live engine migration.
 
 | State | Current representation | Migration consequence |
 | --- | --- | --- |
-| Stream history | `streams/<stream>.log`, with legacy `RNL1`, versioned `RNL2`, and request-aware `RNL3` record families. Each frame carries a logical offset, publish timestamp, optional UTF-8 key, payload lengths, and, for `RNL3`, a request ID. Current versioned/request-aware writers bound keys to 128 bytes, payloads to 64 MiB, and request IDs to 1 KiB. | Read records in logical offset order and write an explicitly versioned import representation. Preserve fields and bytes, not the local frame layout or file name. A mixed valid frame history is a source format case, not a target cluster format. |
+| Stream history | At the recorded baseline, `streams/<stream>.log` may contain `RNL1`, `RNL2`, and request-aware `RNL3` record families. Each frame carries a logical offset, publish timestamp, optional UTF-8 key, and payload; `RNL3` also carries typed request identity. Baseline request-aware writes bound keys to 128 bytes, payloads to 64 MiB, and request IDs to 1 KiB. | The future migration-aware source must contain only its single `RNL3` local format. `RNL1`, `RNL2`, and mixed histories are rejected before source mutation regardless of historical parser support. Preserve fields and bytes in an explicitly versioned import representation, not local frame layout or file name. |
 | Recovery/index state | The local log scans complete frames on open, truncates only an incomplete trailing frame, retains a bounded recent index, and uses a bounded sparse index for older reads. The async engine dispatches this synchronous work through bounded per-stream storage lanes; those lanes are execution isolation, not a migration boundary. | Export only after normal recovery has established a complete source boundary. A malformed complete frame is a validation failure; it must not be skipped or turned into a gap. |
-| Producer retry identity | The local `request_ids` map is rebuilt from request-aware frames. A repeated public request ID with equivalent representable key and payload bytes returns its first recovered offset; ADR 0034 requires a confirmed conflict for changed representable content. | Export every recovered request ID, original offset, and comparison content. The importer must reject an offset mismatch or duplicate conflicting mapping and preserve ADR 0034's exact-retry/conflict semantics. Records without a request ID remain non-deduplicated. |
-| Ordinary and grouped consumer state | Local `consumers/<stream>/<consumer>.json` stores `committed_offset`, out-of-order `acknowledged_offsets`, `delivery_attempts`, optional versioned `policy`, and per-offset `delivery_policies` pinned on first assignment and reused on retries. The adjacent `.json.tmp` path is an append-only event journal with a bounded size; checkpoint compaction writes a separate `.checkpoint.tmp` file and renames it into place. Older checkpoints/journal events default absent policy fields. | Convert this logical state into the clustered consumer-state schema. Preserve the configured policy version and values plus every persisted per-offset policy snapshot with its attempt; these snapshots keep an in-progress record's retry budget stable across a later policy update. Do not copy the JSON file or either temporary path as if it were a clustered snapshot. Validate every offset and policy against the imported stream and accepted policy limits. |
+| Producer retry identity | The local `request_ids` map is rebuilt from request-aware frames. Under [ADR 0034](../decisions/0034-publish-request-id-content-contract.md), an exact public retry returns its first offset and changed representable key or payload is a confirmed conflict. | Import each identity kind, original offset, and comparison content. Reject a conflicting mapping and preserve exact-retry/conflict semantics. Records without an ID remain non-deduplicated; internal dead-letter move identities remain distinct under ADR 0029. |
+| Producer retry identity | The local `request_ids` map is rebuilt from request-aware frames. Under [ADR 0034](../decisions/0034-publish-request-id-content-contract.md), an exact public retry returns its first offset and changed representable key or payload is a confirmed conflict. | Import each identity kind, original offset, and comparison content. Reject a conflicting mapping and preserve exact-retry/conflict semantics. Records without an ID remain non-deduplicated; internal dead-letter move identities remain distinct under ADR 0029. |
+| Ordinary and grouped consumer state | Local `consumers/<stream>/<consumer>.json` stores `committed_offset`, out-of-order `acknowledged_offsets`, `delivery_attempts`, optional versioned `policy`, per-offset `delivery_policies` pinned on first assignment and reused on retries, and `retry_not_before` schedules. The adjacent `.json.tmp` path is an append-only event journal with a bounded size; checkpoint compaction writes a separate `.checkpoint.tmp` file and renames it into place. Current readers require the current fields; earlier checkpoint and event shapes are rejected rather than read forward. | Convert this logical state into the clustered consumer-state schema. Preserve the configured policy version and values, every persisted per-offset policy snapshot, and each not-before deadline; these snapshots keep an in-progress record's retry budget stable across a later policy update. Do not copy the JSON file or either temporary path as if it were a clustered snapshot. Validate every offset and policy against the imported stream and accepted policy limits. |
 | Active deliveries | Local in-flight ownership, deadlines, and delivery tokens are process memory. Attempts are persisted before a delivery is returned, but local tokens do not survive restart. | Do not transfer local tokens, members, or `Instant` deadlines. At the fence, outstanding deliveries become eligible redeliveries on the target; an acknowledgement that races after the fence is rejected and must be retried against the target. |
 | Stream and consumer names/paths | Stream, consumer, and member names are restricted to 1–128 ASCII letters, digits, `.`, `_`, and `-`; stream and consumer names are later used below the local `streams` and `consumers` directories. | Validate names before export and again before import. A migration tool must never accept an arbitrary source path or infer a name from an unsafe filename. |
 
@@ -129,10 +139,11 @@ allocated as an arbitrary migration identity. [ADR 0006](../decisions/0006-separ
 make those group, snapshot, and retained-storage boundaries explicit.
 
 The clustered state machine currently materializes complete retained messages.
-`state-machine.json` and snapshot payloads emit format version 2 and read the
-tested version-1 forms; the OpenRaft `snapshot.json` wrapper also carries
-snapshot metadata. `state-machine.log` is a separate length-prefixed JSON
-journal with record format version 1 and a 64 MiB record bound. These are
+`state-machine.json` and snapshot payloads emit and require format version 3;
+older schemas fail closed without mutation. The OpenRaft `snapshot.json`
+wrapper also carries snapshot metadata. `state-machine.log` is a separate
+length-prefixed JSON journal with record format version 2 and a 64 MiB record
+bound; older record versions fail closed. These are
 separate persistence and recovery boundaries, as documented in the [TD-009
 snapshot evidence note](td-009-snapshot-evidence.md) and [TD-010 retained-state
 evidence note](td-010-retained-state-evidence.md). Its state includes:
@@ -185,14 +196,14 @@ stream placement, storage paths, or node identities.
 
 ## Goals and non-goals
 
-The proposed supported boundary has these goals:
+The accepted first boundary has these goals:
 
 - move a complete supported local deployment, including all streams and
   consumer state, to a fresh supported static cluster;
 - preserve logical offsets, record ordering, timestamps, keys, exact payload
-  bytes, replay eligibility, request-ID retry identity, acknowledged progress,
-  persisted delivery attempts, configured consumer policies, and the policy
-  snapshots already pinned to attempted records;
+  bytes, offset and timestamp replay eligibility, request-ID retry identity,
+  acknowledged progress, persisted attempts and retry schedules, configured
+  consumer policies, and pinned policy snapshots including retry delay;
 - make the authoritative writer and serving deployment unambiguous after every
   interruption or restart;
 - make copy, validation, fencing, cutover, and cleanup progress visible and
@@ -214,14 +225,16 @@ The first boundary does not include:
 - exposing migration paths, Raft terms, group IDs, offsets as physical file
   positions, or placement as normal application concepts.
 
-“Supported” here means a documented, versioned workflow with recovery tests. It
-does not mean that every historical local format, arbitrary target version, or
-future distributed engine can be migrated automatically.
+“Supported” here means a documented, versioned workflow with recovery tests.
+It does not mean that an old software generation, a historical format merely
+readable for compatibility, arbitrary target version, or future distributed
+engine can be migrated automatically.
 
-## Proposed authority model
+## Accepted authority outcome and illustrative record
 
-Treat the source and target as immutable logical generations during migration.
-The migration record is bound to:
+ADR 0043 requires one source generation to remain immutable and explicitly
+fenced while one target generation is staged. An implementation needs durable
+authority evidence bound to at least:
 
 - a unique migration ID;
 - source generation and target generation identifiers;
@@ -234,61 +247,64 @@ The migration record is bound to:
 - phase, bounded progress, last-progress time, validation result, and failure
   reason.
 
-The record must be durable before the source is fenced. Its exact storage path
-and administration API are implementation choices, not public protocol fields.
-The record should use an explicit generation pointer or activation marker;
-startup must never select a generation by directory order or by whichever
-partial file happens to parse. RocksDB’s [`CURRENT` and `MANIFEST` design](https://github.com/facebook/rocksdb/wiki/MANIFEST)
-is a useful reference for this recovery principle, although Runnel needs a
-broker-level migration record rather than RocksDB’s version-edit format.
+The controller writes a durable migration record and source-generation fence
+before export. Every supported source-broker startup must honor the marker and
+refuse ordinary service until an authorized migration resume or abort resolves
+it; an unsupported old binary cannot write the marked source. The source's
+stream and consumer artifacts remain immutable after the final inventory, with
+authority metadata stored separately. Exact paths and administration
+interfaces remain implementation choices. Target selection must use an
+explicit durable generation record, never directory order or whichever
+partial file parses. RocksDB's [`CURRENT` and `MANIFEST` design](https://github.com/facebook/rocksdb/wiki/MANIFEST)
+is a selector/recovery reference, not a format or procedure Runnel adopts.
 
-The proposed phases are:
-
-`planned → preflighted → fenced → copying → validating → ready → activated → complete`
-
-with durable `failed` and `aborted` outcomes. The phase rules are:
+The phase names below are illustrative. The source/target authority and
+rollback outcomes are accepted by ADR 0043:
 
 | Phase | Authoritative deployment | Allowed actions | Restart result |
 | --- | --- | --- | --- |
-| `planned` / `preflighted` | Source | Normal application traffic; target is empty or staging-only. | Source starts normally. A failed preflight does not mutate the source. |
-| `fenced` | None for mutating traffic | No source publishes, creates, polls, or acknowledgements. Target may receive bounded import work but is not ready for clients. | Resume or abort the same migration after validating the source fence. Do not start a second writer. |
-| `copying` / `validating` | None for mutating traffic | Idempotent chunk transfer and read-only validation. | Resume from the last durable chunk boundary or discard unreferenced target staging. |
-| `ready` | Source remains the last serving generation, but remains fenced if cutover has started | Target may be checked through an internal migration/read-only path. No public target traffic. | Keep target staged and source fenced; resolve by activating target or explicitly aborting. |
-| `activated` | Target | Public traffic only through the target endpoint. Source is permanently fenced for this migration. | Target must recover as the authority. It must not silently fall back to source or appear empty. |
-| `complete` | Target | Cleanup of old artifacts after the retention/rollback policy permits it. | Target remains authoritative; cleanup can resume independently. |
+| `planned` / read-only `preflight` | Source | Normal application traffic; target is absent or empty. Planning cannot mutate source state. | Source starts normally. Failed preflight leaves it unchanged. |
+| `fenced` / `copying` / `validating` | Source is the frozen logical authority; neither generation serves application traffic | Source ordinary startup is blocked. Target accepts only migration import and read-only validation, never application writes. | Resume only the same migration from a verified checkpoint, or explicitly abort after proving target is unactivated and source inventory still matches. |
+| `ready` | Source remains the rollback generation; target is complete but not selected for writes | All source/target inventories and every target voter validate. The migration controller can commit activation. | Keep both generations non-writable until activation or explicit abort. |
+| `active-reversible` | Target is selected; source remains fenced and rollback-eligible | Target serves reads only. Target writes remain blocked by the global first-write gate. Endpoint owner must match the selected target generation. | Reconcile endpoint and target activation; explicit offline rollback remains possible only after proving no target-only mutation was accepted. |
+| `write-pending` | Target is the only possible authority; source rollback is forbidden | First target mutation outcome is unresolved. Further mutations fail closed pending reconciliation. | Resolve against target durable state. Never select source while the outcome is ambiguous. |
+| `active-committed` / `complete` | Target | Normal application traffic through target; source is stale retained recovery material. Cleanup follows a separate explicit policy. | Recover forward from target. A source pointer rollback would hide acknowledged target state. |
 
-The source fence and target activation are intentionally ordered to avoid
-split-brain: fence the source, validate and durably activate the target, then
-switch the application endpoint. A coordinator crash between those actions may
-cause downtime, but it must not leave two writable deployments. If endpoint
-state is ambiguous, both deployments remain not-ready until the durable
-migration record and endpoint owner are reconciled.
+The authority order is: durably fence source, freeze and inventory it, import
+and validate target on all configured voters, durably activate the target as
+read-only, record/switch the external endpoint, then admit target writes only
+through the durable first-write gate. A crash may extend downtime. If endpoint
+state is ambiguous, the source remains fenced and target writes remain
+disabled until the generation record and endpoint owner agree.
 
-## Candidate input and target boundary
+## Supported input and target boundary
 
-The candidate first implementation would accept only a narrow, explicit
-matrix; this is not current migration support.
+The future implementation must accept only an explicit compatibility matrix;
+ADR 0043 does not claim current migration support or automatic coverage of
+formats merely readable for historical compatibility.
 
 ### Source
 
-- A cleanly recoverable current local store opened by the source-compatible
-  `runnel-core` reader. This includes valid local histories containing the
-  supported `RNL1`, `RNL2`, and `RNL3` record families in the combinations the
-  current reader accepts.
+- A cleanly recoverable store produced by a future supported,
+  migration-aware source-broker binary, using only its single `RNL3` local
+  stream format and its supported consumer-state schema. No source qualifies
+  at the recorded baseline. `RNL1`, `RNL2`, mixed histories, old software
+  generations, and obsolete state schemas fail preflight without mutation;
+  reader support alone never makes them eligible.
 - Valid stream and consumer names, complete logical offsets, and consumer
   states whose offsets, attempt entries, configured policy, and per-offset
   policy snapshots can be checked against their stream and supported bounds.
-- A source process that has a durable migration record and can acquire the
-  writer fence. For the first operational release, the final copy starts only
-  after the source broker is stopped or placed in an equivalent fenced mode.
+- A source deployment that can durably fence every writer and acknowledgement
+  path. The entire export/import/validation interval starts after that fence;
+  this first slice does not use a live prefix copy or a final short tail fence.
 - A source configuration whose delivery and retention behavior is either equal
   to the target or explicitly covered by a compatibility rule. The first
   implementation should preserve each configured consumer policy and its
   version, plus the policy snapshot pinned to each outstanding attempt. For
-  consumers without an explicit policy, and attempts whose old journal event
-  has no policy snapshot, require equivalent source and target broker-wide
-  acknowledgement-timeout and attempt-limit fallbacks unless the importer can
-  preserve their effective behavior another verified way.
+  consumers without an explicit policy, and attempts without a pinned policy,
+  require equivalent source and target broker-wide acknowledgement-timeout,
+  attempt-limit, and retry-delay fallbacks unless the importer can preserve
+  their effective behavior another verified way.
 
 ### Target
 
@@ -321,59 +337,71 @@ existing refusal behavior is a safety check, not a migration step.
 
 ## Preflight and writer fencing
 
-Preflight should be read-only until the migration record is durably created.
-It should:
+Planning preflight is read-only and cannot establish the final source digest
+while application writes continue. After the operator starts migration, the
+source is drained and durably fenced; only then does the authoritative scan,
+backup, and transfer begin. The implementation should:
 
-1. enumerate streams and consumer files through validated logical names;
-2. recover and scan each stream through the local reader, checking offset
+1. before stopping service, validate migration-aware source/target binaries,
+   source format eligibility, target emptiness and identity, and conservative
+   disk/memory reserve without mutating either generation;
+2. acquire exclusive migration ownership, stop new application operations,
+   drain admitted work at one deployment-wide boundary, and persist the source
+   migration ID and monotonically increasing fence epoch before declaring the
+   source fenced;
+3. recover and scan each stream through the declared reader from that source
+   release,
+   checking offset
    continuity, frame checksums where applicable, key UTF-8 validity, payload
    lengths, timestamp fields, and request-ID mappings;
-3. load each consumer checkpoint and journal, replaying only complete events and
+4. load each consumer checkpoint and journal, replaying only complete events and
    checking committed, out-of-order acknowledged, and attempt offsets against
    `[earliest, next)`, and checking configured and per-offset policy versions
    and values against supported limits;
-4. record source configuration and compatibility descriptors, including the
-   broker-wide fallback acknowledgement timeout and attempt limit, each
-   configured consumer policy and per-offset pinned policy snapshot,
-   retention/replay policy, protocol version, local record-format families,
-   and migration tool version;
-5. estimate source backup, target-per-node, target journal/snapshot, staging,
-   temporary, and transfer-buffer requirements; and
-6. write a source and target inventory with counts and content digests before
-   asking an operator to begin the fence.
+5. record source configuration and compatibility descriptors, including
+   broker-wide fallback timeout, attempt limit, retry delay, configured
+   consumer policies and pinned snapshots, retention/replay policy, current
+   protocol and schema versions, the future source release's single `RNL3`
+   writer format, and migration tool version;
+6. create and independently verify a restorable recovery artifact from the
+   frozen source boundary, separate from the target and from source-only
+   rollback state; and
+7. persist final source and target inventories, counts, bounds, and content
+   digests before copying any application data.
 
-The fence must be stronger than a process convention. The required runtime
-work is:
+The fence must be enforced by the source broker and migration controller, not
+only by a service-manager convention:
 
-- acquire exclusive migration ownership and persist a monotonically increasing
-  writer epoch before accepting the `fenced` phase;
-- stop new stream creation, publish, poll, and acknowledgement work at a
-  defined operation boundary;
-- let operations already past that boundary finish and include their durable
-  effects in the export, or reject them clearly; and
-- cause a stale broker process, stale migration owner, or delayed client path
-  to receive a fencing/retryable result instead of appending or acknowledging.
+- ordinary startup checks the durable marker and refuses service while it names
+  an unresolved migration;
+- all mutating paths, including stream creation, publish, poll/attempt,
+  acknowledgement, policy configuration, retry scheduling, and dead-letter
+  movement, check the same fence epoch;
+- operations admitted before the boundary either finish durably and appear in
+  the final inventory or return a definitive no-effect rejection; an unknown
+  request outcome remains unknown to its client, though any committed effect
+  is included in the frozen inventory; and
+- only explicit migration resume or abort can release the source. An abort
+  reopens it only after proving that target activation and target-only writes
+  did not occur and that the frozen source still validates.
 
 The current local engine has per-stream operation lanes but no persisted
-migration epoch, so this is a prerequisite for calling the procedure supported.
-The current server lifecycle can stop a process, but process shutdown alone is
-not a writer fence: a stale process or an operator restart could otherwise
-serve the same local directory without knowing that another generation is
-authoritative. Stopping the process is therefore only a possible first
-mechanism when a durable migration marker makes a later unfenced restart refuse
-service or explicitly abort the migration after validation. The existing
-`NotLeader` and generic `Cluster` outcomes are not migration-fence outcomes;
-the implementation must add and test a migration-specific classification
-before this design can claim stale-writer rejection.
+migration epoch, so this is not implemented. Stopping a process by itself is
+not a fence: every supported broker binary that can open the marked source
+must honor the marker, and an older or unaware binary must fail closed rather
+than serve it. Source record and consumer files remain immutable after the
+final inventory; only separate migration-authority metadata changes.
 
-Local in-flight deliveries need a deliberate barrier. The simplest first
-contract is to stop new polls, allow acknowledgements that entered before the
-fence to complete, then capture consumer state and invalidate all remaining
-local delivery tokens. Remaining attempts are preserved and redelivered on the
-target. A late source acknowledgement is not copied opportunistically: it is
-rejected by the fence, and the application retries after target activation.
-This can produce a duplicate delivery, which is allowed by at-least-once
-semantics; it must not move acknowledged progress backward.
+At the fence boundary, drain acknowledgements already admitted, then stop new
+polls and invalidate every remaining local delivery token. Preserve its
+attempt and pinned policy state; the target issues only new target receipts.
+The acknowledgement timeout is not transferred as a local `Instant` deadline.
+Any durable retry-delay schedule is carried as bounded remaining delay and
+rebased to target time; an in-flight attempt without an observed-expiry record
+uses ADR 0033's target-side first-observation rule. A late source acknowledgement
+is rejected by the marker and cannot advance imported progress. Redelivery can
+duplicate application work, as permitted by at-least-once delivery, but cannot
+lose or regress acknowledged broker state.
 
 ## Data and consumer-state transfer
 
@@ -414,13 +442,16 @@ For every `(stream, consumer)` pair, import:
   committed offset;
 - every persisted delivery attempt, preserving its maximum observed attempt;
 - the configured consumer policy, including whether it is explicit, its
-  monotonic version, acknowledgement timeout, and attempt limit;
+  monotonic version, acknowledgement timeout, attempt limit, and fixed retry
+  delay;
 - each outstanding attempted offset's pinned policy snapshot, so a policy
   change made after first delivery does not silently change that record's
   retry or dead-letter behavior;
+- any durably scheduled retry-not-before state, represented as remaining
+  bounded delay at the fence and rebased against the target clock;
 - for attempted offsets with no persisted policy snapshot, the same effective
-  source fallback policy, including legacy events whose attempt record predates
-  per-offset policy snapshots;
+  source fallback policy, including any current-schema attempt without a pinned
+  policy;
 - the consumer’s stream/name identity and a state digest; and
 - no local delivery token, `Instant` deadline, or transient member ownership.
 
@@ -433,9 +464,10 @@ importer must establish and verify one coherent value rather than allowing the
 two views to diverge.
 
 An active local message that was not acknowledged at the fence remains
-deliverable. Its attempt count is not reset, so a configured attempt limit can
-still dead-letter it according to the target policy. A target delivery token is
-new and must be acknowledged only with the target response. The migration must
+deliverable under the target's normal post-recovery retry rule. Its attempt
+count and pinned policy are not reset, so the same attempt limit and delay
+still govern later delivery or dead-letter movement. A target delivery token
+is new and must be acknowledged only with the target response. Migration must
 not make a source token valid on the target.
 
 Existing `.dead-letter` streams are copied with their own records and consumer
@@ -447,13 +479,15 @@ activation.
 
 ### Request-ID deduplication
 
-The source export must derive `request_id → offset` from the recovered
-request-aware frames, using the same first-mapping behavior as local recovery.
-The target import must populate the target data group’s per-stream dedup map
-before public traffic is enabled. For a pre-fence publish that committed but
-whose response was lost, retrying the same request ID after cutover must return
-the imported original offset without appending a second record. This must work
-through any target node and after target restart or leader change.
+The source export preserves each recovered identity kind and mapping from
+request-aware frames. For public IDs, the target must compare canonical key
+bytes and exact payload bytes under ADR 0034: an exact retry returns the
+original offset, while changed content is a confirmed conflict. Internal
+dead-letter move IDs remain distinct from public identities under ADR 0029.
+The target data group must have all mappings and comparison records before
+application writes are enabled. A committed pre-fence publish whose response
+was lost therefore resolves through any target node and after target restart
+or leadership change when the retry carries the same ID and content.
 
 For a pre-fence publish without a request ID, neither engine can safely infer
 whether an unknown response corresponded to a committed record. The migration
@@ -463,16 +497,17 @@ be retried on the target. An acknowledgement whose durable outcome is unknown
 is safe to retry after cutover because the target either contains the imported
 progress or redelivers the unacknowledged record.
 
-The current public behavior returns the original offset for an existing request
-ID even if a retry supplies different key or payload data. The first migration
-must preserve that behavior and document it as a compatibility constraint. A
-future conflict-detecting request-ID policy would require a separate protocol
-and migration decision.
+Changed-content reuse of a retained public request ID is rejected under ADR
+0034; migration cannot weaken that rule or invent IDs for records that lack
+them. If the source-format/target-schema combination cannot preserve identity
+kind, original content, and offset, preflight refuses it rather than merging
+identity namespaces or accepting an unverifiable retry.
 
 ## Target construction and cutover
 
-The target cluster should be created as a staging generation, not as a normal
-serving cluster with empty streams. A proposed sequence is:
+The target cluster is a staging generation, not a normal serving cluster with
+empty streams. The following sequence illustrates the accepted outcomes; file
+and command choices remain open:
 
 1. initialize target `storage.json` with a new cluster identity and validate
    every configured voter identity and address (three in the initial
@@ -484,31 +519,35 @@ serving cluster with empty streams. A proposed sequence is:
 3. import stream chunks and consumer state into data groups through the
    migration protocol, with each committed chunk carrying migration ID, stream
    identity, ordinal, expected next offset, and digest;
-4. make every target replica validate the imported digest and local durable
-   state. A node that has not imported or recovered the target state cannot be
-   ready or participate as an unverified authority;
+4. require every configured voter to recover the same target generation and
+   validate the imported digest and local durable state. A lagging or
+   unavailable voter keeps target activation and endpoint readiness false;
 5. commit one target metadata activation record containing the target
    generation, all stream digests, compatibility descriptors, and the writer
    activation epoch; and
-6. only after that record is durable, switch the application endpoint to the
-   target cluster and verify readiness, health, publish retry resolution,
-   replay, poll, and acknowledgement through the public protocol.
+6. activate the target read-only, explicitly record and switch the external
+   endpoint, and verify that readiness identifies the target generation; and
+7. admit the first target mutation only after the target has durably entered
+   the cluster-wide `write-pending` state.
 
-The metadata activation record is the target cluster’s authority for whether
-the staged generation may serve. Because the current implementation has
-independent data groups and no cross-group transaction, activation must include
-an all-stream readiness check. If any required stream is missing or not
-validated, target readiness is false and no stream is served as an accidental
-empty stream. A future per-stream migration could weaken the all-stream fence,
-but it would need a separate application-visible partial-cutover contract.
+The target metadata record selects whether the staged generation may serve.
+Because the current implementation has independent data groups and no
+cross-group transaction, activation must include an all-stream readiness
+check. If any stream is missing or not validated, target readiness is false
+and no stream may appear as an accidental empty stream. Per-stream cutover is
+outside ADR 0043.
 
 An endpoint switch is external state and cannot be made atomic with a Raft
 commit by the current system. The safe ordering is therefore conservative:
 
-1. source fence is durable;
-2. target activation is durable and target readiness is true;
-3. the endpoint owner records the target generation and switches traffic; and
-4. a post-cutover probe confirms the target generation and writer epoch.
+1. the source fence and frozen inventory are durable;
+2. every target voter is caught up, and target activation selects a
+   read-only generation;
+3. the endpoint owner records the target generation and switches traffic;
+4. a post-cutover probe confirms target generation and readiness while
+   application mutation remains disabled; and
+5. the first target mutation crosses its durable `write-pending` boundary before
+   the operation can commit.
 
 If the coordinator stops between these steps, a migration-status operation must
 use the durable records to complete or abort the transition. It must not start
@@ -516,29 +555,38 @@ both brokers and infer authority from reachability.
 
 ## Rollback boundary
 
-Rollback is a generation transition, not a promise that an old directory can
-always be restarted. The supported first-slice boundary is:
+Use ADR 0037's first-target-write boundary, not target activation alone, as the
+point after which the source is stale:
 
-- before target activation, the source remains the recoverable authority. A
-  failed or interrupted target can be resumed from a verified checkpoint or
-  discarded as unreferenced staging. An explicit abort releases the source
-  fence only after the source generation and migration record validate again;
-- once target activation is committed, the target is authoritative and the
-  source is permanently fenced for that migration. The source copy remains a
-  recovery artifact, not a second writer;
-- after target activation, restoring service from the source would hide target
-  publishes, acknowledgements, delivery attempts, and consumer progress. It is
-  therefore not an automatic or supported pointer rollback. Recovery uses the
-  target’s clustered snapshots/restart path or a separately designed reverse
-  migration; and
-- cleanup of the source is delayed until the documented recovery/retention
-  window, backup verification, and target burn-in policy permit it. Failure to
-  clean up is an observable space leak, not permission to delete the only
-  known recovery copy.
+- before target activation, an explicit abort may discard unreferenced target
+  staging and release the source fence only after revalidating the frozen
+  source, backup, and durable migration record;
+- after target activation but before any target-only durable mutation, target
+  is selected and read-only. An explicit offline rollback is permitted only
+  after every target process is stopped, durable target state proves that no
+  target-only mutation was accepted, the endpoint owner records source
+  selection, and the source's migration-aware startup validates the original
+  generation before releasing its fence;
+- before the first target mutation, a cluster-wide durable `write-pending`
+  transition blocks source rollback. If the operation commits, target becomes
+  `active-committed`. A proven no-effect failure may durably restore
+  `active-reversible`; an ambiguous outcome stays pending, blocks further
+  writes, and forbids source selection until target recovery resolves it;
+- after any target-only durable mutation is accepted, recovery is forward-only
+  from target state or a verified target recovery artifact. The source remains
+  frozen but stale: selecting it would hide acknowledged publishes, consumer
+  progress, attempts, or policy changes; and
+- source cleanup is an explicit later action after the configured recovery
+  window and backup policy permit it. Retained stale bytes are not permission
+  to roll back or delete the only recoverable generation.
 
-This intentionally offers a strong pre-activation rollback point and a clear
-post-activation no-downgrade boundary. It is safer than claiming that a
-side-by-side copy remains reversible after target state has changed.
+The write-pending rule applies to engine migration even though the source and
+target use different artifacts. The migration needs a cluster-wide authority
+record before the first user-visible target mutation because that mutation can
+make the frozen local source stale. ADR 0037's artifact-by-artifact
+read/write/mixed/migrate matrix remains specific to storage upgrades; this ADR
+adds logical conversion equality, target read-only activation, and the
+cross-engine authority barrier.
 
 ## Interruption, retry, and ambiguous outcomes
 
@@ -546,16 +594,17 @@ Each phase must have a deterministic restart rule:
 
 | Interruption | Required result |
 | --- | --- |
-| Before the source fence | Source remains writable and authoritative. An incomplete plan can be abandoned without changing logical state. |
-| During fence/drain | Startup finds the durable epoch and either completes the fence or fails closed. It must not accept a publish while the boundary is unresolved. |
-| During stream copy | The source generation is unchanged. Target resumes from the last complete chunk and revalidates its digest, or staging is discarded. A partial chunk is never served. |
+| Before the source fence | Source remains writable and authoritative. An incomplete read-only plan can be abandoned without changing logical state. |
+| During fence/drain | Ordinary startup sees the durable source marker and refuses service until the same migration resumes or is explicitly aborted. It must not accept a publish while the boundary is unresolved. |
+| During stream copy | The frozen source generation is unchanged. Target resumes from the last verified bounded chunk or staging is discarded. A partial chunk is never served. |
 | During consumer-state import | The last durable state record is authoritative. Reapplying the same state digest is idempotent; a different digest for the same migration/consumer fails. |
 | During target validation | Target remains not-ready. Source can be restored only through explicit abort and revalidation. |
-| After target activation commit but before endpoint switch | Source stays fenced. Target activation is authoritative; the operator completes endpoint cutover or declares a target recovery failure, never silently restarts source. |
+| After read-only target activation but before endpoint switch | Source stays fenced; target writes stay disabled. Reconcile the endpoint to target or perform explicit offline rollback after proving zero target-only mutations. |
 | During endpoint switch or status reporting | Readiness is conservative until endpoint owner and durable target activation agree. Unknown route state is an operational incident, not permission for two writers. |
-| After target activation and new traffic | Target recovery or a new migration is required. Source pointer rollback is forbidden. |
+| During `write-pending` | Target blocks further mutations; source rollback is forbidden until target state establishes the operation had no effect and a durable reversible state is restored. An ambiguous result stays pending. |
+| After first target-only durable mutation | Target recovery is forward-only. Source pointer rollback is forbidden. |
 
-### Observable failure outcomes (proposed)
+### Required observable failure outcomes (not yet implemented)
 
 The current protocol can report ordinary validation, cluster, not-leader,
 stream-not-ready, stale-delivery, and transport/unknown outcomes, but it has no
@@ -569,12 +618,12 @@ generic errors:
 | Fence acquisition or drain cannot complete | `failed` or `aborted` before target activation; source remains fenced until the record is reconciled. | Do not start a second source. Resolve the recorded owner, then explicitly abort and revalidate before reopening source traffic. |
 | Chunk, consumer-state, or digest mismatch | Target staging is not ready; source remains the authority if activation has not committed. | Quarantine or discard only unreferenced staging and investigate the named migration/ordinal/digest. Do not skip the record or continue from an unverified prefix. |
 | Target replica or activation readiness failure | Target remains not ready; source stays fenced once cutover has begun. | Resume target recovery or declare a pre-activation abort. Never route clients to a partial or empty target. |
-| Activation committed, route switch unknown | Target is the durable authority; readiness is conservative until the endpoint owner agrees. | Reconcile the endpoint to the target or keep service down. Do not restart the old source as a fallback. |
+| Activation committed, route switch unknown | Target selection is durable and the target remains read-only; readiness is conservative until the endpoint owner agrees. Source rollback remains eligible only if the first-write gate proves no target-only mutation was accepted. | Reconcile the endpoint to target or keep service down. If rollback is chosen, stop every target process and perform the explicit offline rollback; never restart source based on reachability alone. |
 | Stale source write or acknowledgement after activation | Source rejects the operation under the migration epoch; target accepts only a retried operation with its current delivery/request identity. | A publish with a stable request ID may be resolved explicitly; an ID-less publish remains unknown; a stale acknowledgement must not move target progress. |
 
-These are proposed states and operator-visible consequences, not existing
-response codes. The implementation must define their serialization and add
-real-process tests before the procedure can be advertised as supported.
+These are accepted operator-visible consequences, not current response codes.
+The implementation must define their serialization and add real-process
+tests before the procedure can be advertised as supported.
 
 The retry identity rules are equally important:
 
@@ -596,25 +645,26 @@ storage paths as new application concepts.
 
 The current engines retain history from offset zero and expose one-record,
 inclusive offset replay. Replay does not create delivery state, increment an
-attempt, or change ordinary consumer progress. The initial migration must
-preserve the exact `[earliest, next)` range and return the same record for every
-available offset. An absent offset remains an explicit `history_unavailable`
-outcome; it must not become ordinary `empty`.
+attempt, or change ordinary consumer progress. Migration preserves the exact
+`[earliest, next)` range and returns the same record for every available
+offset. An absent offset remains an explicit `history_unavailable` outcome; it
+must not become ordinary `empty`. It also preserves publish timestamps so the
+target can satisfy [ADR 0038](../decisions/0038-timestamp-based-replay-selector.md):
+the timestamp selector returns the lowest matching logical offset despite
+timestamp regressions and retains its accepted no-match and deleted-prefix
+semantics. Any lookup index is derived state and is rebuilt/validated from the
+imported records.
 
 The migration must not use replay as a substitute for a bulk export. Replay is
 an application read, does not carry local request-ID metadata, and is bounded to
 one logical record. Import must read the source representation with a
 source-aware adapter.
 
-When retention is implemented, migration is supportable only if the policy
-defines which history is entitled to move. The fence must freeze the source
-retention floor for the inventory, and the target must preserve the floor,
-`next` offset, replay-unavailable behavior, and any consumer/replay pins. A
-source whose history is already below the target’s promised replay scope must
-fail preflight rather than claim a complete migration. Replay sessions,
-time-based selectors, retention cleanup, and progress replacement remain
-unsupported in this design; [ADR 0024](../decisions/0024-explicit-offset-replay-read.md)
-defines the intentionally smaller current replay contract.
+If retention is implemented before migration support, the fence must freeze
+the source retention floor and any consumer/replay pins, and the target must
+preserve those together with `next` and explicit unavailable-history outcomes.
+A source whose retained history cannot satisfy the target's declared replay
+scope fails preflight; migration never fills a gap with empty history.
 
 ## Compatibility policy
 
@@ -623,20 +673,21 @@ small compatibility matrix:
 
 | Dimension | Supported first slice | Refused or deferred |
 | --- | --- | --- |
-| Public protocol | The current client and server share the provisional `runnel-json-lines` v1 declaration and UTF-8/base64 payload representations; existing requests/responses and client outcome classes remain valid after reconnect. | This declaration is source-level only because v1 has no runtime handshake. Protocol redesign, transparent automatic client reconnection, and new topology fields remain deferred. |
-| Local record encoding | Valid source histories read by the current local reader, including supported mixed `RNL1`/`RNL2`/`RNL3` frames. | Unknown versions, malformed complete frames, unbounded lengths, or guessed format conversion. |
-| Cluster representation | Current target metadata/data-group layout: `storage.json` and the Raft log use version 1, the state-machine journal uses record version 1, checkpoint and snapshot payloads emit version 2 with narrow version-1 read-forward support, and the current `group.json` manifest shape binds stream/group identity. | Import into an older target, unknown target schema, or arbitrary OpenRaft on-disk layout. |
-| Consumer semantics | Local committed and out-of-order acknowledged progress, attempts, configured consumer policy/version, and per-offset pinned policy snapshots convert into coherent clustered state. Outstanding local tokens become redelivery. | Transferring local volatile leases/tokens, dropping a pinned retry-policy snapshot, or changing retry/ack semantics during migration. |
-| Producer identity | All recovered source request IDs map to the same logical offsets after import. | Deduplicating requests that had no ID, inventing IDs, or silently changing key/payload conflict behavior. |
-| Configuration | Preserve configured per-consumer policies and versions plus per-offset policy snapshots; require equal source/target broker-wide fallback acknowledgement timeout and attempt limit for unconfigured consumers and attempts without a persisted snapshot, unless equivalent behavior is otherwise established. Preserve the current unlimited-retention policy and one-record inclusive offset-replay contract. | An unreviewed policy change whose effects could alter redelivery, dead letters, retention floors, or replay eligibility; silently resetting policy versions or replacing the snapshot pinned to an attempted record. |
+| Public protocol | The target implements the negotiated application protocol accepted by [ADR 0031](../decisions/0031-protocol-v2-contract.md). Migration adds no previous-version compatibility or automatic client reconnection promise. | Provisional v1 declaration, mixed-version operation, or topology fields as migration evidence. |
+| Local record encoding | A future migration-aware source release that writes and reads only its single `RNL3` local stream format and supported consumer-state schema, subject to target representability. No source is eligible at the recorded baseline. | `RNL1`, `RNL2`, mixed histories, old software generations, obsolete state schemas, unknown or malformed complete records, unbounded lengths, and guessed conversion. Historical reader support creates no compatibility promise. |
+| Cluster representation | Current target metadata/data-group layout: `storage.json` and the Raft log use their exact supported schemas; the state-machine journal uses record version 2, checkpoint and snapshot payloads require version 3, and the current `group.json` manifest shape binds stream/group identity. Earlier state-machine formats fail closed. | Import into an older target, unknown target schema, or arbitrary OpenRaft on-disk layout. |
+| Consumer semantics | Local committed and out-of-order acknowledged progress, attempts, configured policy/version including retry delay, durable retry scheduling, and per-offset policy snapshots convert into coherent clustered state. Outstanding local tokens/deadlines are dropped and redelivered under target rules. | Transferring local receipts or monotonic deadlines, dropping a pinned policy or scheduled delay, or changing retry/ack semantics. |
+| Producer identity | Public IDs preserve original offsets and exact comparison content under ADR 0034; internal dead-letter identities remain distinct under ADR 0029. | Deduplicating requests without IDs, inventing IDs, merging identity kinds, or changing key/payload conflict behavior. |
+| Configuration | Preserve configured policies/versions, retry delays, and per-offset snapshots; require equivalent source/target fallbacks for acknowledgement timeout, attempt limit, and retry delay where effective behavior depends on them. Preserve retained-history floors/pins and offset/timestamp replay semantics. | Unreviewed policy changes that alter redelivery, dead letters, retention, or replay; resetting versions or pinned snapshots. |
 | Identity | New target cluster identity; deterministic target stream identity and validated data-group manifests. | Copying local state into a target `storage.json`, reusing a different cluster/node identity, or guessing ownership. |
-| Downgrade | Abort and source recovery before activation. | Automatic post-activation downgrade, old-binary startup against target-only state, or source pointer rollback after target writes. |
+| Downgrade | Explicit offline source rollback can be eligible after read-only target activation until a target-only durable mutation is accepted; ADR 0037 governs the pending/commit resolution. | Automatic downgrade, old-binary startup against target-only state, source selection while `write-pending`, or rollback after target writes. |
 
-The existing [safe storage-upgrade design](storage-upgrade-safety-plan.md)
-defines related version, generation, writer-epoch, and fail-closed vocabulary.
-This note narrows that vocabulary to the cross-engine local-to-cluster case;
-it must not be read as accepting the broader storage-upgrade proposal or an
-automatic upgrade/downgrade policy.
+The [safe storage-upgrade design](storage-upgrade-safety-plan.md) defines
+related generation, writer-epoch, and fail-closed vocabulary. ADR 0043 applies
+the offline source, activation, and first-write boundary to engine migration,
+while adding logical state conversion and the all-voter target check. It does
+not add generic artifact compatibility, rolling operation, automatic
+upgrade, or downgrade support.
 
 ## Observability and operator controls
 
@@ -670,12 +721,12 @@ ambiguous, while any required stream is not validated, or while a target
 generation is only staging. A process that starts successfully but cannot
 prove which generation it may serve is not ready.
 
-This is a proposed migration status surface, not a description of the current
-HTTP or public protocol. Today, health and metrics expose broker, request,
-delivery, storage, peer, and snapshot observations, but no migration phase,
-source-fence epoch, target generation, or endpoint owner. Until that surface
-exists, an operator cannot infer migration authority from a successful process
-start, a reachable socket, or an ordinary health response.
+This required migration status surface is not current HTTP or public protocol
+behavior. Today, health and metrics expose broker, request, delivery, storage,
+peer, and snapshot observations, but no migration phase, source-fence epoch,
+target generation, or endpoint owner. Until the migration status exists, an
+operator cannot infer migration authority from process start, a reachable
+socket, or an ordinary health response.
 
 ## Resource bounds and operational budget
 
@@ -684,11 +735,12 @@ Migration is inherently proportional to the retained state being moved, so
 relative to an explicit inventory—not constant total work independent of data
 size.
 
-The first implementation should enforce these bounds:
+ADR 0043 accepts these resource outcomes; implementation must choose and test
+concrete values for the supported source/target schema:
 
 - one migration per source deployment and one active import per stream unless
   measured resource isolation justifies more;
-- a fixed maximum chunk byte/count budget below the current 64 MiB protocol and
+- a fixed maximum chunk byte/count budget below the selected protocol and
   peer-frame limits, with one or a small configured number of chunks buffered;
 - checksum and digest work that streams payloads rather than retaining a whole
   stream or whole deployment in the migration process;
@@ -715,10 +767,11 @@ These sources inform the boundary; none establishes Runnel compatibility.
 
 | Reference | Relevant mechanism | Difference that matters to Runnel |
 | --- | --- | --- |
-| [PostgreSQL `pg_upgrade`](https://www.postgresql.org/docs/current/pgupgrade.html) | Runs compatibility checks before mutation, initializes a separate destination, keeps the old cluster usable for ordinary copy/clone paths, and documents that link/swap choices can remove the old-cluster rollback property. | This is the closest operational model for a side-by-side generation. Runnel should retain the source and validate before activation, but must logically translate records and consumer state because local files are not clustered state. It should not adopt link-mode semantics that let two engines share mutable files. |
-| [Apache Kafka cross-cluster mirroring](https://kafka.apache.org/35/operations/geo-replication-cross-cluster-data-mirroring/) and [MirrorMaker offset configuration](https://kafka.apache.org/38/configuration/mirrormaker-configs/) | MirrorMaker 2 is explicitly used for cloud migration and replicates topics plus consumer groups/offsets; checkpoint and offset-sync settings translate source offsets before target consumers move. | This supports separating data transfer from endpoint cutover and treating consumer progress as migration data. Runnel cannot copy a source consumer offset by numeric translation alone because its local and clustered state models differ; the bundle must validate logical offsets and durable attempt state. The asynchronous mirror remains outside the first slice. |
+| [PostgreSQL 18 `pg_upgrade`](https://www.postgresql.org/docs/18/pgupgrade.html) | Provides a no-mutation compatibility check, initializes a separate destination, stops both servers, and defaults to copying so the old cluster remains usable until the new one is used; link/swap can remove that rollback property earlier. | This supports preflight, a quiesced source, and source-preserving generations. Runnel must logically translate records and consumer state because local files are not clustered state; it does not reuse `pg_upgrade`'s binary-compatible table files. |
+| [Apache Kafka 4.3 MirrorMaker 2](https://kafka.apache.org/43/operations/geo-replication-cross-cluster-data-mirroring/) | Separates cross-cluster topic mirroring from consumer-group checkpointing and exposes transfer/checkpoint progress. | This supports validating consumer state as migration data and surfacing progress. Kafka's replication offsets and topic/partition model do not equal Runnel's local/cluster logical offsets or per-offset delivery attempts; Runnel needs an engine-aware converter. Online mirroring remains deferred. |
+| [Apache Kafka 4.3 upgrade guide](https://kafka.apache.org/43/getting-started/upgrade/) | Uses a staged rolling-binary phase followed by feature finalization, and says metadata downgrade is unsupported for releases with metadata changes. | This reinforces a precise compatibility and downgrade boundary. Runnel has no mixed-version guarantee and instead selects an offline new engine generation; a retained source is rollback-eligible only before target-only durable state. |
 | [Apache Kafka partition reassignment](https://kafka.apache.org/36/operations/basic-kafka-operations/) and [leader-epoch fencing in the protocol](https://kafka.apache.org/37/design/protocol/) | Reassignment uses an explicit plan/verify workflow and a replication throttle. Kafka’s protocol carries leader epochs so stale clients/replicas can be rejected rather than allowed to write against an old authority. | Kafka moves replicas that already share one log protocol. Runnel’s local engine has no Raft membership, committed log identity, or migration epoch, so Kafka-like live reassignment cannot be applied to local files. Its explicit verification, throttling, and stale-authority rejection are useful requirements, but need a Runnel-owned fence. |
-| [etcd learner design](https://etcd.io/docs/v3.6/learning/design-learner/) and [runtime reconfiguration](https://etcd.io/docs/v3.7/op-guide/runtime-configuration/) | A new member receives state as a non-voting learner, cannot serve normal client traffic, and is promoted only after it catches up and passes safety checks. Learner count and replication load are bounded. | Runnel should apply the readiness-before-authority principle to each target replica. A local source is not an etcd/Raft member, so it cannot simply be added as a learner; logical import must first create target data-group state, after which normal controlled replica recovery can apply. |
+| [etcd learner design](https://etcd.io/docs/v3.6/learning/design-learner/) and [runtime reconfiguration](https://etcd.io/docs/v3.7/op-guide/runtime-configuration/) | A new member receives state as a non-voting learner, rejects ordinary client reads and writes (while retaining status and serializable-read exceptions), and is promoted only after it catches up and passes safety checks. Learner count and replication load are bounded. | Runnel should apply the readiness-before-authority principle to each target replica. A local source is not an etcd/Raft member, so it cannot simply be added as a learner; logical import must first create target data-group state, after which normal controlled replica recovery can apply. |
 | [The Raft paper](https://raft.github.io/raft.pdf) and [OpenRaft snapshot replication](https://docs.rs/openraft/latest/openraft/docs/protocol/replication/snapshot_replication/) | Consensus applies an ordered command stream and snapshots carry a committed state boundary and membership information for replica recovery. | A local log has no Raft log index, membership, or committed term to install. The target may use its normal Raft snapshot/recovery path after import, but local-to-cluster conversion needs a Runnel-owned bundle and schema validation before target activation. |
 | [RocksDB MANIFEST/CURRENT](https://github.com/facebook/rocksdb/wiki/MANIFEST) | A transactional version-edit log plus a `CURRENT` pointer identifies the latest consistent generation; recovery does not infer state from arbitrary files and does not apply partial atomic groups. | Runnel needs the same explicit-generation and no-partial-activation discipline. Its marker must additionally bind stream, consumer, request-ID, engine, and writer-epoch semantics; a generic file pointer is insufficient. |
 | [Online, Asynchronous Schema Change in F1](https://research.google/pubs/online-asynchronous-schema-change-in-f1/) | Online readers and writers can corrupt shared data when schema transitions are not mutually compatible; F1 constrains transitions to a formally safe bounded version window. | This is evidence against casually adding a live local writer plus clustered importer. An online Runnel design would need a compatibility proof for every old/new publish, acknowledgement, retry, and ordering interaction; the first slice therefore uses a fence. |
@@ -786,18 +839,20 @@ not as the first one-node-to-cluster cutover.
 
 ## Outcome and evidence gates
 
-The candidate boundary should be evaluated through independently verifiable
-gates, not treated as a prescribed code sequence. The details below name the
-outcomes and evidence required for a safe migration; implementation choices
-such as schema shape, chunk protocol, and phase storage remain open until an
-ADR accepts them.
+ADR 0043 accepts the boundary, not a prescribed code sequence. The gates below
+name independently verifiable implementation outcomes; schema shape, chunk
+protocol, phase storage, and command interfaces remain implementation choices
+when they satisfy that contract.
 
 1. **Schema and preflight outcome.** Evidence establishes a versioned logical
-   export/import schema,
-   source/target identity tuple, digest rules, compatibility matrix, and a
-   read-only source scanner. Fixtures cover mixed local frame families,
-   request IDs, out-of-order acknowledgements, attempts, malformed state,
-   incomplete tails, invalid names, and unavailable history.
+   export/import schema, source/target identity tuple, digest rules,
+   compatibility matrix, and a read-only source scanner. Fixtures cover
+   source records from the future single-format `RNL3` release, explicit
+   `RNL1`/`RNL2` and mixed-history refusals, request identities,
+   out-of-order acknowledgements, attempts and pinned policies, malformed
+   state, invalid names, and unavailable history.
+   Historical formats or records outside the declared migration matrix are
+   proven to refuse without mutation.
 2. **Fresh-target logical import outcome.** Evidence establishes an internal
    target data-group import mechanism with bounded, idempotent chunks,
    stream/consumer digests, explicit offsets, request-ID mappings, and
@@ -834,19 +889,24 @@ are the starting points for a future named migration workflow.
 
 ### Baseline and data fixture
 
-Start a real local source process and use the public client/CLI to create
-multiple streams, including a dead-letter stream, then publish:
+Start the future migration-aware, `RNL3`-only local source release and use the
+supported client to create multiple streams, including a dead-letter stream, then
+publish:
 
 - empty and non-empty keys;
 - binary and UTF-8 payloads;
-- records with and without stable request IDs;
-- request-aware records interleaved with legacy records; and
+- records with and without stable request IDs, including exact retries and a
+  changed-content conflict;
+- its single `RNL3` writer format, plus refusal fixtures for `RNL1`, `RNL2`,
+  and mixed histories; and
 - enough history to cross the local bounded tail index.
 
 Create independent consumers and a shared consumer. Acknowledge records in and
-out of order, leave one delivery in flight, expire one delivery, and persist
-multiple delivery attempts. Record source health, replay results, unavailable
-offset ranges, consumer state, request-ID mappings, and per-stream digests.
+out of order, leave one delivery in flight, persist retry-delay state and
+multiple delivery attempts, and change a policy after one offset has pinned its
+snapshot. Include timestamps that regress and exercise both offset and
+timestamp replay. Record source health, replay results, consumer state,
+request-ID mappings, policy fallback configuration, and per-stream digests.
 
 ### Fault and cutover matrix
 
@@ -854,10 +914,13 @@ For each phase and at least one representative stream, stop or interrupt:
 
 - the exporter during a chunk and at the durable progress record;
 - a target data-group process during import, validation, and activation;
+- one target voter lagging or unavailable during all-voter validation;
 - a target leader before and after a committed import or activation entry;
 - the source process during fence drain and while a client has a pending
   publish or acknowledgement; and
-- the endpoint coordinator between target activation and route switch.
+- the endpoint coordinator between target activation and route switch; and
+- the target process before, during, and after `write-pending`, covering a
+  committed mutation, a proven no-effect result, and an ambiguous result.
 
 After every interruption, verify the phase-specific authority rule, process
 health, target readiness, source immutability, no partial stream visibility,
@@ -869,7 +932,7 @@ After successful cutover, use the public protocol through follower and leader
 addresses to verify:
 
 - a pre-fence request ID with a dropped response resolves to its original
-  offset and appends no duplicate;
+  offset and appends no duplicate, while changed content is rejected;
 - a no-ID ambiguous publish remains explicitly unknown and is not silently
   retried by the migration;
 - acknowledged offsets remain acknowledged and unacknowledged offsets are
@@ -879,15 +942,19 @@ addresses to verify:
 - keyed delivery preserves per-key ordering and unrelated keys continue to
   make progress under the target contract;
 - replay returns the same pre-cutover records, leaves ordinary progress alone,
-  and reports the same unavailable range; and
+  reports the same unavailable range, and timestamp selection retains the
+  lowest matching offset under timestamp regression; and
 - target restart, follower restart, leader failure, and the documented target
   replica-recovery path preserve all imported state.
 
-Test pre-activation abort and source recovery separately from post-activation
-failure. The latter must recover target state or fail closed; it must not pass by
-starting the source with a stale configuration. Include a validation-failure
-case for every bundle field that can create an offset, identity, checksum,
-consumer, or request-ID mismatch.
+Test pre-activation abort, read-only activated rollback, first-write
+reconciliation, and post-commit target recovery separately. A post-commit
+failure must recover target state or fail closed; it must not pass by starting
+the source with a stale configuration. Include a validation-failure case for
+every field that can create an offset, identity, checksum, consumer,
+request-ID, or policy mismatch. Prove that a source format outside the declared
+current migration matrix is refused with all source bytes and consumer state
+unchanged.
 
 ## Migration cost benchmark plan
 
@@ -912,12 +979,13 @@ one interrupted-transfer case. Record:
 - repetition count, fixed CPU/memory/storage limits, raw artifacts, observed
   ranges, and stability status.
 
-The benchmark must distinguish the proportional cost of moving retained data
-from the short final fence and cutover window. It must not be used to claim that
-the current materialized clustered state scales to arbitrary retained history;
+The benchmark must report the full source-unavailable interval separately
+from copy, validation, activation, and endpoint work. It must not describe the
+fence as short unless measurements establish that. It must not claim that the
+current materialized clustered state scales to arbitrary retained history;
 that remains an open storage design question.
 
-## Unresolved risks and evidence required before an ADR
+## Implementation risks and evidence required before support
 
 - **Fence linearization.** The current local engine serializes per-stream
   operations but has no migration epoch. Implement and fault-test the exact
@@ -934,9 +1002,9 @@ that remains an open storage design question.
   tests cover policy persistence/transfer, but not cross-engine conversion.
   Verify redelivery, attempt limits, stale acknowledgements, and keyed ordering
   across the fence.
-- **Request-ID semantics.** Preserve source first-mapping behavior and test
-  retry after response loss, restart, leader change, and target import retry.
-  Decide later whether mismatched key/payload retries should remain accepted.
+- **Request-ID conversion.** Preserve typed identity namespaces, exact
+  comparison bytes, and original offsets under ADRs 0029 and 0034. Prove retry
+  after response loss, restart, leader change, and target import retry.
 - **Retention evolution.** The current all-history policy is simpler than the
   future retention/replay contract. Add retention floors and replay pins to the
   migration inventory before advertising migration for retained history that
@@ -955,24 +1023,23 @@ that remains an open storage design question.
   static-cluster placement is not production-ready. Verify imported target state
   with the supported cluster recovery path before treating migration as a
   general availability feature.
-- **Online availability.** If the bounded fence is too disruptive for a real
-  workload, compare a live-tail protocol and dual writes with failure tests
-  before expanding the scope. Do not infer safety from a successful happy-path
-  copy.
+- **Availability fit.** The accepted full offline fence may be too disruptive
+  for some workloads. Measure its full downtime/resource envelope first; any
+  live-tail or dual-write alternative requires a separately accepted protocol
+  and fault evidence, not an expansion of this implementation.
 
 ## Design gate and planning assessment
 
-This note is exploratory and does not accept a durable compatibility promise or
-an ADR. Implementation should satisfy the design/research evidence class with
-source-backed compatibility analysis, then satisfy the contract/migration gate
-with schema fixtures, interruption/restart tests, real-process cutover tests,
-and explicit rollback outcomes before an ADR or backlog retirement is proposed.
-
-The note does not accept a durable compatibility promise or an ADR. The
-missing supported migration path is tracked as a product outcome in the
-backlog; this note explores a candidate bounded slice. Online migration,
-dynamic placement, and segmented storage remain separate unresolved
-boundaries, and no additional tech-debt item is warranted for them here.
+ADR 0043 accepts the first migration behavior, but no procedure is supported
+until the schema/refusal matrix, durable source fence, bounded import, all-voter
+validation, endpoint reconciliation, first-write resolution, and real-process
+recovery gates pass. The [backlog outcome](../backlog.md#make-growth-from-one-node-to-a-cluster-non-disruptive)
+and [TD-007](../tech-debt.md#td-007-storage-conversion-and-artifact-compatibility-remain-open)
+remain open for that runtime work. Old software generations and historical
+formats not emitted by the future eligible source release are explicitly
+outside the acceptance matrix. Online migration, dynamic placement, and segmented storage
+remain separate outcomes; no additional tech-debt entry is warranted because
+these are not current implementation shortcuts.
 
 ## References
 

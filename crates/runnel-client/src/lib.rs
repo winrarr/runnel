@@ -371,6 +371,7 @@ pub struct ConsumerPolicy {
     pub configured: bool,
     pub ack_timeout_ms: u64,
     pub max_delivery_attempts: Option<u32>,
+    pub retry_delay_ms: u64,
 }
 
 /// The result classification for one request attempt.
@@ -842,6 +843,7 @@ impl Client {
         consumer: impl Into<String>,
         ack_timeout_ms: u64,
         max_delivery_attempts: Option<u32>,
+        retry_delay_ms: u64,
     ) -> Result<ConsumerPolicy, AttemptOutcome> {
         let stream = stream.into();
         let consumer = consumer.into();
@@ -852,6 +854,7 @@ impl Client {
                 consumer: consumer.clone(),
                 ack_timeout_ms,
                 max_delivery_attempts,
+                retry_delay_ms,
             },
             move |response| match response {
                 Response::ConsumerPolicy {
@@ -861,6 +864,7 @@ impl Client {
                     configured,
                     ack_timeout_ms,
                     max_delivery_attempts,
+                    retry_delay_ms,
                 } if response_stream == stream && response_consumer == consumer => {
                     Ok(ConsumerPolicy {
                         stream: response_stream,
@@ -869,6 +873,7 @@ impl Client {
                         configured,
                         ack_timeout_ms,
                         max_delivery_attempts,
+                        retry_delay_ms,
                     })
                 }
                 response => Err(Box::new(response)),
@@ -899,6 +904,7 @@ impl Client {
                     configured,
                     ack_timeout_ms,
                     max_delivery_attempts,
+                    retry_delay_ms,
                 } if response_stream == stream && response_consumer == consumer => {
                     Ok(ConsumerPolicy {
                         stream: response_stream,
@@ -907,6 +913,7 @@ impl Client {
                         configured,
                         ack_timeout_ms,
                         max_delivery_attempts,
+                        retry_delay_ms,
                     })
                 }
                 response => Err(Box::new(response)),

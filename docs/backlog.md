@@ -166,7 +166,7 @@ Goal: let multiple worker instances share one durable consumer while preserving 
 
 Rationale: small applications need a single durable worker without extra coordination, while growing applications should be able to add workers without learning about partitions or triggering application-managed rebalancing.
 
-Current progress: local and clustered grouped delivery now cover durable attempts, out-of-order acknowledgements, expiry, stale-delivery fencing, bounded expiry lookup, and real-process restart/failure paths. New local and persistent one-node recovery tests keep an offset unacknowledged after its first assignment under attempt limit 2, change the current policy to version 2 with limit 1, close and reopen the engine, then verify that the offset is delivered at attempt 2 and terminally moved only after reaching its original limit. This establishes persistence of both attempt count and the pinned snapshot across local journal recovery and persistent Raft engine reopen. The shared `assert_expired_delivery_is_fenced` conformance check requires an expired receipt to be rejected before replacement polling, followed by redelivery to a different member with a new token; both local and persistent Raft tests run it. A real three-process test also checks stale acknowledgement after expiry and before replacement polling. The leader-failure test separately verifies transfer of current policy and the pending offset's pinned snapshot to a new leader. A new real three-process test stops all nodes while a shared delivery is pending, restarts them from the same data directories, and verifies the original member receipt and token remain valid for acknowledgement. Another real three-process public-protocol test verifies that an in-flight key blocks its successor while another key progresses, preserves the held member receipt across a repeated poll, and releases the successor after acknowledgement. Lease expiry remains demand-driven, with no background timer. The shared engine also reports currently tracked in-flight deliveries. Broader failover, replay, retry-policy, dead-letter, and scalable ownership behavior remain incomplete.
+Current progress: local and clustered grouped delivery now cover durable attempts, out-of-order acknowledgements, expiry, stale-delivery fencing, bounded expiry lookup, and real-process restart/failure paths. New local and persistent one-node recovery tests keep an offset unacknowledged after its first assignment under attempt limit 2, change the current policy to version 2 with limit 1, close and reopen the engine, then verify that the offset is delivered at attempt 2 and terminally moved only after reaching its original limit. This establishes persistence of both attempt count and the pinned snapshot across local journal recovery and persistent Raft engine reopen. The shared `assert_expired_delivery_is_fenced` conformance check requires an expired receipt to be rejected before replacement polling, followed by redelivery to a different member with a new token; both local and persistent Raft tests run it. A real three-process test also checks stale acknowledgement after expiry and before replacement polling. The leader-failure test separately verifies transfer of current policy and the pending offset's pinned snapshot to a new leader. A new real three-process test stops all nodes while a shared delivery is pending, restarts them from the same data directories, and verifies the original member receipt and token remain valid for acknowledgement. Another real three-process public-protocol test verifies that an in-flight key blocks its successor while another key progresses, preserves the held member receipt across a repeated poll, and releases the successor after acknowledgement. Lease expiry remains demand-driven, with no background timer. The shared engine also reports currently tracked in-flight deliveries. Broader failover, replay, exponential/jittered backoff, dead-letter recovery, and scalable ownership behavior remain incomplete.
 
 Constraints:
 
@@ -191,23 +191,23 @@ Goal: let applications choose documented retry, backoff, dead-letter, and recove
 Rationale: a single broker-wide attempt limit is a useful local default, but event fan-out, interactive work, and long-running jobs have different failure and recovery needs.
 
 Current progress: local and clustered engines expose durable configure and
-inspect operations for bounded per-consumer acknowledgement timeouts and
-attempt limits. Policies use broker-wide settings as a legacy fallback, pin on
-first delivery, survive restart and clustered state replay, and retain the
-existing derived dead-letter transition. ADR 0033 accepts a fixed
-`retry_delay_ms` from zero through seven days, separate from the lease and
-pinned per offset; runtime implementation and verification remain open. In
-both engines, the delay starts when a committed poll or stale acknowledgement
-first durably observes lease expiry, and the persisted deadline is that
-observation time plus the pinned delay. A late observation starts a fresh full
-delay; a deadline already persisted survives restart and leader transfer. If
-restart or leader transfer precedes durable expiry observation, the first
-later operation starts the delay. Because expiry is demand-driven, a late
-observation can extend total wait beyond lease plus delay, and no command means
-no progress. Clustered timing remains subject to TD-020; local persisted
-deadlines use wall time before and after restart. Exponential or
-jittered delay, provenance, redrive, and richer terminal dispositions remain
-open.
+inspect operations for bounded per-consumer acknowledgement timeouts, attempt
+limits, and the fixed `retry_delay_ms` accepted by ADR 0033. Policies use
+broker-wide settings as a legacy fallback, pin on first delivery, survive
+restart and clustered state replay, and retain the existing derived
+dead-letter transition. The delay is separate from the lease, defaults to
+zero, is bounded to seven days, and is pinned per offset. In both engines, the
+delay starts when a committed poll or stale acknowledgement first durably
+observes lease expiry; a late observation starts a fresh full delay, and a
+deadline already persisted survives restart or leader transfer. If restart
+or leader transfer precedes durable expiry observation, the first later
+operation starts the delay. Recovery, same-key ordering, unrelated work,
+policy changes, batch delivery, and the real clustered process path now have
+focused coverage. Because expiry is demand-driven, a late observation can
+extend total wait beyond lease plus delay, and no command means no progress.
+Clustered timing remains subject to TD-020; local persisted deadlines use
+wall time before and after restart. Exponential or jittered delay, provenance,
+redrive, and richer terminal dispositions remain open.
 
 Constraints:
 
@@ -237,16 +237,21 @@ typed client, CLI, and real-server tests preserve ordinary consumer progress
 and return explicit `history_unavailable` outcomes. [ADR 0038](decisions/0038-timestamp-based-replay-selector.md)
 now accepts the semantics for a one-record time selector over stored broker
 publish timestamps, including equal/regressing timestamp order, no-match, and
-deleted-prefix completeness. The selector is not implemented. Durable replay
-sessions, retention floors and pins, replay acknowledgements,
+deleted-prefix completeness. [ADR 0042](decisions/0042-recoverable-replay-time-index.md)
+selects a cumulative prefix-maximum checkpoint index with 256-record blocks,
+derived-state rebuild in both engines, and the future retained-prefix recovery
+boundary. The selector is not implemented. Its sparse index still grows with
+retained history, so runtime memory and startup costs need measurement. Durable
+replay sessions, retention floors and pins, replay acknowledgements,
 failover/replay-session behavior, and replay-specific observability remain
 open.
 
 The [time-selector research](research/replay-time-selector-semantics.md)
-records source behavior and index/recovery risks. The
+records source behavior and reference-system comparisons. The
 [durable replay-session design](design/replay-sessions.md) compares session
 models and records separate cursor, acknowledgement, fencing, snapshot, and
-retention-pin questions; its time-selector semantics now follow ADR 0038.
+retention-pin questions; the selector semantics follow ADR 0038 and its index
+contract follows ADR 0042.
 
 Constraints:
 
@@ -260,7 +265,8 @@ Acceptance criteria:
 - a consumer can request replay by inclusive logical offset and, after implementation of a bounded index, by the lowest logical offset whose stored broker `published_at_ms` is at least the requested Unix-millisecond threshold; ties select the lowest offset and later traversal stays in append order;
 - a complete view with no timestamp match returns explicit `no_match`; incomplete deleted-prefix history returns `history_unavailable`, using complete prefix timestamp metadata when retention is introduced;
 - replay reads never change the ordinary consumer checkpoint, acknowledgement set, attempts, leases, or delivery tokens; any future progress replacement remains a separate fenced operation;
-- selector lookup work, result bytes, and concurrency are bounded, with index update, restart/rebuild, crash, snapshot-installation, and real-process local/cluster evidence;
+- selector lookup uses the ADR 0042 256-record prefix-maximum checkpoints, returning the lowest matching logical offset across timestamp regressions with logarithmic checkpoint probes and at most 256 header checks; result bytes and concurrency remain bounded;
+- index update, restart/rebuild, crash, snapshot-installation, and real-process local/cluster evidence pass; future retention stores complete deleted-prefix maximum metadata before physical prefix removal and returns `history_unavailable` when that proof is absent or could contain a match;
 - concurrent polls, acknowledgements, retries, and future replay-session changes have deterministic fencing behavior;
 - restart and failover tests preserve the selected replay position and original durable progress as documented;
 - lag, replay progress, unavailable history, and replay-induced resource pressure are observable.
@@ -308,6 +314,26 @@ Acceptance criteria:
 - compression, when enabled, preserves the documented delivery and recovery guarantees;
 - benchmarks report workload, message size, durability choice, throughput, latency, recovery behavior, memory, and storage usage.
 
+### Bound local record materialization and aggregate memory
+
+Goal: establish predictable memory use across current-format recovery, indexing, reads, responses, and concurrent delivery.
+
+Rationale: the local log now has one RNL3 v2 format with bounded key, payload, and identity fields. Those per-record bounds do not cap retained identity indexes, response copies, or multiple concurrent reads. Historical RNL1/RNL2 compatibility is not a product requirement and has been removed under [ADR 0039](decisions/0039-rnl1-write-admission-and-legacy-read-compatibility.md).
+
+Current progress: every local record uses the checksummed RNL3 v2 frame. Recovery rejects old formats before mutating incomplete tails, and focused tests cover bounded parsing, request-ID recovery, checksums, and crash-tail repair. Aggregate memory accounting and resource-scoped workload evidence remain open.
+
+Constraints:
+
+- preserve at-least-once delivery, request-ID replay behavior, checksum validation, and incomplete-tail recovery;
+- account for recovery/index storage, per-operation payload and response buffers, and concurrent operations;
+- do not maintain old-format readers, conversion selectors, or inspection/export routes solely for compatibility.
+
+Acceptance criteria:
+
+- memory costs for recovery, retained indexes, identity maps, payload reads, response encoding, and concurrent operations are measured and budgeted for stated workloads;
+- resource-scoped evidence demonstrates the documented budget at supported concurrency;
+- tests retain coverage for accepted record boundaries, malformed complete frames, checksum failure, and recovery after incomplete final writes.
+
 ### Make retention and disk-pressure behavior safe
 
 Goal: bound retained storage and define what happens as consumers lag or usable disk capacity approaches its limit.
@@ -338,7 +364,7 @@ Goal: let supported broker upgrades preserve or deliberately transform acknowled
 
 Rationale: the storage layout now has separate metadata and stream data groups, so future format and placement changes need an explicit recovery and migration contract.
 
-Current progress: unsupported versions, identities, and layouts in existing clustered storage fail closed before recovery opens groups or mutates authoritative state; empty-directory startup may still initialize `storage.json` by design. The [TD-007 storage compatibility evidence note](design/td-007-storage-compatibility-evidence.md) records current read-forward fixtures and refusal tests. [ADR 0037](decisions/0037-offline-side-by-side-storage-upgrades.md) accepts the first upgrade behavior: offline side-by-side conversion, immutable source until validated target activation, and explicit offline rollback only while no target-only durable mutation has been accepted. A durable `write-pending` state blocks rollback during an unresolved first mutation; successful writes close rollback, proven no-effect failures may restore eligibility, and ambiguous outcomes fail closed. The [policy](design/storage-upgrade-policy.md) summarizes artifact boundaries and the [safety plan](design/storage-upgrade-safety-plan.md) defines implementation gates. This policy does not add runtime support: no migration command, generation selector, writer fence, supported downgrade, interrupted-transfer recovery, or rolling-upgrade path is implemented.
+Current progress: unsupported versions, identities, and layouts in existing clustered storage fail closed before recovery opens groups or mutates authoritative state; empty-directory startup may still initialize `storage.json` by design. The [TD-007 storage compatibility evidence note](design/td-007-storage-compatibility-evidence.md) records current-format recovery, local-stream read-forward fixtures, and refusal tests. Earlier state-machine checkpoint, snapshot, and journal schemas fail closed; no conversion is implemented. [ADR 0037](decisions/0037-offline-side-by-side-storage-upgrades.md) accepts the first upgrade behavior: offline side-by-side conversion, immutable source until validated target activation, and explicit offline rollback only while no target-only durable mutation has been accepted. A durable `write-pending` state blocks rollback during an unresolved first mutation; successful writes close rollback, proven no-effect failures may restore eligibility, and ambiguous outcomes fail closed. The [policy](design/storage-upgrade-policy.md) summarizes artifact boundaries and the [safety plan](design/storage-upgrade-safety-plan.md) defines implementation gates. This policy does not add runtime support: no migration command, generation selector, writer fence, supported downgrade, interrupted-transfer recovery, or rolling-upgrade path is implemented.
 
 Constraints:
 
@@ -348,9 +374,10 @@ Constraints:
 
 Acceptance criteria:
 
-- the current reopen/read-forward behavior and accepted per-artifact
-  compatibility and migration boundaries are documented, including the
-  offline side-by-side contract and unsupported rolling conversion;
+- current local-stream reopen/read-forward behavior, fail-closed handling of
+  unsupported state-machine schemas, and accepted per-artifact compatibility
+  and migration boundaries are documented, including the offline
+  side-by-side contract and unsupported rolling conversion;
 - representative old and new layouts have automated recovery or migration
   tests that preserve logical records, consumer progress, attempts, and
   producer request identity;
@@ -374,7 +401,7 @@ Goal: reduce storage, network, and CPU overhead with efficient message represent
 
 Rationale: small messages and long-lived streams make framing, copying, encoding, and compression costs significant parts of Runnel's performance and storage profile.
 
-Current progress: the provisional protocol and reusable client support validated binary-safe payloads through padded base64 while retaining the legacy text path. Current review confirms that peer commands and clustered persistence encode payload `Vec<u8>` values as JSON integer arrays, local `RNL1`/`RNL2`/`RNL3` records remain uncompressed, and public/peer codecs are not negotiated. The [message encoding and compression study](research/message-encoding-and-compression.md) compares compression placement across client batches, public and peer frames, retained blocks, and separate Raft/state-machine artifacts; the [day-one plan](design/encoding-compression-day1-plan.md) keeps the candidate frame and codec work exploratory. Version negotiation, mixed-format recovery, compression, and representative resource measurements remain open.
+Current progress: the provisional protocol and reusable client support validated binary-safe payloads through padded base64 while retaining the legacy text path. Current review confirms that peer commands and clustered persistence encode payload `Vec<u8>` values as JSON integer arrays, local RNL3 version-2 records remain uncompressed, and public/peer codecs are not negotiated. The [message encoding and compression study](research/message-encoding-and-compression.md) compares compression placement across client batches, public and peer frames, retained blocks, and separate Raft/state-machine artifacts; the [day-one plan](design/encoding-compression-day1-plan.md) keeps the candidate frame and codec work exploratory. Version negotiation, compression, and representative resource measurements remain open.
 
 Constraints:
 
@@ -540,28 +567,45 @@ Acceptance criteria:
 
 Goal: let an application move its retained streams and durable consumer progress from a supported single-node deployment to a supported cluster without changing its messaging model or silently losing acknowledged state.
 
-Rationale: the promise of a credible path from one node to a distributed system is incomplete if only source compatibility exists and operators must invent a risky data migration.
+Rationale: the promise of a credible path from one node to a distributed system is incomplete if applications and operators must invent a risky state transfer. The first safe path may require a maintenance window; “non-disruptive” means preserving the messaging model and acknowledged state, not zero downtime.
 
-Current progress: no supported local-to-cluster migration exists. Local stream
-logs and consumer state use durable representations that the clustered engine
-cannot import. Clustered identity checks reject unsupported or ambiguous
-layouts instead of converting them. The [migration boundary design](design/single-node-to-cluster-migration.md)
-explores a candidate side-by-side logical export/import. The [storage upgrade safety plan](design/storage-upgrade-safety-plan.md)
-records related validation, fencing, rollback, and interruption requirements.
+Current progress: no migration procedure is implemented. Local stream logs and
+consumer state use durable representations that the clustered engine cannot
+import. Clustered identity checks reject unsupported or ambiguous layouts
+instead of converting them. [ADR 0043](decisions/0043-offline-local-to-cluster-migration.md)
+accepts the first behavior: stop and durably fence the whole local deployment,
+then perform bounded logical export/import into a fresh three-voter target,
+validate all target voters, activate read-only, and switch the external
+endpoint. The maintenance window lasts through copying and validation; live
+tailing and dual writes are deferred. The source remains rollback-eligible
+after target activation only until the first target-only durable mutation
+crosses ADR 0037's `write-pending` gate. The [migration design](design/single-node-to-cluster-migration.md)
+records the evidence and implementation gates. No migration runtime or
+source is eligible at the recorded baseline, whose local writer still emits
+ordinary records as `RNL1`. The future migration-aware release must write and
+read only its single `RNL3` local stream format and supported consumer-state
+schema; `RNL1`, `RNL2`, mixed histories, old binaries, and obsolete state
+schemas are refused without source mutation. This product capability preserves
+the acknowledged state of the supported broker and does not promise backward
+compatibility. The [storage upgrade safety plan](design/storage-upgrade-safety-plan.md)
+owns shared offline conversion and recovery boundaries.
 
 Constraints:
 
-- migration must preserve documented offsets, ordering, replay eligibility, producer retry identity, and consumer progress;
-- cutover must have explicit writer fencing and rollback boundaries;
-- migration work and additional storage must remain bounded and observable for large retained streams;
+- when implemented, the migration-aware source release's single `RNL3` local format and supported consumer-state schema must preserve logical offsets, ordering, timestamps, replay eligibility, producer request identity, acknowledged progress, attempts, and pinned policy snapshots; unsupported formats or records fail before source mutation;
+- cutover must have a durable whole-source fence, all-voter target validation, explicit endpoint authority, and the first-target-write rollback boundary;
+- transfer memory, concurrent work, queues, temporary storage, and target reserve must be bounded and observable; the full maintenance-window cost must be measured before publishing an operational size or duration range;
 - applications must not need to learn Raft groups, replica placement, or storage paths.
 
 Acceptance criteria:
 
-- a documented procedure migrates representative retained data and active consumer state from the local engine to the clustered engine;
-- interrupted transfer, failed validation, process restart, and cutover races leave one clearly authoritative serving deployment;
-- post-migration conformance tests demonstrate the same public delivery behavior and resolve pre-cutover publish retry identities correctly;
-- diagnostics report migration progress, validation failures, fencing state, and rollback availability.
+- a documented, versioned procedure migrates representative history from the future supported `RNL3`-only source release and active consumer state to a fresh static cluster without old-binary or legacy-format compatibility promises;
+- preflight accepts only the future migration-aware source release's single `RNL3` local format and supported consumer-state schema, and proves `RNL1`, `RNL2`, mixed histories, obsolete schemas, and unsupported records fail closed without source mutation;
+- real-process tests show that interrupted transfer, failed validation, restart, endpoint ambiguity, and cutover races resume safely or leave one explicit authority, with source-start refusal while fenced;
+- post-migration conformance tests preserve the current public delivery semantics, resolve exact pre-cutover request-ID retries, reject changed-content reuse, preserve consumer state, and prove timestamp/offset replay behavior;
+- tests prove read-only target activation, successful/proven-no-effect/ambiguous first-write outcomes, and the exact rollback closure point;
+- diagnostics report migration progress, validation failures, all-voter readiness, fence/endpoint authority, backup/reserve status, and rollback availability; and
+- a sequential resource-scoped benchmark reports the full source-unavailable interval, copy and validation cost, peak memory, temporary space, and per-node target cost before any supported workload range is claimed.
 
 ### Make placement scale independently of stream identity
 
@@ -745,7 +789,7 @@ Goal: provide the health, security, observability, persistence, and upgrade beha
 
 Rationale: a cluster that is correct only during normal traffic is not a dependable deployment.
 
-Current progress: clustered snapshot lifecycle, peer transport, forwarding, storage, health, and in-flight delivery signals are now visible through existing diagnostics and metrics. Cluster replication progress is exposed as a bounded per-broker aggregate: maximum sampled Raft log-entry lag by numeric peer ID across groups this broker leads, with sampled/total group counts and an explicit unavailable signal when no sampled group is locally led. This is not message or byte lag. The illustrative three-node Kubernetes deployment now has a two-Ready-pod disruption budget for voluntary Eviction API requests, aligned with the static cluster's two-member quorum requirement; Ready status does not itself prove quorum health, and the budget does not cover direct deletion or controller updates and cannot prevent involuntary failures. The [cluster peer transport security research](research/cluster-peer-transport-security.md) records that the current Raft, forwarding, and data-group setup listener uses unauthenticated plain TCP and compares static mutual TLS, workload identity, and network filtering boundaries. [ADR 0032](decisions/0032-static-cluster-peer-mutual-tls.md) now accepts static mutual TLS, per-node identities bound to the configured cluster and node IDs, fail-closed behavior, coordinated initial cutover, and restart-based trust overlap. Runtime TLS, credentials, bounded handshake handling, safe diagnostics, rotation tests, and performance evidence remain unimplemented; the current cluster is still plaintext and must not be described as secured. Broader cluster leadership, resource pressure, security, upgrade, and deployment-level operational behavior remain incomplete.
+Current progress: clustered snapshot lifecycle, peer transport, forwarding, storage, health, and in-flight delivery signals are now visible through existing diagnostics and metrics. Cluster replication progress is exposed as a bounded per-broker aggregate: maximum sampled Raft log-entry lag by numeric peer ID across groups this broker leads, with sampled/total group counts and an explicit unavailable signal when no sampled group is locally led. This is not message or byte lag. The illustrative three-node Kubernetes deployment now has a two-Ready-pod disruption budget for voluntary Eviction API requests, aligned with the static cluster's two-member quorum requirement; Ready status does not itself prove quorum health, and the budget does not cover direct deletion or controller updates and cannot prevent involuntary failures. The [cluster peer transport security research](research/cluster-peer-transport-security.md) records the former plain-TCP boundary and compares static mutual TLS, workload identity, and network filtering. [ADR 0032](decisions/0032-static-cluster-peer-mutual-tls.md) accepts static mutual TLS, per-node identities bound to the configured cluster and node IDs, fail-closed behavior, coordinated initial cutover, and restart-based trust overlap. The peer adapter and Raft server now require explicit trust, certificate, and key paths; bounded TLS 1.3 transport wraps consensus, snapshots, forwarding, and setup, with process tests exercising three-node recovery/forwarding and rejecting plaintext and an unconfigured CA-signed identity before dispatch. The Kubernetes example names per-pod credential paths and requires an operator overlay; it does not provision secrets. Leaf/CA overlap rotation tests, operational automation, and representative handshake/reconnect plus steady-state measurements remain outstanding, so performance effects are unmeasured and the accepted outcome is not complete. Broader cluster leadership, resource pressure, public-listener security, upgrade, and deployment-level operational behavior remain incomplete.
 
 Constraints:
 
@@ -856,7 +900,7 @@ Goal: rerun representative Runnel and competing-broker workloads under controlle
 
 Rationale: performance leadership is meaningful only when message semantics, durability, resource limits, workload shape, and measurement boundaries are equivalent.
 
-Current progress: comparison results now declare operation-specific acknowledgement, durability, replication, delivery, batching, client, latency, topology, and resource boundaries, reject inconsistent metadata, and mark mismatched comparisons as experimental and non-ranking. The [TD-013 semantics note](research/td-013-native-competitor-semantics.md) records the current native boundaries and a candidate common workload envelope without making a client or protocol decision. A common equivalent client and fully comparable consume, recovery, and resource workloads remain open.
+Current progress: comparison results now declare operation-specific acknowledgement, durability, replication, delivery, batching, client, latency, topology, and resource boundaries, reject inconsistent metadata, and mark mismatched comparisons as experimental and non-ranking. The three-node profile now includes a Runnel static-cluster publish adapter alongside the competitor-native clients, with the Runnel host-client resource scope called out explicitly. The [TD-013 semantics note](research/td-013-native-competitor-semantics.md) records the measured boundaries and a candidate common workload envelope without making a client or protocol decision. A common equivalent client and fully comparable consume, recovery, and resource workloads remain open.
 
 Constraints:
 

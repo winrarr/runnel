@@ -482,4 +482,155 @@ def run_runnel(
         ],
         "measurement_client": "host Python socket client",
         "client_image": "host Python runtime",
+        "client_resource_limits": {
+            "scope": "host process",
+            "cpu": "unbounded",
+            "memory": "unbounded",
+        },
+    }
+
+
+def run_runnel_cluster(
+    *,
+    image: str,
+    cpus: str,
+    memory: str,
+    messages: int,
+    sizes: list[int],
+) -> dict[str, Any]:
+    """Adapt the real three-node Runnel public-protocol publish probe."""
+    fd, output_name = tempfile.mkstemp(prefix="runnel-cluster-compare-", suffix=".json")
+    os.close(fd)
+    output = Path(output_name)
+    command = [
+        sys.executable,
+        str(Path(__file__).with_name("cluster.py")),
+        "--runtime",
+        "container",
+        "--image",
+        image,
+        "--nodes",
+        "3",
+        "--cpus",
+        cpus,
+        "--memory",
+        memory,
+        "--messages",
+        str(messages),
+        "--warmup",
+        "100",
+        "--payload-sizes",
+        ",".join(str(size) for size in sizes),
+        "--scenarios",
+        "durable_publish",
+        "--output",
+        str(output),
+    ]
+    try:
+        subprocess.run(command, check=True, cwd=ROOT, capture_output=True, text=True)
+        result = json.loads(output.read_text(encoding="utf-8"))
+    except (subprocess.CalledProcessError, json.JSONDecodeError, OSError) as error:
+        detail = getattr(error, "stderr", None) or str(error)
+        raise ComparisonError(f"Runnel clustered benchmark failed: {detail}") from error
+    finally:
+        output.unlink(missing_ok=True)
+
+    if not isinstance(result, dict):
+        raise ComparisonError("Runnel clustered benchmark result is not an object")
+    result_backends = result.get("backends")
+    if not isinstance(result_backends, dict):
+        raise ComparisonError("Runnel clustered benchmark result has no backend records")
+    source_backend = result_backends.get("runnel-cluster")
+    if not isinstance(source_backend, dict):
+        raise ComparisonError("Runnel clustered benchmark result has no canonical backend")
+    source_scenarios = source_backend.get("scenarios")
+    if not isinstance(source_scenarios, list) or not source_scenarios:
+        raise ComparisonError("Runnel clustered benchmark result has no scenarios")
+
+    scenarios = []
+    for scenario in source_scenarios:
+        if not isinstance(scenario, dict):
+            raise ComparisonError("Runnel clustered benchmark scenario is not an object")
+        operation = scenario_operation(scenario)
+        if operation != "cluster_durable_publish":
+            raise ComparisonError(
+                "Runnel clustered benchmark returned a non-publish scenario: "
+                f"{operation!r}"
+            )
+        required = (
+            "messages",
+            "message_size_bytes",
+            "throughput_messages_per_second",
+            "latency_microseconds",
+        )
+        if any(field not in scenario for field in required):
+            raise ComparisonError("Runnel clustered publish scenario is missing required measurements")
+        if scenario["message_size_bytes"] not in sizes or scenario["messages"] != messages:
+            raise ComparisonError("Runnel clustered publish scenario does not match the requested workload")
+        if not isinstance(scenario["latency_microseconds"], dict):
+            raise ComparisonError("Runnel clustered publish scenario has invalid latency measurements")
+        source_metadata = scenario.get("metadata", {})
+        if not isinstance(source_metadata, dict):
+            raise ComparisonError("Runnel clustered publish scenario metadata is not an object")
+        scenarios.append(
+            {
+                "scenario_id": f"publish:{scenario['message_size_bytes']}",
+                "operation": "publish",
+                "messages": scenario["messages"],
+                "message_size_bytes": scenario["message_size_bytes"],
+                "throughput_messages_per_second": scenario[
+                    "throughput_messages_per_second"
+                ],
+                "throughput_megabytes_per_second": scenario.get(
+                    "throughput_megabytes_per_second"
+                ),
+                "elapsed_seconds": scenario.get("elapsed_seconds"),
+                "elapsed_milliseconds": scenario.get("elapsed_milliseconds"),
+                "latency_sample_count": scenario.get("latency_sample_count"),
+                "latency_microseconds": scenario["latency_microseconds"],
+                "resource_samples": scenario.get("resource_samples", {}),
+                "server_metrics": scenario.get("server_metrics"),
+                "metadata": {
+                    **source_metadata,
+                    "source_operation": "cluster_durable_publish",
+                },
+            }
+        )
+    if sorted(scenario["message_size_bytes"] for scenario in scenarios) != sorted(sizes):
+        raise ComparisonError("Runnel clustered benchmark did not return every requested payload size")
+
+    resource_samples = source_backend.get("resource_samples", {})
+    if not isinstance(resource_samples, dict):
+        resource_samples = {}
+    per_node = resource_samples.get("per_node", {})
+    if not isinstance(per_node, dict):
+        per_node = {}
+    nodes = [
+        {
+            "node_id": str(node_id),
+            "cpu_limit": cpus,
+            "memory_limit": memory,
+            "resource_observation_available": isinstance(per_node.get(str(node_id)), dict),
+            "resource_samples": per_node.get(str(node_id), {}),
+        }
+        for node_id in range(1, 4)
+    ]
+
+    return {
+        "image": source_backend.get("image", image),
+        "image_id": source_backend.get("image_id"),
+        "runtime": source_backend.get("runtime", "container"),
+        "cpu_limit": cpus,
+        "memory_limit": memory,
+        "startup_seconds": source_backend.get("startup_seconds", 0),
+        "resource_samples": resource_samples,
+        "nodes": nodes,
+        "scenarios": scenarios,
+        "measurement_client": "host Python clustered benchmark client",
+        "client_image": "host Python runtime",
+        "client_resource_limits": {
+            "scope": "host process",
+            "cpu": "unbounded",
+            "memory": "unbounded",
+        },
     }
