@@ -81,37 +81,7 @@ impl Drop for RunningNode {
 #[test]
 fn metrics_report_bounded_replication_progress_without_stream_labels() {
     let directory = TempDir::new().unwrap();
-    let addresses = (0..9).map(|_| free_addr()).collect::<Vec<_>>();
-    let cluster_nodes = vec![(1, addresses[6]), (2, addresses[7]), (3, addresses[8])];
-    let nodes = vec![
-        RunningNode::start(
-            1,
-            addresses[0],
-            addresses[3],
-            addresses[6],
-            directory.path().join("node-1"),
-            &cluster_nodes,
-            true,
-        ),
-        RunningNode::start(
-            2,
-            addresses[1],
-            addresses[4],
-            addresses[7],
-            directory.path().join("node-2"),
-            &cluster_nodes,
-            false,
-        ),
-        RunningNode::start(
-            3,
-            addresses[2],
-            addresses[5],
-            addresses[8],
-            directory.path().join("node-3"),
-            &cluster_nodes,
-            false,
-        ),
-    ];
+    let nodes = start_three_node_cluster(&directory);
 
     for node in &nodes {
         wait_for_http(node.http_addr);
@@ -187,6 +157,110 @@ fn metrics_report_bounded_replication_progress_without_stream_labels() {
     }
 }
 
+#[cfg(feature = "persistence-write-counters")]
+#[test]
+fn persistence_write_metrics_require_the_opt_in_query() {
+    let directory = TempDir::new().unwrap();
+    let nodes = start_three_node_cluster(&directory);
+
+    for node in &nodes {
+        wait_for_http(node.http_addr);
+    }
+
+    create_stream(&nodes, "persistence-metrics-probe");
+    publish(&nodes, "persistence-metrics-probe");
+
+    let regular_metrics = nodes
+        .iter()
+        .map(|node| http_metrics(node.http_addr))
+        .collect::<Vec<_>>();
+    assert!(regular_metrics.iter().all(|metrics| {
+        !metrics.contains("runnel_persistence_write_counters_enabled")
+            && !metrics.contains("runnel_persistence_operations_total")
+    }));
+
+    let deadline = Instant::now() + CLUSTER_WAIT_TIMEOUT;
+    let mut opted_metrics = Vec::new();
+    while Instant::now() < deadline {
+        opted_metrics = nodes
+            .iter()
+            .map(|node| {
+                http_metrics_with_path(node.http_addr, "/metrics?persistence_write_counters=true")
+            })
+            .collect();
+        if opted_metrics.iter().any(|metrics| {
+            metrics.lines().any(|line| {
+                line.starts_with(
+                    "runnel_persistence_operations_total{role=\"raft_log_rewrite\",operation=\"write_all\"",
+                )
+            })
+        }) {
+            break;
+        }
+        sleep(Duration::from_millis(50));
+    }
+
+    assert!(
+        opted_metrics
+            .iter()
+            .all(|metrics| { metrics.contains("runnel_persistence_write_counters_enabled 1") }),
+        "each feature-enabled broker should expose counters on explicit request"
+    );
+    assert!(
+        opted_metrics.iter().any(|metrics| {
+            metrics.lines().any(|line| {
+                line.starts_with(
+                    "runnel_persistence_operations_total{role=\"raft_log_rewrite\",operation=\"write_all\"",
+                )
+            })
+        }),
+        "real Raft persistence activity should appear in the opt-in series"
+    );
+    for metrics in &opted_metrics {
+        for line in metrics
+            .lines()
+            .filter(|line| line.starts_with("runnel_persistence_"))
+        {
+            assert!(!line.contains("stream="));
+            assert!(!line.contains("group="));
+        }
+    }
+}
+
+fn start_three_node_cluster(directory: &TempDir) -> Vec<RunningNode> {
+    let addresses = (0..9).map(|_| free_addr()).collect::<Vec<_>>();
+    let cluster_nodes = vec![(1, addresses[6]), (2, addresses[7]), (3, addresses[8])];
+    vec![
+        RunningNode::start(
+            1,
+            addresses[0],
+            addresses[3],
+            addresses[6],
+            directory.path().join("node-1"),
+            &cluster_nodes,
+            true,
+        ),
+        RunningNode::start(
+            2,
+            addresses[1],
+            addresses[4],
+            addresses[7],
+            directory.path().join("node-2"),
+            &cluster_nodes,
+            false,
+        ),
+        RunningNode::start(
+            3,
+            addresses[2],
+            addresses[5],
+            addresses[8],
+            directory.path().join("node-3"),
+            &cluster_nodes,
+            false,
+        ),
+    ]
+}
+
 fn create_stream(nodes: &[RunningNode], stream: &str) {
     let deadline = Instant::now() + CLUSTER_WAIT_TIMEOUT;
     while Instant::now() < deadline {
@@ -247,13 +321,19 @@ fn request(address: SocketAddr, request: Request) -> Result<Response, String> {
 }
 
 fn http_metrics(address: SocketAddr) -> String {
+    http_metrics_with_path(address, "/metrics")
+}
+
+fn http_metrics_with_path(address: SocketAddr, path: &str) -> String {
     let mut stream = TcpStream::connect(address).expect("metrics endpoint should accept scrapes");
     stream
         .set_read_timeout(Some(Duration::from_secs(3)))
         .expect("metrics read timeout should be set");
-    stream
-        .write_all(b"GET /metrics HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
-        .expect("metrics request should be written");
+    write!(
+        stream,
+        "GET {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n"
+    )
+    .expect("metrics request should be written");
     let mut response = String::new();
     stream
         .read_to_string(&mut response)
