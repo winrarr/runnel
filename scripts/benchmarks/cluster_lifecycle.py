@@ -139,9 +139,19 @@ class Cluster:
 
     def metrics(self) -> dict[str, float] | None:
         """Return one flattened metrics snapshot for every live node."""
+        return self._metrics(persistence_write_counters=False)
+
+    def persistence_write_metrics(self) -> dict[str, float] | None:
+        """Read the opt-in fixed-role persistence snapshot from every live node."""
+        return self._metrics(persistence_write_counters=True)
+
+    def _metrics(self, *, persistence_write_counters: bool) -> dict[str, float] | None:
         snapshot: dict[str, float] = {}
         for node in self.nodes:
-            metrics = prometheus_metrics(node.http_port)
+            metrics = prometheus_metrics(
+                node.http_port,
+                persistence_write_counters=persistence_write_counters,
+            )
             if metrics is None:
                 return None
             snapshot.update(

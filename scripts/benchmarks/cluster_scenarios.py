@@ -120,6 +120,32 @@ SNAPSHOT_BUILD_METRICS = {
     "duration_count": "runnel_snapshot_build_duration_seconds_count",
     "duration_max_seconds": "runnel_snapshot_build_duration_seconds_max",
 }
+PERSISTENCE_WRITE_ROLES = (
+    "raft_log_rewrite",
+    "state_machine_journal_append",
+    "state_machine_journal_compaction",
+    "state_machine_checkpoint",
+    "state_machine_snapshot",
+)
+PERSISTENCE_WRITE_OPERATIONS = (
+    "serialize",
+    "snapshot_state_serialize",
+    "write_all",
+    "sync_data",
+    "sync_all",
+    "rename",
+    "directory_sync",
+)
+PERSISTENCE_WRITE_COUNTER_FIELDS = (
+    "attempts",
+    "successes",
+    "failures",
+    "elapsed_nanoseconds",
+    "write_bytes_offered",
+    "write_bytes_completed",
+    "write_accepted_prefix_unknown",
+    "serialization_output_bytes",
+)
 
 
 @dataclass
@@ -434,6 +460,142 @@ def _snapshot_build_metrics(
             for name, metric_name in SNAPSHOT_BUILD_METRICS.items()
         }
     return values
+
+
+def _persistence_write_metric(
+    metrics: dict[str, float],
+    node_name: str,
+    metric_name: str,
+    labels: tuple[tuple[str, str], ...] = (),
+) -> int:
+    label_text = ",".join(f'{key}="{value}"' for key, value in labels)
+    suffix = f"{{{label_text}}}" if labels else ""
+    return int(metrics.get(f"{node_name}.{metric_name}{suffix}", 0))
+
+
+def _persistence_write_counter_snapshot(
+    metrics: dict[str, float] | None, node_ids: list[int]
+) -> dict[str, Any]:
+    """Read fixed per-process role/operation counters from explicit opt-in scrapes."""
+    if metrics is None:
+        return {"available": False, "reason": "metrics endpoint unavailable", "per_node": {}}
+
+    per_node: dict[str, Any] = {}
+    for node_id in node_ids:
+        node_name = f"node_{node_id}"
+        if metrics.get(f"{node_name}.runnel_persistence_write_counters_enabled") != 1:
+            return {
+                "available": False,
+                "reason": "binary did not expose opt-in persistence write counters",
+                "per_node": {},
+            }
+        roles: dict[str, Any] = {}
+        for role in PERSISTENCE_WRITE_ROLES:
+            operations: dict[str, Any] = {}
+            for operation in PERSISTENCE_WRITE_OPERATIONS:
+                labels = (("role", role), ("operation", operation))
+                successes = _persistence_write_metric(
+                    metrics,
+                    node_name,
+                    "runnel_persistence_operations_total",
+                    (*labels, ("result", "success")),
+                )
+                failures = _persistence_write_metric(
+                    metrics,
+                    node_name,
+                    "runnel_persistence_operations_total",
+                    (*labels, ("result", "failure")),
+                )
+                operations[operation] = {
+                    "attempts": successes + failures,
+                    "successes": successes,
+                    "failures": failures,
+                    "elapsed_nanoseconds": _persistence_write_metric(
+                        metrics,
+                        node_name,
+                        "runnel_persistence_operation_elapsed_nanoseconds_total",
+                        labels,
+                    ),
+                    "write_bytes_offered": _persistence_write_metric(
+                        metrics,
+                        node_name,
+                        "runnel_persistence_write_bytes_offered_total",
+                        labels,
+                    ),
+                    "write_bytes_completed": _persistence_write_metric(
+                        metrics,
+                        node_name,
+                        "runnel_persistence_write_bytes_completed_total",
+                        labels,
+                    ),
+                    "write_accepted_prefix_unknown": _persistence_write_metric(
+                        metrics,
+                        node_name,
+                        "runnel_persistence_write_accepted_prefix_unknown_total",
+                        labels,
+                    ),
+                    "serialization_output_bytes": _persistence_write_metric(
+                        metrics,
+                        node_name,
+                        "runnel_persistence_serialization_output_bytes_total",
+                        labels,
+                    ),
+                }
+            roles[role] = operations
+        per_node[node_name] = {"roles": roles}
+    return {"available": True, "per_node": per_node}
+
+
+def _persistence_write_counter_deltas(
+    before: dict[str, Any], after: dict[str, Any]
+) -> dict[str, Any]:
+    if not before["available"] or not after["available"]:
+        return {
+            "available": False,
+            "reason": before.get("reason") or after.get("reason"),
+            "per_node": {},
+        }
+    if before["per_node"].keys() != after["per_node"].keys():
+        return {
+            "available": False,
+            "reason": "per-process counter set changed during interval",
+            "per_node": {},
+        }
+
+    per_node: dict[str, Any] = {}
+    for node_name, before_node in before["per_node"].items():
+        after_node = after["per_node"][node_name]
+        roles: dict[str, Any] = {}
+        for role in PERSISTENCE_WRITE_ROLES:
+            operations: dict[str, Any] = {}
+            for operation in PERSISTENCE_WRITE_OPERATIONS:
+                start = before_node["roles"][role][operation]
+                end = after_node["roles"][role][operation]
+                if any(end[field] < start[field] for field in PERSISTENCE_WRITE_COUNTER_FIELDS):
+                    return {
+                        "available": False,
+                        "reason": f"counter reset within interval for {node_name}",
+                        "per_node": {},
+                    }
+                operations[operation] = {
+                    "start": start,
+                    "end": end,
+                    "delta": {
+                        field: end[field] - start[field]
+                        for field in PERSISTENCE_WRITE_COUNTER_FIELDS
+                    },
+                }
+            roles[role] = operations
+        per_node[node_name] = {"roles": roles}
+    return {"available": True, "per_node": per_node}
+
+
+def _cluster_persistence_write_counter_snapshot(
+    cluster: Cluster, node_ids: list[int]
+) -> dict[str, Any]:
+    scrape = getattr(cluster, "persistence_write_metrics", None)
+    metrics = scrape() if callable(scrape) else None
+    return _persistence_write_counter_snapshot(metrics, node_ids)
 
 
 def _snapshot_build_metric_deltas(
@@ -927,6 +1089,8 @@ def run_raft_log_growth(
     build_counts_before = _snapshot_build_counts(
         metrics_before, [node.node_id for node in cluster.nodes]
     )
+    node_ids = [node.node_id for node in cluster.nodes]
+    write_counters_before = _cluster_persistence_write_counter_snapshot(cluster, node_ids)
     observations: list[dict[str, Any]] = []
     observer_duration_ns = 0
     measured_started_ns = 0
@@ -1064,6 +1228,9 @@ def run_raft_log_growth(
     build_counts_after = _snapshot_build_counts(
         metrics_after, [node.node_id for node in cluster.nodes]
     )
+    write_counters_before_restart = _cluster_persistence_write_counter_snapshot(
+        cluster, node_ids
+    )
     result["metadata"]["per_node"] = _summarize_raft_log_growth(
         initial_state,
         final_state,
@@ -1075,12 +1242,25 @@ def run_raft_log_growth(
     result["metadata"]["snapshot_builds_completed_after"] = build_counts_after
     result["metadata"]["snapshot_purge_cycle_observed"] = True
     result["metadata"]["post_cycle_observation_count"] = len(observations)
+    result["metadata"]["persistence_write_counters"] = {
+        "scope": "per-process aggregate for fixed persistence roles and operations; no stream or group labels",
+        "publish_through_snapshot_purge": _persistence_write_counter_deltas(
+            write_counters_before, write_counters_before_restart
+        ),
+        "follower_restart_recovery": {
+            "available": False,
+            "reason": "recovery process boundary has not been observed",
+        },
+    }
 
     def recover_after_growth() -> dict[str, Any]:
         node_index = cluster.node_count - 1
         restarted_node = cluster.nodes[node_index].node_id
         recovery_started_ns = time.perf_counter_ns()
         restart_ns = cluster.restart_node(node_index)
+        write_counters_after_restart = _cluster_persistence_write_counter_snapshot(
+            cluster, node_ids
+        )
         recovered = cluster.client(node_index)
         try:
             response, poll_ns = poll(recovered, stream, "raft-log-growth-recovery", 0)
@@ -1091,6 +1271,34 @@ def run_raft_log_growth(
             ack_ns = acknowledge(recovered, stream, "raft-log-growth-recovery", 0)
         finally:
             recovered.close()
+        write_counters_after_recovery = _cluster_persistence_write_counter_snapshot(
+            cluster, node_ids
+        )
+        restarted_node_name = f"node_{restarted_node}"
+        recovery_deltas = _persistence_write_counter_deltas(
+            write_counters_after_restart, write_counters_after_recovery
+        )
+        result["metadata"]["persistence_write_counters"][
+            "follower_restart_recovery"
+        ] = {
+            "available": recovery_deltas["available"],
+            "reason": recovery_deltas.get("reason"),
+            "restarted_node_id": restarted_node,
+            "restarted_process_reset": True,
+            "pre_stop_counters": write_counters_before_restart["per_node"].get(
+                restarted_node_name
+            ),
+            "fresh_process_baseline": write_counters_after_restart["per_node"].get(
+                restarted_node_name
+            ),
+            "after_recovery": write_counters_after_recovery["per_node"].get(
+                restarted_node_name
+            ),
+            "fresh_process_to_recovery_delta": recovery_deltas["per_node"].get(
+                restarted_node_name
+            ),
+            "per_node_fresh_process_to_recovery_delta": recovery_deltas["per_node"],
+        }
         elapsed_ns = time.perf_counter_ns() - recovery_started_ns
         return metric(
             "cluster_raft_log_growth_recovery",

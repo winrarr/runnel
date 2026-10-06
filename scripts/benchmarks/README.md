@@ -71,7 +71,41 @@ python3 scripts/benchmarks/cluster.py \
 
 `--raft-log-growth-messages` accepts 64 through 4,096 records (default 256), `--raft-log-growth-batch-size` accepts 1 through the protocol limit of 1,024 records (default 1), and `--raft-log-growth-observation-every` accepts 1 through 1,024 records (default 8). The measured logical payload volume is capped at 16 MiB; this keeps every encoded batch request below the protocol's 64 MiB request limit even at the maximum batch record count. `--raft-log-growth-cycle-timeout-seconds` bounds the snapshot/purge wait to 1 through 300 seconds (default 30).
 
-The measured interval reports record throughput and p50/p99/p99.9 batch-request latency; latency samples are per request, and a final partial batch is allowed when the message count is not divisible by the requested batch size. The artifact records the requested size, actual batch-size counts, outcome-validation boundary, observation samples, and how much interval time was spent reading persisted paths. Samples occur after completed batches that reach or pass the next configured publish interval, so the recorded message index is the actual boundary. Use a wider interval to reduce observation work or a narrower interval for more detail, and interpret the observed peak as a sampled lower bound. Resource samples include per-node CPU, memory, and total data-directory footprint. File sizes and net footprint deltas identify which persisted paths grow or compact; they do not measure bytes written or physical write amplification. Snapshot build metrics are aggregate per node, while purge indices and file sizes come from the selected stream's data group. Raft entries count consensus commands; the harness does not infer a one-to-one relationship between entries, requests, and broker messages. These are workload observations through real compaction cycles, not per-path write-cost attribution or an accepted commit-cost bound. Collect them under the exclusive benchmark lock with bounded, recorded CPU and memory resources, and compare only runs with matching runtime, topology, payload size, message count, batch size, observation interval, durability, and resource limits.
+The measured interval reports record throughput and p50/p99/p99.9 batch-request latency; latency samples are per request, and a final partial batch is allowed when the message count is not divisible by the requested batch size. The artifact records the requested size, actual batch-size counts, outcome-validation boundary, observation samples, and how much interval time was spent reading persisted paths. Samples occur after completed batches that reach or pass the next configured publish interval, so the recorded message index is the actual boundary. Use a wider interval to reduce observation work or a narrower interval for more detail, and interpret the observed peak as a sampled lower bound. Resource samples include per-node CPU, memory, and total data-directory footprint. File sizes and net footprint deltas identify which persisted paths grow or compact; they do not measure bytes written or physical write amplification. Snapshot build metrics are aggregate per node, while purge indices and file sizes come from the selected stream's data group. Raft entries count consensus commands; the harness does not infer a one-to-one relationship between entries, requests, and broker messages. These are workload observations through real compaction cycles, not an accepted commit-cost bound. Collect them under the exclusive benchmark lock with bounded, recorded CPU and memory resources, and compare only runs with matching runtime, topology, payload size, message count, batch size, observation interval, durability, and resource limits.
+
+#### Opt-in persistence-write attribution
+
+The `persistence-write-counters` feature adds fixed-role application-side write counters to the three-node Raft broker. The role and operation set is bounded, carries no stream/group labels, and is absent from the default build. Only the explicit `GET /metrics?persistence_write_counters=true` request adds these metrics; ordinary `/metrics` scrapes and default benchmark artifacts keep their existing shape. The `raft_log_growth` scenario requests counter snapshots at measured publish/purge boundaries and records follower node 3's pre-stop values, fresh post-restart baseline, and recovery delta separately. It marks the process reset and never subtracts counters across it.
+
+Build both server variants from the same checkout and retain each binary before rebuilding the other variant. Run from the repository root; `cluster.py --build` uses default features, so use `--binary` and omit `--build` for these runs. Set `TMPDIR` to the ext4-backed benchmark directory when `/tmp` is tmpfs so broker data uses the same intended storage for both variants:
+
+```sh
+RUN_DIR="$(pwd)/benchmark-results/td026-write-counters"
+mkdir -p "$RUN_DIR/bin" "$RUN_DIR/tmp" "$RUN_DIR/ext4-artifacts"
+cargo build --locked --release -p runnel-server
+cp target/release/runnel "$RUN_DIR/bin/runnel-default"
+cargo build --locked --release -p runnel-server --features persistence-write-counters
+cp target/release/runnel "$RUN_DIR/bin/runnel-counters"
+```
+
+For an enabled/disabled diagnostic, create a small shell script that invokes this command six times with unique `--output`, `--log-dir`, and systemd `--unit` values. Keep the exclusive lock around all six alternating runs, in this order: default/counters for pair 1, counters/default for pair 2, default/counters for pair 3. This prevents another benchmark from entering between pairs while alternating order limits simple time/order effects.
+
+```sh
+systemd-run --user --scope --collect --unit=runnel-td026-pair1-off \
+  --property=CPUQuota=200% --property=MemoryMax=2G -- \
+  env TMPDIR="$RUN_DIR/tmp" \
+  RUNNEL_BENCHMARK_CPU_LIMIT=2 RUNNEL_BENCHMARK_MEMORY_LIMIT=2G \
+  python3 scripts/benchmarks/cluster.py \
+  --binary "$RUN_DIR/bin/runnel-default" \
+  --runtime process --nodes 3 --scenarios raft_log_growth \
+  --raft-log-growth-messages 256 --raft-log-growth-batch-size 8 \
+  --raft-log-growth-observation-every 8 \
+  --raft-log-growth-cycle-timeout-seconds 30 --payload-sizes 1024 \
+  --output "$RUN_DIR/ext4-artifacts/pair1-off.json" \
+  --log-dir "$RUN_DIR/ext4-artifacts/pair1-off-logs"
+```
+
+Change the binary, artifact names, and systemd unit for each invocation; use the same workload and resource values for all six. Do not rebuild between those invocations. Record the checkout revision and any source diff, host/kernel/filesystem and storage location, systemd limits, exact command order, and all six raw artifacts. The `write_bytes_offered` total is application input offered to `write_all`; `write_bytes_completed` credits only successful calls, while a failed call increments the unknown-prefix count. Neither field is physical device traffic. The fixed roles cover Raft-log rewrite, journal append/compaction, checkpoint, and snapshot persistence. Metadata/manifest writes, startup/recovery repair, open/create and directory creation, local-core storage, filesystem metadata/writeback, and device-level traffic are outside these counters. Keep file footprint and optional cgroup/device totals separate. Treat the enabled/disabled difference as diagnostic instrumentation overhead only, not as a product cost bound or performance claim.
 
 `matrix.py` can repeat the log-growth probe across measured publish counts, payload sizes, batch sizes, observation intervals, and independent repetitions. For a compact diagnostic matrix that also varies retained broker history and the general public append-batch baseline, run under the exclusive benchmark lock with bounded native resources:
 

@@ -11,7 +11,8 @@ use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
 
-use crate::NodeId;
+use crate::persistence_write::serialize_json;
+use crate::{NodeId, PersistenceWriteOperation, PersistenceWriteRole, atomic_write_with_role};
 #[cfg(feature = "instrumentation")]
 use runnel_engine::StageTimer;
 
@@ -217,20 +218,27 @@ where
             committed: inner.committed,
             vote: inner.vote,
         };
-        let bytes = serde_json::to_vec(&persisted).map_err(|error| {
+        let bytes = serialize_json(
+            PersistenceWriteRole::RaftLogRewrite,
+            PersistenceWriteOperation::Serialize,
+            &persisted,
+        )
+        .map_err(|error| {
             StorageError::from_io_error(
                 openraft::ErrorSubject::Logs,
                 openraft::ErrorVerb::Write,
                 std::io::Error::other(error),
             )
         })?;
-        atomic_write(path, &bytes).map_err(|error| {
-            StorageError::from_io_error(
-                openraft::ErrorSubject::Logs,
-                openraft::ErrorVerb::Write,
-                error,
-            )
-        })
+        atomic_write_with_role(path, &bytes, PersistenceWriteRole::RaftLogRewrite).map_err(
+            |error| {
+                StorageError::from_io_error(
+                    openraft::ErrorSubject::Logs,
+                    openraft::ErrorVerb::Write,
+                    error,
+                )
+            },
+        )
     }
 }
 
@@ -360,19 +368,6 @@ where
         }
         Self::persist(&inner)
     }
-}
-
-fn atomic_write(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
-    let parent = path.parent().unwrap_or_else(|| Path::new("."));
-    fs::create_dir_all(parent)?;
-    let temp = path.with_extension(format!("tmp-{}", std::process::id()));
-    let mut file = fs::File::create(&temp)?;
-    use std::io::Write;
-    file.write_all(bytes)?;
-    file.sync_all()?;
-    fs::rename(&temp, path)?;
-    let directory = fs::File::open(parent)?;
-    directory.sync_all()
 }
 
 #[cfg(test)]

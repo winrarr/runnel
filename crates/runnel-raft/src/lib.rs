@@ -33,6 +33,7 @@ mod forwarding;
 mod group_manager;
 mod log_store;
 mod network;
+mod persistence_write;
 mod state_machine;
 mod state_machine_journal;
 mod state_machine_store;
@@ -43,6 +44,13 @@ pub use engine::{InMemoryCluster, PersistentEngine, RaftGroup, SingleNodeEngine}
 #[cfg(test)]
 use group_manager::DataGroupManifest;
 pub use group_manager::{GroupManager, ReplicationProgressSnapshot};
+#[cfg(feature = "persistence-write-counters")]
+pub use persistence_write::{
+    PersistenceWriteCounterSnapshot, PersistenceWriteMetricsSnapshot, PersistenceWriteOperation,
+    PersistenceWriteRole, persistence_write_metrics_snapshot,
+};
+#[cfg(not(feature = "persistence-write-counters"))]
+pub(crate) use persistence_write::{PersistenceWriteOperation, PersistenceWriteRole};
 pub use state_machine::{Command, CommandResponse, StreamLifecycle, StreamMetadata};
 #[cfg(test)]
 use state_machine::{GroupKind, SnapshotState, StoredMessage, StreamState, apply_command};
@@ -123,6 +131,25 @@ fn atomic_write(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     fs::rename(&temp, path)?;
     let directory = fs::File::open(parent)?;
     directory.sync_all()
+}
+
+#[inline]
+fn atomic_write_with_role(
+    path: &Path,
+    bytes: &[u8],
+    role: PersistenceWriteRole,
+) -> std::io::Result<()> {
+    use persistence_write::{PersistenceWriteOperation as Operation, measure_io, write_all};
+
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    fs::create_dir_all(parent)?;
+    let temp = path.with_extension(format!("tmp-{}", std::process::id()));
+    let mut file = fs::File::create(&temp)?;
+    write_all(&mut file, role, bytes)?;
+    measure_io(role, Operation::SyncAll, 0, || file.sync_all())?;
+    measure_io(role, Operation::Rename, 0, || fs::rename(&temp, path))?;
+    let directory = fs::File::open(parent)?;
+    measure_io(role, Operation::DirectorySync, 0, || directory.sync_all())
 }
 
 #[cfg(test)]

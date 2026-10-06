@@ -3,13 +3,15 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
-use axum::extract::State;
+use axum::extract::{RawQuery, State};
 use axum::http::StatusCode;
 use axum::routing::get;
 use axum::{Json, Router};
 use runnel_engine::{BrokerError, Engine, PollResult};
 use runnel_protocol::Request;
 use runnel_raft::{GroupManager, ReplicationProgressSnapshot, SnapshotMetricsSnapshot};
+#[cfg(feature = "persistence-write-counters")]
+use runnel_raft::{PersistenceWriteOperation, PersistenceWriteRole};
 use tracing::error;
 
 use crate::protocol::ProtocolAdmission;
@@ -341,7 +343,13 @@ async fn readiness(State(state): State<HttpState>) -> (StatusCode, Json<HealthBo
     }
 }
 
-async fn metrics(State(state): State<HttpState>) -> (StatusCode, String) {
+async fn metrics(
+    State(state): State<HttpState>,
+    RawQuery(query): RawQuery,
+) -> (StatusCode, String) {
+    #[cfg(not(feature = "persistence-write-counters"))]
+    let _ = query;
+
     state
         .metrics
         .metrics_scrapes
@@ -356,16 +364,16 @@ async fn metrics(State(state): State<HttpState>) -> (StatusCode, String) {
                 Some(cluster) => Some(cluster.replication_progress().await),
                 None => None,
             };
-            (
-                StatusCode::OK,
-                format_metrics(
-                    Some(health),
-                    Some(snapshot_metrics),
-                    replication_progress,
-                    &state.metrics,
-                    state.admission,
-                ),
-            )
+            let body = format_metrics(
+                Some(health),
+                Some(snapshot_metrics),
+                replication_progress,
+                &state.metrics,
+                state.admission,
+            );
+            #[cfg(feature = "persistence-write-counters")]
+            let body = add_requested_persistence_write_metrics(body, query.as_deref());
+            (StatusCode::OK, body)
         }
         Err(error) => {
             state
@@ -379,10 +387,82 @@ async fn metrics(State(state): State<HttpState>) -> (StatusCode, String) {
             error!(%error, "metrics check failed");
             // Keep process and admission telemetry scrapeable without turning unavailable
             // engine-derived samples into fresh-looking zeroes or stale values.
-            (
-                StatusCode::OK,
-                format_metrics(None, None, None, &state.metrics, state.admission),
-            )
+            let body = format_metrics(None, None, None, &state.metrics, state.admission);
+            #[cfg(feature = "persistence-write-counters")]
+            let body = add_requested_persistence_write_metrics(body, query.as_deref());
+            (StatusCode::OK, body)
+        }
+    }
+}
+
+#[cfg(feature = "persistence-write-counters")]
+fn add_requested_persistence_write_metrics(mut body: String, query: Option<&str>) -> String {
+    let requested = query.is_some_and(|query| {
+        query
+            .split('&')
+            .any(|parameter| parameter == "persistence_write_counters=true")
+    });
+    if requested {
+        append_persistence_write_metrics(&mut body);
+    }
+    body
+}
+
+#[cfg(feature = "persistence-write-counters")]
+fn append_persistence_write_metrics(output: &mut String) {
+    let snapshot = runnel_raft::persistence_write_metrics_snapshot();
+    writeln!(output, "# HELP runnel_persistence_write_counters_enabled Whether opt-in persistence write counters are available.").unwrap();
+    writeln!(output, "# TYPE runnel_persistence_write_counters_enabled gauge\nrunnel_persistence_write_counters_enabled 1").unwrap();
+    writeln!(output, "# HELP runnel_persistence_operations_total Attempts by fixed persistence role, operation, and outcome.").unwrap();
+    writeln!(output, "# TYPE runnel_persistence_operations_total counter").unwrap();
+    writeln!(output, "# HELP runnel_persistence_operation_elapsed_nanoseconds_total Cumulative elapsed time inside fixed persistence role and operation calls.").unwrap();
+    writeln!(
+        output,
+        "# TYPE runnel_persistence_operation_elapsed_nanoseconds_total counter"
+    )
+    .unwrap();
+    writeln!(output, "# HELP runnel_persistence_write_bytes_offered_total Bytes offered to write_all by fixed persistence role.").unwrap();
+    writeln!(
+        output,
+        "# TYPE runnel_persistence_write_bytes_offered_total counter"
+    )
+    .unwrap();
+    writeln!(output, "# HELP runnel_persistence_write_bytes_completed_total Bytes for write_all calls that returned success.").unwrap();
+    writeln!(
+        output,
+        "# TYPE runnel_persistence_write_bytes_completed_total counter"
+    )
+    .unwrap();
+    writeln!(output, "# HELP runnel_persistence_write_accepted_prefix_unknown_total Failed write_all calls whose accepted prefix is unknown.").unwrap();
+    writeln!(
+        output,
+        "# TYPE runnel_persistence_write_accepted_prefix_unknown_total counter"
+    )
+    .unwrap();
+    writeln!(output, "# HELP runnel_persistence_serialization_output_bytes_total Bytes generated by successful serialization stages; distinct from file writes.").unwrap();
+    writeln!(
+        output,
+        "# TYPE runnel_persistence_serialization_output_bytes_total counter"
+    )
+    .unwrap();
+
+    for role in PersistenceWriteRole::ALL {
+        for operation in PersistenceWriteOperation::ALL {
+            let counter = snapshot.counter(role, operation);
+            if counter.attempts == 0 {
+                continue;
+            }
+            writeln!(output, "runnel_persistence_operations_total{{role=\"{}\",operation=\"{}\",result=\"success\"}} {}", role.as_str(), operation.as_str(), counter.successes).unwrap();
+            writeln!(output, "runnel_persistence_operations_total{{role=\"{}\",operation=\"{}\",result=\"failure\"}} {}", role.as_str(), operation.as_str(), counter.failures).unwrap();
+            writeln!(output, "runnel_persistence_operation_elapsed_nanoseconds_total{{role=\"{}\",operation=\"{}\"}} {}", role.as_str(), operation.as_str(), counter.elapsed_nanoseconds).unwrap();
+            if counter.write_bytes_offered > 0 || counter.write_accepted_prefix_unknown > 0 {
+                writeln!(output, "runnel_persistence_write_bytes_offered_total{{role=\"{}\",operation=\"write_all\"}} {}", role.as_str(), counter.write_bytes_offered).unwrap();
+                writeln!(output, "runnel_persistence_write_bytes_completed_total{{role=\"{}\",operation=\"write_all\"}} {}", role.as_str(), counter.write_bytes_completed).unwrap();
+                writeln!(output, "runnel_persistence_write_accepted_prefix_unknown_total{{role=\"{}\",operation=\"write_all\"}} {}", role.as_str(), counter.write_accepted_prefix_unknown).unwrap();
+            }
+            if counter.serialization_output_bytes > 0 {
+                writeln!(output, "runnel_persistence_serialization_output_bytes_total{{role=\"{}\",operation=\"{}\"}} {}", role.as_str(), operation.as_str(), counter.serialization_output_bytes).unwrap();
+            }
         }
     }
 }
@@ -951,5 +1031,61 @@ mod tests {
                 .filter(|line| line.starts_with("runnel_snapshot_build_"))
                 .all(|line| !line.contains('{'))
         );
+    }
+
+    #[test]
+    fn default_metrics_formatter_does_not_include_write_counter_series() {
+        let admission = ProtocolAdmission {
+            max_connections: 1,
+            max_request_bytes: 1,
+            max_in_flight_requests: 1,
+            request_timeout: Duration::from_secs(1),
+        };
+        let body = format_metrics(None, None, None, &ServerMetrics::default(), admission);
+        assert!(!body.contains("runnel_persistence_"));
+    }
+
+    #[cfg(feature = "persistence-write-counters")]
+    #[test]
+    fn metrics_query_controls_write_counter_series() {
+        let regular_metrics = "# ordinary metrics\n".to_owned();
+        let default_body = add_requested_persistence_write_metrics(regular_metrics.clone(), None);
+        assert_eq!(default_body, regular_metrics);
+        assert!(!default_body.contains("runnel_persistence_"));
+
+        let disabled_body = add_requested_persistence_write_metrics(
+            regular_metrics.clone(),
+            Some("persistence_write_counters=false"),
+        );
+        assert_eq!(disabled_body, regular_metrics);
+
+        let enabled_body = add_requested_persistence_write_metrics(
+            regular_metrics,
+            Some("persistence_write_counters=true"),
+        );
+        assert!(enabled_body.contains("runnel_persistence_write_counters_enabled 1"));
+    }
+
+    #[cfg(feature = "persistence-write-counters")]
+    #[test]
+    fn explicit_write_counter_export_has_no_dynamic_stream_or_group_labels() {
+        let mut body = String::new();
+        append_persistence_write_metrics(&mut body);
+
+        assert!(body.contains("runnel_persistence_write_counters_enabled 1"));
+        assert!(!body.contains("stream="));
+        assert!(!body.contains("group="));
+        for line in body
+            .lines()
+            .filter(|line| line.starts_with("runnel_persistence_"))
+        {
+            if let Some(labels) = line.split_once('{').map(|(_, labels)| labels) {
+                assert!(labels.contains("role=\""));
+                assert!(
+                    labels.contains("operation=\"")
+                        || line.starts_with("runnel_persistence_write_counters_enabled")
+                );
+            }
+        }
     }
 }

@@ -67,6 +67,9 @@ from cluster_scenarios import (  # noqa: E402
     MIN_RAFT_LOG_GROWTH_CYCLE_TIMEOUT_SECONDS,
     MIN_RAFT_LOG_GROWTH_MESSAGES,
     MIN_SNAPSHOT_BUILD_MESSAGES,
+    PERSISTENCE_WRITE_COUNTER_FIELDS,
+    PERSISTENCE_WRITE_OPERATIONS,
+    PERSISTENCE_WRITE_ROLES,
     _hot_ordering_metadata,
     _observed_purge_advanced,
     _raft_data_group_state,
@@ -90,6 +93,8 @@ from cluster_scenarios import (  # noqa: E402
     run_snapshot_build_hot_path,
     _snapshot_build_metric_deltas,
     _snapshot_build_metrics,
+    _persistence_write_counter_deltas,
+    _persistence_write_counter_snapshot,
     run_slow_consumer_backpressure,
 )
 from common import BenchmarkError, metric, parse_nonnegative_int, percentile  # noqa: E402
@@ -108,6 +113,68 @@ class _ClientsContext:
 
 
 class ClusterBenchmarkTests(unittest.TestCase):
+    def test_persistence_write_counter_scrape_deltas_are_fixed_and_per_process(self) -> None:
+        def metrics(*, successes: int, elapsed: int, offered: int) -> dict[str, float]:
+            labels = 'role="raft_log_rewrite",operation="write_all"'
+            return {
+                "node_1.runnel_persistence_write_counters_enabled": 1.0,
+                f'node_1.runnel_persistence_operations_total{{{labels},result="success"}}': float(successes),
+                f'node_1.runnel_persistence_operations_total{{{labels},result="failure"}}': 0.0,
+                f'node_1.runnel_persistence_operation_elapsed_nanoseconds_total{{{labels}}}': float(elapsed),
+                f'node_1.runnel_persistence_write_bytes_offered_total{{{labels}}}': float(offered),
+                f'node_1.runnel_persistence_write_bytes_completed_total{{{labels}}}': float(offered),
+                f'node_1.runnel_persistence_write_accepted_prefix_unknown_total{{{labels}}}': 0.0,
+            }
+
+        before = _persistence_write_counter_snapshot(
+            metrics(successes=2, elapsed=20, offered=8), [1]
+        )
+        after = _persistence_write_counter_snapshot(
+            metrics(successes=3, elapsed=31, offered=12), [1]
+        )
+        delta = _persistence_write_counter_deltas(before, after)
+
+        self.assertEqual(
+            PERSISTENCE_WRITE_ROLES,
+            (
+                "raft_log_rewrite",
+                "state_machine_journal_append",
+                "state_machine_journal_compaction",
+                "state_machine_checkpoint",
+                "state_machine_snapshot",
+            ),
+        )
+        self.assertEqual(len(PERSISTENCE_WRITE_OPERATIONS), 7)
+        self.assertEqual(len(PERSISTENCE_WRITE_COUNTER_FIELDS), 8)
+        self.assertTrue(delta["available"])
+        cell = delta["per_node"]["node_1"]["roles"]["raft_log_rewrite"]["write_all"]
+        self.assertEqual(cell["start"]["write_bytes_completed"], 8)
+        self.assertEqual(cell["end"]["write_bytes_completed"], 12)
+        self.assertEqual(cell["delta"]["attempts"], 1)
+        self.assertEqual(cell["delta"]["elapsed_nanoseconds"], 11)
+        self.assertEqual(cell["delta"]["write_bytes_offered"], 4)
+        self.assertEqual(cell["delta"]["write_bytes_completed"], 4)
+        self.assertFalse(
+            _persistence_write_counter_snapshot({}, [1])["available"]
+        )
+
+    def test_persistence_write_counter_delta_reports_a_process_reset(self) -> None:
+        labels = 'role="raft_log_rewrite",operation="write_all",result="success"'
+        before = _persistence_write_counter_snapshot(
+            {
+                "node_1.runnel_persistence_write_counters_enabled": 1.0,
+                f"node_1.runnel_persistence_operations_total{{{labels}}}": 4.0,
+            },
+            [1],
+        )
+        after = _persistence_write_counter_snapshot(
+            {"node_1.runnel_persistence_write_counters_enabled": 1.0}, [1]
+        )
+
+        delta = _persistence_write_counter_deltas(before, after)
+        self.assertFalse(delta["available"])
+        self.assertIn("counter reset", delta["reason"])
+
     def test_cli_dispatch_preserves_payload_and_recovery_order(self) -> None:
         with patch.object(
             sys,
@@ -858,11 +925,46 @@ class ClusterBenchmarkTests(unittest.TestCase):
             SimpleNamespace(node_id=node_id, data_dir=f"node-{node_id}")
             for node_id in range(1, 4)
         ]
+        def write_counter_metrics(values: tuple[int, int, int]) -> dict[str, float]:
+            metrics: dict[str, float] = {}
+            labels = 'role="raft_log_rewrite",operation="write_all"'
+            for node_id, value in enumerate(values, start=1):
+                prefix = f"node_{node_id}."
+                metrics[f"{prefix}runnel_persistence_write_counters_enabled"] = 1.0
+                metrics[
+                    f'{prefix}runnel_persistence_operations_total{{{labels},result="success"}}'
+                ] = float(value)
+                metrics[
+                    f'{prefix}runnel_persistence_operations_total{{{labels},result="failure"}}'
+                ] = 0.0
+                metrics[
+                    f"{prefix}runnel_persistence_operation_elapsed_nanoseconds_total{{{labels}}}"
+                ] = float(value * 10)
+                metrics[
+                    f"{prefix}runnel_persistence_write_bytes_offered_total{{{labels}}}"
+                ] = float(value * 4)
+                metrics[
+                    f"{prefix}runnel_persistence_write_bytes_completed_total{{{labels}}}"
+                ] = float(value * 4)
+                metrics[
+                    f"{prefix}runnel_persistence_write_accepted_prefix_unknown_total{{{labels}}}"
+                ] = 0.0
+            return metrics
+
+        counter_scrapes = iter(
+            (
+                write_counter_metrics((10, 10, 10)),
+                write_counter_metrics((12, 12, 12)),
+                write_counter_metrics((12, 12, 0)),
+                write_counter_metrics((13, 13, 2)),
+            )
+        )
         cluster = SimpleNamespace(
             node_count=3,
             nodes=nodes,
             stats=object(),
             metrics=lambda: None,
+            persistence_write_metrics=lambda: next(counter_scrapes),
             client=lambda index: clients[index],
             restart_node=lambda _index: 10_000,
         )
@@ -935,6 +1037,30 @@ class ClusterBenchmarkTests(unittest.TestCase):
             result["metadata"]["consensus_history_boundary"],
         )
         self.assertTrue(result["metadata"]["snapshot_purge_cycle_observed"])
+        counters = result["metadata"]["persistence_write_counters"]
+        publish_deltas = counters["publish_through_snapshot_purge"]
+        self.assertTrue(publish_deltas["available"])
+        self.assertEqual(
+            publish_deltas["per_node"]["node_1"]["roles"]["raft_log_rewrite"][
+                "write_all"
+            ]["delta"]["attempts"],
+            2,
+        )
+        recovery_counters = counters["follower_restart_recovery"]
+        self.assertTrue(recovery_counters["available"])
+        self.assertTrue(recovery_counters["restarted_process_reset"])
+        self.assertEqual(recovery_counters["pre_stop_counters"]["roles"][
+            "raft_log_rewrite"
+        ]["write_all"]["attempts"], 12)
+        self.assertEqual(recovery_counters["fresh_process_baseline"]["roles"][
+            "raft_log_rewrite"
+        ]["write_all"]["attempts"], 0)
+        self.assertEqual(recovery_counters["after_recovery"]["roles"][
+            "raft_log_rewrite"
+        ]["write_all"]["attempts"], 2)
+        self.assertEqual(recovery_counters["fresh_process_to_recovery_delta"][
+            "roles"
+        ]["raft_log_rewrite"]["write_all"]["delta"]["attempts"], 2)
         self.assertEqual(result["recovery"]["metadata"]["replayed_offset"], 0)
         self.assertTrue(result["recovery"]["metadata"]["earliest_payload_verified"])
 
