@@ -385,7 +385,7 @@ fn three_process_cluster_replicates_and_recovers_after_failures() {
             || Request::PublishBytes {
                 stream: "batch-jobs".to_owned(),
                 key: None,
-                payload_base64: BinaryPayload::new(binary_batch_payload.clone()),
+                payload: BinaryPayload::new(binary_batch_payload.clone()),
                 request_id: Some("batch-job-1".to_owned()),
             },
             |response| matches!(response, Response::Published { offset: 1, .. }),
@@ -459,8 +459,8 @@ fn three_process_cluster_replicates_and_recovers_after_failures() {
     ));
     assert!(matches!(
         &messages[1],
-        BatchMessageResponse::Bytes { payload_base64, .. }
-            if payload_base64.as_bytes() == binary_batch_payload
+        BatchMessageResponse::Bytes { payload, .. }
+            if payload.as_bytes() == binary_batch_payload
     ));
     let batch_receipts = batch_response_receipts(batch_response);
     assert_eq!(
