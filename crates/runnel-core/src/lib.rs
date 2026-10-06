@@ -28,14 +28,11 @@ use delivery_state::MAX_CACHED_CONSUMER_STATES;
 use std::fs::OpenOptions;
 #[cfg(test)]
 use std::io::Write;
-use stream_log::REQUEST_ID_MAX_LEN;
+use stream_log::MAX_REQUEST_ID_LEN;
 #[cfg(test)]
 use stream_log::{
-    LEGACY_HEADER_LEN, LEGACY_MAGIC, LEGACY_REQUEST_ID_FORMAT_VERSION, LEGACY_WRITE_MAX_BODY_LEN,
-    LEGACY_WRITE_MAX_KEY_LEN, MAX_IN_MEMORY_RECORDS, REQUEST_ID_FORMAT_VERSION,
-    REQUEST_ID_HEADER_LEN, REQUEST_ID_MAGIC, REQUEST_ID_MAX_BODY_LEN, REQUEST_ID_MAX_KEY_LEN,
-    VERSIONED_FORMAT_VERSION, VERSIONED_HEADER_LEN, VERSIONED_MAGIC, VERSIONED_MAX_BODY_LEN,
-    VERSIONED_MAX_KEY_LEN,
+    MAX_BODY_LEN, MAX_IN_MEMORY_RECORDS, MAX_KEY_LEN, RECORD_FORMAT_VERSION, RECORD_HEADER_LEN,
+    RECORD_MAGIC,
 };
 const DEFAULT_ACK_TIMEOUT: Duration = Duration::from_secs(30);
 const DEAD_LETTER_SUFFIX: &str = ".dead-letter";
@@ -45,17 +42,6 @@ pub use runnel_engine::{
     AckResult, BrokerError, ConsumerPolicy, HealthSnapshot, Message, Offset, PollResult,
     ReplayMessage,
 };
-
-/// Selects the durable record format used for new appends.
-///
-/// Readers accept legacy `RNL1`, versioned `RNL2`, and request-aware `RNL3` frames.
-/// The versioned format is deliberately opt-in until its compatibility policy
-/// is accepted for normal broker deployments.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum DurableFormat {
-    Rnl1,
-    VersionedV1,
-}
 
 #[derive(Debug, Clone)]
 pub struct BrokerConfig {
@@ -318,7 +304,7 @@ fn dead_letter_move_id(
         source_stream.len(),
         source_consumer.len(),
     );
-    if move_id.len() <= REQUEST_ID_MAX_LEN as usize {
+    if move_id.len() <= MAX_REQUEST_ID_LEN as usize {
         return Ok(move_id);
     }
     Err(BrokerError::Io(io::Error::new(
@@ -1376,7 +1362,7 @@ mod tests {
         assert_ne!(first, dead_letter_move_id("events", "other", 7).unwrap());
         assert_ne!(first, dead_letter_move_id("audit", "worker", 7).unwrap());
         assert_ne!(first, dead_letter_move_id("events", "worker", 8).unwrap());
-        assert!(first.len() <= REQUEST_ID_MAX_LEN as usize);
+        assert!(first.len() <= MAX_REQUEST_ID_LEN as usize);
     }
 
     #[test]
@@ -1690,41 +1676,6 @@ mod tests {
         assert_eq!(message.payload, b"poison");
     }
 
-    fn append_legacy_request_id_record(
-        root: &Path,
-        stream: &str,
-        offset: Offset,
-        key: Option<&str>,
-        payload: &[u8],
-        request_id: &str,
-    ) {
-        let key_bytes = key.unwrap_or_default().as_bytes();
-        let request_id_bytes = request_id.as_bytes();
-        let payload_len = u32::try_from(payload.len()).unwrap();
-        let key_len = u32::try_from(key_bytes.len()).unwrap();
-        let request_id_len = u32::try_from(request_id_bytes.len()).unwrap();
-        let mut header = [0; REQUEST_ID_HEADER_LEN];
-        header[..4].copy_from_slice(REQUEST_ID_MAGIC);
-        header[4] = LEGACY_REQUEST_ID_FORMAT_VERSION;
-        header[6..8].copy_from_slice(&(REQUEST_ID_HEADER_LEN as u16).to_le_bytes());
-        header[8..12].copy_from_slice(&payload_len.to_le_bytes());
-        header[12..16].copy_from_slice(&payload_len.to_le_bytes());
-        header[16..24].copy_from_slice(&offset.to_le_bytes());
-        header[32..36].copy_from_slice(&key_len.to_le_bytes());
-        header[36..40].copy_from_slice(&request_id_len.to_le_bytes());
-        let checksum =
-            stream_log::request_id_checksum(&header, key_bytes, request_id_bytes, payload);
-        header[44..48].copy_from_slice(&checksum.to_le_bytes());
-
-        let path = stream_path(root, stream);
-        let mut file = OpenOptions::new().append(true).open(path).unwrap();
-        file.write_all(&header).unwrap();
-        file.write_all(key_bytes).unwrap();
-        file.write_all(request_id_bytes).unwrap();
-        file.write_all(payload).unwrap();
-        file.sync_all().unwrap();
-    }
-
     #[test]
     fn dead_letter_move_identity_rejects_different_content_after_restart() {
         let directory = tempdir().unwrap();
@@ -1898,127 +1849,6 @@ mod tests {
         assert_dead_letter_move_at(&broker, &move_id, 1, 2);
         let public = broker.replay("events.dead-letter", "inspector", 0).unwrap();
         assert_eq!(public.payload, b"poison");
-    }
-
-    #[test]
-    fn legacy_public_move_id_remains_public_and_does_not_satisfy_new_move() {
-        let directory = tempdir().unwrap();
-        let config = BrokerConfig {
-            ack_timeout: Duration::ZERO,
-            max_delivery_attempts: Some(1),
-        };
-        let move_id = dead_letter_move_id("events", "worker", 0).unwrap();
-
-        {
-            let broker = Broker::open(directory.path(), config.clone()).unwrap();
-            broker
-                .publish("events", Some("order-1".to_owned()), b"poison".to_vec())
-                .unwrap();
-            assert!(matches!(
-                broker.poll("events", "worker").unwrap(),
-                PollResult::Message(Message {
-                    offset: 0,
-                    delivery_attempt: Some(1),
-                    ..
-                })
-            ));
-            broker.create_stream("events.dead-letter").unwrap();
-        }
-        append_legacy_request_id_record(
-            directory.path(),
-            "events.dead-letter",
-            0,
-            Some("order-1"),
-            b"poison",
-            &move_id,
-        );
-
-        let broker = Broker::open(directory.path(), config).unwrap();
-        assert_eq!(broker.poll("events", "worker").unwrap(), PollResult::Empty);
-        let source_state = load_consumer_state(directory.path(), "events", "worker").unwrap();
-        assert_eq!(source_state.committed_offset, 1);
-        assert_dead_letter_move_at(&broker, &move_id, 1, 2);
-
-        assert!(matches!(
-            broker.publish_with_request_id(
-                "events.dead-letter",
-                Some("different-key".to_owned()),
-                b"different payload".to_vec(),
-                Some(move_id),
-            ),
-            Err(BrokerError::RequestIdContentConflict)
-        ));
-        let old_public = broker.replay("events.dead-letter", "inspector", 0).unwrap();
-        assert_eq!(old_public.key.as_deref(), Some("order-1"));
-        assert_eq!(old_public.payload, b"poison");
-    }
-
-    #[test]
-    fn interrupted_legacy_move_retries_as_typed_move_once_after_restart() {
-        let directory = tempdir().unwrap();
-        let config = BrokerConfig {
-            ack_timeout: Duration::ZERO,
-            max_delivery_attempts: Some(1),
-        };
-        let move_id = dead_letter_move_id("events", "worker", 0).unwrap();
-
-        {
-            let broker = Broker::open(directory.path(), config.clone()).unwrap();
-            broker
-                .publish("events", Some("order-1".to_owned()), b"poison".to_vec())
-                .unwrap();
-            assert!(matches!(
-                broker.poll("events", "worker").unwrap(),
-                PollResult::Message(Message {
-                    offset: 0,
-                    delivery_attempt: Some(1),
-                    ..
-                })
-            ));
-            broker.create_stream("events.dead-letter").unwrap();
-        }
-        // This RNL3 v1 frame models an old internal append whose source ack was not durable.
-        append_legacy_request_id_record(
-            directory.path(),
-            "events.dead-letter",
-            0,
-            Some("order-1"),
-            b"poison",
-            &move_id,
-        );
-
-        {
-            let broker = Broker::open(directory.path(), config.clone()).unwrap();
-            broker.fail_next_dead_letter_ack_persist();
-            assert!(matches!(
-                broker.poll("events", "worker"),
-                Err(BrokerError::Io(error)) if error.kind() == io::ErrorKind::Interrupted
-            ));
-            let source_state = load_consumer_state(directory.path(), "events", "worker").unwrap();
-            assert_eq!(source_state.committed_offset, 0);
-            assert_dead_letter_move_at(&broker, &move_id, 1, 2);
-        }
-
-        {
-            let broker = Broker::open(directory.path(), config.clone()).unwrap();
-            assert_eq!(broker.poll("events", "worker").unwrap(), PollResult::Empty);
-            let source_state = load_consumer_state(directory.path(), "events", "worker").unwrap();
-            assert_eq!(source_state.committed_offset, 1);
-            assert_dead_letter_move_at(&broker, &move_id, 1, 2);
-        }
-
-        let broker = Broker::open(directory.path(), config).unwrap();
-        assert_eq!(broker.poll("events", "worker").unwrap(), PollResult::Empty);
-        assert_dead_letter_move_at(&broker, &move_id, 1, 2);
-        assert!(matches!(
-            broker.publish_with_request_id(
-                "events.dead-letter",
-                Some("changed-key".to_owned()),
-                b"changed payload".to_vec(),
-                Some(move_id),
-            ),
-            Err(BrokerError::RequestIdContentConflict)
-        ));
     }
 
     fn delivery(result: Result<PollResult, BrokerError>) -> (Offset, String) {
@@ -2515,7 +2345,7 @@ mod tests {
         let path = directory.path().join("streams/events.log");
         let complete_len = fs::metadata(&path).unwrap().len();
         let mut file = OpenOptions::new().append(true).open(&path).unwrap();
-        file.write_all(b"RNL1partial").unwrap();
+        file.write_all(b"RNL3partial").unwrap();
         file.sync_all().unwrap();
 
         let broker = Broker::open(directory.path(), BrokerConfig::default()).unwrap();
@@ -2636,7 +2466,7 @@ mod tests {
         }
         let path = directory.path().join("streams/events.log");
         let mut file = OpenOptions::new().append(true).open(path).unwrap();
-        file.write_all(b"RNL1partial").unwrap();
+        file.write_all(b"RNL3partial").unwrap();
         file.sync_all().unwrap();
 
         let broker = Broker::open(directory.path(), BrokerConfig::default()).unwrap();
@@ -2652,41 +2482,50 @@ mod tests {
     }
 
     #[test]
-    fn complete_legacy_record_with_malformed_key_fails_closed_on_recovery() {
-        let directory = tempdir().unwrap();
-        {
-            let broker = Broker::open(directory.path(), BrokerConfig::default()).unwrap();
-            broker
-                .publish("events", Some("complete".to_owned()), b"payload".to_vec())
-                .unwrap();
+    fn unsupported_old_stream_formats_fail_before_any_tail_is_truncated() {
+        let mut rnl3_v1_frame = vec![0; RECORD_HEADER_LEN];
+        rnl3_v1_frame[..4].copy_from_slice(RECORD_MAGIC);
+        rnl3_v1_frame[4] = 1;
+        rnl3_v1_frame[6..8].copy_from_slice(&(RECORD_HEADER_LEN as u16).to_le_bytes());
+
+        for (old_bytes, expected_error) in [
+            (
+                b"RNL1 old stream data".to_vec(),
+                "unsupported RNL1 stream format; this broker requires RNL3",
+            ),
+            (
+                b"RNL2 old stream data".to_vec(),
+                "unsupported RNL2 stream format; this broker requires RNL3",
+            ),
+            (rnl3_v1_frame, "unsupported RNL3 record version"),
+        ] {
+            let directory = tempdir().unwrap();
+            {
+                let broker = Broker::open(directory.path(), BrokerConfig::default()).unwrap();
+                broker
+                    .publish("events", None, b"complete".to_vec())
+                    .unwrap();
+            }
+
+            let current_path = directory.path().join("streams/events.log");
+            let mut current = OpenOptions::new().append(true).open(&current_path).unwrap();
+            current.write_all(&RECORD_MAGIC[..3]).unwrap();
+            current.sync_all().unwrap();
+            let current_bytes = fs::read(&current_path).unwrap();
+
+            let old_path = directory.path().join("streams/old.log");
+            fs::write(&old_path, &old_bytes).unwrap();
+
+            let error = match Broker::open(directory.path(), BrokerConfig::default()) {
+                Err(BrokerError::Io(error)) => error,
+                Err(error) => panic!("expected unsupported old stream artifact, got {error}"),
+                Ok(_) => panic!("expected unsupported old stream artifact to fail startup"),
+            };
+            assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+            assert_eq!(error.to_string(), expected_error);
+            assert_eq!(fs::read(&old_path).unwrap(), old_bytes);
+            assert_eq!(fs::read(&current_path).unwrap(), current_bytes);
         }
-
-        let path = directory.path().join("streams/events.log");
-        let valid_len = fs::metadata(&path).unwrap().len();
-        let key = [0xff];
-        let payload = b"malformed-key-record";
-        let mut header = [0; LEGACY_HEADER_LEN];
-        header[..4].copy_from_slice(LEGACY_MAGIC);
-        header[4..12].copy_from_slice(&1_u64.to_le_bytes());
-        header[20..24].copy_from_slice(&(key.len() as u32).to_le_bytes());
-        header[24..28].copy_from_slice(&(payload.len() as u32).to_le_bytes());
-
-        let mut file = OpenOptions::new().append(true).open(&path).unwrap();
-        file.write_all(&header).unwrap();
-        file.write_all(&key).unwrap();
-        file.write_all(payload).unwrap();
-        file.sync_all().unwrap();
-        let complete_len =
-            valid_len + LEGACY_HEADER_LEN as u64 + key.len() as u64 + payload.len() as u64;
-
-        let error = match Broker::open(directory.path(), BrokerConfig::default()) {
-            Err(BrokerError::Io(error)) => error,
-            Err(error) => panic!("expected malformed legacy key to fail recovery, got {error}"),
-            Ok(_) => panic!("expected malformed legacy key to fail recovery"),
-        };
-        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
-        assert_eq!(error.to_string(), "legacy record key is not UTF-8");
-        assert_eq!(fs::metadata(&path).unwrap().len(), complete_len);
     }
 
     #[tokio::test]
@@ -2711,7 +2550,7 @@ mod tests {
         let path = directory.path().join("streams/events.log");
         let complete_len = fs::metadata(&path).unwrap().len();
         let mut file = OpenOptions::new().append(true).open(&path).unwrap();
-        file.write_all(REQUEST_ID_MAGIC).unwrap();
+        file.write_all(RECORD_MAGIC).unwrap();
         file.sync_all().unwrap();
 
         let broker = Broker::open(directory.path(), BrokerConfig::default()).unwrap();
@@ -2731,18 +2570,79 @@ mod tests {
     }
 
     #[test]
-    fn request_id_reader_fails_closed_on_unknown_versions_and_identity_flags() {
-        for (version, flags, expected_error) in [
-            (3, 0, "unsupported request-aware record version"),
-            (
-                LEGACY_REQUEST_ID_FORMAT_VERSION,
-                1,
-                "unsupported request-aware record flags",
+    fn current_record_writer_round_trips_ordinary_and_request_id_records() {
+        let directory = tempdir().unwrap();
+        {
+            let broker = Broker::open(directory.path(), BrokerConfig::default()).unwrap();
+            assert_eq!(
+                broker
+                    .publish("events", None, b"ordinary".to_vec())
+                    .unwrap(),
+                0
+            );
+            assert_eq!(
+                broker
+                    .publish_with_request_id(
+                        "events",
+                        Some("order-1".to_owned()),
+                        b"request-aware".to_vec(),
+                        Some("request-1".to_owned()),
+                    )
+                    .unwrap(),
+                1
+            );
+        }
+
+        let path = directory.path().join("streams/events.log");
+        let bytes = fs::read(&path).unwrap();
+        assert_eq!(&bytes[..4], RECORD_MAGIC);
+        assert_eq!(bytes[4], RECORD_FORMAT_VERSION);
+        assert_eq!(bytes[5], 2, "ordinary publishes have no request identity");
+        assert_eq!(u32::from_le_bytes(bytes[36..40].try_into().unwrap()), 0);
+        let second_record = RECORD_HEADER_LEN + b"ordinary".len();
+        assert_eq!(&bytes[second_record..second_record + 4], RECORD_MAGIC);
+        assert_eq!(bytes[second_record + 4], RECORD_FORMAT_VERSION);
+        assert_eq!(bytes[second_record + 5], 0);
+        assert_eq!(
+            u32::from_le_bytes(
+                bytes[second_record + 36..second_record + 40]
+                    .try_into()
+                    .unwrap()
             ),
+            "request-1".len() as u32
+        );
+
+        let broker = Broker::open(directory.path(), BrokerConfig::default()).unwrap();
+        assert_eq!(
+            broker.replay("events", "inspector", 0).unwrap().payload,
+            b"ordinary"
+        );
+        assert_eq!(
+            broker.replay("events", "inspector", 1).unwrap().payload,
+            b"request-aware"
+        );
+        assert_eq!(
+            broker
+                .publish_with_request_id(
+                    "events",
+                    Some("order-1".to_owned()),
+                    b"request-aware".to_vec(),
+                    Some("request-1".to_owned()),
+                )
+                .unwrap(),
+            1
+        );
+    }
+
+    #[test]
+    fn record_reader_fails_closed_on_unknown_versions_and_identity_flags() {
+        for (version, flags, expected_error) in [
+            (1, 0, "unsupported RNL3 record version"),
+            (3, 0, "unsupported RNL3 record version"),
             (
-                REQUEST_ID_FORMAT_VERSION,
-                2,
-                "unsupported request-aware record flags",
+                RECORD_FORMAT_VERSION,
+                3,
+                "unsupported RNL3 record identity flag",
             ),
         ] {
             let directory = tempdir().unwrap();
@@ -2752,18 +2652,19 @@ mod tests {
             }
 
             let path = directory.path().join("streams/events.log");
-            let mut header = [0; REQUEST_ID_HEADER_LEN];
-            header[..4].copy_from_slice(REQUEST_ID_MAGIC);
+            let mut header = [0; RECORD_HEADER_LEN];
+            header[..4].copy_from_slice(RECORD_MAGIC);
             header[4] = version;
             header[5] = flags;
+            header[6..8].copy_from_slice(&(RECORD_HEADER_LEN as u16).to_le_bytes());
             let mut file = OpenOptions::new().append(true).open(&path).unwrap();
             file.write_all(&header).unwrap();
             file.sync_all().unwrap();
 
             let error = match Broker::open(directory.path(), BrokerConfig::default()) {
                 Err(BrokerError::Io(error)) => error,
-                Err(error) => panic!("expected invalid request-aware frame, got {error}"),
-                Ok(_) => panic!("expected invalid request-aware frame to fail recovery"),
+                Err(error) => panic!("expected invalid stream record, got {error}"),
+                Ok(_) => panic!("expected invalid stream record to fail recovery"),
             };
             assert_eq!(error.kind(), io::ErrorKind::InvalidData);
             assert_eq!(error.to_string(), expected_error);
@@ -2771,7 +2672,7 @@ mod tests {
     }
 
     #[test]
-    fn request_identity_kind_is_covered_by_frame_checksum() {
+    fn record_identity_kind_is_covered_by_frame_checksum() {
         let directory = tempdir().unwrap();
         {
             let broker = Broker::open(directory.path(), BrokerConfig::default()).unwrap();
@@ -2787,7 +2688,7 @@ mod tests {
 
         let path = directory.path().join("streams/events.log");
         let mut bytes = fs::read(&path).unwrap();
-        assert_eq!(bytes[4], REQUEST_ID_FORMAT_VERSION);
+        assert_eq!(bytes[4], RECORD_FORMAT_VERSION);
         assert_eq!(bytes[5], 0);
         bytes[5] = 1;
         fs::write(&path, bytes).unwrap();
@@ -2798,53 +2699,15 @@ mod tests {
             Ok(_) => panic!("expected identity kind mutation to fail recovery"),
         };
         assert_eq!(error.kind(), io::ErrorKind::InvalidData);
-        assert_eq!(error.to_string(), "request-aware record checksum mismatch");
-    }
-
-    #[tokio::test]
-    async fn request_id_writer_rejects_oversized_fields_for_versioned_storage() {
-        let directory = tempdir().unwrap();
-        let broker = Broker::open_with_format(
-            directory.path(),
-            BrokerConfig::default(),
-            DurableFormat::VersionedV1,
-        )
-        .unwrap();
-
-        let key_error = Engine::publish(
-            &broker,
-            "events",
-            Some("k".repeat(VERSIONED_MAX_KEY_LEN as usize + 1)),
-            b"payload".to_vec(),
-            Some("request-1".to_owned()),
-        )
-        .await
-        .unwrap_err();
-        assert!(
-            matches!(key_error, BrokerError::Io(error) if error.kind() == io::ErrorKind::InvalidInput)
-        );
-
-        let request_id_error = Engine::publish(
-            &broker,
-            "events",
-            None,
-            b"payload".to_vec(),
-            Some("r".repeat(REQUEST_ID_MAX_LEN as usize + 1)),
-        )
-        .await
-        .unwrap_err();
-        assert!(matches!(
-            request_id_error,
-            BrokerError::Io(error) if error.kind() == io::ErrorKind::InvalidInput
-        ));
+        assert_eq!(error.to_string(), "RNL3 record checksum mismatch");
     }
 
     #[test]
-    fn request_id_recovery_rejects_oversized_lengths_before_allocation() {
+    fn record_recovery_rejects_oversized_lengths_before_allocation() {
         for (key_len, request_id_len, body_len) in [
-            (REQUEST_ID_MAX_KEY_LEN + 1, 0, 0),
-            (0, REQUEST_ID_MAX_LEN + 1, 0),
-            (0, 0, REQUEST_ID_MAX_BODY_LEN + 1),
+            (MAX_KEY_LEN + 1, 0, 0),
+            (0, MAX_REQUEST_ID_LEN + 1, 0),
+            (0, 0, MAX_BODY_LEN + 1),
         ] {
             let directory = tempdir().unwrap();
             {
@@ -2852,10 +2715,11 @@ mod tests {
                 broker.create_stream("events").unwrap();
             }
             let path = directory.path().join("streams/events.log");
-            let mut header = [0; REQUEST_ID_HEADER_LEN];
-            header[..4].copy_from_slice(REQUEST_ID_MAGIC);
-            header[4] = REQUEST_ID_FORMAT_VERSION;
-            header[6..8].copy_from_slice(&(REQUEST_ID_HEADER_LEN as u16).to_le_bytes());
+            let mut header = [0; RECORD_HEADER_LEN];
+            header[..4].copy_from_slice(RECORD_MAGIC);
+            header[4] = RECORD_FORMAT_VERSION;
+            header[5] = 0;
+            header[6..8].copy_from_slice(&(RECORD_HEADER_LEN as u16).to_le_bytes());
             header[8..12].copy_from_slice(&body_len.to_le_bytes());
             header[12..16].copy_from_slice(&body_len.to_le_bytes());
             header[32..36].copy_from_slice(&key_len.to_le_bytes());
@@ -2873,113 +2737,18 @@ mod tests {
     }
 
     #[test]
-    fn versioned_frames_round_trip_and_recover_after_restart() {
-        let directory = tempdir().unwrap();
-        {
-            let broker = Broker::open_with_format(
-                directory.path(),
-                BrokerConfig::default(),
-                DurableFormat::VersionedV1,
-            )
-            .unwrap();
-            assert_eq!(
-                broker
-                    .publish("events", Some("order-1".to_owned()), b"payload".to_vec())
-                    .unwrap(),
-                0
-            );
-        }
-
-        let path = directory.path().join("streams/events.log");
-        let bytes = fs::read(&path).unwrap();
-        assert_eq!(&bytes[..4], VERSIONED_MAGIC);
-        assert_eq!(
-            u16::from_le_bytes(bytes[6..8].try_into().unwrap()) as usize,
-            VERSIONED_HEADER_LEN
-        );
-        assert_eq!(u32::from_le_bytes(bytes[8..12].try_into().unwrap()), 7);
-
-        let broker = Broker::open_with_format(
-            directory.path(),
-            BrokerConfig::default(),
-            DurableFormat::VersionedV1,
-        )
-        .unwrap();
-        let message = match broker.poll("events", "reader").unwrap() {
-            PollResult::Message(message) => message,
-            PollResult::Empty => panic!("expected versioned message"),
-        };
-        assert_eq!(message.offset, 0);
-        assert_eq!(message.key.as_deref(), Some("order-1"));
-        assert_eq!(message.payload, b"payload");
-        assert_eq!(
-            broker.ack("events", "reader", 0).unwrap(),
-            AckResult::Acknowledged
-        );
-    }
-
-    #[test]
-    fn versioned_reader_replays_mixed_legacy_and_versioned_frames() {
+    fn record_checksum_corruption_fails_recovery() {
         let directory = tempdir().unwrap();
         {
             let broker = Broker::open(directory.path(), BrokerConfig::default()).unwrap();
-            broker.publish("events", None, b"legacy".to_vec()).unwrap();
-        }
-        {
-            let broker = Broker::open_with_format(
-                directory.path(),
-                BrokerConfig::default(),
-                DurableFormat::VersionedV1,
-            )
-            .unwrap();
-            broker
-                .publish("events", None, b"versioned".to_vec())
-                .unwrap();
-        }
-
-        let broker = Broker::open_with_format(
-            directory.path(),
-            BrokerConfig::default(),
-            DurableFormat::VersionedV1,
-        )
-        .unwrap();
-        for (offset, payload) in [(0, b"legacy".as_slice()), (1, b"versioned".as_slice())] {
-            let message = match broker.poll("events", "reader").unwrap() {
-                PollResult::Message(message) => message,
-                PollResult::Empty => panic!("expected retained offset {offset}"),
-            };
-            assert_eq!(message.offset, offset);
-            assert_eq!(message.payload, payload);
-            assert_eq!(
-                broker.ack("events", "reader", offset).unwrap(),
-                AckResult::Acknowledged
-            );
-        }
-        assert_eq!(broker.poll("events", "reader").unwrap(), PollResult::Empty);
-    }
-
-    #[test]
-    fn versioned_checksum_corruption_fails_recovery() {
-        let directory = tempdir().unwrap();
-        {
-            let broker = Broker::open_with_format(
-                directory.path(),
-                BrokerConfig::default(),
-                DurableFormat::VersionedV1,
-            )
-            .unwrap();
             broker.publish("events", None, b"payload".to_vec()).unwrap();
         }
         let path = directory.path().join("streams/events.log");
         let mut bytes = fs::read(&path).unwrap();
-        bytes[VERSIONED_HEADER_LEN] ^= 1;
+        bytes[RECORD_HEADER_LEN] ^= 1;
         fs::write(&path, bytes).unwrap();
 
-        let result = Broker::open_with_format(
-            directory.path(),
-            BrokerConfig::default(),
-            DurableFormat::VersionedV1,
-        );
+        let result = Broker::open(directory.path(), BrokerConfig::default());
         assert!(matches!(
             result,
             Err(BrokerError::Io(error)) if error.kind() == io::ErrorKind::InvalidData
@@ -2987,104 +2756,7 @@ mod tests {
     }
 
     #[test]
-    fn incomplete_versioned_frame_is_discarded_on_recovery() {
-        let directory = tempdir().unwrap();
-        {
-            let broker = Broker::open_with_format(
-                directory.path(),
-                BrokerConfig::default(),
-                DurableFormat::VersionedV1,
-            )
-            .unwrap();
-            broker
-                .publish("events", None, b"complete".to_vec())
-                .unwrap();
-        }
-        let path = directory.path().join("streams/events.log");
-        let complete_len = fs::metadata(&path).unwrap().len();
-        let mut file = OpenOptions::new().append(true).open(&path).unwrap();
-        file.write_all(VERSIONED_MAGIC).unwrap();
-        file.write_all(&[VERSIONED_FORMAT_VERSION]).unwrap();
-        file.sync_all().unwrap();
-
-        let broker = Broker::open_with_format(
-            directory.path(),
-            BrokerConfig::default(),
-            DurableFormat::VersionedV1,
-        )
-        .unwrap();
-        assert_eq!(fs::metadata(&path).unwrap().len(), complete_len);
-        assert!(matches!(
-            broker.poll("events", "reader").unwrap(),
-            PollResult::Message(Message { offset: 0, .. })
-        ));
-    }
-
-    #[test]
-    fn versioned_storage_rejects_oversized_records_before_allocation() {
-        let directory = tempdir().unwrap();
-        {
-            let broker = Broker::open_with_format(
-                directory.path(),
-                BrokerConfig::default(),
-                DurableFormat::VersionedV1,
-            )
-            .unwrap();
-            broker.create_stream("events").unwrap();
-        }
-        let path = directory.path().join("streams/events.log");
-        let mut header = [0; VERSIONED_HEADER_LEN];
-        header[..4].copy_from_slice(VERSIONED_MAGIC);
-        header[4] = VERSIONED_FORMAT_VERSION;
-        header[6..8].copy_from_slice(&(VERSIONED_HEADER_LEN as u16).to_le_bytes());
-        header[8..12].copy_from_slice(&(VERSIONED_MAX_BODY_LEN + 1).to_le_bytes());
-        header[12..16].copy_from_slice(&(VERSIONED_MAX_BODY_LEN + 1).to_le_bytes());
-        let mut file = OpenOptions::new().append(true).open(&path).unwrap();
-        file.write_all(&header).unwrap();
-        file.sync_all().unwrap();
-
-        let result = Broker::open_with_format(
-            directory.path(),
-            BrokerConfig::default(),
-            DurableFormat::VersionedV1,
-        );
-        assert!(matches!(
-            result,
-            Err(BrokerError::Io(error)) if error.kind() == io::ErrorKind::InvalidData
-        ));
-    }
-
-    #[test]
-    fn versioned_writer_rejects_oversized_payloads_and_keys() {
-        let directory = tempdir().unwrap();
-        let broker = Broker::open_with_format(
-            directory.path(),
-            BrokerConfig::default(),
-            DurableFormat::VersionedV1,
-        )
-        .unwrap();
-
-        let key_error = broker
-            .publish(
-                "events",
-                Some("k".repeat(VERSIONED_MAX_KEY_LEN as usize + 1)),
-                b"payload".to_vec(),
-            )
-            .unwrap_err();
-        assert!(
-            matches!(key_error, BrokerError::Io(error) if error.kind() == io::ErrorKind::InvalidInput)
-        );
-
-        let payload_error = broker
-            .publish("events", None, vec![0; VERSIONED_MAX_BODY_LEN as usize + 1])
-            .unwrap_err();
-        assert!(
-            matches!(payload_error, BrokerError::Io(error) if error.kind() == io::ErrorKind::InvalidInput)
-        );
-    }
-
-    #[test]
-    fn rnl1_batch_rejects_oversized_items_without_consuming_offsets() {
+    fn record_batch_rejects_oversized_items_without_consuming_offsets() {
         let directory = tempdir().unwrap();
         let broker = Broker::open(directory.path(), BrokerConfig::default()).unwrap();
         broker.create_stream("events").unwrap();
@@ -3094,7 +2766,7 @@ mod tests {
                 "events",
                 vec![
                     PublishRecord {
-                        key: Some("k".repeat(LEGACY_WRITE_MAX_KEY_LEN as usize + 1)),
+                        key: Some("k".repeat(MAX_KEY_LEN as usize + 1)),
                         payload: b"rejected".to_vec(),
                         request_id: None,
                     },
@@ -3118,7 +2790,7 @@ mod tests {
             fs::metadata(directory.path().join("streams/events.log"))
                 .unwrap()
                 .len(),
-            (LEGACY_HEADER_LEN + 2 + 4) as u64
+            (RECORD_HEADER_LEN + 2 + 4) as u64
         );
     }
 
@@ -3137,7 +2809,7 @@ mod tests {
             .publish_batch(
                 "events",
                 vec![PublishRecord {
-                    key: Some("k".repeat(LEGACY_WRITE_MAX_KEY_LEN as usize + 1)),
+                    key: Some("k".repeat(MAX_KEY_LEN as usize + 1)),
                     payload: b"rejected".to_vec(),
                     request_id: None,
                 }],
@@ -3161,7 +2833,7 @@ mod tests {
                 "events",
                 vec![
                     PublishRecord {
-                        key: Some("k".repeat(LEGACY_WRITE_MAX_KEY_LEN as usize + 1)),
+                        key: Some("k".repeat(MAX_KEY_LEN as usize + 1)),
                         payload: b"rejected".to_vec(),
                         request_id: None,
                     },
@@ -3182,42 +2854,5 @@ mod tests {
                 .await
                 .is_ok()
         );
-    }
-
-    #[test]
-    fn historical_rnl1_fields_above_write_limits_remain_replayable() {
-        let directory = tempdir().unwrap();
-        let streams = directory.path().join("streams");
-        fs::create_dir_all(&streams).unwrap();
-        let path = streams.join("events.log");
-        let key = "k".repeat(LEGACY_WRITE_MAX_KEY_LEN as usize + 1);
-        let payload_len = LEGACY_WRITE_MAX_BODY_LEN + 1;
-        let mut header = [0; LEGACY_HEADER_LEN];
-        header[..4].copy_from_slice(LEGACY_MAGIC);
-        header[4..12].copy_from_slice(&0_u64.to_le_bytes());
-        header[12..20].copy_from_slice(&123_u64.to_le_bytes());
-        header[20..24].copy_from_slice(&(key.len() as u32).to_le_bytes());
-        header[24..28].copy_from_slice(&payload_len.to_le_bytes());
-        let mut file = OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&path)
-            .unwrap();
-        file.write_all(&header).unwrap();
-        file.write_all(key.as_bytes()).unwrap();
-        let encoded_len = (LEGACY_HEADER_LEN + key.len()) as u64 + u64::from(payload_len);
-        file.set_len(encoded_len).unwrap();
-        drop(file);
-
-        let broker = Broker::open(directory.path(), BrokerConfig::default()).unwrap();
-        let message = broker.replay("events", "inspector", 0).unwrap();
-
-        assert_eq!(message.offset, 0);
-        assert_eq!(message.published_at_ms, 123);
-        assert_eq!(message.key.as_deref(), Some(key.as_str()));
-        assert_eq!(message.payload.len(), payload_len as usize);
-        assert!(message.payload.first().is_some_and(|byte| *byte == 0));
-        assert!(message.payload.last().is_some_and(|byte| *byte == 0));
-        assert_eq!(fs::metadata(&path).unwrap().len(), encoded_len);
     }
 }

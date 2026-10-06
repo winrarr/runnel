@@ -314,30 +314,25 @@ Acceptance criteria:
 - compression, when enabled, preserves the documented delivery and recovery guarantees;
 - benchmarks report workload, message size, durability choice, throughput, latency, recovery behavior, memory, and storage usage.
 
-### Bound legacy record materialization without losing old data
+### Bound local record materialization and aggregate memory
 
-Goal: keep recovery, indexing, delivery, replay, and response memory bounded while preserving a non-destructive route to every complete historical RNL1 record.
+Goal: establish predictable memory use across current-format recovery, indexing, reads, responses, and concurrent delivery.
 
-Rationale: [ADR 0039](decisions/0039-rnl1-write-admission-and-legacy-read-compatibility.md) caps new local RNL1 writes at the existing 128-byte key and 64 MiB payload limits while keeping the current complete-record read behavior. Those write limits do not bound old RNL1 keys and payloads, retained key bytes, response copies, or concurrent operations.
+Rationale: the local log now has one RNL3 v2 format with bounded key, payload, and identity fields. Those per-record bounds do not cap retained identity indexes, response copies, or multiple concurrent reads. Historical RNL1/RNL2 compatibility is not a product requirement and has been removed under [ADR 0039](decisions/0039-rnl1-write-admission-and-legacy-read-compatibility.md).
 
-Current progress: local RNL1 scalar and batch writes enforce the selected per-field limits before frame output and return `invalid_record` with rejected semantics. Rejected-only batches do not wake delivery waiters, and tests preserve complete historical records above the write limits. Historical recovery and delivery materialization, bounded inspection/export, response-size refusal, and aggregate concurrent memory budgets remain unimplemented.
+Current progress: every local record uses the checksummed RNL3 v2 frame. Recovery rejects old formats before mutating incomplete tails, and focused tests cover bounded parsing, request-ID recovery, checksums, and crash-tail repair. Aggregate memory accounting and resource-scoped workload evidence remain open.
 
 Constraints:
 
-- keep new-write admission separate from complete historical record eligibility;
-- do not truncate, skip, compact, acknowledge, or dead-letter a complete record because it exceeds a future read or materialization budget;
-- before a lower read ceiling can block normal startup or delivery, provide a read-only bounded-memory inventory/export route that preserves stream identity, offset, timestamp, key bytes, and payload bytes, including records that do not fit RNL2/RNL3;
-- startup refusal for a complete out-of-policy record must be explicit and happen before any stream's incomplete-tail repair can mutate the store;
-- preserve poll, replay, redelivery, acknowledgement, and dead-letter ordering while accounting for aggregate in-flight work.
+- preserve at-least-once delivery, request-ID replay behavior, checksum validation, and incomplete-tail recovery;
+- account for recovery/index storage, per-operation payload and response buffers, and concurrent operations;
+- do not maintain old-format readers, conversion selectors, or inspection/export routes solely for compatibility.
 
 Acceptance criteria:
 
-- recovery scratch memory, retained key/index bytes, per-operation message materialization, response serialization, and aggregate concurrent bytes have explicit, verifiable budgets or streaming behavior;
-- a read-only inspector/export can identify and retrieve complete records beyond any normal broker read ceiling without mutating source logs or requiring conversion into a narrower format;
-- any normal startup or delivery refusal names the affected stream, logical offset, declared field sizes, and relevant budget, is distinct from corruption and incomplete-tail handling, and leaves source files and consumer state unchanged;
-- complete records at each accepted boundary remain readable and malformed complete records still fail closed; incomplete suffix repair only changes the actual incomplete suffix;
-- tests cover startup across multiple streams, sparse replay, poll/redelivery, response-size handling, dead-letter source progress, and restart after refusal or export;
-- resource-scoped recovery, replay, response, and concurrent-delivery measurements demonstrate that the documented budgets hold for stated workloads.
+- memory costs for recovery, retained indexes, identity maps, payload reads, response encoding, and concurrent operations are measured and budgeted for stated workloads;
+- resource-scoped evidence demonstrates the documented budget at supported concurrency;
+- tests retain coverage for accepted record boundaries, malformed complete frames, checksum failure, and recovery after incomplete final writes.
 
 ### Make retention and disk-pressure behavior safe
 
@@ -406,7 +401,7 @@ Goal: reduce storage, network, and CPU overhead with efficient message represent
 
 Rationale: small messages and long-lived streams make framing, copying, encoding, and compression costs significant parts of Runnel's performance and storage profile.
 
-Current progress: the provisional protocol and reusable client support validated binary-safe payloads through padded base64 while retaining the legacy text path. Current review confirms that peer commands and clustered persistence encode payload `Vec<u8>` values as JSON integer arrays, local `RNL1`/`RNL2`/`RNL3` records remain uncompressed, and public/peer codecs are not negotiated. The [message encoding and compression study](research/message-encoding-and-compression.md) compares compression placement across client batches, public and peer frames, retained blocks, and separate Raft/state-machine artifacts; the [day-one plan](design/encoding-compression-day1-plan.md) keeps the candidate frame and codec work exploratory. Version negotiation, mixed-format recovery, compression, and representative resource measurements remain open.
+Current progress: the provisional protocol and reusable client support validated binary-safe payloads through padded base64 while retaining the legacy text path. Current review confirms that peer commands and clustered persistence encode payload `Vec<u8>` values as JSON integer arrays, local RNL3 version-2 records remain uncompressed, and public/peer codecs are not negotiated. The [message encoding and compression study](research/message-encoding-and-compression.md) compares compression placement across client batches, public and peer frames, retained blocks, and separate Raft/state-machine artifacts; the [day-one plan](design/encoding-compression-day1-plan.md) keeps the candidate frame and codec work exploratory. Version negotiation, compression, and representative resource measurements remain open.
 
 Constraints:
 

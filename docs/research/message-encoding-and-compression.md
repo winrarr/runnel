@@ -1,12 +1,12 @@
 # Message encoding and compression study
 
-- Status: research-backed exploratory study; not an accepted compatibility decision
+- Status: research-backed study; the local stream format is accepted separately by ADR 0039
 - Last reviewed: 2026-10-05
 - Baseline inspected: `db86fd2793f4904712a11314a21e149abdcf1897`
 - Evidence class: research/design
 - Scope: public request/response payloads, retained message records, and the
   clustered peer transport
-- Current evidence: [protocol compatibility design](../design/protocol-compatibility.md),
+- Current evidence: [ADR 0039](../decisions/0039-rnl1-write-admission-and-legacy-read-compatibility.md), [protocol compatibility design](../design/protocol-compatibility.md),
   [storage compatibility evidence](../design/td-007-storage-compatibility-evidence.md),
   [clustered outcome contract](../design/clustered-outcome-contract.md), and
   [distributed architecture exploration](distributed-architecture-options.md)
@@ -22,9 +22,9 @@
 
 This document records the evidence and hypotheses behind the backlog outcome
 [Make message encoding and compression evolvable](../backlog.md#make-message-encoding-and-compression-evolvable).
-It does not change the current wire or storage format. The exact compatibility
-policy, format bytes, and default codec require a future ADR after the focused
-tests and measurements described here.
+It does not change the public wire or codec. ADR 0039 already selects the
+local RNL3 v2 format and refuses obsolete local frames; future schema and
+compression choices still require focused design, tests, and measurements.
 
 ## Decision summary
 
@@ -36,11 +36,10 @@ evolvable encoding/compression contract:
   base64 `PublishBytes`, `PublishBatch`, `MessageBytes`, and replay variants.
   Publish batches are bounded and return ordered per-record outcomes; they do
   not imply atomicity.
-- Local stream files are one `.log` file per stream. The reader dispatches
-  between legacy `RNL1`, checksummed uncompressed `RNL2`, and request-aware
-  checksummed `RNL3` frames. `RNL2` has encoding and compression fields, but
-  only `bytes` plus `none` are currently accepted. `RNL3` carries request
-  identity but has no compression metadata.
+- Local retained records use one checksummed RNL3 version-2 frame, including
+  ordinary records without an identity. Its typed identity flag and bounded
+  key, payload, and identity fields are part of the accepted local format.
+  RNL1, RNL2, and RNL3 version 1 are refused before recovery mutation.
 - Cluster peer RPCs remain a custom big-endian `u32` length prefix around JSON,
   capped at 64 MiB, with no protocol preface or codec negotiation. Snapshot
   transfer is configured as 64 KiB chunks over that outer frame. A peer frame
@@ -59,13 +58,11 @@ evolvable encoding/compression contract:
   accepts a future segmented retained-data boundary without choosing that
   segment's schema, compression, or whether its bytes are shared with Raft.
 
-The bounded next step is an opt-in, uncompressed, Runnel-owned durable-frame
-contract with golden fixtures and real restart/corruption tests. It should
-preserve all current readers and public behavior, establish length/checksum
-and recovery semantics, and measure the uncompressed framing cost. Only then
-should bounded LZ4 and Zstandard experiments be added, followed by a separate
-peer-transport negotiation design. No source supports claiming that one codec
-or schema will win across Runnel's workloads.
+The accepted local storage boundary is RNL3 version 2 for all records,
+as selected by ADR 0039. Further compression or encoding work must name
+the transformed boundary, use explicit frame/version semantics, preserve
+current durability and message behavior, and establish bounded recovery.
+No old local reader or mixed-format recovery path is a requirement.
 
 ## How to read this document
 
@@ -98,10 +95,8 @@ and [state-machine snapshots and checkpoints](../../crates/runnel-raft/src/state
 |---|---|---|
 | Public client protocol | Serde-tagged JSON requests and responses are exchanged as one line per request. Incoming request bytes must be UTF-8. The protocol crate, reusable client, and server expose the same source-level `runnel-json-lines` v1 support declaration, but the listener does not advertise or negotiate it at runtime. The configured request-frame limit is bounded above by 64 MiB and includes the JSON/base64 representation, not just decoded payload bytes. The client separately bounds response buffering with its local `max_response_bytes` setting; the server does not negotiate or enforce that client-side value. | No public binary protocol, runtime version negotiation, compatibility range, or stable wire schema exists. A base64 request can consume substantially more wire space than its logical payload, and v1 does not expose an authoritative operation stage/outcome on errors. |
 | Public payloads | `Publish` accepts a UTF-8 `String`. `PublishBytes` and `PublishBatch` carry `BinaryPayload`, which is standard padded base64 in JSON and decodes to `Vec<u8>`. Responses choose the readable UTF-8 variant or an explicit base64 variant without changing logical bytes. Publish batches are capped at 1,024 records and preserve input order with one outcome per record; a batch is not atomic. | The current JSON path is a development representation, not a compact binary contract. The optional ordering key remains an application-visible UTF-8 string; changing key semantics to arbitrary bytes would be a separate decision. A future envelope must preserve per-record outcomes and the distinction between confirmed, rejected, retryable, and unknown work. |
-| Legacy local records | `RNL1` is a 28-byte little-endian header containing magic, offset, timestamp, key length, and payload length, followed by UTF-8 key bytes and raw payload bytes. It has no checksum, compression identifier, or format-version field. | A complete `RNL1` record does not provide corruption detection. Its lengths are bounded by file availability and integer arithmetic, but not by the versioned storage limits. |
-| Versioned local records | `RNL2` version 1 is a 44-byte little-endian frame with flags, header length, stored/logical body lengths, offset, timestamp, key length, encoding `bytes`, compression `none`, reserved fields, and CRC-32C. Its reader rejects compressed records and requires the exact 44-byte header. | The versioned fields are an experimental boundary, not an evolvable contract: there is no accepted field-width/reserved-bit policy, segment generation, migration selector, or rolling-writer gate. |
-| Request-aware local records | `RNL3` version 1 is a 48-byte little-endian frame with request-ID length and CRC-32C. It is used for public request identities and local dead-letter move identities; request IDs are bounded at 1 KiB, and the request-aware key/body limits are 128 bytes/64 MiB. | `RNL3` has no encoding or compression identifiers. A future compressed request-aware record needs an explicit compatible version/family; reusing reserved bytes without a decision would make request deduplication and recovery ambiguous. |
-| Local recovery | `StreamLog::open` scans complete frames, dispatches by magic, and truncates an incomplete suffix. A complete unsupported magic, invalid key encoding, impossible versioned field, or checksum mismatch fails recovery. Normal server startup selects `RNL1` for ordinary appends; request-aware appends use `RNL3` under that same default, while `VersionedV1` is an explicit core configuration/test path. | The one-file layout can contain different recognized frame families, but there is no cross-release mixed-writer guarantee, generation manifest, writer fence, or conversion/rollback procedure. Current read-forward behavior is useful evidence, not a release compatibility promise. |
+| Local stream records | Every record uses the checksummed RNL3 version-2 frame. The 48-byte header carries the version, typed identity flag, offsets, timestamp, bounded lengths, and CRC-32C; keys are capped at 128 bytes, payloads at 64 MiB, and identity strings at 1 KiB. | Compression and codec negotiation are not implemented. RNL1, RNL2, and RNL3 version 1 are refused before incomplete-tail repair; no backward-read promise exists. |
+| Local recovery | Startup scans every stream using the RNL3 v2 reader before truncating any incomplete final suffix. Complete malformed records, unsupported versions/flags, offset gaps, and checksum failures fail recovery. | Per-record bounds do not establish aggregate memory use for retained identities, payload reads, responses, or concurrent operations; see [TD-028](../tech-debt.md#td-028-aggregate-local-record-materialization-lacks-a-memory-budget). |
 | Peer transport | Peer requests and responses use a persistent or pooled TCP connection with a big-endian `u32` body length and JSON body. The outer frame cap is 64 MiB, and the OpenRaft snapshot policy limits individual chunks to 64 KiB. `PeerRequest` covers Raft control RPCs, forwarding, and data-group setup; snapshot chunks travel through the same outer framing. `serde_json` serializes command `Vec<u8>` values as JSON integer arrays. | There is no connection preface, version/capability handshake, codec negotiation, or rule preventing a new writer from sending a body an older peer cannot interpret. Inbound code checks the declared JSON length before resizing its frame buffer; outbound code materializes the serialized frame before checking the 64 MiB cap, so the cap is not a pre-serialization allocation bound. Snapshot chunking is not resumable format migration. |
 | Clustered persistence | The Raft log, state-machine journal, checkpoints, and snapshots have separate JSON formats and version/recovery rules. `Command::Publish` carries payload as `Vec<u8>`, which JSON encodes as integer arrays in Raft entries and journal records. The journal uses a little-endian `u32` length plus JSON, caps each record at 64 MiB, reads the journal file during recovery, truncates a partial final record, and is synced before state-machine application. The Raft log, checkpoints, and snapshots use their own atomic replacement paths; snapshots still materialize complete retained state. | Compressing or changing the retained-message frame alone cannot reduce these separately serialized Raft, journal, checkpoint, snapshot, or peer representations. Any candidate must name which file/network boundary it transforms and separately bound its encoded and decoded size. Each artifact needs its own version, failure, recovery, and migration gate. |
 
@@ -143,10 +138,10 @@ current implementation already satisfies them.
    torn suffix when the format can prove that it is incomplete. A complete
    frame with a bad checksum, impossible length, unknown required feature, or
    invalid text field must not be silently skipped.
-6. **Upgrade safety:** old data must remain readable for the documented
-   compatibility window. New writers need an explicit capability/fencing gate;
-   parsing one new frame successfully is not proof that old writers can append
-   beside it or that rollback is safe.
+6. **Format changes:** Runnel has no backward-compatibility requirement.
+   A new local format may replace the current one after an explicit
+   decision and focused recovery evidence; do not retain readers only
+   to keep obsolete local artifacts readable.
 7. **Client reach:** a future binary schema must have maintained
    implementations for the languages Runnel intends to support. A generated
    schema dependency is acceptable only if its toolchain, field policy, and
@@ -365,71 +360,22 @@ advertised the codec and limits; a wire choice must not force a replica to
 persist bytes it cannot recover. The Raft/state-machine journal and snapshot
 formats remain independently versioned.
 
-### Durable records and mixed-format recovery
+### Durable records and current-format changes
 
-The current reader's `RNL1`/`RNL2`/`RNL3` dispatch is a useful compatibility
-fixture. It is not enough to promise rolling upgrades because the current
-one-file writer has no generation selector or old-writer fence. The safer
-future migration shape is format-tagged immutable segments with a small
-validated generation/manifest selector:
+RNL3 version 2 is the only current local stream format. It stores ordinary
+records and typed public/dead-letter identities in one checksummed frame
+family. RNL1, RNL2, and RNL3 version 1 are rejected before recovery can
+truncate an incomplete suffix. There is no legacy reader, writer selector,
+or audit/export route to maintain.
 
-- retain old segments and keep their readers;
-- write the new format only to a new segment family after an explicit writer
-  capability gate;
-- validate complete frames before exposing records;
-- convert/compact only through a temporary validated output and an atomic
-  selector update; and
-- define what an old binary does when the active generation contains a frame
-  it cannot read: fail closed or use a tested fallback, never appear empty.
-
-If a single file eventually mixes frames, every supported writer and recovery
-path must recognize every permitted magic/version and prove that an old
-writer cannot truncate an unknown suffix. Segment boundaries make that proof
-and rollback boundary easier. The storage-upgrade proposals provide the
-broader generation, fence, and rollback context: [policy](../design/storage-upgrade-policy.md)
-and [safety plan](../design/storage-upgrade-safety-plan.md).
-
-### Recovery and corruption rules
-
-Before allocating key, body, batch, or decompression buffers, validate all
-lengths and limits. Codec checksums and the Runnel frame checksum protect
-different byte ranges: LZ4's optional block checksum hashes compressed block
-bytes, while its optional content checksum hashes decoded frame content;
-Zstandard's optional 32-bit content checksum stores the low 32 bits of an
-XXH64 digest over decoded content. Kafka's record-batch CRC-32C covers batch
-bytes after the CRC field ([LZ4 frame specification](https://github.com/lz4/lz4/blob/dev/doc/lz4_Frame_format.md),
-[RFC 8878](https://www.rfc-editor.org/rfc/rfc8878.html), and [Kafka record-batch
-format](https://kafka.apache.org/43/implementation/message-format/)). These
-are accidental-corruption checks, not authentication, and codec-level
-checksums may be absent. A Runnel durable frame should therefore checksum its
-own version/codec/length metadata and stored bytes, with an explicitly defined
-coverage rule, even if the codec checksum is also enabled.
-
-For a durable block, validate the descriptor before choosing or invoking a
-decoder. In particular, separately bound stored bytes, encoded envelope
-bytes, decoded logical bytes, record count, codec window/block size, and
-dictionary ID. Zstandard's format can represent windows far larger than a
-broker should accept; RFC 9659's 8 MiB requirement is specific to HTTP content
-coding. Do not use a codec's frame content-size field as the only allocation
-bound, and reject unknown required flags, codecs, or dictionaries before
-allocating from their lengths. Then:
-
-- a short final header/body that can only be a torn append may be truncated to
-  the last complete frame and synchronized;
-- a complete frame with a bad checksum, impossible length, unknown required
-  version/codec/dictionary, invalid text field, or decompression expansion
-  beyond policy must fail recovery and surface corruption/unsupported format;
-- a frame must not be silently skipped merely because its payload is
-  unreadable; and
-- a bad snapshot or journal record must follow its consensus recovery boundary,
-  not be treated as a retained-message record.
-
-The acceptance tests need bit flips in header, key, request ID, and stored
-body; truncated compressed blocks; oversized stored/logical/window lengths;
-unknown IDs and flags; a crash at the write/sync boundary; and restart with
-both old and new records. CRC-32C is suitable for accidental-corruption
-coverage if retained, but it does not provide authenticity or malicious-input
-protection by itself.
+A future local codec change should use an explicit frame version or family
+and define field limits, checksum coverage, bounded decoding, crash-tail
+recovery, and non-mutating refusal behavior. It must preserve current
+logical offsets, request-ID semantics, and acknowledgement ordering. This
+does not require old local frames to remain readable. Segment layout,
+retention, and local-to-cluster migration have separate design records:
+[storage upgrade policy](../design/storage-upgrade-policy.md) and
+[safety plan](../design/storage-upgrade-safety-plan.md).
 
 ## Research hypotheses for Runnel
 
@@ -492,8 +438,8 @@ An ADR should not be proposed as accepted until evidence also covers:
 - golden cross-version fixtures and interoperability in at least the intended
   client languages;
 - bounded decoding/decompression and fuzz/fault-injection behavior;
-- old/new readers, writer fencing, mixed-format restart, retention, and
-  rollback boundaries;
+- current-format restart, explicit refusal of obsolete local frames, retention, and
+  conversion boundaries;
 - per-record offsets, acknowledgements, redelivery, request identity, and
   dead-letter behavior through compressed blocks;
 - peer handshake, unsupported capability, reconnect, snapshot, and leader/
@@ -503,21 +449,18 @@ An ADR should not be proposed as accepted until evidence also covers:
 
 ## Bounded next-step recommendation
 
-1. **Freeze the existing boundary with fixtures.** Capture representative
-   `RNL1`, `RNL2`, and `RNL3` bytes, public text/base64 requests and responses,
+1. **Freeze the current boundary with fixtures.** Capture representative
+   RNL3 version-2 records, public text/base64 requests and responses,
    peer JSON frames, and journal tails. Add malformed, truncated, and checksum
    failure vectors to the focused test plan without changing defaults.
-2. **Choose one candidate durable-frame family in a future ADR.** Reuse the
-   current `RNL2`/`RNL3` work only if their exact-header and request-identity
-   limitations are intentionally addressed; otherwise define a new
-   format-tagged segment family. Specify integer widths, endian convention,
-   lengths, limits, checksum coverage, record/block index, reserved values,
-   and writer/reader activation before implementation.
-3. **Implement and test only the uncompressed durable candidate first.** Keep
-   the JSON/base64 public path, default `RNL1` writes, current recognized
-   readers, peer JSON framing, Raft journal, and snapshots unchanged. Make the
-   candidate opt-in and test opaque bytes, offset/replay/ack semantics, torn
-   suffixes, complete corruption, restart, and bounded allocation.
+2. **Choose a bounded encoding extension in a future ADR.** Extend the current
+   RNL3 frame or define a new frame family explicitly. Specify integer widths,
+   endian convention, lengths, limits, checksum coverage, record/block index,
+   reserved values, and writer/reader activation before implementation.
+3. **Implement and test the uncompressed durable candidate first.** Keep
+   the JSON/base64 public path, current RNL3 v2 behavior, peer JSON framing,
+   Raft journal, and snapshots unchanged. Test opaque bytes, offset/replay/ack
+   semantics, torn suffixes, complete corruption, restart, and bounded allocation.
 4. **Measure each representation and placement separately.** Compare the
    current JSON/base64 and peer JSON byte-array sizes with an uncompressed
    binary-envelope candidate before attributing any reduction to compression.
@@ -542,9 +485,9 @@ schema generation, compression policy, or rolling cluster upgrades.
   client, or should CBOR be the public compatibility bridge?
 - Which fields belong in the schema body versus the Runnel-owned outer frame,
   and does a durable block index provide sufficient offset-to-record lookup?
-- Should `RNL2`/`RNL3` be extended under a formally versioned contract or
-  retired behind a new segment family? How are current one-file logs selected,
-  migrated, and rolled back?
+- Should the current RNL3 v2 frame be extended under a formally versioned
+  contract or replaced by a new segment family? How should a future local
+  layout be selected and activated?
 - What are the maximum stored body, encoded envelope, logical payload,
   decompressed block, record count, and batch wait values at each boundary?
 - Does the public binary path need one negotiated schema for requests,

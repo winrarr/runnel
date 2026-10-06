@@ -28,14 +28,12 @@ implementation. Keeping one offset value per identity avoids increasing the
 per-ID value size; the second map has a fixed per-stream header plus separate
 capacity slack, and a cross-kind collision stores the text in both buckets.
 
-Advance the request-aware `RNL3` frame version to version 2. Keep its current
-header layout and use the flags byte to identify the variant: zero for a public
-request ID and one for a local dead-letter move. Reject unknown versions or
-flag values as malformed records. The existing checksum covers the version
-and flags. Version 1 continues to require zero flags; recovery places its IDs
-in the public-ID bucket as a compatibility lookup policy, not proof of public
-provenance. RNL1 and RNL2 records remain unchanged; new code reads mixed
-RNL1, RNL2, and RNL3 version-1/version-2 histories.
+Use the RNL3 version-2 flags byte to identify the record variant: zero for
+a public request ID, one for a local dead-letter move, and two for an ordinary
+record with no identity. The checksum covers the version, flags, metadata,
+key, identity bytes, and payload. Reject unknown versions or flag values.
+RNL3 version 1 and the former RNL1/RNL2 formats are unsupported under
+[ADR 0039](0039-rnl1-write-admission-and-legacy-read-compatibility.md).
 
 Public publishes look up only `PublicRequestId`. The typed lookup separation
 does not determine content-equivalence behavior for a reused public ID. ADR
@@ -55,32 +53,18 @@ whether its content matches or differs, remains a separate public record; the
 broker appends the internal move and advances source progress only after that
 append is durable.
 
-During recovery, index every existing RNL3 version-1 ID in the
-`PublicRequestId` bucket. This is a compatibility lookup policy, not a claim
-about provenance: the old frame has no trustworthy identity kind, and neither
-its prefix nor content can establish origin. Historical internal move records
-therefore remain addressable through the public-ID bucket, as they were under
-the former shared namespace. Version-2-and-later move lookup does not consult
-that bucket. If an old move's target append is present but its source
-acknowledgement is not durable at upgrade, a retry may append one new typed
-move before advancing source progress. This possible duplicate at the upgrade
-boundary is accepted to preserve at-least-once progress without allowing an
-ambiguous legacy record to stand in for a new typed move. Once a typed move
-exists, repeated retry/reopen reconciles that move and does not append another
-record.
+Recovery indexes current public and move identities in separate buckets;
+ordinary records have no identity entry. The current reader accepts only
+RNL3 version 2, so it never has to infer the type of an older ambiguous ID.
+Within the current format, a durable move append can be reconciled after
+restart before source progress advances, preserving the append-then-ack
+ordering.
 
-This is a forward-read storage change, not a public wire change. The current
-version-1 reader rejects every other RNL3 frame version as invalid data; an
-older binary therefore fails closed on a version-2 frame. Downgrade after the
-first version-2 append is unsupported. No conversion of old frames is required
-or attempted: new code reads the existing RNL1/RNL2/RNL3 version-1 history and
-the new version-2 records. This is a deliberate one-way boundary for the
-current provisional storage format. ADR 0001 already leaves long-lived format
-compatibility undefined, and TD-007 tracks the broader storage compatibility
-policy; this local identity fix does not claim a general upgrade or rollback
-path. This decision does not alter the clustered engine, whose current derived
-record and source progress remain in one replicated data-group transition
-under ADR 0016.
+The typed identity variants are part of the canonical local RNL3 version-2
+format selected by ADR 0039. Older local frame families are refused, and no
+downgrade or historical conversion path is promised. This decision does not
+alter the clustered engine, whose current derived record and source progress
+remain in one replicated data-group transition under ADR 0016.
 
 ## Rationale and alternatives
 
@@ -121,9 +105,6 @@ claim.
   content-equivalence behavior is governed by ADR 0034, and both local and
   clustered runtime paths apply its exact-retry and changed-content rejection
   contract.
-- One extra dead-letter record may be appended for an interrupted move from
-  pre-upgrade RNL3 data; new typed retries remain duplicate-safe under the
-  existing append-then-checkpoint ordering.
 - The two local identity buckets may contain the same text; combined index
   cardinality remains unbounded and retention is not defined by this change.
 - Stream name, consumer name, and offset remain the move key while the current
@@ -135,22 +116,14 @@ claim.
 
 Core and real-server tests cover same-content and mismatching public
 collisions; separate public and internal target offsets and contents; public
-request replay after restart; source acknowledgement failure followed by
-reopen/retry without a second typed move; and legacy RNL3 version-1 recovery,
-including the permitted upgrade-boundary duplicate. The earlier core tests
-that asserted first-use-wins are now changed to exercise ADR 0034's exact
-retry and conflict behavior; shared engine and clustered real-process
-coverage is recorded in the linked request-ID research. Version-1 IDs are
-indexed in the public-ID bucket as a compatibility lookup policy, not as proof
-of public provenance. Historical internal moves remain addressable through
-that bucket as under the former shared namespace, but cannot satisfy a
-version-2 typed move lookup. An interrupted legacy move may therefore append
-one typed move before source progress advances. Parser tests cover valid mixed
-versions, unsupported versions or identity flags failing closed, and
-incomplete tails. The baseline reader's version-1-only guard establishes that
-it rejects a newly written version-2 frame; the test suite separately verifies
-that the new reader does not accept unknown versions or flags. The existing
-target-write, source-event, and restart tests support at-least-once ordering.
+request replay after restart; and source acknowledgement failure followed by
+reopen/retry without a second typed move. The earlier core tests that asserted
+first-use-wins exercise ADR 0034's exact retry and conflict behavior; shared
+engine and clustered real-process coverage is recorded in the linked
+request-ID research. Parser tests cover ordinary records, both typed identity
+flags, unsupported versions or flags failing closed, checksum validation, and
+incomplete tails. The target-write, source-event, and restart tests support
+at-least-once ordering. ADR 0039 owns the current local frame-version policy.
 ADR 0034 owns cross-engine public request-ID mismatch semantics. The current
 local and clustered runtime behavior and focused verification are recorded in
 the linked request-ID research; this ADR's evidence remains specific to local

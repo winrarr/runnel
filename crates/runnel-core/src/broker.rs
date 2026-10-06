@@ -27,8 +27,8 @@ use super::delivery_state::{DeliveryState, DeliveryTokenGenerator, InFlight};
 use super::storage::StorageExecutor;
 use super::stream_log::{RecordIndex, StreamLog};
 use super::{
-    AckResult, BrokerConfig, DEAD_LETTER_HASH_PREFIX, DEAD_LETTER_SUFFIX, DurableFormat,
-    HealthSnapshot, dead_letter_move_id, dead_letter_stream_name, stream_path, validate_name,
+    AckResult, BrokerConfig, DEAD_LETTER_HASH_PREFIX, DEAD_LETTER_SUFFIX, HealthSnapshot,
+    dead_letter_move_id, dead_letter_stream_name, stream_path, validate_name,
 };
 
 #[derive(Clone)]
@@ -38,7 +38,6 @@ pub struct Broker {
 
 pub(super) struct BrokerState {
     pub(super) root: PathBuf,
-    pub(super) durable_format: DurableFormat,
     pub(super) streams: RwLock<HashMap<String, Arc<Mutex<StreamState>>>>,
     pub(super) ack_timeout: Duration,
     pub(super) max_delivery_attempts: Option<u32>,
@@ -135,11 +134,7 @@ struct PendingDelivery {
 }
 
 impl BrokerState {
-    fn open(
-        root: impl AsRef<Path>,
-        config: BrokerConfig,
-        durable_format: DurableFormat,
-    ) -> Result<Self, BrokerError> {
+    fn open(root: impl AsRef<Path>, config: BrokerConfig) -> Result<Self, BrokerError> {
         if config.max_delivery_attempts == Some(0) {
             return Err(BrokerError::Configuration(
                 "max delivery attempts must be greater than zero".to_owned(),
@@ -151,7 +146,7 @@ impl BrokerState {
         fs::create_dir_all(&streams_dir)?;
         fs::create_dir_all(&consumers_dir)?;
 
-        let mut streams = HashMap::new();
+        let mut recovered_streams = Vec::new();
         for entry in fs::read_dir(&streams_dir)? {
             let entry = entry?;
             let path = entry.path();
@@ -163,13 +158,20 @@ impl BrokerState {
                 continue;
             };
             validate_name("stream", name)?;
-            let log = StreamLog::open(&path, durable_format)?;
-            streams.insert(name.to_owned(), Arc::new(Mutex::new(StreamState::new(log))));
+            let (log, incomplete_tail) = StreamLog::inspect(&path)?;
+            recovered_streams.push((name.to_owned(), log, incomplete_tail));
+        }
+
+        // Validate every stream before truncating any incomplete tail. An unsupported old
+        // format in a later file must not leave earlier stream files partially recovered.
+        let mut streams = HashMap::with_capacity(recovered_streams.len());
+        for (name, mut log, incomplete_tail) in recovered_streams {
+            log.finish_recovery(incomplete_tail)?;
+            streams.insert(name, Arc::new(Mutex::new(StreamState::new(log))));
         }
 
         Ok(Self {
             root,
-            durable_format,
             streams: RwLock::new(streams),
             ack_timeout: config.ack_timeout,
             max_delivery_attempts: config.max_delivery_attempts,
@@ -193,16 +195,8 @@ impl BrokerState {
 
 impl Broker {
     pub fn open(root: impl AsRef<Path>, config: BrokerConfig) -> Result<Self, BrokerError> {
-        Self::open_with_format(root, config, DurableFormat::Rnl1)
-    }
-
-    pub fn open_with_format(
-        root: impl AsRef<Path>,
-        config: BrokerConfig,
-        durable_format: DurableFormat,
-    ) -> Result<Self, BrokerError> {
         Ok(Self {
-            inner: Arc::new(BrokerState::open(root, config, durable_format)?),
+            inner: Arc::new(BrokerState::open(root, config)?),
         })
     }
 
@@ -220,7 +214,7 @@ impl Broker {
         }
 
         let path = stream_path(&self.inner.root, stream);
-        let log = StreamLog::create(&path, self.inner.durable_format)?;
+        let log = StreamLog::create(&path)?;
         streams.insert(
             stream.to_owned(),
             Arc::new(Mutex::new(StreamState::new(log))),
@@ -1188,7 +1182,7 @@ impl Broker {
             return Ok(Arc::clone(stream_state));
         }
         let path = stream_path(&self.inner.root, stream);
-        let log = StreamLog::create(&path, self.inner.durable_format)?;
+        let log = StreamLog::create(&path)?;
         let stream_state = Arc::new(Mutex::new(StreamState::new(log)));
         streams.insert(stream.to_owned(), Arc::clone(&stream_state));
         Ok(stream_state)
