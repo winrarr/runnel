@@ -1,6 +1,6 @@
 # Worker assignment and pull request handoff
 
-This checklist covers delegated tasks. Follow the repository root `AGENTS.md` and [`SKILL.md`](SKILL.md), which own shared engineering and parallel-worktree policy. Confirm the assignment's owner, scope, baseline, and acceptance criteria. Ask only when a missing detail materially changes the work; otherwise state a safe assumption and proceed.
+This checklist covers delegated tasks. Follow the repository root `AGENTS.md` and [`SKILL.md`](SKILL.md), which own shared engineering and parallel-worktree policy. Confirm the assignment's owner, scope, baseline, and acceptance criteria. When behavior or architecture is unsettled, investigate viable options and choose and recommend the one best supported by project goals and evidence; do not treat the absence of an accepted ADR as a stop condition. Ask the coordinator for a second opinion only when a material owner-level trade-off remains unresolved or the task's authorization is insufficient. Otherwise state assumptions, record the rationale and residual risks, and proceed.
 
 ## Before editing
 
