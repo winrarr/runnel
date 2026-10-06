@@ -2,11 +2,13 @@
 
 - Status: proposed
 - Date: 2026-10-05
+- Revalidated against baseline: `8fae2d1f81da9146a26cfb20d190214eab370a71`
 - Primary evidence class: design/research
 
 ## Context
 
-The current local and clustered engines return one delivery per poll. A member
+At the revalidation baseline, the current local and clustered engines return
+one delivery per poll. A member
 has one in-flight delivery, every grouped delivery has a lease and receipt
 fence, same-key records do not overlap within a shared consumer, and
 acknowledgements may advance out of order. Local attempt and acknowledged state
@@ -69,7 +71,10 @@ acknowledgements under the following contract:
   retry resolves committed offsets as already confirmed and leaves stale or
   unapplied receipts with their applicable result. Only failures proven to
   precede application are retryable; timeouts, disconnects, and generic
-  post-submission failures are unknown.
+  post-submission failures are unknown. [ADR 0026](0026-semantic-engine-error-classification.md)
+  classifies error kinds and safe retry outcomes but does not identify operation
+  stage, so a runtime needs explicit stage evidence to report a local
+  pre-append failure as retryable; a generic storage error remains unknown.
 - Local assignment and acknowledgement are confirmed only after the
   corresponding consumer-journal sync. If a local append or sync outcome is
   uncertain, the broker must reconcile or reload journal state and align its
@@ -89,9 +94,11 @@ acknowledgements under the following contract:
 - Existing attempt-limit terminal movement remains per offset and follows the
   current engine boundary. It is not an acknowledgement-vector item. Local
   dead-letter movement remains at least once across its separate target-log
-  append and source checkpoint. Clustered dead-letter movement remains in the
-  source data group's replicated transition. Batch assignment does not make
-  local dead-letter movement transactional or strengthen its recovery claim.
+  append and source checkpoint. Its typed move identity is separate from public
+  request IDs under [ADR 0029](0029-local-typed-dead-letter-move-identities.md);
+  that identity distinction does not make the two writes transactional.
+  Clustered dead-letter movement remains in the source data group's replicated
+  transition. Batch assignment does not strengthen either recovery claim.
 - The protocol operation and field names in the linked design are candidates,
   not accepted compatibility promises. The provisional protocol has no
   backward-compatibility requirement. No exactly-once application guarantee,
@@ -194,3 +201,4 @@ Follow [benchmarking policy](../benchmarking.md) for authoritative evidence.
 - [Clustered retry and dead-letter policy, ADR 0016](0016-clustered-retry-and-dead-letter-policy.md)
 - [Semantic engine error classification, ADR 0026](0026-semantic-engine-error-classification.md)
 - [Consumer-scoped retry policy, ADR 0027](0027-consumer-scoped-retry-policy.md)
+- [Local typed dead-letter move identities, ADR 0029](0029-local-typed-dead-letter-move-identities.md)

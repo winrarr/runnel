@@ -1,12 +1,14 @@
 # Consume batches: proposed semantic contract
 
 - Status: proposed for acceptance by [ADR 0030](../decisions/0030-consume-batch-contract.md); runtime API and behavior are not implemented
-- Implementation review baseline: `7a20de5f03f6976c3d411f5bdf5f878824c99fc5`
-- Linked research reviewed at baseline: `7a20de5f03f6976c3d411f5bdf5f878824c99fc5`
+- Implementation review baseline: `8fae2d1f81da9146a26cfb20d190214eab370a71`
+- Linked research reviewed at baseline: `8fae2d1f81da9146a26cfb20d190214eab370a71`
 - Primary evidence class: design/research
 - Related outcome: [Make batching preserve per-record outcomes](../backlog.md#make-batching-preserve-per-record-outcomes)
 - Source study: [Consume-batch semantics](../research/consume-batch-semantics.md)
-- Current shared-consumer decisions: [ADR 0013](../decisions/0013-local-shared-consumer-delivery.md), [ADR 0015](../decisions/0015-clustered-shared-consumer-ownership.md)
+- Current decisions: [ADR 0013](../decisions/0013-local-shared-consumer-delivery.md), [ADR 0015](../decisions/0015-clustered-shared-consumer-ownership.md),
+  [ADR 0026](../decisions/0026-semantic-engine-error-classification.md), [ADR 0027](../decisions/0027-consumer-scoped-retry-policy.md),
+  [ADR 0029](../decisions/0029-local-typed-dead-letter-move-identities.md)
 
 ## Recommendation
 
@@ -160,9 +162,14 @@ it does not change the timeout or attempt limit already pinned to an offset.
 If the scheduler reaches an offset whose attempt limit is exhausted, retain
 the current terminal dead-letter behavior. The move is not a returned batch
 receipt and is not included in the ack-vector atomicity guarantee. Local
-dead-letter movement remains at least once across its separate log and
-consumer-state writes; clustered movement remains within the stream data
-group's replicated transition.
+dead-letter movement remains at least once across its separate target-log
+append and source checkpoint. Under
+[ADR 0029](../decisions/0029-local-typed-dead-letter-move-identities.md), local
+move identities occupy a typed namespace separate from public request IDs; the
+accepted legacy-frame upgrade boundary can still append one additional typed
+move before source progress advances. This does not make the local writes
+transactional. Clustered movement remains within the stream data group's
+replicated transition.
 
 The batch is not a transaction with application work, another consumer, a
 publish, a different ack request, or a downstream database. Mixed batches may
@@ -190,8 +197,9 @@ conflicts with restart recovery. Cluster results must be computed
 deterministically from the committed command and its leader-sampled lease
 time. Local lease expiry uses a monotonic clock; clustered
 expiry uses the replicated lease-clock floor and absolute deadline described
-in [ADR 0015](../decisions/0015-clustered-shared-consumer-ownership.md). At this
-baseline, both engines reject an ack that observes expiry before reassignment;
+in [ADR 0015](../decisions/0015-clustered-shared-consumer-ownership.md). At
+review baseline `8fae2d1f81da9146a26cfb20d190214eab370a71`, both engines reject
+an ack that observes expiry before reassignment;
 the shared-engine contract test exercises that case. The refreshed
 [consume-batch research note](../research/consume-batch-semantics.md) records
 the aligned result and the matching test coverage.
@@ -246,6 +254,12 @@ If the vector was evaluated before the failure, return those per-item statuses
 valid entries); reserve a whole-request error for failures that prevent item
 evaluation. That makes stale-cache handling and complete-event recovery
 explicit acceptance requirements for a future vector path.
+[ADR 0026](../decisions/0026-semantic-engine-error-classification.md) defines
+semantic error kinds and safe retry outcomes, but it does not identify
+whether a specific operation failed before or after its append or submission
+boundary. The implementation must carry that stage evidence to report a
+pre-append failure as `retryable`; if only a generic storage/state/cluster error
+is available, otherwise-valid receipts remain `unknown`.
 
 For the cluster, compute every item result in one committed state-machine
 transition using one observed lease-clock value. A committed transition applies
