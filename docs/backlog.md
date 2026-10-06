@@ -117,11 +117,18 @@ publish/consume/ack flow that redelivers an unacknowledged binary message after
 restart. Protocol, client, and server-facing code now automatically check that
 their provisional v1 version range and UTF-8 text/base64 payload declarations
 remain aligned. A version-negotiated compatibility contract and evidence from
-an intended external application remain open. The source-backed
-[publish request-ID reuse review](research/publish-request-id-content-mismatch.md)
-confirms that both engines currently return the first offset when a retry
-changes key or payload; the clustered mismatch case lacks focused process
-coverage, and the public contract decision remains open.
+an intended external application remain open. [ADR 0034](decisions/0034-publish-request-id-content-contract.md)
+accepts the cross-engine contract: retries with equivalent key bytes and
+payload bytes resolve to the original offset, while changed representable key
+bytes or payload bytes for a retained `(stream, request_id)` are rejected
+without appending a message. For request-ID comparison only, absent and empty
+keys compare as equivalent because the current local durable record cannot
+distinguish them; this does not equate their ordering intent. Runtime
+behavior is still first-use-wins in both engines; the semantic rejection, its
+provisional wire mapping, client guidance, and focused local/batch/cluster
+tests remain unimplemented. The
+[source-backed review](research/publish-request-id-content-mismatch.md)
+records the reference comparison and remaining retention-lifetime question.
 
 ## Make message processing complete
 

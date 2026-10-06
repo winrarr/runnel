@@ -1,142 +1,131 @@
 # Reusing a publish request ID with changed content
 
-- Status: exploratory contract review; no Runnel behavior or public contract decision accepted
-- Last reviewed: 2026-10-05
-- Baseline: `fe511a58c701c4061e8a4642c48265fdfca49883` (merged PR #398)
+- Status: contract accepted in [ADR 0034](../decisions/0034-publish-request-id-content-contract.md); runtime implementation remains open
+- Last reviewed: 2026-10-06
+- Baseline: `ebcf6624809caa784aed7823d69886dc133f8c64`
 - Related outcome: [Make client interactions dependable and evolvable](../backlog.md#make-client-interactions-dependable-and-evolvable)
-- Related decision: [ADR 0004: Use Multi-Raft as the first distributed engine](../decisions/0004-multi-raft-first-distributed-engine.md)
-- Distinct from: [TD-029 public request IDs and dead-letter move identity](td-029-dead-letter-identity-contract.md), which concerns separating caller IDs from internal dead-letter move IDs
+- Related decisions: [ADR 0004](../decisions/0004-multi-raft-first-distributed-engine.md), [ADR 0026](../decisions/0026-semantic-engine-error-classification.md), and [ADR 0029](../decisions/0029-local-typed-dead-letter-move-identities.md)
 
-This review asks what a broker should do when a publish reuses a `request_id`
-for the same stream but changes its key or payload. It verifies the current
-local and clustered behavior, compares two primary product references, and
-records alternatives for a later contract decision. It does not change runtime
-behavior or accept a compatibility promise.
+This note compares the current local and clustered behavior with two
+reference approaches. The accepted Runnel contract is recorded in ADR 0034;
+this note does not change runtime behavior or make a compatibility promise.
 
 ## Current Runnel behavior
 
-**Observed locally:** `Broker::publish_with_request_id` looks up the public ID
-in the stream's request index and returns its stored offset before examining
-the new key or payload. The local index is per stream and is rebuilt from
-request-aware log frames on open. The core test
+**Local engine:** [`Broker::publish_with_request_id`](../../crates/runnel-core/src/broker.rs#L171)
+looks up the public ID in the stream's request index and returns its stored
+offset before comparing the incoming key or payload. The request-aware log
+stores the ID, key bytes, and payload. Its record reader represents a
+zero-byte key as `None`, so it does not distinguish an absent key from
+`Some("")`. The local tests
 [`repeated_request_id_returns_original_offset_without_appending`](../../crates/runnel-core/src/lib.rs#L451)
-publishes `original-key`/`original`, retries the ID with
-`retry-key`/`retry-payload`, and asserts offset `0` plus the original stored
-message. [`request_id_deduplication_survives_restart`](../../crates/runnel-core/src/lib.rs#L551)
-repeats the mismatch after reopening the same log and again gets the original
-offset.
+and [`request_id_deduplication_survives_restart`](../../crates/runnel-core/src/lib.rs#L551)
+assert that even changed key and payload return the original offset, both
+before and after restart.
 
-**Observed in the clustered implementation:** the replicated publish command
-looks up `dedup[stream][request_id]` and returns `Published { offset }` before
-appending the incoming key or payload. The dedup map is part of persisted
-state-machine and snapshot state. The real-process cluster test
-[`three_process_cluster_replicates_and_recovers_after_failures`](../../crates/runnel-server/tests/cluster_smoke.rs#L165)
-retries the same ID from another node with the same content; it demonstrates
-cross-node deduplication, but does not test a changed key or payload. Therefore
-cluster mismatch behavior follows directly from the state-machine code, while
-the corresponding mismatched-content cluster case lacks focused end-to-end
-coverage.
+**Clustered engine:** replicated state maps `dedup[stream][request_id]` to an
+offset and stores each message's key, payload, and generated timestamp in
+stream state. [`Command::Publish`](../../crates/runnel-raft/src/state_machine.rs#L301)
+returns the mapped offset before comparing incoming message fields. The dedup
+map and stream messages are persisted in state-machine and snapshot state.
+The real-process test
+[`three_process_cluster_replicates_and_recovers_after_failures`](../../crates/runnel-server/tests/cluster_smoke.rs#L175)
+retries identical content from another node; it does not exercise a mismatch.
+The mismatch behavior follows from the state-machine branch, but lacks
+focused cluster process coverage.
 
-The ID is scoped to one stream in both implementations. Neither lookup uses a
-time-based duplicate window: the local mapping is recovered from retained log
-records, while clustered state stores the mapping with replicated state. The
-current retained-history slice has no message-retention policy that defines an
-ID expiry boundary. Future retention or deletion work would need to state how
-it interacts with retry identity.
+In both engines, public request IDs are scoped per stream and have no
+time-based window. The current local log and clustered state retain request
+identity with message history; no message-retention policy defines an expiry
+boundary. ADR 0029 separately distinguishes local public IDs from internal
+dead-letter move IDs.
 
 The [client README](../../crates/runnel-client/README.md#run-the-application-example)
-says to treat an ID as unique to one logical publish on its stream and retry
-with the same ID and bytes. [ADR 0004](../decisions/0004-multi-raft-first-distributed-engine.md)
-accepts that a stable ID lets a safe retry return its original offset, but does
-not define how changed publish inputs should be classified. The
-[single-node-to-cluster migration design](../design/single-node-to-cluster-migration.md#local-state)
-records preservation of today's mismatch behavior as a migration constraint;
-it is a design proposal rather than a decision on the public contract. The
-current local code comment calls the behavior intentional for compatibility,
-and the local tests assert it. These are evidence of existing implementation
-intent, not an explanation of the client-facing tradeoff or a cross-engine
-contract decision.
+guides callers to reuse one ID for a logical publish and retry with the same
+bytes. ADR 0004 says a stable ID returns the original offset but leaves changed
+inputs undefined. Existing local tests and a code comment intentionally
+preserve first-use-wins behavior. These are evidence of implementation
+intent, not a prior cross-engine contract decision.
 
 ## Reference behavior
 
-**Stripe API:** Stripe documents that it compares parameters on reuse of an
-idempotency key and errors when they differ. It retains a result for the first
-request after endpoint execution begins; validation failures and concurrent
-execution conflicts are not saved as idempotent results. Keys may be pruned
-after at least 24 hours, after which reuse starts a new request. This makes
-input mismatch visible, but its HTTP operation-result model and expiry policy
-do not establish what Runnel's retained-message identity should be. See
+**Stripe API:** Stripe compares parameters for a reused idempotency key and
+errors if they differ. It saves a result once endpoint execution begins and
+may prune keys after at least 24 hours, after which reuse starts a new
+request. Validation failures and concurrent execution conflicts are not saved
+as idempotent results. This makes changed input visible, but its HTTP
+operation-result boundary and pruning policy do not prescribe Runnel's
+retained-message lifetime. See
 [Stripe's idempotent request contract](https://docs.stripe.com/api/idempotent_requests).
 
-**NATS JetStream:** JetStream documents message-ID-only duplicate detection:
-its example sends the same `Nats-Msg-Id` with different bodies, consults only
-the ID, and retains only the first message. It scopes duplicate recognition to
-a configurable sliding window, with a documented two-minute default in the
-model deep dive. This is closer to a message broker's publish path and to
-Runnel's current first-write-wins behavior, but its finite window differs from
-Runnel's current log-backed mapping. See the official
-[JetStream deduplication description](https://github.com/nats-io/nats.docs/blob/master/using-nats/jetstream/model_deep_dive.md#message-deduplication)
-and [publish header reference](https://github.com/nats-io/nats.docs/blob/master/nats-concepts/jetstream/headers.md#publish).
+**NATS JetStream:** current documentation describes `Nats-Msg-Id` duplicate
+suppression within a stream's duplicate window and acknowledges a duplicate
+with the original sequence. The NATS maintainers' archived model deep dive
+gives a specific example with repeated IDs and different bodies, says the
+implementation consults only the message ID, and documents a two-minute
+default window. This is a closer broker-publish comparison, but its
+configurable sliding window differs from Runnel's current retained mapping.
+See [current JetStream publishing guidance](https://docs.nats.io/learn/jetstream/publishing#avoiding-duplicate-writes),
+and the [archived ID-only example](https://github.com/nats-io/nats.docs/blob/master/using-nats/jetstream/model_deep_dive.md#message-deduplication).
 
-These references show two established choices rather than one universal rule:
-Stripe rejects mismatched operation parameters; JetStream treats the supplied
-message ID itself as the deduplication identity and ignores body differences
-within its window. Neither reference defines a Runnel contract.
+These references demonstrate viable but different policies. They do not
+establish a universal rule or determine Runnel's ID lifetime.
 
-## Runnel-specific assessment
+## Runnel-specific decision and consequences
 
-The current behavior makes an exact retry after a lost response resolve to the
-original offset without adding a second record. It also returns that same
-confirmed offset if an application accidentally reuses an ID for a different
-key or payload. A caller can therefore mistake a successful response for
-acceptance of the new content. This risk is especially relevant to a reusable
-client contract: the client can preserve an ID, but cannot verify from the
-response that the retried input matched the original record.
+ADR 0034 accepts exact-input retries and confirmed rejection for changed
+content while a `(stream, request_id)` mapping remains retained. Comparison
+uses exact decoded payload bytes and key bytes; an absent key and an empty key
+are equivalent because the existing local record format decodes both as zero
+key bytes. This is a request-ID comparison limitation, not a general claim
+that the inputs have the same ordering semantics: `Some("")` can express an
+ordering key and `None` does not. The accepted conflict guarantee applies to
+payload differences and key differences the current local format can
+represent. A future format may preserve the key-presence distinction, but
+that change is not part of this decision. Non-empty keys are compared
+byte-for-byte. The broker-generated timestamp is excluded. Equal retries
+return the original offset; a differing representable key or payload appends
+no message and must surface as a `Rejected` semantic outcome. Exact wire codes
+remain part of the provisional protocol and are not selected by the ADR.
 
-Three plausible contract choices remain:
+This choice prevents a confirmed offset from being mistaken for acceptance of
+different content. It retains exact retry resolution after a lost response
+and applies independently to each record in the ordered publish-batch result.
+It does not make publish batches atomic. Request IDs stay stream-scoped.
+Their lifetime remains tied to retained deduplication state: no TTL or future
+retention policy is accepted. Any retention change must keep enough original
+input to compare a retained identity or remove its message and identity
+coherently.
 
-1. **First use wins, regardless of content.** Keep the current code. Document
-   that the ID denotes the logical publish, that the first accepted record is
-   authoritative, and that callers must retry the exact original inputs. This
-   has a cheap lookup and matches JetStream's identity-only choice. It must
-   also define the ID's lifetime as retention evolves. The main risk is silent
-   suppression of a genuinely new message when an ID is mistakenly reused.
-2. **Reject a mismatched reuse.** Return the original offset for equivalent
-   publish inputs, but return a specific rejection when the key or payload
-   differs. This is aligned with Stripe's mismatch detection and surfaces
-   accidental ID reuse. The contract would need to define equality over all
-   message-affecting fields and how the rejection helps a caller resolve the
-   original ambiguous publish. A local implementation may need to read or
-   fingerprint the original payload; clustered and local engines must preserve
-   the same comparison and error semantics.
-3. **Make content part of the caller's identity.** Require a derived or
-   otherwise content-bound request ID. This can make changed input appear as a
-   different publish, but it moves ID construction and collision handling to
-   clients and does not itself report accidental reuse. It is not implied by
-   the current API.
+No persistent-format conversion is needed for currently retained messages:
+the local request-aware record has the content fields used by the contract,
+with zero-byte keys canonicalized as described above; clustered persisted
+state carries both the offset mapping and message. Old binaries, downgrade,
+and broader upgrade compatibility remain undefined. A local duplicate lookup
+may require reading the original payload, while the clustered engine can
+compare its materialized message. This potential cost has not been measured
+and is not a performance claim.
 
-**Inference / recommendation for a future decision:** the contract should
-explicitly say whether a request ID denotes only an operation identity or an
-operation plus its semantic inputs, and state its stream scope and lifetime.
-Rejecting mismatched key/payload reuse is the clearest way to expose a caller
-bug, while preserving first-use-wins may be preferable if Runnel treats the ID
-as a pure message identity and accepts that a duplicate acknowledgement says
-only “this ID already committed.” The references and current evidence are not
-sufficient to select between those meanings. Keep the intended outcome open
-until the project accepts one with its response and retention consequences.
+## Remaining evidence and planning disposition
 
-## Evidence gaps and disposition
+- Local and clustered engines need shared exact-retry and mismatch tests for
+  representable key-only and payload-only differences, the absent/empty key
+  comparison edge, binary bytes, stream scope, and IDs that survive restart.
+  The tests must keep the distinct ordering-key intent visible.
+- Clustered real-process coverage needs a mismatch through a follower and
+  after leader change or restart. State-machine and snapshot recovery checks
+  must prove the retained message remains available for comparison.
+- Publish-batch tests need duplicate IDs in one ordered batch, mixed exact and
+  conflicting records, per-record rejection, and continued outcomes for
+  independent records. Typed clients need to classify this as a rejected
+  result. Existing timeout and lost-response tests should continue to resolve
+  exact retries to the original offset.
+- Update client documentation to say that retry preserves the original key
+  and payload bytes. Wire vocabulary, storage compatibility, and the ID's
+  lifetime under future retention remain open implementation or planning work.
 
-- Add a real-server clustered test that reuses one ID with a changed key and
-  payload, including after leader change or restart, once the contract is
-  selected. Current local tests cover the mismatch and restart path; current
-  clustered process coverage retries identical content only.
-- If first-use-wins is selected, document that the returned offset identifies
-  the first accepted record even when retry contents differ, and preserve the
-  exact-input retry guidance in supported clients.
-- If mismatch rejection is selected, specify the public error/outcome and
-  compare exact-input enforcement cost and durable index options across both
-  engines before implementation.
-- No runtime change, test, or ADR is warranted by this research-only change.
-  The client-interactions backlog outcome remains open; this note supplies
-  evidence for a later contract decision.
+The client-interactions backlog outcome remains open. Its progress now records
+that the semantic contract is accepted while the old first-use-wins runtime,
+wire mapping, and end-to-end mismatch tests remain unimplemented. No tracker
+item was added: this decision clarifies an existing child outcome rather than
+establishing a separate product outcome or implementation shortcut.
