@@ -46,5 +46,6 @@ Current decisions:
 - 0040-bounded-raft-log-persistence.md: replace retained-map rewrites with bounded append-only Raft-log segments and fixed-size durable control state.
 - 0041-first-consumer-lag-observation.md: accept one bounded, operator-authorized exact-consumer lag diagnostic with a local read cap and a leader-authoritative applied Raft revision.
 - 0042-recoverable-replay-time-index.md: use derived 256-record cumulative prefix-maximum checkpoints for exact timestamp replay and rebuild them from authoritative state.
+- 0043-offline-local-to-cluster-migration.md: accept offline logical export/import from the future supported RNL3-only local release into a fresh static cluster, with durable source fencing and a first-target-write rollback boundary.
 
 Proposed decisions awaiting review: none.
