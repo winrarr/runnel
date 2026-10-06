@@ -357,13 +357,24 @@ request nor substitutes a later record. A read racing a floor advance resolves
 against one authoritative view and returns either the requested record or
 that unavailable-history outcome.
 
-The first contract has no durable replay cursor, session, acknowledgement,
-range/time selector, or retention pin. A successful read-only replay returns
-one record from the history available at its authoritative read point and does
-not promise that the record remains stored. Any later session or multi-record
-replay feature needs a separate decision for its lifecycle and any pinning; it
-must not be inferred from this bounded operation or overload the ordinary
-consumer checkpoint.
+The current runtime has no durable replay cursor, session, acknowledgement,
+range selector, time-selector support, or retention pin. A successful
+read-only offset replay returns one record from the history available at its
+authoritative read point and does not promise that the record remains stored.
+Any later session or multi-record replay feature needs a separate decision for
+its lifecycle and any pinning; it must not be inferred from this bounded
+operation or overload the ordinary consumer checkpoint.
+
+Time-selector semantics are accepted separately in
+[ADR 0038](../decisions/0038-timestamp-based-replay-selector.md): select the
+lowest logical offset whose stored broker publish timestamp is at least the
+requested time, with explicit no-match and deleted-prefix completeness
+outcomes. The selector is not implemented. A bounded lookup index and complete
+deleted-prefix maximum remain implementation gates. Offset reads below the
+retained floor return `history_unavailable`; time selection also returns that
+outcome whenever a deleted prefix could contain an earlier match. Neither
+selector silently replays an incomplete suffix, and time selection does not
+promise a wall-clock boundary from the first retained record.
 
 ### Reserved capacity and storage accounting
 
@@ -558,7 +569,7 @@ normal replacement path, as recorded in [Raft recovery and replacement research]
 | --- | --- | --- |
 | Retention | All complete broker history remains; no automatic time/size deletion. | Unlimited by default; explicit age/size targets are eligibility rules, with a monotonic logical floor and protected durable progress. | Whether cleanup uses segments, extents, or another recoverable representation. |
 | Lagging consumers | Durable contiguous progress and out-of-order acknowledgements are persisted; no retention inventory exists. | Lagging progress or an active delivery may hold the floor above target; incomplete inventory blocks deletion. No expiry, implicit reset, or cursor clamp. | A complete bounded source for local and clustered durable consumer state. |
-| Replay | The bounded offset read is explicit, read-only, and returns `history_unavailable` for a missing offset; it does not provide a session. | A request below the floor returns `history_unavailable` with the retained range. The read does not pin history or alter ordinary progress. | Whether a future durable replay session or multi-record operation should exist; neither is part of the first contract. |
+| Replay | The bounded offset read is explicit, read-only, and returns `history_unavailable` for a missing offset; time selection is not implemented. | An offset below the floor returns `history_unavailable`; time selection follows ADR 0038 and proves deleted-prefix completeness before returning a match or `no_match`. Neither selector pins history or alters ordinary progress. | A bounded timestamp lookup and complete deleted-prefix maximum; replay sessions and multi-record operations remain separate choices. |
 | Dead-letter history | Local movement appends or reconciles the target record before source progress; clustered movement is atomic in its data group. | Broker-managed dead-letter output remains unlimited until move reconciliation no longer depends on target history. | A durable move ledger or other bounded representation, if finite dead-letter retention is later needed. |
 | Disk admission | Bounded protocol/executor admission exists, but no physical reserve or capacity provider. | Logical retention cannot overrule protected history. Configured physical enforcement reserves required headroom and refuses before mutation when safe admission cannot be established; stage uncertainty remains explicit. | Capacity provider, measured reserve, pressure thresholds, and cluster-local reporting. |
 | Cleanup | No cleanup operation exists. | The logical floor becomes authoritative before physical deletion can remove history it declares unavailable; cleanup lag remains visible. | Manifests/segments, directory-sync sequence, orphan cleanup, and scheduling. |

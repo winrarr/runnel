@@ -1,17 +1,18 @@
 # Replay time-selector semantics
 
-- Status: exploratory research; no API or compatibility decision
-- Last reviewed: 2026-10-05
-- Baseline: f999c1b9ad5d22408bbbe6c6276a42e825cd62ef
+- Status: source research; selector semantics accepted by ADR 0038, runtime and API remain open
+- Last reviewed: 2026-10-06
+- Baseline inspected: `5dc76270a46690fce074fcaf61b5a8cda9838cd0`
 - Primary evidence class: design/research; secondary: correctness/reliability, storage/recovery
 - Scope: meanings and operational bounds for unfinished time-based replay and durable sessions
-- Related: [replay backlog outcome](../backlog.md#make-replay-an-explicit-and-safe-consumer-operation), [ADR 0024](../decisions/0024-explicit-offset-replay-read.md), [retention and disk-pressure design](../design/retention-disk-pressure-plan.md), and [durable replay sessions](../design/replay-sessions.md)
+- Related: [replay backlog outcome](../backlog.md#make-replay-an-explicit-and-safe-consumer-operation), [ADR 0024](../decisions/0024-explicit-offset-replay-read.md), [ADR 0038](../decisions/0038-timestamp-based-replay-selector.md), [retention and disk-pressure design](../design/retention-disk-pressure-plan.md), and [durable replay sessions](../design/replay-sessions.md)
 
-This note examines the open time-selector semantics in the replay backlog. It
-does not change runtime behavior, propose a compatibility promise, or accept
-the candidate in the retention design. The current contract and code are the
-baseline; the existing design's “first retained record at or after” wording is
-a useful candidate that still needs edge-case decisions.
+This note records the current timestamp source, relevant reference behavior,
+and lookup constraints for the replay selector. [ADR 0038](../decisions/0038-timestamp-based-replay-selector.md)
+now accepts the selector semantics; this note does not add runtime behavior or
+select an API representation, index layout, or replay-session contract. The
+inspected baseline is code evidence, not a claim that a timestamp selector is
+already implemented.
 
 ## Current Runnel behavior
 
@@ -99,16 +100,14 @@ The session-specific comparisons add three useful contrasts:
   metadata included in recoverable state. Raft does not supply time lookup,
   retention, or lease semantics.
 
-## Candidate meanings
+## Selector alternatives and accepted contract
 
-The retention design currently proposes a **published-time selector resolved
-to the first retained record at or after the requested time**. That is closest
-to Kafka's lower-bound lookup and is a plausible replay-start meaning. To be
-testable, it would need to mean something like “choose the lowest logical
-message offset in the selected retained view whose stored `published_at_ms` is
-greater than or equal to `T`; begin replay at that record and then follow
-logical append order.” This is an inference for discussion, not an accepted
-definition.
+ADR 0038 selects the first interpretation in the table: the lowest logical
+offset in one captured view whose stored broker `published_at_ms` is at least
+`T`, with append-order traversal thereafter. The selector is inclusive and
+selects a replay start, not a timestamp-filtered set. Kafka uses a similar
+lower-bound shape for `offsetsForTimes`; the accepted tie, regression, no-match,
+and deleted-prefix rules are Runnel decisions.
 
 | Meaning | Boundary and ordering | Benefits | Main risk or ambiguity |
 | --- | --- | --- | --- |
@@ -118,16 +117,11 @@ definition.
 | Nearest record by absolute time distance | Minimize `abs(record_time - T)` with another rule for ties. | Can find a nearby anchor even when no exact timestamp exists. | May select a record before `T`, is unstable around equal-distance ties, and does not define the replay interval that follows. “Nearest” alone is not a safe replay contract. |
 | Return every record whose timestamp is `>= T` | Timestamp is a filter over a bounded view, not a cursor lookup. | Gives a literal time-filtered result. | Results can be non-contiguous in append order; work and response size need explicit bounds, and consumers need a cursor independent of timestamps. |
 
-The first interpretation is a reasonable **candidate** because replay is
-forward through an ordered stream and the current retention design already
-uses that wording. However, the actual predicate should be on the stored
-broker-assigned `published_at_ms`, with the meaning that records after the
-selected start position are returned in logical order even if their timestamps
-are lower. If product intent instead requires “all events occurring after
-time T,” Runnel would need a timestamp filter and a late-arrival policy, not
-only a replay start selector.
+Other rows remain rejected alternatives for this replay-start operation. A
+request for every event whose timestamp is at least T would be a distinct
+filter with separate bounded-result and late-arrival semantics.
 
-## Decisions a future contract must make
+## Accepted contract and open implementation gates
 
 ### Timestamp source and clock
 
@@ -136,36 +130,27 @@ at millisecond precision. The clustered request path can sample it on a
 non-leader ingress node and forward it. The protocol has no caller-supplied
 event-time field.
 
-**Inference:** using this field is the smallest compatible selector because
-the current record already exposes it. It means “Runnel-assigned publish
-time” only. It must not be described as event time, a commit timestamp, or a
-globally monotonic timeline. A future API could support caller event time, but
-that would require a distinct field and validation rules rather than
-silently changing `published_at_ms`.
+**Accepted:** use the persisted `published_at_ms` exactly as stored. It means
+Runnel-assigned publish time only; it is not event time, a commit timestamp,
+or a globally monotonic timeline. A future caller event-time field would be a
+distinct message-contract change, not a reinterpretation of this field.
 
-**Open:** should the clustered timestamp continue to come from the request
-ingress node, be sampled at the leader, or be assigned from a per-stream
-monotonic policy? These choices move the meaning and clock dependency. A
-monotonic policy could make timestamp lookup easier but would be a semantic
-change and still would not make timestamps represent physical elapsed time.
-Spanner's uncertainty interval is an example of the additional machinery
-needed to make stronger clock claims; Runnel currently has no such bound.
+**Observed:** local append samples process wall time. The clustered request
+path samples at ingress before forwarding may occur. ADR 0038 does not move
+that sampling point, clamp old or new timestamps, or promise a clock-error
+bound. Spanner's uncertainty interval illustrates the additional machinery
+needed for stronger clock claims; Runnel currently exposes no such bound.
 
 ### Equal, late, and out-of-order timestamps
 
-With millisecond precision, multiple records can share one timestamp. An
-inclusive lower-bound selector should therefore choose the lowest matching
-logical offset, so a retry of the same selector over an unchanged history
-resolves consistently. A rule based on timestamps alone cannot establish
-append order when timestamps tie.
-
-The code does not enforce nondecreasing timestamps. A timestamp index sorted
-only by time could therefore return a later logical offset while an earlier
-logical record also matches. A lower-bound scan in logical order is a precise
-definition even with out-of-order timestamps, but it may require inspecting
-many records. Enforcing monotonic timestamps or scanning/filtering by time are
-different designs with different API consequences; neither follows from the
-current code.
+With millisecond precision, multiple records can share one timestamp. ADR
+0035 resolves ties to the lowest matching logical offset. The code does not
+enforce nondecreasing timestamps. Later logical records may therefore have
+lower timestamps than earlier ones; the selector still chooses the lowest
+offset matching `published_at_ms >= T`, and continuation remains in append
+order. A timestamp-only sorted index cannot implement that rule. A logical-
+order scan can define it, but requires examining a potentially large retained
+range, so runtime lookup must use a recoverable bounded structure.
 
 The current field also cannot distinguish delayed publication, clock skew,
 wall-clock correction, or an intentionally late application event. Late
@@ -174,50 +159,38 @@ offset, not by inferred causality.
 
 ### No match and retained history
 
-An input time later than every record in the captured view has no matching
-record; that is not necessarily `history_unavailable`. A future API should
-distinguish “no match through this view's end” from “the requested scope is
-partly or wholly below the retained floor.” Reusing `history_unavailable` for
-both cases would make a future time selector indistinguishable from a missing
-record at an offset.
+An input time later than every record in the captured view has no match.
+ADR 0038 assigns this a distinct `no_match` outcome, including an empty stream;
+the one-shot read does not wait for future records. This outcome is valid only
+when the searched view is complete for the threshold.
 
-Retention makes completeness more difficult when timestamps may be out of
-order. The logical retention floor tells the broker which offsets were
-deleted, but the timestamp at the first retained record cannot prove that no
-deleted record had a timestamp greater than or equal to `T`. Returning only
-the first retained match may silently truncate a time scope. Possible
-directions to evaluate include conservative unavailable-history reporting,
-retaining a summary of timestamp bounds for deleted history, or requiring a
-documented timestamp-order invariant before promising complete time ranges.
-This note does not select one. The existing retention design's requirement to
-report the available logical and time boundary and fail a request that spans
-deleted history is a useful safety constraint, but needs an implementable
-definition for nonmonotonic timestamps.
-
-If no record matches `T` in the current retained view, a read-only one-shot
-lookup should report the view's end as “no current match.” Waiting for future
-records would be a follow/live operation with separate timeouts and session
-semantics.
+With prefix retention, the deleted prefix can contain an earlier match even
+when a retained suffix has a match. ADR 0038 accepts a complete maximum
+`published_at_ms` summary for the deleted prefix: if it is below T, no deleted
+record matched; if it is at least T, return `history_unavailable` because the
+earliest matching offset was deleted and is unknowable. Missing or untrusted
+summary metadata also fails closed. This summary works only for contiguous
+prefix deletion; a future scheme with holes needs an equivalent completeness
+proof.
 
 ### Precision and input representation
 
-The stored timestamp is integer Unix milliseconds. A selector with finer
-precision cannot recover information that was never stored. If a future wire
-field is numeric milliseconds, negative and out-of-range values need explicit
-validation. If a textual field is desired, it should require an unambiguous
-UTC offset and define rounding or rejection for sub-millisecond fractions;
-RFC 3339 provides a representation vocabulary but not those Runnel policies.
+The stored timestamp is integer Unix milliseconds. ADR 0038 selects a
+non-negative unsigned millisecond input and rejects values that cannot be
+represented by the selected integer type. A textual RFC 3339 field is not
+selected; if considered later, it would need UTC-offset and sub-millisecond
+rounding rules because the stored source cannot recover finer precision.
 
 ### Concurrency, progress, and sessions
 
 Current offset replay is read-only and does not change ordinary progress; the
 consumer contract tests that replaying an acknowledged record does not rewind
-the next poll. A time selector should preserve this separation. Replaying a
+the next poll. The accepted time selector preserves this separation. Replaying a
 record while the ordinary consumer processes it may cause the application to
 observe the same logical record through both paths; the replay result is not
 an ordinary delivery and has no delivery token or acknowledgement.
 
-A selector should be resolved against one captured stream view: its retention
+A selector is resolved against one captured stream view: its retention
 floor and end position at the operation's serialization point. The local
 stream lock already gives an individual replay read an append boundary; the
 clustered replay command is submitted through the stream Raft group. A
@@ -227,8 +200,8 @@ session could see new appends inconsistently or lose a record between selector
 resolution and fetch. Ordinary poll/ack activity must not silently reset or
 advance that replay cursor, and replay must not rewrite the ordinary
 checkpoint. The [session design](../design/replay-sessions.md) develops a
-fixed-view, separate-cursor candidate and records its open choices for ack
-fencing, retries, lifecycle, and retention.
+fixed-view, separate-cursor model and records its open choices for ack fencing,
+retries, lifecycle, and retention.
 
 The public boundary should remain a stream, consumer, logical record, and
 replay scope. Existing logical message offsets are already part of the
@@ -237,53 +210,47 @@ IDs, Raft log IDs, node placement, or other physical storage coordinates.
 
 ## Bounds and operational implications
 
-There is no time lookup operation or declared timestamp index in the current
-replay contract. The local log keeps logical-offset lookup structures, while
-the clustered state machine holds retained messages in a vector. A first
-matching logical offset under nonmonotonic timestamps may require examining
-the retained range. That could turn a nominally one-record replay into
-history-proportional work, hold the local per-stream lock, or consume
-clustered state-machine work. The exact cost is not measured here.
+There is no time lookup operation or timestamp index in the current replay
+contract. The local log keeps logical-offset lookup structures, while the
+clustered state machine holds retained messages in an offset-ordered vector.
+The minimum matching offset under timestamp regressions may require examining
+the retained range. That could turn a one-record read into history-proportional
+work, hold the local per-stream lock, or consume clustered state-machine work.
+No cost has yet been measured for such a query.
 
-Any implementation proposal should therefore bound both the selector work
-and the replay result/session. It should state whether lookup has a proven
-index, a bounded scan with a resource limit, or a potentially long scan that
-must be rejected or scheduled away from foreground delivery. It should
-measure local and clustered lookup cost over increasing retained histories
-and include concurrent publish/poll workloads before claiming acceptable
-impact. Adding an index may require additional recovery metadata and consistency
-checks; the existing replay budget constraint that replay not starve ordinary
-consumers still applies.
+ADR 0038 therefore gates runtime support on a recoverable index that preserves
+logical-order selection without scanning history per request. The exact data
+layout remains open. Verify bounded work for no-match, sparse-match, equal-time,
+and regressing-time cases; index update/rebuild cost; and impact on concurrent
+publish/poll paths. The local index and clustered replicated state must agree
+after restart and snapshot recovery. The selector must not starve foreground
+consumers.
 
-## Disposition and evidence needed
+## Disposition
 
-**Runnel inference:** time-based replay is reasonably implementable as an
-incremental capability because records already carry broker-assigned
-millisecond timestamps and both engines have a logical replay boundary. The
-smallest candidate is an inclusive lower-bound start selector over stored
-publish time, resolved in logical offset order. However, it is not ready to
-become an implementation contract until the project decides whether that
-lookup remains meaningful with nonmonotonic timestamps, what “complete” means
-below a retention floor, and how a multi-record session pins a stable view.
+The source evidence supports a deterministic time replay contract using the
+existing `published_at_ms` field. [ADR 0038](../decisions/0038-timestamp-based-replay-selector.md)
+accepts inclusive `>= T`, the lowest logical matching offset, append-order
+continuation, explicit `no_match`, and fail-closed behavior when a deleted
+prefix could contain an earlier match. This selects broker-assigned publish
+time, not event time or a globally ordered physical clock.
 
-**Disposition:** keep the existing replay backlog outcome open; do not add a
-separate backlog item or edit unrelated tracker sections. The current backlog
-already names time selectors, and the retention design already records the
-first-at-or-after candidate. This note and the linked session design refine
-those open semantics. Defer runtime work until a design/ADR resolves timestamp
-source, tie and no-match outcomes, retention completeness, bounded lookup,
-session fencing, lifetime, and failover behavior. Time selection is a
-near-term design question; a production selector with retention-aware
-sessions still depends on broader replay and retention capabilities.
+Runtime work is next within the replay backlog, not deferred pending another
+semantic decision. The first slice is a bounded one-record time selector. It
+must include a recoverable lookup index that is correct under timestamp
+regression; implementing an unbounded scan would not satisfy the backlog's
+resource constraint. Pages and durable sessions remain follow-on decisions
+because they add cursor, fencing, failover, and retention-pin lifecycle state.
 
 Evidence needed before implementation includes:
 
-- tests for inclusive/exclusive boundaries and several records sharing one
+- tests for inclusive boundaries and several records sharing one
   millisecond;
 - tests with backward, equal, and forward timestamp values at increasing
   logical offsets;
 - tests for a target before, within, and after the retained time range, plus
-  prefix deletion where deleted timestamps are not monotonic;
+  prefix deletion where the deleted-prefix maximum is below, equal to, and
+  above the selector threshold, including missing/corrupt summary metadata;
 - local and clustered tests that capture the same logical view during
   concurrent publish, poll, acknowledgement, and replay;
 - restart and leader-change coverage for any persisted replay session, cursor,
@@ -295,10 +262,9 @@ Evidence needed before implementation includes:
 
 The inspection covered the current local and clustered replay paths, the
 shared replay contract, the timestamp creation paths, ADR 0024, and the
-retention design proposal. No runtime or test changes are appropriate in this
-research-only task. No separate safe refactor was identified: consolidating
-timestamp assignment or adding a time index would itself constrain selector
-semantics and should follow the design decision and evidence above. The
-existing replay backlog remains the correct planning record; its replay
-child now links these notes without changing the outcome or its status. No new
-backlog or tech-debt item is warranted by this exploratory note.
+retention design proposal. This documentation run changes no runtime or tests. No separate refactor is
+selected: timestamp-index format and update mechanics must follow the accepted
+semantics and storage recovery evidence. The existing replay backlog remains
+the correct tracker. TD-002 and TD-010 already cover local cold scans and
+clustered retained-history traversal; they are updated to link this accepted
+selector and its implementation gate. No new debt identifier is warranted.
