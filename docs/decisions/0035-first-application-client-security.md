@@ -67,22 +67,31 @@ wire schema.
 - Keep the existing loopback bind as the local-development default. With no
   security configuration, an unauthenticated plaintext listener is allowed
   only on a loopback address. Any non-loopback application bind requires both
-  TLS and authentication. An explicitly named insecure development/test
-  override may allow a non-loopback plaintext listener for isolated examples,
-  but does not create a protected deployment and must not be documented as a
-  production setting. Supplying only one of TLS or authentication, or invalid
-  secure configuration, is a startup error; there is no plaintext fallback.
-  Loopback mode trusts every local process and user able to reach the socket;
-  it is not isolation for a shared host.
-- On a secured connection, establish one authenticated role for the lifetime
-  of that connection before accepting any ordinary protocol operation,
-  including `Health`. A missing, unknown, or invalid credential is rejected
-  before dispatch with one generic authentication failure or a connection
-  close, then close the unauthenticated connection. Do not distinguish absent,
-  unknown, malformed, or revoked credentials. The exact authentication
-  exchange, response, and any frame or field encoding remain protocol
-  decisions under the protocol-compatibility work; this ADR does not define
-  them.
+  TLS and authentication. The only exception is an explicitly named insecure
+  development/test override for isolated examples, and it may allow
+  non-loopback plaintext only when neither TLS nor credential policy is
+  configured. Configuring either TLS or credential policy requires both TLS
+  and authentication, even with that override; partial or invalid secure
+  configuration is a startup error and cannot be downgraded to plaintext.
+  The override does not create a protected deployment and must not be
+  documented as a production setting. Loopback mode trusts every local process
+  and user able to reach the socket; it is not isolation for a shared host.
+- On every secured connection, complete TLS before sending or accepting the
+  protocol preface and require core protocol v2. Its `Hello` reply must include
+  the presence-required boolean `auth_required`, which must be true for a
+  secured connection. Omission is a protocol violation; a false value or
+  unavailable exchange makes the server close without application dispatch.
+  The bounded post-`Hello` control exchange named `bearer_auth` establishes
+  the connection role.
+  Establish one authenticated role for the lifetime of the connection only
+  after that exchange succeeds. No ordinary application operation, including
+  `Health`, may reach dispatch before then. Credentials and operations are not
+  sent in TLS early data. A missing, unknown, or invalid credential is rejected
+  generically and the unauthenticated connection is closed. Do not distinguish
+  absent, unknown, malformed, or revoked credentials. The protocol
+  compatibility decision (ADR 0031) owns the `auth_required` Protobuf tag,
+  field presence/schema, and exact exchange encoding. This decision sets the
+  security requirement and ordering that wire contract must preserve.
 
 ### Credentials and authorization
 
@@ -205,10 +214,10 @@ hardening remain release work.
   configuration will stop starting. This intentionally changes today's
   permissive remote-bind behavior; the JSON protocol has no compatibility
   guarantee.
-- The runtime needs TLS stream handling, policy validation, connection
-  authentication, an exhaustive role check before dispatch, safe secret
-  loading, and client/CLI credential and trust configuration. These are not
-  implemented by this decision.
+- The runtime needs TLS stream handling, policy validation, the required
+  post-`Hello` authentication phase before dispatch, an exhaustive role check,
+  safe secret loading, and client/CLI credential and trust configuration.
+  These are not implemented by this decision.
 - Operators need one runtime token policy and at least one `operator`
   credential for administration. Ordinary `application` credentials cannot
   create streams, change consumer policy, or inspect broker health.
@@ -258,17 +267,23 @@ Before describing a secured build as ready for use, add protocol and
 real-server coverage for:
 
 - default loopback development access and startup rejection of non-loopback
-  plaintext/no-auth binds; explicit development override behavior;
-- successful TLS 1.3 client connection, rejection of TLS 1.2 and plaintext at
-  the secure listener, trusted CA loading, certificate/name mismatch, and
-  proof that neither the TLS library nor the server accepts 0-RTT application
-  operations; incomplete handshakes, oversized pre-authentication input, and
-  repeated failed authentication remain within configured resource/time
-  bounds;
-- valid, missing, unknown, and malformed credentials; all role-permitted
-  operations; application-role denials for stream creation, consumer-policy
-  changes, and protocol health before engine dispatch; and exhaustive handling
-  when protocol operations are added;
+  plaintext/no-auth binds; prove the explicit development/test override is the
+  only remote plaintext exception and cannot bypass configured TLS or
+  credential policy;
+- successful TLS 1.3 client connection, TLS completion before protocol preface,
+  rejection of TLS 1.2 and plaintext at the secure listener, trusted CA
+  loading, certificate/name mismatch, and proof that neither the TLS library
+  nor the server accepts 0-RTT application operations; incomplete handshakes,
+  oversized pre-authentication input, and repeated failed authentication
+  remain within configured resource/time bounds;
+- in secured core v2, require `auth_required=true` in the `Hello` reply and
+  complete the bounded `bearer_auth` exchange. Treat omission as a protocol
+  violation; reject false or unavailable authentication before application
+  dispatch. Exercise valid, missing, unknown, and malformed credentials and
+  prove no application request reaches dispatch before success; then verify
+  role-permitted operations, application-role denials for stream creation,
+  consumer-policy changes, and protocol health, plus exhaustive handling when
+  protocol operations are added;
 - invalid or unreadable policy/certificate files failing before listener
   acceptance, and proof that tokens/digests never appear in client/server
   debug output, logs, errors, or metrics;

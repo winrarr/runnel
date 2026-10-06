@@ -51,14 +51,25 @@ is authoritative if wording differs.
   the unauthenticated connection.
 - Retain unauthenticated plaintext only on the loopback local-development
   default. A non-loopback client listener requires both TLS and a bearer
-  credential; partial or invalid secure config fails closed, with no protocol
-  downgrade. An explicitly named development/test override does not make a
-  remote deployment secure.
-- Authenticate each secured connection before any ordinary protocol request.
-  A runtime policy file contains credential IDs, token verifier digests, and
-  one fixed role per token; raw 256-bit random tokens come from protected
-  runtime client secret sources. Multiple token entries per role allow a
-  staged restart-based rotation.
+  credential. The only exception is an explicitly named insecure development/
+  test override for isolated examples, and it may allow non-loopback plaintext
+  only when neither TLS nor credential policy is configured. Configuring
+  either requires both TLS and authentication, even with the override; partial
+  or invalid secure config fails closed, with no protocol downgrade. The
+  override does not make a remote deployment secure.
+- On a secured connection, complete TLS before sending or accepting the
+  protocol preface and require core protocol v2. Its `Hello` reply must include
+  the presence-required boolean `auth_required`, set to true. Omission is a
+  protocol violation, while false or an unavailable exchange closes the
+  connection before application dispatch. A distinct bounded post-`Hello`
+  `bearer_auth` control exchange must succeed before dispatch. Credentials and
+  operations are not sent in TLS early data. ADR 0031 maps this requirement to
+  the protocol mechanism and owns the Protobuf tag, field presence, schema, and
+  encoding; this design sets security policy, not protocol fields. A runtime
+  policy file contains credential IDs and token verifier digests, with one
+  fixed role per token. Raw 256-bit random tokens come from protected runtime
+  client secret sources. Multiple token entries per role allow a staged
+  restart-based rotation.
 - `application` credentials can publish, batch publish, consume, replay,
   acknowledge, and inspect consumer policy. `operator` credentials can issue
   all current protocol operations, including stream creation, consumer-policy
@@ -75,11 +86,15 @@ is authoritative if wording differs.
   policy on every client-serving replica and coordinated rotation; this ADR
   does not establish a safe rolling configuration procedure or peer security.
 
-Authentication exchange bytes, protocol-version negotiation, TLS crate/API,
-configuration syntax, command-line names, client API shape, token generation
-tooling, and HTTP listener implementation remain implementation or protocol
-design work. In particular, do not add an authentication frame or negotiation
-field here; the protocol compatibility decision owns those bytes.
+Exact authentication exchange bytes and remaining protocol-version negotiation
+details, TLS crate/API, configuration syntax, command-line names, client API
+shape, token generation tooling, and HTTP listener implementation remain
+implementation or protocol design work. The required boundary is TLS before
+the preface and a present, true `auth_required` boolean in the core v2 `Hello`
+reply for secured connections. The post-`Hello` `bearer_auth` exchange must
+succeed before application dispatch. ADR 0031 maps this security requirement
+to the protocol mechanism and owns its Protobuf tag, schema, and encoding; this
+design does not define wire fields.
 
 ## Implementation guidance and release gates
 
@@ -107,13 +122,18 @@ reason values. Repeated bad credentials must not create unbounded log or
 metric state.
 
 The secured listener needs real-process tests for loopback development mode,
-remote-bind rejection and explicit development override, TLS 1.3 success and
-TLS 1.2/plaintext rejection, disabled 0-RTT, server trust and name validation,
-incomplete handshake and oversized pre-authentication bounds, credential
-failure before dispatch, both roles across every operation, exhaustive
-authorization for future variants, invalid config before listener acceptance,
-secret redaction, and restart-based token and certificate rotation. Tests must
-prove no request is replayed automatically when its result may be unknown.
+remote-bind rejection and the explicit development override as the only
+non-loopback plaintext exception, including proof it cannot bypass configured
+TLS or credential policy; TLS 1.3 success and TLS 1.2/plaintext rejection,
+disabled 0-RTT, server trust and name validation, incomplete handshake and
+oversized pre-authentication bounds, the core v2 `auth_required` boolean
+present and true for secured connections, rejection if it is missing or false,
+successful and failed `bearer_auth` exchanges, TLS-before-preface, unavailable
+or failed auth closing before application dispatch, both roles across every
+operation, exhaustive authorization for future variants, invalid config before
+listener acceptance, secret redaction, and restart-based token and certificate
+rotation. Tests must prove no request is replayed automatically when its result
+may be unknown.
 
 Deployment evidence must separately validate HTTP access. For Kubernetes,
 health probes and the designated scraper must reach their intended routes,
