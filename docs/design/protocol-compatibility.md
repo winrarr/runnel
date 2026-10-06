@@ -30,7 +30,11 @@ bounded length-prefixed frames, and sequential request/response exchange.
 Negotiation and effective directional limits are scoped to one connection and
 are repeated after reconnect. V2 has a typed refusal before application
 traffic when a valid Hello has no version or required-capability overlap. It
-does not silently fall back to v1.
+does not silently fall back to v1. The accepted contract also makes the
+authentication requirement explicit in Hello and gates application traffic
+behind a bounded post-Hello bearer exchange when required. ADR 0035 owns the TLS,
+credential, and role policy; protocol compatibility owns only the control
+frame and ordering.
 
 V2 carries opaque message bytes directly and has explicit confirmed, rejected,
 retryable, and unknown outcomes with topology-neutral processing stages. The
@@ -248,6 +252,16 @@ invalid Protobuf message, unsupported bootstrap revision, or nonzero reserved
 byte closes the connection. A peer that has parsed a valid Hello sends either
 a Hello reply or a typed refusal and then closes after a refusal.
 
+When application security is configured, the server completes TLS before
+reading the RNLN preface. TLS 0-RTT is disabled for application protocol
+connections; the client sends no preface, credential, or application request
+before the full handshake completes. The default loopback listener with no
+security configuration and the explicitly named insecure development/test
+override use plaintext; ADR 0035 owns those listener conditions and the TLS
+profile. Any client configured with a bearer credential must establish and
+validate TLS before sending the preface; it never offers that credential over
+plaintext, even if a plaintext peer claims authentication is required.
+
 Each Hello lists inclusive minimum and maximum minor versions for each
 supported major, the client's offered and required capabilities, and its
 maximum outbound and inbound application-frame bodies. Each positive major
@@ -260,8 +274,14 @@ server. Capability names are case-sensitive ASCII identifiers matching
 sets, and the required set is a subset of the offered set. A parseable Hello
 with invalid ranges or capability sets receives `invalid_hello` and closes.
 The reply lists the selected version, the selected subset of offered
-capabilities, the server's maximum inbound and outbound body sizes, and the
-effective frame limits. For client-to-server traffic, the effective limit is
+capabilities, the server's maximum inbound and outbound body sizes, the
+effective frame limits, and an optional Protobuf boolean `auth_required`. Every
+successful Hello reply must include this field; absence is a protocol
+violation, and the client closes without sending credentials or an application
+request. `false` is allowed only with security configuration absent on the
+default loopback listener or under the explicit insecure development/test
+override. TLS or credential-policy configuration requires `true`. For
+client-to-server traffic, the effective limit is
 the minimum of the client's outbound ceiling and the server's inbound ceiling;
 for server-to-client traffic, it is the minimum of the client's inbound ceiling
 and the server's outbound ceiling. The client verifies both exact minima, that
@@ -273,16 +293,38 @@ A limit below 1 KiB returns `limit_too_small`; a ceiling above its directional
 hard maximum returns `limit_too_large`. A client that receives an effective
 limit other than the computed minimum treats it as a protocol violation and
 closes; it also rejects server-advertised endpoint limits outside the
-directional bounds. A refusal means no application operation was attempted. The client
-sends no application frame until it has received and validated a successful
-Hello reply. The server does not process application traffic until it has sent
-a successful Hello reply.
+directional bounds. A refusal means no application operation was attempted.
+The client sends no post-Hello frame until it has received and validated a
+successful Hello reply. If `auth_required` is true, it sends exactly one
+bounded `bearer_auth` control frame and waits for the
+`authenticated` control reply before any operation. A client without a
+credential closes without sending an application request. The authentication
+request and reply each have a maximum 1 KiB encoded body, also subject to the
+negotiated directional limit, and the exchange remains within configured
+connection/request deadlines. A well-framed `bearer_auth` with an empty or
+invalid credential, or an operation sent before authentication succeeds,
+receives only a generic `authentication_failed` control response and closes the
+connection; malformed or over-limit framing closes without parsing or
+dispatch. Failure does not reveal whether a credential is unknown, invalid, or
+absent. If the auth deadline expires before completion, the connection closes
+without an application response. Authentication control has no application
+outcome or stage because no operation is dispatched. When
+`auth_required` is false, the client sends no credential and may start
+application traffic. A client configured with a credential treats false as a
+configuration/security mismatch and closes before sending that credential or
+an operation. If the server receives a `bearer_auth` control frame when false,
+it closes without examining the credential or accepting an application
+request. When `auth_required` is true, the server does not dispatch an
+application operation, including Health, until authentication succeeds; when
+false, successful Hello is sufficient to begin application traffic.
 
 Unknown optional capabilities are ignored. A client must require every
 capability needed to interpret or perform its request; it must not send the
 request if that capability was not selected. Core v2 behavior is defined by
 the selected version and does not need
-a capability flag. A future `consume_batch` capability can gate its operation;
+a capability flag. The bearer-auth exchange is core v2 control flow, not an
+optional capability; every v2 peer must understand it. A future
+`consume_batch` capability can gate its operation;
 the client must require that capability in Hello before sending any operation
 it defines, and the server refuses an unsupported requirement before
 application traffic. This does not fix the operation or field names in this
@@ -299,18 +341,21 @@ failure and does not retry the application request as v1.
 
 ### Application frames, schema, and limits
 
-V2 application frames use a four-byte unsigned big-endian length followed by
+V2 post-Hello frames use a four-byte unsigned big-endian length followed by
 one Protobuf v3 envelope. The declared length counts only the encoded Protobuf
 body, not the four-byte prefix. Zero-length, truncated, or over-limit frames
 are rejected and the connection is closed; implementations validate the
 length before allocating the body and do not scan for a later frame boundary.
-The client envelope is a top-level Protobuf oneof whose field tags are reserved
-for operation variants; the initial envelope has no optional metadata fields.
-The server envelope similarly contains one operation reply. This makes an
-unknown top-level client tag an unknown operation rather than an ambiguous
-extension.
+The client envelope distinguishes the core `bearer_auth` control variant from
+top-level operation variants; the initial application envelope has no
+optional metadata fields. The server envelope distinguishes `authenticated`
+and generic `authentication_failed` control replies from operation replies.
+This makes an unknown top-level application tag an unknown operation rather
+than an ambiguous extension. Authentication control bodies are limited to
+1 KiB in each direction and also obey the negotiated frame limits.
 
-The server and client exchange exactly one application request and its
+The server and client exchange exactly one authentication control request and
+reply when required, followed by exactly one application request and its
 response at a time. No pipelining, multiplexing, out-of-order completion, or
 correlation ID is part of v2. Response order identifies the request.
 
@@ -362,9 +407,9 @@ safety; unknown codes remain diagnostic values. Optional human-readable
 diagnostic text is capped at 512 UTF-8 bytes.
 No field addition may silently change a required behavior.
 
-The Protobuf schema contains a client Hello, server Hello reply/refusal, client
-application envelope, server application envelope, and operation-specific
-request/result messages. Every successful or failed application result
+The Protobuf schema contains a client Hello, server Hello reply/refusal, the
+post-Hello client and server control/application envelopes, and
+operation-specific request/result messages. Every successful or failed application result
 contains outcome and stage; an error additionally contains its stable code and
 diagnostic, while a success contains the typed operation result. A batch result
 carries item outcomes and does not infer atomicity from its outer envelope.
@@ -440,13 +485,25 @@ retention policy must not expire an ID while retaining the record it
 identifies; the replay safety guarantee ends when that record and its identity
 are both eligible for removal.
 
-For v2, the fingerprint is the stream, key presence and exact UTF-8 key bytes,
-and exact logical payload bytes. The server-assigned publish timestamp and the
-request ID itself are excluded. Repeating a request ID with the same
-fingerprint returns the original receipt without appending another record.
-Reusing it with a different fingerprint returns `request_id_conflict`,
-`rejected` at `execution_started`, and definitive no-effect evidence; the
-original record is unchanged. This deliberately changes the current
+For v2 request-ID comparison, canonical key bytes are the exact UTF-8 key
+bytes after protocol decoding, with absent and empty keys both represented as
+zero bytes. They are equivalent for this comparison because the current local
+durable representation cannot distinguish them; this does not make them
+equivalent for ordering semantics, where an empty key can express ordering
+intent and an absent key cannot. The fingerprint is the stream, these canonical
+key bytes, and exact logical payload bytes. The server-assigned publish
+timestamp and the request ID itself are excluded. Repeating a request ID with
+the same comparison inputs returns the original receipt without appending
+another record. Reusing it with different comparison inputs maps to
+`request_id_conflict` only after the serialized engine comparison proves the
+requested publish was not appended. It may then be reported as `rejected` at
+`execution_started` with affirmative no-effect evidence; the original record
+and identity mapping remain unchanged, no stream offset is allocated, and no
+consumer state changes. A clustered comparison command may itself commit and
+apply to order the comparison, but that is not application of the requested
+publish. An error that does not establish this no-append/no-effect result
+retains its conservative retryable or unknown classification and is not
+reported as a proven conflict rejection. This deliberately changes the current
 provisional v1 behavior, which returns the original offset without comparing
 key or payload. [ADR 0029](../decisions/0029-local-typed-dead-letter-move-identities.md)
 continues to describe current v1 and storage identity behavior; ADR 0031
@@ -470,12 +527,21 @@ The compatibility rules are:
 | Parseable Hello with invalid or duplicate major/minor ranges, malformed or duplicate capability names, or a required capability absent from the offer | Server returns `invalid_hello` and closes without processing application traffic. |
 | v2 peers with no common major/minor | Server sends typed `unsupported_version` refusal after parsing the valid v2 Hello, then closes. No application operation was attempted. |
 | A required capability is not supported | Server sends typed `unsupported_capability` refusal and closes before application traffic. The client does not silently drop the requirement. |
+| Successful Hello reply omits `auth_required` | Client treats the reply as a protocol violation, sends no credential or application request, and closes. |
+| `auth_required` is true and client has no credential | Client closes without sending an application request; server dispatches no operation. |
+| `auth_required` is true and a well-framed `bearer_auth` has an empty or invalid credential, or an application operation arrives before authentication succeeds | Server returns only generic `authentication_failed` control response and closes; it does not dispatch the operation or reveal credential state. A connection that closes or times out without sending the auth frame receives no application result. |
+| `auth_required` is false but client is configured with a credential | Client treats this as a security/configuration mismatch, sends neither credential nor application request, and closes. |
+| `auth_required` is false but a client sends `bearer_auth` anyway | Server closes without examining the credential or accepting an application request. |
+| `auth_required` is false on a listener with TLS or credential-policy configuration, or outside loopback without the explicit insecure development/test override | Server configuration is invalid under ADR 0035; it must not downgrade to plaintext or unauthenticated operation service. |
 | Selected version, capability, or limit is outside the client offer | Client treats the reply as a protocol violation, sends no application request, and closes. |
+| TLS handshake is incomplete or fails | No RNLN preface or application data is sent or accepted; the transport closes. |
+| Client has a bearer credential but cannot establish and validate TLS | Client closes before sending the RNLN preface and never sends the credential over plaintext. |
+| TLS 0-RTT data contains a credential, preface, or application request | TLS 0-RTT is disabled for these connections; client does not send early data and server does not accept it for protocol processing. |
 | Unknown bootstrap revision, malformed preface/Hello, invalid or oversized length, or truncated frame | The receiver closes. It sends a typed refusal only when it can safely parse the valid v2 Hello; it does not guess or resynchronize. |
 | v1 JSON-lines client connects to a v2-only listener | The listener rejects the non-v2 preface and closes. It does not parse the bytes as a v1 request or promise a v1-readable refusal. |
 | v2 client connects to a v1-only listener | The v2 client waits only within its handshake deadline. EOF, timeout, or a non-v2 response is a handshake failure; it sends no application request and never retries as v1. |
 | Well-framed unknown operation | Server returns `unsupported_operation` with a definitive rejected outcome and keeps the connection only if the next frame boundary is known. |
-| Reconnect after peer restart, leader change, or failure | Client opens a new connection and repeats the complete preface and Hello. No old selection or limits carry over. |
+| Reconnect after peer restart, leader change, or failure | Client opens a new connection and repeats the complete transport setup, preface, Hello, and required authentication. No old selection, limits, or authentication carries over. |
 
 The initial v2 deployment replaces provisional v1 at one coordinated breaking
 release boundary for the server, reusable Rust client, and CLI. The v2 listener
@@ -490,8 +556,10 @@ The protocol decision does not promise mixed-version broker-cluster upgrades,
 internal peer-protocol compatibility, or storage/disk-format compatibility.
 A public connection's Hello says nothing about whether another node can accept
 or forward its operation. This ADR selects no rolling-upgrade sequence or
-rollback behavior; those require separate peer and storage evidence. It also
-adds no TLS, authentication, or other security contract.
+rollback behavior; those require separate peer and storage evidence. ADR 0035
+owns the TLS profile, listener configuration, credentials, and role policy;
+this protocol contract defines only TLS-before-preface ordering, the explicit
+`auth_required` Hello signal, and the bounded bearer-control exchange.
 
 ### Reference comparison and rationale
 
@@ -502,7 +570,7 @@ transfer their compatibility promises or application semantics to Runnel.
 | --- | --- | --- |
 | [Apache Kafka protocol guide](https://kafka.apache.org/43/design/protocol/) | ApiVersions reports supported API versions, the client selects an overlap, and the client repeats discovery after reconnect. Kafka versions each API independently. | Select one connection-scoped major/minor and rediscover on every connection. Runnel does not need per-operation ranges before independent API evolution justifies their matrix. |
 | [NATS client protocol](https://docs.nats.io/reference/protocols/client) | The server sends an initial INFO with protocol/features and a maximum payload; later INFO can update connection-visible state. | A bounded capability/limit exchange is useful, but Runnel chooses mutual Hello negotiation before requests. It does not inherit NATS topology updates or server-first transition behavior. |
-| [PostgreSQL protocol overview](https://www.postgresql.org/docs/current/protocol-overview.html) | Startup uses a versioned startup packet before ordinary traffic and can refuse unsupported startup modes. | Keep handshake failures separate from application outcomes and do not begin operations before negotiation completes. PostgreSQL's authentication and startup model are not adopted. |
+| [PostgreSQL protocol overview](https://www.postgresql.org/docs/current/protocol-overview.html) | Startup uses a versioned startup packet before ordinary traffic and can refuse unsupported startup modes. | Keep handshake failures separate from application outcomes and do not begin operations before negotiation completes. Runnel defines its own bounded bearer exchange; it does not adopt PostgreSQL's authentication messages or policy. |
 | [RFC 9293, TCP](https://www.rfc-editor.org/rfc/rfc9293.html) | TCP supplies an ordered byte stream; application writes and TCP segments do not define message boundaries. | Use an explicit bounded length prefix and validate it before allocation. |
 | [Protocol Buffers v3 guide](https://protobuf.dev/programming-guides/proto3/) and [encoding guide](https://protobuf.dev/programming-guides/encoding/) | Numbered fields and length-delimited bytes support direct binary values and documented schema-evolution rules; field numbers must not be reused, and parser unknown-field behavior must be considered. | Choose Protobuf v3 for the initial typed public schema, with reserved removed tags, explicit presence/default rules, capability gates, and language-neutral golden frames. Its generated-code/tooling cost is accepted for direct bytes and formal cross-language schema; no language support is claimed until independently verified. |
 
@@ -521,9 +589,12 @@ This is a design-only decision; no runtime negotiation or Protobuf codec is
 implemented at the reviewed baseline. Before describing v2 as supported, the
 implementation must provide:
 
-- checked preface, Hello, no-overlap, required-capability refusal, client
-  selection validation, reconnect renegotiation, and every mismatch row above
-  in tests that start the real server;
+- checked TLS-before-preface ordering with 0-RTT disabled, preface and Hello,
+  explicit `auth_required` presence and negotiation, no-overlap and
+  required-capability refusal, bounded bearer authentication, generic auth
+  failure and close, no application dispatch before successful authentication,
+  client selection validation, reconnect renegotiation, and every mismatch
+  row above in tests that start the real server;
 - golden Protobuf frames for all supported operations and a generated client
   plus an independent decoder, preserving opaque bytes and unknown optional
   fields/enums according to this policy;
@@ -534,8 +605,9 @@ implementation must provide:
   rejected, retryable, and unknown outcomes, including no-effect-before-engine,
   definitive post-entry rejection, ambiguous timeouts, response loss after
   durable apply, reconnect, and safe stable-ID resolution;
-- changed-ID-fingerprint rejection and same-fingerprint resolution across
-  restart and leader change, without duplicate records; and
+- changed-ID-content rejection (including absent/empty-key comparison
+  equivalence) and equal-content resolution across restart and leader change,
+  without duplicate records; and
 - release evidence for the coordinated v1 break and explicit statements that
   peer and disk compatibility are not covered.
 
