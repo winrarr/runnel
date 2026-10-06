@@ -1,17 +1,20 @@
 # Consume-batch semantics study
 
 - Status: source-backed research; proposed semantic contract recorded in ADR 0030; runtime API and behavior are not implemented
-- Last reviewed: 2026-10-05
-- Repository baseline: `f52d367fd5a6860a20607ac3024cc44edfeb3ec0` (pre-change baseline)
+- Last reviewed: 2026-10-06
+- Repository review baseline: `8fae2d1f81da9146a26cfb20d190214eab370a71`
 - Primary evidence class: research/design
 - Scope: bounded consume delivery and acknowledgement contracts for the local and early clustered engines
 - Related outcome: [Make batching preserve per-record outcomes](../backlog.md#make-batching-preserve-per-record-outcomes)
-- Related decisions: [ADR 0013](../decisions/0013-local-shared-consumer-delivery.md), [ADR 0015](../decisions/0015-clustered-shared-consumer-ownership.md), [ADR 0027](../decisions/0027-consumer-scoped-retry-policy.md), [ADR 0030](../decisions/0030-consume-batch-contract.md)
+- Related decisions: [ADR 0013](../decisions/0013-local-shared-consumer-delivery.md), [ADR 0015](../decisions/0015-clustered-shared-consumer-ownership.md),
+  [ADR 0026](../decisions/0026-semantic-engine-error-classification.md), [ADR 0027](../decisions/0027-consumer-scoped-retry-policy.md),
+  [ADR 0029](../decisions/0029-local-typed-dead-letter-move-identities.md), [ADR 0030](../decisions/0030-consume-batch-contract.md)
+- Related technical debt: [TD-017](../tech-debt.md#td-017-dead-letter-movement-spans-separate-durable-records), [TD-025](../tech-debt.md#td-025-shared-engine-errors-expose-implementation-specific-failure-details)
 - Related performance evidence: [Systems performance research for Runnel](systems-performance-research.md)
 
 This note compares consume-batch references with the behavior in the code at
-the recorded baseline. It supports the semantic contract proposed in ADR 0030;
-it does not accept a wire API, implementation, compatibility promise, or
+the recorded review baseline. It supports the semantic contract proposed in ADR
+0030; it does not accept a wire API, implementation, compatibility promise, or
 performance claim.
 
 ## Assessment
@@ -89,18 +92,14 @@ exists at this baseline. Current batch APIs and network tests cover publish
 batches only. Existing one-record coverage is relevant to the constraints but
 does not establish batch outcomes:
 
-- At the supplied baseline, the local and persistent clustered engine tests
-  verified that an assigned offset kept its old attempt limit after version 2
-  was configured and that the current policy version survived reopen, but
-  neither reopened with that offset still pending under its old snapshot. This
-  change adds `pending_delivery_keeps_pinned_attempt_limit_after_reopen` and
-  `persistent_raft_pending_delivery_keeps_pinned_attempt_limit_after_reopen`.
-  Each test assigns an offset under version 1 with attempt limit 2, commits
-  version 2 with limit 1 while the offset remains unacknowledged, closes and
-  reopens the engine, verifies version 2 remains current, then observes attempt
-  2 under the pinned limit and terminal movement at that original limit. This
-  establishes pending-snapshot reopen behavior for the local consumer journal
-  and the persistent one-node Raft engine.
+- At this review baseline, `pending_delivery_keeps_pinned_attempt_limit_after_reopen`
+  and `persistent_raft_pending_delivery_keeps_pinned_attempt_limit_after_reopen`
+  assign an offset under version 1 with attempt limit 2, commit version 2 with
+  limit 1 while it remains unacknowledged, reopen the local journal or
+  persistent one-node Raft engine, and observe attempt 2 under the pinned limit
+  before terminal movement at that original limit. This establishes pending
+  snapshot recovery for those local and single-node persistent-engine paths; it
+  does not cover a multi-node cluster restart with a pending snapshot.
 - The real three-process transfer test configures version 1, delivers an
   offset, changes the current policy to version 2, fails the original leader,
   and verifies the new leader sees version 2 while the offset still follows
@@ -127,16 +126,19 @@ the [local restart test source](../../crates/runnel-server/tests/server_smoke.rs
 (`network_protocol_reassigns_group_delivery_after_restart`),
 and the [cluster node-failure test](../../crates/runnel-server/tests/cluster_smoke.rs).
 The accepted retry-policy details are in
-[ADR 0027](../decisions/0027-consumer-scoped-retry-policy.md).
+[ADR 0027](../decisions/0027-consumer-scoped-retry-policy.md). Local
+dead-letter move identity and the separate append/checkpoint recovery boundary
+are covered by
+[ADR 0029](../decisions/0029-local-typed-dead-letter-move-identities.md): the
+typed identity prevents public request IDs from impersonating new internal
+moves, but does not make the two writes atomic and permits one extra typed move
+when an interrupted legacy frame is retried across the upgrade boundary.
 
-The pending-offset recovery tests added by this change are
-`pending_delivery_keeps_pinned_attempt_limit_after_reopen` and
-`persistent_raft_pending_delivery_keeps_pinned_attempt_limit_after_reopen` in
-those respective test modules. The persistent test exercises a one-node Raft
-engine reopen; multi-node cluster restart with a pending snapshot remains
-uncovered. Existing three-process leader-failure coverage verifies transfer of
-the current policy and pinned snapshot to a new leader, which is a separate
-failure path.
+The pending-offset recovery tests are in those respective modules. The
+persistent test exercises a one-node Raft engine reopen; multi-node cluster
+restart with a pending snapshot remains uncovered. Existing three-process
+leader-failure coverage verifies transfer of the current policy and pinned
+snapshot to a new leader, which is a separate failure path.
 
 ## Reference behavior
 
@@ -312,19 +314,26 @@ assertions should preserve topology-free semantics where practical.
   outcomes. Runtime API shape remains provisional. Implementation must add
   batch-specific contract, local, cluster, and real-process coverage; the
   broader benchmark matrix remains the acceptance gate for performance claims.
+  ADR 0026's current error outcome taxonomy is not operation-stage evidence, so
+  the batch path must define a stage-aware mapping for known pre-append or
+  pre-submit failures, or conservatively return `unknown` for generic storage
+  and cluster errors. This is an implementation gate, not a claim about current
+  behavior.
 - **Performance:** no direct performance change is expected from this research
   note. Throughput improvement is a hypothesis; no magnitude is estimated.
   Batching may improve small-message throughput while increasing tail latency,
   memory, lease expiries, or queueing. The current benchmarks do not quantify
   that tradeoff.
 - **Refactor/planning assessment:** the local and clustered implementations,
-  reusable engine assertion, policy and transfer tests, ADRs 0013, 0015, and
-  0027, and the shared-consumer and batching backlog outcomes were inspected.
-  No code refactor is warranted: current code follows the accepted single-record
-  fencing and retry-policy decisions, and this update corrects the research
-  record. ADR 0030 proposes the selected semantic contract; the backlog remains
+  reusable engine assertion, policy and transfer tests, ADRs 0013, 0015, 0026,
+  0027, and 0029, the shared-consumer and batching backlog outcomes, and TD-017
+  and TD-025 were inspected. No code refactor is warranted: current code follows
+  the accepted single-record fencing and retry-policy decisions, and this update
+  corrects the research record. ADR 0030 remains proposed; the backlog stays
   open because runtime behavior, failure tests, and performance evidence are
-  unfinished. No separate actionable refactor or tech-debt item was identified.
+  unfinished. TD-025 already tracks the stage-aware outcome gap identified here,
+  and TD-017 tracks the separate local dead-letter recovery boundary, so no new
+  tracker item is warranted.
 - **Unresolved evidence:** no workload has established whether network round
   trips, per-record local sync, consensus round trips, JSON/base64 work, or
   client-side processing dominates; the proposed 1,024-record ceiling is a
