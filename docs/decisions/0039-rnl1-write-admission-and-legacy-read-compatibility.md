@@ -1,6 +1,6 @@
 # ADR 0039: Bound new RNL1 writes and preserve complete legacy reads
 
-- Status: accepted; local write admission implementation in progress
+- Status: accepted; local write admission implemented
 - Date: 2026-10-06
 - Baseline: `f6bc65cbe19a5902616aeeaa3ce46dedae583d2a`
 - Primary evidence class: design/research; secondary: storage safety, public outcome
@@ -48,7 +48,7 @@ No lower complete-record read ceiling is selected. Before a future decision sele
 - New RNL1 input above the selected write limits is rejected even though the old writer could encode it. The new error result makes the no-effect outcome explicit for scalar and batch publish.
 - Complete historical RNL1 records beyond those values remain subject to today's read/materialization behavior. This avoids a corpus-blind read break but leaves the RNL1 resource debt partially open.
 - The read-only size audit can inform a future read and memory policy, but observed maxima do not prove that unseen stores fit or establish safe concurrent RSS.
-- Runtime verification must cover accepted values at the boundary, rejection immediately above each boundary before any durable byte or index mutation, scalar and batch outcomes, valid later writes after rejection, and reopening/replaying a complete historical RNL1 record whose field exceeds the write limit. Existing incomplete-tail and malformed-complete-record tests must remain valid.
+- Implementation tests cover key and payload boundary acceptance, rejection above either boundary before any durable byte or index mutation, scalar and batch `invalid_record` outcomes, valid later writes after rejection, rejected-only batch notification behavior, and reopening/replaying a complete historical RNL1 record whose fields exceed the write limits. Existing incomplete-tail and malformed-complete-record tests remain valid.
 - A later aggregate resource policy must separately account for recovery scratch memory, retained key/index bytes, per-operation payload materialization, response serialization, and concurrent operations. Measure claims under explicit process/container resources; do not infer them from these per-field limits.
 - Any future lower read ceiling requires its own ADR, representative corpus/workload evidence, the non-destructive export/preflight behavior above, and crash/recovery tests proving no acknowledgement or source mutation on refusal.
 

@@ -96,7 +96,7 @@ Any future read-limit decision must not be made from format constants alone. It 
    reservation/reader failures where possible; do not rely on exhausting the
    test host's memory to prove graceful allocation handling.
 
-The accepted writer cap needs focused tests for pre-write rejection and historical-read compatibility. Any implementation that later changes current recovery or data accessibility needs focused crash/recovery coverage and a separate ADR describing the selected compatibility consequence. A claimed process-memory improvement needs measured, resource-scoped evidence for startup and delivery; synthetic boundary tests alone establish correctness, not an operational allocation budget.
+The accepted writer cap has focused tests for boundary acceptance, pre-write rejection, batch outcomes, and historical-read compatibility. Any implementation that later changes current recovery or data accessibility needs focused crash/recovery coverage and a separate ADR describing the selected compatibility consequence. A claimed process-memory improvement needs measured, resource-scoped evidence for startup and delivery; synthetic boundary tests alone establish correctness, not an operational allocation budget.
 
 ## Sources
 

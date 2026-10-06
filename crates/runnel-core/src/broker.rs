@@ -291,9 +291,8 @@ impl Broker {
         validate_name("stream", stream)?;
         let stream_state = self.get_or_create_stream(stream)?;
         let mut stream_state = self.lock_stream(&stream_state)?;
-        let has_records = !records.is_empty();
         let outcomes = stream_state.log.append_batch(records)?;
-        if has_records {
+        if outcomes.iter().any(|outcome| outcome.is_ok()) {
             stream_state.availability.notify_waiters();
         }
         Ok(outcomes)

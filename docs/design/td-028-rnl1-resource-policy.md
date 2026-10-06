@@ -1,17 +1,17 @@
 # TD-028: RNL1 allocation and resource policy
 
-- Status: first compatibility policy accepted by [ADR 0039](../decisions/0039-rnl1-write-admission-and-legacy-read-compatibility.md); runtime write admission and bounded legacy reads remain open
+- Status: first compatibility policy accepted by [ADR 0039](../decisions/0039-rnl1-write-admission-and-legacy-read-compatibility.md) and local RNL1 write admission implemented; bounded legacy reads remain open
 - Baseline for this policy update: `f6bc65cbe19a5902616aeeaa3ce46dedae583d2a`
 - Primary evidence class: design/research; secondary: storage safety
 - Scope: local RNL1 write admission, recovery/indexing, delivery, replay, response materialization, and non-destructive handling of complete records outside a future read policy
 - Related debt: [TD-028](../tech-debt.md#td-028-rnl1-materialization-lacks-an-operational-allocation-budget)
 - Related evidence: [TD-007 storage compatibility](td-007-storage-compatibility-evidence.md#evidence-matrix), [TD-028 allocation-policy evidence](../research/td-028-rnl1-allocation-policy.md), [TD-002 storage scalability](td-002-storage-scalability-evidence.md)
 
-This document records the accepted first policy and the implementation evidence still required. It does not claim that the runtime already enforces the selected write bound or that arbitrary historical records are safely materializable.
+This document records the accepted first policy, its implementation, and the evidence still required for bounded historical reads. The runtime enforces the selected new-write bound; that bound does not make arbitrary historical records safely materializable.
 
 ## Accepted policy summary
 
-New RNL1 appends will be limited to a 128-byte UTF-8 key and a 64 MiB payload, matching the existing per-field limits for RNL2/RNL3. The check belongs at the storage writer, must happen before any frame bytes are written, and must produce an explicit rejected input outcome for scalar and per-record batch publish. The values are existing format limits and a conservative cap on future persisted records, not a measured whole-process memory budget.
+New RNL1 appends are limited to a 128-byte UTF-8 key and a 64 MiB payload, matching the existing per-field limits for RNL2/RNL3. The storage writer checks before any frame bytes are written and returns an explicit `invalid_record` rejection for scalar and per-record batch publish. A rejected-only batch does not notify delivery waiters; mixed batches retain independent per-record results and notify when at least one item is accepted. The values are existing format limits and a cap on future persisted records, not a measured whole-process memory budget.
 
 No lower cap is imposed on complete historical RNL1 reads. Recovery continues to distinguish an incomplete tail from a complete frame, and must not reject, truncate, skip, rewrite, acknowledge, or automatically dead-letter a complete record only because its declared field lengths exceed the new-write limits. This preserves eligibility under the current reader; it does not promise that every host can allocate, replay, or return an arbitrarily large record. Existing process, client-response, and target-format limits may still constrain delivery, and the current reader does not provide a reliable bounded-memory refusal.
 
@@ -73,14 +73,13 @@ Rust documents `Vec::try_reserve` as returning capacity-overflow or allocator-re
 
 ## Implementation and future read-policy gates
 
-The accepted first implementation is intentionally narrower than a complete process-memory budget:
+The accepted first implementation is complete and intentionally narrower than a complete process-memory budget. Core tests cover the new write limits, non-mutating rejection, independent batch outcomes, rejected-only notification behavior, and replay of historical records above the write limits. The remaining gates are:
 
-1. Validate RNL1 key and payload lengths in the storage writer before emitting any frame byte. Reject a scalar publish explicitly; in publish batches, preserve the existing independent per-record result behavior and continue processing later valid items.
-2. Preserve every complete historical RNL1 record through the existing recovery and read path, even when its key or payload exceeds the new write ceiling. Do not reuse write limits as read limits.
-3. Keep incomplete-tail handling independent: only an actually incomplete suffix may enter the existing repair path. A complete malformed record remains an error and is not truncated.
-4. Do not claim that the new write cap bounds recovery, the key cache, delivery materialization, response serialization, or aggregate concurrent memory. These remain explicit follow-up resource outcomes.
-5. Before a future read ceiling below the encoded RNL1 envelope, implement read-only bounded-memory inspection/export for complete outliers and a whole-store non-mutating preflight. Refuse with a distinct resource-policy result that names the stream, offset, field lengths, and selected limit; preserve all source bytes and consumer state. Export must preserve logical offset, timestamp, key bytes, and payload bytes and must not require the record to fit RNL2/RNL3.
-6. A complete read-budget solution must cover recovery transient bytes, retained key/index bytes, operation materialization, response serialization, and aggregate concurrent work separately. Any streaming or refusal path must preserve poll/replay progress and dead-letter source acknowledgement ordering.
+1. Preserve every complete historical RNL1 record through the existing recovery and read path, even when its key or payload exceeds the new write ceiling. Do not reuse write limits as read limits.
+2. Keep incomplete-tail handling independent: only an actually incomplete suffix may enter the existing repair path. A complete malformed record remains an error and is not truncated.
+3. Do not claim that the new write cap bounds recovery, the key cache, delivery materialization, response serialization, or aggregate concurrent memory. These remain explicit follow-up resource outcomes.
+4. Before a future read ceiling below the encoded RNL1 envelope, implement read-only bounded-memory inspection/export for complete outliers and a whole-store non-mutating preflight. Refuse with a distinct resource-policy result that names the stream, offset, field lengths, and selected limit; preserve all source bytes and consumer state. Export must preserve logical offset, timestamp, key bytes, and payload bytes and must not require the record to fit RNL2/RNL3.
+5. A complete read-budget solution must cover recovery transient bytes, retained key/index bytes, operation materialization, response serialization, and aggregate concurrent work separately. Any streaming or refusal path must preserve poll/replay progress and dead-letter source acknowledgement ordering.
 
 ## Read and conversion behavior to preserve
 

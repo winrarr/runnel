@@ -1466,6 +1466,73 @@ fn network_protocol_returns_partial_publish_batch_outcomes() {
     ));
 }
 
+#[test]
+fn network_protocol_rejects_oversized_rnl1_records_without_consuming_offsets() {
+    let directory = TempDir::new().unwrap();
+    let server = RunningServer::start(directory.path());
+    assert!(matches!(
+        request(
+            server.broker_addr,
+            Request::CreateStream {
+                stream: "events".to_owned(),
+            },
+        ),
+        Response::StreamCreated { created: true, .. }
+    ));
+
+    assert!(matches!(
+        request(
+            server.broker_addr,
+            Request::Publish {
+                stream: "events".to_owned(),
+                key: Some("k".repeat(129)),
+                payload: "rejected".to_owned(),
+                request_id: None,
+            },
+        ),
+        Response::Error { code, message }
+            if code == "invalid_record" && message.contains("129 bytes")
+    ));
+    assert!(matches!(
+        request(
+            server.broker_addr,
+            Request::Publish {
+                stream: "events".to_owned(),
+                key: None,
+                payload: "accepted".to_owned(),
+                request_id: None,
+            },
+        ),
+        Response::Published { offset: 0, .. }
+    ));
+
+    assert!(matches!(
+        request(
+            server.broker_addr,
+            Request::PublishBatch {
+                stream: "events".to_owned(),
+                records: vec![
+                    PublishBatchRecord {
+                        key: Some("k".repeat(129)),
+                        payload_base64: BinaryPayload::new(b"rejected".to_vec()),
+                        request_id: None,
+                    },
+                    PublishBatchRecord {
+                        key: None,
+                        payload_base64: BinaryPayload::new(b"accepted".to_vec()),
+                        request_id: None,
+                    },
+                ],
+            },
+        ),
+        Response::PublishBatch { outcomes, .. }
+            if matches!(outcomes.as_slice(), [
+                PublishBatchRecordResponse::Error { code, message },
+                PublishBatchRecordResponse::Published { offset: 1 },
+            ] if code == "invalid_record" && message.contains("129 bytes"))
+    ));
+}
+
 fn request(address: SocketAddr, request: Request) -> Response {
     let encoded = serde_json::to_string(&request).unwrap();
     request_line(address, &encoded)

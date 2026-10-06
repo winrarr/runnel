@@ -314,6 +314,8 @@ Goal: keep recovery, indexing, delivery, replay, and response memory bounded whi
 
 Rationale: [ADR 0039](decisions/0039-rnl1-write-admission-and-legacy-read-compatibility.md) caps new local RNL1 writes at the existing 128-byte key and 64 MiB payload limits while keeping the current complete-record read behavior. Those write limits do not bound old RNL1 keys and payloads, retained key bytes, response copies, or concurrent operations.
 
+Current progress: local RNL1 scalar and batch writes enforce the selected per-field limits before frame output and return `invalid_record` with rejected semantics. Rejected-only batches do not wake delivery waiters, and tests preserve complete historical records above the write limits. Historical recovery and delivery materialization, bounded inspection/export, response-size refusal, and aggregate concurrent memory budgets remain unimplemented.
+
 Constraints:
 
 - keep new-write admission separate from complete historical record eligibility;

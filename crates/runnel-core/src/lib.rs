@@ -3062,11 +3062,9 @@ mod tests {
             .unwrap();
 
         assert_eq!(outcomes.len(), 2);
-        assert!(matches!(
-            &outcomes[0],
-            Err(BrokerError::Io(error)) if error.kind() == io::ErrorKind::InvalidInput
-        ));
+        assert!(matches!(&outcomes[0], Err(BrokerError::InvalidRecord(_))));
         assert_eq!(outcomes[1].as_ref().unwrap(), &0);
+        assert!(!directory.path().join("consumers/events").exists());
         let message = broker.replay("events", "inspector", 0).unwrap();
         assert_eq!(message.key.as_deref(), Some("ok"));
         assert_eq!(message.payload, b"kept");
@@ -3075,6 +3073,68 @@ mod tests {
                 .unwrap()
                 .len(),
             (LEGACY_HEADER_LEN + 2 + 4) as u64
+        );
+    }
+
+    #[tokio::test]
+    async fn publish_batch_notifies_only_when_a_record_is_accepted() {
+        let directory = tempdir().unwrap();
+        let broker = Broker::open(directory.path(), BrokerConfig::default()).unwrap();
+        broker.create_stream("events").unwrap();
+        let stream = broker.get_stream("events").unwrap();
+        let availability = stream.lock().unwrap().availability.clone();
+        let notified = availability.notified();
+        tokio::pin!(notified);
+        notified.as_mut().enable();
+
+        let outcomes = broker
+            .publish_batch(
+                "events",
+                vec![PublishRecord {
+                    key: Some("k".repeat(LEGACY_WRITE_MAX_KEY_LEN as usize + 1)),
+                    payload: b"rejected".to_vec(),
+                    request_id: None,
+                }],
+            )
+            .unwrap();
+        assert!(matches!(
+            outcomes.as_slice(),
+            [Err(BrokerError::InvalidRecord(_))]
+        ));
+        assert!(
+            tokio::time::timeout(Duration::from_millis(5), notified.as_mut())
+                .await
+                .is_err()
+        );
+
+        let notified = availability.notified();
+        tokio::pin!(notified);
+        notified.as_mut().enable();
+        let outcomes = broker
+            .publish_batch(
+                "events",
+                vec![
+                    PublishRecord {
+                        key: Some("k".repeat(LEGACY_WRITE_MAX_KEY_LEN as usize + 1)),
+                        payload: b"rejected".to_vec(),
+                        request_id: None,
+                    },
+                    PublishRecord {
+                        key: None,
+                        payload: b"accepted".to_vec(),
+                        request_id: None,
+                    },
+                ],
+            )
+            .unwrap();
+        assert!(matches!(
+            outcomes.as_slice(),
+            [Err(BrokerError::InvalidRecord(_)), Ok(0)]
+        ));
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), notified.as_mut())
+                .await
+                .is_ok()
         );
     }
 

@@ -105,28 +105,24 @@ fn request_aware_limits(durable_format: DurableFormat) -> RequestAwareLimits {
 
 fn legacy_write_lengths(key_len: usize, payload_len: usize) -> Result<(u32, u32), BrokerError> {
     let key_len = u32::try_from(key_len).map_err(|_| {
-        BrokerError::Io(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "message key exceeds u32 length",
-        ))
+        BrokerError::InvalidRecord(
+            "message key length exceeds u32 storage representation".to_owned(),
+        )
     })?;
     if key_len > LEGACY_WRITE_MAX_KEY_LEN {
-        return Err(BrokerError::Io(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "message key exceeds RNL1 write limit",
+        return Err(BrokerError::InvalidRecord(format!(
+            "message key is {key_len} bytes; RNL1 write limit is {LEGACY_WRITE_MAX_KEY_LEN} bytes"
         )));
     }
 
     let payload_len = u32::try_from(payload_len).map_err(|_| {
-        BrokerError::Io(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "message payload exceeds u32 length",
-        ))
+        BrokerError::InvalidRecord(
+            "message payload length exceeds u32 storage representation".to_owned(),
+        )
     })?;
     if payload_len > LEGACY_WRITE_MAX_BODY_LEN {
-        return Err(BrokerError::Io(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "message payload exceeds RNL1 write limit",
+        return Err(BrokerError::InvalidRecord(format!(
+            "message payload is {payload_len} bytes; RNL1 write limit is {LEGACY_WRITE_MAX_BODY_LEN} bytes"
         )));
     }
 
@@ -617,7 +613,7 @@ impl StreamLog {
                     appended = true;
                     outcomes.push(Ok(offset));
                 }
-                Err(error) if is_invalid_input(&error) => outcomes.push(Err(error)),
+                Err(error) if is_per_record_rejection(&error) => outcomes.push(Err(error)),
                 Err(error) => return Err(error),
             }
         }
@@ -1252,11 +1248,12 @@ fn record_is_candidate(
         .is_none_or(|key| in_flight.is_none_or(|(_, keys)| !keys.contains(key)))
 }
 
-fn is_invalid_input(error: &BrokerError) -> bool {
-    matches!(
-        error,
-        BrokerError::Io(io_error) if io_error.kind() == io::ErrorKind::InvalidInput
-    )
+fn is_per_record_rejection(error: &BrokerError) -> bool {
+    match error {
+        BrokerError::InvalidRecord(_) => true,
+        BrokerError::Io(io_error) => io_error.kind() == io::ErrorKind::InvalidInput,
+        _ => false,
+    }
 }
 
 fn now_ms() -> u64 {
@@ -1290,14 +1287,22 @@ mod tests {
             .unwrap(),
             (LEGACY_WRITE_MAX_KEY_LEN, LEGACY_WRITE_MAX_BODY_LEN)
         );
+        assert_eq!(
+            legacy_write_lengths("é".repeat(64).len(), 0).unwrap().0,
+            128
+        );
 
         assert!(matches!(
             legacy_write_lengths(LEGACY_WRITE_MAX_KEY_LEN as usize + 1, 0),
-            Err(BrokerError::Io(error)) if error.kind() == io::ErrorKind::InvalidInput
+            Err(BrokerError::InvalidRecord(_))
+        ));
+        assert!(matches!(
+            legacy_write_lengths("é".repeat(65).len(), 0),
+            Err(BrokerError::InvalidRecord(_))
         ));
         assert!(matches!(
             legacy_write_lengths(0, LEGACY_WRITE_MAX_BODY_LEN as usize + 1),
-            Err(BrokerError::Io(error)) if error.kind() == io::ErrorKind::InvalidInput
+            Err(BrokerError::InvalidRecord(_))
         ));
     }
 
@@ -1325,10 +1330,7 @@ mod tests {
             vec![2],
             false,
         );
-        assert!(matches!(
-            key_error,
-            Err(BrokerError::Io(error)) if error.kind() == io::ErrorKind::InvalidInput
-        ));
+        assert!(matches!(key_error, Err(BrokerError::InvalidRecord(_))));
         assert_eq!(
             std::fs::read(&path).unwrap(),
             bytes_after_valid_boundary_record
@@ -1339,10 +1341,7 @@ mod tests {
 
         let payload_error =
             log.append_with_sync(None, vec![2; LEGACY_WRITE_MAX_BODY_LEN as usize + 1], false);
-        assert!(matches!(
-            payload_error,
-            Err(BrokerError::Io(error)) if error.kind() == io::ErrorKind::InvalidInput
-        ));
+        assert!(matches!(payload_error, Err(BrokerError::InvalidRecord(_))));
         assert_eq!(
             std::fs::read(&path).unwrap(),
             bytes_after_valid_boundary_record
@@ -1354,6 +1353,24 @@ mod tests {
             log.append_with_sync(None, vec![3], false).unwrap(),
             1,
             "a rejected append must not consume a logical offset"
+        );
+    }
+
+    #[test]
+    fn rnl1_writer_accepts_payload_at_selected_boundary() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("events.log");
+        let mut log = StreamLog::create(&path, DurableFormat::Rnl1).unwrap();
+        assert_eq!(
+            log.append_with_sync(None, vec![7; LEGACY_WRITE_MAX_BODY_LEN as usize], false)
+                .unwrap(),
+            0
+        );
+        assert_eq!(log.next_offset(), 1);
+        assert_eq!(log.in_memory_record_count(), 1);
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().len(),
+            LEGACY_HEADER_LEN as u64 + u64::from(LEGACY_WRITE_MAX_BODY_LEN)
         );
     }
 

@@ -153,7 +153,7 @@ This register records known implementation and documentation shortcomings. Produ
 
 ## TD-028: RNL1 materialization lacks an operational allocation budget
 
-- Status: partially addressed; ADR 0039 accepts 128-byte keys and 64 MiB payloads for new local RNL1 writes while preserving complete historical reads; aggregate recovery and delivery budgets remain open
+- Status: partially addressed; new local RNL1 writes enforce 128-byte keys and 64 MiB payloads while complete historical reads remain eligible; aggregate recovery and delivery budgets remain open
 - Goal: define and enforce a resource policy for legacy `RNL1` recovery and delivery without silently making previously valid records unreadable.
 - Rationale: the historical `RNL1` format permits very large records, while current recovery and delivery materialize their keys and payloads in memory without a smaller per-record allocation limit.
 - Impact: a complete record may require up to `u32::MAX` bytes for its key and another `u32::MAX` bytes for its payload. Current recovery allocates the key and delivery allocates the full payload; the current completeness check prevents allocation for a short trailing record but does not bound a complete large record.
