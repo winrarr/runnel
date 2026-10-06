@@ -18,12 +18,18 @@ must distinguish a complete view with no match from a retained suffix whose
 deleted prefix could contain an earlier match, and it must not scan history
 for every request.
 
-The local engine appends mixed `RNL1`, `RNL2`, and `RNL3` frames to one file per
-stream. Opening a stream already scans every complete frame to rebuild the
-recent record cache, bounded sparse offset checkpoints, and request-ID index.
-The recent cache retains 1,024 records; sparse offset checkpoints occur every
-64 offsets but retain only 1,024 entries. An old logical offset can therefore
-require scanning from byte zero. There is no timestamp index.
+The local engine appends records to one file per stream. At this baseline,
+`Broker::open` writes `RNL1` for ordinary appends and `RNL3` for request-ID
+appends; the explicitly selected `VersionedV1` mode writes `RNL2` for ordinary
+appends and `RNL3` for request-ID appends. Opening a stream already scans every
+complete frame to rebuild the recent record cache, bounded sparse offset
+checkpoints, and request-ID index. The recent cache retains 1,024 records;
+sparse offset checkpoints occur every 64 offsets but retain only 1,024
+entries. An old logical offset can therefore require scanning from byte zero.
+There is no timestamp index. The format fixtures below cover currently
+selectable writer paths; they do not create an obligation to support retired
+software versions or additional formats solely because a reader recognizes
+them.
 
 The clustered engine materializes each stream's retained messages in an
 offset-ordered `Vec`. Applied commands are first appended to and synced in the
@@ -200,10 +206,14 @@ tracked by TD-002 and TD-010.
   partially filled final block. Verify exact offset selection, append-order
   continuation, at most 256 header reads for a match, and zero block reads
   for no-match.
-- Verify local checkpoint construction for RNL1, RNL2, and RNL3 records,
-  byte-cursor correctness, batch append ordering, torn final tails, and
-  restart/rebuild. Complete malformed or corrupt log records must still fail
-  recovery rather than produce an index result.
+- Verify local checkpoint construction and byte-cursor correctness for each
+  currently selectable writer path: default `RNL1` ordinary append,
+  request-ID `RNL3` append, and opt-in `VersionedV1`/`RNL2` ordinary append.
+  This covers current product behavior rather than compatibility with prior
+  software versions or formats that are only reader-recognized. Also cover
+  batch append ordering, torn final tails, and restart/rebuild. Complete
+  malformed or corrupt log records must still fail recovery rather than
+  produce an index result.
 - Verify clustered index equivalence after journal replay, state checkpoint
   reopen, snapshot build/install, follower restart, and leader change. The
   index must be absent from persisted snapshots and reconstructed from their
@@ -218,8 +228,8 @@ tracked by TD-002 and TD-010.
   sparse-match, and adversarial-regression workloads. Measure index bytes and
   resident memory, startup/rebuild cost, selector latency, and foreground
   publish/poll latency over increasing histories before making performance
-  claims. Verify `response_too_large` for a legacy record that exceeds the
-  negotiated response limit without cloning/materializing its payload or
+  claims. Verify `response_too_large` for a complete stored record that exceeds
+  the negotiated response limit without cloning/materializing its payload or
   changing any consumer state.
 
 This is documentation and design evidence only. No runtime or crash-recovery
