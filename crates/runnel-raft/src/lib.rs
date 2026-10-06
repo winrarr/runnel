@@ -33,6 +33,7 @@ mod forwarding;
 mod group_manager;
 mod log_store;
 mod network;
+mod peer_tls;
 mod persistence_write;
 mod state_machine;
 mod state_machine_journal;
@@ -44,6 +45,7 @@ pub use engine::{InMemoryCluster, PersistentEngine, RaftGroup, SingleNodeEngine}
 #[cfg(test)]
 use group_manager::DataGroupManifest;
 pub use group_manager::{GroupManager, ReplicationProgressSnapshot};
+pub use peer_tls::{PeerTlsConfig, PeerTlsHandshakePermit};
 #[cfg(feature = "persistence-write-counters")]
 pub use persistence_write::{
     PersistenceWriteCounterSnapshot, PersistenceWriteMetricsSnapshot, PersistenceWriteOperation,
