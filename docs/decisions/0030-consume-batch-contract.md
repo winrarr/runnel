@@ -88,9 +88,11 @@ acknowledgements under the following contract:
 - Preserve the current same-key exclusion rule across the complete consumer:
   at most one in-flight record for any non-empty key. Different keys can be
   acknowledged out of order. Response order does not promise application
-  execution order. Each offset continues to use its pinned timeout and attempt
-  limit across retry, even when a batch contains offsets with different policy
-  snapshots; policy changes do not rewrite an existing offset's policy.
+  execution order. Each offset continues to use its full effective consumer
+  retry policy across retries, including its timeout and attempt limit. The
+  per-offset snapshot includes the complete policy selected at assignment;
+  any additional accepted retry-policy fields are pinned too. Later consumer
+  configuration does not rewrite an existing offset's policy.
 - Existing attempt-limit terminal movement remains per offset and follows the
   current engine boundary. It is not an acknowledgement-vector item. Local
   dead-letter movement remains at least once across its separate target-log
