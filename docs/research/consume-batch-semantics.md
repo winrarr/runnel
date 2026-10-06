@@ -1,6 +1,6 @@
 # Consume-batch semantics study
 
-- Status: source-backed research; proposed semantic contract recorded in ADR 0030; runtime API and behavior are not implemented
+- Status: source-backed research supporting the semantic contract accepted in ADR 0030; runtime API and behavior are not implemented
 - Last reviewed: 2026-10-06
 - Repository review baseline: `8fae2d1f81da9146a26cfb20d190214eab370a71`
 - Primary evidence class: research/design
@@ -13,8 +13,8 @@
 - Related performance evidence: [Systems performance research for Runnel](systems-performance-research.md)
 
 This note compares consume-batch references with the behavior in the code at
-the recorded review baseline. It supports the semantic contract proposed in ADR
-0030; it does not accept a wire API, implementation, compatibility promise, or
+the recorded review baseline. It supports the semantic contract accepted in ADR
+0030; it does not define a wire API, implementation, compatibility promise, or
 performance claim.
 
 ## Assessment
@@ -308,10 +308,11 @@ assertions should preserve topology-free semantics where practical.
   test covers transfer to a new leader, while process restart of a three-node
   cluster with a pending snapshot remains untested. Vector outcomes and the
   other batch-specific cases remain open.
-- **Near-term vs deferred:** recommend accepting the semantic contract proposed
-  in ADR 0030 because both engines expose the necessary delivery and durability
-  boundaries and the reviewed references support bounded receive and per-entry
-  outcomes. Runtime API shape remains provisional. Implementation must add
+- **Near-term vs deferred:** the accepted contract is reasonably implementable
+  as a protocol/engine vertical slice because both engines expose the necessary
+  delivery and durability boundaries and the reviewed references support
+  bounded receive and per-entry outcomes. Runtime API shape remains provisional.
+  Implementation must add
   batch-specific contract, local, cluster, and real-process coverage; the
   broader benchmark matrix remains the acceptance gate for performance claims.
   ADR 0026's current error outcome taxonomy is not operation-stage evidence, so
@@ -329,14 +330,14 @@ assertions should preserve topology-free semantics where practical.
   0027, and 0029, the shared-consumer and batching backlog outcomes, and TD-017
   and TD-025 were inspected. No code refactor is warranted: current code follows
   the accepted single-record fencing and retry-policy decisions, and this update
-  corrects the research record. ADR 0030 remains proposed; the backlog stays
-  open because runtime behavior, failure tests, and performance evidence are
+  corrects the research record. ADR 0030 is accepted; the backlog stays open
+  because runtime behavior, failure tests, and performance evidence are
   unfinished. TD-025 already tracks the stage-aware outcome gap identified here,
   and TD-017 tracks the separate local dead-letter recovery boundary, so no new
   tracker item is warranted.
 - **Unresolved evidence:** no workload has established whether network round
   trips, per-record local sync, consensus round trips, JSON/base64 work, or
-  client-side processing dominates; the proposed 1,024-record ceiling is a
+  client-side processing dominates; the accepted 1,024-record ceiling is a
   protocol bound, not an optimal or resource-validated batch size.
 
 ## References

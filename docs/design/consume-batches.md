@@ -1,7 +1,7 @@
-# Consume batches: proposed semantic contract
+# Consume batches: accepted semantic contract
 
-- Status: proposed for acceptance by [ADR 0030](../decisions/0030-consume-batch-contract.md); runtime API and behavior are not implemented
-- Implementation review baseline: `8fae2d1f81da9146a26cfb20d190214eab370a71`
+- Status: semantic contract accepted by [ADR 0030](../decisions/0030-consume-batch-contract.md); runtime API and behavior are not implemented
+- Implementation review baseline: `c3a894b6d88a40245c1116e2c5006b94f5573aee`
 - Linked research reviewed at baseline: `8fae2d1f81da9146a26cfb20d190214eab370a71`
 - Primary evidence class: design/research
 - Related outcome: [Make batching preserve per-record outcomes](../backlog.md#make-batching-preserve-per-record-outcomes)
@@ -10,7 +10,7 @@
   [ADR 0026](../decisions/0026-semantic-engine-error-classification.md), [ADR 0027](../decisions/0027-consumer-scoped-retry-policy.md),
   [ADR 0029](../decisions/0029-local-typed-dead-letter-move-identities.md)
 
-## Recommendation
+## Accepted contract
 
 Add a pull operation that assigns a bounded set of records to one consumer
 member, and an acknowledgement operation that accepts independent delivery
@@ -26,7 +26,7 @@ consumer journal sync and acknowledgement after its journal sync. The cluster
 confirms both only after the corresponding data-group Raft command commits.
 Neither boundary makes application work exactly once.
 
-ADR 0030 proposes these semantic invariants, including the initial
+ADR 0030 accepts these semantic invariants, including the initial
 1,024-record request ceiling, but does not freeze the names or fields below as
 a wire API. No performance gain is established. Implementation remains gated
 on the correctness and performance evidence listed at the end of this design.
@@ -77,7 +77,7 @@ current demand-driven rules. A byte limit too small for the first eligible
 record returns an explicit oversized-record error before assignment.
 
 This expands the accepted scalar rule of one outstanding delivery per member
-to one outstanding *set* per member. ADR 0030 proposes this semantic change;
+to one outstanding *set* per member. ADR 0030 accepts this semantic change;
 no compatibility obligation requires preserving the scalar wire shape.
 
 Each ack response preserves input order and reports one of:
@@ -198,7 +198,7 @@ deterministically from the committed command and its leader-sampled lease
 time. Local lease expiry uses a monotonic clock; clustered
 expiry uses the replicated lease-clock floor and absolute deadline described
 in [ADR 0015](../decisions/0015-clustered-shared-consumer-ownership.md). At
-review baseline `8fae2d1f81da9146a26cfb20d190214eab370a71`, both engines reject
+review baseline `c3a894b6d88a40245c1116e2c5006b94f5573aee`, both engines reject
 an ack that observes expiry before reassignment;
 the shared-engine contract test exercises that case. The refreshed
 [consume-batch research note](../research/consume-batch-semantics.md) records
@@ -313,7 +313,7 @@ work; an all-or-nothing transaction across batch receipts is unnecessary for
 independent application records and cannot include consumer side effects; and
 background prefetch would decouple application batch size from storage fetch,
 but adds hidden buffers and scheduling state before Runnel has evidence for
-that architecture. The proposed pull batch is the smallest design that can
+that architecture. The accepted pull batch is the smallest design that can
 amortize the existing assignment and ack boundaries while retaining receipt
 semantics.
 
@@ -356,11 +356,10 @@ comparison after commit when it meaningfully covers the changed path, otherwise
 record the targeted benchmark and coverage gap as required by
 [benchmarking policy](../benchmarking.md).
 
-**Recommendation:** accept the semantic contract proposed in ADR 0030. It is
-implementable as a protocol/engine vertical slice within the existing local
-and single-group replicated design. Runtime work remains gated on the tests
-above, including ack journal reconciliation and the preserved dead-letter
-boundary.
+**Implementation gate:** the accepted semantic contract is implementable as a
+protocol/engine vertical slice within the existing local and single-group
+replicated design. Runtime work remains gated on the tests above, including
+ack journal reconciliation and the preserved dead-letter boundary.
 The existing [batching backlog item](../backlog.md#make-batching-preserve-per-record-outcomes)
 already tracks the intended outcome and broad evidence gate, so this decision
 does not change its goal or acceptance criteria; keep it open. No separate
