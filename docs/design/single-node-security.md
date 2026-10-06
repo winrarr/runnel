@@ -1,125 +1,152 @@
 # Single-node client and operations security
 
-**Status:** Design proposal; not an accepted runtime contract; **Last reviewed:** 2026-09-29; **Observed baseline:** `3d2f2a6a68ef978ed43a0735159f26db332483d9`
+**Status:** first application-client security contract accepted by [ADR 0035](../decisions/0035-first-application-client-security.md); runtime behavior is not implemented. **Last reviewed:** 2026-10-06. **Observed baseline:** `5d3625d9c63903809e2a026c997522cf182786e5`.
 
-This note scopes a first security boundary for one Runnel broker process. It records observed behavior, compares established designs, and recommends outcomes for a later decision and implementation. It does not add security controls or make a security guarantee. The provisional wire protocol has no backward-compatibility requirement, so a future accepted design may change its connection setup.
+This document records the accepted boundary and the implementation work it
+leaves. Current behavior is defined by code and tests. The source-backed
+[authentication research](../research/client-authentication.md) compares that
+behavior with first-party broker references and primary TLS guidance. This
+design adds no runtime control or security guarantee.
 
-## Observed baseline
+## Current behavior and exposure
 
-- `runnel-server` binds the client JSON-lines listener and the HTTP listener directly as plain TCP sockets. The client listener defaults to `127.0.0.1:4222`; the HTTP listener defaults to `127.0.0.1:8080`. There is no protocol handshake or authentication state before requests reach `dispatch` ([bootstrap](../../crates/runnel-server/src/bootstrap.rs), [connection handling](../../crates/runnel-server/src/connection.rs), [dispatch](../../crates/runnel-server/src/dispatch.rs)).
-- The reusable client opens a `TcpStream` and sends JSON-lines requests without TLS or authentication ([client](../../crates/runnel-client/src/lib.rs)). The `runnelctl` CLI uses the same client path.
-- The HTTP listener serves `/health/live`, `/health/ready`, and `/metrics` without authentication. The current default metrics use fixed operation labels and do not include principal identity, stream names, message data, or credentials ([observability](../../crates/runnel-server/src/observability.rs)).
-- The Kubernetes example explicitly binds broker, HTTP, and peer listeners to `0.0.0.0`. Its documentation says the broker and HTTP Service have no TLS, authentication, authorization, or credential rotation and must remain in a trusted development network ([manifest](../../deploy/kubernetes/runnel.yaml), [deployment notes](../../deploy/kubernetes/README.md)). This is an observed development configuration, not a secure-network guarantee.
-- The existing backlog already calls for runtime-supplied credentials, optional client authentication and authorization, documented TLS, and repeatable security tests in [Make the single-node deployment ready for real use](../backlog.md#make-the-single-node-deployment-ready-for-real-use). The clustered deployment has a separate security outcome.
+- The server binds the client JSON-lines listener directly over plain TCP,
+  defaulting to `127.0.0.1:4222`. There is no TLS, authentication, or
+  authorization state before requests reach dispatch ([bootstrap](../../crates/runnel-server/src/bootstrap.rs),
+  [connection handling](../../crates/runnel-server/src/connection.rs),
+  [dispatch](../../crates/runnel-server/src/dispatch.rs)).
+- The reusable Rust client opens a plain `TcpStream`; `runnelctl` uses the same
+  path. Neither currently accepts credentials or TLS settings
+  ([client](../../crates/runnel-client/src/lib.rs),
+  [CLI](../../crates/runnel-cli/src/main.rs)).
+- The HTTP listener also defaults to loopback but serves `/health/live`,
+  `/health/ready`, and `/metrics` without TLS or authentication. Readiness
+  exposes stream count and storage bytes; metrics show operational signals
+  ([observability](../../crates/runnel-server/src/observability.rs)).
+- The development Kubernetes manifest binds both listeners to `0.0.0.0`,
+  exposes port 8080 through its regular and headless Services, and uses the
+  shared HTTP listener for health probes and metrics. No NetworkPolicy or
+  HTTP access control is installed. This is not a private boundary by default
+  and is not a supported production security configuration
+  ([manifest](../../deploy/kubernetes/runnel.yaml),
+  [deployment notes](../../deploy/kubernetes/README.md#health-and-traffic-routing),
+  [metrics notes](../../deploy/kubernetes/README.md#metrics-and-monitoring)).
+- The separate Raft peer listener also uses plain TCP today. Application
+  listener security does not protect peer RPCs or make a cluster secure.
 
-## Scope and threat model
+## Accepted first client contract
 
-### Assets and boundaries
+The accepted choice is summarized here; [ADR 0035](../decisions/0035-first-application-client-security.md)
+is authoritative if wording differs.
 
-The protected assets are message payloads and keys, stream and consumer state, the ability to publish, consume, replay, acknowledge, or change consumer policy, authentication credentials, TLS private keys, operational metadata, and broker availability.
+- Terminate TLS in Runnel for secured application connections and require TLS
+  1.3. Clients validate the server certificate chain and connection name.
+  TLS 1.2 may be added only as an explicit non-default compatibility extension
+  if supported-client evidence justifies its additional profile.
+- Disable TLS 1.3 early data (0-RTT). Runnel has no replay-safe protocol
+  profile for mutating operations, so requests cannot reach dispatch before
+  the full handshake completes ([RFC 9846](https://www.rfc-editor.org/info/rfc9846/)).
+- TLS and pre-authentication input must use bounded connection slots, deadlines,
+  memory, and frame sizes; an expired or failed authentication attempt closes
+  the unauthenticated connection.
+- Retain unauthenticated plaintext only on the loopback local-development
+  default. A non-loopback client listener requires both TLS and a bearer
+  credential; partial or invalid secure config fails closed, with no protocol
+  downgrade. An explicitly named development/test override does not make a
+  remote deployment secure.
+- Authenticate each secured connection before any ordinary protocol request.
+  A runtime policy file contains credential IDs, token verifier digests, and
+  one fixed role per token; raw 256-bit random tokens come from protected
+  runtime client secret sources. Multiple token entries per role allow a
+  staged restart-based rotation.
+- `application` credentials can publish, batch publish, consume, replay,
+  acknowledge, and inspect consumer policy. `operator` credentials can issue
+  all current protocol operations, including stream creation, consumer-policy
+  changes, and protocol health inspection. Authorization is checked before
+  engine dispatch. The policy has no per-stream or per-consumer grants; every
+  application credential can access all broker data.
+- Keep HTTP health and metrics outside the application credential boundary.
+  The listener stays loopback by default. If a deployment binds it beyond
+  loopback, its network must allow only trusted health-probe sources and the
+  designated private scraper; do not publish it to an untrusted or public
+  route. The current development manifest does not enforce this requirement.
+- Scope the first deployment guarantee to a single node. Credential policy is
+  supplied locally, not replicated. A clustered deployment needs consistent
+  policy on every client-serving replica and coordinated rotation; this ADR
+  does not establish a safe rolling configuration procedure or peer security.
 
-The first boundary covers client-to-broker requests and the health/metrics surface of a single node. It distinguishes:
+Authentication exchange bytes, protocol-version negotiation, TLS crate/API,
+configuration syntax, command-line names, client API shape, token generation
+tooling, and HTTP listener implementation remain implementation or protocol
+design work. In particular, do not add an authentication frame or negotiation
+field here; the protocol compatibility decision owns those bytes.
 
-1. **Local development:** loopback connections on a single host. Loopback limits network reach, but every local process able to use that socket can currently issue every protocol operation. It does not isolate mutually untrusted users sharing the host.
-2. **Trusted private network:** a broker reached across a LAN, VPC, container, or pod network. Network isolation helps, but a compromised peer or accidental exposure can observe or issue traffic unless the application connection itself is protected.
-3. **Operations surface:** health and metrics used by probes and monitoring. These endpoints do not carry message payloads today, but can reveal service state and load. Health probes need a low-friction path; metrics access should be limited to the monitoring boundary.
-4. **Persistent storage and host:** operating-system users, administrators, the broker process, mounted storage, and backups. Transport authentication does not encrypt existing data at rest or defend against host/root access.
+## Implementation guidance and release gates
 
-Out of scope for this proposal are Raft peer authentication and encryption, cluster membership, inter-node authorization, multi-tenant isolation, per-user resource quotas, an external identity provider, broker-host compromise, administrator compromise, and protection against volumetric network denial of service. These remain separate design or operational outcomes. In particular, securing the client listener must not be represented as securing the current plain TCP peer listener.
+The server must validate the certificate/key pair and complete credential
+policy before binding a secure client listener. Invalid configuration,
+unknown roles, or unreadable files are startup errors. The client must never
+send a token before TLS succeeds, must verify the server's identity, and must
+not automatically replay an operation after an authentication or transport
+failure. Credential and certificate changes require a restart; old and new
+token verifiers may overlap during client migration, but restarting drops
+persistent connections. When requests may already have reached dispatch, the
+current unknown-outcome rules still apply.
 
-### Actors and assumptions
+Authorization must be an exhaustive mapping from each protocol operation to a
+role requirement. Unknown or unclassified operations are denied until that
+mapping is updated. A denial must not reach the engine or reveal stream or
+consumer existence. The policy must stay outside the engine and persistent
+state: client identity is a server transport concern, not a durable message
+attribute.
 
-Assume an attacker may observe or modify traffic on a network path, connect from an untrusted network location, possess a revoked or low-privilege client credential, or send malformed and repeated connection attempts. Also account for accidental deployment exposure and operator mistakes with files or ACLs. The broker process, its host administrator, and the local filesystem controls are trusted for this first cut. A credentialed client can read the data and perform operations granted to its principal; authentication cannot make malicious authorized application behavior safe.
+Logs and metrics must omit tokens, verifier digests, private keys, message
+payloads, message keys, resource names, and attacker-controlled identity
+labels. Security metrics should use only fixed low-cardinality operation and
+reason values. Repeated bad credentials must not create unbounded log or
+metric state.
 
-## Recommended initial model
+The secured listener needs real-process tests for loopback development mode,
+remote-bind rejection and explicit development override, TLS 1.3 success and
+TLS 1.2/plaintext rejection, disabled 0-RTT, server trust and name validation,
+incomplete handshake and oversized pre-authentication bounds, credential
+failure before dispatch, both roles across every operation, exhaustive
+authorization for future variants, invalid config before listener acceptance,
+secret redaction, and restart-based token and certificate rotation. Tests must
+prove no request is replayed automatically when its result may be unknown.
 
-The recommendation is **TLS for network client traffic, static high-entropy bearer credentials for client identity, and default-deny operation grants**. Keep the policy and credential verifier in a runtime configuration file owned by the broker operator. This is a deliberately small, single-node bootstrap model, not a multi-tenant identity service.
+Deployment evidence must separately validate HTTP access. For Kubernetes,
+health probes and the designated scraper must reach their intended routes,
+while untrusted namespaces and ingress cannot reach port 8080. Validate the
+actual network-policy behavior with the supported CNI; the presence of policy
+YAML is not proof of isolation. The existing development manifest remains
+explicitly insecure until TLS/authentication, protected deployment networks,
+and the separate peer-security boundary are implemented and tested.
 
-### Authentication boundary
+Correctness and operational safety are the primary evidence. A docs-only
+contract decision has no applicable runtime tests and makes no throughput or
+latency claim. Measure connection setup and persistent-connection costs only
+after implementation if making a performance claim.
 
-- Complete TLS negotiation and server-certificate validation before sending any credential or application request. Require TLS on any non-loopback client listener in the secure operating mode; do not retry or fall back to plaintext on the same port.
-- After TLS, require a bounded connection preface/authentication exchange before accepting any ordinary `Request`. A missing or failed exchange must never reach `dispatch`, including for `Health`. Keep the authentication frame and deadline inside the existing connection and request resource bounds. Do not make authentication an optional ordinary operation that can be skipped by sending another request first.
-- Use named principals with randomly generated, high-entropy opaque tokens. Treat tokens as secrets equivalent to passwords. Avoid user-chosen passwords, challenge-response invention, and bearer tokens on plaintext connections. Allow more than one active token verifier to map to a principal for planned rotation. Because a sufficiently random token is not a human password, the server can store a one-way digest rather than recoverable token text; the exact token format and digest choice belong in the implementation ADR.
-- Associate the authenticated principal with the connection. Authorize every request before invoking the engine, using the latest valid policy snapshot. Authentication establishes identity; it does not imply permission. Keep policy evaluation in `runnel-server` at the protocol boundary rather than adding transport identity to `runnel-engine` or the storage model.
-- Use explicit grants and deny by default. The initial policy should support these distinct capabilities: publish; consume and acknowledge; replay; inspect consumer state; configure consumer policy; create streams; and operator access. Grants should be scoped to exact validated stream names, and to exact consumer names for consumer-scoped operations. Avoid regexes, implicit wildcard semantics, and an anonymous/default user initially. Stream creation and consumer-policy changes should require an operator grant unless a later decision defines safe scoped delegation. An operator can grant application principals narrower access. The implementation must map every current and future protocol operation exhaustively to a capability; an unclassified operation is denied.
-- Provide a documented development mode for unauthenticated loopback use only. It is not a production setting. The secure mode should reject non-loopback client binds without TLS and authentication unless an explicitly named insecure test/development override is supplied. Keep loopback as the default bind. This changes today’s permissive `--listen` behavior for users who bind remotely without security configuration; the protocol and CLI remain provisional.
+## Deferred boundaries
 
-This proposal does not require mutual TLS for the first release. TLS server authentication prevents credential disclosure to a network impostor when clients verify the configured server identity. Client certificates and certificate-to-principal mapping are a possible later mechanism for deployments that already operate a PKI; accepting mTLS must not silently imply authorization grants.
+- Named principals with exact stream/consumer grants and custom ACL patterns
+  are deferred. They could isolate mutually untrusted services, but Runnel is
+  not initially multi-tenant and has no principal/policy management surface.
+- Mutual TLS, OAuth/OIDC, LDAP, password authentication, automated token
+  issuance, token expiry, live reload, and external secret-manager plugins are
+  deferred until a concrete deployment requires their lifecycle and
+  availability contracts.
+- The shared cleartext HTTP listener remains a security gap. Route-level
+  authentication, TLS, or split listener policy may be a later runtime slice;
+  until then, operations must be restricted to a verified private network.
+- Cluster-wide credential distribution, safe rolling rotation, peer mTLS,
+  node identity, and peer protocol compatibility remain outside this
+  single-node contract and require their own accepted design.
 
-### Authorization semantics
-
-For each request, evaluate the principal, operation, validated stream name, and (when present) consumer name before engine dispatch. Denials must have a stable, explicit `forbidden`-class response that does not disclose whether an unmatched stream or consumer exists. A denied write is known not to have been dispatched; an authorization failure must not be confused with a timeout or an ambiguous operation outcome. This gate does not change the existing at-least-once acknowledgement contract or authorize automatic retries.
-
-Treat `Health` as an observation capability because its current response includes stream count and logical storage bytes. Keep liveness/readiness probes free of message data and credentials. Metrics remain a separate operations surface: restrict them to a private monitoring path, and require transport security and an appropriate scrape identity whenever they cross an untrusted network. If probes and metrics cannot be isolated on the current shared HTTP listener, a later implementation should split their bind/access policies rather than expose all HTTP routes to the client-facing network.
-
-The grants above do not partition storage, enforce per-principal capacity, or isolate a principal from side effects allowed to another principal on the same stream. Exact consumer grants limit which checkpoint a client can affect, but do not create a separate tenant or guarantee fair scheduling. Those are separate outcomes.
-
-## TLS, configuration, and secret lifecycle
-
-### Configuration and key handling
-
-Use explicit file paths for the server certificate chain and matching private key. For client-certificate authentication in a later stage, configure a separate trusted client CA bundle and make client-certificate verification explicit. Clients configure their trusted server CA roots and connect using a DNS name or IP address present in the certificate Subject Alternative Name (SAN). Do not provide a “skip verification” mode as a normal option. Prefer the TLS library’s maintained secure defaults, disable obsolete protocol versions, and require at least TLS 1.2 unless supported-client evidence establishes a stronger compatible minimum.
-
-TLS files and principal policy are supplied at runtime, never committed to the repository, baked into a container image, or placed under the broker data directory. A deployment may mount files from its secret manager or orchestrator secret facility. Restrict private-key and client-credential file access to the service account and intended client; protect backups and secret-manager access with least privilege. Environment variables and command-line arguments should not carry token values because process inspection, diagnostics, and launch records can disclose them. CLI tools should accept a protected credential file or an application-provided secret source and must not echo the value.
-
-The broker must validate the complete certificate/key pair, trust settings, policy syntax, unique principal and credential identifiers, and ACL targets before binding the client or operations listener. An invalid or unreadable security configuration is a startup error; it must not silently disable TLS or authorization. Keep certificate paths, principal names, and public certificate metadata out of error messages when they could reveal deployment details unnecessarily.
-
-### Rotation and revocation
-
-For the first cut, use explicit restart-based rotation rather than claiming live reload. Rotate an application token by adding a newly generated token for the same least-privilege principal to the policy and restarting the broker; deploy it to the client and verify successful use while the old token remains valid; then remove the old verifier and restart again. Restart drops connections; clients reconnect using their new configuration and do not replay an operation whose outcome is unknown. The overlap interval is an operator-controlled compromise between availability and revocation speed. Emergency revocation removes the old verifier and accepts the connection interruption.
-
-Initial static tokens have no automatic expiry. This keeps local validation and offline operation simple, but makes timely operator revocation essential; time-limited credentials or dynamic issuance need a later design for renewal, clock skew, and expired-client behavior.
-
-Replace a server leaf certificate and private key as a matched pair, validate the new pair, then restart the broker. For CA rotation, clients should trust both old and new roots during a planned overlap; switch the server certificate, verify clients can connect, and then remove the retired root from client trust stores. A compromised key requires expedited replacement and removal of its trust path. Certificate reload, zero-downtime rotation, and automated secret manager integration are deferred until their lifecycle and failure behavior are separately designed and tested.
-
-Restart-based rotation creates a single-node availability gap. The process must fail closed on startup if new files are invalid, while leaving the existing on-disk broker state intact. Operators need an offline recovery path with host filesystem access if every operator credential is lost. Authentication config and broker data must have independent backup/restore policies; restoring data must not accidentally restore a revoked credential.
-
-## Failures, logging, and metrics
-
-| Condition | Required outcome |
-| --- | --- |
-| TLS protocol, certificate, or hostname verification fails | Close the transport before accepting credentials or requests; no plaintext fallback. |
-| Authentication is absent, invalid, or revoked | Reject before dispatch; return a generic authentication failure and close or reset the unauthenticated connection. |
-| Authentication succeeds but the grant is missing | Return an explicit authorization denial; do not invoke the engine; do not reveal stream/consumer existence. |
-| Security config or certificate/key material is invalid | Fail startup before listeners accept traffic; report an actionable error without secret contents. |
-| Client disconnects after a request may have been sent | Preserve existing unknown-outcome behavior; never automatically replay a publish or acknowledgement because credentials rotated. |
-| A token or key is compromised | Support operator revocation/replacement, record a safe audit event, and document that restarting disconnects clients. |
-
-Security logs should record bounded event types such as authentication success, authentication failure, authorization denial, security configuration startup, and TLS configuration failure. Use structured fields and static reason codes. Never log tokens, token digests, private keys, passwords, message payloads, message keys, or full request frames. Avoid untrusted raw user names and error strings in log templates; sanitize values to prevent log injection. Any principal identifier included in an audit event is operator-configured and must be escaped. Rate-limit or aggregate repeated failure logging so a credential spray cannot exhaust log storage.
-
-Keep metric cardinality bounded. Add aggregate authentication and authorization failure counters with fixed operation/reason labels only; do not label metrics by principal, token, stream, consumer, certificate subject, or remote address. Metrics must not expose credentials or message content. Restrict access to the metrics route as an operations endpoint; authentication counters do not replace security logs or access control.
-
-## Reference designs and trade-offs
-
-| Reference | Sourced design | Relevance to Runnel | Difference or limit |
-| --- | --- | --- | --- |
-| [Apache Kafka authorization and ACLs](https://kafka.apache.org/41/security/authorization-and-acls/) and [SASL authentication](https://kafka.apache.org/41/security/authentication-using-sasl/) | Kafka separates authenticated principals from resource/operation ACLs and offers multiple authentication mechanisms. | Supports keeping authentication separate from authorization and checking a finite operation/resource matrix. | Kafka has a mature multi-listener, multi-tenant platform and richer principal/policy administration. Copying its mechanism breadth would add operational burden without a current Runnel use case. |
-| [RabbitMQ access control](https://www.rabbitmq.com/docs/access-control) and [TLS support](https://www.rabbitmq.com/docs/ssl) | RabbitMQ separates identity from permissions, scopes permissions to virtual hosts/resources, supports password or certificate identity, and documents TLS and certificate rotation. Its docs note that cached permission checks can delay permission changes until reconnect. | Supports a simple separation between principal, stream/consumer grants, and transport protection; highlights that revocation timing and reconnect behavior must be explicit. | Runnel has no virtual-host namespace or user-management database. Exact stream/consumer grants and restart-based updates are a narrower fit than adopting virtual hosts, plugins, or multiple backends. |
-| [NATS authorization](https://docs.nats.io/learn/security/authorization) and [encryption/TLS](https://docs.nats.io/learn/security/encryption) | NATS models authorization as explicit publish/subscribe allow-lists. Its TLS guide treats each connection type independently and distinguishes server-side encryption from verifying client identity. | Supports default-deny allow-lists and distinct client, monitoring, and peer trust boundaries; warns that TLS encryption alone does not authenticate clients. | NATS subjects and accounts are not equivalent to Runnel’s streams, consumers, and acknowledgements. Runnel needs an explicit capability for each protocol operation rather than copying publish/subscribe alone. |
-| [TLS 1.3, RFC 8446](https://www.rfc-editor.org/rfc/rfc8446) | Defines the current TLS 1.3 protocol and its cryptographic handshake and record protection. | Primary protocol reference for a maintained TLS library and secure negotiation. | The implementation must also consider deployed client-library support; the initial compatibility minimum remains an implementation decision. |
-| [OWASP Secrets Management](https://cheatsheetseries.owasp.org/cheatsheets/Secrets_Management_Cheat_Sheet.html), [Logging](https://cheatsheetseries.owasp.org/cheatsheets/Logging_Cheat_Sheet.html), and [Authorization](https://cheatsheetseries.owasp.org/cheatsheets/Authorization_Cheat_Sheet.html) guidance | Recommends secret lifecycle and least-privilege controls, and excluding credentials and tokens from logs. | Informs runtime-only secret supply, narrow grants, revocation, redaction, and bounded security events. | These are general guidance, not a Runnel API or an assurance that a particular deployment is secure. |
-| [Kubernetes Secret good practices](https://kubernetes.io/docs/concepts/security/secrets-good-practices/) | Describes access controls, encryption-at-rest considerations, and restricting Secret access in Kubernetes. | Applies to the illustrative deployment’s mounted runtime credentials and certificate files. | Kubernetes Secret objects alone do not secure the application listener, peer transport, node, or external backup; the current example does not yet mount Runnel credentials. |
-
-The recommended first step is static operator-managed principals and grants, not OAuth/OIDC, LDAP, dynamic token issuance, or a general policy plugin. Those alternatives can reduce local credential management at larger scale, but require external availability, token-expiration and caching rules, identity mapping, and more complex recovery. Mutual TLS can replace bearer tokens where a deployment already has client PKI, but certificate issuance, mapping, expiry, and trust-bundle rotation add operational dependencies. A reverse proxy can terminate TLS and authenticate clients, but the broker still needs a trusted identity propagation boundary and must not trust spoofable headers from arbitrary clients; proxy mode therefore needs a separate design.
-
-## Verification gates for a future implementation
-
-Security behavior is network behavior. Cover it with tests that start the real server process, and exercise the supported reusable client and CLI where their behavior changes. The minimum gate should include:
-
-1. **Safe startup and bind behavior:** default loopback behavior; secure remote bind requires TLS and authentication; explicit development override is visible; invalid policy, missing files, mismatched certificate/key, expired or wrong-identity certificate, and malformed trust configuration fail before a listener serves requests.
-2. **TLS interoperability:** trusted CA and matching SAN succeed; wrong CA, wrong SAN, expired certificate, and plaintext client to a TLS listener fail before any protocol request; there is no plaintext downgrade.
-3. **Authentication:** an authenticated principal can reuse a persistent connection; absent, malformed, incorrect, or revoked credentials never dispatch application requests; failure responses do not reveal whether the principal exists. Handshake size and time limits remain bounded under incomplete or repeated attempts.
-4. **Authorization matrix:** test every current protocol variant, including text/binary/batch publish, poll, replay, grouped delivery/acknowledgement, consumer configuration, inspection, stream creation, and health. Prove allowed operations reach the engine and denied writes leave durable state unchanged. Add an exhaustive mapping check so future request variants cannot become implicitly allowed.
-5. **HTTP separation:** liveness/readiness behavior continues to work for the intended local or orchestrator probe; external metrics access follows the configured private/authenticated boundary; health and metrics expose no secrets or message content.
-6. **Rotation and recovery:** stage old/new token overlap across the required restarts, switch clients, revoke old token, then verify that restart closes old connections and the old token fails on reconnect; verify the broker recovers existing stream and consumer state. Rotate a certificate and trust bundle, then test that an invalid replacement fails closed and that restoring the known-good files allows the broker to restart with its prior state. The test must establish that no operation is silently replayed across reconnect.
-7. **Redaction and bounded observability:** deliberately submit credentials, payload-like strings, malformed frames, and hostile principal text, then assert broker logs and metrics contain no secret or message body and use only fixed-cardinality labels. Repeated bad logins remain bounded.
-
-Use ephemeral ports, isolated data/config/certificate directories, a unique `CARGO_TARGET_DIR` for concurrent builds, and clean up child processes on both success and failure. Keep a disposable test CA and keys out of committed artifacts. A smoke pass with `openssl` alone is not enough: the broker process and supported client must exercise the actual protocol and authorization boundary. Correctness and security are the primary evidence; no benchmark is required for this design note. An implementation should measure connection setup/TLS handshake cost if it makes performance claims, and test that persistent requests retain bounded resource use.
-
-## Near-term disposition and open decisions
-
-This outcome is reasonably implementable near term because it fits the existing `runnel-server` transport/dispatch boundary and reusable client, without requiring changes to the engine, durable log, or replicated state. The work is security-sensitive: an omitted protocol operation or accidental plaintext listener could invalidate the boundary, so the operation matrix, real-process tests, startup fail-closed behavior, and deployment documentation are release gates rather than follow-up polish. Restart-based rotation and static local policy keep the initial operating model understandable at the cost of a brief single-node connection interruption and manual credential administration.
-
-Before implementation, an ADR should decide the authentication exchange, configuration syntax and permissions, exact grant representation, HTTP probe and metrics bind/access split, secure-mode/loopback compatibility behavior, and minimum TLS/client compatibility. This proposal intentionally does not select crate APIs, command-line flag names, persistent identity storage, or peer transport behavior.
-
-The existing [single-node deployment backlog outcome](../backlog.md#make-the-single-node-deployment-ready-for-real-use) already states runtime credential supply, authentication/authorization, TLS, and repeatable security tests. This proposal refines the evidence and boundaries but does not materially change that intended outcome, so no backlog or tech-debt update is warranted. The clustered security requirement remains tracked in its separate cluster-operability backlog outcome. Inspection of the touching server, client, metrics, and deployment docs found no separate refactor or shortcut that should be added to tech debt without implementation evidence.
+The existing [single-node readiness backlog](../backlog.md#make-the-single-node-deployment-ready-for-real-use)
+remains open until runtime controls, client configuration, deployment
+isolation, and the real-server test matrix are delivered. This design and
+research record no longer recommends per-resource ACLs or treats HTTP routes
+as private by assumption; those are explicitly deferred or operationally
+bounded as above.
