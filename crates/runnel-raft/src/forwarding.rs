@@ -170,7 +170,39 @@ impl<'a> ClientForwarder<'a> {
         leader_id: Option<NodeId>,
     ) -> Result<PollResult, BrokerError> {
         match self
-            .operation(ForwardedOperation::Poll { stream, consumer }, leader_id)
+            .operation(
+                ForwardedOperation::Poll {
+                    stream,
+                    consumer,
+                    max_response_bytes: None,
+                },
+                leader_id,
+            )
+            .await?
+        {
+            ForwardedResponse::Poll(result) => result.map_err(forward_error_to_broker),
+            _ => Err(BrokerError::Cluster(
+                "leader returned the wrong poll response".to_owned(),
+            )),
+        }
+    }
+
+    pub(super) async fn poll_with_response_limit(
+        &self,
+        stream: String,
+        consumer: String,
+        max_response_bytes: usize,
+        leader_id: Option<NodeId>,
+    ) -> Result<PollResult, BrokerError> {
+        match self
+            .operation(
+                ForwardedOperation::Poll {
+                    stream,
+                    consumer,
+                    max_response_bytes: Some(max_response_bytes),
+                },
+                leader_id,
+            )
             .await?
         {
             ForwardedResponse::Poll(result) => result.map_err(forward_error_to_broker),
@@ -240,6 +272,34 @@ impl<'a> ClientForwarder<'a> {
                     stream,
                     consumer,
                     member,
+                    max_response_bytes: None,
+                },
+                leader_id,
+            )
+            .await?
+        {
+            ForwardedResponse::PollGroup(result) => result.map_err(forward_error_to_broker),
+            _ => Err(BrokerError::Cluster(
+                "leader returned the wrong grouped poll response".to_owned(),
+            )),
+        }
+    }
+
+    pub(super) async fn poll_group_with_response_limit(
+        &self,
+        stream: String,
+        consumer: String,
+        member: String,
+        max_response_bytes: usize,
+        leader_id: Option<NodeId>,
+    ) -> Result<PollResult, BrokerError> {
+        match self
+            .operation(
+                ForwardedOperation::PollGroup {
+                    stream,
+                    consumer,
+                    member,
+                    max_response_bytes: Some(max_response_bytes),
                 },
                 leader_id,
             )
@@ -361,6 +421,9 @@ pub(super) fn forward_error_to_broker(error: network::ForwardError) -> BrokerErr
         }
         network::ForwardError::ConsumeBatchRecordTooLarge { max_bytes } => {
             BrokerError::ConsumeBatchRecordTooLarge { max_bytes }
+        }
+        network::ForwardError::ResponseTooLarge { max_bytes } => {
+            BrokerError::ResponseTooLarge { max_bytes }
         }
         network::ForwardError::Message(message) => BrokerError::Cluster(message),
     }

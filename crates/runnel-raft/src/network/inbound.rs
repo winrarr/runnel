@@ -138,7 +138,11 @@ async fn handle_forwarded(
                 .await
                 .map_err(forward_error),
         ),
-        ForwardedOperation::Poll { stream, consumer } => {
+        ForwardedOperation::Poll {
+            stream,
+            consumer,
+            max_response_bytes,
+        } => {
             let Ok(group) = manager.data_group_for_stream(&stream).await else {
                 return ForwardedResponse::Poll(Err(ForwardError::Message(
                     "stream data group is unavailable".to_owned(),
@@ -148,7 +152,13 @@ async fn handle_forwarded(
             if leader_id != Some(manager.node_id()) {
                 return ForwardedResponse::Poll(Err(ForwardError::NotLeader { leader_id }));
             }
-            ForwardedResponse::Poll(group.poll(&stream, &consumer).await.map_err(forward_error))
+            let result = match max_response_bytes {
+                Some(max_bytes) => group
+                    .poll_with_response_limit(stream, consumer, max_bytes)
+                    .await,
+                None => group.poll(&stream, &consumer).await,
+            };
+            ForwardedResponse::Poll(result.map_err(forward_error))
         }
         ForwardedOperation::Replay {
             stream,
@@ -193,12 +203,25 @@ async fn handle_forwarded(
             stream,
             consumer,
             member,
-        } => ForwardedResponse::PollGroup(
-            manager
-                .poll_group_local(&stream, &consumer, &member)
-                .await
-                .map_err(forward_error),
-        ),
+            max_response_bytes,
+        } => {
+            let Ok(group) = manager.data_group_for_stream(&stream).await else {
+                return ForwardedResponse::PollGroup(Err(ForwardError::Message(
+                    "stream data group is unavailable".to_owned(),
+                )));
+            };
+            let leader_id = group.raft().current_leader().await;
+            if leader_id != Some(manager.node_id()) {
+                return ForwardedResponse::PollGroup(Err(ForwardError::NotLeader { leader_id }));
+            }
+            let result = match max_response_bytes {
+                Some(max_bytes) => group
+                    .poll_group_with_response_limit(stream, consumer, member, max_bytes)
+                    .await,
+                None => group.poll_group(stream, consumer, member).await,
+            };
+            ForwardedResponse::PollGroup(result.map_err(forward_error))
+        }
         ForwardedOperation::PollGroupBatch {
             stream,
             consumer,
@@ -295,6 +318,9 @@ fn forward_error(error: crate::BrokerError) -> ForwardError {
         }
         crate::BrokerError::ConsumeBatchRecordTooLarge { max_bytes } => {
             ForwardError::ConsumeBatchRecordTooLarge { max_bytes }
+        }
+        crate::BrokerError::ResponseTooLarge { max_bytes } => {
+            ForwardError::ResponseTooLarge { max_bytes }
         }
         error => ForwardError::Message(error.to_string()),
     }

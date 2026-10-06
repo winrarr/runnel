@@ -263,6 +263,16 @@ hardening remain release work.
 
 ## Implementation evidence required
 
+The current implementation supplies the v2 authentication exchange,
+secret-safe client TLS and credential configuration, TLS 1.3 policy
+construction, runtime credential-policy parsing and verifier checks, fixed-role
+classification, and a pre-dispatch authorization gate. Server startup has not
+yet wired the policy and TLS modules or secure bind validation, and the CLI
+does not yet expose runtime token/trust configuration. These focused code and
+unit boundaries are not real-process security evidence and do not establish a
+secured deployment. The HTTP operations listener remains outside this
+contract.
+
 Before describing a secured build as ready for use, add protocol and
 real-server coverage for:
 

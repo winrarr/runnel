@@ -64,6 +64,8 @@ pub(crate) enum ForwardedOperation {
     Poll {
         stream: String,
         consumer: String,
+        #[serde(default)]
+        max_response_bytes: Option<usize>,
     },
     Replay {
         stream: String,
@@ -89,6 +91,8 @@ pub(crate) enum ForwardedOperation {
         stream: String,
         consumer: String,
         member: String,
+        #[serde(default)]
+        max_response_bytes: Option<usize>,
     },
     PollGroupBatch {
         stream: String,
@@ -431,6 +435,9 @@ pub(crate) enum ForwardError {
     },
     InvalidBatchRequest(String),
     ConsumeBatchRecordTooLarge {
+        max_bytes: usize,
+    },
+    ResponseTooLarge {
         max_bytes: usize,
     },
     RequestIdContentConflict,

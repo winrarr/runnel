@@ -1,6 +1,6 @@
 # Protocol compatibility and evolution
 
-- Status: accepted protocol contract; runtime implementation and compatibility claims remain open
+- Status: accepted protocol contract; v2 framing, client/server envelopes, and outcome mapping are implemented, while secure startup and independent interoperability evidence remain open
 - Date: 2026-09-02
 - Last reviewed: 2026-10-06
 - Baseline reviewed: `c3a894b6d88a40245c1116e2c5006b94f5573aee`
@@ -8,14 +8,16 @@
 - Related debt: TD-003, TD-018, TD-023, TD-025, and [Make client interactions dependable and evolvable](../backlog.md#make-client-interactions-dependable-and-evolvable)
 - Related evidence: [clustered outcome contract](clustered-outcome-contract.md), [application-aware retry policy](application-aware-retry-policy.md), [durability and delivery policy](durability-delivery-policy.md), [message encoding and compression research](../research/message-encoding-and-compression.md), [ADR 0022](../decisions/0022-provisional-binary-payloads.md), [ADR 0024](../decisions/0024-explicit-offset-replay-read.md), [ADR 0026](../decisions/0026-semantic-engine-error-classification.md), and [ADR 0027](../decisions/0027-consumer-scoped-retry-policy.md)
 
-This design records observed v1 behavior and the accepted v2 client/broker
-contract from [ADR 0031](../decisions/0031-protocol-v2-contract.md).
-Observations are tied to the baseline above. The v2 contract is not implemented
-and does not establish a released support window or cross-release guarantee.
-The crate's v1 support constants remain source metadata only. TD-003 stays open
-until runtime negotiation, interoperability, and compatibility evidence pass.
-ADR 0026 closes the engine-level portion of TD-025; ADR 0031 accepts the future
-v2 stage-aware outcome contract, which is not present in provisional v1.
+This design records observed v1 behavior at the reviewed baseline and the
+accepted v2 client/broker contract from [ADR 0031](../decisions/0031-protocol-v2-contract.md).
+The implementation now has generated v2 schemas, framing and Hello/auth
+negotiation, v2 client/server envelopes, outcome mapping, and response-size
+admission before delivery mutation. Startup and secure-listener integration,
+real-process security coverage, and independent generated-client evidence
+remain open; this does not establish a cross-release compatibility promise.
+The v1 observations below are historical and tied to the baseline above.
+ADR 0026 closes the engine-level portion of TD-025; the v2 stage-aware outcome
+contract is implemented in the protocol, connection, and engine paths.
 
 ## Policy summary
 
@@ -37,10 +39,10 @@ credential, and role policy; protocol compatibility owns only the control
 frame and ordering.
 
 V2 carries opaque message bytes directly and has explicit confirmed, rejected,
-retryable, and unknown outcomes with topology-neutral processing stages. The
-outcome and stage contract is accepted, but no v2 runtime or cross-language
-support matrix exists yet. Compatibility and rollout claims wait for the
-real-server and generated-client evidence in the accepted decision.
+retryable, and unknown outcomes with topology-neutral processing stages.
+Those behaviors are implemented in the current runtime slice. Secure startup,
+real-process security coverage, and independent generated-client evidence
+remain gates before broader support claims.
 
 The logical payload, public wire encoding, peer transport, and durable storage
 remain separate boundaries. Public protocol negotiation does not establish
@@ -228,12 +230,12 @@ and the reusable client keeps that generic response `Unknown`. Neither an
 engine outcome nor a transport error establishes a commit/apply stage for a
 client.
 
-## Accepted v2 contract
+## Accepted v2 contract and current implementation
 
-ADR 0031 selects a first negotiated public protocol. The decisions below are
-accepted design constraints for its future runtime; they are not descriptions
-of the current listener. The current JSON-lines v1 remains provisional and
-carries no cross-release compatibility promise.
+ADR 0031 selects the negotiated public protocol implemented by the current
+runtime slice. The decision remains authoritative for its wire contract; the
+v1 observations above describe only the reviewed historical baseline. Runnel
+does not preserve a v1 fallback or promise cross-release compatibility.
 
 ### Bootstrap, negotiation, and reconnect
 
@@ -518,7 +520,7 @@ operation without a stable identity has an unknown outcome, the client must
 inspect application state or make an explicit duplicate-versus-loss decision;
 the library does not invent retry safety.
 
-### Mismatch, v1 boundary, and rollout
+### Mismatch and v2-only operation
 
 The compatibility rules are:
 
@@ -543,14 +545,12 @@ The compatibility rules are:
 | Well-framed unknown operation | Server returns `unsupported_operation` with a definitive rejected outcome and keeps the connection only if the next frame boundary is known. |
 | Reconnect after peer restart, leader change, or failure | Client opens a new connection and repeats the complete transport setup, preface, Hello, and required authentication. No old selection, limits, or authentication carries over. |
 
-The initial v2 deployment replaces provisional v1 at one coordinated breaking
-release boundary for the server, reusable Rust client, and CLI. The v2 listener
-is v2-only; there is no dual parser, second listener, implicit v1 mode, or
-migration window in this decision because the repository has no published v1
-support matrix or known independently deployed client population. If later
-evidence justifies overlap, a new decision must define its duration, client
-selection, compatibility tests, and removal point. It must not add silent
-downgrade.
+V2 is the sole public application protocol. The runtime removes the
+provisional JSON-lines implementation without a transition listener, dual
+parser, implicit v1 mode, or silent downgrade. Prior-release compatibility is
+not a product goal, so no migration window or compatibility release process is
+required. A peer using an unsupported protocol receives only the bounded
+handshake failure behavior defined above.
 
 The protocol decision does not promise mixed-version broker-cluster upgrades,
 internal peer-protocol compatibility, or storage/disk-format compatibility.
@@ -583,11 +583,13 @@ because this is the future language-client boundary, not a shell-only
 transport. Compression and per-operation versioning are deferred until
 capability needs and workload evidence justify them.
 
-### Implementation and compatibility gates
+### Implementation and interoperability gates
 
-This is a design-only decision; no runtime negotiation or Protobuf codec is
-implemented at the reviewed baseline. Before describing v2 as supported, the
-implementation must provide:
+The reviewed baseline predates the v2 implementation. The current runtime
+provides v2 Protobuf negotiation and framing, v2 client/server envelopes,
+TLS/auth policy modules, an authorization gate, and response-size preflight.
+Before making broader security or cross-language support claims, remaining
+evidence must provide:
 
 - checked TLS-before-preface ordering with 0-RTT disabled, preface and Hello,
   explicit `auth_required` presence and negotiation, no-overlap and
@@ -608,11 +610,14 @@ implementation must provide:
 - changed-ID-content rejection (including absent/empty-key comparison
   equivalence) and equal-content resolution across restart and leader change,
   without duplicate records; and
-- release evidence for the coordinated v1 break and explicit statements that
-  peer and disk compatibility are not covered.
+- a real-server check that unsupported JSON-lines traffic is closed without
+  parsing or application dispatch; peer and disk compatibility remain
+  separate boundaries.
 
-The current Rust wire fixtures and real-process tests documented above remain
-v1 evidence only. A future consume-batch feature or any other optional behavior
-must be withheld unless Hello selected its required capability. Until these
-gates pass, TD-003 and TD-025 remain open for implementation/evidence, and no
-cross-release or cross-language compatibility claim is authorized.
+The current Rust wire fixtures cover v2; existing baseline v1 tests are
+historical evidence only. A future consume-batch feature or any other optional
+behavior must be withheld unless Hello selected its required capability.
+Until remaining implementation and evidence gates pass, TD-003 and TD-025
+remain open. No prior-release compatibility is promised, and no cross-language
+interoperability claim is authorized before the independent generated-client
+check.

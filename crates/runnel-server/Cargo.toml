@@ -18,16 +18,25 @@ path = "src/main.rs"
 
 [dependencies]
 axum.workspace = true
+base64 = "0.23"
 clap.workspace = true
+getrandom = "0.3"
 runnel-core = { path = "../runnel-core" }
 runnel-engine = { path = "../runnel-engine" }
 runnel-raft = { path = "../runnel-raft" }
 runnel-protocol = { path = "../runnel-protocol" }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
+rustls-pemfile = "2"
 serde.workspace = true
 serde_json.workspace = true
+sha2 = "0.10"
+subtle = "2"
+thiserror.workspace = true
 tokio.workspace = true
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring"] }
 tracing.workspace = true
 tracing-subscriber.workspace = true
+zeroize = "1"
 
 [dev-dependencies]
 runnel-client = { path = "../runnel-client" }

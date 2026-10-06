@@ -12,8 +12,8 @@ use runnel_engine::{
     AckBatchItem, AckBatchOutcome, AckBatchRejection, AckBatchResult, BrokerError,
     ConsumeBatchLimits, ConsumerPolicy, DeliveryReceipt, MAX_PUBLISH_BATCH_RECORDS, Message,
     Offset, PollBatchResponseSizer, PollResult, PublishRecord, PublishRecordOutcome, ReplayMessage,
-    poll_batch_response_len, validate_ack_batch_receipts, validate_consume_batch_limits,
-    validate_consumer_policy,
+    poll_batch_response_len, poll_message_response_upper_bound, validate_ack_batch_receipts,
+    validate_consume_batch_limits, validate_consumer_policy,
 };
 #[cfg(test)]
 use std::io;
@@ -69,17 +69,6 @@ impl StreamState {
             delivery: DeliveryState::new(),
             availability: Arc::new(Notify::new()),
         }
-    }
-
-    fn find_candidate(
-        &mut self,
-        consumer: &str,
-        committed_offset: Offset,
-        acknowledged_offsets: &BTreeSet<Offset>,
-    ) -> Result<Option<RecordIndex>, BrokerError> {
-        let in_flight = self.delivery.in_flight_filter(consumer);
-        self.log
-            .find_candidate(committed_offset, acknowledged_offsets, in_flight)
     }
 
     fn find_candidate_excluding(
@@ -404,6 +393,42 @@ impl Broker {
         consumer: &str,
         member: &str,
     ) -> Result<PollResult, BrokerError> {
+        self.poll_group_inner(stream, consumer, member, Some(member), None)
+    }
+
+    pub fn poll_with_response_limit(
+        &self,
+        stream: &str,
+        consumer: &str,
+        max_response_bytes: usize,
+    ) -> Result<PollResult, BrokerError> {
+        self.poll_group_inner(stream, consumer, consumer, None, Some(max_response_bytes))
+    }
+
+    pub fn poll_group_with_response_limit(
+        &self,
+        stream: &str,
+        consumer: &str,
+        member: &str,
+        max_response_bytes: usize,
+    ) -> Result<PollResult, BrokerError> {
+        self.poll_group_inner(
+            stream,
+            consumer,
+            member,
+            Some(member),
+            Some(max_response_bytes),
+        )
+    }
+
+    fn poll_group_inner(
+        &self,
+        stream: &str,
+        consumer: &str,
+        member: &str,
+        response_member: Option<&str>,
+        max_response_bytes: Option<usize>,
+    ) -> Result<PollResult, BrokerError> {
         #[cfg(feature = "instrumentation")]
         let _stage_timer = StageTimer::new("core.poll");
         validate_name("stream", stream)?;
@@ -421,6 +446,18 @@ impl Broker {
             let mut message = stream_state.log.read_message(stream, in_flight.offset())?;
             message.delivery_token = Some(in_flight.delivery_token().to_owned());
             message.delivery_attempt = Some(in_flight.delivery_attempt());
+            if max_response_bytes.is_some_and(|limit| {
+                poll_message_response_upper_bound(
+                    &message,
+                    consumer,
+                    response_member,
+                    response_member.is_some(),
+                ) > limit
+            }) {
+                return Err(BrokerError::ResponseTooLarge {
+                    max_bytes: max_response_bytes.expect("checked above"),
+                });
+            }
             return Ok(PollResult::Message(message));
         }
 
@@ -431,13 +468,26 @@ impl Broker {
             self.inner.ack_timeout.as_millis().min(u128::from(u64::MAX)) as u64,
             self.inner.max_delivery_attempts,
         );
+        let mut terminal_candidates = Vec::new();
+        let mut excluded_offsets = HashSet::new();
+        let excluded_keys = HashSet::new();
         loop {
-            let candidate = stream_state.find_candidate(
+            let candidate = stream_state.find_candidate_excluding(
                 consumer,
                 consumer_state.committed_offset,
                 &consumer_state.acknowledged_offsets,
+                &excluded_offsets,
+                &excluded_keys,
             )?;
             let Some(candidate) = candidate else {
+                self.persist_pending_dead_letters(
+                    &mut stream_state,
+                    stream,
+                    consumer,
+                    &root,
+                    &mut consumer_state,
+                    terminal_candidates,
+                )?;
                 return Ok(PollResult::Empty);
             };
 
@@ -452,31 +502,37 @@ impl Broker {
                 .is_some_and(|max_attempts| attempts >= max_attempts)
                 && !self.is_dead_letter_stream(stream)?
             {
-                self.dead_letter_record(&mut stream_state, stream, consumer, &candidate)?;
-                if let Err(error) = self.persist_dead_letter_ack(
-                    &root,
-                    stream,
-                    consumer,
-                    &consumer_state,
-                    candidate.offset,
-                ) {
-                    stream_state
-                        .delivery
-                        .mark_consumer_needs_reconcile(consumer);
-                    return Err(error);
-                }
-                consumer_state.acknowledge(candidate.offset);
-                stream_state
-                    .delivery
-                    .cache_consumer_state(consumer.to_owned(), consumer_state.clone());
-                stream_state.availability.notify_waiters();
-                self.inner.dead_letters.fetch_add(1, Ordering::Relaxed);
+                excluded_offsets.insert(candidate.offset);
+                terminal_candidates.push(candidate);
                 continue;
             }
 
             let candidate_offset = candidate.offset;
             let delivery_attempt = attempts.saturating_add(1);
             let mut message = stream_state.log.read_message(stream, candidate.offset)?;
+            let delivery_token = self.inner.delivery_tokens.next();
+            message.delivery_token = Some(delivery_token.clone());
+            message.delivery_attempt = Some(delivery_attempt);
+            if max_response_bytes.is_some_and(|limit| {
+                poll_message_response_upper_bound(
+                    &message,
+                    consumer,
+                    response_member,
+                    response_member.is_some(),
+                ) > limit
+            }) {
+                return Err(BrokerError::ResponseTooLarge {
+                    max_bytes: max_response_bytes.expect("checked above"),
+                });
+            }
+            self.persist_pending_dead_letters(
+                &mut stream_state,
+                stream,
+                consumer,
+                &root,
+                &mut consumer_state,
+                terminal_candidates,
+            )?;
             if let Err(error) = persist_consumer_event(
                 &root,
                 stream,
@@ -500,9 +556,6 @@ impl Broker {
                 .delivery_policies
                 .entry(candidate.offset)
                 .or_insert_with(|| policy.clone());
-            let delivery_token = self.inner.delivery_tokens.next();
-            message.delivery_token = Some(delivery_token.clone());
-            message.delivery_attempt = Some(delivery_attempt);
             if delivery_attempt > 1 {
                 self.inner.redeliveries.fetch_add(1, Ordering::Relaxed);
             }
@@ -525,6 +578,39 @@ impl Broker {
             stream_state.availability.notify_waiters();
             return Ok(PollResult::Message(message));
         }
+    }
+
+    fn persist_pending_dead_letters(
+        &self,
+        stream_state: &mut StreamState,
+        stream: &str,
+        consumer: &str,
+        root: &Path,
+        consumer_state: &mut ConsumerState,
+        candidates: Vec<RecordIndex>,
+    ) -> Result<(), BrokerError> {
+        for candidate in candidates {
+            self.dead_letter_record(stream_state, stream, consumer, &candidate)?;
+            if let Err(error) = self.persist_dead_letter_ack(
+                root,
+                stream,
+                consumer,
+                consumer_state,
+                candidate.offset,
+            ) {
+                stream_state
+                    .delivery
+                    .mark_consumer_needs_reconcile(consumer);
+                return Err(error);
+            }
+            consumer_state.acknowledge(candidate.offset);
+            stream_state
+                .delivery
+                .cache_consumer_state(consumer.to_owned(), consumer_state.clone());
+            stream_state.availability.notify_waiters();
+            self.inner.dead_letters.fetch_add(1, Ordering::Relaxed);
+        }
+        Ok(())
     }
 
     pub(super) async fn poll_batch_wait(

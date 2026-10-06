@@ -148,12 +148,69 @@ pub fn validate_ack_batch_receipts(receipts: &[DeliveryReceipt]) -> Result<(), B
     Ok(())
 }
 
-/// Measure the exact encoded JSON-lines size of the provisional `poll_batch`
-/// response shape without allocating base64 copies of record payloads.
+/// Conservatively bound the encoded v2 scalar poll response body.
 ///
-/// The matching wire response stores valid UTF-8 payloads as JSON text and
-/// other payloads as padded standard base64. Metadata and the terminating
-/// newline are included in the returned byte count.
+/// The estimate includes the Protobuf message, application-response, and
+/// server-frame envelopes. It intentionally overestimates omitted zero-valued
+/// scalar fields so engines can refuse an oversized delivery before assigning
+/// it without depending on the protocol crate.
+pub fn poll_message_response_upper_bound(
+    message: &Message,
+    consumer: &str,
+    member: Option<&str>,
+    include_delivery_token: bool,
+) -> usize {
+    poll_message_response_upper_bound_parts(
+        &message.stream,
+        consumer,
+        member,
+        message.offset,
+        message.key.as_deref(),
+        message.payload.len(),
+        message.published_at_ms,
+        message.delivery_token.as_deref(),
+        message.delivery_attempt,
+        include_delivery_token,
+    )
+}
+
+/// Bound a scalar poll response from message metadata without materializing its
+/// payload. This is useful to replicated state machines that preflight a
+/// delivery from their stored record before copying the record into a reply.
+#[allow(clippy::too_many_arguments)]
+pub fn poll_message_response_upper_bound_parts(
+    stream: &str,
+    consumer: &str,
+    member: Option<&str>,
+    offset: Offset,
+    key: Option<&str>,
+    payload_len: usize,
+    published_at_ms: u64,
+    delivery_token: Option<&str>,
+    delivery_attempt: Option<u32>,
+    include_delivery_token: bool,
+) -> usize {
+    let message_len = message_result_upper_bound(
+        stream,
+        consumer,
+        member,
+        offset,
+        key,
+        payload_len,
+        published_at_ms,
+        delivery_token,
+        delivery_attempt,
+        include_delivery_token,
+    );
+    let application_response_len = 4usize
+        .saturating_add(length_delimited_field_upper_bound(message_len));
+    length_delimited_field_upper_bound(application_response_len)
+}
+
+/// Conservatively bound the encoded v2 `poll_batch` response body.
+///
+/// Payloads are protobuf byte fields, so their wire size is linear in the
+/// stored bytes and does not require a base64 allocation or payload scan.
 pub fn poll_batch_response_len(
     stream: &str,
     consumer: &str,
@@ -173,29 +230,24 @@ pub struct PollBatchResponseSizer {
     consumer: String,
     member: Option<String>,
     encoded_len: usize,
-    messages: usize,
 }
 
 impl PollBatchResponseSizer {
     pub fn new(stream: &str, consumer: &str, member: Option<&str>) -> Self {
-        let encoded_len = "{\"type\":\"poll_batch\",\"stream\":".len()
-            + json_string_len(stream)
-            + ",\"consumer\":".len()
-            + json_string_len(consumer)
-            + ",\"messages\":[".len()
-            + "]}\n".len();
+        let batch_result_len = protobuf_string_field_upper_bound(stream)
+            .saturating_add(protobuf_string_field_upper_bound(consumer));
+        let application_response_len = length_delimited_field_upper_bound(batch_result_len);
+        let encoded_len = length_delimited_field_upper_bound(application_response_len);
         Self {
             consumer: consumer.to_owned(),
             member: member.map(str::to_owned),
             encoded_len,
-            messages: 0,
         }
     }
 
     pub fn projected_len(&self, message: &Message) -> usize {
         self.encoded_len
-            .saturating_add(if self.messages == 0 { 0 } else { 1 })
-            .saturating_add(poll_batch_message_len(
+            .saturating_add(batch_message_item_upper_bound(
                 message,
                 &self.consumer,
                 self.member.as_deref(),
@@ -204,7 +256,6 @@ impl PollBatchResponseSizer {
 
     pub fn push(&mut self, message: &Message) -> usize {
         self.encoded_len = self.projected_len(message);
-        self.messages = self.messages.saturating_add(1);
         self.encoded_len
     }
 
@@ -213,38 +264,88 @@ impl PollBatchResponseSizer {
     }
 }
 
-fn poll_batch_message_len(message: &Message, consumer: &str, member: Option<&str>) -> usize {
-    let mut length = "{\"stream\":".len() + json_string_len(&message.stream);
-    length += ",\"consumer\":".len() + json_string_len(consumer);
-    if let Some(member) = member {
-        length += ",\"member\":".len() + json_string_len(member);
-    }
-    length += ",\"offset\":".len() + message.offset.to_string().len();
-    length += ",\"key\":".len() + message.key.as_deref().map_or("null".len(), json_string_len);
-    if let Ok(payload) = std::str::from_utf8(&message.payload) {
-        length += ",\"payload\":".len() + json_string_len(payload);
-    } else {
-        let encoded_len = message.payload.len().saturating_add(2) / 3 * 4;
-        length += ",\"payload_base64\":".len() + encoded_len + 2;
-    }
-    length += ",\"published_at_ms\":".len() + message.published_at_ms.to_string().len();
-    if let Some(delivery_token) = message.delivery_token.as_deref() {
-        length += ",\"delivery_token\":".len() + json_string_len(delivery_token);
-    }
-    if let Some(delivery_attempt) = message.delivery_attempt {
-        length += ",\"delivery_attempt\":".len() + delivery_attempt.to_string().len();
-    }
-    length + 1
+fn batch_message_item_upper_bound(
+    message: &Message,
+    consumer: &str,
+    member: Option<&str>,
+) -> usize {
+    let message_len = message_result_upper_bound(
+        &message.stream,
+        consumer,
+        member,
+        message.offset,
+        message.key.as_deref(),
+        message.payload.len(),
+        message.published_at_ms,
+        message.delivery_token.as_deref(),
+        message.delivery_attempt,
+        message.delivery_token.is_some(),
+    );
+    // Each item carries confirmed outcome and stage fields, then embeds the
+    // message. The item itself is repeated as field 3 of PollBatchResult.
+    let item_len = 4usize.saturating_add(length_delimited_field_upper_bound(message_len));
+    length_delimited_field_upper_bound(item_len)
 }
 
-fn json_string_len(value: &str) -> usize {
-    value.bytes().fold(2, |length, byte| {
-        length.saturating_add(match byte {
-            b'"' | b'\\' | b'\x08' | b'\t' | b'\n' | b'\x0c' | b'\r' => 2,
-            0x00..=0x1f => 6,
-            _ => 1,
-        })
-    })
+fn message_result_upper_bound(
+    stream: &str,
+    consumer: &str,
+    member: Option<&str>,
+    offset: Offset,
+    key: Option<&str>,
+    payload_len: usize,
+    published_at_ms: u64,
+    delivery_token: Option<&str>,
+    delivery_attempt: Option<u32>,
+    include_delivery_token: bool,
+) -> usize {
+    let mut length = protobuf_string_field_upper_bound(stream)
+        .saturating_add(protobuf_string_field_upper_bound(consumer))
+        .saturating_add(protobuf_varint_field_upper_bound(offset))
+        .saturating_add(protobuf_bytes_field_upper_bound(payload_len))
+        .saturating_add(protobuf_varint_field_upper_bound(published_at_ms));
+    if let Some(member) = member {
+        length = length.saturating_add(protobuf_string_field_upper_bound(member));
+    }
+    if let Some(key) = key {
+        length = length.saturating_add(protobuf_string_field_upper_bound(key));
+    }
+    if include_delivery_token
+        && let Some(token) = delivery_token
+    {
+        length = length.saturating_add(protobuf_string_field_upper_bound(token));
+    }
+    if let Some(attempt) = delivery_attempt {
+        length = length.saturating_add(protobuf_varint_field_upper_bound(u64::from(attempt)));
+    }
+    length
+}
+
+fn protobuf_string_field_upper_bound(value: &str) -> usize {
+    protobuf_bytes_field_upper_bound(value.len())
+}
+
+fn protobuf_bytes_field_upper_bound(value_len: usize) -> usize {
+    1usize
+        .saturating_add(protobuf_varint_len(value_len as u64))
+        .saturating_add(value_len)
+}
+
+fn protobuf_varint_field_upper_bound(value: u64) -> usize {
+    1usize.saturating_add(protobuf_varint_len(value))
+}
+
+fn length_delimited_field_upper_bound(value_len: usize) -> usize {
+    protobuf_bytes_field_upper_bound(value_len)
+}
+
+fn protobuf_varint_len(mut value: u64) -> usize {
+    let mut length = 1;
+    while value >= 0x80 {
+        value >>= 7;
+        length += 1;
+    }
+    length
 }
 
 /// One opaque record in a publish batch.
@@ -485,6 +586,8 @@ pub enum BrokerError {
         "the first eligible message cannot fit in the {max_bytes}-byte consume-batch response bound"
     )]
     ConsumeBatchRecordTooLarge { max_bytes: usize },
+    #[error("the eligible message cannot fit in the {max_bytes}-byte response bound")]
+    ResponseTooLarge { max_bytes: usize },
     #[error("request must be sent to the elected leader {leader_id:?}")]
     NotLeader { leader_id: Option<u64> },
     #[error("cluster error: {0}")]
@@ -514,7 +617,9 @@ impl BrokerError {
             Self::ConsumerStatePersistence { .. } => BrokerErrorKind::State,
             Self::LockPoisoned => BrokerErrorKind::Internal,
             Self::Configuration(_) => BrokerErrorKind::Configuration,
-            Self::InvalidBatchRequest(_) | Self::ConsumeBatchRecordTooLarge { .. } => {
+            Self::InvalidBatchRequest(_)
+            | Self::ConsumeBatchRecordTooLarge { .. }
+            | Self::ResponseTooLarge { .. } => {
                 BrokerErrorKind::InvalidRequest
             }
             Self::NotLeader { .. } => BrokerErrorKind::Routing,
@@ -600,6 +705,16 @@ pub trait Engine: Send + Sync {
 
     fn poll<'a>(&'a self, stream: &'a str, consumer: &'a str) -> EngineFuture<'a, PollResult>;
 
+    /// Deliver one ordinary record only when its complete v2 response body is
+    /// guaranteed to fit. Engines must check before persisting assignment or
+    /// attempt state.
+    fn poll_with_response_limit<'a>(
+        &'a self,
+        stream: &'a str,
+        consumer: &'a str,
+        max_response_bytes: usize,
+    ) -> EngineFuture<'a, PollResult>;
+
     /// Return one ordered, bounded set for an ordinary consumer. The ordinary
     /// consumer name is also the member identity for receipts.
     fn poll_batch<'a>(
@@ -683,6 +798,17 @@ pub trait Engine: Send + Sync {
             ))
         })
     }
+
+    /// Deliver one shared-consumer record only when its complete v2 response
+    /// body is guaranteed to fit. Engines must check before persisting
+    /// assignment or attempt state.
+    fn poll_group_with_response_limit<'a>(
+        &'a self,
+        stream: &'a str,
+        consumer: &'a str,
+        member: &'a str,
+        max_response_bytes: usize,
+    ) -> EngineFuture<'a, PollResult>;
 
     /// Acknowledge one ordinary scalar delivery by offset.
     ///

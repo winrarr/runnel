@@ -78,16 +78,17 @@ Constraints:
 - keep the public vocabulary small and intent-oriented;
 - do not expose storage layout, physical placement, or broker topology as normal application concepts;
 - support message payloads without requiring them to be text;
-- do not claim compatibility until compatibility and upgrade behavior are defined.
+- evolve v2 schemas under the accepted within-major rules, but make no prior-release compatibility promise;
+- do not claim cross-language interoperability until an independent generated client is verified.
 
 Acceptance criteria:
 
 - clients can distinguish confirmed success, confirmed rejection, retryable failure, and unknown outcome;
 - a producer can safely retry according to documented semantics without creating an unintended duplicate when deduplication is requested;
-- the contract has a documented compatibility policy;
-- behavior is covered by interoperability and compatibility tests.
+- the protocol's within-major evolution policy and lack of a prior-release promise are documented;
+- behavior is covered by wire fixtures, real-process negotiation/reconnect tests, and independent generated-client evidence before cross-language support is claimed.
 
-Decision progress: [ADR 0031](decisions/0031-protocol-v2-contract.md) accepts the first v2 handshake, Protobuf schema policy, directional bounds, rollout boundary, publish-ID mismatch behavior, and outcome/stage vocabulary. [ADR 0034](decisions/0034-publish-request-id-content-contract.md) now implements the content-conflict behavior in the current provisional v1 engines and server mapping. V2 runtime negotiation, generated-client fixtures, v2-specific real-server mismatch/reconnect/outcome tests, and interoperability evidence remain open; v1 and v2 are not yet a cross-release compatibility promise.
+Decision progress: [ADR 0031](decisions/0031-protocol-v2-contract.md) accepts the v2 handshake, Protobuf schema policy, directional bounds, v2-only operation, publish-ID mismatch behavior, and outcome/stage vocabulary. The implementation now replaces JSON-lines with generated Protobuf v2 framing and typed application envelopes, validates Hello negotiation, uses opaque payload bytes, and implements bounded response admission before delivery mutation in both engines. The reusable client negotiates v2 and preserves the accepted outcome model. V2 real-process security/startup integration, broader mismatch/reconnect and response-loss coverage, and an independent generated-client interoperability check remain open. There is no v1 fallback or cross-release compatibility promise.
 
 ### Provide a production-usable client path
 
@@ -453,14 +454,18 @@ cover shutdown during engine execution or a hard process stop. Consumer lag,
 reclaimable storage, resource pressure, and the remaining security and
 capacity controls are still open. The first application-client security
 contract is accepted in [ADR 0035](decisions/0035-first-application-client-security.md)
-and documented in the [source-backed research](research/client-authentication.md):
-secured non-loopback listeners will terminate TLS 1.3 in Runnel, require a
-runtime bearer credential, and distinguish fixed application and operator
-roles. This is a planning decision only; the listener, client/CLI credential
-support, authorization checks, rotation behavior, and real-server security
-coverage remain unimplemented. The separate HTTP listener is still cleartext
-and unauthenticated. In particular, the development Kubernetes manifest binds
-it to all pod interfaces and exposes health and metrics on the pod network;
+and documented in the [source-backed research](research/client-authentication.md).
+The protocol/client slice now has TLS 1.3 configuration with system or
+operator-supplied trust roots, secret-safe 256-bit bearer credentials, a
+bounded Hello/auth exchange, policy verifier loading, exhaustive fixed-role
+classification, an authorization gate before dispatch, and engine-owned
+response-size preflight. Startup/bind validation and `runnelctl` runtime
+credential/trust wiring are not yet integrated; neither the TLS listener nor
+policy loader is connected to broker startup. Real-process TLS, authentication,
+authorization, and fail-closed startup evidence also remains open. This is not
+a claim that the deployment is secure: the separate HTTP listener is still
+cleartext and unauthenticated. The development Kubernetes manifest binds it
+to all pod interfaces and exposes health and metrics on the pod network;
 production deployment isolation and HTTP access controls remain open. This
 client contract does not secure the Raft peer listener or establish clustered
 security.
@@ -727,7 +732,7 @@ Acceptance criteria:
 - clients can distinguish confirmed success, confirmed rejection, retryable failure, and unknown outcome;
 - safe retries do not create unintended duplicate messages when deduplication is requested.
 
-Decision progress: [ADR 0031](decisions/0031-protocol-v2-contract.md) accepts the public v2 outcome/stage vocabulary and its topology-neutral durability boundary. The current provisional v1 engine classification, error mapping, and focused ID-conflict tests are implemented under ADR 0034. V2 server/client fields, v2 response-loss resolution, broader supported-node failure evidence, and a compatibility promise remain open, so this outcome stays open.
+Decision progress: [ADR 0031](decisions/0031-protocol-v2-contract.md) accepts the public v2 outcome/stage vocabulary and its topology-neutral durability boundary. V2 server/client envelopes now carry operation outcomes and stages; local and clustered poll paths reject responses that cannot fit before changing delivery state. [ADR 0034](decisions/0034-publish-request-id-content-contract.md) implements content-conflict behavior in both engines and the v2 mapping. Real-process response-loss and supported-node failure evidence remain open, so this outcome stays open. No cross-release compatibility promise is part of the v2 contract.
 
 ### Make the clustered deployment operable
 

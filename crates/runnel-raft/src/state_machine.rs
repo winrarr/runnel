@@ -55,6 +55,10 @@ pub enum Command {
         stream: String,
         consumer: String,
         member: String,
+        #[serde(default)]
+        response_member: Option<String>,
+        #[serde(default = "default_poll_response_limit")]
+        max_response_bytes: usize,
         now_ms: u64,
         lease_deadline_ms: u64,
         #[serde(default)]
@@ -127,6 +131,9 @@ pub enum CommandResponse {
     },
     GroupPoll {
         result: runnel_engine::PollResult,
+    },
+    GroupPollResponseTooLarge {
+        max_bytes: usize,
     },
     GroupBatchPoll {
         messages: Vec<Message>,
@@ -466,6 +473,8 @@ pub(super) fn apply_command(
             stream,
             consumer,
             member,
+            response_member,
+            max_response_bytes,
             now_ms,
             lease_deadline_ms,
             max_delivery_attempts,
@@ -477,6 +486,8 @@ pub(super) fn apply_command(
                 stream,
                 consumer,
                 member,
+                response_member,
+                max_response_bytes,
                 now_ms,
                 lease_deadline_ms,
                 max_delivery_attempts,
@@ -556,6 +567,10 @@ pub(super) fn apply_command(
             kind,
         ),
     }
+}
+
+fn default_poll_response_limit() -> usize {
+    runnel_engine::MAX_CONSUME_BATCH_RESPONSE_BYTES
 }
 
 fn apply_replay(

@@ -5,7 +5,14 @@ edition.workspace = true
 
 [dependencies]
 base64 = "0.23"
+prost = "0.14"
 serde.workspace = true
+thiserror.workspace = true
+zeroize = "1"
+
+[build-dependencies]
+prost-build = "0.14"
+protoc-bin-vendored = "3"
 
 [dev-dependencies]
 runnel-engine = { path = "../runnel-engine" }

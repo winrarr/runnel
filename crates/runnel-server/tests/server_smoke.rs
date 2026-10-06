@@ -234,8 +234,7 @@ fn network_protocol_persists_acknowledgements_across_restart() {
 fn network_protocol_round_trips_binary_payload_across_restart() {
     let directory = TempDir::new().unwrap();
     let server = RunningServer::start(directory.path());
-    let binary_json =
-        r#"{"op":"publish_bytes","stream":"binary","key":null,"payload_base64":"AAH/Cl8="}"#;
+    let payload = vec![0, 1, 255, b'\n', b'_'];
 
     assert!(matches!(
         request(
@@ -247,19 +246,30 @@ fn network_protocol_round_trips_binary_payload_across_restart() {
         Response::StreamCreated { created: true, .. }
     ));
     assert!(matches!(
-        request_line(server.broker_addr, binary_json),
+        request(
+            server.broker_addr,
+            Request::PublishBytes {
+                stream: "binary".to_owned(),
+                key: None,
+                payload: BinaryPayload::new(payload.clone()),
+                request_id: None,
+            },
+        ),
         Response::Published { offset: 0, .. }
     ));
     assert!(matches!(
-        request_line(
+        request(
             server.broker_addr,
-            r#"{"op":"poll","stream":"binary","consumer":"worker"}"#,
+            Request::Poll {
+                stream: "binary".to_owned(),
+                consumer: "worker".to_owned(),
+            },
         ),
         Response::MessageBytes {
             offset: 0,
-            payload_base64,
+            payload: received,
             ..
-        } if payload_base64.as_bytes() == [0, 1, 255, b'\n', b'_']
+        } if received.as_bytes() == payload
     ));
 
     server.stop();
@@ -275,20 +285,23 @@ fn network_protocol_round_trips_binary_payload_across_restart() {
         ),
         Response::ReplayMessageBytes {
             offset: 0,
-            payload_base64,
+            payload: received,
             ..
-        } if payload_base64.as_bytes() == [0, 1, 255, b'\n', b'_']
+        } if received.as_bytes() == payload
     ));
     assert!(matches!(
-        request_line(
+        request(
             server.broker_addr,
-            r#"{"op":"poll","stream":"binary","consumer":"worker"}"#,
+            Request::Poll {
+                stream: "binary".to_owned(),
+                consumer: "worker".to_owned(),
+            },
         ),
         Response::MessageBytes {
             offset: 0,
-            payload_base64,
+            payload: received,
             ..
-        } if payload_base64.as_bytes() == [0, 1, 255, b'\n', b'_']
+        } if received.as_bytes() == payload
     ));
     assert!(matches!(
         request(
@@ -307,39 +320,23 @@ fn network_protocol_round_trips_binary_payload_across_restart() {
 }
 
 #[test]
-fn network_protocol_rejects_binary_conflicts_before_engine_execution() {
+fn network_protocol_rejects_json_lines_without_processing_the_request() {
     let directory = TempDir::new().unwrap();
     let server = RunningServer::start(directory.path());
+    let mut stream = TcpStream::connect(server.broker_addr).expect("broker should accept TCP");
+    stream
+        .set_read_timeout(Some(Duration::from_secs(2)))
+        .expect("read timeout should be set");
+    stream
+        .write_all(b"{\"op\":\"create_stream\",\"stream\":\"events\"}\n")
+        .unwrap();
+    let mut response = Vec::new();
+    stream.read_to_end(&mut response).unwrap();
+    assert!(response.is_empty(), "v1 JSON must not receive a response");
 
     assert!(matches!(
-        request(
-            server.broker_addr,
-            Request::CreateStream {
-                stream: "binary".to_owned(),
-            },
-        ),
-        Response::StreamCreated { created: true, .. }
-    ));
-    assert!(matches!(
-        request_line(
-            server.broker_addr,
-            r#"{"op":"publish","stream":"binary","key":null,"payload":"text","payload_base64":"AA=="}"#,
-        ),
-        Response::Error { code, .. } if code == "invalid_request"
-    ));
-    assert!(matches!(
-        request_line(
-            server.broker_addr,
-            r#"{"op":"publish_bytes","stream":"binary","key":null,"payload_base64":"not base64"}"#,
-        ),
-        Response::Error { code, .. } if code == "invalid_request"
-    ));
-    assert!(matches!(
-        request_line(
-            server.broker_addr,
-            r#"{"op":"poll","stream":"binary","consumer":"worker"}"#,
-        ),
-        Response::Empty { .. }
+        request(server.broker_addr, Request::Health),
+        Response::Health { streams: 0, .. }
     ));
 }
 
@@ -1325,12 +1322,12 @@ fn network_protocol_recovers_binary_publish_batch_and_request_ids() {
                 records: vec![
                     PublishBatchRecord {
                         key: Some("order-1".to_owned()),
-                        payload_base64: BinaryPayload::new(vec![0, 1, 255]),
+                        payload: BinaryPayload::new(vec![0, 1, 255]),
                         request_id: Some("batch-1".to_owned()),
                     },
                     PublishBatchRecord {
                         key: None,
-                        payload_base64: BinaryPayload::new(b"second".to_vec()),
+                        payload: BinaryPayload::new(b"second".to_vec()),
                         request_id: Some("batch-2".to_owned()),
                     },
                 ],
@@ -1353,12 +1350,12 @@ fn network_protocol_recovers_binary_publish_batch_and_request_ids() {
                 records: vec![
                     PublishBatchRecord {
                         key: Some("order-1".to_owned()),
-                        payload_base64: BinaryPayload::new(vec![0, 1, 255]),
+                        payload: BinaryPayload::new(vec![0, 1, 255]),
                         request_id: Some("batch-1".to_owned()),
                     },
                     PublishBatchRecord {
                         key: None,
-                        payload_base64: BinaryPayload::new(b"second".to_vec()),
+                        payload: BinaryPayload::new(b"second".to_vec()),
                         request_id: Some("batch-2".to_owned()),
                     },
                 ],
@@ -1380,9 +1377,9 @@ fn network_protocol_recovers_binary_publish_batch_and_request_ids() {
         ),
         Response::MessageBytes {
             offset: 0,
-            payload_base64,
+            payload,
             ..
-        } if payload_base64.as_bytes() == [0, 1, 255]
+        } if payload.as_bytes() == [0, 1, 255]
     ));
     assert!(matches!(
         request(
@@ -1418,7 +1415,7 @@ fn network_protocol_rejects_publish_batches_over_record_bound() {
     let records = (0..=MAX_PUBLISH_BATCH_RECORDS)
         .map(|_| PublishBatchRecord {
             key: None,
-            payload_base64: BinaryPayload::new(Vec::new()),
+            payload: BinaryPayload::new(Vec::new()),
             request_id: None,
         })
         .collect();
@@ -1447,12 +1444,12 @@ fn network_protocol_returns_partial_publish_batch_outcomes() {
                 records: vec![
                     PublishBatchRecord {
                         key: None,
-                        payload_base64: BinaryPayload::new(b"rejected".to_vec()),
+                        payload: BinaryPayload::new(b"rejected".to_vec()),
                         request_id: Some("x".repeat(1_025)),
                     },
                     PublishBatchRecord {
                         key: None,
-                        payload_base64: BinaryPayload::new(b"accepted".to_vec()),
+                        payload: BinaryPayload::new(b"accepted".to_vec()),
                         request_id: Some("accepted".to_owned()),
                     },
                 ],
@@ -1467,75 +1464,90 @@ fn network_protocol_returns_partial_publish_batch_outcomes() {
 }
 
 fn request(address: SocketAddr, request: Request) -> Response {
-    let encoded = serde_json::to_string(&request).unwrap();
-    request_line(address, &encoded)
-}
-
-fn request_line(address: SocketAddr, encoded: &str) -> Response {
-    let mut stream = TcpStream::connect(address).expect("broker should accept connections");
-    stream
-        .set_read_timeout(Some(Duration::from_secs(2)))
-        .expect("read timeout should be set");
-    writeln!(stream, "{encoded}").unwrap();
-    let mut response = String::new();
-    BufReader::new(stream).read_line(&mut response).unwrap();
-    serde_json::from_str(&response).unwrap()
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap()
+        .block_on(async move {
+            let mut client = runnel_client::Client::connect(address).await.unwrap();
+            client.request(&request).await.unwrap()
+        })
 }
 
 fn request_through_dropping_proxy(address: SocketAddr, request: Request) -> Response {
+    use runnel_protocol::v2::{self, ServerFrame};
+
+    fn read_frame(stream: &mut TcpStream) -> std::io::Result<Vec<u8>> {
+        let mut length = [0; 4];
+        stream.read_exact(&mut length)?;
+        let length = u32::from_be_bytes(length) as usize;
+        let mut body = vec![0; length];
+        stream.read_exact(&mut body)?;
+        Ok(body)
+    }
+
+    fn write_frame(stream: &mut TcpStream, body: &[u8]) -> std::io::Result<()> {
+        let length = u32::try_from(body.len())
+            .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidData, "frame length"))?;
+        stream.write_all(&length.to_be_bytes())?;
+        stream.write_all(body)
+    }
+
     let listener = TcpListener::bind(("127.0.0.1", 0)).expect("proxy should bind");
     let proxy_addr = listener
         .local_addr()
         .expect("proxy address should be available");
     let (response_sender, response_receiver) = mpsc::channel();
     let proxy = std::thread::spawn(move || {
-        let (client, _) = listener.accept().expect("proxy should accept a client");
-        let mut request_line = String::new();
-        BufReader::new(
-            client
-                .try_clone()
-                .expect("proxy should clone the client connection"),
-        )
-        .read_line(&mut request_line)
-        .expect("proxy should read the client request");
+        let (mut client, _) = listener.accept().expect("proxy should accept a client");
+        let mut broker = TcpStream::connect(address).expect("proxy should reach broker");
+        client
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        broker
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
 
-        let mut broker = TcpStream::connect(address).expect("proxy should reach the broker");
-        broker
-            .set_read_timeout(Some(Duration::from_secs(2)))
-            .expect("proxy read timeout should be set");
-        broker
-            .write_all(request_line.as_bytes())
-            .expect("proxy should forward the request");
-        let mut response = String::new();
-        BufReader::new(broker)
-            .read_line(&mut response)
-            .expect("proxy should read the broker response");
+        let mut preface = [0; runnel_protocol::v2::PREFACE.len()];
+        client.read_exact(&mut preface).unwrap();
+        broker.write_all(&preface).unwrap();
+
+        let client_hello = read_frame(&mut client).unwrap();
+        write_frame(&mut broker, &client_hello).unwrap();
+        let server_hello = read_frame(&mut broker).unwrap();
+        write_frame(&mut client, &server_hello).unwrap();
+
+        let application_request = read_frame(&mut client).unwrap();
+        write_frame(&mut broker, &application_request).unwrap();
+        let application_response = read_frame(&mut broker).unwrap();
+        let response = match v2::decode_server_frame(
+            &application_response,
+            v2::MAX_SERVER_TO_CLIENT_FRAME_BYTES,
+        )
+        .unwrap()
+        {
+            ServerFrame::Application(reply) => reply.response,
+            _ => panic!("broker should return an application response"),
+        };
         response_sender
             .send(response)
             .expect("test should receive the broker response");
-        drop(client);
     });
 
-    let encoded = serde_json::to_string(&request).expect("request should serialize");
-    let mut client = TcpStream::connect(proxy_addr).expect("client should reach the proxy");
-    client
-        .set_read_timeout(Some(Duration::from_secs(2)))
-        .expect("client read timeout should be set");
-    writeln!(client, "{encoded}").expect("client should write the request");
-    let mut response = String::new();
-    assert_eq!(
-        BufReader::new(client)
-            .read_line(&mut response)
-            .expect("client should observe the dropped response"),
-        0,
-        "proxy should close the client connection without forwarding the response"
-    );
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap()
+        .block_on(async move {
+            let mut client = runnel_client::Client::connect(proxy_addr).await.unwrap();
+            let _ = client.request(&request).await;
+        });
 
     let response = response_receiver
-        .recv_timeout(Duration::from_secs(2))
-        .expect("proxy should observe a broker response");
+        .recv_timeout(Duration::from_secs(5))
+        .expect("proxy should observe the broker response");
     proxy.join().expect("proxy should finish cleanly");
-    serde_json::from_str(&response).expect("broker response should be valid JSON")
+    response
 }
 
 fn free_addr() -> SocketAddr {

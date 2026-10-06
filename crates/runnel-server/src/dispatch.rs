@@ -8,6 +8,7 @@ use runnel_protocol::{
     AckBatchItemOutcome, AckBatchItemResponse, BatchMessageResponse, BinaryPayload,
     MAX_PUBLISH_BATCH_RECORDS, PublishBatchRecordResponse, Request, Response,
 };
+use runnel_protocol::v2::{ApplicationReply, ItemMetadata, Outcome, Stage};
 
 #[cfg(feature = "instrumentation")]
 use runnel_engine::StageTimer;
@@ -15,21 +16,54 @@ use runnel_engine::StageTimer;
 use crate::observability::{ServerMetrics, record_batch_delivery, record_delivery};
 use crate::protocol::invalid_request_response;
 
-pub(crate) async fn handle_request(
+pub(crate) async fn handle_request_with_metadata(
     engine: &dyn Engine,
     request: Request,
     metrics: &ServerMetrics,
-) -> Response {
+    max_response_bytes: usize,
+) -> ApplicationReply {
     #[cfg(feature = "instrumentation")]
     let _stage_timer = StageTimer::new("server.engine_request");
+    let batch_request = matches!(
+        &request,
+        Request::PublishBatch { .. }
+            | Request::PollBatch { .. }
+            | Request::PollGroupBatch { .. }
+            | Request::AckBatch { .. }
+            | Request::AckGroupBatch { .. }
+    );
+    let state_changing = matches!(
+        &request,
+        Request::CreateStream { .. }
+            | Request::Publish { .. }
+            | Request::PublishBytes { .. }
+            | Request::PublishBatch { .. }
+            | Request::PollGroup { .. }
+            | Request::PollGroupBatch { .. }
+            | Request::ConfigureConsumer { .. }
+            | Request::Ack { .. }
+            | Request::AckBatch { .. }
+            | Request::AckGroup { .. }
+            | Request::AckGroupBatch { .. }
+    );
+    let grouped_poll = matches!(&request, Request::PollGroup { .. });
+    let mut item_metadata = Vec::new();
     if let Request::PublishBatch { records, .. } = &request {
         if records.is_empty() {
-            return invalid_request_response("publish batch must contain at least one record");
+            return ApplicationReply::failed(
+                invalid_request_response("publish batch must contain at least one record"),
+                Outcome::Rejected,
+                Stage::Validated,
+            );
         }
         if records.len() > MAX_PUBLISH_BATCH_RECORDS {
-            return invalid_request_response(&format!(
-                "publish batch contains more than {MAX_PUBLISH_BATCH_RECORDS} records"
-            ));
+            return ApplicationReply::failed(
+                invalid_request_response(&format!(
+                    "publish batch contains more than {MAX_PUBLISH_BATCH_RECORDS} records"
+                )),
+                Outcome::Rejected,
+                Stage::Validated,
+            );
         }
     }
     let result = match request {
@@ -60,12 +94,12 @@ pub(crate) async fn handle_request(
         Request::PublishBytes {
             stream,
             key,
-            payload_base64,
+            payload,
             request_id,
         } => {
-            let payload_bytes = payload_base64.as_bytes().len() as u64;
+            let payload_bytes = payload.as_bytes().len() as u64;
             engine
-                .publish(&stream, key, payload_base64.into_bytes(), request_id)
+                .publish(&stream, key, payload.into_bytes(), request_id)
                 .await
                 .map(|offset| {
                     metrics.publishes.fetch_add(1, Ordering::Relaxed);
@@ -78,13 +112,13 @@ pub(crate) async fn handle_request(
         Request::PublishBatch { stream, records } => {
             let payload_sizes = records
                 .iter()
-                .map(|record| record.payload_base64.as_bytes().len() as u64)
+                .map(|record| record.payload.as_bytes().len() as u64)
                 .collect::<Vec<_>>();
             let records = records
                 .into_iter()
                 .map(|record| PublishRecord {
                     key: record.key,
-                    payload: record.payload_base64.into_bytes(),
+                    payload: record.payload.into_bytes(),
                     request_id: record.request_id,
                 })
                 .collect();
@@ -102,6 +136,10 @@ pub(crate) async fn handle_request(
                         .zip(payload_sizes)
                         .map(|(outcome, payload_bytes)| match outcome {
                             Ok(offset) => {
+                                item_metadata.push(ItemMetadata {
+                                    outcome: Outcome::Confirmed,
+                                    stage: Stage::Durable,
+                                });
                                 metrics.publishes.fetch_add(1, Ordering::Relaxed);
                                 metrics
                                     .published_bytes
@@ -109,6 +147,10 @@ pub(crate) async fn handle_request(
                                 PublishBatchRecordResponse::Published { offset }
                             }
                             Err(error) => {
+                                item_metadata.push(ItemMetadata {
+                                    outcome: broker_outcome(error.outcome()),
+                                    stage: Stage::ExecutionStarted,
+                                });
                                 let Response::Error { code, message } =
                                     publish_batch_error_response(&error)
                                 else {
@@ -122,7 +164,9 @@ pub(crate) async fn handle_request(
                 })
         }
         Request::Poll { stream, consumer } => {
-            let result = engine.poll(&stream, &consumer).await;
+            let result = engine
+                .poll_with_response_limit(&stream, &consumer, max_response_bytes)
+                .await;
             record_delivery(metrics, &result);
             result.map(|result| match result {
                 PollResult::Message(message) => message_response(MessageResponse {
@@ -152,13 +196,24 @@ pub(crate) async fn handle_request(
                     &consumer,
                     ConsumeBatchLimits {
                         max_records,
-                        max_bytes,
+                        max_bytes: max_bytes.min(max_response_bytes),
                         max_wait_ms,
                     },
                 )
                 .await;
             match result {
                 Ok(messages) => {
+                    item_metadata = messages
+                        .iter()
+                        .map(|message| ItemMetadata {
+                            outcome: Outcome::Confirmed,
+                            stage: if message.delivery_token.is_some() {
+                                Stage::Durable
+                            } else {
+                                Stage::Completed
+                            },
+                        })
+                        .collect();
                     record_batch_delivery(metrics, &messages);
                     Ok(Response::PollBatch {
                         stream,
@@ -185,7 +240,14 @@ pub(crate) async fn handle_request(
             consumer,
             member,
         } => {
-            let result = engine.poll_group(&stream, &consumer, &member).await;
+            let result = engine
+                .poll_group_with_response_limit(
+                    &stream,
+                    &consumer,
+                    &member,
+                    max_response_bytes,
+                )
+                .await;
             record_delivery(metrics, &result);
             result.map(|result| match result {
                 PollResult::Message(message) => message_response(MessageResponse {
@@ -217,13 +279,20 @@ pub(crate) async fn handle_request(
                     &member,
                     ConsumeBatchLimits {
                         max_records,
-                        max_bytes,
+                        max_bytes: max_bytes.min(max_response_bytes),
                         max_wait_ms,
                     },
                 )
                 .await;
             match result {
                 Ok(messages) => {
+                    item_metadata = messages
+                        .iter()
+                        .map(|_| ItemMetadata {
+                            outcome: Outcome::Confirmed,
+                            stage: Stage::Durable,
+                        })
+                        .collect();
                     record_batch_delivery(metrics, &messages);
                     Ok(Response::PollBatch {
                         stream,
@@ -283,6 +352,22 @@ pub(crate) async fn handle_request(
             )
             .await
             .map(|result| {
+                item_metadata = result
+                    .outcomes
+                    .iter()
+                    .map(|item| match item.outcome {
+                        AckBatchOutcome::Confirmed | AckBatchOutcome::AlreadyConfirmed => {
+                            ItemMetadata {
+                                outcome: Outcome::Confirmed,
+                                stage: Stage::Durable,
+                            }
+                        }
+                        AckBatchOutcome::Rejected { .. } => ItemMetadata {
+                            outcome: Outcome::Rejected,
+                            stage: Stage::ExecutionStarted,
+                        },
+                    })
+                    .collect();
                 metrics.acknowledgements.fetch_add(
                     result
                         .outcomes
@@ -339,6 +424,22 @@ pub(crate) async fn handle_request(
             )
             .await
             .map(|result| {
+                item_metadata = result
+                    .outcomes
+                    .iter()
+                    .map(|item| match item.outcome {
+                        AckBatchOutcome::Confirmed | AckBatchOutcome::AlreadyConfirmed => {
+                            ItemMetadata {
+                                outcome: Outcome::Confirmed,
+                                stage: Stage::Durable,
+                            }
+                        }
+                        AckBatchOutcome::Rejected { .. } => ItemMetadata {
+                            outcome: Outcome::Rejected,
+                            stage: Stage::ExecutionStarted,
+                        },
+                    })
+                    .collect();
                 metrics.acknowledgements.fetch_add(
                     result
                         .outcomes
@@ -364,7 +465,36 @@ pub(crate) async fn handle_request(
         }),
     };
 
-    result.unwrap_or_else(|error| error_response(&error))
+    match result {
+        Ok(response) if batch_request => ApplicationReply::batch(response, item_metadata),
+        Ok(response) => {
+            let stage = match (&response, grouped_poll) {
+                (Response::Message { .. } | Response::MessageBytes { .. }, true) => Stage::Durable,
+                (Response::Empty { .. }, true) => Stage::Completed,
+                _ if state_changing => Stage::Durable,
+                _ => Stage::Completed,
+            };
+            ApplicationReply {
+                response,
+                outcome: Some(Outcome::Confirmed),
+                stage: Some(stage),
+                items: Vec::new(),
+            }
+        }
+        Err(error) => ApplicationReply::failed(
+            error_response(&error),
+            broker_outcome(error.outcome()),
+            Stage::ExecutionStarted,
+        ),
+    }
+}
+
+fn broker_outcome(outcome: runnel_engine::BrokerErrorOutcome) -> Outcome {
+    match outcome {
+        runnel_engine::BrokerErrorOutcome::Rejected => Outcome::Rejected,
+        runnel_engine::BrokerErrorOutcome::Retryable => Outcome::Retryable,
+        runnel_engine::BrokerErrorOutcome::Unknown => Outcome::Unknown,
+    }
 }
 
 fn consumer_policy_response(stream: String, consumer: String, policy: ConsumerPolicy) -> Response {
@@ -411,7 +541,7 @@ fn batch_message_response(
             member: member.map(str::to_owned),
             offset,
             key,
-            payload_base64: BinaryPayload::new(payload),
+            payload: BinaryPayload::new(payload),
             published_at_ms,
             delivery_token,
             delivery_attempt,
@@ -475,7 +605,7 @@ fn replay_message_response(message: ReplayMessage, consumer: String) -> Response
             consumer,
             offset,
             key,
-            payload_base64: BinaryPayload::new(error.into_bytes()),
+            payload: BinaryPayload::new(error.into_bytes()),
             published_at_ms,
         },
     }
@@ -523,7 +653,7 @@ fn message_response(message: MessageResponse) -> Response {
             member,
             offset,
             key,
-            payload_base64: BinaryPayload::new(error.into_bytes()),
+            payload: BinaryPayload::new(error.into_bytes()),
             published_at_ms,
             delivery_token,
             delivery_attempt,
@@ -553,6 +683,7 @@ fn error_response(error: &BrokerError) -> Response {
         BrokerError::Configuration(_) => "invalid_configuration",
         BrokerError::InvalidBatchRequest(_) => "invalid_batch_request",
         BrokerError::ConsumeBatchRecordTooLarge { .. } => "consume_batch_record_too_large",
+        BrokerError::ResponseTooLarge { .. } => "response_too_large",
         BrokerError::NotLeader { .. } => "cluster_error",
         BrokerError::Cluster(_) => "cluster_error",
     };

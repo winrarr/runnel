@@ -1,11 +1,13 @@
-use base64::{Engine as _, engine::general_purpose::STANDARD};
-use serde::de::Error as _;
-use serde::{Deserialize, Deserializer, Serialize, Serializer};
+use serde::{Deserialize, Serialize};
 
-/// Name of the current provisional application protocol.
-pub const PROTOCOL_NAME: &str = "runnel-json-lines";
-/// Version of the current provisional JSON-lines protocol.
-pub const PROTOCOL_VERSION: u16 = 1;
+pub mod v2;
+mod security;
+pub use security::{BearerToken, SecurityRole, TokenFormatError};
+
+/// Name of the v2 Protobuf application protocol.
+pub const PROTOCOL_NAME: &str = "runnel-protobuf";
+/// Application protocol major declared by this implementation.
+pub const PROTOCOL_VERSION: u16 = 2;
 /// Lowest protocol version supported by this crate.
 pub const MIN_SUPPORTED_PROTOCOL_VERSION: u16 = PROTOCOL_VERSION;
 /// Highest protocol version supported by this crate.
@@ -27,13 +29,14 @@ impl ProtocolVersionRange {
     }
 }
 
-/// Payload representation supported by the provisional wire protocol.
+/// Payload helpers exposed by the Rust API. Every v2 wire payload is an opaque
+/// Protobuf byte field; `Utf8Text` is only a convenience input/output view.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PayloadEncoding {
-    /// UTF-8 text in the legacy `payload` field.
+    /// UTF-8 text supplied through a text convenience API.
     Utf8Text,
-    /// Exact application bytes in the padded `payload_base64` field.
-    Base64,
+    /// Exact application bytes supplied through a binary convenience API.
+    Binary,
 }
 
 /// Version and payload compatibility declared by this protocol implementation.
@@ -66,24 +69,21 @@ pub const PROTOCOL_SUPPORT: ProtocolSupport = ProtocolSupport {
         min: MIN_SUPPORTED_PROTOCOL_VERSION,
         max: MAX_SUPPORTED_PROTOCOL_VERSION,
     },
-    payload_encodings: &[PayloadEncoding::Utf8Text, PayloadEncoding::Base64],
+    payload_encodings: &[PayloadEncoding::Utf8Text, PayloadEncoding::Binary],
 };
 
 /// Maximum number of records accepted in one publish-batch request.
 pub const MAX_PUBLISH_BATCH_RECORDS: usize = 1024;
 /// Maximum encoded request size supported by the protocol's publish-batch path.
 pub const MAX_PUBLISH_BATCH_BYTES: usize = 64 * 1024 * 1024;
-/// Maximum encoded response size supported by the provisional protocol.
-///
-/// Message responses can carry a payload accepted by a request at the maximum
-/// request size, plus response metadata. The additional 1 MiB leaves room for
-/// that metadata while keeping a finite default bound for clients.
-pub const MAX_RESPONSE_BYTES: usize = MAX_PUBLISH_BATCH_BYTES + 1024 * 1024;
+/// Maximum server-to-client Protobuf frame body size.
+pub const MAX_RESPONSE_BYTES: usize = v2::MAX_SERVER_TO_CLIENT_FRAME_BYTES;
 /// Maximum number of records accepted by one consume-batch request.
 pub const MAX_CONSUME_BATCH_RECORDS: usize = 1024;
 
-/// Opaque bytes represented as standard padded base64 on the provisional wire.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// Opaque application bytes carried directly in a v2 Protobuf `bytes` field.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(transparent)]
 pub struct BinaryPayload(Vec<u8>);
 
 impl BinaryPayload {
@@ -92,9 +92,16 @@ impl BinaryPayload {
         Self(value.into())
     }
 
-    /// Decode a standard padded base64 value into a binary payload.
+    /// Decode a base64 command-line input into application bytes.
+    ///
+    /// This is an input convenience only; v2 transports the decoded bytes in
+    /// its Protobuf `bytes` field.
     pub fn from_base64(value: &str) -> Result<Self, base64::DecodeError> {
-        STANDARD.decode(value).map(Self)
+        use base64::Engine as _;
+
+        base64::engine::general_purpose::STANDARD
+            .decode(value)
+            .map(Self)
     }
 
     /// Return the application bytes without changing them.
@@ -107,28 +114,9 @@ impl BinaryPayload {
         self.0
     }
 
-    /// Return the wire representation used by this payload.
+    /// Return the Rust API view used by this payload.
     pub const fn encoding(&self) -> PayloadEncoding {
-        PayloadEncoding::Base64
-    }
-}
-
-impl Serialize for BinaryPayload {
-    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
-    where
-        S: Serializer,
-    {
-        serializer.serialize_str(&STANDARD.encode(&self.0))
-    }
-}
-
-impl<'de> Deserialize<'de> for BinaryPayload {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        let value = String::deserialize(deserializer)?;
-        STANDARD.decode(value).map(Self).map_err(D::Error::custom)
+        PayloadEncoding::Binary
     }
 }
 
@@ -137,7 +125,7 @@ impl<'de> Deserialize<'de> for BinaryPayload {
 #[serde(deny_unknown_fields)]
 pub struct PublishBatchRecord {
     pub key: Option<String>,
-    pub payload_base64: BinaryPayload,
+    pub payload: BinaryPayload,
     #[serde(default)]
     pub request_id: Option<String>,
 }
@@ -145,12 +133,12 @@ pub struct PublishBatchRecord {
 impl PublishBatchRecord {
     /// Return the wire representation used by this record's payload.
     pub const fn payload_encoding(&self) -> PayloadEncoding {
-        PayloadEncoding::Base64
+        PayloadEncoding::Binary
     }
 }
 
 /// The broker's result for one publish-batch record.
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum PublishBatchRecordResponse {
     Published { offset: u64 },
@@ -171,11 +159,11 @@ pub enum Request {
         #[serde(default)]
         request_id: Option<String>,
     },
-    /// Publish arbitrary bytes as the explicit `payload_base64` representation.
+    /// Publish arbitrary application bytes.
     PublishBytes {
         stream: String,
         key: Option<String>,
-        payload_base64: BinaryPayload,
+        payload: BinaryPayload,
         #[serde(default)]
         request_id: Option<String>,
     },
@@ -256,7 +244,7 @@ impl Request {
     pub const fn payload_encoding(&self) -> Option<PayloadEncoding> {
         match self {
             Self::Publish { .. } => Some(PayloadEncoding::Utf8Text),
-            Self::PublishBytes { .. } | Self::PublishBatch { .. } => Some(PayloadEncoding::Base64),
+            Self::PublishBytes { .. } | Self::PublishBatch { .. } => Some(PayloadEncoding::Binary),
             Self::CreateStream { .. }
             | Self::Poll { .. }
             | Self::PollBatch { .. }
@@ -282,8 +270,8 @@ pub struct BatchDeliveryReceipt {
     pub delivery_token: String,
 }
 
-/// One JSON object in a mixed text/binary consume-batch response.
-#[derive(Debug, Serialize, Deserialize)]
+/// One decoded item in a consume-batch response.
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum BatchMessageResponse {
     Text {
@@ -307,7 +295,7 @@ pub enum BatchMessageResponse {
         member: Option<String>,
         offset: u64,
         key: Option<String>,
-        payload_base64: BinaryPayload,
+        payload: BinaryPayload,
         published_at_ms: u64,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         delivery_token: Option<String>,
@@ -317,7 +305,7 @@ pub enum BatchMessageResponse {
 }
 
 /// One independently evaluated acknowledgement receipt.
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct AckBatchItemResponse {
     pub offset: u64,
@@ -337,7 +325,7 @@ pub enum AckBatchItemOutcome {
     Rejected,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Response {
     StreamCreated {
@@ -371,7 +359,7 @@ pub enum Response {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         delivery_attempt: Option<u32>,
     },
-    /// A message whose bytes are not representable by the legacy UTF-8 payload field.
+    /// A message whose application bytes are not valid UTF-8.
     MessageBytes {
         stream: String,
         consumer: String,
@@ -379,7 +367,7 @@ pub enum Response {
         member: Option<String>,
         offset: u64,
         key: Option<String>,
-        payload_base64: BinaryPayload,
+        payload: BinaryPayload,
         published_at_ms: u64,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         delivery_token: Option<String>,
@@ -394,13 +382,13 @@ pub enum Response {
         payload: String,
         published_at_ms: u64,
     },
-    /// A replay record whose bytes are not representable by the legacy UTF-8 payload field.
+    /// A replay record whose application bytes are not valid UTF-8.
     ReplayMessageBytes {
         stream: String,
         consumer: String,
         offset: u64,
         key: Option<String>,
-        payload_base64: BinaryPayload,
+        payload: BinaryPayload,
         published_at_ms: u64,
     },
     Empty {
@@ -443,7 +431,7 @@ impl Response {
         match self {
             Self::Message { .. } | Self::ReplayMessage { .. } => Some(PayloadEncoding::Utf8Text),
             Self::MessageBytes { .. } | Self::ReplayMessageBytes { .. } => {
-                Some(PayloadEncoding::Base64)
+                Some(PayloadEncoding::Binary)
             }
             Self::StreamCreated { .. }
             | Self::Published { .. }
@@ -460,82 +448,14 @@ impl Response {
 }
 
 #[cfg(test)]
-mod consume_batch_response_tests {
-    use super::{BatchMessageResponse, BinaryPayload, Response};
-    use runnel_engine::{Message, poll_batch_response_len};
+mod payload_tests {
+    use super::{BinaryPayload, PayloadEncoding};
 
     #[test]
-    fn consume_batch_size_includes_serialized_metadata_payload_expansion_and_newline() {
-        let messages = vec![
-            Message {
-                stream: "events/☃".to_owned(),
-                offset: 17,
-                key: Some("key\n\"quoted".to_owned()),
-                payload: "text\n☃".as_bytes().to_vec(),
-                published_at_ms: 1_723_456_789,
-                delivery_token: Some("receipt-\"\n".to_owned()),
-                delivery_attempt: Some(12),
-            },
-            Message {
-                stream: "events/☃".to_owned(),
-                offset: 18,
-                key: None,
-                payload: vec![0, 1, 255, b'\n'],
-                published_at_ms: 1_723_456_790,
-                delivery_token: Some("receipt-2".to_owned()),
-                delivery_attempt: Some(2),
-            },
-        ];
-        let response = Response::PollBatch {
-            stream: "events/☃".to_owned(),
-            consumer: "workers".to_owned(),
-            messages: messages
-                .iter()
-                .map(|message| {
-                    let common = (
-                        message.stream.clone(),
-                        "workers".to_owned(),
-                        Some("member-☃".to_owned()),
-                        message.offset,
-                        message.key.clone(),
-                        message.published_at_ms,
-                        message.delivery_token.clone(),
-                        message.delivery_attempt,
-                    );
-                    if let Ok(payload) = String::from_utf8(message.payload.clone()) {
-                        BatchMessageResponse::Text {
-                            stream: common.0,
-                            consumer: common.1,
-                            member: common.2,
-                            offset: common.3,
-                            key: common.4,
-                            payload,
-                            published_at_ms: common.5,
-                            delivery_token: common.6,
-                            delivery_attempt: common.7,
-                        }
-                    } else {
-                        BatchMessageResponse::Bytes {
-                            stream: common.0,
-                            consumer: common.1,
-                            member: common.2,
-                            offset: common.3,
-                            key: common.4,
-                            payload_base64: BinaryPayload::new(message.payload.clone()),
-                            published_at_ms: common.5,
-                            delivery_token: common.6,
-                            delivery_attempt: common.7,
-                        }
-                    }
-                })
-                .collect(),
-        };
-        let mut serialized = serde_json::to_vec(&response).unwrap();
-        serialized.push(b'\n');
-
-        assert_eq!(
-            poll_batch_response_len("events/☃", "workers", Some("member-☃"), &messages),
-            serialized.len()
-        );
+    fn binary_payload_is_raw_v2_bytes() {
+        let value = [0, 1, 255, b'\n'];
+        let payload = BinaryPayload::new(value);
+        assert_eq!(payload.as_bytes(), value);
+        assert_eq!(payload.encoding(), PayloadEncoding::Binary);
     }
 }

@@ -17,7 +17,7 @@ use runnel_engine::StageTimer;
 use runnel_engine::{
     AckBatchResult, AckResult, BrokerError, ConsumeBatchLimits, ConsumerPolicy, DeliveryReceipt,
     Engine, EngineFuture, Message, Offset, PollResult, ReplayMessage, validate_ack_batch_receipts,
-    validate_consume_batch_limits, validate_consumer_policy,
+    validate_consume_batch_limits, validate_consumer_policy, MAX_CONSUME_BATCH_RESPONSE_BYTES,
 };
 use serde::{Deserialize, Serialize};
 use tokio::sync::RwLock;
@@ -649,6 +649,56 @@ impl RaftGroup {
         consumer: String,
         member: String,
     ) -> Result<PollResult, BrokerError> {
+        self.poll_group_with_response_limit(
+            stream,
+            consumer,
+            member,
+            MAX_CONSUME_BATCH_RESPONSE_BYTES,
+        )
+        .await
+    }
+
+    pub async fn poll_with_response_limit(
+        &self,
+        stream: String,
+        consumer: String,
+        max_response_bytes: usize,
+    ) -> Result<PollResult, BrokerError> {
+        self.poll_group_with_response_member(
+            stream.clone(),
+            consumer.clone(),
+            consumer,
+            None,
+            max_response_bytes,
+        )
+        .await
+    }
+
+    pub async fn poll_group_with_response_limit(
+        &self,
+        stream: String,
+        consumer: String,
+        member: String,
+        max_response_bytes: usize,
+    ) -> Result<PollResult, BrokerError> {
+        self.poll_group_with_response_member(
+            stream,
+            consumer,
+            member.clone(),
+            Some(member),
+            max_response_bytes,
+        )
+        .await
+    }
+
+    async fn poll_group_with_response_member(
+        &self,
+        stream: String,
+        consumer: String,
+        member: String,
+        response_member: Option<String>,
+        max_response_bytes: usize,
+    ) -> Result<PollResult, BrokerError> {
         #[cfg(feature = "instrumentation")]
         let _stage_timer = StageTimer::new("raft.poll_quorum");
         let now_ms = now_ms();
@@ -666,6 +716,8 @@ impl RaftGroup {
                 stream,
                 consumer,
                 member,
+                response_member,
+                max_response_bytes,
                 now_ms,
                 lease_deadline_ms,
                 max_delivery_attempts: self.max_delivery_attempts,
@@ -676,6 +728,9 @@ impl RaftGroup {
             .map_err(map_client_write_error)?;
         match response.data {
             CommandResponse::GroupPoll { result } => Ok(result),
+            CommandResponse::GroupPollResponseTooLarge { max_bytes } => {
+                Err(BrokerError::ResponseTooLarge { max_bytes })
+            }
             CommandResponse::StreamNotFound => Err(BrokerError::StreamNotFound(stream_name)),
             other => Err(BrokerError::Cluster(format!(
                 "unexpected grouped poll response: {other:?}"
@@ -1024,6 +1079,23 @@ impl Engine for SingleNodeEngine {
         Box::pin(async move { self.group.poll(stream, consumer).await })
     }
 
+    fn poll_with_response_limit<'a>(
+        &'a self,
+        stream: &'a str,
+        consumer: &'a str,
+        max_response_bytes: usize,
+    ) -> EngineFuture<'a, PollResult> {
+        Box::pin(async move {
+            self.group
+                .poll_with_response_limit(
+                    stream.to_owned(),
+                    consumer.to_owned(),
+                    max_response_bytes,
+                )
+                .await
+        })
+    }
+
     fn configure_consumer<'a>(
         &'a self,
         stream: &'a str,
@@ -1073,6 +1145,25 @@ impl Engine for SingleNodeEngine {
         Box::pin(async move {
             self.group
                 .poll_group(stream.to_owned(), consumer.to_owned(), member.to_owned())
+                .await
+        })
+    }
+
+    fn poll_group_with_response_limit<'a>(
+        &'a self,
+        stream: &'a str,
+        consumer: &'a str,
+        member: &'a str,
+        max_response_bytes: usize,
+    ) -> EngineFuture<'a, PollResult> {
+        Box::pin(async move {
+            self.group
+                .poll_group_with_response_limit(
+                    stream.to_owned(),
+                    consumer.to_owned(),
+                    member.to_owned(),
+                    max_response_bytes,
+                )
                 .await
         })
     }
@@ -1435,6 +1526,38 @@ impl Engine for PersistentEngine {
         })
     }
 
+    fn poll_with_response_limit<'a>(
+        &'a self,
+        stream: &'a str,
+        consumer: &'a str,
+        max_response_bytes: usize,
+    ) -> EngineFuture<'a, PollResult> {
+        Box::pin(async move {
+            let data_group = self.manager.data_group_for_stream(stream).await?;
+            let Some(leader_id) = data_group.raft().current_leader().await else {
+                return Err(BrokerError::NotLeader { leader_id: None });
+            };
+            if leader_id != self.node_id {
+                return self
+                    .forwarder()
+                    .poll_with_response_limit(
+                        stream.to_owned(),
+                        consumer.to_owned(),
+                        max_response_bytes,
+                        Some(leader_id),
+                    )
+                    .await;
+            }
+            data_group
+                .poll_with_response_limit(
+                    stream.to_owned(),
+                    consumer.to_owned(),
+                    max_response_bytes,
+                )
+                .await
+        })
+    }
+
     fn configure_consumer<'a>(
         &'a self,
         stream: &'a str,
@@ -1544,6 +1667,41 @@ impl Engine for PersistentEngine {
             }
             self.manager
                 .poll_group_local(stream, consumer, member)
+                .await
+        })
+    }
+
+    fn poll_group_with_response_limit<'a>(
+        &'a self,
+        stream: &'a str,
+        consumer: &'a str,
+        member: &'a str,
+        max_response_bytes: usize,
+    ) -> EngineFuture<'a, PollResult> {
+        Box::pin(async move {
+            let data_group = self.manager.data_group_for_stream(stream).await?;
+            let Some(leader_id) = data_group.raft().current_leader().await else {
+                return Err(BrokerError::NotLeader { leader_id: None });
+            };
+            if leader_id != self.node_id {
+                return self
+                    .forwarder()
+                    .poll_group_with_response_limit(
+                        stream.to_owned(),
+                        consumer.to_owned(),
+                        member.to_owned(),
+                        max_response_bytes,
+                        Some(leader_id),
+                    )
+                    .await;
+            }
+            data_group
+                .poll_group_with_response_limit(
+                    stream.to_owned(),
+                    consumer.to_owned(),
+                    member.to_owned(),
+                    max_response_bytes,
+                )
                 .await
         })
     }
