@@ -123,6 +123,8 @@ Useful workflows:
 
 The existing scripts/verify.sh command remains as a thin compatibility wrapper around just verify.
 
+`just bench-compare-cluster` builds the Runnel image and runs an opt-in three-node durable-publish comparison for Runnel, Kafka, Redpanda, and JetStream. It is an engineering baseline, not a cross-product ranking; Runnel's host-side benchmark client is not cgroup-limited by the configured client budget.
+
 The required pull-request CI gate is a two-branch DAG: `Verify` and `Integration`
 run in parallel and both must pass. `Verify` owns the real three-node
 `cluster_smoke` test; `Integration` owns the process smoke and container smoke

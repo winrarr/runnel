@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
-"""Run a first-pass native-tool comparison of Runnel, Kafka, Redpanda, and JetStream.
+"""Run a first-pass non-ranking comparison of Runnel, Kafka, Redpanda, and JetStream.
 
-The default comparison preserves each broker's native benchmark client and
-single-node topology. ``--nodes 3`` adds a competitor-only, durable-publish
-comparison with three broker nodes and replication factor three. It deliberately
-does not include Runnel or a consumer result because those paths do not yet have
-matching distributed semantics in this harness.
+The default comparison uses each broker's current benchmark client and a
+single-node topology. ``--nodes 3`` runs durable publish on three broker nodes
+for every selected backend. Runnel uses the existing clustered public-protocol
+runner; differences in client behavior and durability boundaries remain
+explicit, so results are not eligible for cross-product ranking.
 
 The implementation is split into private lifecycle, backend, result-policy, and
 CLI modules. This file remains the stable executable and import facade for the
@@ -48,6 +48,7 @@ from compare_backends import (
     run_kafka_family,
     run_nats,
     run_runnel,
+    run_runnel_cluster,
     start_kafka_services,
     start_nats_services,
     start_redpanda_services,

@@ -220,6 +220,16 @@ def validate_backend_record(
     )
     if client_image != declared_client_image:
         raise ComparisonError(f"backend {name!r} has inconsistent client image metadata")
+    if name == "runnel":
+        client_limits = backend.get("client_resource_limits")
+        if not isinstance(client_limits, dict):
+            raise ComparisonError("Runnel backend is missing client_resource_limits")
+        if client_limits != {
+            "scope": "host process",
+            "cpu": "unbounded",
+            "memory": "unbounded",
+        }:
+            raise ComparisonError("Runnel client resource limits must disclose the host scope")
 
     if expected_nodes is not None:
         node_records = backend.get("nodes")
@@ -359,49 +369,81 @@ def benchmark_suite(nodes: int, backends: list[str]) -> str:
 def backend_metadata(name: str, nodes: int) -> dict[str, Any]:
     """Declare operation-specific client, durability, and comparison boundaries."""
     if name == "runnel":
-        acknowledgement = (
-            "request response after the current local durable append; consume acknowledgement "
-            "persists a consumer checkpoint"
-        )
-        replication = "single local broker engine"
-        measurement_boundary = "Runnel's current line-delimited JSON protocol"
         client_image = "host Python runtime"
-        client_name = "host Python socket client"
-        scenario_classes = ["publish-only", "consume-with-ack"]
-        scenario_boundaries = {
-            "publish-only": {
-                "acknowledgement_boundary": "publish response after the local durable append",
-                "durability_boundary": (
-                    "current local broker durable-append default; no replica quorum"
-                ),
-                "replication_topology": replication,
-                "delivery_boundary": "not applicable to publish-only",
-                "batching_boundary": (
-                    "one in-flight publish request per message; concurrency=1; no client batching"
-                ),
-                "client_boundary": "host Python socket client using the host Python runtime",
-                "latency_boundary": (
-                    "per-message publish request send-to-response; p50/p99/p99.9/max are recorded"
-                ),
-            },
-            "consume-with-ack": {
-                "acknowledgement_boundary": (
-                    "ack response after the local consumer checkpoint is persisted"
-                ),
-                "durability_boundary": "consumer checkpoint persistence on the single local broker",
-                "replication_topology": replication,
-                "delivery_boundary": (
-                    "one poll followed by one acknowledgement per message; at-least-once delivery"
-                ),
-                "batching_boundary": (
-                    "one poll-and-ack sequence per message; concurrency=1; no client batching"
-                ),
-                "client_boundary": "host Python socket client using the host Python runtime",
-                "latency_boundary": (
-                    "per-message poll-and-ack sequence; p50/p99/p99.9/max are recorded"
-                ),
-            },
-        }
+        if nodes == THREE_NODE_COUNT:
+            acknowledgement = (
+                "public publish response after commit by the current three-node Raft quorum "
+                "and durable local state"
+            )
+            replication = "three-node static Multi-Raft; one data group per stream"
+            measurement_boundary = "Runnel's clustered line-delimited JSON public protocol"
+            client_name = "host Python clustered benchmark client"
+            scenario_classes = ["publish-only"]
+            scenario_boundaries = {
+                "publish-only": {
+                    "acknowledgement_boundary": acknowledgement,
+                    "durability_boundary": (
+                        "current three-node Raft quorum commit and local durable state; "
+                        "filesystem flush behavior is not claimed equivalent"
+                    ),
+                    "replication_topology": replication,
+                    "delivery_boundary": "not applicable to publish-only",
+                    "batching_boundary": (
+                        "one in-flight public publish request per record; persistent clients "
+                        "rotate across the three nodes; no client batching"
+                    ),
+                    "client_boundary": (
+                        "host Python socket client from cluster.py; host-side and not cgroup-limited"
+                    ),
+                    "latency_boundary": (
+                        "per-message public publish request send-to-response, including cluster "
+                        "routing and quorum work; p50/p99/p99.9/max are recorded"
+                    ),
+                }
+            }
+        else:
+            acknowledgement = (
+                "request response after the current local durable append; consume acknowledgement "
+                "persists a consumer checkpoint"
+            )
+            replication = "single local broker engine"
+            measurement_boundary = "Runnel's current line-delimited JSON protocol"
+            client_name = "host Python socket client"
+            scenario_classes = ["publish-only", "consume-with-ack"]
+            scenario_boundaries = {
+                "publish-only": {
+                    "acknowledgement_boundary": "publish response after the local durable append",
+                    "durability_boundary": (
+                        "current local broker durable-append default; no replica quorum"
+                    ),
+                    "replication_topology": replication,
+                    "delivery_boundary": "not applicable to publish-only",
+                    "batching_boundary": (
+                        "one in-flight publish request per message; concurrency=1; no client batching"
+                    ),
+                    "client_boundary": "host Python socket client using the host Python runtime",
+                    "latency_boundary": (
+                        "per-message publish request send-to-response; p50/p99/p99.9/max are recorded"
+                    ),
+                },
+                "consume-with-ack": {
+                    "acknowledgement_boundary": (
+                        "ack response after the local consumer checkpoint is persisted"
+                    ),
+                    "durability_boundary": "consumer checkpoint persistence on the single local broker",
+                    "replication_topology": replication,
+                    "delivery_boundary": (
+                        "one poll followed by one acknowledgement per message; at-least-once delivery"
+                    ),
+                    "batching_boundary": (
+                        "one poll-and-ack sequence per message; concurrency=1; no client batching"
+                    ),
+                    "client_boundary": "host Python socket client using the host Python runtime",
+                    "latency_boundary": (
+                        "per-message poll-and-ack sequence; p50/p99/p99.9/max are recorded"
+                    ),
+                },
+            }
     elif name in {"kafka", "redpanda"}:
         client_image = KAFKA_IMAGE
         client_name = "Kafka producer/consumer performance clients"
@@ -581,6 +623,17 @@ def backend_metadata(name: str, nodes: int) -> dict[str, Any]:
         "measurement_boundary": measurement_boundary,
         "measurement_client": client_name,
         "client_image": client_image,
+        **(
+            {
+                "client_resource_limits": {
+                    "scope": "host process",
+                    "cpu": "unbounded",
+                    "memory": "unbounded",
+                }
+            }
+            if name == "runnel"
+            else {}
+        ),
         "semantic_metadata": {
             "acknowledgement_boundary": acknowledgement,
             "replication_topology": replication,
