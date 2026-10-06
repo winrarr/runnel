@@ -94,6 +94,7 @@ async fn typed_client_keeps_a_connection_and_preserves_binary_payloads() {
         .await
         .unwrap()
         .expect("the text message should be available");
+    assert!(text_message.delivery_token.is_none());
     assert_eq!(text_message.offset, text_receipt.offset);
     assert_eq!(text_message.key.as_deref(), Some("text-key"));
     assert_eq!(text_message.payload, "hello");
@@ -111,6 +112,7 @@ async fn typed_client_keeps_a_connection_and_preserves_binary_payloads() {
         .await
         .unwrap()
         .expect("the binary message should be available");
+    assert!(binary_message.delivery_token.is_none());
     assert_eq!(binary_message.offset, binary_receipt.offset);
     assert_eq!(binary_message.key.as_deref(), Some("binary-key"));
     assert_eq!(binary_message.payload, binary_payload);

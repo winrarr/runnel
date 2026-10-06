@@ -133,7 +133,7 @@ pub(crate) async fn handle_request(
                     key: message.key,
                     payload: message.payload,
                     published_at_ms: message.published_at_ms,
-                    delivery_token: message.delivery_token,
+                    delivery_token: None,
                     delivery_attempt: message.delivery_attempt,
                 }),
                 PollResult::Empty => Response::Empty { stream, consumer },
