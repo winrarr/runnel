@@ -1,7 +1,10 @@
 use std::collections::BTreeMap;
 use std::time::Duration;
 
-use runnel_engine::{AckResult, BrokerError, ConsumerPolicy, Offset, PollResult, ReplayMessage};
+use runnel_engine::{
+    AckBatchResult, AckResult, BrokerError, ConsumerPolicy, DeliveryReceipt, Message, Offset,
+    PollResult, ReplayMessage,
+};
 
 use super::NodeId;
 use super::group_manager::GroupManager;
@@ -48,7 +51,9 @@ impl<'a> ClientForwarder<'a> {
             | ForwardedOperation::ConfigureConsumer { stream, .. }
             | ForwardedOperation::InspectConsumer { stream, .. }
             | ForwardedOperation::PollGroup { stream, .. }
+            | ForwardedOperation::PollGroupBatch { stream, .. }
             | ForwardedOperation::AckGroup { stream, .. }
+            | ForwardedOperation::AckGroupBatch { stream, .. }
             | ForwardedOperation::InitializeDataStream { stream, .. } => Ok(self
                 .manager
                 .data_group_for_stream(stream)
@@ -62,7 +67,17 @@ impl<'a> ClientForwarder<'a> {
     async fn operation(
         &self,
         operation: ForwardedOperation,
+        leader_id: Option<NodeId>,
+    ) -> Result<ForwardedResponse, BrokerError> {
+        self.operation_with_timeout(operation, leader_id, FORWARD_TIMEOUT)
+            .await
+    }
+
+    async fn operation_with_timeout(
+        &self,
+        operation: ForwardedOperation,
         mut leader_id: Option<NodeId>,
+        timeout: Duration,
     ) -> Result<ForwardedResponse, BrokerError> {
         let mut last_error = None;
         for _ in 0..FORWARD_ATTEMPTS {
@@ -93,7 +108,7 @@ impl<'a> ClientForwarder<'a> {
                     self.manager.peer_transport(),
                     address,
                     operation.clone(),
-                    FORWARD_TIMEOUT,
+                    timeout,
                 )
                 .await
                 {
@@ -237,6 +252,30 @@ impl<'a> ClientForwarder<'a> {
         }
     }
 
+    pub(super) async fn poll_group_batch(
+        &self,
+        operation: ForwardedOperation,
+        leader_id: Option<NodeId>,
+    ) -> Result<Vec<Message>, BrokerError> {
+        let ForwardedOperation::PollGroupBatch { max_wait_ms, .. } = &operation else {
+            return Err(BrokerError::Cluster(
+                "expected a grouped batch poll forwarding operation".to_owned(),
+            ));
+        };
+        let timeout = Duration::from_millis(*max_wait_ms).saturating_add(FORWARD_TIMEOUT);
+        match self
+            .operation_with_timeout(operation, leader_id, timeout)
+            .await?
+        {
+            ForwardedResponse::PollGroupBatch(result) => result
+                .map(|messages| messages.into_iter().map(Message::from).collect())
+                .map_err(forward_error_to_broker),
+            _ => Err(BrokerError::Cluster(
+                "leader returned the wrong grouped batch poll response".to_owned(),
+            )),
+        }
+    }
+
     pub(super) async fn ack_group(
         &self,
         operation: ForwardedOperation,
@@ -246,6 +285,33 @@ impl<'a> ClientForwarder<'a> {
             ForwardedResponse::AckGroup(result) => result.map_err(forward_error_to_broker),
             _ => Err(BrokerError::Cluster(
                 "leader returned the wrong grouped acknowledgement response".to_owned(),
+            )),
+        }
+    }
+
+    pub(super) async fn ack_group_batch(
+        &self,
+        stream: String,
+        consumer: String,
+        member: String,
+        receipts: Vec<DeliveryReceipt>,
+        leader_id: Option<NodeId>,
+    ) -> Result<AckBatchResult, BrokerError> {
+        match self
+            .operation(
+                ForwardedOperation::AckGroupBatch {
+                    stream,
+                    consumer,
+                    member,
+                    receipts,
+                },
+                leader_id,
+            )
+            .await?
+        {
+            ForwardedResponse::AckGroupBatch(result) => result.map_err(forward_error_to_broker),
+            _ => Err(BrokerError::Cluster(
+                "leader returned the wrong grouped batch acknowledgement response".to_owned(),
             )),
         }
     }
@@ -260,7 +326,9 @@ fn forwarded_leader(response: &ForwardedResponse) -> Option<Option<NodeId>> {
         | ForwardedResponse::Ack(Err(network::ForwardError::NotLeader { leader_id }))
         | ForwardedResponse::ConsumerPolicy(Err(network::ForwardError::NotLeader { leader_id }))
         | ForwardedResponse::PollGroup(Err(network::ForwardError::NotLeader { leader_id }))
-        | ForwardedResponse::AckGroup(Err(network::ForwardError::NotLeader { leader_id })) => {
+        | ForwardedResponse::PollGroupBatch(Err(network::ForwardError::NotLeader { leader_id }))
+        | ForwardedResponse::AckGroup(Err(network::ForwardError::NotLeader { leader_id }))
+        | ForwardedResponse::AckGroupBatch(Err(network::ForwardError::NotLeader { leader_id })) => {
             Some(*leader_id)
         }
         _ => None,
@@ -287,6 +355,12 @@ pub(super) fn forward_error_to_broker(error: network::ForwardError) -> BrokerErr
             earliest_offset,
             next_offset,
         },
+        network::ForwardError::InvalidBatchRequest(message) => {
+            BrokerError::InvalidBatchRequest(message)
+        }
+        network::ForwardError::ConsumeBatchRecordTooLarge { max_bytes } => {
+            BrokerError::ConsumeBatchRecordTooLarge { max_bytes }
+        }
         network::ForwardError::Message(message) => BrokerError::Cluster(message),
     }
 }

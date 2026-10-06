@@ -8,7 +8,10 @@ use std::time::Duration;
 use openraft::BasicNode;
 use openraft::network::RaftNetworkFactory;
 use openraft::{Config, SnapshotPolicy};
-use runnel_engine::{AckResult, BrokerError, ConsumerPolicy, Offset, PollResult, ReplayMessage};
+use runnel_engine::{
+    AckBatchResult, AckResult, BrokerError, ConsumeBatchLimits, ConsumerPolicy, DeliveryReceipt,
+    Message, Offset, PollResult, ReplayMessage,
+};
 use serde::{Deserialize, Serialize};
 use tokio::sync::{Mutex, RwLock};
 
@@ -613,6 +616,79 @@ impl GroupManager {
         self.data_group_for_stream(stream)
             .await?
             .poll_group(stream.to_owned(), consumer.to_owned(), member.to_owned())
+            .await
+    }
+
+    pub(crate) async fn poll_group_batch_local(
+        &self,
+        stream: &str,
+        consumer: &str,
+        member: &str,
+        limits: ConsumeBatchLimits,
+    ) -> Result<Vec<Message>, BrokerError> {
+        self.data_group_for_stream(stream)
+            .await?
+            .poll_group_batch(
+                stream.to_owned(),
+                consumer.to_owned(),
+                member.to_owned(),
+                limits,
+            )
+            .await
+    }
+
+    pub(crate) async fn poll_group_batch_for_forwarding(
+        &self,
+        stream: &str,
+        consumer: &str,
+        member: &str,
+        limits: ConsumeBatchLimits,
+    ) -> Result<Vec<Message>, BrokerError> {
+        self.data_group_for_stream(stream)
+            .await?
+            .poll_group_batch_for_forwarding(
+                stream.to_owned(),
+                consumer.to_owned(),
+                member.to_owned(),
+                limits,
+            )
+            .await
+    }
+
+    pub(crate) async fn poll_batch_local(
+        &self,
+        stream: &str,
+        consumer: &str,
+        limits: ConsumeBatchLimits,
+    ) -> Result<Vec<Message>, BrokerError> {
+        self.data_group_for_stream(stream)
+            .await?
+            .poll_batch(stream.to_owned(), consumer.to_owned(), limits)
+            .await
+    }
+
+    pub(crate) async fn poll_batch_for_forwarding(
+        &self,
+        stream: &str,
+        consumer: &str,
+        limits: ConsumeBatchLimits,
+    ) -> Result<Vec<Message>, BrokerError> {
+        self.data_group_for_stream(stream)
+            .await?
+            .poll_batch_for_forwarding(stream.to_owned(), consumer.to_owned(), limits)
+            .await
+    }
+
+    pub(crate) async fn ack_group_batch_local(
+        &self,
+        stream: String,
+        consumer: String,
+        member: String,
+        receipts: Vec<DeliveryReceipt>,
+    ) -> Result<AckBatchResult, BrokerError> {
+        self.data_group_for_stream(&stream)
+            .await?
+            .ack_group_batch(stream, consumer, member, receipts)
             .await
     }
 

@@ -6,8 +6,9 @@ use std::thread::sleep;
 use std::time::{Duration, Instant};
 
 use runnel_client::{
-    AttemptFailure, AttemptOutcome, Client, ClientConfig, ClientError, PublishBatchOutcome,
-    PublishBatchRecord, PublishOptions, PublishReceipt,
+    AttemptFailure, AttemptOutcome, BatchAcknowledgementOutcome, BatchDeliveryReceipt, Client,
+    ClientConfig, ClientError, ConsumeBatchLimits, PublishBatchOutcome, PublishBatchRecord,
+    PublishOptions, PublishReceipt,
 };
 use runnel_protocol::{PublishBatchRecordResponse, Response};
 use tempfile::TempDir;
@@ -225,6 +226,155 @@ async fn typed_publish_batch_preserves_outcomes_and_request_id_replay_after_rest
             .is_none(),
         "replaying the batch after restart must not append duplicates"
     );
+}
+
+#[tokio::test]
+async fn typed_consume_batch_fences_scalar_ack_and_recovers_after_restart() {
+    let directory = TempDir::new().unwrap();
+    let limits = ConsumeBatchLimits {
+        max_records: 2,
+        max_bytes: 64 * 1024,
+        max_wait_ms: 0,
+    };
+    let server = RunningServer::start(directory.path(), &[]);
+    let mut client = Client::connect(server.broker_addr).await.unwrap();
+    client.create_stream("events").await.unwrap();
+
+    let binary_payload = [0, 1, 255, b'\n', b'_', 0];
+    client
+        .publish_bytes("events", binary_payload.to_vec())
+        .await
+        .unwrap();
+    client.publish("events", "second").await.unwrap();
+
+    let first = client.poll_batch("events", "worker", limits).await.unwrap();
+    assert_eq!(first.len(), 2);
+    assert_eq!(first[0].offset, 0);
+    assert_eq!(first[0].payload, binary_payload);
+    assert_eq!(first[1].offset, 1);
+    assert!(first.iter().all(|message| message.delivery_token.is_some()));
+    assert_eq!(
+        client.poll_batch("events", "worker", limits).await.unwrap(),
+        first,
+        "a repeated poll must recover the same active set"
+    );
+
+    assert!(matches!(
+        client.ack("events", "worker", first[0].offset).await,
+        Err(AttemptOutcome::Rejected(_))
+    ));
+    let acknowledgement = client
+        .ack_batch(
+            "events",
+            "worker",
+            [BatchDeliveryReceipt {
+                offset: first[0].offset,
+                delivery_token: first[0].delivery_token.clone().unwrap(),
+            }],
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        acknowledgement.outcomes[0].outcome,
+        BatchAcknowledgementOutcome::Confirmed
+    );
+
+    drop(client);
+    drop(server);
+
+    let server = RunningServer::start(directory.path(), &[]);
+    let mut recovered = Client::connect(server.broker_addr).await.unwrap();
+    let remaining = recovered
+        .poll_batch("events", "worker", limits)
+        .await
+        .unwrap();
+    assert_eq!(remaining.len(), 1);
+    assert_eq!(remaining[0].offset, first[1].offset);
+    assert_eq!(remaining[0].payload, b"second");
+    assert_eq!(remaining[0].delivery_attempt, Some(2));
+    assert_ne!(
+        remaining[0].delivery_token.as_deref(),
+        first[1].delivery_token.as_deref(),
+        "volatile leases receive fresh receipts after restart"
+    );
+    let recovered_ack = recovered
+        .ack_batch(
+            "events",
+            "worker",
+            [BatchDeliveryReceipt {
+                offset: remaining[0].offset,
+                delivery_token: remaining[0].delivery_token.clone().unwrap(),
+            }],
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        recovered_ack.outcomes[0].outcome,
+        BatchAcknowledgementOutcome::Confirmed
+    );
+    assert!(
+        recovered
+            .poll_batch("events", "worker", limits)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[tokio::test]
+async fn consume_batch_server_timeout_does_not_create_an_assignment() {
+    let directory = TempDir::new().unwrap();
+    let server = RunningServer::start(directory.path(), &["--request-timeout-ms", "50"]);
+    let mut client = Client::connect(server.broker_addr).await.unwrap();
+    client.create_stream("events").await.unwrap();
+    client.publish("events", "work").await.unwrap();
+
+    let outcome = client
+        .poll_batch(
+            "events",
+            "worker",
+            ConsumeBatchLimits {
+                max_records: 2,
+                max_bytes: 64 * 1024,
+                max_wait_ms: 500,
+            },
+        )
+        .await;
+    assert!(matches!(
+        outcome,
+        Err(AttemptOutcome::Unknown(AttemptFailure::Broker(
+            Response::Error { ref code, .. }
+        ))) if code == "request_timeout"
+    ));
+
+    drop(client);
+    let mut retry = Client::connect(server.broker_addr).await.unwrap();
+    let messages = retry
+        .poll_batch(
+            "events",
+            "worker",
+            ConsumeBatchLimits {
+                max_records: 2,
+                max_bytes: 64 * 1024,
+                max_wait_ms: 0,
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(messages.len(), 1);
+    assert_eq!(messages[0].offset, 0);
+    assert_eq!(messages[0].delivery_attempt, Some(1));
+    retry
+        .ack_batch(
+            "events",
+            "worker",
+            [BatchDeliveryReceipt {
+                offset: messages[0].offset,
+                delivery_token: messages[0].delivery_token.clone().unwrap(),
+            }],
+        )
+        .await
+        .unwrap();
 }
 
 #[tokio::test]
@@ -678,6 +828,83 @@ async fn typed_publish_batch_retries_after_lost_response_without_duplicates() {
             .unwrap()
             .is_none(),
         "retrying after response loss must not append duplicate records"
+    );
+}
+
+#[tokio::test]
+async fn typed_consume_batch_ack_retries_after_lost_response() {
+    let directory = TempDir::new().unwrap();
+    let server = RunningServer::start(directory.path(), &[]);
+    let mut setup = Client::connect(server.broker_addr).await.unwrap();
+    setup.create_stream("events").await.unwrap();
+    setup.publish("events", "work").await.unwrap();
+    let delivery = setup
+        .poll_batch(
+            "events",
+            "worker",
+            ConsumeBatchLimits {
+                max_records: 1,
+                max_bytes: 64 * 1024,
+                max_wait_ms: 0,
+            },
+        )
+        .await
+        .unwrap()
+        .pop()
+        .expect("the record should be assigned to the batch");
+    let receipts = [BatchDeliveryReceipt {
+        offset: delivery.offset,
+        delivery_token: delivery.delivery_token.clone().unwrap(),
+    }];
+    drop(setup);
+
+    let proxy_listener = AsyncTcpListener::bind("127.0.0.1:0").await.unwrap();
+    let proxy_address = proxy_listener.local_addr().unwrap();
+    let proxy = ProxyGuard {
+        handle: Some(tokio::spawn(drop_first_response_proxy(
+            proxy_listener,
+            server.broker_addr,
+        ))),
+    };
+    let mut client = Client::connect(proxy_address).await.unwrap();
+    assert!(matches!(
+        client.ack_batch("events", "worker", receipts.clone()).await,
+        Err(AttemptOutcome::Unknown(AttemptFailure::Client(
+            ClientError::Eof
+        )))
+    ));
+    client.reconnect(proxy_address).await.unwrap();
+    let retry = client
+        .ack_batch("events", "worker", receipts)
+        .await
+        .unwrap();
+    assert_eq!(
+        retry.outcomes[0].outcome,
+        BatchAcknowledgementOutcome::AlreadyConfirmed
+    );
+    drop(client);
+
+    let dropped_response = proxy.finish().await.unwrap();
+    assert!(matches!(
+        serde_json::from_slice::<Response>(&dropped_response).unwrap(),
+        Response::AckBatch { outcomes, .. }
+            if matches!(outcomes.first().map(|item| &item.outcome), Some(&runnel_protocol::AckBatchItemOutcome::Confirmed))
+    ));
+    let mut verifier = Client::connect(server.broker_addr).await.unwrap();
+    assert!(
+        verifier
+            .poll_batch(
+                "events",
+                "worker",
+                ConsumeBatchLimits {
+                    max_records: 1,
+                    max_bytes: 64 * 1024,
+                    max_wait_ms: 0,
+                },
+            )
+            .await
+            .unwrap()
+            .is_empty()
     );
 }
 

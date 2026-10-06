@@ -1,6 +1,6 @@
 # Consume batches: accepted semantic contract
 
-- Status: semantic contract accepted by [ADR 0030](../decisions/0030-consume-batch-contract.md); runtime API and behavior are not implemented
+- Status: semantic contract accepted by [ADR 0030](../decisions/0030-consume-batch-contract.md); runtime implementation is under review
 - Implementation review baseline: `c3a894b6d88a40245c1116e2c5006b94f5573aee`
 - Linked research reviewed at baseline: `8fae2d1f81da9146a26cfb20d190214eab370a71`
 - Primary evidence class: design/research
@@ -33,7 +33,7 @@ on the correctness and performance evidence listed at the end of this design.
 
 ## Proposed protocol shape
 
-The candidate wire shape is `poll_batch` and `poll_group_batch`, each with
+The provisional public wire shape is `poll_batch` and `poll_group_batch`, each with
 `stream`, `consumer`, `max_records`, `max_bytes`, and `max_wait_ms`; the grouped
 form also carries `member`. Add `ack_batch` and `ack_group_batch`, each with
 the relevant stream, consumer, member identity, and a list of
@@ -321,49 +321,77 @@ Unresolved risks are the tail-latency cost of `max_wait_ms`, state and snapshot
 growth from outstanding receipts, the work performed when a batch poll crosses
 multiple attempt-limited records, and throughput loss when one slow record
 keeps a member's active set from being replenished. A hot ordering key remains
-intentionally serial. Cluster waiters also need a bounded wake-and-recheck
-mechanism that behaves correctly during leadership changes; polling the Raft
-state machine while holding apply or stream locks is not acceptable.
+intentionally serial. Local and clustered waiters now register before checking
+availability and wait outside the stream lock and Raft apply path; clustered
+waiters also watch Raft metrics so leadership changes wake collection. These
+mechanisms have focused publish/ack and leadership-loss tests, but their
+tail-latency and resource effects have not been measured.
 
-## Verification and disposition
+## Implementation status and disposition
 
-Before implementation, add reusable engine-contract and focused local/cluster
-tests for ordered partial batches, empty and byte/count truncation, oversized
-first records, lower limits against an existing active set, same-key exclusion
-within/across batches, out-of-order per-key ack, duplicate and stale receipts,
-the mixed-vector resolution matrix above, lost ack response and same-member
-poll retry after response loss, disconnect during response, local journal
-failure before/after append and restart redelivery, clustered restart and
-leader change around commit, and request timeout during collection. Cover
-multiple pinned policy snapshots in one set, policy updates across local
-restart and clustered leadership transfer, and attempt-limit dead-letter
-movement before and among returned records. Verify each engine's existing
-dead-letter crash boundary is preserved. Cover collection wakeups after
-publish, acknowledgement, and lease expiry, while proving waits stay outside
-the local stream lock and Raft apply path. The existing shared-engine contract
-already covers single-receipt expiry before reassignment. Real-server tests
-must cover wire and typed-client outcome mapping; the local protocol/restart
-test and three-process cluster test remain required end-to-end gates.
+As of 2026-10-06, the runtime adds provisional `poll_batch`,
+`poll_group_batch`, `ack_batch`, and `ack_group_batch` operations through the
+engine, JSON-lines protocol, Rust client, and server. Local assignments and
+valid ack subsets each use one consumer-journal event and sync; uncertain
+journal writes invalidate cached consumer state for reconciliation before the
+next operation. Local leases remain volatile across restart. Clustered polls
+collect outside apply and commit assignments as one command; valid ack subsets
+commit as one data-group command, and receipts plus active sets are replicated.
+Batch-created deliveries require per-record receipt tokens even through scalar
+ack operations, preserving offset-only acknowledgement for leases created by
+scalar polling. Operation and field names remain provisional until the
+concurrent protocol-contract decision is reconciled.
 
-No performance claim is made by this design. Before recommending an
-optimization implementation, compare the scalar path with count, encoded-byte,
-wait, payload-size, consumer-count, key-distribution, and ack-pattern variants
-on local and three-node engines. Measure throughput, p50/p99/p99.9 latency,
-response bytes, memory, local sync count, Raft commands/bytes, in-flight state,
-redelivery, and timeout behavior under controlled resources. A concurrent or
-microbenchmark-only result is exploratory; use the canonical authoritative
-comparison after commit when it meaningfully covers the changed path, otherwise
-record the targeted benchmark and coverage gap as required by
-[benchmarking policy](../benchmarking.md).
+The reusable engine contract currently covers ordered assignment and replay,
+mixed per-entry ack outcomes, scalar-ack fence rejection, count and encoded-byte
+bounds, oversized first records, wakeups after publish and acknowledgement,
+lease expiry, pinned policy, and same-key exclusion. It runs against local,
+single-node Raft, and persistent Raft engines. Focused local recovery tests
+cover failures before journal append, partial journal appends, and uncertain
+assignment and acknowledgement syncs, including restart and reconciliation.
+Real server processes cover typed-client binary batch wire behavior, partial
+acknowledgement and local restart redelivery, server timeout before assignment,
+ack response loss and exact retry, and clustered partial acknowledgement through
+follower restart and leader change. The real three-process cluster test also
+verifies that legacy offset-only `Ack` cannot acknowledge a batch-assigned
+lease. A clustered engine test verifies collection returns when leadership is
+lost.
 
-**Implementation gate:** the accepted semantic contract is implementable as a
-protocol/engine vertical slice within the existing local and single-group
-replicated design. Runtime work remains gated on the tests above, including
-ack journal reconciliation and the preserved dead-letter boundary.
-The existing [batching backlog item](../backlog.md#make-batching-preserve-per-record-outcomes)
-already tracks the intended outcome and broad evidence gate, so this decision
-does not change its goal or acceptance criteria; keep it open. No separate
-tech-debt item is warranted: the journal ambiguity case is a required design
-and test gate for this future behavior, not a newly discovered independent
-current shortcut. No runtime or performance effect is expected from this
-documentation-only decision and research refresh.
+For peer forwarding, successful batch-poll responses use a private compact DTO:
+valid UTF-8 payload bytes are serialized as JSON text and other payload bytes
+as standard base64, while stream, offset, key, publish time, receipt token, and
+attempt number are preserved. This avoids the integer-array expansion of
+`Vec<u8>` in the private peer JSON response. The peer frame limit is 66 MiB in
+both directions, an increase of 2 MiB over the previous shared 64 MiB limit.
+The public batch response ceiling is 65 MiB, leaving up to 1 MiB for private
+response-envelope overhead; the additional 1 MiB is fixed headroom, not a new
+request-size allowance at the public server boundary. Peer writes stop
+serialization at the frame limit, and receivers reject an over-limit length
+before resizing their frame buffer. Existing public request configuration
+remains capped at 64 MiB. The peer JSON response change has no version
+negotiation, so mixed-binary cluster upgrades are not supported; use one
+consistent binary across cluster nodes.
+
+The pre-commit peer-frame check serializes into a counting sink before
+assignment commits. Binary payloads therefore incur a temporary per-record
+base64 string during sizing, then are encoded again into the outbound bounded
+frame. The receiving process temporarily holds the bounded frame alongside
+decoded response values, and public response serialization creates its own
+output buffer. These copies and the extra serialization pass can raise peak
+memory use and poll latency for large binary batches. No performance conclusion
+is established; a controlled batch throughput, latency, and peak-memory
+comparison remains open.
+
+Remaining evidence includes request-response loss after a committed clustered
+consume-batch acknowledgement, client disconnect while reading a batch
+response, broader attempt-limit dead-letter cases across both engines, and a
+controlled consume-batch performance/resource matrix. These are implementation
+follow-up gates; no performance improvement, supported batch-size default, or
+cost bound is established. Use [benchmarking policy](../benchmarking.md) for
+any future comparison.
+
+The [batching backlog item](../backlog.md#make-batching-preserve-per-record-outcomes)
+remains open for those failure, recovery, workload, and resource outcomes. No
+new tech-debt item is warranted from this implementation review: the known
+candidate scan, per-event sync, outstanding-state growth, and lease behavior
+are already represented by TD-016, TD-019, TD-010, and TD-020 respectively.

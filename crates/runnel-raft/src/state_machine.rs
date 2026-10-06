@@ -1,7 +1,10 @@
 use std::collections::BTreeMap;
 
 use openraft::{BasicNode, LogId, StoredMembership};
-use runnel_engine::{ConsumerPolicy, Offset, ReplayMessage, validate_consumer_policy};
+use runnel_engine::{
+    AckBatchResult, ConsumerPolicy, DeliveryReceipt, Message, Offset, ReplayMessage,
+    validate_consumer_policy,
+};
 use serde::{Deserialize, Serialize};
 
 use super::NodeId;
@@ -61,12 +64,39 @@ pub enum Command {
         #[serde(default)]
         policy_version: Option<u64>,
     },
+    PollGroupBatch {
+        stream: String,
+        consumer: String,
+        member: String,
+        #[serde(default)]
+        response_member: Option<String>,
+        max_records: usize,
+        max_bytes: usize,
+        token_seed: String,
+        now_ms: u64,
+        lease_deadline_ms: u64,
+        #[serde(default)]
+        max_delivery_attempts: Option<u32>,
+        #[serde(default)]
+        legacy_ack_timeout_ms: Option<u64>,
+        #[serde(default)]
+        policy_version: Option<u64>,
+        #[serde(default)]
+        transition_only: bool,
+    },
     AckGroup {
         stream: String,
         consumer: String,
         member: String,
         offset: Offset,
         delivery_token: String,
+        now_ms: u64,
+    },
+    AckGroupBatch {
+        stream: String,
+        consumer: String,
+        member: String,
+        receipts: Vec<DeliveryReceipt>,
         now_ms: u64,
     },
 }
@@ -97,6 +127,15 @@ pub enum CommandResponse {
     GroupPoll {
         result: runnel_engine::PollResult,
     },
+    GroupBatchPoll {
+        messages: Vec<Message>,
+        collection_complete: bool,
+        terminal_transitions: usize,
+    },
+    GroupBatchPollActiveSetLimitExceeded,
+    GroupBatchPollRecordTooLarge {
+        max_bytes: usize,
+    },
     Replay {
         result: ReplayMessage,
     },
@@ -114,6 +153,9 @@ pub enum CommandResponse {
     GroupStaleDelivery {
         consumer: String,
         offset: Offset,
+    },
+    GroupBatchAcknowledged {
+        result: AckBatchResult,
     },
     StreamNotFound,
     Noop,
@@ -430,6 +472,39 @@ pub(super) fn apply_command(
             log_id,
             kind,
         ),
+        Command::PollGroupBatch {
+            stream,
+            consumer,
+            member,
+            response_member,
+            max_records,
+            max_bytes,
+            token_seed,
+            now_ms,
+            lease_deadline_ms,
+            max_delivery_attempts,
+            legacy_ack_timeout_ms,
+            policy_version,
+            transition_only,
+        } => delivery::apply_group_batch_poll(
+            state,
+            delivery::GroupBatchPollRequest {
+                stream,
+                consumer,
+                member,
+                response_member,
+                max_records,
+                max_bytes,
+                token_seed,
+                now_ms,
+                lease_deadline_ms,
+                max_delivery_attempts,
+                legacy_ack_timeout_ms,
+                policy_version,
+                transition_only,
+            },
+            kind,
+        ),
         Command::AckGroup {
             stream,
             consumer,
@@ -445,6 +520,23 @@ pub(super) fn apply_command(
                 member,
                 offset,
                 delivery_token,
+                now_ms,
+            },
+            kind,
+        ),
+        Command::AckGroupBatch {
+            stream,
+            consumer,
+            member,
+            receipts,
+            now_ms,
+        } => delivery::apply_group_batch_ack(
+            state,
+            delivery::GroupBatchAckRequest {
+                stream,
+                consumer,
+                member,
+                receipts,
                 now_ms,
             },
             kind,

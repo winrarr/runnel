@@ -3,7 +3,10 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
-use runnel_engine::{Engine, EngineFuture, PublishRecord, PublishRecordOutcome};
+use runnel_engine::{
+    AckBatchResult, ConsumeBatchLimits, DeliveryReceipt, Engine, EngineFuture, PublishRecord,
+    PublishRecordOutcome,
+};
 #[cfg(test)]
 use std::fs;
 
@@ -111,6 +114,26 @@ impl Engine for Broker {
             .dispatch_stream(stream, move |stream| broker.poll(stream, &consumer))
     }
 
+    fn poll_batch<'a>(
+        &'a self,
+        stream: &'a str,
+        consumer: &'a str,
+        limits: ConsumeBatchLimits,
+    ) -> EngineFuture<'a, Vec<Message>> {
+        let broker = self.clone();
+        Box::pin(async move {
+            broker
+                .poll_batch_wait(
+                    stream.to_owned(),
+                    consumer.to_owned(),
+                    consumer.to_owned(),
+                    None,
+                    limits,
+                )
+                .await
+        })
+    }
+
     fn configure_consumer<'a>(
         &'a self,
         stream: &'a str,
@@ -168,6 +191,27 @@ impl Engine for Broker {
         })
     }
 
+    fn poll_group_batch<'a>(
+        &'a self,
+        stream: &'a str,
+        consumer: &'a str,
+        member: &'a str,
+        limits: ConsumeBatchLimits,
+    ) -> EngineFuture<'a, Vec<Message>> {
+        let broker = self.clone();
+        Box::pin(async move {
+            broker
+                .poll_batch_wait(
+                    stream.to_owned(),
+                    consumer.to_owned(),
+                    member.to_owned(),
+                    Some(member.to_owned()),
+                    limits,
+                )
+                .await
+        })
+    }
+
     fn ack<'a>(
         &'a self,
         stream: &'a str,
@@ -179,6 +223,20 @@ impl Engine for Broker {
         let consumer = consumer.to_owned();
         Arc::clone(&self.inner.storage_executor)
             .dispatch_stream(stream, move |stream| broker.ack(stream, &consumer, offset))
+    }
+
+    fn ack_batch<'a>(
+        &'a self,
+        stream: &'a str,
+        consumer: &'a str,
+        receipts: Vec<DeliveryReceipt>,
+    ) -> EngineFuture<'a, AckBatchResult> {
+        let broker = self.clone();
+        let stream = stream.to_owned();
+        let consumer = consumer.to_owned();
+        Arc::clone(&self.inner.storage_executor).dispatch_stream(stream, move |stream| {
+            broker.ack_batch(stream, &consumer, &consumer, receipts)
+        })
     }
 
     fn ack_group<'a>(
@@ -196,6 +254,22 @@ impl Engine for Broker {
         let delivery_token = delivery_token.to_owned();
         Arc::clone(&self.inner.storage_executor).dispatch_stream(stream, move |stream| {
             broker.ack_group(stream, &consumer, &member, offset, &delivery_token)
+        })
+    }
+
+    fn ack_group_batch<'a>(
+        &'a self,
+        stream: &'a str,
+        consumer: &'a str,
+        member: &'a str,
+        receipts: Vec<DeliveryReceipt>,
+    ) -> EngineFuture<'a, AckBatchResult> {
+        let broker = self.clone();
+        let stream = stream.to_owned();
+        let consumer = consumer.to_owned();
+        let member = member.to_owned();
+        Arc::clone(&self.inner.storage_executor).dispatch_stream(stream, move |stream| {
+            broker.ack_batch(stream, &consumer, &member, receipts)
         })
     }
 
@@ -265,6 +339,13 @@ mod tests {
     use std::sync::{Arc, Barrier};
     use std::thread;
     use tempfile::tempdir;
+
+    #[tokio::test]
+    async fn local_engine_implements_consume_batch_contract() {
+        let directory = tempdir().unwrap();
+        let broker = Broker::open(directory.path(), BrokerConfig::default()).unwrap();
+        runnel_test_support::assert_consume_batch_contract(&broker).await;
+    }
 
     #[test]
     fn independent_consumers_each_receive_the_stream() {
@@ -1984,6 +2065,170 @@ mod tests {
         assert_eq!(broker.poll("events", "worker").unwrap(), PollResult::Empty);
     }
 
+    #[tokio::test]
+    async fn uncertain_batch_journal_sync_recovers_assignment_and_acknowledgement() {
+        let directory = tempdir().unwrap();
+        let limits = ConsumeBatchLimits {
+            max_records: 2,
+            max_bytes: 64 * 1024,
+            max_wait_ms: 0,
+        };
+        {
+            let broker = Broker::open(directory.path(), BrokerConfig::default()).unwrap();
+            Engine::publish(&broker, "events", None, b"first".to_vec(), None)
+                .await
+                .unwrap();
+            Engine::publish(&broker, "events", None, b"second".to_vec(), None)
+                .await
+                .unwrap();
+            broker.fail_next_consumer_batch_event_sync();
+            let error = Engine::poll_batch(&broker, "events", "worker", limits)
+                .await
+                .expect_err("a failed sync must leave the assignment outcome unknown");
+            assert_eq!(error.outcome(), runnel_engine::BrokerErrorOutcome::Unknown);
+        }
+
+        let broker = Broker::open(directory.path(), BrokerConfig::default()).unwrap();
+        let recovered = Engine::poll_batch(&broker, "events", "worker", limits)
+            .await
+            .unwrap();
+        assert_eq!(
+            recovered
+                .iter()
+                .map(|message| (message.offset, message.delivery_attempt))
+                .collect::<Vec<_>>(),
+            [(0, Some(2)), (1, Some(2))]
+        );
+        let receipts = recovered
+            .iter()
+            .map(|message| DeliveryReceipt {
+                offset: message.offset,
+                delivery_token: message.delivery_token.clone().unwrap(),
+            })
+            .collect::<Vec<_>>();
+        broker.fail_next_consumer_batch_event_sync();
+        let error = Engine::ack_batch(&broker, "events", "worker", receipts.clone())
+            .await
+            .expect_err("a failed acknowledgement sync must remain unknown");
+        assert_eq!(error.outcome(), runnel_engine::BrokerErrorOutcome::Unknown);
+        drop(broker);
+
+        let broker = Broker::open(directory.path(), BrokerConfig::default()).unwrap();
+        let retried = Engine::ack_batch(&broker, "events", "worker", receipts)
+            .await
+            .unwrap();
+        assert!(retried.outcomes.iter().all(|item| matches!(
+            item.outcome,
+            runnel_engine::AckBatchOutcome::AlreadyConfirmed
+        )));
+    }
+
+    #[tokio::test]
+    async fn batch_journal_preappend_failure_is_retryable_without_advancing_attempt() {
+        let directory = tempdir().unwrap();
+        let broker = Broker::open(directory.path(), BrokerConfig::default()).unwrap();
+        Engine::publish(&broker, "events", None, b"work".to_vec(), None)
+            .await
+            .unwrap();
+        broker.fail_next_consumer_batch_event_before_append();
+
+        let error = Engine::poll_batch(
+            &broker,
+            "events",
+            "worker",
+            ConsumeBatchLimits {
+                max_records: 1,
+                max_bytes: 64 * 1024,
+                max_wait_ms: 0,
+            },
+        )
+        .await
+        .expect_err("an injected pre-append failure should be reported");
+        assert_eq!(
+            error.outcome(),
+            runnel_engine::BrokerErrorOutcome::Retryable
+        );
+
+        let retry = Engine::poll_batch(
+            &broker,
+            "events",
+            "worker",
+            ConsumeBatchLimits {
+                max_records: 1,
+                max_bytes: 64 * 1024,
+                max_wait_ms: 0,
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(retry.len(), 1);
+        assert_eq!(retry[0].delivery_attempt, Some(1));
+    }
+
+    #[tokio::test]
+    async fn partial_batch_journal_appends_truncate_and_redeliver_after_restart() {
+        let directory = tempdir().unwrap();
+        let limits = ConsumeBatchLimits {
+            max_records: 1,
+            max_bytes: 64 * 1024,
+            max_wait_ms: 0,
+        };
+        {
+            let broker = Broker::open(directory.path(), BrokerConfig::default()).unwrap();
+            Engine::publish(&broker, "events", None, b"work".to_vec(), None)
+                .await
+                .unwrap();
+            broker.fail_next_consumer_batch_event_partial_append();
+            let error = Engine::poll_batch(&broker, "events", "worker", limits)
+                .await
+                .expect_err("a partial assignment event append has an unknown outcome");
+            assert_eq!(error.outcome(), runnel_engine::BrokerErrorOutcome::Unknown);
+        }
+
+        let broker = Broker::open(directory.path(), BrokerConfig::default()).unwrap();
+        let first = Engine::poll_batch(&broker, "events", "worker", limits)
+            .await
+            .unwrap();
+        assert_eq!(first[0].delivery_attempt, Some(1));
+        broker.fail_next_consumer_batch_event_partial_append();
+        let error = Engine::ack_batch(
+            &broker,
+            "events",
+            "worker",
+            vec![DeliveryReceipt {
+                offset: first[0].offset,
+                delivery_token: first[0].delivery_token.clone().unwrap(),
+            }],
+        )
+        .await
+        .expect_err("a partial acknowledgement event append is unknown");
+        assert_eq!(error.outcome(), runnel_engine::BrokerErrorOutcome::Unknown);
+        drop(broker);
+
+        let broker = Broker::open(directory.path(), BrokerConfig::default()).unwrap();
+        let redelivered = Engine::poll_batch(&broker, "events", "worker", limits)
+            .await
+            .unwrap();
+        assert_eq!(redelivered.len(), 1);
+        assert_eq!(redelivered[0].offset, first[0].offset);
+        assert_eq!(redelivered[0].delivery_attempt, Some(2));
+        let acked = Engine::ack_batch(
+            &broker,
+            "events",
+            "worker",
+            vec![DeliveryReceipt {
+                offset: redelivered[0].offset,
+                delivery_token: redelivered[0].delivery_token.clone().unwrap(),
+            }],
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            acked.outcomes[0].outcome,
+            runnel_engine::AckBatchOutcome::Confirmed
+        );
+    }
+
     #[test]
     fn consumer_delivery_journal_stays_within_its_checkpoint_bound() {
         let directory = tempdir().unwrap();
@@ -1997,7 +2242,7 @@ mod tests {
         .unwrap();
         broker.publish("events", None, b"payload".to_vec()).unwrap();
 
-        for expected_attempt in 1..=2_000 {
+        for expected_attempt in 1..=12_000 {
             let message = match broker.poll("events", "worker").unwrap() {
                 PollResult::Message(message) => message,
                 PollResult::Empty => panic!("expected delivery attempt {expected_attempt}"),
@@ -2021,7 +2266,65 @@ mod tests {
             PollResult::Message(message) => message,
             PollResult::Empty => panic!("expected delivery after journal compaction recovery"),
         };
-        assert_eq!(message.delivery_attempt, Some(2_001));
+        assert_eq!(message.delivery_attempt, Some(12_001));
+    }
+
+    #[tokio::test]
+    async fn maximum_consume_batch_fits_the_bounded_consumer_journal() {
+        let directory = tempdir().unwrap();
+        let broker = Broker::open(directory.path(), BrokerConfig::default()).unwrap();
+        for _ in 0..runnel_engine::MAX_CONSUME_BATCH_RECORDS {
+            broker.publish("events", None, b"work".to_vec()).unwrap();
+        }
+        let limits = ConsumeBatchLimits {
+            max_records: runnel_engine::MAX_CONSUME_BATCH_RECORDS,
+            max_bytes: runnel_engine::MAX_CONSUME_BATCH_RESPONSE_BYTES,
+            max_wait_ms: 0,
+        };
+        let first = Engine::poll_batch(&broker, "events", "worker", limits)
+            .await
+            .unwrap();
+        assert_eq!(first.len(), runnel_engine::MAX_CONSUME_BATCH_RECORDS);
+        let journal_path = directory.path().join("consumers/events/worker.json.tmp");
+        assert!(fs::metadata(&journal_path).unwrap().len() <= MAX_CONSUMER_STATE_JOURNAL_BYTES);
+        drop(broker);
+
+        let broker = Broker::open(directory.path(), BrokerConfig::default()).unwrap();
+        let recovered = Engine::poll_batch(&broker, "events", "worker", limits)
+            .await
+            .unwrap();
+        assert_eq!(recovered.len(), runnel_engine::MAX_CONSUME_BATCH_RECORDS);
+        assert!(
+            recovered
+                .iter()
+                .all(|message| message.delivery_attempt == Some(2))
+        );
+        assert!(fs::metadata(&journal_path).unwrap().len() <= MAX_CONSUMER_STATE_JOURNAL_BYTES);
+
+        let acknowledged = Engine::ack_batch(
+            &broker,
+            "events",
+            "worker",
+            recovered
+                .iter()
+                .map(|message| DeliveryReceipt {
+                    offset: message.offset,
+                    delivery_token: message.delivery_token.clone().unwrap(),
+                })
+                .collect(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            acknowledged.outcomes.len(),
+            runnel_engine::MAX_CONSUME_BATCH_RECORDS
+        );
+        assert!(
+            acknowledged
+                .outcomes
+                .iter()
+                .all(|item| matches!(item.outcome, runnel_engine::AckBatchOutcome::Confirmed))
+        );
     }
 
     #[test]

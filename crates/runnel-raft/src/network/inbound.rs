@@ -5,7 +5,8 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::watch;
 
 use super::{
-    ForwardError, ForwardedOperation, ForwardedResponse, PeerRequest, PeerResponse,
+    ForwardError, ForwardedBatchMessage, ForwardedOperation, ForwardedResponse, PeerRequest,
+    PeerResponse,
     framing::{read_frame, write_frame},
 };
 use crate::{GroupManager, StreamMetadata};
@@ -198,6 +199,40 @@ async fn handle_forwarded(
                 .await
                 .map_err(forward_error),
         ),
+        ForwardedOperation::PollGroupBatch {
+            stream,
+            consumer,
+            member,
+            response_member,
+            max_records,
+            max_bytes,
+            max_wait_ms,
+        } => {
+            let limits = runnel_engine::ConsumeBatchLimits {
+                max_records,
+                max_bytes,
+                max_wait_ms,
+            };
+            let result = if response_member.is_some() {
+                manager
+                    .poll_group_batch_for_forwarding(&stream, &consumer, &member, limits)
+                    .await
+            } else {
+                manager
+                    .poll_batch_for_forwarding(&stream, &consumer, limits)
+                    .await
+            };
+            ForwardedResponse::PollGroupBatch(
+                result
+                    .map(|messages| {
+                        messages
+                            .into_iter()
+                            .map(ForwardedBatchMessage::from)
+                            .collect()
+                    })
+                    .map_err(forward_error),
+            )
+        }
         ForwardedOperation::AckGroup {
             stream,
             consumer,
@@ -207,6 +242,17 @@ async fn handle_forwarded(
         } => ForwardedResponse::AckGroup(
             manager
                 .ack_group_local(stream, consumer, member, offset, delivery_token)
+                .await
+                .map_err(forward_error),
+        ),
+        ForwardedOperation::AckGroupBatch {
+            stream,
+            consumer,
+            member,
+            receipts,
+        } => ForwardedResponse::AckGroupBatch(
+            manager
+                .ack_group_batch_local(stream, consumer, member, receipts)
                 .await
                 .map_err(forward_error),
         ),
@@ -243,6 +289,12 @@ fn forward_error(error: crate::BrokerError) -> ForwardError {
             earliest_offset,
             next_offset,
         },
+        crate::BrokerError::InvalidBatchRequest(message) => {
+            ForwardError::InvalidBatchRequest(message)
+        }
+        crate::BrokerError::ConsumeBatchRecordTooLarge { max_bytes } => {
+            ForwardError::ConsumeBatchRecordTooLarge { max_bytes }
+        }
         error => ForwardError::Message(error.to_string()),
     }
 }

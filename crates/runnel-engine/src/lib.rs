@@ -63,6 +63,190 @@ pub const MAX_CONSUMER_POLICY_ACK_TIMEOUT_MS: u64 = 7 * 24 * 60 * 60 * 1_000;
 /// Maximum number of records accepted by one publish-batch engine operation.
 pub const MAX_PUBLISH_BATCH_RECORDS: usize = 1024;
 
+/// Maximum number of records returned by one consume-batch operation.
+pub const MAX_CONSUME_BATCH_RECORDS: usize = 1024;
+
+/// Hard line-size ceiling for a consume-batch response, including its newline.
+pub const MAX_CONSUME_BATCH_RESPONSE_BYTES: usize = 65 * 1024 * 1024;
+
+/// The caller-visible bounds for one consume-batch poll.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ConsumeBatchLimits {
+    pub max_records: usize,
+    pub max_bytes: usize,
+    pub max_wait_ms: u64,
+}
+
+/// One opaque receipt used to acknowledge a delivered record.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DeliveryReceipt {
+    pub offset: Offset,
+    pub delivery_token: String,
+}
+
+/// Per-receipt result of a consume-batch acknowledgement.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AckBatchItem {
+    pub offset: Offset,
+    pub outcome: AckBatchOutcome,
+}
+
+/// Result for one receipt in an acknowledgement vector.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "outcome", rename_all = "snake_case")]
+pub enum AckBatchOutcome {
+    Confirmed,
+    AlreadyConfirmed,
+    Rejected { reason: AckBatchRejection },
+}
+
+/// Why an individual receipt was rejected while other receipts were evaluated.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AckBatchRejection {
+    NotInFlight,
+    StaleDelivery,
+}
+
+/// Ordered per-receipt outcomes from one acknowledgement-vector operation.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct AckBatchResult {
+    pub outcomes: Vec<AckBatchItem>,
+}
+
+/// Validate public shape and resource bounds for a consume-batch poll.
+pub fn validate_consume_batch_limits(limits: ConsumeBatchLimits) -> Result<(), BrokerError> {
+    if !(1..=MAX_CONSUME_BATCH_RECORDS).contains(&limits.max_records) {
+        return Err(BrokerError::InvalidBatchRequest(format!(
+            "max_records must be between 1 and {MAX_CONSUME_BATCH_RECORDS}"
+        )));
+    }
+    if limits.max_bytes == 0 || limits.max_bytes > MAX_CONSUME_BATCH_RESPONSE_BYTES {
+        return Err(BrokerError::InvalidBatchRequest(format!(
+            "max_bytes must be between 1 and {MAX_CONSUME_BATCH_RESPONSE_BYTES}"
+        )));
+    }
+    Ok(())
+}
+
+/// Validate a receipt vector before the engine reads or mutates consumer state.
+pub fn validate_ack_batch_receipts(receipts: &[DeliveryReceipt]) -> Result<(), BrokerError> {
+    if receipts.is_empty() || receipts.len() > MAX_CONSUME_BATCH_RECORDS {
+        return Err(BrokerError::InvalidBatchRequest(format!(
+            "acknowledgement receipt count must be between 1 and {MAX_CONSUME_BATCH_RECORDS}"
+        )));
+    }
+    let mut offsets = std::collections::HashSet::with_capacity(receipts.len());
+    for receipt in receipts {
+        if !offsets.insert(receipt.offset) {
+            return Err(BrokerError::InvalidBatchRequest(format!(
+                "duplicate acknowledgement offset {}",
+                receipt.offset
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// Measure the exact encoded JSON-lines size of the provisional `poll_batch`
+/// response shape without allocating base64 copies of record payloads.
+///
+/// The matching wire response stores valid UTF-8 payloads as JSON text and
+/// other payloads as padded standard base64. Metadata and the terminating
+/// newline are included in the returned byte count.
+pub fn poll_batch_response_len(
+    stream: &str,
+    consumer: &str,
+    member: Option<&str>,
+    messages: &[Message],
+) -> usize {
+    let mut sizer = PollBatchResponseSizer::new(stream, consumer, member);
+    for message in messages {
+        sizer.push(message);
+    }
+    sizer.encoded_len()
+}
+
+/// Incrementally measures an encoded poll-batch response while candidates are
+/// selected. This avoids repeatedly encoding or rescanning accumulated payloads.
+pub struct PollBatchResponseSizer {
+    consumer: String,
+    member: Option<String>,
+    encoded_len: usize,
+    messages: usize,
+}
+
+impl PollBatchResponseSizer {
+    pub fn new(stream: &str, consumer: &str, member: Option<&str>) -> Self {
+        let encoded_len = "{\"type\":\"poll_batch\",\"stream\":".len()
+            + json_string_len(stream)
+            + ",\"consumer\":".len()
+            + json_string_len(consumer)
+            + ",\"messages\":[".len()
+            + "]}\n".len();
+        Self {
+            consumer: consumer.to_owned(),
+            member: member.map(str::to_owned),
+            encoded_len,
+            messages: 0,
+        }
+    }
+
+    pub fn projected_len(&self, message: &Message) -> usize {
+        self.encoded_len
+            .saturating_add(if self.messages == 0 { 0 } else { 1 })
+            .saturating_add(poll_batch_message_len(
+                message,
+                &self.consumer,
+                self.member.as_deref(),
+            ))
+    }
+
+    pub fn push(&mut self, message: &Message) -> usize {
+        self.encoded_len = self.projected_len(message);
+        self.messages = self.messages.saturating_add(1);
+        self.encoded_len
+    }
+
+    pub fn encoded_len(&self) -> usize {
+        self.encoded_len
+    }
+}
+
+fn poll_batch_message_len(message: &Message, consumer: &str, member: Option<&str>) -> usize {
+    let mut length = "{\"stream\":".len() + json_string_len(&message.stream);
+    length += ",\"consumer\":".len() + json_string_len(consumer);
+    if let Some(member) = member {
+        length += ",\"member\":".len() + json_string_len(member);
+    }
+    length += ",\"offset\":".len() + message.offset.to_string().len();
+    length += ",\"key\":".len() + message.key.as_deref().map_or("null".len(), json_string_len);
+    if let Ok(payload) = std::str::from_utf8(&message.payload) {
+        length += ",\"payload\":".len() + json_string_len(payload);
+    } else {
+        let encoded_len = message.payload.len().saturating_add(2) / 3 * 4;
+        length += ",\"payload_base64\":".len() + encoded_len + 2;
+    }
+    length += ",\"published_at_ms\":".len() + message.published_at_ms.to_string().len();
+    if let Some(delivery_token) = message.delivery_token.as_deref() {
+        length += ",\"delivery_token\":".len() + json_string_len(delivery_token);
+    }
+    if let Some(delivery_attempt) = message.delivery_attempt {
+        length += ",\"delivery_attempt\":".len() + delivery_attempt.to_string().len();
+    }
+    length + 1
+}
+
+fn json_string_len(value: &str) -> usize {
+    value.bytes().fold(2, |length, byte| {
+        length.saturating_add(match byte {
+            b'"' | b'\\' | b'\x08' | b'\t' | b'\n' | b'\x0c' | b'\r' => 2,
+            0x00..=0x1f => 6,
+            _ => 1,
+        })
+    })
+}
+
 /// One opaque record in a publish batch.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PublishRecord {
@@ -238,6 +422,17 @@ pub enum BrokerErrorOutcome {
     Unknown,
 }
 
+/// The local consumer-journal boundary where persistence failed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConsumerStatePersistStage {
+    /// The event was not appended, so retrying the unchanged operation is safe.
+    BeforeAppend,
+    /// The append may contain a partial event and must be reconciled first.
+    Append,
+    /// The complete event was written but its durability sync failed.
+    Sync,
+}
+
 #[derive(Debug, Error)]
 pub enum BrokerError {
     #[error("invalid {kind} name '{name}'; use 1-128 ASCII letters, digits, '.', '_', or '-'")]
@@ -271,10 +466,21 @@ pub enum BrokerError {
     Io(#[from] io::Error),
     #[error("consumer state error: {0}")]
     State(#[from] serde_json::Error),
+    #[error("consumer state persistence failed at {stage:?}: {message}")]
+    ConsumerStatePersistence {
+        stage: ConsumerStatePersistStage,
+        message: String,
+    },
     #[error("broker lock is poisoned")]
     LockPoisoned,
     #[error("invalid broker configuration: {0}")]
     Configuration(String),
+    #[error("invalid consume-batch request: {0}")]
+    InvalidBatchRequest(String),
+    #[error(
+        "the first eligible message cannot fit in the {max_bytes}-byte consume-batch response bound"
+    )]
+    ConsumeBatchRecordTooLarge { max_bytes: usize },
     #[error("request must be sent to the elected leader {leader_id:?}")]
     NotLeader { leader_id: Option<u64> },
     #[error("cluster error: {0}")]
@@ -300,8 +506,12 @@ impl BrokerError {
             Self::CorruptRecord(_) => BrokerErrorKind::CorruptData,
             Self::Io(_) => BrokerErrorKind::Storage,
             Self::State(_) => BrokerErrorKind::State,
+            Self::ConsumerStatePersistence { .. } => BrokerErrorKind::State,
             Self::LockPoisoned => BrokerErrorKind::Internal,
             Self::Configuration(_) => BrokerErrorKind::Configuration,
+            Self::InvalidBatchRequest(_) | Self::ConsumeBatchRecordTooLarge { .. } => {
+                BrokerErrorKind::InvalidRequest
+            }
             Self::NotLeader { .. } => BrokerErrorKind::Routing,
             Self::Cluster(_) => BrokerErrorKind::Cluster,
         }
@@ -314,6 +524,15 @@ impl BrokerError {
     /// remain `Unknown` because an engine cannot prove that a mutation did not
     /// commit merely from the backend error it received.
     pub fn outcome(&self) -> BrokerErrorOutcome {
+        if matches!(
+            self,
+            Self::ConsumerStatePersistence {
+                stage: ConsumerStatePersistStage::BeforeAppend,
+                ..
+            }
+        ) {
+            return BrokerErrorOutcome::Retryable;
+        }
         match self.kind() {
             BrokerErrorKind::ResourceNotReady | BrokerErrorKind::Routing => {
                 BrokerErrorOutcome::Retryable
@@ -375,6 +594,37 @@ pub trait Engine: Send + Sync {
 
     fn poll<'a>(&'a self, stream: &'a str, consumer: &'a str) -> EngineFuture<'a, PollResult>;
 
+    /// Return one ordered, bounded set for an ordinary consumer. The ordinary
+    /// consumer name is also the member identity for receipts.
+    fn poll_batch<'a>(
+        &'a self,
+        stream: &'a str,
+        consumer: &'a str,
+        limits: ConsumeBatchLimits,
+    ) -> EngineFuture<'a, Vec<Message>> {
+        let _ = (stream, consumer, limits);
+        Box::pin(async {
+            Err(BrokerError::Cluster(
+                "consume batches are not supported by this engine".to_owned(),
+            ))
+        })
+    }
+
+    /// Return one ordered, bounded set for a shared-consumer member.
+    fn poll_group_batch<'a>(
+        &'a self,
+        _stream: &'a str,
+        _consumer: &'a str,
+        _member: &'a str,
+        _limits: ConsumeBatchLimits,
+    ) -> EngineFuture<'a, Vec<Message>> {
+        Box::pin(async {
+            Err(BrokerError::Cluster(
+                "shared consume batches are not supported by this engine".to_owned(),
+            ))
+        })
+    }
+
     /// Configure durable retry settings for one named consumer.
     ///
     /// Engines that do not support consumer configuration retain the shared
@@ -428,12 +678,34 @@ pub trait Engine: Send + Sync {
         })
     }
 
+    /// Acknowledge one ordinary scalar delivery by offset.
+    ///
+    /// A delivery assigned by `poll_batch` is receipt-fenced and cannot be
+    /// acknowledged through this offset-only operation; use `ack_batch` for
+    /// that active set.
     fn ack<'a>(
         &'a self,
         stream: &'a str,
         consumer: &'a str,
         offset: Offset,
     ) -> EngineFuture<'a, AckResult>;
+
+    /// Acknowledge an ordinary consumer's receipts independently in one
+    /// durable acknowledgement-subset transition. Each receipt is required
+    /// for an entry assigned by `poll_batch`; scalar offset-only ack cannot
+    /// bypass the batch delivery fence.
+    fn ack_batch<'a>(
+        &'a self,
+        _stream: &'a str,
+        _consumer: &'a str,
+        _receipts: Vec<DeliveryReceipt>,
+    ) -> EngineFuture<'a, AckBatchResult> {
+        Box::pin(async {
+            Err(BrokerError::Cluster(
+                "consume-batch acknowledgements are not supported by this engine".to_owned(),
+            ))
+        })
+    }
 
     fn ack_group<'a>(
         &'a self,
@@ -446,6 +718,24 @@ pub trait Engine: Send + Sync {
         Box::pin(async {
             Err(BrokerError::Cluster(
                 "shared consumer acknowledgements are not supported by this engine".to_owned(),
+            ))
+        })
+    }
+
+    /// Acknowledge a shared member's receipts independently in one durable
+    /// acknowledgement-subset transition. Each receipt is required for an
+    /// entry assigned by `poll_group_batch`; scalar offset-only ack cannot
+    /// bypass the batch delivery fence.
+    fn ack_group_batch<'a>(
+        &'a self,
+        _stream: &'a str,
+        _consumer: &'a str,
+        _member: &'a str,
+        _receipts: Vec<DeliveryReceipt>,
+    ) -> EngineFuture<'a, AckBatchResult> {
+        Box::pin(async {
+            Err(BrokerError::Cluster(
+                "shared consume-batch acknowledgements are not supported by this engine".to_owned(),
             ))
         })
     }
@@ -530,6 +820,30 @@ mod tests {
             ),
             (
                 BrokerError::State(state_error),
+                BrokerErrorKind::State,
+                BrokerErrorOutcome::Unknown,
+            ),
+            (
+                BrokerError::ConsumerStatePersistence {
+                    stage: super::ConsumerStatePersistStage::BeforeAppend,
+                    message: "injected".to_owned(),
+                },
+                BrokerErrorKind::State,
+                BrokerErrorOutcome::Retryable,
+            ),
+            (
+                BrokerError::ConsumerStatePersistence {
+                    stage: super::ConsumerStatePersistStage::Append,
+                    message: "injected".to_owned(),
+                },
+                BrokerErrorKind::State,
+                BrokerErrorOutcome::Unknown,
+            ),
+            (
+                BrokerError::ConsumerStatePersistence {
+                    stage: super::ConsumerStatePersistStage::Sync,
+                    message: "injected".to_owned(),
+                },
                 BrokerErrorKind::State,
                 BrokerErrorOutcome::Unknown,
             ),

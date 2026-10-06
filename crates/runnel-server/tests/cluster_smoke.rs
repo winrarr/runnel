@@ -15,7 +15,10 @@ use runnel_client::{
     AttemptFailure, Client, ClientConfig, ClientError, PublishBatchOutcome, PublishBatchRecord,
     PublishOptions, PublishReceipt,
 };
-use runnel_protocol::{PublishBatchRecordResponse, Request, Response};
+use runnel_protocol::{
+    AckBatchItemOutcome, BatchDeliveryReceipt, BatchMessageResponse, BinaryPayload,
+    PublishBatchRecordResponse, Request, Response,
+};
 use tempfile::TempDir;
 #[cfg(feature = "test-replacement-recovery")]
 use tokio::io::AsyncReadExt;
@@ -346,6 +349,223 @@ fn three_process_cluster_replicates_and_recovers_after_failures() {
             |response| matches!(response, Response::Acknowledged { .. }),
         ),
         Response::Acknowledged { .. }
+    ));
+
+    let batch_node = create_stream_on_any(&mut nodes, "batch-jobs");
+    assert!(matches!(
+        wait_for_response_at(
+            nodes[batch_node].broker_addr,
+            || Request::ConfigureConsumer {
+                stream: "batch-jobs".to_owned(),
+                consumer: "workers".to_owned(),
+                ack_timeout_ms: 60_000,
+                max_delivery_attempts: None,
+            },
+            |response| matches!(response, Response::ConsumerPolicy { .. }),
+        ),
+        Response::ConsumerPolicy { .. }
+    ));
+    assert!(matches!(
+        wait_for_response_at(
+            nodes[batch_node].broker_addr,
+            || Request::Publish {
+                stream: "batch-jobs".to_owned(),
+                key: None,
+                payload: "first-batch-job".to_owned(),
+                request_id: Some("batch-job-0".to_owned()),
+            },
+            |response| matches!(response, Response::Published { offset: 0, .. }),
+        ),
+        Response::Published { offset: 0, .. }
+    ));
+    let binary_batch_payload = vec![0, 0xff, b'\n', 0x80];
+    assert!(matches!(
+        wait_for_response_at(
+            nodes[(batch_node + 1) % nodes.len()].broker_addr,
+            || Request::PublishBytes {
+                stream: "batch-jobs".to_owned(),
+                key: None,
+                payload_base64: BinaryPayload::new(binary_batch_payload.clone()),
+                request_id: Some("batch-job-1".to_owned()),
+            },
+            |response| matches!(response, Response::Published { offset: 1, .. }),
+        ),
+        Response::Published { offset: 1, .. }
+    ));
+    let offset_only_batch = wait_for_response_at(
+        nodes[batch_node].broker_addr,
+        || Request::PollBatch {
+            stream: "batch-jobs".to_owned(),
+            consumer: "offset-only".to_owned(),
+            max_records: 2,
+            max_bytes: 64 * 1024,
+            max_wait_ms: 0,
+        },
+        |response| matches!(response, Response::PollBatch { messages, .. } if messages.len() == 2),
+    );
+    let offset_only_receipts = batch_response_receipts(offset_only_batch);
+    assert!(matches!(
+        request(
+            nodes[batch_node].broker_addr,
+            Request::Ack {
+                stream: "batch-jobs".to_owned(),
+                consumer: "offset-only".to_owned(),
+                offset: offset_only_receipts[0].0,
+            },
+        ),
+        Ok(Response::Error { ref code, .. }) if code == "stale_delivery"
+    ));
+    assert!(matches!(
+        wait_for_response_at(
+            nodes[batch_node].broker_addr,
+            || Request::AckBatch {
+                stream: "batch-jobs".to_owned(),
+                consumer: "offset-only".to_owned(),
+                receipts: vec![BatchDeliveryReceipt {
+                    offset: offset_only_receipts[0].0,
+                    delivery_token: offset_only_receipts[0].1.clone(),
+                }],
+            },
+            |response| matches!(response, Response::AckBatch { outcomes, .. } if outcomes.len() == 1),
+        ),
+        Response::AckBatch { outcomes, .. }
+            if matches!(outcomes.first().map(|item| &item.outcome), Some(&AckBatchItemOutcome::Confirmed))
+    ));
+
+    let batch_request = || Request::PollGroupBatch {
+        stream: "batch-jobs".to_owned(),
+        consumer: "workers".to_owned(),
+        member: "member-a".to_owned(),
+        max_records: 2,
+        max_bytes: 64 * 1024,
+        max_wait_ms: 0,
+    };
+    let initial_batch_leader = data_group_leader(&nodes, "batch-jobs");
+    let initial_batch_follower = (0..nodes.len())
+        .map(|index| (initial_batch_leader + index + 1) % nodes.len())
+        .find(|index| *index != initial_batch_leader)
+        .expect("one follower should be available for forwarded batch responses");
+    let batch_response = wait_for_response_at(
+        nodes[initial_batch_follower].broker_addr,
+        batch_request,
+        |response| matches!(response, Response::PollBatch { messages, .. } if messages.len() == 2),
+    );
+    let Response::PollBatch { messages, .. } = &batch_response else {
+        panic!("expected a consume-batch response, got {batch_response:?}");
+    };
+    assert!(matches!(
+        &messages[0],
+        BatchMessageResponse::Text { payload, .. } if payload == "first-batch-job"
+    ));
+    assert!(matches!(
+        &messages[1],
+        BatchMessageResponse::Bytes { payload_base64, .. }
+            if payload_base64.as_bytes() == binary_batch_payload
+    ));
+    let batch_receipts = batch_response_receipts(batch_response);
+    assert_eq!(
+        batch_receipts
+            .iter()
+            .map(|(offset, _)| *offset)
+            .collect::<Vec<_>>(),
+        [0, 1]
+    );
+    assert_eq!(
+        batch_receipts,
+        batch_response_receipts(wait_for_response_at(
+            nodes[(batch_node + 1) % nodes.len()].broker_addr,
+            batch_request,
+            |response| matches!(response, Response::PollBatch { messages, .. } if messages.len() == 2),
+        )),
+        "a repeated cluster poll must return its complete original active set"
+    );
+    assert!(matches!(
+        request(
+            nodes[batch_node].broker_addr,
+            Request::AckGroup {
+                stream: "batch-jobs".to_owned(),
+                consumer: "workers".to_owned(),
+                member: "member-a".to_owned(),
+                offset: batch_receipts[0].0,
+                delivery_token: String::new(),
+            },
+        ),
+        Ok(Response::Error { ref code, .. }) if code == "stale_delivery"
+    ));
+    let ack_first = wait_for_response_at(
+        nodes[batch_node].broker_addr,
+        || Request::AckGroupBatch {
+            stream: "batch-jobs".to_owned(),
+            consumer: "workers".to_owned(),
+            member: "member-a".to_owned(),
+            receipts: vec![BatchDeliveryReceipt {
+                offset: batch_receipts[0].0,
+                delivery_token: batch_receipts[0].1.clone(),
+            }],
+        },
+        |response| matches!(response, Response::AckBatch { outcomes, .. } if outcomes.len() == 1),
+    );
+    assert!(matches!(
+        ack_first,
+        Response::AckBatch { outcomes, .. }
+            if matches!(outcomes.first().map(|item| &item.outcome), Some(&AckBatchItemOutcome::Confirmed))
+    ));
+
+    let batch_leader = data_group_leader(&nodes, "batch-jobs");
+    let restarted_follower = (0..nodes.len())
+        .map(|index| (batch_leader + index + 1) % nodes.len())
+        .find(|index| *index != batch_leader)
+        .expect("one follower should be available to restart");
+    nodes[restarted_follower].restart();
+    let remaining_batch = wait_for_response_at(
+        nodes[restarted_follower].broker_addr,
+        batch_request,
+        |response| matches!(response, Response::PollBatch { messages, .. } if messages.len() == 1),
+    );
+    let remaining_receipts = batch_response_receipts(remaining_batch);
+    assert_eq!(remaining_receipts, [batch_receipts[1].clone()]);
+    let previous_batch_leader = data_group_leader(&nodes, "batch-jobs");
+    nodes[previous_batch_leader].stop();
+    let successor_batch_leader = data_group_leader(&nodes, "batch-jobs");
+    assert_ne!(successor_batch_leader, previous_batch_leader);
+    let after_leader_change = wait_for_response_at(
+        nodes[successor_batch_leader].broker_addr,
+        batch_request,
+        |response| matches!(response, Response::PollBatch { messages, .. } if messages.len() == 1),
+    );
+    assert_eq!(
+        batch_response_receipts(after_leader_change),
+        remaining_receipts,
+        "a committed active set and its receipt must survive leader change"
+    );
+    let ack_second = wait_for_response_at(
+        nodes[successor_batch_leader].broker_addr,
+        || Request::AckGroupBatch {
+            stream: "batch-jobs".to_owned(),
+            consumer: "workers".to_owned(),
+            member: "member-a".to_owned(),
+            receipts: vec![BatchDeliveryReceipt {
+                offset: remaining_receipts[0].0,
+                delivery_token: remaining_receipts[0].1.clone(),
+            }],
+        },
+        |response| matches!(response, Response::AckBatch { outcomes, .. } if outcomes.len() == 1),
+    );
+    assert!(matches!(
+        ack_second,
+        Response::AckBatch { outcomes, .. }
+            if matches!(outcomes.first().map(|item| &item.outcome), Some(&AckBatchItemOutcome::Confirmed))
+    ));
+    nodes[previous_batch_leader].restart();
+    assert!(matches!(
+        wait_for_response_at(
+            nodes[previous_batch_leader].broker_addr,
+            || Request::CreateStream {
+                stream: "batch-jobs".to_owned(),
+            },
+            |response| matches!(response, Response::StreamCreated { created: false, .. }),
+        ),
+        Response::StreamCreated { created: false, .. }
     ));
 
     let legacy_retry_node = create_stream_on_any(&mut nodes, "legacy-retry");
@@ -2826,6 +3046,30 @@ async fn write_peer_frame(stream: &mut AsyncTcpStream, frame: &[u8]) -> Result<(
     }
     stream.write_all(&length.to_be_bytes()).await?;
     stream.write_all(frame).await
+}
+
+fn batch_response_receipts(response: Response) -> Vec<(u64, String)> {
+    let Response::PollBatch { messages, .. } = response else {
+        panic!("expected a consume-batch response, got {response:?}");
+    };
+    messages
+        .into_iter()
+        .map(|message| match message {
+            BatchMessageResponse::Text {
+                offset,
+                delivery_token,
+                ..
+            }
+            | BatchMessageResponse::Bytes {
+                offset,
+                delivery_token,
+                ..
+            } => (
+                offset,
+                delivery_token.expect("batch message should carry its receipt"),
+            ),
+        })
+        .collect()
 }
 
 #[cfg(feature = "test-replacement-recovery")]

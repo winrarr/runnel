@@ -8,6 +8,7 @@ instrumentation = ["runnel-engine/instrumentation"]
 test-replacement-recovery = ["openraft/loosen-follower-log-revert"]
 
 [dependencies]
+base64 = "0.23"
 openraft.workspace = true
 runnel-engine = { path = "../runnel-engine" }
 serde.workspace = true

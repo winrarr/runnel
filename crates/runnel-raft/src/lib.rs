@@ -25,7 +25,7 @@ use openraft::{Entry, EntryPayload, RaftSnapshotBuilder, SnapshotMeta};
 use openraft::{LogId, StoredMembership};
 use runnel_engine::BrokerError;
 #[cfg(test)]
-use runnel_engine::{AckResult, Engine, Message, Offset, PollResult};
+use runnel_engine::{AckResult, ConsumeBatchLimits, Engine, Message, Offset, PollResult};
 
 mod delivery;
 mod engine;
@@ -1010,6 +1010,7 @@ mod tests {
         let engine = SingleNodeEngine::new(1).await.unwrap();
         runnel_test_support::assert_error_classification_contract(&engine).await;
         runnel_test_support::assert_publish_batch_contract(&engine).await;
+        runnel_test_support::assert_consume_batch_contract(&engine).await;
         runnel_test_support::assert_shared_delivery_contract(&engine).await;
     }
 
@@ -1039,6 +1040,7 @@ mod tests {
         .await
         .unwrap();
         runnel_test_support::assert_publish_batch_contract(&engine).await;
+        runnel_test_support::assert_consume_batch_contract(&engine).await;
         runnel_test_support::assert_shared_delivery_contract(&engine).await;
         runnel_test_support::assert_independent_consumers_contract(&engine).await;
         runnel_test_support::assert_key_ordering_contract(&engine).await;
@@ -1732,6 +1734,40 @@ mod tests {
                 tokio::time::sleep(Duration::from_millis(10)).await;
             }
         }
+    }
+
+    #[tokio::test]
+    async fn consume_batch_collection_returns_when_leadership_is_lost() {
+        let cluster = InMemoryCluster::new([1, 2, 3]).await.unwrap();
+        let leader = cluster.leader().await.unwrap();
+        leader.create_stream("events".to_owned()).await.unwrap();
+
+        let polling_leader = Arc::clone(&leader);
+        let poll = tokio::spawn(async move {
+            polling_leader
+                .poll_batch(
+                    "events".to_owned(),
+                    "worker".to_owned(),
+                    ConsumeBatchLimits {
+                        max_records: 2,
+                        max_bytes: 64 * 1024,
+                        max_wait_ms: 5_000,
+                    },
+                )
+                .await
+        });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        leader
+            .raft
+            .shutdown()
+            .await
+            .expect("the test leader should shut down cleanly");
+
+        let result = tokio::time::timeout(Duration::from_secs(3), poll)
+            .await
+            .expect("batch collection should wake after leader shutdown")
+            .expect("poll task should not panic");
+        assert!(matches!(result, Err(BrokerError::NotLeader { .. })));
     }
 
     #[tokio::test]

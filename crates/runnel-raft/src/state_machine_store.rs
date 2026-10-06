@@ -19,9 +19,11 @@ use runnel_engine::{BrokerError, ConsumerPolicy, Offset};
 #[cfg(test)]
 use runnel_engine::{Message, PollResult};
 use serde::{Deserialize, Serialize};
-use tokio::sync::RwLock;
+use tokio::sync::{Notify, RwLock, futures::Notified};
 
-use super::delivery::{GroupConsumerState, dead_letter_stream_name};
+use super::delivery::{
+    GroupBatchPollRequest, GroupConsumerState, dead_letter_stream_name, preview_group_batch,
+};
 use super::state_machine::{
     CommandResponse, GroupKind, SnapshotState, StateMachineData, StoredMessage, StreamLifecycle,
     StreamMetadata, StreamState, apply_command, stream_identity,
@@ -362,6 +364,7 @@ impl Drop for SnapshotBuildAttempt<'_> {
 #[derive(Debug, Default)]
 pub(super) struct StateMachineStore {
     pub(super) state: RwLock<StateMachineData>,
+    changes: Notify,
     snapshot_idx: AtomicU64,
     current_snapshot: RwLock<Option<StoredSnapshot>>,
     #[cfg(test)]
@@ -491,6 +494,7 @@ impl StateMachineStore {
             .open(&journal_path)?;
         Ok(Self {
             state: RwLock::new(state),
+            changes: Notify::new(),
             snapshot_idx: AtomicU64::new(0),
             current_snapshot: RwLock::new(current_snapshot),
             #[cfg(test)]
@@ -500,6 +504,32 @@ impl StateMachineStore {
             kind,
             metrics: Arc::new(SnapshotMetrics::default()),
         })
+    }
+
+    pub(super) fn changed(&self) -> Notified<'_> {
+        self.changes.notified()
+    }
+
+    pub(super) async fn preview_group_batch(
+        &self,
+        request: GroupBatchPollRequest,
+    ) -> Result<(CommandResponse, Option<u64>), BrokerError> {
+        let state = self.state.read().await;
+        let effective_now_ms = state.state.lease_clock_ms.max(request.now_ms);
+        let next_expiry_ms = state
+            .state
+            .group_consumers
+            .get(&(request.stream.clone(), request.consumer.clone()))
+            .and_then(|consumer| {
+                consumer
+                    .in_flight
+                    .values()
+                    .map(|delivery| delivery.deadline_ms)
+                    .filter(|deadline| *deadline > effective_now_ms)
+                    .min()
+            });
+        let response = preview_group_batch(&state.state, request, &self.kind);
+        Ok((response, next_expiry_ms))
     }
 
     fn persist_journal(&self, entries: &[Entry<TypeConfig>]) -> Result<(), StorageError<NodeId>> {
@@ -849,6 +879,7 @@ impl RaftStateMachine<TypeConfig> for Arc<StateMachineStore> {
         #[cfg(feature = "instrumentation")]
         let _stage_timer = StageTimer::new("raft.state_machine_apply");
         let entries = entries.into_iter().collect::<Vec<_>>();
+        let changed = !entries.is_empty();
         let mut state = self.state.write().await;
         // The journal is the durable write-ahead record for the materialized state. Serializing
         // borrowed entries avoids cloning each retained payload before it is moved into state.
@@ -871,6 +902,10 @@ impl RaftStateMachine<TypeConfig> for Arc<StateMachineStore> {
                     entry.log_id,
                 )),
             }
+        }
+        drop(state);
+        if changed {
+            self.changes.notify_waiters();
         }
         Ok(responses)
     }
@@ -923,6 +958,7 @@ impl RaftStateMachine<TypeConfig> for Arc<StateMachineStore> {
             *state = next_state;
             drop(state);
             *self.current_snapshot.write().await = Some(stored_snapshot);
+            self.changes.notify_waiters();
             Ok(data_len)
         }
         .await;
