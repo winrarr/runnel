@@ -263,7 +263,7 @@ impl TcpConnection {
     }
 }
 
-/// Owns all compatibility peer connections for one broker engine lifetime.
+/// Owns all pooled peer connections for one broker engine lifetime.
 ///
 /// OpenRaft retains one lazy network client per replication target and group,
 /// while forwarding and setup requests do not receive such an owner. Keeping
@@ -298,7 +298,7 @@ impl PeerTransport {
         pools.pool(target, address)
     }
 
-    /// Stop new requests and close all idle compatibility sockets. Requests
+    /// Stop new requests and close all idle pooled sockets. Requests
     /// already in flight finish under their existing TTL, then discard their
     /// sockets instead of returning them to a closed pool.
     pub(crate) fn shutdown(&self) {
@@ -1163,7 +1163,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn compatibility_connections_follow_transport_lifetime() {
+    async fn pooled_connections_follow_transport_lifetime() {
         let peer = TestPeer::start(None).await;
 
         let transport = PeerTransport::new(None);

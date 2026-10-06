@@ -62,8 +62,8 @@ spec:
   serviceName: runnel-headless
   podManagementPolicy: Parallel
   replicas: 3
-  # Keep image changes explicit while clustered storage and peer compatibility
-  # remain undefined. Delete/restart one pod at a time for experiments.
+  # Keep image changes explicit: mixed-version peers are unsupported and no
+  # tested upgrade procedure exists. Restart one pod at a time for experiments.
   updateStrategy:
     type: OnDelete
   selector:

@@ -216,12 +216,13 @@ constrain workload-controller rolling updates, so the PDB is not an upgrade
 safety mechanism.
 
 There is no supported rolling-upgrade, downgrade, or rollback procedure for
-this deployment. Clustered storage layout and peer/protocol compatibility are
-still under development; a new binary can fail closed on an unsupported
-volume, and reverting a binary after it has written incompatible state is not
-defined. Use a disposable cluster for upgrade experiments and preserve any
-claims needed for recovery before changing the image. `kubectl rollout
-restart` is not a compatibility test or an upgrade procedure.
+this deployment. Mixed-version Raft peers are unsupported, and no tested
+upgrade procedure exists. Clustered storage layout and protocol-version
+compatibility remain under development; a new binary can fail closed on an
+unsupported volume, and reverting a binary after it has written incompatible
+state is not defined. Use a disposable cluster for upgrade experiments and
+preserve any claims needed for recovery before changing the image. `kubectl
+rollout restart` is not a compatibility test or an upgrade procedure.
 
 ## Metrics and monitoring
 
