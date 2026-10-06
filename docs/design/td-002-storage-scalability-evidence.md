@@ -14,9 +14,14 @@
 
 This note records what the current local log proves, what the existing growth
 measurements do not prove, and the evidence gates for a future segmented and
-indexed representation. It is not an accepted storage decision or an
-implementation plan. The physical unit, index format, migration mechanism, and
-retention API remain open.
+indexed representation. It is not an accepted overall storage decision or an
+implementation plan. The physical unit, general-purpose offset index,
+migration mechanism, and retention API remain open. The narrower replay-time
+index is now selected by [ADR 0042](../decisions/0042-recoverable-replay-time-index.md):
+its derived cumulative prefix-maximum checkpoints add one row and byte cursor
+per 256 retained records and are rebuilt during the existing startup scan.
+That selector-specific decision does not settle generic storage segmentation
+or retire this debt; its memory and startup effects still need measurement.
 
 ## Observed baseline
 
@@ -279,9 +284,11 @@ evidence for all of the following outcomes:
   different physical layouts while preserving the same logical behavior.
 
 Until these gates are met, retain the current one-file format and treat
-segmentation/indexing as an exploratory design choice. Do not mark TD-002
-retired merely because a segment type or index exists: the debt covers
-scalability, retention, recovery, and compatibility together.
+segmentation and general-purpose storage indexing as exploratory design
+choices. The narrower replay-time lookup is selected by ADR 0042 but remains
+unimplemented and does not settle the physical storage representation. Do not
+mark TD-002 retired merely because a segment type or index exists: the debt
+covers scalability, retention, recovery, and compatibility together.
 
 ## Refactor and planning assessment
 
