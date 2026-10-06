@@ -182,6 +182,24 @@ impl StreamLog {
         self.identity_offset(request_id, RequestIdentityKind::Public)
     }
 
+    pub(super) fn request_offset_for_content(
+        &mut self,
+        request_id: &str,
+        key: Option<&str>,
+        payload: &[u8],
+    ) -> Result<Option<Offset>, BrokerError> {
+        let Some(offset) = self.request_offset(request_id) else {
+            return Ok(None);
+        };
+        let existing = self.find_record(offset)?;
+        let existing_key = existing.key.as_deref().unwrap_or_default().as_bytes();
+        let incoming_key = key.unwrap_or_default().as_bytes();
+        if existing_key != incoming_key || self.read_payload(&existing)? != payload {
+            return Err(BrokerError::RequestIdContentConflict);
+        }
+        Ok(Some(offset))
+    }
+
     pub(super) fn dead_letter_move_offset(&self, move_id: &str) -> Option<Offset> {
         self.identity_offset(move_id, RequestIdentityKind::DeadLetterMove)
     }
@@ -548,11 +566,19 @@ impl StreamLog {
             request_id,
         } in records
         {
-            if let Some(request_id) = request_id.as_ref()
-                && let Some(offset) = self.request_offset(request_id)
-            {
-                outcomes.push(Ok(offset));
-                continue;
+            if let Some(request_id) = request_id.as_ref() {
+                match self.request_offset_for_content(request_id, key.as_deref(), &payload) {
+                    Ok(Some(offset)) => {
+                        outcomes.push(Ok(offset));
+                        continue;
+                    }
+                    Ok(None) => {}
+                    Err(error @ BrokerError::RequestIdContentConflict) => {
+                        outcomes.push(Err(error));
+                        continue;
+                    }
+                    Err(error) => return Err(error),
+                }
             }
 
             let outcome = match request_id {

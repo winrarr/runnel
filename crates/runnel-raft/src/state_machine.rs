@@ -115,6 +115,7 @@ pub enum CommandResponse {
     Published {
         offset: Offset,
     },
+    RequestIdContentConflict,
     Acknowledged,
     ConsumerPolicy {
         policy: ConsumerPolicy,
@@ -351,6 +352,19 @@ pub(super) fn apply_command(
                     .get(&stream)
                     .and_then(|requests| requests.get(request_id))
             {
+                let Some(existing) = usize::try_from(*offset)
+                    .ok()
+                    .and_then(|index| state.streams.get(&stream)?.messages.get(index))
+                else {
+                    // A dedup entry without its retained message cannot safely be
+                    // treated as either an exact retry or a new publish.
+                    return CommandResponse::Noop;
+                };
+                let existing_key = existing.key.as_deref().unwrap_or_default().as_bytes();
+                let incoming_key = key.as_deref().unwrap_or_default().as_bytes();
+                if existing_key != incoming_key || existing.payload != payload {
+                    return CommandResponse::RequestIdContentConflict;
+                }
                 return CommandResponse::Published { offset: *offset };
             }
             let (stream_id, group_id) = stream_identity(&stream);

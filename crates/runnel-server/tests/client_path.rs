@@ -136,6 +136,174 @@ async fn typed_client_keeps_a_connection_and_preserves_binary_payloads() {
 }
 
 #[tokio::test]
+async fn typed_client_reports_request_id_content_conflicts_without_appending() {
+    let directory = TempDir::new().unwrap();
+    let server = RunningServer::start(directory.path(), &[]);
+    let mut client = Client::connect(server.broker_addr).await.unwrap();
+    client.create_stream("events").await.unwrap();
+
+    let original = vec![0, 1, 255];
+    let first = client
+        .publish_bytes_with_options(
+            "events",
+            original.clone(),
+            PublishOptions::default().with_request_id("single-id"),
+        )
+        .await
+        .unwrap();
+    assert_eq!(first.offset, 0);
+    let exact = client
+        .publish_bytes_with_options(
+            "events",
+            original.clone(),
+            PublishOptions::default()
+                .with_key("")
+                .with_request_id("single-id"),
+        )
+        .await
+        .unwrap();
+    assert_eq!(exact.offset, first.offset);
+
+    let key_conflict = client
+        .publish_bytes_with_options(
+            "events",
+            original.clone(),
+            PublishOptions::default()
+                .with_key("different-ordering-key")
+                .with_request_id("single-id"),
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(
+        key_conflict,
+        AttemptOutcome::Rejected(AttemptFailure::Broker(Response::Error {
+            code,
+            ..
+        })) if code == "request_id_content_conflict"
+    ));
+
+    let payload_conflict = client
+        .publish_bytes_with_options(
+            "events",
+            b"different payload".to_vec(),
+            PublishOptions::default().with_request_id("single-id"),
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(
+        payload_conflict,
+        AttemptOutcome::Rejected(AttemptFailure::Broker(Response::Error {
+            code,
+            ..
+        })) if code == "request_id_content_conflict"
+    ));
+
+    let batch = client
+        .publish_batch(
+            "events",
+            [
+                PublishBatchRecord::with_options(
+                    b"batch-first".to_vec(),
+                    PublishOptions::default()
+                        .with_key("batch-key")
+                        .with_request_id("batch-id"),
+                ),
+                PublishBatchRecord::with_options(
+                    b"batch-first".to_vec(),
+                    PublishOptions::default()
+                        .with_key("batch-key")
+                        .with_request_id("batch-id"),
+                ),
+                PublishBatchRecord::with_options(
+                    b"batch-changed".to_vec(),
+                    PublishOptions::default()
+                        .with_key("batch-key")
+                        .with_request_id("batch-id"),
+                ),
+                PublishBatchRecord::with_options(
+                    b"independent".to_vec(),
+                    PublishOptions::default().with_request_id("other-id"),
+                ),
+            ],
+        )
+        .await;
+    assert!(batch.attempt.is_none());
+    assert_eq!(batch.outcomes.len(), 4);
+    assert_eq!(
+        batch.outcomes[0],
+        PublishBatchOutcome::Confirmed(PublishReceipt {
+            stream: "events".to_owned(),
+            offset: 1,
+        })
+    );
+    assert_eq!(batch.outcomes[1], batch.outcomes[0]);
+    assert!(matches!(
+        &batch.outcomes[2],
+        PublishBatchOutcome::Rejected { code, .. }
+            if code == "request_id_content_conflict"
+    ));
+    assert_eq!(
+        batch.outcomes[3],
+        PublishBatchOutcome::Confirmed(PublishReceipt {
+            stream: "events".to_owned(),
+            offset: 2,
+        })
+    );
+
+    drop(client);
+    drop(server);
+
+    let server = RunningServer::start(directory.path(), &[]);
+    let mut recovered = Client::connect(server.broker_addr).await.unwrap();
+    let replay = recovered
+        .publish_bytes_with_options(
+            "events",
+            original.clone(),
+            PublishOptions::default().with_request_id("single-id"),
+        )
+        .await
+        .unwrap();
+    assert_eq!(replay.offset, 0);
+    let after_restart = recovered
+        .publish_bytes_with_options(
+            "events",
+            b"different payload".to_vec(),
+            PublishOptions::default().with_request_id("single-id"),
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(
+        after_restart,
+        AttemptOutcome::Rejected(AttemptFailure::Broker(Response::Error {
+            code,
+            ..
+        })) if code == "request_id_content_conflict"
+    ));
+
+    for (offset, expected) in [
+        (0, original.as_slice()),
+        (1, b"batch-first".as_slice()),
+        (2, b"independent".as_slice()),
+    ] {
+        let message = recovered
+            .poll_bytes("events", "verifier")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(message.offset, offset);
+        assert_eq!(message.payload, expected);
+        recovered.ack("events", "verifier", offset).await.unwrap();
+    }
+    assert!(
+        recovered
+            .poll_bytes("events", "verifier")
+            .await
+            .unwrap()
+            .is_none()
+    );
+}
+
+#[tokio::test]
 async fn typed_publish_batch_preserves_outcomes_and_request_id_replay_after_restart() {
     let directory = TempDir::new().unwrap();
     let server = RunningServer::start(directory.path(), &[]);

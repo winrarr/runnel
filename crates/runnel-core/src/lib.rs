@@ -545,14 +545,48 @@ mod tests {
         let retry = Engine::publish(
             &broker,
             "events",
-            Some("retry-key".to_owned()),
-            b"retry-payload".to_vec(),
+            Some("original-key".to_owned()),
+            b"original".to_vec(),
             Some("request-1".to_owned()),
         )
         .await
         .unwrap();
 
         assert_eq!((first, retry), (0, 0));
+        let key_conflict = Engine::publish(
+            &broker,
+            "events",
+            Some("retry-key".to_owned()),
+            b"original".to_vec(),
+            Some("request-1".to_owned()),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(
+            key_conflict.kind(),
+            runnel_engine::BrokerErrorKind::RequestIdContentConflict
+        );
+        assert_eq!(
+            key_conflict.outcome(),
+            runnel_engine::BrokerErrorOutcome::Rejected
+        );
+        assert!(matches!(
+            Engine::publish(
+                &broker,
+                "events",
+                Some("original-key".to_owned()),
+                b"retry-payload".to_vec(),
+                Some("request-1".to_owned()),
+            )
+            .await,
+            Err(BrokerError::RequestIdContentConflict)
+        ));
+        assert_eq!(
+            Engine::publish(&broker, "events", None, b"next".to_vec(), None)
+                .await
+                .unwrap(),
+            1
+        );
         assert!(matches!(
             broker.poll("events", "reader").unwrap(),
             PollResult::Message(Message {
@@ -566,7 +600,22 @@ mod tests {
             broker.ack("events", "reader", 0).unwrap(),
             AckResult::Acknowledged
         );
+        assert!(matches!(
+            broker.poll("events", "reader").unwrap(),
+            PollResult::Message(Message { offset: 1, payload, .. }) if payload == b"next"
+        ));
+        assert_eq!(
+            broker.ack("events", "reader", 1).unwrap(),
+            AckResult::Acknowledged
+        );
         assert_eq!(broker.poll("events", "reader").unwrap(), PollResult::Empty);
+    }
+
+    #[tokio::test]
+    async fn broker_implements_publish_request_id_content_contract() {
+        let directory = tempdir().unwrap();
+        let broker = Broker::open(directory.path(), BrokerConfig::default()).unwrap();
+        runnel_test_support::assert_publish_request_id_contract(&broker).await;
     }
 
     #[tokio::test]
@@ -599,7 +648,7 @@ mod tests {
                 &broker,
                 "events",
                 None,
-                b"events-retry".to_vec(),
+                b"events".to_vec(),
                 Some("same-request".to_owned()),
             )
             .await
@@ -611,13 +660,29 @@ mod tests {
                 &broker,
                 "audit",
                 None,
-                b"audit-retry".to_vec(),
+                b"audit".to_vec(),
                 Some("same-request".to_owned()),
             )
             .await
             .unwrap(),
             0
         );
+        for (stream, payload) in [
+            ("events", b"events-retry".as_slice()),
+            ("audit", b"audit-retry"),
+        ] {
+            assert!(matches!(
+                Engine::publish(
+                    &broker,
+                    stream,
+                    None,
+                    payload.to_vec(),
+                    Some("same-request".to_owned()),
+                )
+                .await,
+                Err(BrokerError::RequestIdContentConflict)
+            ));
+        }
         assert!(matches!(
             broker.poll("events", "reader").unwrap(),
             PollResult::Message(Message { payload, .. }) if payload == b"events"
@@ -650,13 +715,26 @@ mod tests {
             Engine::publish(
                 &broker,
                 "events",
-                Some("retry-key".to_owned()),
-                b"retry-payload".to_vec(),
+                Some("original-key".to_owned()),
+                b"original".to_vec(),
                 Some("request-1".to_owned()),
             )
             .await
             .unwrap(),
             0
+        );
+        assert_eq!(
+            Engine::publish(
+                &broker,
+                "events",
+                Some("retry-key".to_owned()),
+                b"retry-payload".to_vec(),
+                Some("request-1".to_owned()),
+            )
+            .await
+            .unwrap_err()
+            .kind(),
+            runnel_engine::BrokerErrorKind::RequestIdContentConflict
         );
         assert_eq!(
             Engine::publish(&broker, "events", None, b"ordinary".to_vec(), None)
@@ -687,7 +765,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn concurrent_duplicate_requests_append_once() {
+    async fn concurrent_mismatched_request_ids_accept_one_content() {
         const CALL_COUNT: usize = 32;
 
         let directory = tempdir().unwrap();
@@ -696,24 +774,43 @@ mod tests {
         for call in 0..CALL_COUNT {
             let broker = broker.clone();
             calls.push(tokio::spawn(async move {
-                Engine::publish(
+                let result = Engine::publish(
                     &broker,
                     "events",
                     Some(format!("key-{call}")),
                     format!("payload-{call}").into_bytes(),
                     Some("request-1".to_owned()),
                 )
-                .await
-                .unwrap()
+                .await;
+                (call, result)
             }));
         }
 
+        let mut accepted_call = None;
+        let mut conflicts = 0;
         for call in calls {
-            assert_eq!(call.await.unwrap(), 0);
+            let (call, result) = call.await.unwrap();
+            match result {
+                Ok(0) => {
+                    assert!(accepted_call.replace(call).is_none());
+                }
+                Err(error) => {
+                    assert_eq!(
+                        error.kind(),
+                        runnel_engine::BrokerErrorKind::RequestIdContentConflict
+                    );
+                    conflicts += 1;
+                }
+                result => panic!("unexpected concurrent publish result: {result:?}"),
+            }
         }
+        assert!(accepted_call.is_some());
+        assert_eq!(conflicts, CALL_COUNT - 1);
         assert!(matches!(
             broker.poll("events", "reader").unwrap(),
-            PollResult::Message(Message { offset: 0, .. })
+            PollResult::Message(Message { offset: 0, key: Some(key), payload, .. })
+                if key == format!("key-{}", accepted_call.unwrap())
+                    && payload == format!("payload-{}", accepted_call.unwrap()).as_bytes()
         ));
         assert_eq!(
             broker.ack("events", "reader", 0).unwrap(),
@@ -1777,17 +1874,15 @@ mod tests {
             assert_eq!(source_state.committed_offset, 1);
             assert!(source_state.delivery_attempts.is_empty());
             assert_dead_letter_move_at(&broker, &move_id, 1, 2);
-            assert_eq!(
-                broker
-                    .publish_with_request_id(
-                        "events.dead-letter",
-                        Some("changed-key".to_owned()),
-                        b"changed payload".to_vec(),
-                        Some(move_id.clone()),
-                    )
-                    .unwrap(),
-                0
-            );
+            assert!(matches!(
+                broker.publish_with_request_id(
+                    "events.dead-letter",
+                    Some("changed-key".to_owned()),
+                    b"changed payload".to_vec(),
+                    Some(move_id.clone()),
+                ),
+                Err(BrokerError::RequestIdContentConflict)
+            ));
         }
 
         let broker = Broker::open(directory.path(), config).unwrap();
@@ -1836,17 +1931,15 @@ mod tests {
         assert_eq!(source_state.committed_offset, 1);
         assert_dead_letter_move_at(&broker, &move_id, 1, 2);
 
-        assert_eq!(
-            broker
-                .publish_with_request_id(
-                    "events.dead-letter",
-                    Some("different-key".to_owned()),
-                    b"different payload".to_vec(),
-                    Some(move_id),
-                )
-                .unwrap(),
-            0
-        );
+        assert!(matches!(
+            broker.publish_with_request_id(
+                "events.dead-letter",
+                Some("different-key".to_owned()),
+                b"different payload".to_vec(),
+                Some(move_id),
+            ),
+            Err(BrokerError::RequestIdContentConflict)
+        ));
         let old_public = broker.replay("events.dead-letter", "inspector", 0).unwrap();
         assert_eq!(old_public.key.as_deref(), Some("order-1"));
         assert_eq!(old_public.payload, b"poison");
@@ -1909,17 +2002,15 @@ mod tests {
         let broker = Broker::open(directory.path(), config).unwrap();
         assert_eq!(broker.poll("events", "worker").unwrap(), PollResult::Empty);
         assert_dead_letter_move_at(&broker, &move_id, 1, 2);
-        assert_eq!(
-            broker
-                .publish_with_request_id(
-                    "events.dead-letter",
-                    Some("changed-key".to_owned()),
-                    b"changed payload".to_vec(),
-                    Some(move_id),
-                )
-                .unwrap(),
-            0
-        );
+        assert!(matches!(
+            broker.publish_with_request_id(
+                "events.dead-letter",
+                Some("changed-key".to_owned()),
+                b"changed payload".to_vec(),
+                Some(move_id),
+            ),
+            Err(BrokerError::RequestIdContentConflict)
+        ));
     }
 
     fn delivery(result: Result<PollResult, BrokerError>) -> (Offset, String) {
@@ -2583,7 +2674,7 @@ mod tests {
                 &broker,
                 "events",
                 None,
-                b"retry".to_vec(),
+                b"complete".to_vec(),
                 Some("request-1".to_owned()),
             )
             .await

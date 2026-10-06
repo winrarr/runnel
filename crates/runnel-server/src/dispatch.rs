@@ -538,6 +538,7 @@ fn error_response(error: &BrokerError) -> Response {
         BrokerError::StreamNotReady(_) => "stream_not_ready",
         BrokerError::AckNotInFlight { .. } => "ack_not_in_flight",
         BrokerError::StaleDelivery { .. } => "stale_delivery",
+        BrokerError::RequestIdContentConflict => "request_id_content_conflict",
         BrokerError::OutOfOrderAck { .. } => "out_of_order_ack",
         BrokerError::HistoryUnavailable { .. } => "history_unavailable",
         BrokerError::CorruptRecord(_) => "corrupt_record",

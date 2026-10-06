@@ -344,6 +344,7 @@ pub(super) fn forward_error_to_broker(error: network::ForwardError) -> BrokerErr
         network::ForwardError::StaleDelivery { consumer, offset } => {
             BrokerError::StaleDelivery { consumer, offset }
         }
+        network::ForwardError::RequestIdContentConflict => BrokerError::RequestIdContentConflict,
         network::ForwardError::HistoryUnavailable {
             stream,
             requested_offset,

@@ -384,6 +384,8 @@ pub enum BrokerErrorKind {
     ResourceNotReady,
     /// The delivery state rejects this acknowledgement or delivery attempt.
     DeliveryRejected,
+    /// A retained public request ID was reused with different message content.
+    RequestIdContentConflict,
     /// The requested retained history is not available.
     HistoryUnavailable,
     /// Durable message data could not be decoded or validated.
@@ -471,6 +473,8 @@ pub enum BrokerError {
         stage: ConsumerStatePersistStage,
         message: String,
     },
+    #[error("request ID was already used for different message content")]
+    RequestIdContentConflict,
     #[error("broker lock is poisoned")]
     LockPoisoned,
     #[error("invalid broker configuration: {0}")]
@@ -502,6 +506,7 @@ impl BrokerError {
             Self::AckNotInFlight { .. }
             | Self::StaleDelivery { .. }
             | Self::OutOfOrderAck { .. } => BrokerErrorKind::DeliveryRejected,
+            Self::RequestIdContentConflict => BrokerErrorKind::RequestIdContentConflict,
             Self::HistoryUnavailable { .. } => BrokerErrorKind::HistoryUnavailable,
             Self::CorruptRecord(_) => BrokerErrorKind::CorruptData,
             Self::Io(_) => BrokerErrorKind::Storage,
@@ -545,6 +550,7 @@ impl BrokerError {
             BrokerErrorKind::InvalidRequest
             | BrokerErrorKind::ResourceNotFound
             | BrokerErrorKind::DeliveryRejected
+            | BrokerErrorKind::RequestIdContentConflict
             | BrokerErrorKind::HistoryUnavailable
             | BrokerErrorKind::Configuration => BrokerErrorOutcome::Rejected,
         }
@@ -796,6 +802,11 @@ mod tests {
                     received: 1,
                 },
                 BrokerErrorKind::DeliveryRejected,
+                BrokerErrorOutcome::Rejected,
+            ),
+            (
+                BrokerError::RequestIdContentConflict,
+                BrokerErrorKind::RequestIdContentConflict,
                 BrokerErrorOutcome::Rejected,
             ),
             (

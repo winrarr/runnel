@@ -1035,7 +1035,10 @@ fn network_protocol_keeps_mismatching_public_dead_letter_id_separate_after_resta
                 request_id: Some("runnel-dlq/v1/6:events/6:worker/0".to_owned()),
             },
         ),
-        Response::Published { offset: 0, .. }
+        Response::Error {
+            code,
+            ..
+        } if code == "request_id_content_conflict"
     ));
     assert!(matches!(
         request(
@@ -1177,7 +1180,10 @@ fn network_protocol_does_not_accept_same_content_public_id_as_dead_letter_move()
                 request_id: Some("runnel-dlq/v1/6:events/6:worker/0".to_owned()),
             },
         ),
-        Response::Published { offset: 0, .. }
+        Response::Error {
+            code,
+            ..
+        } if code == "request_id_content_conflict"
     ));
     assert!(matches!(
         request(
@@ -1346,13 +1352,13 @@ fn network_protocol_recovers_binary_publish_batch_and_request_ids() {
                 stream: "events".to_owned(),
                 records: vec![
                     PublishBatchRecord {
-                        key: Some("different-key".to_owned()),
-                        payload_base64: BinaryPayload::new(b"different".to_vec()),
+                        key: Some("order-1".to_owned()),
+                        payload_base64: BinaryPayload::new(vec![0, 1, 255]),
                         request_id: Some("batch-1".to_owned()),
                     },
                     PublishBatchRecord {
                         key: None,
-                        payload_base64: BinaryPayload::new(b"different".to_vec()),
+                        payload_base64: BinaryPayload::new(b"second".to_vec()),
                         request_id: Some("batch-2".to_owned()),
                     },
                 ],

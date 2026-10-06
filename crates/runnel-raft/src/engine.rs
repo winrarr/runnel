@@ -530,6 +530,7 @@ impl RaftGroup {
             .map_err(map_client_write_error)?;
         match response.data {
             CommandResponse::Published { offset } => Ok(offset),
+            CommandResponse::RequestIdContentConflict => Err(BrokerError::RequestIdContentConflict),
             CommandResponse::StreamNotFound => Err(BrokerError::StreamNotFound(stream_name)),
             other => Err(BrokerError::Cluster(format!(
                 "unexpected publish response: {other:?}"

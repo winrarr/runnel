@@ -433,6 +433,7 @@ pub(crate) enum ForwardError {
     ConsumeBatchRecordTooLarge {
         max_bytes: usize,
     },
+    RequestIdContentConflict,
     HistoryUnavailable {
         stream: String,
         requested_offset: Offset,

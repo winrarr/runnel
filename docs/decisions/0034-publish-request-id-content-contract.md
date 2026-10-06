@@ -166,29 +166,29 @@ The alternatives considered were:
   their original content is the comparison authority. This does not promise
   compatibility with older binaries, migration, downgrade, or a particular
   future storage format.
-- Runtime implementation must replace current tests that expect a mismatched
-  retry to return success. The shared engine contract should cover same-key
-  and same-payload exact retries, non-empty key-only and payload-only
-  conflicts, request-ID comparison equivalence for absent versus empty keys,
-  binary payload equality, stream scope, concurrent reuse ordering, and
-  restart behavior. Tests must preserve the separate ordering-key semantics.
-- Publish-batch coverage should include mixed records, duplicate IDs within
-  one ordered batch, exact retry offsets, per-record conflict rejection, and
-  continuation of independent records. Real-process clustered coverage
-  should include a changed-content retry through a follower and recovery
-  after leader change or restart; the typed client should expose it as a
-  rejected outcome. These tests establish correctness, not batch atomicity.
-- Client documentation must explain that a retry preserves both the original
-  key and payload bytes. The current text says “same ID and bytes” and should
-  be made precise with the runtime change. Public protocol names and wire
-  representation remain provisional.
+- Runtime implementation now replaces the prior first-use-wins mismatch
+  behavior. The shared engine contract covers exact retries, non-empty
+  key-only and payload-only conflicts, absent/empty key comparison, binary
+  payloads, stream scope, concurrent reuse, and no offset/consumer-state
+  mutation while preserving distinct ordering-key intent. Separate local and
+  real-server tests cover persistence across restart.
+- Publish-batch coverage checks mixed records, duplicate IDs in an ordered
+  batch, exact retry offsets, per-record conflict rejection, and continuation
+  of independent records. Typed-client real-server coverage checks rejected
+  classification and local restart. Three-process coverage exercises a
+  mismatch through a follower and after leader change. These tests establish
+  correctness at the tested boundaries, not batch atomicity or power-loss
+  behavior.
+- Client guidance now requires retries to preserve the original key and
+  payload bytes. The wire code and representation remain provisional and do
+  not establish compatibility across releases.
 
 The remaining material risks are the unselected lifetime under future
 retention and the local duplicate-path comparison cost. The former must be
 resolved with the retention policy before message pruning is implemented; the
-latter needs measurement only if duplicate-retry cost is material after the
-correctness change. This contract is accepted, while runtime behavior and
-implementation evidence remain open in the backlog.
+latter needs measurement only if duplicate-retry cost is material. The
+contract is accepted and implemented; broader client interoperability and
+retention evidence remain open in the client-interactions backlog outcome.
 
 ## References
 

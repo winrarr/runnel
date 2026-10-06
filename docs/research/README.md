@@ -80,8 +80,9 @@ for the same evidence labels and outcome/evidence gates.
   records the accepted identity contract and the unresolved provenance of
   legacy RNL3 records.
 - [Publish request-ID reuse with changed content](publish-request-id-content-mismatch.md)
-  compares the current first-use-wins behavior with parameter-mismatch and
-  message-ID-only reference contracts without accepting a Runnel policy.
+  compares the historical first-use-wins behavior with parameter-mismatch and
+  message-ID-only reference contracts, and records ADR 0034's implemented
+  cross-engine content-conflict behavior.
 - [TD-018 retry-policy source review (2026-10)](td-018-retry-policy-review-2026-10.md) checks the exploratory retry design against current Runnel behavior and current primary broker documentation without accepting new policy semantics.
 - [Systems performance research for Runnel](systems-performance-research.md)
   connects established and recent systems research on durable batching,

@@ -33,19 +33,25 @@ The broker address defaults to `127.0.0.1:4222`. `ORDER_ID` must be non-empty
 and should come from a stable application event identity. The example uses
 `order-created:<ORDER_ID>` as `request_id`, retains the exact payload and
 options, and, only when the publish outcome is `Unknown`, reconnects and
-explicitly retries once with the same request ID and bytes. A second uncertain
-result is returned to the caller for application-level resolution. Confirmed
-rejections are surfaced, and the example does not spin on retryable failures.
+explicitly retries once with the same request ID, key, and payload bytes. A
+second uncertain result is returned to the caller for application-level
+resolution. Confirmed rejections are surfaced, and the example does not spin
+on retryable failures.
 
 Treat a request ID as unique to one logical publish on its stream. Persist it
 with the application event so a process restart does not create a new identity
-for the same operation. The current broker deduplicates repeated IDs and
-returns the original offset; a new identity can create a duplicate if an
-earlier publish was accepted but its response was lost. The client does not
-retry automatically. For requests that time out or are cancelled after they
-may have started writing, treat the outcome as unknown, replace the connection,
-and decide explicitly whether to retry. Keep retries bounded and apply
-application backoff where a response classifies an operation as retryable.
+for the same operation. While that stream-scoped ID remains retained, an
+equivalent key and payload returns the original offset; different representable
+key or payload bytes are rejected without appending a record. For ID comparison,
+an absent key and an empty key compare alike because the current local durable
+format stores both as zero key bytes; this does not make their ordering intent
+equivalent. The provisional server response uses `request_id_content_conflict`
+for this rejection. A new identity can create a duplicate if an earlier
+publish was accepted but its response was lost. The client does not retry
+automatically. For requests that time out or are cancelled after they may have
+started writing, treat the outcome as unknown, replace the connection, and
+decide explicitly whether to retry. Keep retries bounded and apply application
+backoff where a response classifies an operation as retryable.
 
 The crate and broker currently declare `runnel-json-lines` protocol version 1,
 including UTF-8 text and base64-encoded opaque bytes. This declaration is
