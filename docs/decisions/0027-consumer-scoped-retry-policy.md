@@ -2,6 +2,7 @@
 
 - Status: accepted
 - Date: 2026-09-06
+- Extended by: [ADR 0033](0033-fixed-consumer-retry-delay.md), which accepts the next bounded retry-delay field; runtime support remains open.
 
 ## Decision
 
@@ -64,6 +65,6 @@ consumer lifecycle was durable.
 
 Focused local, clustered, protocol, and real-server tests cover policy
 validation, idempotent inspection, per-consumer isolation, version pinning,
-restart persistence, and existing derived dead-letter behavior. Remaining
-backlog acceptance requires a separate decision and tests for backoff,
-provenance, redrive, and richer terminal dispositions.
+restart persistence, and existing derived dead-letter behavior. ADR 0033 now
+decides the fixed-delay contract; its local and clustered runtime tests remain
+open along with provenance, redrive, and richer terminal dispositions.

@@ -177,12 +177,24 @@ Goal: let applications choose documented retry, backoff, dead-letter, and recove
 
 Rationale: a single broker-wide attempt limit is a useful local default, but event fan-out, interactive work, and long-running jobs have different failure and recovery needs.
 
-Current progress: local and clustered engines now expose durable configure and
+Current progress: local and clustered engines expose durable configure and
 inspect operations for bounded per-consumer acknowledgement timeouts and
-attempt limits. Policies use the broker-wide settings as a legacy fallback,
-pin on first delivery, survive restart and clustered state replay, and retain
-the existing derived dead-letter transition. Backoff, provenance, redrive, and
-richer terminal dispositions remain open.
+attempt limits. Policies use broker-wide settings as a legacy fallback, pin on
+first delivery, survive restart and clustered state replay, and retain the
+existing derived dead-letter transition. ADR 0033 accepts a fixed
+`retry_delay_ms` from zero through seven days, separate from the lease and
+pinned per offset; runtime implementation and verification remain open. In
+both engines, the delay starts when a committed poll or stale acknowledgement
+first durably observes lease expiry, and the persisted deadline is that
+observation time plus the pinned delay. A late observation starts a fresh full
+delay; a deadline already persisted survives restart and leader transfer. If
+restart or leader transfer precedes durable expiry observation, the first
+later operation starts the delay. Because expiry is demand-driven, a late
+observation can extend total wait beyond lease plus delay, and no command means
+no progress. Clustered timing remains subject to TD-020; local persisted
+deadlines use wall time before and after restart. Exponential or
+jittered delay, provenance, redrive, and richer terminal dispositions remain
+open.
 
 Constraints:
 
@@ -194,7 +206,9 @@ Constraints:
 Acceptance criteria:
 
 - consumers can select and inspect a documented retry and dead-letter policy;
-- backoff, attempt limits, redrive, and poison-message behavior have repeatable failure and restart tests;
+- the fixed retry delay remains separate from the acknowledgement lease, defaults to zero, is bounded to seven days, and is pinned per offset;
+- both engines start the delay at first durable expiry observation, including late poll/stale-ack observation after restart or leader transfer; persisted deadlines survive recovery, with repeatable boundary, same-key ordering, unrelated-work, and stale-token tests;
+- attempt limits and poison-message/dead-letter behavior retain repeatable failure and restart tests;
 - dead-letter provenance and duplicate behavior are explicit;
 - policy state can be transferred when consumer ownership moves between nodes.
 
