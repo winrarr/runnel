@@ -1,17 +1,18 @@
 # Replay selectors and bounded sessions
 
-- Status: exploratory design for pages and sessions; ADR 0038 accepts one-shot time-selector semantics; runtime and wire shape remain open
+- Status: exploratory design for pages and sessions; ADRs 0038 and 0042 accept one-shot time-selector semantics and its index/recovery contract; runtime and wire shape remain open
 - Last reviewed: 2026-10-06
-- Baseline: `5dc76270a46690fce074fcaf61b5a8cda9838cd0`
+- Baseline inspected for this update: `da6b14e72ce75317ad0fa3fe05f91a28026b67b2`
 - Primary evidence class: design/research; secondary: correctness/reliability, storage/recovery
 - Scope: bounded replay selectors, paging, and optional durable replay sessions
-- Related: [replay backlog outcome](../backlog.md#make-replay-an-explicit-and-safe-consumer-operation), [ADR 0024](../decisions/0024-explicit-offset-replay-read.md), [ADR 0038](../decisions/0038-timestamp-based-replay-selector.md), [replay time-selector research](../research/replay-time-selector-semantics.md), and [retention and disk-pressure design](retention-disk-pressure-plan.md)
+- Related: [replay backlog outcome](../backlog.md#make-replay-an-explicit-and-safe-consumer-operation), [ADR 0024](../decisions/0024-explicit-offset-replay-read.md), [ADR 0038](../decisions/0038-timestamp-based-replay-selector.md), [ADR 0042](../decisions/0042-recoverable-replay-time-index.md), [replay time-selector research](../research/replay-time-selector-semantics.md), and [retention and disk-pressure design](retention-disk-pressure-plan.md)
 
 This note explores how to extend the accepted one-record offset read into
 bounded replay without coupling replay to a consumer's ordinary checkpoint. It
 compares selector reads, stateless bounded pages, and durable sessions. It
-does not accept wire fields, retention behavior, a timestamp index, or a
-session state format. Any API shapes below are illustrative.
+does not accept wire fields, retention policy, or a session state format. Any
+API shapes below are illustrative. ADR 0042 accepts the derived index for the
+one-shot timestamp selector; this design keeps pages and sessions open.
 
 ## Current boundary
 
@@ -104,14 +105,17 @@ maximum is at least T, or the summary is missing or untrustworthy, the earliest
 match cannot be established. A retention design with deletion holes needs an
 equivalent completeness proof.
 
-The semantic contract is accepted, but runtime lookup remains gated. The local
-sparse index orders records by offset and old reads may scan; the clustered
-engine stores an offset-ordered vector. A timestamp-sorted index alone cannot
-find the minimum matching offset under clock regressions. Before exposing the
-selector, provide a recoverable lookup structure that preserves lowest-offset
-semantics with explicit work bounds and test restart, snapshot, and rebuild
-behavior. The design does not mandate a physical index layout. See ADR 0038
-for the implementation evidence gates and source comparison.
+The semantic contract and derived-index design are accepted, but runtime
+lookup remains gated. [ADR 0042](../decisions/0042-recoverable-replay-time-index.md)
+selects cumulative prefix-maximum checkpoints at 256-record boundaries. The
+monotone summaries identify the first block that can match despite timestamp
+regressions; the engine scans at most that block in logical order. Local and
+clustered engines rebuild the index from authoritative log/state, and
+clustered snapshot installation rebuilds from retained messages. Index
+metadata is one compact summary per block and therefore still grows with
+retained history; its memory, startup, and foreground impact requires runtime
+measurement. See ADR 0042 for the exact update, bounds, retention, and
+acceptance contract.
 
 ## Fencing and concurrency
 
@@ -250,11 +254,11 @@ implementation and later session gates, not open selector choices.
 1. **Implement the accepted one-shot time selector.** Preserve the current
    offset operation. Resolve one time-selected record against a single
    `[earliest, next)` view, distinguish `no_match` from
-   `history_unavailable`, and never touch the ordinary checkpoint. Build or
-   derive a recoverable lookup structure that returns the minimum logical
-   matching offset under equal and regressing timestamps without a history-
-   proportional query scan. Add the deleted-prefix maximum timestamp summary
-   when retention is implemented; until its completeness is known, fail closed.
+   `history_unavailable`, and never touch the ordinary checkpoint. Implement
+   the cumulative prefix-maximum index, rebuild it from each engine's
+   authoritative state, and meet the query and retained-prefix gates in ADR
+   0042. Add complete deleted-prefix metadata when retention is implemented;
+   until its completeness is known, fail closed.
 2. **Add stateless bounded pages only after selector resolution is stable.**
    Capture selector resolution and `[earliest, next)` once. Bound returned
    records and serialized bytes, return a resumable logical cursor, and make
@@ -289,14 +293,15 @@ The [replay backlog outcome](../backlog.md#make-replay-an-explicit-and-safe-cons
 now links the accepted selector semantics and carries their bounded lookup
 and recovery gates. [ADR 0038](../decisions/0038-timestamp-based-replay-selector.md)
 settles the previously open timestamp source, comparison, tie, regression,
-no-match, and deleted-prefix behavior. Replay sessions, protected pins,
-expiry, and page semantics remain open in the [retention and disk-pressure
-design](retention-disk-pressure-plan.md). Existing [TD-002](../tech-debt.md#td-002-one-file-and-a-startup-scan-per-local-stream)
+no-match, and deleted-prefix behavior; [ADR 0042](../decisions/0042-recoverable-replay-time-index.md)
+settles the first selector's index and recovery contract. Replay sessions,
+protected pins, expiry, and page semantics remain open in the [retention and
+disk-pressure design](retention-disk-pressure-plan.md). Existing
+[TD-002](../tech-debt.md#td-002-one-file-and-a-startup-scan-per-local-stream)
 and [TD-010](../tech-debt.md#td-010-clustered-state-materializes-complete-retained-history)
-cover local cold scans and clustered full-history traversal; no separate debt
-item is warranted. No runtime refactor belongs in this documentation-only
-change; index shape and timestamp assignment remain implementation choices
-within the accepted semantic constraints.
+cover local cold scans and clustered full-history traversal; both remain open
+for runtime and resource evidence. No runtime refactor belongs in this
+documentation-only change; storage growth and session decisions remain separate.
 
 No runtime performance change is expected. This document neither implements
 an API nor claims lookup or throughput improvement. Runtime tests and
@@ -310,11 +315,10 @@ and later implementation evidence remain open.
 - Should a future consumer-checkpoint selector snapshot the first
   uncommitted offset only, including grouped consumers with out-of-order
   acknowledgements?
-- What recoverable local and replicated index representation gives bounded
-  lowest-offset lookup under timestamp regressions without excessive update,
-  memory, or rebuild cost?
-- When retention is implemented, how will complete deleted-prefix timestamp
-  maxima be persisted, migrated, and included in snapshots?
+- Is the selected sparse index's update, memory, and rebuild cost acceptable
+  over supported retained-history sizes? Runtime evidence is still required.
+- How will the selected deleted-prefix timestamp maximum and retained floor be
+  persisted and included in snapshots when retention is implemented?
 - What exact offset outcome should distinguish an offset at captured `next`
   from history below `earliest` for future multi-record pages?
 - If a session can pin history, what duration, renewal limit, administrative

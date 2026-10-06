@@ -15,7 +15,14 @@ retained payloads are copied or scanned, and what evidence is still needed to
 implement the accepted separation between retained payload storage and
 replicated semantic state. It is not an additional storage decision, an
 implementation plan, or a commitment to a particular database or file layout.
-Rust code and tests remain authoritative if this note becomes stale.
+The later [ADR 0042](../decisions/0042-recoverable-replay-time-index.md)
+selects a derived in-memory prefix-maximum checkpoint index for the one-shot
+time replay selector, with one summary per 256 records and rebuild after state
+recovery or snapshot installation. That narrow lookup structure does not
+resolve payload materialization, full snapshot growth, or a durable retained-
+state index. Its additional resident memory and recovery cost still require
+measurement. Rust code and tests remain authoritative if this note becomes
+stale.
 
 ## Question and boundary
 

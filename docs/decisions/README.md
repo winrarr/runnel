@@ -45,5 +45,6 @@ Current decisions:
 - 0039-rnl1-write-admission-and-legacy-read-compatibility.md: cap new local RNL1 writes at existing RNL2/RNL3 per-field limits while retaining current eligibility for complete historical RNL1 records.
 - 0040-bounded-raft-log-persistence.md: replace retained-map rewrites with bounded append-only Raft-log segments and fixed-size durable control state.
 - 0041-first-consumer-lag-observation.md: accept one bounded, operator-authorized exact-consumer lag diagnostic with a local read cap and a leader-authoritative applied Raft revision.
+- 0042-recoverable-replay-time-index.md: use derived 256-record cumulative prefix-maximum checkpoints for exact timestamp replay and rebuild them from authoritative state.
 
 Proposed decisions awaiting review: none.

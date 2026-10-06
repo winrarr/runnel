@@ -237,16 +237,21 @@ typed client, CLI, and real-server tests preserve ordinary consumer progress
 and return explicit `history_unavailable` outcomes. [ADR 0038](decisions/0038-timestamp-based-replay-selector.md)
 now accepts the semantics for a one-record time selector over stored broker
 publish timestamps, including equal/regressing timestamp order, no-match, and
-deleted-prefix completeness. The selector is not implemented. Durable replay
-sessions, retention floors and pins, replay acknowledgements,
+deleted-prefix completeness. [ADR 0042](decisions/0042-recoverable-replay-time-index.md)
+selects a cumulative prefix-maximum checkpoint index with 256-record blocks,
+derived-state rebuild in both engines, and the future retained-prefix recovery
+boundary. The selector is not implemented. Its sparse index still grows with
+retained history, so runtime memory and startup costs need measurement. Durable
+replay sessions, retention floors and pins, replay acknowledgements,
 failover/replay-session behavior, and replay-specific observability remain
 open.
 
 The [time-selector research](research/replay-time-selector-semantics.md)
-records source behavior and index/recovery risks. The
+records source behavior and reference-system comparisons. The
 [durable replay-session design](design/replay-sessions.md) compares session
 models and records separate cursor, acknowledgement, fencing, snapshot, and
-retention-pin questions; its time-selector semantics now follow ADR 0038.
+retention-pin questions; the selector semantics follow ADR 0038 and its index
+contract follows ADR 0042.
 
 Constraints:
 
@@ -260,7 +265,8 @@ Acceptance criteria:
 - a consumer can request replay by inclusive logical offset and, after implementation of a bounded index, by the lowest logical offset whose stored broker `published_at_ms` is at least the requested Unix-millisecond threshold; ties select the lowest offset and later traversal stays in append order;
 - a complete view with no timestamp match returns explicit `no_match`; incomplete deleted-prefix history returns `history_unavailable`, using complete prefix timestamp metadata when retention is introduced;
 - replay reads never change the ordinary consumer checkpoint, acknowledgement set, attempts, leases, or delivery tokens; any future progress replacement remains a separate fenced operation;
-- selector lookup work, result bytes, and concurrency are bounded, with index update, restart/rebuild, crash, snapshot-installation, and real-process local/cluster evidence;
+- selector lookup uses the ADR 0042 256-record prefix-maximum checkpoints, returning the lowest matching logical offset across timestamp regressions with logarithmic checkpoint probes and at most 256 header checks; result bytes and concurrency remain bounded;
+- index update, restart/rebuild, crash, snapshot-installation, and real-process local/cluster evidence pass; future retention stores complete deleted-prefix maximum metadata before physical prefix removal and returns `history_unavailable` when that proof is absent or could contain a match;
 - concurrent polls, acknowledgements, retries, and future replay-session changes have deterministic fencing behavior;
 - restart and failover tests preserve the selected replay position and original durable progress as documented;
 - lag, replay progress, unavailable history, and replay-induced resource pressure are observable.
