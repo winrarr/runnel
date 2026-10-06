@@ -18,7 +18,10 @@ are separate boundaries and are not part of this decision.
 
 Runnel owns the OpenRaft network adapter, and its static configuration already
 maps node IDs to peer addresses. Static mutual TLS therefore fits the existing
-transport and membership model. etcd's [peer transport guidance](https://etcd.io/docs/v3.6/op-guide/security/)
+transport and membership model. The peer transport is a new TLS-using protocol
+with no older-client population or mixed-binary rollout promise. [RFC 9852](https://www.rfc-editor.org/info/rfc9852/)
+therefore sets TLS 1.3 as the initial peer profile; TLS 1.2 is not enabled by
+default. etcd's [peer transport guidance](https://etcd.io/docs/v3.6/op-guide/security/)
 distinguishes certificate-authenticated peers from self-signed TLS that only
 encrypts; [RFC 9525](https://www.rfc-editor.org/info/rfc9525/) defines
 service-identity matching, and [RFC 9846](https://www.rfc-editor.org/info/rfc9846/)
@@ -75,11 +78,15 @@ path cannot determine one unique configured peer identity, it must fail
 closed. This policy does not change Raft membership or permit identities
 outside the static peer map.
 
-Use TLS 1.2 or later according to the selected implementation's secure
-defaults, and disable TLS 1.3 early application data (0-RTT). Peer protocol
-versioning is separate from TLS negotiation. The first secure deployment has
-no mixed plaintext/TLS mode and makes no mixed-binary or rolling-upgrade
-compatibility promise. Existing clusters must make a coordinated cutover:
+Require TLS 1.3 for the initial peer profile and reject TLS 1.2 and earlier;
+disable TLS 1.3 early application data (0-RTT). Do not add TLS 1.2 as a
+compatibility mode unless deployment evidence justifies it and a later
+decision accepts it as an explicit non-default option. Consequently, nodes in
+environments that support only TLS 1.2 cannot form or operate a cluster. Peer
+protocol versioning is separate from TLS negotiation. The first secure
+deployment has no mixed plaintext/TLS mode and makes no mixed-binary or
+rolling-upgrade compatibility promise. Existing clusters must make a
+coordinated cutover:
 stop all old plaintext nodes, install the common trust bundle and each node's
 own credentials, then start the full cluster with the same static membership
 and binary version. New clusters start with these settings from the beginning.
@@ -146,7 +153,8 @@ chosen peer boundary as directly as static mTLS.
 - Focused certificate tests and real three-process tests must cover accepted
   member identities; missing, malformed, expired, untrusted, wrong-node,
   wrong-cluster, and unconfigured certificates; plaintext rejection before
-  dispatch; and the full consensus, forwarding, and setup paths.
+  dispatch; successful TLS 1.3 handshakes; TLS 1.2 rejection; and the full
+  consensus, forwarding, and setup paths.
 - Rotation tests must demonstrate old/new trust overlap and one-node-at-a-time
   restart while quorum remains available. Public client and HTTP behavior
   must remain unchanged by this peer-only policy.
