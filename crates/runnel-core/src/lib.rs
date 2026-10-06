@@ -31,10 +31,11 @@ use std::io::Write;
 use stream_log::REQUEST_ID_MAX_LEN;
 #[cfg(test)]
 use stream_log::{
-    LEGACY_HEADER_LEN, LEGACY_MAGIC, LEGACY_REQUEST_ID_FORMAT_VERSION, MAX_IN_MEMORY_RECORDS,
-    REQUEST_ID_FORMAT_VERSION, REQUEST_ID_HEADER_LEN, REQUEST_ID_MAGIC, REQUEST_ID_MAX_BODY_LEN,
-    REQUEST_ID_MAX_KEY_LEN, VERSIONED_FORMAT_VERSION, VERSIONED_HEADER_LEN, VERSIONED_MAGIC,
-    VERSIONED_MAX_BODY_LEN, VERSIONED_MAX_KEY_LEN,
+    LEGACY_HEADER_LEN, LEGACY_MAGIC, LEGACY_REQUEST_ID_FORMAT_VERSION, LEGACY_WRITE_MAX_BODY_LEN,
+    LEGACY_WRITE_MAX_KEY_LEN, MAX_IN_MEMORY_RECORDS, REQUEST_ID_FORMAT_VERSION,
+    REQUEST_ID_HEADER_LEN, REQUEST_ID_MAGIC, REQUEST_ID_MAX_BODY_LEN, REQUEST_ID_MAX_KEY_LEN,
+    VERSIONED_FORMAT_VERSION, VERSIONED_HEADER_LEN, VERSIONED_MAGIC, VERSIONED_MAX_BODY_LEN,
+    VERSIONED_MAX_KEY_LEN,
 };
 const DEFAULT_ACK_TIMEOUT: Duration = Duration::from_secs(30);
 const DEAD_LETTER_SUFFIX: &str = ".dead-letter";
@@ -3034,5 +3035,143 @@ mod tests {
         assert!(
             matches!(payload_error, BrokerError::Io(error) if error.kind() == io::ErrorKind::InvalidInput)
         );
+    }
+
+    #[test]
+    fn rnl1_batch_rejects_oversized_items_without_consuming_offsets() {
+        let directory = tempdir().unwrap();
+        let broker = Broker::open(directory.path(), BrokerConfig::default()).unwrap();
+        broker.create_stream("events").unwrap();
+
+        let outcomes = broker
+            .publish_batch(
+                "events",
+                vec![
+                    PublishRecord {
+                        key: Some("k".repeat(LEGACY_WRITE_MAX_KEY_LEN as usize + 1)),
+                        payload: b"rejected".to_vec(),
+                        request_id: None,
+                    },
+                    PublishRecord {
+                        key: Some("ok".to_owned()),
+                        payload: b"kept".to_vec(),
+                        request_id: None,
+                    },
+                ],
+            )
+            .unwrap();
+
+        assert_eq!(outcomes.len(), 2);
+        assert!(matches!(&outcomes[0], Err(BrokerError::InvalidRecord(_))));
+        assert_eq!(outcomes[1].as_ref().unwrap(), &0);
+        assert!(!directory.path().join("consumers/events").exists());
+        let message = broker.replay("events", "inspector", 0).unwrap();
+        assert_eq!(message.key.as_deref(), Some("ok"));
+        assert_eq!(message.payload, b"kept");
+        assert_eq!(
+            fs::metadata(directory.path().join("streams/events.log"))
+                .unwrap()
+                .len(),
+            (LEGACY_HEADER_LEN + 2 + 4) as u64
+        );
+    }
+
+    #[tokio::test]
+    async fn publish_batch_notifies_only_when_a_record_is_accepted() {
+        let directory = tempdir().unwrap();
+        let broker = Broker::open(directory.path(), BrokerConfig::default()).unwrap();
+        broker.create_stream("events").unwrap();
+        let stream = broker.get_stream("events").unwrap();
+        let availability = stream.lock().unwrap().availability.clone();
+        let notified = availability.notified();
+        tokio::pin!(notified);
+        notified.as_mut().enable();
+
+        let outcomes = broker
+            .publish_batch(
+                "events",
+                vec![PublishRecord {
+                    key: Some("k".repeat(LEGACY_WRITE_MAX_KEY_LEN as usize + 1)),
+                    payload: b"rejected".to_vec(),
+                    request_id: None,
+                }],
+            )
+            .unwrap();
+        assert!(matches!(
+            outcomes.as_slice(),
+            [Err(BrokerError::InvalidRecord(_))]
+        ));
+        assert!(
+            tokio::time::timeout(Duration::from_millis(5), notified.as_mut())
+                .await
+                .is_err()
+        );
+
+        let notified = availability.notified();
+        tokio::pin!(notified);
+        notified.as_mut().enable();
+        let outcomes = broker
+            .publish_batch(
+                "events",
+                vec![
+                    PublishRecord {
+                        key: Some("k".repeat(LEGACY_WRITE_MAX_KEY_LEN as usize + 1)),
+                        payload: b"rejected".to_vec(),
+                        request_id: None,
+                    },
+                    PublishRecord {
+                        key: None,
+                        payload: b"accepted".to_vec(),
+                        request_id: None,
+                    },
+                ],
+            )
+            .unwrap();
+        assert!(matches!(
+            outcomes.as_slice(),
+            [Err(BrokerError::InvalidRecord(_)), Ok(0)]
+        ));
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), notified.as_mut())
+                .await
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn historical_rnl1_fields_above_write_limits_remain_replayable() {
+        let directory = tempdir().unwrap();
+        let streams = directory.path().join("streams");
+        fs::create_dir_all(&streams).unwrap();
+        let path = streams.join("events.log");
+        let key = "k".repeat(LEGACY_WRITE_MAX_KEY_LEN as usize + 1);
+        let payload_len = LEGACY_WRITE_MAX_BODY_LEN + 1;
+        let mut header = [0; LEGACY_HEADER_LEN];
+        header[..4].copy_from_slice(LEGACY_MAGIC);
+        header[4..12].copy_from_slice(&0_u64.to_le_bytes());
+        header[12..20].copy_from_slice(&123_u64.to_le_bytes());
+        header[20..24].copy_from_slice(&(key.len() as u32).to_le_bytes());
+        header[24..28].copy_from_slice(&payload_len.to_le_bytes());
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)
+            .unwrap();
+        file.write_all(&header).unwrap();
+        file.write_all(key.as_bytes()).unwrap();
+        let encoded_len = (LEGACY_HEADER_LEN + key.len()) as u64 + u64::from(payload_len);
+        file.set_len(encoded_len).unwrap();
+        drop(file);
+
+        let broker = Broker::open(directory.path(), BrokerConfig::default()).unwrap();
+        let message = broker.replay("events", "inspector", 0).unwrap();
+
+        assert_eq!(message.offset, 0);
+        assert_eq!(message.published_at_ms, 123);
+        assert_eq!(message.key.as_deref(), Some(key.as_str()));
+        assert_eq!(message.payload.len(), payload_len as usize);
+        assert!(message.payload.first().is_some_and(|byte| *byte == 0));
+        assert!(message.payload.last().is_some_and(|byte| *byte == 0));
+        assert_eq!(fs::metadata(&path).unwrap().len(), encoded_len);
     }
 }

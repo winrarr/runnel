@@ -308,6 +308,31 @@ Acceptance criteria:
 - compression, when enabled, preserves the documented delivery and recovery guarantees;
 - benchmarks report workload, message size, durability choice, throughput, latency, recovery behavior, memory, and storage usage.
 
+### Bound legacy record materialization without losing old data
+
+Goal: keep recovery, indexing, delivery, replay, and response memory bounded while preserving a non-destructive route to every complete historical RNL1 record.
+
+Rationale: [ADR 0039](decisions/0039-rnl1-write-admission-and-legacy-read-compatibility.md) caps new local RNL1 writes at the existing 128-byte key and 64 MiB payload limits while keeping the current complete-record read behavior. Those write limits do not bound old RNL1 keys and payloads, retained key bytes, response copies, or concurrent operations.
+
+Current progress: local RNL1 scalar and batch writes enforce the selected per-field limits before frame output and return `invalid_record` with rejected semantics. Rejected-only batches do not wake delivery waiters, and tests preserve complete historical records above the write limits. Historical recovery and delivery materialization, bounded inspection/export, response-size refusal, and aggregate concurrent memory budgets remain unimplemented.
+
+Constraints:
+
+- keep new-write admission separate from complete historical record eligibility;
+- do not truncate, skip, compact, acknowledge, or dead-letter a complete record because it exceeds a future read or materialization budget;
+- before a lower read ceiling can block normal startup or delivery, provide a read-only bounded-memory inventory/export route that preserves stream identity, offset, timestamp, key bytes, and payload bytes, including records that do not fit RNL2/RNL3;
+- startup refusal for a complete out-of-policy record must be explicit and happen before any stream's incomplete-tail repair can mutate the store;
+- preserve poll, replay, redelivery, acknowledgement, and dead-letter ordering while accounting for aggregate in-flight work.
+
+Acceptance criteria:
+
+- recovery scratch memory, retained key/index bytes, per-operation message materialization, response serialization, and aggregate concurrent bytes have explicit, verifiable budgets or streaming behavior;
+- a read-only inspector/export can identify and retrieve complete records beyond any normal broker read ceiling without mutating source logs or requiring conversion into a narrower format;
+- any normal startup or delivery refusal names the affected stream, logical offset, declared field sizes, and relevant budget, is distinct from corruption and incomplete-tail handling, and leaves source files and consumer state unchanged;
+- complete records at each accepted boundary remain readable and malformed complete records still fail closed; incomplete suffix repair only changes the actual incomplete suffix;
+- tests cover startup across multiple streams, sparse replay, poll/redelivery, response-size handling, dead-letter source progress, and restart after refusal or export;
+- resource-scoped recovery, replay, response, and concurrent-delivery measurements demonstrate that the documented budgets hold for stated workloads.
+
 ### Make retention and disk-pressure behavior safe
 
 Goal: bound retained storage and define what happens as consumers lag or usable disk capacity approaches its limit.

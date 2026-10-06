@@ -534,6 +534,7 @@ fn message_response(message: MessageResponse) -> Response {
 fn error_response(error: &BrokerError) -> Response {
     let code = match error {
         BrokerError::InvalidName { .. } => "invalid_name",
+        BrokerError::InvalidRecord(_) => "invalid_record",
         BrokerError::StreamNotFound(_) => "stream_not_found",
         BrokerError::StreamNotReady(_) => "stream_not_ready",
         BrokerError::AckNotInFlight { .. } => "ack_not_in_flight",
@@ -563,8 +564,8 @@ fn error_response(error: &BrokerError) -> Response {
 }
 
 fn publish_batch_error_response(error: &BrokerError) -> Response {
-    if let BrokerError::Io(io_error) = error
-        && io_error.kind() == std::io::ErrorKind::InvalidInput
+    if matches!(error, BrokerError::InvalidRecord(_))
+        || matches!(error, BrokerError::Io(io_error) if io_error.kind() == std::io::ErrorKind::InvalidInput)
     {
         return Response::Error {
             code: "invalid_record".to_owned(),

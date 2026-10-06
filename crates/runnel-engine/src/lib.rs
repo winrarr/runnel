@@ -439,6 +439,8 @@ pub enum ConsumerStatePersistStage {
 pub enum BrokerError {
     #[error("invalid {kind} name '{name}'; use 1-128 ASCII letters, digits, '.', '_', or '-'")]
     InvalidName { kind: &'static str, name: String },
+    #[error("invalid message record: {0}")]
+    InvalidRecord(String),
     #[error("stream '{0}' does not exist")]
     StreamNotFound(String),
     #[error("stream '{0}' is not ready")]
@@ -500,7 +502,7 @@ impl BrokerError {
     /// JSON state file, a lock, or a distributed transport.
     pub fn kind(&self) -> BrokerErrorKind {
         match self {
-            Self::InvalidName { .. } => BrokerErrorKind::InvalidRequest,
+            Self::InvalidName { .. } | Self::InvalidRecord(_) => BrokerErrorKind::InvalidRequest,
             Self::StreamNotFound(_) => BrokerErrorKind::ResourceNotFound,
             Self::StreamNotReady(_) => BrokerErrorKind::ResourceNotReady,
             Self::AckNotInFlight { .. }
@@ -766,6 +768,11 @@ mod tests {
                     kind: "stream",
                     name: "bad/name".to_owned(),
                 },
+                BrokerErrorKind::InvalidRequest,
+                BrokerErrorOutcome::Rejected,
+            ),
+            (
+                BrokerError::InvalidRecord("payload exceeds write limit".to_owned()),
                 BrokerErrorKind::InvalidRequest,
                 BrokerErrorOutcome::Rejected,
             ),
