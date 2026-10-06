@@ -24,7 +24,8 @@ const MAX_SIMULTANEOUS_HANDSHAKES: usize = 32;
 // address the same broker. Admission waits are bounded by the RPC TTL.
 const MAX_ACTIVE_PEER_CONNECTIONS: usize = 256;
 const FRAME_MEMORY_QUANTUM: usize = 1024 * 1024;
-// At most 256 MiB of peer frame payloads can be buffered per broker process.
+// Charges at most 256 MiB of encoded frame bytes per process. The decoded heap size
+// is type-dependent and is not an exact allocation budget.
 const MAX_CONCURRENT_PEER_FRAME_MEMORY: usize = 256 * 1024 * 1024;
 const MAX_CONCURRENT_FRAME_WRITES: usize = 4;
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);

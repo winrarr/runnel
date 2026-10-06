@@ -22,9 +22,9 @@ use crate::{METADATA_GROUP_ID, PeerTlsConfig, TypeConfig};
 #[cfg(feature = "instrumentation")]
 use runnel_engine::StageTimer;
 
+use super::framing::{BoundedFrame, read_frame_bounded, write_frame_bounded};
 #[cfg(test)]
 use super::framing::{read_frame, write_frame};
-use super::framing::{read_frame_bounded, write_frame_bounded};
 use super::{ForwardedOperation, ForwardedResponse, PeerRequest, PeerResponse};
 
 // Reap old sockets lazily on the next checkout so an inactive peer does not
@@ -125,7 +125,7 @@ async fn read_peer_frame<Res: DeserializeOwned>(
     stream: &mut PeerStream,
     read_buffer: &mut Vec<u8>,
     peer_tls: Option<&Arc<PeerTlsConfig>>,
-) -> io::Result<Res> {
+) -> io::Result<BoundedFrame<Res>> {
     match stream {
         PeerStream::Tls(stream) => {
             let tls = peer_tls.ok_or_else(|| {
@@ -137,7 +137,9 @@ async fn read_peer_frame<Res: DeserializeOwned>(
             read_frame_bounded(stream.as_mut(), read_buffer, &tls.frame_memory()).await
         }
         #[cfg(test)]
-        PeerStream::Plain(stream) => read_frame(stream, read_buffer).await,
+        PeerStream::Plain(stream) => read_frame(stream, read_buffer)
+            .await
+            .map(BoundedFrame::unbounded),
     }
 }
 
@@ -244,17 +246,18 @@ impl TcpConnection {
             drop(_write_timer);
             #[cfg(feature = "instrumentation")]
             let _read_timer = StageTimer::new("raft.peer_rpc.read");
-            let response =
+            let response_frame =
                 read_peer_frame(&mut stream, &mut read_buffer, peer_tls.as_ref()).await?;
-            Ok::<_, io::Error>((stream, connection_permit, response, read_buffer))
+            Ok::<_, io::Error>((stream, connection_permit, response_frame, read_buffer))
         })
         .await;
 
         match result {
-            Ok(Ok((stream, connection_permit, response, read_buffer))) => {
+            Ok(Ok((stream, connection_permit, response_frame, read_buffer))) => {
                 self.stream = Some(stream);
                 self.connection_permit = connection_permit;
                 self.read_buffer = read_buffer;
+                let (response, _frame_memory_permit) = response_frame.into_parts();
                 Ok(response)
             }
             Ok(Err(error)) => Err(error),
@@ -1043,11 +1046,11 @@ mod tests {
             let _connection_permit = connection_permit;
             assert_eq!(peer_id, 0);
             let mut payload = Vec::new();
-            let request: PeerRequest =
+            let request_frame =
                 read_frame_bounded(&mut stream, &mut payload, &server_tls.frame_memory())
                     .await
                     .unwrap();
-            assert!(matches!(request, PeerRequest::Forward(_)));
+            assert!(matches!(request_frame.value, PeerRequest::Forward(_)));
             write_frame_bounded(
                 &mut stream,
                 &PeerResponse::Forward(ForwardedResponse::CreateStream(Ok(true))),

@@ -172,10 +172,14 @@ This decision is implemented for the current static Raft server path. Startup
 loads explicit per-node trust, certificate, and key files before binding the
 peer listener. The runnel-raft transport uses rustls TLS 1.3 with early data
 disabled, binds the exact certificate SAN to configured node and cluster
-identity, and bounds handshakes, active peer sessions, frame memory, and
-concurrent writes. Focused certificate tests cover expiry and identity/trust
-failures; real three-process tests cover peer transport during consensus,
-recovery, forwarding, plaintext rejection, and unconfigured identity rejection.
+identity, and bounds handshakes, active peer sessions, encoded frame admission, and
+concurrent writes. The 256 MiB frame admission charges encoded lengths and
+remains held through inbound dispatch/response writing and outbound response
+delivery; it is not an exact bound on deserialized object-graph heap size, which
+remains type-dependent and unmeasured. Focused certificate tests cover expiry
+and identity/trust failures; real three-process tests cover peer transport
+during consensus, recovery, forwarding, plaintext rejection, and unconfigured
+identity rejection.
 
 This implementation status does not mean the full operational outcome is
 complete: trust-overlap rotation is not process-tested or automated, the

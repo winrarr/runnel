@@ -5,7 +5,7 @@ use serde::Serialize;
 use serde::de::DeserializeOwned;
 use std::sync::Arc;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
-use tokio::sync::Semaphore;
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
 const FRAME_MEMORY_QUANTUM: usize = 1024 * 1024;
 const MAX_BUFFERED_FRAME_MEMORY: usize = 256 * 1024 * 1024;
@@ -13,6 +13,28 @@ const FRAME_ADMISSION_TIMEOUT: std::time::Duration = std::time::Duration::from_s
 
 pub(super) const MAX_FRAME_SIZE: u32 = 66 * 1024 * 1024;
 pub(super) const MAX_REUSABLE_FRAME_BUFFER_SIZE: usize = 1024 * 1024;
+
+/// Parsed frame and its encoded-length admission charge. The caller keeps this
+/// value alive while using the deserialized contents so admission covers the
+/// processing lifetime. The charge does not estimate Rust heap size after serde.
+pub(super) struct BoundedFrame<T> {
+    pub(super) value: T,
+    memory_permit: Option<OwnedSemaphorePermit>,
+}
+
+impl<T> BoundedFrame<T> {
+    pub(super) fn into_parts(self) -> (T, Option<OwnedSemaphorePermit>) {
+        (self.value, self.memory_permit)
+    }
+
+    #[cfg(test)]
+    pub(super) fn unbounded(value: T) -> Self {
+        Self {
+            value,
+            memory_permit: None,
+        }
+    }
+}
 
 pub(super) async fn write_frame<T: Serialize>(
     stream: &mut (impl AsyncWrite + Unpin),
@@ -109,14 +131,16 @@ pub(super) async fn read_frame<T: DeserializeOwned>(
     stream: &mut (impl AsyncRead + Unpin),
     payload: &mut Vec<u8>,
 ) -> Result<T, io::Error> {
-    read_frame_inner(stream, payload, None).await
+    read_frame_inner(stream, payload, None)
+        .await
+        .map(|frame| frame.value)
 }
 
 pub(super) async fn read_frame_bounded<T: DeserializeOwned, S: AsyncRead + Unpin>(
     stream: &mut S,
     payload: &mut Vec<u8>,
     memory_budget: &Arc<Semaphore>,
-) -> Result<T, io::Error> {
+) -> Result<BoundedFrame<T>, io::Error> {
     read_frame_inner(stream, payload, Some(memory_budget)).await
 }
 
@@ -124,7 +148,7 @@ async fn read_frame_inner<T: DeserializeOwned, S: AsyncRead + Unpin>(
     stream: &mut S,
     payload: &mut Vec<u8>,
     memory_budget: Option<&Arc<Semaphore>>,
-) -> Result<T, io::Error> {
+) -> Result<BoundedFrame<T>, io::Error> {
     let length = stream.read_u32().await?;
     if length > MAX_FRAME_SIZE {
         return Err(io::Error::new(
@@ -132,7 +156,7 @@ async fn read_frame_inner<T: DeserializeOwned, S: AsyncRead + Unpin>(
             "peer RPC exceeds the frame limit",
         ));
     }
-    let _memory_permit = if let Some(memory_budget) = memory_budget {
+    let memory_permit = if let Some(memory_budget) = memory_budget {
         let units = (length as usize).div_ceil(FRAME_MEMORY_QUANTUM).max(1);
         if units > MAX_BUFFERED_FRAME_MEMORY / FRAME_MEMORY_QUANTUM {
             return Err(io::Error::new(
@@ -160,7 +184,10 @@ async fn read_frame_inner<T: DeserializeOwned, S: AsyncRead + Unpin>(
     if payload.capacity() > MAX_REUSABLE_FRAME_BUFFER_SIZE {
         *payload = Vec::new();
     }
-    Ok(value)
+    Ok(BoundedFrame {
+        value,
+        memory_permit,
+    })
 }
 
 #[cfg(test)]
@@ -192,6 +219,30 @@ mod tests {
         let (prefix, payload) = server.await.unwrap();
         assert_eq!(prefix, (payload.len() as u32).to_be_bytes());
         assert_eq!(payload, b"42");
+    }
+
+    #[tokio::test]
+    async fn frame_memory_permit_lives_with_decoded_frame() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            write_frame(&mut stream, &"peer-frame".to_owned())
+                .await
+                .unwrap();
+        });
+
+        let mut stream = TcpStream::connect(address).await.unwrap();
+        let budget = Arc::new(Semaphore::new(1));
+        let frame = read_frame_bounded::<String, _>(&mut stream, &mut Vec::new(), &budget)
+            .await
+            .unwrap();
+
+        assert_eq!(frame.value, "peer-frame");
+        assert_eq!(budget.available_permits(), 0);
+        drop(frame);
+        assert_eq!(budget.available_permits(), 1);
+        server.await.unwrap();
     }
 
     #[tokio::test]

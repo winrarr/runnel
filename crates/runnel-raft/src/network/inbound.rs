@@ -75,7 +75,7 @@ async fn handle_connection(
     let frame_memory = peer_tls.frame_memory();
     let frame_write_slots = peer_tls.frame_write_slots();
     loop {
-        let request: PeerRequest = match tokio::time::timeout(
+        let frame = match tokio::time::timeout(
             FRAME_READ_TIMEOUT,
             read_frame_bounded(&mut stream, &mut read_buffer, &frame_memory),
         )
@@ -88,11 +88,12 @@ async fn handle_connection(
                 ));
             }
             Ok(result) => match result {
-                Ok(request) => request,
+                Ok(frame) => frame,
                 Err(error) if error.kind() == io::ErrorKind::UnexpectedEof => return Ok(()),
                 Err(error) => return Err(error),
             },
         };
+        let (request, _frame_memory_permit) = frame.into_parts();
         let response = match request {
             PeerRequest::AppendEntries { group_id, request } => {
                 match resolve_group(&manager, &group_id).await? {
