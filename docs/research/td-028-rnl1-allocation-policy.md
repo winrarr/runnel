@@ -1,6 +1,6 @@
 # TD-028: RNL1 allocation policy evidence
 
-- Status: exploratory evidence; no RNL1 size policy or implementation is accepted
+- Status: source evidence supporting [ADR 0039](../decisions/0039-rnl1-write-admission-and-legacy-read-compatibility.md); no lower historical RNL1 read ceiling or aggregate memory budget is accepted
 - Last reviewed: 2026-10-02
 - Baseline: `a42fbfd207b1a26f4b52fce8110311453d55a009`
 - Primary evidence class: storage safety
@@ -9,17 +9,17 @@
 - Related evidence: [TD-007 storage compatibility](../design/td-007-storage-compatibility-evidence.md#evidence-matrix), [TD-002 storage scalability](../design/td-002-storage-scalability-evidence.md), and [message encoding and compression](message-encoding-and-compression.md)
 - Related proposal: [safe durable storage upgrades](../design/storage-upgrade-safety-plan.md)
 
-This note describes current source behavior, compares practical policy choices, and identifies the evidence needed before implementation. It does not authorize a size limit, change recovery, or make a release compatibility promise.
+This note describes the source behavior observed at its recorded baseline, compares practical policy choices, and identifies evidence needed for the accepted first policy and later read-budget work. ADR 0039 selects a bound for new local RNL1 writes while leaving complete historical reads unchanged; it does not establish a release compatibility promise or a whole-process resource budget.
 
 ## Disposition
 
-Do not enforce a smaller `RNL1` bound yet. The source confirms that a complete legacy record can trigger large allocations, but the repository has no production-log corpus, no valid near-limit fixtures, and no evidence that the `RNL2`/`RNL3` bounds cover deployed history. Applying those bounds retroactively could make complete, valid historical bytes fail startup or delivery. The near-term work justified by current evidence is to collect corpus size statistics and choose an explicit read, write, and conversion policy; it is not to select a numeric limit from the newer formats by analogy.
+The evidence supports bounding new RNL1 writes separately from historical reads. ADR 0039 selects 128-byte keys and 64 MiB payloads for new local RNL1 appends because those per-field limits already govern RNL2/RNL3 writes. It does not apply them to complete records already stored under RNL1. Applying a smaller read envelope retroactively could make valid history fail startup or delivery, and the repository has no production-log corpus establishing that deployed history fits. The selected write values are an initial consistency policy, not a corpus-derived safe memory budget.
 
-No tracker change is warranted. TD-028 already records the unaccepted policy, the missing production-corpus evidence, the compatibility constraint, and the retirement evidence required. This investigation does not change that scope or identify a separate untracked implementation shortcut.
+TD-028 now records the accepted write rule and the still-open materialization risk. The backlog tracks the separate recovery/delivery budget and non-destructive legacy export outcome; this evidence does not justify marking the broader debt retired.
 
 ## Current behavior established by source and tests
 
-`RNL1` has a 28-byte header: magic, little-endian `u64` offset and timestamp, then independent little-endian `u32` key and payload byte lengths. The writer rejects lengths that do not fit `u32`, but defines no smaller key or payload limit. Its encoded length field therefore permits up to `u32::MAX` bytes for each field, or `28 + 2 × u32::MAX` bytes for one record. That arithmetic describes the old format's encoded envelope, not a guarantee that any process can allocate, address, or use such a record. See `StreamLog::append_with_sync` and the constants in [`stream_log.rs`](../../crates/runnel-core/src/stream_log.rs).
+`RNL1` has a 28-byte header: magic, little-endian `u64` offset and timestamp, then independent little-endian `u32` key and payload byte lengths. At the original evidence baseline, the writer rejected lengths that did not fit `u32` but had no smaller key or payload limit. ADR 0039 now selects 128-byte keys and 64 MiB payloads for new writes. The format's encoded field lengths still allow up to `u32::MAX` bytes in complete historical records; this is not a guarantee that any process can allocate, address, or use such a record. See `StreamLog::append_with_sync` and the constants in [`stream_log.rs`](../../crates/runnel-core/src/stream_log.rs).
 
 Recovery now scans the log incrementally rather than loading the entire file. For `RNL1`, it checks length arithmetic and compares the complete record length with the remaining file bytes before allocating the key. For a complete record it then allocates the full key bytes, validates UTF-8, creates an owned `String`, and seeks over the payload without allocating that payload. `StreamLog::open` retains up to 1,024 recent `RecordIndex` entries, each of which owns its key. So recovery has per-record key materialization and a bounded entry count, but neither a per-key byte bound nor a total cached-key byte budget. A complete record's payload is allocated later by `read_payload` for poll, replay, and dead-letter movement. `read_legacy_record`, `StreamLog::open`, `read_payload`, and `Broker::dead_letter_record` show these paths.
 
@@ -29,7 +29,7 @@ The newer format limits are not an accepted RNL1 policy. `RNL2` uses 128-byte ke
 
 Delivery also has materialization beyond the local file read: core `Message` and replay payloads are owned `Vec<u8>` values; the server serializes a full response into another vector; and the reusable client has a configurable encoded-response limit, defaulting to about 65 MiB. The server does not apply that client response limit before serialization. A sufficiently large legacy record can therefore be readable through an in-process path but exceed a client's response limit. If the first poll read succeeds, the delivery attempt is persisted before the message is returned; an oversized response can leave the client with an unknown operation outcome and the delivery to expire for redelivery. A configured dead-letter attempt limit adds another constraint: automatic dead-letter movement reads the complete source payload and appends a request-aware RNL3 target record, whose payload ceiling is 64 MiB and key ceiling is 128 bytes. [`Broker::poll_group`](../../crates/runnel-core/src/broker.rs#L309), [`send_response`](../../crates/runnel-server/src/protocol.rs#L146), [`ClientConfig::max_response_bytes`](../../crates/runnel-client/src/lib.rs#L35), and [`Broker::dead_letter_record`](../../crates/runnel-core/src/broker.rs#L592) make these distinct limits visible. They are not evidence that all historical RNL1 records are network-deliverable or dead-letterable today.
 
-No ADR accepts a retroactive RNL1 allocation ceiling. Existing RNL2/RNL3 constants define their own on-disk validation and append behavior; the storage upgrade documents are proposals, not accepted policy. The task-specific gap also remains explicit in TD-028 and the [TD-007 evidence matrix](../design/td-007-storage-compatibility-evidence.md#evidence-matrix).
+ADR 0039 accepts the existing RNL2/RNL3 per-field values only for new RNL1 writes. It explicitly does not impose those limits on complete historical RNL1 records. The unresolved read/materialization gap remains explicit in TD-028 and the [TD-007 evidence matrix](../design/td-007-storage-compatibility-evidence.md#evidence-matrix).
 
 ## External reference evidence
 
@@ -47,11 +47,11 @@ Apache Kafka documents a distinct accepted record-batch bound through `message.m
 | Stream recovery metadata and payload output | Can avoid allocating complete keys during startup scans and can avoid full payload materialization in a future chunked read/export path | Current `RecordIndex` and engine message models own `String` keys and `Vec<u8>` payloads; server JSON responses also serialize a whole response. Preserving unbounded record delivery requires a broader API/protocol change. Streaming the scanner alone reduces startup allocation but does not retire delivery risk. |
 | Copy-convert supported history to a bounded checksummed format | Can keep source bytes authoritative while building and validating a new generation; source can remain untouched if a record cannot be represented | RNL2/RNL3 currently top out at 128-byte keys and 64 MiB payloads. An oversized source record must stop conversion with its offset and sizes, remain retrievable through a documented legacy path, or wait for a format/read path that can represent it. Truncation, omission, or splitting into multiple logical messages would change data semantics. |
 
-The plausible long-term policy is layered: explicitly bound new writes, decide the supported legacy read envelope from evidence, and separately bound total materialized bytes in recovery/indexing and concurrent delivery. Whether to retain unrestricted legacy reading, provide a compatibility mode, or require a non-destructive conversion for out-of-envelope records is unresolved. This is a research recommendation, not an accepted design.
+The accepted first policy is layered: bound new writes, retain complete historical reads, and defer a lower read ceiling until resource and corpus evidence plus a non-destructive export route exist. A full policy must still address aggregate materialized bytes in recovery/indexing, delivery, response encoding, and concurrent work. See ADR 0039 for the selected compatibility boundary.
 
-## Evidence and decision required before implementation
+## Evidence required for a future historical read policy
 
-The next policy decision should not be made from format constants alone. It needs all of the following evidence and explicit choices:
+Any future read-limit decision must not be made from format constants alone. It needs all of the following evidence and explicit choices:
 
 1. **Corpus inventory.** Scan representative real RNL1 logs without opening
    them through the normal broker path. Record format counts, number of logs
@@ -66,12 +66,11 @@ The next policy decision should not be made from format constants alone. It need
    unbounded. Measure peak RSS, recovery time, and poll/replay memory under the
    intended host/container limit and supported request concurrency. Do not
    infer a whole-process budget from a single-record limit.
-3. **Compatibility decision.** Decide whether limits constrain only new
-   RNL1 writes, all complete RNL1 reads, or delivery/export only. Define
-   behavior for already persisted complete records outside each limit and the
-   versioned format that new writes use. If a lower read cap is selected,
-   require a documented non-destructive route before making those records
-   inaccessible through ordinary startup or delivery.
+3. **Compatibility and export route.** If any lower read cap is selected,
+   require a documented non-destructive route before making complete records
+   inaccessible through ordinary startup or delivery. The route must preserve
+   offset, timestamp, key bytes, and payload bytes even when the record cannot
+   be represented in RNL2/RNL3.
 4. **Conversion/read route.** Define a read-only inventory or export mode
    that does not mutate the source. Normal `StreamLog::open` is not read-only:
    it opens for append and truncates an incomplete suffix. A converter should
@@ -97,7 +96,7 @@ The next policy decision should not be made from format constants alone. It need
    reservation/reader failures where possible; do not rely on exhausting the
    test host's memory to prove graceful allocation handling.
 
-An implementation that changes current recovery or data accessibility needs focused crash/recovery coverage and an accepted ADR describing the selected compatibility consequence. Any claimed performance or memory improvement also needs measured, resource-scoped evidence for startup and delivery; synthetic boundary tests alone establish correctness, not an operational allocation budget.
+The accepted writer cap needs focused tests for pre-write rejection and historical-read compatibility. Any implementation that later changes current recovery or data accessibility needs focused crash/recovery coverage and a separate ADR describing the selected compatibility consequence. A claimed process-memory improvement needs measured, resource-scoped evidence for startup and delivery; synthetic boundary tests alone establish correctness, not an operational allocation budget.
 
 ## Sources
 
@@ -123,4 +122,4 @@ The Rust and Kafka sources support only the mechanism descriptions above. The Ru
 
 ## Refactor and planning-record assessment
 
-This research changes no runtime code, so no runtime or end-to-end test applies. It adds a focused research record and an index entry. No concrete adjacent runtime refactor is safe to make before the allocation and compatibility policy is accepted; implementing one here would cross into storage behavior owned by `runnel-core`. No tracker update is needed because TD-028 already captures the goal, rationale, constraints, production-corpus gap, and retirement evidence.
+This evidence record remains research rather than a policy authority; ADR 0039 owns the accepted write/read compatibility rule. The focused core writer change is verified in the implementation PR, while no aggregate-memory or performance claim is made. TD-028 and the backlog are updated: writer admission is a bounded implementation outcome, and historical materialization, outlier export, and resource measurements remain open. No unrelated refactor is justified by this evidence.
