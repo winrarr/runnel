@@ -3,7 +3,7 @@ use std::io::{self, Write};
 use serde::Serialize;
 
 #[cfg(feature = "persistence-write-counters")]
-const PERSISTENCE_WRITE_ROLE_COUNT: usize = 5;
+const PERSISTENCE_WRITE_ROLE_COUNT: usize = 7;
 #[cfg(feature = "persistence-write-counters")]
 const PERSISTENCE_WRITE_OPERATION_COUNT: usize = 7;
 
@@ -16,6 +16,8 @@ pub enum PersistenceWriteRole {
     StateMachineJournalCompaction,
     StateMachineCheckpoint,
     StateMachineSnapshot,
+    RaftLogSegmentAppend,
+    RaftLogControlState,
 }
 
 impl PersistenceWriteRole {
@@ -26,6 +28,8 @@ impl PersistenceWriteRole {
         Self::StateMachineJournalCompaction,
         Self::StateMachineCheckpoint,
         Self::StateMachineSnapshot,
+        Self::RaftLogSegmentAppend,
+        Self::RaftLogControlState,
     ];
 
     #[cfg(feature = "persistence-write-counters")]
@@ -36,6 +40,8 @@ impl PersistenceWriteRole {
             Self::StateMachineJournalCompaction => "state_machine_journal_compaction",
             Self::StateMachineCheckpoint => "state_machine_checkpoint",
             Self::StateMachineSnapshot => "state_machine_snapshot",
+            Self::RaftLogSegmentAppend => "raft_log_segment_append",
+            Self::RaftLogControlState => "raft_log_control_state",
         }
     }
 }
@@ -359,7 +365,7 @@ mod enabled {
 
         #[test]
         fn role_and_operation_classification_is_fixed_and_unique() {
-            assert_eq!(PersistenceWriteRole::ALL.len(), 5);
+            assert_eq!(PersistenceWriteRole::ALL.len(), 7);
             assert_eq!(PersistenceWriteOperation::ALL.len(), 7);
             let roles = PersistenceWriteRole::ALL.map(PersistenceWriteRole::as_str);
             let operations = PersistenceWriteOperation::ALL.map(PersistenceWriteOperation::as_str);
