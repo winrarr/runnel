@@ -48,6 +48,7 @@ const SNAPSHOT_INTERRUPTION_ATTEMPTS: usize = 3;
 // current token while the intentionally stale acknowledgements are committed.
 const REASSIGN_ACK_TIMEOUT_MS: u64 = 5_000;
 const KEY_ORDERING_ACK_TIMEOUT_MS: u64 = 60_000;
+const FULL_CLUSTER_RESTART_ACK_TIMEOUT_MS: u64 = 300_000;
 
 struct RunningNode {
     node_id: u64,
@@ -1335,6 +1336,149 @@ fn three_process_cluster_preserves_group_delivery_through_replica_restart() {
                 stream: "restart-jobs".to_owned(),
                 consumer: "workers".to_owned(),
                 member: "member-e".to_owned(),
+            },
+            |response| matches!(response, Response::Empty { .. }),
+        ),
+        Response::Empty { .. }
+    ));
+    assert_live_nodes(&mut nodes);
+}
+
+#[test]
+fn three_process_cluster_preserves_pending_group_delivery_through_full_restart() {
+    let directory = TempDir::new().unwrap();
+    let addresses = (0..9).map(|_| free_addr()).collect::<Vec<_>>();
+    let cluster_nodes = vec![(1, addresses[6]), (2, addresses[7]), (3, addresses[8])];
+    let mut nodes = vec![
+        RunningNode::start_with_ack_timeout(
+            1,
+            addresses[0],
+            addresses[3],
+            addresses[6],
+            directory.path().join("node-1"),
+            cluster_nodes.clone(),
+            true,
+            FULL_CLUSTER_RESTART_ACK_TIMEOUT_MS,
+        ),
+        RunningNode::start_with_ack_timeout(
+            2,
+            addresses[1],
+            addresses[4],
+            addresses[7],
+            directory.path().join("node-2"),
+            cluster_nodes.clone(),
+            false,
+            FULL_CLUSTER_RESTART_ACK_TIMEOUT_MS,
+        ),
+        RunningNode::start_with_ack_timeout(
+            3,
+            addresses[2],
+            addresses[5],
+            addresses[8],
+            directory.path().join("node-3"),
+            cluster_nodes,
+            false,
+            FULL_CLUSTER_RESTART_ACK_TIMEOUT_MS,
+        ),
+    ];
+    for node in &nodes {
+        wait_for_http(node.http_addr);
+    }
+
+    let leader = create_stream_on_any(&mut nodes, "pending-restart-jobs");
+    assert!(matches!(
+        wait_for_response_at(
+            nodes[leader].broker_addr,
+            || Request::Publish {
+                stream: "pending-restart-jobs".to_owned(),
+                key: None,
+                payload: "recover-pending-work".to_owned(),
+                request_id: Some("pending-restart-work".to_owned()),
+            },
+            |response| matches!(response, Response::Published { offset: 0, .. }),
+        ),
+        Response::Published { offset: 0, .. }
+    ));
+
+    let pending = wait_for_response_on_any(
+        &mut nodes,
+        || Request::PollGroup {
+            stream: "pending-restart-jobs".to_owned(),
+            consumer: "workers".to_owned(),
+            member: "member-a".to_owned(),
+        },
+        |response| {
+            matches!(
+                response,
+                Response::Message {
+                    offset: 0,
+                    payload,
+                    delivery_attempt: Some(1),
+                    delivery_token: Some(_),
+                    ..
+                } if payload == "recover-pending-work"
+            )
+        },
+    );
+    let pending_token = match pending {
+        Response::Message {
+            delivery_token: Some(token),
+            ..
+        } => token,
+        response => panic!("expected initial grouped delivery, got {response:?}"),
+    };
+
+    // All replicas stop with the lease pending. Restart each node from its
+    // original directory before asking the recovered group for the receipt.
+    for node in &mut nodes {
+        node.stop();
+    }
+    for node in &mut nodes {
+        node.restart();
+    }
+
+    assert!(matches!(
+        wait_for_response_on_any(
+            &mut nodes,
+            || Request::PollGroup {
+                stream: "pending-restart-jobs".to_owned(),
+                consumer: "workers".to_owned(),
+                member: "member-a".to_owned(),
+            },
+            |response| matches!(
+                response,
+                Response::Message {
+                    offset: 0,
+                    payload,
+                    delivery_attempt: Some(1),
+                    delivery_token: Some(token),
+                    ..
+                } if payload == "recover-pending-work" && token == &pending_token
+            ),
+        ),
+        Response::Message { offset: 0, .. }
+    ));
+    assert!(matches!(
+        wait_for_response_on_any(
+            &mut nodes,
+            || Request::AckGroup {
+                stream: "pending-restart-jobs".to_owned(),
+                consumer: "workers".to_owned(),
+                member: "member-a".to_owned(),
+                offset: 0,
+                delivery_token: pending_token.clone(),
+            },
+            |response| matches!(response, Response::Acknowledged { .. }),
+        ),
+        Response::Acknowledged { .. }
+    ));
+    assert!(matches!(
+        wait_for_response_on_any(
+            &mut nodes,
+            || Request::PollGroup {
+                stream: "pending-restart-jobs".to_owned(),
+                consumer: "workers".to_owned(),
+                member: "member-b".to_owned(),
             },
             |response| matches!(response, Response::Empty { .. }),
         ),
