@@ -1,10 +1,12 @@
 # Consumer-lag telemetry design
 
-- Status: semantic contract accepted by
-  [ADR 0028](../decisions/0028-consumer-lag-observation-semantics.md); runtime
-  design remains exploratory
+- Status: semantics accepted by
+  [ADR 0028](../decisions/0028-consumer-lag-observation-semantics.md); the
+  first bounded operator observation is accepted by
+  [ADR 0041](../decisions/0041-first-consumer-lag-observation.md); runtime is
+  not implemented
 - Last reviewed: 2026-10-06
-- Baseline inspected: `8fae2d1f81da9146a26cfb20d190214eab370a71`
+- Baseline inspected: `a77b8e0fcc0b10c8adf33e0c7e4cb34dcdc49a0`
 - Evidence class: design/research; secondary: operational telemetry
 - Related debt: [TD-006](../tech-debt.md#td-006-operational-telemetry-remains-incomplete)
 - Scope: bounded logical consumer-lag observation for local and early clustered engines
@@ -12,9 +14,11 @@
 This is design-only, not an implementation or a runtime guarantee. Rust code
 and tests remain authoritative if this note becomes stale.
 
-The accepted contract defines logical cursor lag and its unavailable states
-without authorizing a runtime API, engine capability, or metric family. Any
-future implementation must keep scrape and diagnostic work bounded, avoid
+The accepted contract defines logical cursor lag and its unavailable states.
+ADR 0041 selects one operator-authorized, exact-identity protocol-v2
+diagnostic with explicit local and clustered read bounds. It does not add an
+engine capability, runtime API, or metric family to the current code. Any
+future implementation must keep diagnostic work bounded, avoid
 caller-controlled Prometheus labels, and count a replicated consumer once.
 `HealthSnapshot` and the existing health response remain separate from this
 optional telemetry.
@@ -63,11 +67,12 @@ complete consumer scope:
   out-of-order acknowledgements, delivery attempts, configured policy, and
   policies pinned to offsets. Consumer state is loaded lazily, with no complete
   durable consumer catalogue. The cache limit of 1,024 entries does not bound
-  checkpoint file size or identify all consumers. Only the append journal has
-  a 64 KiB cap; checkpoint files and their acknowledgement sets have no
-  equivalent bound. Local redelivery and dead-letter totals are process
-  atomics initialized at open; clustered totals come from replicated
-  state-machine state, so restart behavior differs by engine.
+  checkpoint file size or identify all consumers. Journal writes have a
+  1 MiB cap, checked after reading during recovery; checkpoint files and their
+  acknowledgement sets have no equivalent bound. Local redelivery and
+  dead-letter totals are process atomics initialized at open; clustered totals
+  come from replicated state-machine state, so restart behavior differs by
+  engine.
 - Clustered [`GroupManager::health`](../../crates/runnel-raft/src/group_manager.rs#L633)
   sums materialized groups on the current node. A data-group health snapshot
   derives `storage_bytes` by iterating retained messages and summing logical
@@ -119,9 +124,12 @@ outcome; it does not retire the debt item or authorize runtime behavior.
 [ADR 0028](../decisions/0028-consumer-lag-observation-semantics.md) accepts
 the meaning of cursor lag, the distinction between lag and in-flight work, and
 the rule that unavailable or incomplete data is never represented as zero.
-It does not accept an engine method, aggregate, protocol operation, metrics
-family, source-freshness promise, or consumer-coverage promise. Those require
-the implementation gates below.
+[ADR 0041](../decisions/0041-first-consumer-lag-observation.md) selects the
+first exact-identity operator operation, its v2/operator authorization path,
+its local byte caps, freshness rule, and the required OpenRaft barrier and
+applied revision. These are accepted target semantics, not implemented
+runtime guarantees. Aggregation, metric families, and a consumer catalogue
+remain unaccepted and unimplemented.
 
 ## Semantics
 
@@ -223,41 +231,39 @@ unsupported or incomplete source must yield `unknown`; it must not fabricate
 zeroes. This capability shape is an implementation option, not part of ADR
 0028.
 
-### Exact selected-consumer observation
+### Accepted first exact-identity observation
 
-A candidate exact diagnostic accepts one validated stream and consumer
-identity and returns at most one fixed-shape record. It reads the stream head
-and consumer cursor from one consistent stream/data-group snapshot. The
-operator-facing response should contain only the lag value, status, observation
-time, and an opaque source revision; raw offsets, group IDs, replica placement,
-and log layout are internal evidence, not new application concepts. The first
-slice omits age, logical bytes, unacknowledged counts, and in-flight counts.
-Those values need separate bounded metadata and semantics. Internally, the
-candidate record is:
+[ADR 0041](../decisions/0041-first-consumer-lag-observation.md) accepts one
+validated `(stream, consumer)` request over negotiated protocol v2, authorized
+for the operator role. It returns one fixed-shape result from one consistent
+local or leader-authoritative data-group sample. The response carries status,
+an optional `cursor_lag_records`, the sample time, and an opaque equality-only
+source revision. It does not echo the identity. A fixed reason code explains
+`unknown`; no lag value accompanies an unavailable or incomplete source. The
+first slice omits age, logical bytes, unacknowledged counts, and in-flight
+counts. The result shape is:
 
 ```text
-cursor_lag_records (omitted unless fresh and retained)
-source_revision (opaque outside the engine)
-observed_at_ms
-status = fresh | stale | unknown | retention_expired
+status = fresh | unknown | retention_expired
+reason = missing_state | incomplete_state | over_budget | busy | source_unavailable
+cursor_lag_records (present only for fresh)
+observed_at_ms (present when a complete sample exists)
+source_revision (opaque and equality-only; present when a complete sample exists)
 ```
 
-An identity-selected request limits the identity count and response shape,
-but it does not by itself bound local bytes read. Checkpoint files are not
-currently size-limited, and the recovery journal's 64 KiB limit is checked
-after `fs::read`. The candidate contract and its proposed hard limits are
-specified in [Stage 0](#proposed-first-slice-stage-0); they are
-design proposals, not current runtime guarantees. Current network surfaces
-are unauthenticated, so no new inspection endpoint is authorized by this
-document.
+The response is capped at 2 KiB. `stale` is not emitted because this slice
+never serves a cached result. If a supported retention floor later establishes
+`F > C`, return `retention_expired`, omit numeric lag, and include `F`, `C`,
+and `H` as required by ADR 0028. No runtime endpoint is implemented.
 
 A missing durable state entry is not proof that a named consumer exists or is
-caught up. Until a query finds a valid durable checkpoint/journal entry locally
-or a replicated consumer entry in the stream group, the result is `unknown`
-with no numeric lag; it must not create or persist consumer state. This rule
-intentionally treats empty-poll history as engine-specific: a local empty poll
-does not persist state, while a clustered group poll initializes replicated
-consumer state. Neither path may turn absence into zero.
+caught up. A valid durable checkpoint or replayable journal locally, or a
+replicated consumer entry in the stream group, establishes known state. A
+policy-only entry counts. Absence returns `unknown` with reason
+`missing_state`, no numeric lag, and no mutation. This rule intentionally
+treats empty-poll history as engine-specific: a local empty poll does not
+persist state, while a clustered group poll initializes replicated consumer
+state. Neither path may turn absence into zero.
 
 ### Local engine
 
@@ -265,11 +271,17 @@ The recovered local stream log exposes its exclusive `next_offset` as `H`;
 the consumer checkpoint stores `C` and out-of-order `A`, while the active
 delivery index supplies a current process-local count. The existing
 `inspect_consumer` path returns retry settings and is not a progress query.
-There is no current telemetry operation that reads these values together. A
-future named observation must not enumerate log records. Its read should hold
-the existing per-stream lock while sampling `H` and `C`; it must use a
-diagnostic-only bounded reader rather than changing ordinary checkpoint
-recovery semantics. Looking up an old message timestamp is a separate
+There is no current telemetry operation that reads these values together.
+The accepted query samples `H`, `C`, and the retained floor under the existing
+per-stream lock and never enumerates log records. Its future diagnostic-only
+reader is capped at 1 MiB each for the checkpoint and journal (2 MiB total plus
+two cap-detection bytes), without changing ordinary checkpoint recovery.
+Over-cap, corrupt, or incomplete files yield `unknown` without repair or
+truncation. The baseline maximum 1,024-record batch fixture measured 123,854
+journal bytes and a 101,348-byte checkpoint projection, so 64 KiB would reject
+a valid single batch; larger multi-member state can still exceed the selected
+cap. The local source revision identifies this same lock-consistent sample and
+is opaque and equality-only. Looking up an old message timestamp is a separate
 indexed-metadata operation and is not available from the current tail/sparse
 indexes with a guaranteed bounded cost.
 
@@ -299,16 +311,14 @@ requires crash/recovery and compatibility evidence.
 ### Clustered engine
 
 The static cluster has one logical data group per stream and replicates
-consumer progress and grouped in-flight state in that group. A future lag
-query should:
-
-1. resolve the stream through the metadata group;
-2. obtain a committed, leader-authoritative view from that stream's data group
-   with an applied source revision, or a clearly marked cached view with that
-   revision and `stale` status;
-3. aggregate at most once per logical stream/data-group identity; and
-4. return per-group `unknown` if leadership, initialization, snapshot
-   installation, or the bounded query fails.
+consumer progress and grouped in-flight state in that group. The accepted exact
+query resolves the stream's data group and reads only from its current leader.
+That leader confirms a linearizable barrier, then samples stream head, durable
+consumer progress, retained floor, and `last_applied_log` under one state
+read-lock operation. It returns a numeric result only when the sample's applied
+revision covers OpenRaft's barrier. No cached result is accepted in this first
+slice; barrier, apply, initialization, leadership, or forwarding failure
+returns `unknown` without a numeric value.
 
 `GroupManager::health` is currently a local-node aggregate. It is useful as a
 broker health signal but must not become a cross-node lag reducer: summing the
@@ -321,13 +331,12 @@ scrapes. A follower's cached value may be used only with `stale` status and a
 source revision, never as a fresh committed cluster result.
 
 The metadata group must not be mistaken for a consumer-bearing stream group.
-An exact query resolves one stream and routes to its current data-group leader;
-it returns one answer for that request and does not enumerate or sum replica
-copies. Internally, aggregate work must key each result by stable logical
-stream/data-group identity. A cluster-wide aggregate cannot be emitted by
-every node's `/metrics` endpoint and then summed: it needs one designated
-collector or an external deduplicator. Until that exists, clustered lag is not
-exported as a metric.
+An exact query returns one answer for the selected stream and does not enumerate
+or sum replica copies. Internally, aggregate work must key each result by
+stable logical stream/data-group identity. A cluster-wide aggregate cannot be
+emitted by every node's `/metrics` endpoint and then summed: it needs one
+designated collector or an external deduplicator. Until that exists, clustered
+lag is not exported as a metric.
 
 ## Metrics and cardinality
 
@@ -474,118 +483,49 @@ their partition, subscription, or monitoring models.
 | [Google Cloud Pub/Sub monitoring](https://docs.cloud.google.com/pubsub/docs/monitoring) | Recommends viewing unacknowledged count with oldest-unacknowledged age, and documents that backlog samples can have gaps for several minutes. | Complementary count and age can explain different failure shapes, but Runnel must expose its own observation timestamp and unknown/stale state. Its committed cursor distance is not Pub/Sub's unacknowledged count. |
 | [Prometheus instrumentation guidance](https://prometheus.io/docs/practices/instrumentation/) and [metric naming/cardinality guidance](https://prometheus.io/docs/practices/naming/) | Current state belongs in gauges; every label set consumes resources, and high-cardinality identities should be avoided. For elapsed time, export the event's Unix timestamp and derive age in queries. | Keep default metrics label-free with no stream, consumer, member, key, offset, or token values. Export snapshot and record timestamps rather than maintaining time-since gauges. Identity-selected diagnostics are a separate bounded interface, not per-consumer series. |
 
-## Proposed first slice (Stage 0)
+## Accepted first slice
 
-The smallest useful runtime slice is an exact, identity-selected
-`cursor_lag_records` diagnostic for one validated `(stream, consumer)`. It is
-not a broker-wide aggregate and adds no per-consumer metric series. The
-following contract is the recommended implementation proposal; it is not an
-accepted decision or a runtime authorization.
+[ADR 0041](../decisions/0041-first-consumer-lag-observation.md) resolves the
+former Stage 0 alternatives as one bounded design target:
 
-### Known consumer and completeness
+- Inspect exactly one validated `(stream, consumer)` through a negotiated v2
+  operation available to the `operator` role. The application role, v1
+  listener, HTTP routes, and `/metrics` receive no identity-selected result.
+- Report `H - C` only for a known durable state from one current sample. A
+  missing entry is `unknown/missing_state`, never zero, and the query must not
+  create consumer state. There is no catalogue or completeness claim.
+- Freshness means a request-local, uncached sample. The local engine samples
+  under the stream lock; the cluster reads only from the current data-group
+  leader after OpenRaft `ensure_linearizable()`, then atomically captures the
+  source values and applied `LogId`. Unavailable or incomplete sources return
+  unknown without lag; the first slice does not serve stale cache entries.
+- The local diagnostic reader has a 1 MiB cap for each of checkpoint and
+  journal files. The existing 1,024-record fixture measured 123,854 journal
+  bytes and a 101,348-byte checkpoint projection, so the proposed 64 KiB cap
+  was too small. Valid state beyond 1 MiB remains explicitly unknown.
+- A broker admits one lag query at a time without queuing; the absolute
+  deadline is at most one second and also respects the remaining request
+  deadline. The serialized response is capped at 2 KiB.
+- Aggregates, per-identity metric labels, age, byte lag, and unsupported source
+  details remain deferred. Current retention is unlimited; if future bounded
+  floor metadata establishes `F > C`, the result is `retention_expired` with no
+  numeric lag and the `F`, `C`, and `H` diagnostics specified by ADR 0028.
 
-- A consumer is known only when a valid durable state entry exists for the
-  requested pair: the local checkpoint or replayable event journal, or the
-  clustered stream group's consumer state. A policy-only durable state entry
-  counts as known. A missing entry, invalid state, or over-budget read returns
-  `unknown` without a numeric lag and without creating state. Local state is
-  currently loaded by [`load_consumer_state`](../../crates/runnel-core/src/consumer_state.rs#L120);
-  clustered poll state is initialized by [`apply_group_poll`](../../crates/runnel-raft/src/delivery.rs#L55).
-- Local empty polls currently do not persist consumer state. Clustered group
-  polls initialize a replicated state entry even when no message is returned.
-  This asymmetry is observable evidence; the first query reports the persisted
-  state it can prove and never treats absence as a caught-up cursor.
-- One identity query needs no catalogue and makes no completeness claim about
-  other consumers. Any aggregate metric requires a complete durable catalogue
-  covering every persisted consumer state in its declared scope. Neither the
-  local engine nor the server currently provides a bounded complete catalogue.
-  The first slice therefore has no consumer maximum, configured subset,
-  top-K selection, directory scan, or aggregate metric. A later partial scope
-  must be named partial and must not be described as broker-wide.
-
-### Bounded source read
-
-- Validate both names before path construction. Sample local `H` and `C` while
-  holding the existing per-stream lock. Do not scan the stream log, enumerate
-  consumer files, mutate a checkpoint, load the result into the delivery cache,
-  or alter ordinary recovery behavior.
-- Run the synchronous read on the existing bounded storage executor. If the
-  request deadline expires while blocking I/O is still running, retain its
-  diagnostic permit until that work exits so timed-out reads cannot accumulate
-  outside the concurrency limit.
-- As a conservative proposal, read at most 64 KiB from the checkpoint and at
-  most 64 KiB from its journal per selected identity. Read no more than the cap
-  plus one byte, stop parsing beyond the cap, and return `unknown` if either
-  file exceeds its cap or the state cannot be validated. This cap is
-  diagnostic-only; ordinary consumer recovery remains unchanged. Validate the
-  cap against representative checkpoint sizes before accepting it.
-- Do not call the current recovery loader as-is: journal replay repairs a
-  partial tail by truncating the journal. Add a read-only bounded parser for
-  the diagnostic; if it sees partial or corrupt state that ordinary recovery
-  would repair, return `unknown` and leave both checkpoint and journal intact.
-- For a local source revision, capture the `(H, C)` pair under the same
-  per-stream lock and use that lock-consistent sample as the revision; the
-  query does not read or serve a cached value. For a cluster source, capture
-  the applied `LogId` after the linearizable read barrier. Keep either token
-  opaque in any operator response.
-- Accept only `H >= C` and, while current unlimited retention applies, compute
-  `H - C` (`F = 0`). If future retention advances `F` above `C`, return
-  `retention_expired` with no numeric lag. Do not include `A` in this value,
-  subtract in-flight deliveries, or infer ready work. Do not add age, bytes,
-  or an unacknowledged-record count to this slice.
-
-### Cluster source revision and replica handling
-
-- Resolve the requested stream to its one logical data group. Route the query
-  to the current leader, obtain a linearizable read barrier, wait until the
-  state machine has applied through that committed barrier, and sample `H` and
-  `C` together with the applied `LogId` (term and index). The source revision
-  is opaque outside the engine. A leader hint or `last_applied_log` alone
-  cannot prove freshness; the current policy-inspection path has no lag read
-  barrier or revision result.
-- If leadership changes, the group is initializing, the barrier cannot be
-  established, or apply does not reach the barrier within the query deadline,
-  return `unknown`; do not fall back to a follower value or add it to a partial
-  cluster total. `stale` is reserved for a future explicitly cached response.
-- A request produces one result for the stream's logical group. It does not
-  sample each replica. Do not add lag to each node's `/metrics` endpoint.
-  Any later cluster aggregate must have a single designated collector or an
-  explicit external deduplicator keyed by logical stream identity; ordinary
-  node scrapes must never be summed as distinct consumers.
-
-### Operator boundary and resource limits
-
-- The existing JSON-lines and HTTP listeners are unauthenticated and can be
-  rebound beyond loopback; the framed peer listener also has no authentication.
-  They are not approved transports for a new identity-selected progress query.
-  The proposed boundary is a dedicated, versioned management surface with a
-  read-only consumer-progress privilege and a trusted/authenticated cluster
-  forwarding path. No authentication mechanism or admin protocol currently
-  exists, so neither listener nor credential design can be selected here. Do
-  not put identity-selected results on `/metrics`.
-- Proposed hard limits are one `(stream, consumer)` per request, one data
-  group per request, and one in-flight lag query per broker. If its permit is
-  busy, return `unknown`/over-budget immediately without queuing. Cap the
-  end-to-end telemetry deadline at one second and at the caller's remaining
-  request deadline; cap the serialized response at 2 KiB. The same deadline
-  covers leader forwarding, read barrier, apply wait, local source reads, and
-  response writing; forwarding retries may not reset it. Keep this capacity
-  separate from readiness and shutdown work.
-- The one-second and 2 KiB limits are candidate design budgets, not measured
-  product SLOs. A focused test and representative local/three-node workload
-  must verify them before acceptance. Exceeding any bound yields an explicit
-  unknown/over-budget result or omits the optional value, never a fresh zero.
+The read barrier is supported by the pinned OpenRaft 0.9.25 primary API, but
+Runnel does not yet call it from consumer inspection. Its adapter must bind the
+returned barrier to an atomic state-machine sample whose `last_applied_log`
+covers it and enforce one deadline across forwarding, barrier, apply wait,
+read, and response. A leader hint or applied revision sampled without the
+barrier is not sufficient. See ADR 0041 for the accepted wire role, reason
+codes, source revision rules, and implementation gates.
 
 ### Stage-zero disposition
 
-No operator-facing runtime slice is safe to start from the current code. The
-primary blocker is the lack of an authenticated management protocol and
-authorization model; the client and peer network surfaces are unauthenticated.
-Two implementation gates remain as well: current Raft reads do not establish
-the linearizable source revision, and local checkpoint reads are unbounded.
-The proposals above define how a follow-up decision could close those gates
-without changing delivery behavior. Until that decision is accepted, keep this
-as exploratory design, add no API or metric, and leave TD-006 open.
+The design decision is complete; runtime work remains gated on protocol v2
+TLS/authentication and operator authorization, a non-mutating bounded local
+reader, and the barrier-backed applied-revision adapter contract. TD-006 stays
+open because none of these runtime behaviors or observability outputs exists
+in the current code.
 
 ## Hypotheses and unresolved risks
 
@@ -608,24 +548,22 @@ claims about the current runtime:
   out-of-order acknowledgements, retention floors, and frame-format changes
   may make record lag plus age the more robust first release.
 
-The runtime blockers are now explicit rather than open-ended design choices:
+The runtime gaps are implementation gates, not unresolved design alternatives:
 
-1. There is no authenticated operator plane or authorization model. A
-   follow-up decision must select the trust boundary and compatibility policy
-   before choosing a listener or protocol operation. No identity-bearing
-   query should be added to the current unauthenticated endpoints.
-2. The Raft adapter must establish and return a linearizable applied revision
-   for the selected stream group. The existing leader-routed policy read does
-   not provide that evidence.
-3. The local diagnostic reader must enforce the proposed byte cap without
-   changing ordinary recovery; representative checkpoints must show whether
-   the proposed 64 KiB cap leaves a useful observation rate.
-4. Broker-wide aggregation remains a later, separate decision: it needs a
-   complete bounded catalogue and one cluster collector or an explicit
-   deduplication layer. The current first-slice proposal deliberately avoids
-   aggregate completeness.
-5. Age, logical byte lag, replay pins, and future retention floors stay out of
-   scope until their source metadata and semantics are bounded.
+1. Protocol v2, TLS/authentication, and operator-role authorization are
+   accepted by ADRs 0031 and 0035 but do not exist in the current listener.
+   The diagnostic must not be added to v1 or the unauthenticated HTTP routes.
+2. The required read barrier is available in pinned OpenRaft 0.9.25, but the
+   Runnel adapter must call it and return a same-lock applied revision with the
+   selected head and cursor under one absolute deadline.
+3. The local diagnostic parser must enforce the selected 1 MiB cap per file
+   without changing ordinary recovery. The measured 1,024-record fixture
+   exceeds 64 KiB; valid multi-member checkpoint state can exceed 1 MiB and
+   then returns `unknown`.
+4. Broker-wide aggregation remains deferred until a complete bounded
+   catalogue and one cluster collector or explicit deduplicator are accepted.
+5. Age, logical byte lag, and unsupported source detail remain out of scope
+   until their metadata and semantics can be sampled within explicit bounds.
 
 ## Test and acceptance gates
 
@@ -634,24 +572,15 @@ behavior or performance claim is made, so implementation benchmarks are not a
 gate for this document. The future implementation should satisfy the
 following staged gates.
 
-### Stage 0 — accept or revise the proposed contract
+### Stage 0 — accepted by ADR 0041
 
-- Review the proposed known-consumer rule and the explicit absence of an
-  aggregate from the first slice. A missing durable entry is `unknown`; an
-  aggregate remains blocked on a complete durable catalogue.
-- Review the diagnostic-only 64 KiB checkpoint and journal caps and the
-  one-identity, one-group, one-query-per-broker, one-second, 2 KiB response
-  budgets. Confirm with representative state sizes before accepting the local
-  cap.
-- Define an authenticated operator boundary and its compatibility policy.
-  The current JSON-lines and HTTP listeners are not approved for this
-  identity-selected operation.
-- Require a clustered linearizable read barrier and an applied `LogId` source
-  revision. A current leader hint or local applied position alone is
-  insufficient evidence of fresh committed state.
-- Keep this design exploratory until those gates are captured in an accepted
-  follow-up decision. Use a deterministic clock/source-revision seam in unit
-  tests and real filesystem/process tests for the failure behavior.
+The identity scope, missing-state behavior, local file caps, freshness and
+source-revision guarantees, v2 operator authorization, one-query admission,
+one-second deadline, and 2 KiB response cap are selected in
+[ADR 0041](../decisions/0041-first-consumer-lag-observation.md).
+The 64 KiB file proposal was rejected based on the existing 1,024-record
+fixture. Runtime implementation remains unstarted until its local, security,
+and clustered gates below are satisfied.
 
 ### Stage 1 — exact local observation
 
@@ -663,9 +592,10 @@ following staged gates.
   persistence, and acknowledgement must not produce a false caught-up result.
 - A query for an identity with no durable state returns `unknown` and does not
   create or persist a consumer checkpoint or truncate/repair its event journal.
-- The diagnostic reads no stream records. Inputs at the proposed file caps
-  complete; cap-plus-one input returns `unknown` without parsing beyond the
-  limit. Standard recovery remains unchanged.
+- The diagnostic reads no stream records. Inputs at the accepted 1 MiB
+  per-file caps complete; cap-plus-one input returns `unknown` without parsing
+  beyond the limit. Standard recovery remains unchanged. The maximum batch
+  fixture remains readable under the cap; larger valid state fails closed.
 - The real-server query boundary enforces authentication, request deadline,
   concurrency and response-byte limits, and does not affect readiness or
   health response shape.
@@ -732,16 +662,18 @@ they do not permit a claim that telemetry improves broker performance.
 
 ## Implementation feasibility review
 
-The exact 8fae2d1 source and tests support the `H - C` semantic definition but
-do not yet provide a safe operator observation:
+The supplied `a77b8e0` source and tests support the `H - C` semantic
+definition but do not yet implement the accepted operator observation:
 
 - `Broker::inspect_consumer` validates one identity and reads its state under
   the stream lock, but returns retry policy. A missing checkpoint causes the
   loader to synthesize an empty in-memory state for that call. An empty local
   poll does not persist the consumer; delivery-attempt, ack, and policy events
-  do. The checkpoint stores the unbounded acknowledgement and attempt maps;
-  the 64 KiB journal limit is checked after the journal is read. The 1,024
-  entry cache is a performance cache, not a catalogue or an on-disk size cap.
+  do. The checkpoint stores acknowledgement, attempt, and pinned-policy maps
+  without a file-size limit; journal writes are capped at 1 MiB, but recovery
+  reads before checking that cap. The 1,024-entry cache is a performance cache,
+  not a catalogue or an on-disk size cap. The accepted diagnostic cap is 1 MiB
+  per file, based on the measured maximum-batch fixture.
 - The Raft state machine already persists `last_applied_log` with state
   snapshots and journals in [`StateMachineData`](../../crates/runnel-raft/src/state_machine.rs#L214).
   `group_consumers` and `consumers` contain replicated per-stream progress,
@@ -749,10 +681,12 @@ do not yet provide a safe operator observation:
   clustered [`PersistentEngine::inspect_consumer`](../../crates/runnel-raft/src/engine.rs#L1069)
   selects/forwards to the current leader and returns policy only. It neither
   establishes a linearizable read barrier nor returns the applied `LogId` with
-  the sampled values.
+  the sampled values. The pinned OpenRaft API provides `ensure_linearizable()`;
+  Runnel must add the adapter call and atomically sample a covering applied
+  revision with the requested state.
 - Cluster `health` is computed from each node's materialized groups. With one
   logical data group per stream replicated to all voters, summing metrics from
-  each node would count one consumer multiple times. The exact-query proposal
+  each node would count one consumer multiple times. The accepted exact query
   avoids this by reading the requested stream once through its leader; a
   cluster aggregate still needs one collector or deduplication layer.
 - `/metrics` bounds the `engine.health()` call at one second, then collects
@@ -772,25 +706,22 @@ query, complete consumer-scope scrape, or summary-maintenance cost. The
 concrete workload and measurements required before a runtime performance
 claim are listed under [Benchmark applicability](#benchmark-applicability).
 
-The smallest useful runtime candidate remains an exact, identity-selected
-`cursor_lag_records` diagnostic for one `(stream, consumer)`. The proposed
-known-state rule, local byte caps, Raft source revision, per-request bounds,
-and replica behavior above make that candidate reviewable. However, no safe
-operator-facing slice is ready: the current code has no authenticated admin
-boundary, the cluster read path lacks a freshness barrier, and bounded local
-reads are not implemented. A missing entry must stay unknown. A process-local
-cache, partial scan, per-node replica sum, `H - C` represented as ready or
-unacknowledged work, or a fresh-looking zero would violate ADR 0028.
+The accepted first runtime slice is the exact operator-authorized
+`cursor_lag_records` diagnostic for one `(stream, consumer)` in ADR 0041. It is
+not safe to expose until the negotiated-v2 TLS/authentication implementation,
+the diagnostic-only bounded parser, and the linearizable applied-revision
+adapter are implemented and pass the gates above. A missing entry remains
+unknown. A process-local cache, partial scan, per-node replica sum, `H - C`
+represented as ready or unacknowledged work, or a fresh-looking zero violates
+ADR 0028.
 
 ## Recommendation
 
-Keep ADR 0028 as the only accepted decision and TD-006 open. Do not implement
-an engine capability, aggregate, API, metric, or freshness/coverage promise
-from this proposal. The first operator-facing slice should be the bounded,
-authenticated exact-identity read defined above, once the operator trust
-boundary, local cap, and clustered read barrier are accepted and tested. Keep
-broker-wide aggregate metrics later until a complete bounded catalogue and
-single logical cluster collector exist. Keep bytes and age out until indexed
-source metadata exists. No tracker edit is warranted by this design-only
-review: the telemetry outcome remains represented by TD-006 and has not been
-implemented or accepted as a new independent commitment.
+Keep TD-006 open while implementing the bounded exact-identity diagnostic as
+its first consumer-progress slice. ADR 0041 accepts the exposure and source
+contract, but no runtime capability, API, or metric exists yet. Keep aggregate
+metrics deferred until a complete bounded catalogue and one logical cluster
+collector exist. Keep bytes and age out until indexed source metadata is
+available and bounded. No runtime test or performance claim applies to this
+design-only change; the listed implementation tests and benchmark gates apply
+when runtime work begins.

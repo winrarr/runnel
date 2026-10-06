@@ -451,7 +451,13 @@ after restart on the same data directory, retrying the stable request ID
 returns the original offset and the stream contains one record. This does not
 cover shutdown during engine execution or a hard process stop. Consumer lag,
 reclaimable storage, resource pressure, and the remaining security and
-capacity controls are still open. The first application-client security
+capacity controls are still open. [ADR 0041](decisions/0041-first-consumer-lag-observation.md)
+now accepts a bounded exact-identity consumer-progress diagnostic for the
+operator role over negotiated v2. The operation, v2 authentication runtime,
+local bounded reader, and cluster read barrier are not implemented; this
+acceptance adds no metric or runtime guarantee. Aggregate lag metrics remain
+future work requiring a complete bounded catalogue and one logical cluster
+collector. The first application-client security
 contract is accepted in [ADR 0035](decisions/0035-first-application-client-security.md)
 and documented in the [source-backed research](research/client-authentication.md):
 secured non-loopback listeners will terminate TLS 1.3 in Runnel, require a
@@ -477,6 +483,10 @@ Acceptance criteria:
 - authentication and authorization can protect client operations when enabled;
 - client connections can use TLS with documented configuration and failure behavior;
 - readiness and liveness have documented meanings and are suitable for stateful deployment;
+- an authenticated operator can inspect one consumer's cursor lag with
+  explicit unknown and retention-expired outcomes; any aggregate lag metric
+  uses fixed cardinality, complete declared coverage, and one logical cluster
+  source;
 - metrics expose throughput, latency, consumer lag, redelivery, storage, resource pressure, and broker health;
 - graceful shutdown, full or slow storage, and restart behavior are covered by repeatable tests;
 - the container and single-node Kubernetes deployment document their persistence and resource assumptions.
