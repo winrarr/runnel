@@ -35,5 +35,6 @@ Current decisions:
 - 0029-local-typed-dead-letter-move-identities.md: separate local public publish IDs and internal dead-letter move identities, with compatibility lookup for untyped legacy records.
 - 0030-consume-batch-contract.md: bounded pull batches with one active set per member, per-record opaque receipts, independent acknowledgement outcomes, and explicit local and clustered durability boundaries.
 - 0031-protocol-v2-contract.md: accept a Protobuf v3, connection-negotiated public v2 contract with explicit directional frame limits and stage-aware outcomes.
+- 0032-static-cluster-peer-mutual-tls.md: require mutual TLS and bind peer certificates to configured static node and cluster identities.
 
 Proposed decisions awaiting review: none.
