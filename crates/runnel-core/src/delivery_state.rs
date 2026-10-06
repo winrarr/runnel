@@ -1,11 +1,11 @@
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use runnel_engine::{BrokerError, Offset};
 
-use super::consumer_state::{ConsumerState, load_consumer_state};
+use super::consumer_state::{ConsumerState, load_consumer_state, sync_consumer_state_journal};
 
 pub(super) const MAX_CACHED_CONSUMER_STATES: usize = 1024;
 
@@ -22,6 +22,7 @@ pub(super) struct InFlight {
     key: Option<String>,
     delivery_attempt: u32,
     delivery_token: String,
+    requires_receipt: bool,
     deadline: Instant,
 }
 
@@ -32,6 +33,7 @@ impl InFlight {
         key: Option<String>,
         delivery_attempt: u32,
         delivery_token: String,
+        requires_receipt: bool,
         deadline: Instant,
     ) -> Self {
         Self {
@@ -40,6 +42,7 @@ impl InFlight {
             key,
             delivery_attempt,
             delivery_token,
+            requires_receipt,
             deadline,
         }
     }
@@ -59,13 +62,17 @@ impl InFlight {
     pub(super) fn delivery_token(&self) -> &str {
         &self.delivery_token
     }
+
+    pub(super) fn requires_receipt(&self) -> bool {
+        self.requires_receipt
+    }
 }
 
 #[derive(Default)]
 struct ConsumerInFlightIndex {
     offsets: HashSet<Offset>,
     keys: HashSet<String>,
-    members: HashMap<String, Offset>,
+    members: HashMap<String, BTreeSet<Offset>>,
 }
 
 #[derive(Default)]
@@ -80,6 +87,9 @@ pub(super) struct DeliveryState {
     // This index mirrors only active deliveries and is removed when a consumer has no deliveries.
     // It avoids rebuilding per-consumer offset/key sets and scanning members on every poll.
     in_flight_by_consumer: HashMap<String, ConsumerInFlightIndex>,
+    // A failed journal append/sync must be reloaded and synced before another
+    // operation trusts the in-memory checkpoint or member index.
+    consumers_needing_reconcile: HashSet<String>,
 }
 
 impl DeliveryState {
@@ -87,7 +97,8 @@ impl DeliveryState {
         Self::default()
     }
 
-    pub(super) fn expire(&mut self, now: Instant) {
+    pub(super) fn expire(&mut self, now: Instant) -> bool {
+        let mut expired_any = false;
         while let Some((&deadline, _)) = self.in_flight_deadlines.first_key_value() {
             if deadline > now {
                 break;
@@ -103,9 +114,11 @@ impl DeliveryState {
                     .is_some_and(|in_flight| in_flight.deadline <= now)
                 {
                     self.remove_in_flight(&delivery_key);
+                    expired_any = true;
                 }
             }
         }
+        expired_any
     }
 
     pub(super) fn member_delivery(
@@ -117,6 +130,7 @@ impl DeliveryState {
             .in_flight_by_consumer
             .get(consumer)
             .and_then(|index| index.members.get(member))
+            .and_then(|offsets| offsets.first())
             .copied()
         else {
             return Ok(None);
@@ -130,6 +144,40 @@ impl DeliveryState {
             .cloned()
             .map(Some)
             .ok_or(BrokerError::CorruptRecord(offset))
+    }
+
+    pub(super) fn member_deliveries(
+        &self,
+        consumer: &str,
+        member: &str,
+    ) -> Result<Vec<InFlight>, BrokerError> {
+        let Some(offsets) = self
+            .in_flight_by_consumer
+            .get(consumer)
+            .and_then(|index| index.members.get(member))
+        else {
+            return Ok(Vec::new());
+        };
+        offsets
+            .iter()
+            .map(|offset| {
+                self.in_flight
+                    .get(&DeliveryKey {
+                        consumer: consumer.to_owned(),
+                        offset: *offset,
+                    })
+                    .cloned()
+                    .ok_or(BrokerError::CorruptRecord(*offset))
+            })
+            .collect()
+    }
+
+    pub(super) fn next_deadline_for_consumer(&self, consumer: &str) -> Option<Instant> {
+        self.in_flight
+            .iter()
+            .filter(|(key, _)| key.consumer == consumer)
+            .map(|(_, delivery)| delivery.deadline)
+            .min()
     }
 
     pub(super) fn in_flight_filter(
@@ -172,7 +220,7 @@ impl DeliveryState {
         if let Some(key) = key {
             index.keys.insert(key);
         }
-        index.members.insert(member, offset);
+        index.members.entry(member).or_default().insert(offset);
     }
 
     pub(super) fn remove(&mut self, consumer: &str, offset: Offset) -> Option<InFlight> {
@@ -188,11 +236,36 @@ impl DeliveryState {
         stream: &str,
         consumer: &str,
     ) -> Result<ConsumerState, BrokerError> {
+        if self.consumers_needing_reconcile.contains(consumer) {
+            let recovered = load_consumer_state(root, stream, consumer)?;
+            sync_consumer_state_journal(root, stream, consumer)?;
+            let stale_offsets = self
+                .in_flight
+                .keys()
+                .filter(|key| {
+                    key.consumer == consumer
+                        && (key.offset < recovered.committed_offset
+                            || recovered.acknowledged_offsets.contains(&key.offset))
+                })
+                .map(|key| key.offset)
+                .collect::<Vec<_>>();
+            for offset in stale_offsets {
+                self.remove(consumer, offset);
+            }
+            self.consumers_needing_reconcile.remove(consumer);
+            self.cache_consumer_state(consumer.to_owned(), recovered.clone());
+            return Ok(recovered);
+        }
         if let Some(cached) = self.consumer_states.get(consumer) {
             return Ok(cached.clone());
         }
 
         load_consumer_state(root, stream, consumer)
+    }
+
+    pub(super) fn mark_consumer_needs_reconcile(&mut self, consumer: &str) {
+        self.consumers_needing_reconcile.insert(consumer.to_owned());
+        self.consumer_states.remove(consumer);
     }
 
     pub(super) fn cache_consumer_state(&mut self, consumer: String, state: ConsumerState) {
@@ -239,12 +312,11 @@ impl DeliveryState {
             if let Some(key) = in_flight.key.as_ref() {
                 index.keys.remove(key);
             }
-            if index
-                .members
-                .get(&in_flight.member)
-                .is_some_and(|offset| *offset == delivery_key.offset)
-            {
-                index.members.remove(&in_flight.member);
+            if let Some(offsets) = index.members.get_mut(&in_flight.member) {
+                offsets.remove(&delivery_key.offset);
+                if offsets.is_empty() {
+                    index.members.remove(&in_flight.member);
+                }
             }
             remove_consumer_index = index.offsets.is_empty();
         }
@@ -314,6 +386,7 @@ mod tests {
                 Some("customer-a".to_owned()),
                 2,
                 "token".to_owned(),
+                false,
                 deadline,
             ),
         );

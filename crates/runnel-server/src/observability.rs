@@ -83,7 +83,7 @@ pub(crate) struct ServerMetrics {
     health_check_failures: AtomicU64,
 }
 
-const REQUEST_OPERATION_COUNT: usize = 11;
+const REQUEST_OPERATION_COUNT: usize = 13;
 const LATENCY_BUCKET_MICROS: [u64; 6] = [100, 1_000, 10_000, 100_000, 1_000_000, 10_000_000];
 const LATENCY_BUCKET_LABELS: [&str; LATENCY_BUCKET_MICROS.len()] =
     ["0.0001", "0.001", "0.01", "0.1", "1", "10"];
@@ -93,11 +93,13 @@ pub(crate) enum RequestOperation {
     CreateStream,
     Publish,
     Poll,
+    PollBatch,
     Replay,
     PollGroup,
     ConfigureConsumer,
     InspectConsumer,
     Ack,
+    AckBatch,
     AckGroup,
     Health,
     InvalidRequest,
@@ -108,11 +110,13 @@ impl RequestOperation {
         Self::CreateStream,
         Self::Publish,
         Self::Poll,
+        Self::PollBatch,
         Self::Replay,
         Self::PollGroup,
         Self::ConfigureConsumer,
         Self::InspectConsumer,
         Self::Ack,
+        Self::AckBatch,
         Self::AckGroup,
         Self::Health,
         Self::InvalidRequest,
@@ -123,14 +127,16 @@ impl RequestOperation {
             Self::CreateStream => 0,
             Self::Publish => 1,
             Self::Poll => 2,
-            Self::Replay => 3,
-            Self::PollGroup => 4,
-            Self::ConfigureConsumer => 5,
-            Self::InspectConsumer => 6,
-            Self::Ack => 7,
-            Self::AckGroup => 8,
-            Self::Health => 9,
-            Self::InvalidRequest => 10,
+            Self::PollBatch => 3,
+            Self::Replay => 4,
+            Self::PollGroup => 5,
+            Self::ConfigureConsumer => 6,
+            Self::InspectConsumer => 7,
+            Self::Ack => 8,
+            Self::AckBatch => 9,
+            Self::AckGroup => 10,
+            Self::Health => 11,
+            Self::InvalidRequest => 12,
         }
     }
 
@@ -139,11 +145,13 @@ impl RequestOperation {
             Self::CreateStream => "create_stream",
             Self::Publish => "publish",
             Self::Poll => "poll",
+            Self::PollBatch => "poll_batch",
             Self::Replay => "replay",
             Self::PollGroup => "poll_group",
             Self::ConfigureConsumer => "configure_consumer",
             Self::InspectConsumer => "inspect_consumer",
             Self::Ack => "ack",
+            Self::AckBatch => "ack_batch",
             Self::AckGroup => "ack_group",
             Self::Health => "health",
             Self::InvalidRequest => "invalid_request",
@@ -157,11 +165,13 @@ impl RequestOperation {
             Request::PublishBytes { .. } => Self::Publish,
             Request::PublishBatch { .. } => Self::Publish,
             Request::Poll { .. } => Self::Poll,
+            Request::PollBatch { .. } | Request::PollGroupBatch { .. } => Self::PollBatch,
             Request::Replay { .. } => Self::Replay,
             Request::PollGroup { .. } => Self::PollGroup,
             Request::ConfigureConsumer { .. } => Self::ConfigureConsumer,
             Request::InspectConsumer { .. } => Self::InspectConsumer,
             Request::Ack { .. } => Self::Ack,
+            Request::AckBatch { .. } | Request::AckGroupBatch { .. } => Self::AckBatch,
             Request::AckGroup { .. } => Self::AckGroup,
             Request::Health => Self::Health,
         }
@@ -290,6 +300,19 @@ pub(crate) fn record_delivery(metrics: &ServerMetrics, result: &Result<PollResul
             .delivered_bytes
             .fetch_add(message.payload.len() as u64, Ordering::Relaxed);
     }
+}
+
+pub(crate) fn record_batch_delivery(metrics: &ServerMetrics, messages: &[runnel_engine::Message]) {
+    metrics
+        .deliveries
+        .fetch_add(messages.len() as u64, Ordering::Relaxed);
+    metrics.delivered_bytes.fetch_add(
+        messages
+            .iter()
+            .map(|message| message.payload.len() as u64)
+            .sum(),
+        Ordering::Relaxed,
+    );
 }
 
 async fn liveness() -> StatusCode {

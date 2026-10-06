@@ -2,7 +2,8 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::path::Path;
 use std::sync::Arc;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use openraft::BasicNode;
 use openraft::error::{ClientWriteError, RPCError, RaftError, RemoteError, Unreachable};
@@ -14,8 +15,9 @@ use openraft::raft::{
 #[cfg(feature = "instrumentation")]
 use runnel_engine::StageTimer;
 use runnel_engine::{
-    AckResult, BrokerError, ConsumerPolicy, Engine, EngineFuture, Offset, PollResult,
-    ReplayMessage, validate_consumer_policy,
+    AckBatchResult, AckResult, BrokerError, ConsumeBatchLimits, ConsumerPolicy, DeliveryReceipt,
+    Engine, EngineFuture, Message, Offset, PollResult, ReplayMessage, validate_ack_batch_receipts,
+    validate_consume_batch_limits, validate_consumer_policy,
 };
 use serde::{Deserialize, Serialize};
 use tokio::sync::RwLock;
@@ -27,6 +29,7 @@ use super::state_machine_store::StateMachineStore;
 use super::{GroupManager, NodeId, Raft, TypeConfig, validate_name};
 
 pub(super) const DEFAULT_RAFT_ACK_TIMEOUT: Duration = Duration::from_secs(30);
+static BATCH_TOKEN_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 pub(super) const STORAGE_METADATA_FORMAT_VERSION: u32 = 1;
 pub(super) const STORAGE_METADATA_FILE: &str = "storage.json";
 const LEGACY_SINGLE_GROUP_PATHS: &[&str] = &[
@@ -377,6 +380,17 @@ pub struct RaftGroup {
     pub(super) max_delivery_attempts: Option<u32>,
 }
 
+fn batch_token_seed(node_id: NodeId) -> String {
+    let epoch = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let sequence = BATCH_TOKEN_SEQUENCE
+        .fetch_add(1, Ordering::Relaxed)
+        .wrapping_add(1);
+    format!("{node_id:x}-{epoch:x}-{sequence:x}")
+}
+
 fn map_client_write_error(
     error: RaftError<NodeId, ClientWriteError<NodeId, BasicNode>>,
 ) -> BrokerError {
@@ -386,6 +400,27 @@ fn map_client_write_error(
         };
     }
     BrokerError::Cluster(error.to_string())
+}
+
+fn batch_poll_response(
+    stream: String,
+    response: CommandResponse,
+) -> Result<Vec<Message>, BrokerError> {
+    match response {
+        CommandResponse::StreamNotFound => Err(BrokerError::StreamNotFound(stream)),
+        CommandResponse::GroupBatchPollActiveSetLimitExceeded => Err(
+            BrokerError::InvalidBatchRequest(
+                "the active delivery set exceeds the requested count or byte limit; retry with the original or a larger limit"
+                    .to_owned(),
+            ),
+        ),
+        CommandResponse::GroupBatchPollRecordTooLarge { max_bytes } => {
+            Err(BrokerError::ConsumeBatchRecordTooLarge { max_bytes })
+        }
+        other => Err(BrokerError::Cluster(format!(
+            "unexpected grouped batch poll response: {other:?}"
+        ))),
+    }
 }
 
 impl RaftGroup {
@@ -647,6 +682,247 @@ impl RaftGroup {
         }
     }
 
+    pub async fn poll_group_batch(
+        &self,
+        stream: String,
+        consumer: String,
+        member: String,
+        limits: ConsumeBatchLimits,
+    ) -> Result<Vec<Message>, BrokerError> {
+        self.poll_group_batch_with_response_member(
+            stream,
+            consumer,
+            member.clone(),
+            Some(member),
+            limits,
+            false,
+        )
+        .await
+    }
+
+    pub(crate) async fn poll_group_batch_for_forwarding(
+        &self,
+        stream: String,
+        consumer: String,
+        member: String,
+        limits: ConsumeBatchLimits,
+    ) -> Result<Vec<Message>, BrokerError> {
+        self.poll_group_batch_with_response_member(
+            stream,
+            consumer,
+            member.clone(),
+            Some(member),
+            limits,
+            true,
+        )
+        .await
+    }
+
+    pub async fn poll_batch(
+        &self,
+        stream: String,
+        consumer: String,
+        limits: ConsumeBatchLimits,
+    ) -> Result<Vec<Message>, BrokerError> {
+        self.poll_group_batch_with_response_member(
+            stream,
+            consumer.clone(),
+            consumer,
+            None,
+            limits,
+            false,
+        )
+        .await
+    }
+
+    pub(crate) async fn poll_batch_for_forwarding(
+        &self,
+        stream: String,
+        consumer: String,
+        limits: ConsumeBatchLimits,
+    ) -> Result<Vec<Message>, BrokerError> {
+        self.poll_group_batch_with_response_member(
+            stream,
+            consumer.clone(),
+            consumer,
+            None,
+            limits,
+            true,
+        )
+        .await
+    }
+
+    async fn poll_group_batch_with_response_member(
+        &self,
+        stream: String,
+        consumer: String,
+        member: String,
+        response_member: Option<String>,
+        limits: ConsumeBatchLimits,
+        ensure_forwardable: bool,
+    ) -> Result<Vec<Message>, BrokerError> {
+        validate_name("stream", &stream)?;
+        validate_name("consumer", &consumer)?;
+        validate_name("member", &member)?;
+        validate_consume_batch_limits(limits)?;
+        if runnel_engine::poll_batch_response_len(
+            &stream,
+            &consumer,
+            response_member.as_deref(),
+            &[],
+        ) > limits.max_bytes
+        {
+            return Err(BrokerError::InvalidBatchRequest(
+                "max_bytes is too small for an empty consume-batch response".to_owned(),
+            ));
+        }
+        let wait_deadline = Instant::now()
+            .checked_add(Duration::from_millis(limits.max_wait_ms))
+            .ok_or_else(|| {
+                BrokerError::InvalidBatchRequest("max_wait_ms is too large".to_owned())
+            })?;
+        let legacy_policy =
+            ConsumerPolicy::legacy(duration_ms(self.ack_timeout), self.max_delivery_attempts);
+        let policy = self
+            .state_machine
+            .consumer_policy(&stream, &consumer, legacy_policy.clone())
+            .await?;
+        let token_seed = batch_token_seed(self.node_id);
+        let mut raft_metrics = self.raft.metrics();
+
+        loop {
+            let leader_id = raft_metrics.borrow().current_leader;
+            if leader_id != Some(self.node_id) {
+                return Err(BrokerError::NotLeader { leader_id });
+            }
+            let notified = self.state_machine.changed();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+
+            let sample_now_ms = now_ms();
+            let request = super::delivery::GroupBatchPollRequest {
+                stream: stream.clone(),
+                consumer: consumer.clone(),
+                member: member.clone(),
+                response_member: response_member.clone(),
+                max_records: limits.max_records,
+                max_bytes: limits.max_bytes,
+                token_seed: token_seed.clone(),
+                now_ms: sample_now_ms,
+                lease_deadline_ms: sample_now_ms.saturating_add(policy.ack_timeout_ms),
+                max_delivery_attempts: self.max_delivery_attempts,
+                legacy_ack_timeout_ms: Some(legacy_policy.ack_timeout_ms),
+                policy_version: policy.configured.then_some(policy.version),
+                transition_only: false,
+            };
+            let (preview, next_expiry_ms) = self
+                .state_machine
+                .preview_group_batch(request.clone())
+                .await?;
+            let (messages, collection_complete, terminal_transitions) = match preview {
+                CommandResponse::GroupBatchPoll {
+                    messages,
+                    collection_complete,
+                    terminal_transitions,
+                } => (messages, collection_complete, terminal_transitions),
+                response => {
+                    return batch_poll_response(stream, response);
+                }
+            };
+
+            if terminal_transitions > 0 {
+                let mut transition_request = request;
+                transition_request.transition_only = true;
+                self.submit_group_batch_poll(transition_request).await?;
+                continue;
+            }
+
+            if limits.max_wait_ms == 0 || collection_complete || Instant::now() >= wait_deadline {
+                if ensure_forwardable {
+                    super::network::ensure_forwarded_batch_response_fits(&messages)?;
+                }
+                return self.submit_group_batch_poll(request).await;
+            }
+
+            let until_deadline = tokio::time::Instant::from_std(wait_deadline);
+            let expiry = next_expiry_ms.map(|expiry_ms| {
+                let delay = Duration::from_millis(expiry_ms.saturating_sub(now_ms()));
+                tokio::time::Instant::now() + delay
+            });
+            let wake_at = expiry.map_or(until_deadline, |expiry| expiry.min(until_deadline));
+            tokio::select! {
+                _ = &mut notified => {}
+                result = raft_metrics.changed() => {
+                    if result.is_err() {
+                        return Err(BrokerError::NotLeader { leader_id: None });
+                    }
+                }
+                _ = tokio::time::sleep_until(wake_at) => {}
+            }
+        }
+    }
+
+    async fn submit_group_batch_poll(
+        &self,
+        request: super::delivery::GroupBatchPollRequest,
+    ) -> Result<Vec<Message>, BrokerError> {
+        let stream = request.stream.clone();
+        let response = self
+            .raft
+            .client_write(Command::PollGroupBatch {
+                stream: request.stream.clone(),
+                consumer: request.consumer.clone(),
+                member: request.member.clone(),
+                response_member: request.response_member.clone(),
+                max_records: request.max_records,
+                max_bytes: request.max_bytes,
+                token_seed: request.token_seed.clone(),
+                now_ms: request.now_ms,
+                lease_deadline_ms: request.lease_deadline_ms,
+                max_delivery_attempts: request.max_delivery_attempts,
+                legacy_ack_timeout_ms: request.legacy_ack_timeout_ms,
+                policy_version: request.policy_version,
+                transition_only: request.transition_only,
+            })
+            .await
+            .map_err(map_client_write_error)?;
+        match response.data {
+            CommandResponse::GroupBatchPoll { messages, .. } => Ok(messages),
+            response => batch_poll_response(stream, response),
+        }
+    }
+
+    pub async fn ack_group_batch(
+        &self,
+        stream: String,
+        consumer: String,
+        member: String,
+        receipts: Vec<DeliveryReceipt>,
+    ) -> Result<AckBatchResult, BrokerError> {
+        validate_name("stream", &stream)?;
+        validate_name("consumer", &consumer)?;
+        validate_name("member", &member)?;
+        validate_ack_batch_receipts(&receipts)?;
+        let response = self
+            .raft
+            .client_write(Command::AckGroupBatch {
+                stream: stream.clone(),
+                consumer: consumer.clone(),
+                member,
+                receipts,
+                now_ms: now_ms(),
+            })
+            .await
+            .map_err(map_client_write_error)?;
+        match response.data {
+            CommandResponse::GroupBatchAcknowledged { result } => Ok(result),
+            CommandResponse::StreamNotFound => Err(BrokerError::StreamNotFound(stream)),
+            other => Err(BrokerError::Cluster(format!(
+                "unexpected grouped batch acknowledgement response: {other:?}"
+            ))),
+        }
+    }
+
     pub async fn ack_group(
         &self,
         stream: String,
@@ -800,6 +1076,38 @@ impl Engine for SingleNodeEngine {
         })
     }
 
+    fn poll_batch<'a>(
+        &'a self,
+        stream: &'a str,
+        consumer: &'a str,
+        limits: ConsumeBatchLimits,
+    ) -> EngineFuture<'a, Vec<Message>> {
+        Box::pin(async move {
+            self.group
+                .poll_batch(stream.to_owned(), consumer.to_owned(), limits)
+                .await
+        })
+    }
+
+    fn poll_group_batch<'a>(
+        &'a self,
+        stream: &'a str,
+        consumer: &'a str,
+        member: &'a str,
+        limits: ConsumeBatchLimits,
+    ) -> EngineFuture<'a, Vec<Message>> {
+        Box::pin(async move {
+            self.group
+                .poll_group_batch(
+                    stream.to_owned(),
+                    consumer.to_owned(),
+                    member.to_owned(),
+                    limits,
+                )
+                .await
+        })
+    }
+
     fn ack<'a>(
         &'a self,
         stream: &'a str,
@@ -809,6 +1117,24 @@ impl Engine for SingleNodeEngine {
         Box::pin(async move {
             self.group
                 .ack(stream.to_owned(), consumer.to_owned(), offset)
+                .await
+        })
+    }
+
+    fn ack_batch<'a>(
+        &'a self,
+        stream: &'a str,
+        consumer: &'a str,
+        receipts: Vec<DeliveryReceipt>,
+    ) -> EngineFuture<'a, AckBatchResult> {
+        Box::pin(async move {
+            self.group
+                .ack_group_batch(
+                    stream.to_owned(),
+                    consumer.to_owned(),
+                    consumer.to_owned(),
+                    receipts,
+                )
                 .await
         })
     }
@@ -829,6 +1155,25 @@ impl Engine for SingleNodeEngine {
                     member.to_owned(),
                     offset,
                     delivery_token.to_owned(),
+                )
+                .await
+        })
+    }
+
+    fn ack_group_batch<'a>(
+        &'a self,
+        stream: &'a str,
+        consumer: &'a str,
+        member: &'a str,
+        receipts: Vec<DeliveryReceipt>,
+    ) -> EngineFuture<'a, AckBatchResult> {
+        Box::pin(async move {
+            self.group
+                .ack_group_batch(
+                    stream.to_owned(),
+                    consumer.to_owned(),
+                    member.to_owned(),
+                    receipts,
                 )
                 .await
         })
@@ -965,6 +1310,66 @@ impl PersistentEngine {
 
     fn forwarder(&self) -> ClientForwarder<'_> {
         ClientForwarder::new(&self.manager, self.node_id, &self.peers)
+    }
+
+    async fn poll_group_batch_routed(
+        &self,
+        stream: &str,
+        consumer: &str,
+        member: &str,
+        response_member: Option<String>,
+        limits: ConsumeBatchLimits,
+    ) -> Result<Vec<Message>, BrokerError> {
+        let data_group = self.manager.data_group_for_stream(stream).await?;
+        let Some(leader_id) = data_group.raft().current_leader().await else {
+            return Err(BrokerError::NotLeader { leader_id: None });
+        };
+        if leader_id != self.node_id {
+            return self
+                .forwarder()
+                .poll_group_batch(
+                    super::network::ForwardedOperation::PollGroupBatch {
+                        stream: stream.to_owned(),
+                        consumer: consumer.to_owned(),
+                        member: member.to_owned(),
+                        response_member,
+                        max_records: limits.max_records,
+                        max_bytes: limits.max_bytes,
+                        max_wait_ms: limits.max_wait_ms,
+                    },
+                    Some(leader_id),
+                )
+                .await;
+        }
+        let result = if response_member.is_some() {
+            self.manager
+                .poll_group_batch_local(stream, consumer, member, limits)
+                .await
+        } else {
+            self.manager
+                .poll_batch_local(stream, consumer, limits)
+                .await
+        };
+        match result {
+            Ok(messages) => Ok(messages),
+            Err(BrokerError::NotLeader { leader_id }) => {
+                self.forwarder()
+                    .poll_group_batch(
+                        super::network::ForwardedOperation::PollGroupBatch {
+                            stream: stream.to_owned(),
+                            consumer: consumer.to_owned(),
+                            member: member.to_owned(),
+                            response_member,
+                            max_records: limits.max_records,
+                            max_bytes: limits.max_bytes,
+                            max_wait_ms: limits.max_wait_ms,
+                        },
+                        leader_id,
+                    )
+                    .await
+            }
+            Err(error) => Err(error),
+        }
     }
 }
 
@@ -1142,6 +1547,31 @@ impl Engine for PersistentEngine {
         })
     }
 
+    fn poll_batch<'a>(
+        &'a self,
+        stream: &'a str,
+        consumer: &'a str,
+        limits: ConsumeBatchLimits,
+    ) -> EngineFuture<'a, Vec<Message>> {
+        Box::pin(async move {
+            self.poll_group_batch_routed(stream, consumer, consumer, None, limits)
+                .await
+        })
+    }
+
+    fn poll_group_batch<'a>(
+        &'a self,
+        stream: &'a str,
+        consumer: &'a str,
+        member: &'a str,
+        limits: ConsumeBatchLimits,
+    ) -> EngineFuture<'a, Vec<Message>> {
+        Box::pin(async move {
+            self.poll_group_batch_routed(stream, consumer, member, Some(member.to_owned()), limits)
+                .await
+        })
+    }
+
     fn ack<'a>(
         &'a self,
         stream: &'a str,
@@ -1165,6 +1595,18 @@ impl Engine for PersistentEngine {
                 }
                 Err(error) => Err(error),
             }
+        })
+    }
+
+    fn ack_batch<'a>(
+        &'a self,
+        stream: &'a str,
+        consumer: &'a str,
+        receipts: Vec<DeliveryReceipt>,
+    ) -> EngineFuture<'a, AckBatchResult> {
+        Box::pin(async move {
+            self.ack_group_batch(stream, consumer, consumer, receipts)
+                .await
         })
     }
 
@@ -1198,6 +1640,57 @@ impl Engine for PersistentEngine {
                 Ok(result) => Ok(result),
                 Err(BrokerError::NotLeader { leader_id }) => {
                     self.forwarder().ack_group(operation, leader_id).await
+                }
+                Err(error) => Err(error),
+            }
+        })
+    }
+
+    fn ack_group_batch<'a>(
+        &'a self,
+        stream: &'a str,
+        consumer: &'a str,
+        member: &'a str,
+        receipts: Vec<DeliveryReceipt>,
+    ) -> EngineFuture<'a, AckBatchResult> {
+        Box::pin(async move {
+            let data_group = self.manager.data_group_for_stream(stream).await?;
+            let Some(leader_id) = data_group.raft().current_leader().await else {
+                return Err(BrokerError::NotLeader { leader_id: None });
+            };
+            if leader_id != self.node_id {
+                return self
+                    .forwarder()
+                    .ack_group_batch(
+                        stream.to_owned(),
+                        consumer.to_owned(),
+                        member.to_owned(),
+                        receipts,
+                        Some(leader_id),
+                    )
+                    .await;
+            }
+            match self
+                .manager
+                .ack_group_batch_local(
+                    stream.to_owned(),
+                    consumer.to_owned(),
+                    member.to_owned(),
+                    receipts.clone(),
+                )
+                .await
+            {
+                Ok(result) => Ok(result),
+                Err(BrokerError::NotLeader { leader_id }) => {
+                    self.forwarder()
+                        .ack_group_batch(
+                            stream.to_owned(),
+                            consumer.to_owned(),
+                            member.to_owned(),
+                            receipts,
+                            leader_id,
+                        )
+                        .await
                 }
                 Err(error) => Err(error),
             }

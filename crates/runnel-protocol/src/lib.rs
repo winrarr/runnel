@@ -79,6 +79,8 @@ pub const MAX_PUBLISH_BATCH_BYTES: usize = 64 * 1024 * 1024;
 /// request size, plus response metadata. The additional 1 MiB leaves room for
 /// that metadata while keeping a finite default bound for clients.
 pub const MAX_RESPONSE_BYTES: usize = MAX_PUBLISH_BATCH_BYTES + 1024 * 1024;
+/// Maximum number of records accepted by one consume-batch request.
+pub const MAX_CONSUME_BATCH_RECORDS: usize = 1024;
 
 /// Opaque bytes represented as standard padded base64 on the provisional wire.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -185,6 +187,13 @@ pub enum Request {
         stream: String,
         consumer: String,
     },
+    PollBatch {
+        stream: String,
+        consumer: String,
+        max_records: usize,
+        max_bytes: usize,
+        max_wait_ms: u64,
+    },
     /// Read one retained record at an inclusive logical offset without
     /// changing the consumer's ordinary progress.
     Replay {
@@ -196,6 +205,14 @@ pub enum Request {
         stream: String,
         consumer: String,
         member: String,
+    },
+    PollGroupBatch {
+        stream: String,
+        consumer: String,
+        member: String,
+        max_records: usize,
+        max_bytes: usize,
+        max_wait_ms: u64,
     },
     ConfigureConsumer {
         stream: String,
@@ -213,12 +230,23 @@ pub enum Request {
         consumer: String,
         offset: u64,
     },
+    AckBatch {
+        stream: String,
+        consumer: String,
+        receipts: Vec<BatchDeliveryReceipt>,
+    },
     AckGroup {
         stream: String,
         consumer: String,
         member: String,
         offset: u64,
         delivery_token: String,
+    },
+    AckGroupBatch {
+        stream: String,
+        consumer: String,
+        member: String,
+        receipts: Vec<BatchDeliveryReceipt>,
     },
     Health,
 }
@@ -231,15 +259,82 @@ impl Request {
             Self::PublishBytes { .. } | Self::PublishBatch { .. } => Some(PayloadEncoding::Base64),
             Self::CreateStream { .. }
             | Self::Poll { .. }
+            | Self::PollBatch { .. }
             | Self::Replay { .. }
             | Self::PollGroup { .. }
+            | Self::PollGroupBatch { .. }
             | Self::ConfigureConsumer { .. }
             | Self::InspectConsumer { .. }
             | Self::Ack { .. }
+            | Self::AckBatch { .. }
             | Self::AckGroup { .. }
+            | Self::AckGroupBatch { .. }
             | Self::Health => None,
         }
     }
+}
+
+/// One opaque token/offset pair in an acknowledgement-batch request.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BatchDeliveryReceipt {
+    pub offset: u64,
+    pub delivery_token: String,
+}
+
+/// One JSON object in a mixed text/binary consume-batch response.
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum BatchMessageResponse {
+    Text {
+        stream: String,
+        consumer: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        member: Option<String>,
+        offset: u64,
+        key: Option<String>,
+        payload: String,
+        published_at_ms: u64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        delivery_token: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        delivery_attempt: Option<u32>,
+    },
+    Bytes {
+        stream: String,
+        consumer: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        member: Option<String>,
+        offset: u64,
+        key: Option<String>,
+        payload_base64: BinaryPayload,
+        published_at_ms: u64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        delivery_token: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        delivery_attempt: Option<u32>,
+    },
+}
+
+/// One independently evaluated acknowledgement receipt.
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AckBatchItemResponse {
+    pub offset: u64,
+    pub outcome: AckBatchItemOutcome,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub code: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
+}
+
+/// Provisional status names for an individual receipt result.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AckBatchItemOutcome {
+    Confirmed,
+    AlreadyConfirmed,
+    Rejected,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -256,6 +351,11 @@ pub enum Response {
     PublishBatch {
         stream: String,
         outcomes: Vec<PublishBatchRecordResponse>,
+    },
+    PollBatch {
+        stream: String,
+        consumer: String,
+        messages: Vec<BatchMessageResponse>,
     },
     Message {
         stream: String,
@@ -313,6 +413,11 @@ pub enum Response {
         offset: u64,
         already_acknowledged: bool,
     },
+    AckBatch {
+        stream: String,
+        consumer: String,
+        outcomes: Vec<AckBatchItemResponse>,
+    },
     ConsumerPolicy {
         stream: String,
         consumer: String,
@@ -343,11 +448,94 @@ impl Response {
             Self::StreamCreated { .. }
             | Self::Published { .. }
             | Self::PublishBatch { .. }
+            | Self::PollBatch { .. }
             | Self::Empty { .. }
             | Self::Acknowledged { .. }
+            | Self::AckBatch { .. }
             | Self::ConsumerPolicy { .. }
             | Self::Health { .. }
             | Self::Error { .. } => None,
         }
+    }
+}
+
+#[cfg(test)]
+mod consume_batch_response_tests {
+    use super::{BatchMessageResponse, BinaryPayload, Response};
+    use runnel_engine::{Message, poll_batch_response_len};
+
+    #[test]
+    fn consume_batch_size_includes_serialized_metadata_payload_expansion_and_newline() {
+        let messages = vec![
+            Message {
+                stream: "events/☃".to_owned(),
+                offset: 17,
+                key: Some("key\n\"quoted".to_owned()),
+                payload: "text\n☃".as_bytes().to_vec(),
+                published_at_ms: 1_723_456_789,
+                delivery_token: Some("receipt-\"\n".to_owned()),
+                delivery_attempt: Some(12),
+            },
+            Message {
+                stream: "events/☃".to_owned(),
+                offset: 18,
+                key: None,
+                payload: vec![0, 1, 255, b'\n'],
+                published_at_ms: 1_723_456_790,
+                delivery_token: Some("receipt-2".to_owned()),
+                delivery_attempt: Some(2),
+            },
+        ];
+        let response = Response::PollBatch {
+            stream: "events/☃".to_owned(),
+            consumer: "workers".to_owned(),
+            messages: messages
+                .iter()
+                .map(|message| {
+                    let common = (
+                        message.stream.clone(),
+                        "workers".to_owned(),
+                        Some("member-☃".to_owned()),
+                        message.offset,
+                        message.key.clone(),
+                        message.published_at_ms,
+                        message.delivery_token.clone(),
+                        message.delivery_attempt,
+                    );
+                    if let Ok(payload) = String::from_utf8(message.payload.clone()) {
+                        BatchMessageResponse::Text {
+                            stream: common.0,
+                            consumer: common.1,
+                            member: common.2,
+                            offset: common.3,
+                            key: common.4,
+                            payload,
+                            published_at_ms: common.5,
+                            delivery_token: common.6,
+                            delivery_attempt: common.7,
+                        }
+                    } else {
+                        BatchMessageResponse::Bytes {
+                            stream: common.0,
+                            consumer: common.1,
+                            member: common.2,
+                            offset: common.3,
+                            key: common.4,
+                            payload_base64: BinaryPayload::new(message.payload.clone()),
+                            published_at_ms: common.5,
+                            delivery_token: common.6,
+                            delivery_attempt: common.7,
+                        }
+                    }
+                })
+                .collect(),
+        };
+        let mut serialized = serde_json::to_vec(&response).unwrap();
+        serialized.push(b'\n');
+
+        assert_eq!(
+            poll_batch_response_len("events/☃", "workers", Some("member-☃"), &messages),
+            serialized.len()
+        );
     }
 }

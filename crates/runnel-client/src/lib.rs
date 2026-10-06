@@ -2,8 +2,10 @@ use std::io;
 use std::time::Duration;
 
 use runnel_protocol::{
-    BinaryPayload, MAX_PUBLISH_BATCH_BYTES, MAX_PUBLISH_BATCH_RECORDS, MAX_RESPONSE_BYTES,
-    PublishBatchRecord as WirePublishBatchRecord, PublishBatchRecordResponse, Request, Response,
+    AckBatchItemOutcome as WireAckBatchItemOutcome, BatchMessageResponse, BinaryPayload,
+    MAX_CONSUME_BATCH_RECORDS, MAX_PUBLISH_BATCH_BYTES, MAX_PUBLISH_BATCH_RECORDS,
+    MAX_RESPONSE_BYTES, PublishBatchRecord as WirePublishBatchRecord, PublishBatchRecordResponse,
+    Request, Response,
 };
 pub use runnel_protocol::{PayloadEncoding, ProtocolSupport, ProtocolVersionRange};
 use thiserror::Error;
@@ -213,6 +215,42 @@ pub struct PublishBatchAttempt {
     pub outcomes: Vec<PublishBatchOutcome>,
     /// The whole-request failure behind repeated retryable or unknown outcomes, if any.
     pub attempt: Option<AttemptFailure>,
+}
+
+/// Explicit response, record-count, and collection-wait bounds for one consume batch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ConsumeBatchLimits {
+    pub max_records: usize,
+    pub max_bytes: usize,
+    pub max_wait_ms: u64,
+}
+
+/// A per-record receipt returned by consume-batch polling.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BatchDeliveryReceipt {
+    pub offset: u64,
+    pub delivery_token: String,
+}
+
+/// One acknowledgement result in the same order as the supplied receipts.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BatchAcknowledgementItem {
+    pub offset: u64,
+    pub outcome: BatchAcknowledgementOutcome,
+}
+
+/// Independent result for one acknowledgement receipt.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BatchAcknowledgementOutcome {
+    Confirmed,
+    AlreadyConfirmed,
+    Rejected { code: String, message: String },
+}
+
+/// Ordered per-receipt outcomes from one acknowledgement-vector request.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct BatchAcknowledgement {
+    pub outcomes: Vec<BatchAcknowledgementItem>,
 }
 
 /// A message returned by a successful poll.
@@ -759,6 +797,41 @@ impl Client {
             .await
     }
 
+    /// Poll an ordinary consumer for one bounded active set of binary-safe messages.
+    ///
+    /// The caller supplies count, byte, and collection-wait limits. The byte
+    /// limit is reduced to this client's configured response limit before the
+    /// request is sent. Each returned message includes the receipt needed by
+    /// `ack_batch`; a transport failure after sending remains an unknown poll
+    /// outcome, so reconnect and repeat the same poll to resolve it.
+    pub async fn poll_batch(
+        &mut self,
+        stream: impl Into<String>,
+        consumer: impl Into<String>,
+        limits: ConsumeBatchLimits,
+    ) -> Result<Vec<BinaryMessage>, AttemptOutcome> {
+        self.poll_batch_request("poll_batch", stream.into(), consumer.into(), None, limits)
+            .await
+    }
+
+    /// Poll one shared-consumer member for one bounded active set.
+    pub async fn poll_group_batch(
+        &mut self,
+        stream: impl Into<String>,
+        consumer: impl Into<String>,
+        member: impl Into<String>,
+        limits: ConsumeBatchLimits,
+    ) -> Result<Vec<BinaryMessage>, AttemptOutcome> {
+        self.poll_batch_request(
+            "poll_group_batch",
+            stream.into(),
+            consumer.into(),
+            Some(member.into()),
+            limits,
+        )
+        .await
+    }
+
     /// Configure durable retry settings for one consumer.
     pub async fn configure_consumer(
         &mut self,
@@ -997,7 +1070,11 @@ impl Client {
         .await
     }
 
-    /// Acknowledge a message delivered to an ordinary consumer.
+    /// Acknowledge a message delivered by the ordinary scalar poll operation.
+    ///
+    /// A message assigned through `poll_batch` requires its per-record receipt
+    /// and must be acknowledged through `ack_batch`; this offset-only method
+    /// cannot bypass that batch delivery fence.
     pub async fn ack(
         &mut self,
         stream: impl Into<String>,
@@ -1032,6 +1109,39 @@ impl Client {
                 }
                 response => Err(Box::new(response)),
             },
+        )
+        .await
+    }
+
+    /// Acknowledge a subset of an ordinary consumer's active batch.
+    ///
+    /// Every receipt is evaluated independently and the valid subset is
+    /// durably applied as one engine transition. A lost whole-request response
+    /// is unknown; retry the same receipts to resolve committed offsets.
+    pub async fn ack_batch(
+        &mut self,
+        stream: impl Into<String>,
+        consumer: impl Into<String>,
+        receipts: impl IntoIterator<Item = BatchDeliveryReceipt>,
+    ) -> Result<BatchAcknowledgement, AttemptOutcome> {
+        self.ack_batch_request("ack_batch", stream.into(), consumer.into(), None, receipts)
+            .await
+    }
+
+    /// Acknowledge a subset of one shared-consumer member's active batch.
+    pub async fn ack_group_batch(
+        &mut self,
+        stream: impl Into<String>,
+        consumer: impl Into<String>,
+        member: impl Into<String>,
+        receipts: impl IntoIterator<Item = BatchDeliveryReceipt>,
+    ) -> Result<BatchAcknowledgement, AttemptOutcome> {
+        self.ack_batch_request(
+            "ack_group_batch",
+            stream.into(),
+            consumer.into(),
+            Some(member.into()),
+            receipts,
         )
         .await
     }
@@ -1145,6 +1255,200 @@ impl Client {
                 stream: response_stream,
                 consumer: response_consumer,
             } if response_stream == stream && response_consumer == consumer => Ok(None),
+            response => Err(Box::new(response)),
+        })
+        .await
+    }
+
+    async fn poll_batch_request(
+        &mut self,
+        operation: &'static str,
+        stream: String,
+        consumer: String,
+        member: Option<String>,
+        limits: ConsumeBatchLimits,
+    ) -> Result<Vec<BinaryMessage>, AttemptOutcome> {
+        if !(1..=MAX_CONSUME_BATCH_RECORDS).contains(&limits.max_records) {
+            return Err(AttemptOutcome::Rejected(AttemptFailure::Client(
+                ClientError::InvalidBatch {
+                    message: format!(
+                        "max_records must be between 1 and {MAX_CONSUME_BATCH_RECORDS}"
+                    ),
+                },
+            )));
+        }
+        if limits.max_bytes == 0 {
+            return Err(AttemptOutcome::Rejected(AttemptFailure::Client(
+                ClientError::InvalidBatch {
+                    message: "max_bytes must be greater than zero".to_owned(),
+                },
+            )));
+        }
+        let max_bytes = limits
+            .max_bytes
+            .min(self.config.max_response_bytes)
+            .min(MAX_RESPONSE_BYTES);
+        let empty_response = Response::PollBatch {
+            stream: stream.clone(),
+            consumer: consumer.clone(),
+            messages: Vec::new(),
+        };
+        let minimum_bytes = serde_json::to_vec(&empty_response)
+            .map(|mut bytes| {
+                bytes.push(b'\n');
+                bytes.len()
+            })
+            .map_err(|source| {
+                AttemptOutcome::Rejected(AttemptFailure::Client(ClientError::EncodeRequest {
+                    source,
+                }))
+            })?;
+        if minimum_bytes > max_bytes {
+            return Err(AttemptOutcome::Rejected(AttemptFailure::Client(
+                ClientError::InvalidBatch {
+                    message: "max_bytes is smaller than the empty response envelope".to_owned(),
+                },
+            )));
+        }
+        let request = match member.as_ref() {
+            Some(member) => Request::PollGroupBatch {
+                stream: stream.clone(),
+                consumer: consumer.clone(),
+                member: member.clone(),
+                max_records: limits.max_records,
+                max_bytes,
+                max_wait_ms: limits.max_wait_ms,
+            },
+            None => Request::PollBatch {
+                stream: stream.clone(),
+                consumer: consumer.clone(),
+                max_records: limits.max_records,
+                max_bytes,
+                max_wait_ms: limits.max_wait_ms,
+            },
+        };
+        self.request_typed(operation, request, move |response| match response {
+            Response::PollBatch {
+                stream: response_stream,
+                consumer: response_consumer,
+                messages,
+            } if response_stream == stream && response_consumer == consumer => {
+                let decoded = messages
+                    .into_iter()
+                    .map(|message| {
+                        decode_batch_message(message, &stream, &consumer, member.as_deref())
+                    })
+                    .collect::<Option<Vec<_>>>();
+                decoded.ok_or_else(|| {
+                    Box::new(Response::Error {
+                        code: "invalid_batch_response".to_owned(),
+                        message: "poll batch response contained invalid message metadata"
+                            .to_owned(),
+                    })
+                })
+            }
+            response => Err(Box::new(response)),
+        })
+        .await
+    }
+
+    async fn ack_batch_request(
+        &mut self,
+        operation: &'static str,
+        stream: String,
+        consumer: String,
+        member: Option<String>,
+        receipts: impl IntoIterator<Item = BatchDeliveryReceipt>,
+    ) -> Result<BatchAcknowledgement, AttemptOutcome> {
+        let receipts = receipts.into_iter().collect::<Vec<_>>();
+        if receipts.is_empty() || receipts.len() > MAX_CONSUME_BATCH_RECORDS {
+            return Err(AttemptOutcome::Rejected(AttemptFailure::Client(
+                ClientError::InvalidBatch {
+                    message: format!(
+                        "acknowledgement receipt count must be between 1 and {MAX_CONSUME_BATCH_RECORDS}"
+                    ),
+                },
+            )));
+        }
+        let mut offsets = std::collections::HashSet::with_capacity(receipts.len());
+        if let Some(duplicate) = receipts
+            .iter()
+            .map(|receipt| receipt.offset)
+            .find(|offset| !offsets.insert(*offset))
+        {
+            return Err(AttemptOutcome::Rejected(AttemptFailure::Client(
+                ClientError::InvalidBatch {
+                    message: format!("duplicate acknowledgement offset {duplicate}"),
+                },
+            )));
+        }
+        let request = match member {
+            Some(member) => Request::AckGroupBatch {
+                stream: stream.clone(),
+                consumer: consumer.clone(),
+                member,
+                receipts: receipts
+                    .iter()
+                    .map(|receipt| runnel_protocol::BatchDeliveryReceipt {
+                        offset: receipt.offset,
+                        delivery_token: receipt.delivery_token.clone(),
+                    })
+                    .collect(),
+            },
+            None => Request::AckBatch {
+                stream: stream.clone(),
+                consumer: consumer.clone(),
+                receipts: receipts
+                    .iter()
+                    .map(|receipt| runnel_protocol::BatchDeliveryReceipt {
+                        offset: receipt.offset,
+                        delivery_token: receipt.delivery_token.clone(),
+                    })
+                    .collect(),
+            },
+        };
+        let expected_offsets = receipts
+            .into_iter()
+            .map(|receipt| receipt.offset)
+            .collect::<Vec<_>>();
+        self.request_typed(operation, request, move |response| match response {
+            Response::AckBatch {
+                stream: response_stream,
+                consumer: response_consumer,
+                outcomes,
+            } if response_stream == stream
+                && response_consumer == consumer
+                && outcomes.len() == expected_offsets.len()
+                && outcomes
+                    .iter()
+                    .zip(&expected_offsets)
+                    .all(|(outcome, offset)| outcome.offset == *offset) =>
+            {
+                Ok(BatchAcknowledgement {
+                    outcomes: outcomes
+                        .into_iter()
+                        .map(|item| BatchAcknowledgementItem {
+                            offset: item.offset,
+                            outcome: match item.outcome {
+                                WireAckBatchItemOutcome::Confirmed => {
+                                    BatchAcknowledgementOutcome::Confirmed
+                                }
+                                WireAckBatchItemOutcome::AlreadyConfirmed => {
+                                    BatchAcknowledgementOutcome::AlreadyConfirmed
+                                }
+                                WireAckBatchItemOutcome::Rejected => {
+                                    BatchAcknowledgementOutcome::Rejected {
+                                        code: item.code.unwrap_or_else(|| "rejected".to_owned()),
+                                        message: item.message.unwrap_or_else(|| {
+                                            "broker rejected the acknowledgement receipt".to_owned()
+                                        }),
+                                    }
+                                }
+                            },
+                        })
+                        .collect(),
+                })
+            }
             response => Err(Box::new(response)),
         })
         .await
@@ -1356,9 +1660,10 @@ enum BatchFailureKind {
 
 fn classify_error_code(code: &str) -> BatchFailureKind {
     match code {
-        "connection_limit" | "request_saturated" | "stream_not_ready" => {
-            BatchFailureKind::Retryable
-        }
+        "connection_limit"
+        | "request_saturated"
+        | "stream_not_ready"
+        | "consumer_state_retryable" => BatchFailureKind::Retryable,
         "request_timeout"
         | "storage_error"
         | "consumer_state_error"
@@ -1468,6 +1773,67 @@ fn attempt_failure_details(failure: &AttemptFailure) -> (String, String) {
         ),
         AttemptFailure::Client(error) => ("client_error".to_owned(), error.to_string()),
     }
+}
+
+fn decode_batch_message(
+    message: BatchMessageResponse,
+    stream: &str,
+    consumer: &str,
+    member: Option<&str>,
+) -> Option<BinaryMessage> {
+    let decoded = match message {
+        BatchMessageResponse::Text {
+            stream: response_stream,
+            consumer: response_consumer,
+            member: response_member,
+            offset,
+            key,
+            payload,
+            published_at_ms,
+            delivery_token,
+            delivery_attempt,
+        } => BinaryMessage {
+            stream: response_stream,
+            consumer: response_consumer,
+            member: response_member,
+            offset,
+            key,
+            payload: payload.into_bytes(),
+            published_at_ms,
+            delivery_token,
+            delivery_attempt,
+        },
+        BatchMessageResponse::Bytes {
+            stream: response_stream,
+            consumer: response_consumer,
+            member: response_member,
+            offset,
+            key,
+            payload_base64,
+            published_at_ms,
+            delivery_token,
+            delivery_attempt,
+        } => BinaryMessage {
+            stream: response_stream,
+            consumer: response_consumer,
+            member: response_member,
+            offset,
+            key,
+            payload: payload_base64.into_bytes(),
+            published_at_ms,
+            delivery_token,
+            delivery_attempt,
+        },
+    };
+    if decoded.stream != stream
+        || decoded.consumer != consumer
+        || decoded.member.as_deref() != member
+        || decoded.delivery_token.is_none()
+        || decoded.delivery_attempt.is_none()
+    {
+        return None;
+    }
+    Some(decoded)
 }
 
 enum TypedResponse<T> {
@@ -2830,6 +3196,21 @@ mod tests {
         assert!(
             matches!(outcome, AttemptOutcome::Retryable(AttemptFailure::Broker(Response::Error { code, .. })) if code == "request_saturated")
         );
+    }
+
+    #[tokio::test]
+    async fn classifies_preappend_consumer_state_failure_as_retryable() {
+        let outcome = request_outcome(Response::Error {
+            code: "consumer_state_retryable".to_owned(),
+            message: "append was not attempted".to_owned(),
+        })
+        .await;
+
+        assert!(matches!(
+            outcome,
+            AttemptOutcome::Retryable(AttemptFailure::Broker(Response::Error { code, .. }))
+                if code == "consumer_state_retryable"
+        ));
     }
 
     #[tokio::test]

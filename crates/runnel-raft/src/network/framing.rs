@@ -1,4 +1,4 @@
-use std::io;
+use std::io::{self, Write};
 use std::mem::size_of;
 
 use serde::Serialize;
@@ -6,7 +6,7 @@ use serde::de::DeserializeOwned;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 
-const MAX_FRAME_SIZE: u32 = 64 * 1024 * 1024;
+pub(super) const MAX_FRAME_SIZE: u32 = 66 * 1024 * 1024;
 pub(super) const MAX_REUSABLE_FRAME_BUFFER_SIZE: usize = 1024 * 1024;
 
 pub(super) async fn write_frame<T: Serialize>(
@@ -15,7 +15,24 @@ pub(super) async fn write_frame<T: Serialize>(
 ) -> Result<(), io::Error> {
     let mut frame = Vec::with_capacity(size_of::<u32>());
     frame.extend_from_slice(&[0; size_of::<u32>()]);
-    serde_json::to_writer(&mut frame, value).map_err(io::Error::other)?;
+    let serialization = {
+        let mut writer = BoundedFrameWriter {
+            frame: &mut frame,
+            max_payload_bytes: MAX_FRAME_SIZE as usize,
+            exceeded_limit: false,
+        };
+        let result = serde_json::to_writer(&mut writer, value);
+        (result, writer.exceeded_limit)
+    };
+    if let Err(error) = serialization.0 {
+        if serialization.1 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "peer RPC exceeds the frame limit",
+            ));
+        }
+        return Err(io::Error::other(error));
+    }
     let length = u32::try_from(frame.len() - size_of::<u32>())
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "peer RPC is too large"))?;
     if length > MAX_FRAME_SIZE {
@@ -26,6 +43,44 @@ pub(super) async fn write_frame<T: Serialize>(
     }
     frame[..size_of::<u32>()].copy_from_slice(&length.to_be_bytes());
     stream.write_all(&frame).await
+}
+
+struct BoundedFrameWriter<'a> {
+    frame: &'a mut Vec<u8>,
+    max_payload_bytes: usize,
+    exceeded_limit: bool,
+}
+
+impl Write for BoundedFrameWriter<'_> {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        let payload_len = self.frame.len() - size_of::<u32>();
+        if bytes.len() > self.max_payload_bytes.saturating_sub(payload_len) {
+            self.exceeded_limit = true;
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "peer RPC exceeds the frame limit",
+            ));
+        }
+        let required_capacity = self.frame.len() + bytes.len();
+        if required_capacity > self.frame.capacity() {
+            let current_payload_capacity = self.frame.capacity() - size_of::<u32>();
+            let target_payload_capacity = current_payload_capacity
+                .saturating_mul(2)
+                .max(bytes.len())
+                .min(self.max_payload_bytes);
+            let target_capacity =
+                size_of::<u32>() + target_payload_capacity.max(payload_len + bytes.len());
+            self.frame
+                .try_reserve_exact(target_capacity.saturating_sub(self.frame.len()))
+                .map_err(io::Error::other)?;
+        }
+        self.frame.extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
 }
 
 pub(super) async fn read_frame<T: DeserializeOwned>(
@@ -100,6 +155,25 @@ mod tests {
         assert_eq!(error.kind(), io::ErrorKind::InvalidData);
         assert_eq!(error.to_string(), "peer RPC exceeds the frame limit");
         assert!(payload.is_empty());
+        assert_eq!(payload.capacity(), 0);
         server.await.unwrap();
+    }
+
+    #[test]
+    fn bounded_writer_rejects_before_growing_past_its_limit() {
+        let mut frame = vec![0; size_of::<u32>()];
+        let mut writer = BoundedFrameWriter {
+            frame: &mut frame,
+            max_payload_bytes: 3,
+            exceeded_limit: false,
+        };
+
+        assert!(writer.write_all(b"123").is_ok());
+        assert_eq!(
+            writer.write_all(b"4").unwrap_err().kind(),
+            io::ErrorKind::InvalidData
+        );
+        assert!(writer.exceeded_limit);
+        assert_eq!(frame.len(), size_of::<u32>() + 3);
     }
 }

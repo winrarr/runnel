@@ -1,7 +1,9 @@
 use std::time::Duration;
 
 use runnel_engine::{
-    AckResult, BrokerError, BrokerErrorKind, BrokerErrorOutcome, Engine, PollResult, PublishRecord,
+    AckBatchOutcome, AckResult, BrokerError, BrokerErrorKind, BrokerErrorOutcome,
+    ConsumeBatchLimits, DeliveryReceipt, Engine, PollResult, PublishRecord,
+    poll_batch_response_len,
 };
 
 /// Verify the semantic error boundary shared by local and distributed engines.
@@ -142,6 +144,556 @@ pub async fn assert_publish_batch_contract(engine: &dyn Engine) {
             .collect::<Result<Vec<_>, _>>()
             .unwrap(),
         vec![0, 1]
+    );
+}
+
+/// Verify the ordered active-set, receipt, mixed-result, and same-key rules
+/// shared by local and clustered consume-batch implementations.
+pub async fn assert_consume_batch_contract(engine: &dyn Engine) {
+    let stream = "contract.consume-batch";
+    assert!(engine.create_stream(stream).await.unwrap());
+    for payload in [b"first".as_slice(), b"second", b"third", b"fourth"] {
+        engine
+            .publish(stream, None, payload.to_vec(), None)
+            .await
+            .unwrap();
+    }
+
+    let limits = ConsumeBatchLimits {
+        max_records: 2,
+        max_bytes: 64 * 1024,
+        max_wait_ms: 0,
+    };
+    let first = engine.poll_batch(stream, "worker", limits).await.unwrap();
+    assert_eq!(
+        first
+            .iter()
+            .map(|message| message.offset)
+            .collect::<Vec<_>>(),
+        [0, 1]
+    );
+    assert!(first.iter().all(|message| message.delivery_token.is_some()));
+    assert_eq!(
+        engine.poll_batch(stream, "worker", limits).await.unwrap(),
+        first,
+        "repeating a poll must recover the same active set"
+    );
+    let scalar_ack = engine
+        .ack(stream, "worker", first[0].offset)
+        .await
+        .expect_err("a scalar offset-only ack must not bypass a batch receipt fence");
+    assert_eq!(scalar_ack.kind(), BrokerErrorKind::DeliveryRejected);
+    assert_eq!(scalar_ack.outcome(), BrokerErrorOutcome::Rejected);
+    let lower_limit = engine
+        .poll_batch(
+            stream,
+            "worker",
+            ConsumeBatchLimits {
+                max_records: 1,
+                ..limits
+            },
+        )
+        .await
+        .expect_err("a smaller limit must reject an oversized live set");
+    assert_eq!(lower_limit.kind(), BrokerErrorKind::InvalidRequest);
+
+    let receipts = vec![
+        DeliveryReceipt {
+            offset: first[0].offset,
+            delivery_token: first[0].delivery_token.clone().unwrap(),
+        },
+        DeliveryReceipt {
+            offset: first[1].offset,
+            delivery_token: "stale-receipt".to_owned(),
+        },
+    ];
+    let outcome = engine
+        .ack_batch(stream, "worker", receipts.clone())
+        .await
+        .unwrap();
+    assert_eq!(outcome.outcomes.len(), 2);
+    assert!(matches!(
+        outcome.outcomes[0].outcome,
+        AckBatchOutcome::Confirmed
+    ));
+    assert!(matches!(
+        outcome.outcomes[1].outcome,
+        AckBatchOutcome::Rejected { .. }
+    ));
+    let retry = engine
+        .ack_batch(stream, "worker", vec![receipts[0].clone()])
+        .await
+        .unwrap();
+    assert!(matches!(
+        retry.outcomes[0].outcome,
+        AckBatchOutcome::AlreadyConfirmed
+    ));
+
+    let remaining = engine.poll_batch(stream, "worker", limits).await.unwrap();
+    assert_eq!(remaining.len(), 1);
+    assert_eq!(remaining[0].offset, 1);
+    assert_eq!(
+        engine
+            .ack_batch(
+                stream,
+                "worker",
+                vec![DeliveryReceipt {
+                    offset: remaining[0].offset,
+                    delivery_token: remaining[0].delivery_token.clone().unwrap(),
+                }],
+            )
+            .await
+            .unwrap()
+            .outcomes[0]
+            .outcome,
+        AckBatchOutcome::Confirmed
+    );
+
+    let next = engine.poll_batch(stream, "worker", limits).await.unwrap();
+    assert_eq!(
+        next.iter()
+            .map(|message| message.offset)
+            .collect::<Vec<_>>(),
+        [2, 3]
+    );
+    let out_of_order_receipts = next
+        .iter()
+        .rev()
+        .map(|message| DeliveryReceipt {
+            offset: message.offset,
+            delivery_token: message.delivery_token.clone().unwrap(),
+        })
+        .collect::<Vec<_>>();
+    let out_of_order_ack = engine
+        .ack_batch(stream, "worker", out_of_order_receipts)
+        .await
+        .unwrap();
+    assert_eq!(
+        out_of_order_ack
+            .outcomes
+            .iter()
+            .map(|outcome| outcome.offset)
+            .collect::<Vec<_>>(),
+        [3, 2],
+        "ack results preserve input order even when receipts complete out of order"
+    );
+    assert!(
+        out_of_order_ack
+            .outcomes
+            .iter()
+            .all(|item| matches!(item.outcome, AckBatchOutcome::Confirmed))
+    );
+    assert!(
+        engine
+            .poll_batch(stream, "worker", limits)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+
+    let duplicate = "contract.consume-batch-duplicate";
+    assert!(engine.create_stream(duplicate).await.unwrap());
+    engine
+        .publish(duplicate, None, b"duplicate-check".to_vec(), None)
+        .await
+        .unwrap();
+    let duplicate_set = engine
+        .poll_batch(
+            duplicate,
+            "worker",
+            ConsumeBatchLimits {
+                max_records: 1,
+                ..limits
+            },
+        )
+        .await
+        .unwrap();
+    let duplicate_receipt = DeliveryReceipt {
+        offset: duplicate_set[0].offset,
+        delivery_token: duplicate_set[0].delivery_token.clone().unwrap(),
+    };
+    let invalid_vector = engine
+        .ack_batch(
+            duplicate,
+            "worker",
+            vec![duplicate_receipt.clone(), duplicate_receipt.clone()],
+        )
+        .await
+        .expect_err("duplicate offsets must reject the vector before any ack");
+    assert_eq!(invalid_vector.kind(), BrokerErrorKind::InvalidRequest);
+    assert_eq!(
+        engine
+            .poll_batch(
+                duplicate,
+                "worker",
+                ConsumeBatchLimits {
+                    max_records: 1,
+                    ..limits
+                },
+            )
+            .await
+            .unwrap(),
+        duplicate_set,
+        "a malformed receipt vector must not alter the active set"
+    );
+    assert_eq!(
+        engine
+            .ack_batch(duplicate, "worker", vec![duplicate_receipt])
+            .await
+            .unwrap()
+            .outcomes[0]
+            .outcome,
+        AckBatchOutcome::Confirmed
+    );
+
+    let bounded = "contract.consume-batch-bounds";
+    assert!(engine.create_stream(bounded).await.unwrap());
+    engine
+        .publish(bounded, None, b"small".to_vec(), None)
+        .await
+        .unwrap();
+    engine
+        .publish(bounded, None, vec![b'x'; 512], None)
+        .await
+        .unwrap();
+    let empty_response_bytes = poll_batch_response_len(bounded, "worker", None, &[]);
+    let byte_limits = ConsumeBatchLimits {
+        max_records: 2,
+        max_bytes: empty_response_bytes + 300,
+        max_wait_ms: 0,
+    };
+    let bounded_batch = engine
+        .poll_batch(bounded, "worker", byte_limits)
+        .await
+        .unwrap();
+    assert_eq!(
+        bounded_batch
+            .iter()
+            .map(|message| message.offset)
+            .collect::<Vec<_>>(),
+        [0],
+        "a later record that exceeds the byte limit must leave a smaller prefix"
+    );
+    assert!(
+        poll_batch_response_len(bounded, "worker", None, &bounded_batch) <= byte_limits.max_bytes
+    );
+    let live_set_bytes = poll_batch_response_len(bounded, "worker", None, &bounded_batch);
+    let lower_byte_limit = engine
+        .poll_batch(
+            bounded,
+            "worker",
+            ConsumeBatchLimits {
+                max_bytes: live_set_bytes - 1,
+                ..byte_limits
+            },
+        )
+        .await
+        .expect_err("a smaller byte limit must reject an oversized live set");
+    assert_eq!(lower_byte_limit.kind(), BrokerErrorKind::InvalidRequest);
+    engine
+        .ack_batch(
+            bounded,
+            "worker",
+            vec![DeliveryReceipt {
+                offset: bounded_batch[0].offset,
+                delivery_token: bounded_batch[0].delivery_token.clone().unwrap(),
+            }],
+        )
+        .await
+        .unwrap();
+    let oversized_first = engine
+        .poll_batch(bounded, "worker", byte_limits)
+        .await
+        .expect_err("an oversized first eligible record must be rejected explicitly");
+    assert_eq!(oversized_first.kind(), BrokerErrorKind::InvalidRequest);
+
+    let waiting = "contract.consume-batch-wakeup";
+    assert!(engine.create_stream(waiting).await.unwrap());
+    let wait_limits = ConsumeBatchLimits {
+        max_records: 2,
+        max_bytes: 64 * 1024,
+        max_wait_ms: 100,
+    };
+    let (collected, published) =
+        tokio::join!(engine.poll_batch(waiting, "worker", wait_limits), async {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            tokio::time::timeout(
+                Duration::from_millis(50),
+                engine.publish(waiting, None, b"wakeup".to_vec(), None),
+            )
+            .await
+            .expect("publishing during batch collection must not wait for the poll deadline")
+        });
+    assert_eq!(published.unwrap(), 0);
+    let collected = collected.unwrap();
+    assert_eq!(collected.len(), 1);
+    assert_eq!(collected[0].offset, 0);
+    engine
+        .ack_batch(
+            waiting,
+            "worker",
+            vec![DeliveryReceipt {
+                offset: collected[0].offset,
+                delivery_token: collected[0].delivery_token.clone().unwrap(),
+            }],
+        )
+        .await
+        .unwrap();
+
+    let ack_wakeup = "contract.consume-batch-ack-wakeup";
+    assert!(engine.create_stream(ack_wakeup).await.unwrap());
+    for payload in [b"first".as_slice(), b"second".as_slice()] {
+        engine
+            .publish(
+                ack_wakeup,
+                Some("same-key".to_owned()),
+                payload.to_vec(),
+                None,
+            )
+            .await
+            .unwrap();
+    }
+    let first_keyed = engine
+        .poll_group_batch(
+            ack_wakeup,
+            "workers",
+            "member-a",
+            ConsumeBatchLimits {
+                max_records: 2,
+                max_wait_ms: 0,
+                ..limits
+            },
+        )
+        .await
+        .unwrap();
+    let (next_keyed, acked) = tokio::join!(
+        engine.poll_group_batch(
+            ack_wakeup,
+            "workers",
+            "member-b",
+            ConsumeBatchLimits {
+                max_records: 1,
+                max_wait_ms: 200,
+                ..limits
+            },
+        ),
+        async {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            tokio::time::timeout(
+                Duration::from_millis(50),
+                engine.ack_group_batch(
+                    ack_wakeup,
+                    "workers",
+                    "member-a",
+                    vec![DeliveryReceipt {
+                        offset: first_keyed[0].offset,
+                        delivery_token: first_keyed[0].delivery_token.clone().unwrap(),
+                    }],
+                ),
+            )
+            .await
+            .expect("acknowledgement during collection must complete before the wait deadline")
+        }
+    );
+    assert_eq!(
+        acked.unwrap().outcomes[0].outcome,
+        AckBatchOutcome::Confirmed
+    );
+    let next_keyed = next_keyed.unwrap();
+    assert_eq!(next_keyed.len(), 1);
+    assert_eq!(next_keyed[0].offset, 1);
+    engine
+        .ack_group_batch(
+            ack_wakeup,
+            "workers",
+            "member-b",
+            vec![DeliveryReceipt {
+                offset: next_keyed[0].offset,
+                delivery_token: next_keyed[0].delivery_token.clone().unwrap(),
+            }],
+        )
+        .await
+        .unwrap();
+
+    let expiry = "contract.consume-batch-expiry";
+    assert!(engine.create_stream(expiry).await.unwrap());
+    engine
+        .publish(expiry, None, b"lease".to_vec(), None)
+        .await
+        .unwrap();
+    engine
+        .configure_consumer(expiry, "workers", 25, None)
+        .await
+        .unwrap();
+    let expiry_limits = ConsumeBatchLimits {
+        max_records: 1,
+        max_bytes: 64 * 1024,
+        max_wait_ms: 0,
+    };
+    let expiring = engine
+        .poll_group_batch(expiry, "workers", "member-a", expiry_limits)
+        .await
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(40)).await;
+    let redelivered = engine
+        .poll_group_batch(expiry, "workers", "member-b", expiry_limits)
+        .await
+        .unwrap();
+    assert_eq!(redelivered.len(), 1);
+    assert_eq!(redelivered[0].offset, expiring[0].offset);
+    assert_eq!(redelivered[0].delivery_attempt, Some(2));
+    assert_ne!(
+        redelivered[0].delivery_token, expiring[0].delivery_token,
+        "expired batch receipts must be replaced"
+    );
+    assert!(matches!(
+        engine
+            .ack_group_batch(
+                expiry,
+                "workers",
+                "member-a",
+                vec![DeliveryReceipt {
+                    offset: expiring[0].offset,
+                    delivery_token: expiring[0].delivery_token.clone().unwrap(),
+                }],
+            )
+            .await
+            .unwrap()
+            .outcomes[0]
+            .outcome,
+        AckBatchOutcome::Rejected { .. }
+    ));
+    assert_eq!(
+        engine
+            .ack_group_batch(
+                expiry,
+                "workers",
+                "member-b",
+                vec![DeliveryReceipt {
+                    offset: redelivered[0].offset,
+                    delivery_token: redelivered[0].delivery_token.clone().unwrap(),
+                }],
+            )
+            .await
+            .unwrap()
+            .outcomes[0]
+            .outcome,
+        AckBatchOutcome::Confirmed
+    );
+
+    let policy = "contract.consume-batch-policy";
+    assert!(engine.create_stream(policy).await.unwrap());
+    engine
+        .configure_consumer(policy, "workers", 25, Some(3))
+        .await
+        .unwrap();
+    engine
+        .publish(policy, None, b"pinned-policy".to_vec(), None)
+        .await
+        .unwrap();
+    let pinned_limits = ConsumeBatchLimits {
+        max_records: 1,
+        max_bytes: 64 * 1024,
+        max_wait_ms: 0,
+    };
+    let first_policy_delivery = engine
+        .poll_group_batch(policy, "workers", "member-a", pinned_limits)
+        .await
+        .unwrap();
+    engine
+        .configure_consumer(policy, "workers", 500, Some(1))
+        .await
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(40)).await;
+    let redelivered_policy = engine
+        .poll_group_batch(policy, "workers", "member-b", pinned_limits)
+        .await
+        .unwrap();
+    assert_eq!(redelivered_policy.len(), 1);
+    assert_eq!(
+        redelivered_policy[0].offset,
+        first_policy_delivery[0].offset
+    );
+    assert_eq!(redelivered_policy[0].delivery_attempt, Some(2));
+    engine
+        .ack_group_batch(
+            policy,
+            "workers",
+            "member-b",
+            vec![DeliveryReceipt {
+                offset: redelivered_policy[0].offset,
+                delivery_token: redelivered_policy[0].delivery_token.clone().unwrap(),
+            }],
+        )
+        .await
+        .unwrap();
+
+    let keyed = "contract.consume-batch-key";
+    assert!(engine.create_stream(keyed).await.unwrap());
+    for payload in [b"first".as_slice(), b"second".as_slice()] {
+        engine
+            .publish(keyed, Some("same-key".to_owned()), payload.to_vec(), None)
+            .await
+            .unwrap();
+    }
+    let one = engine
+        .poll_group_batch(
+            keyed,
+            "workers",
+            "member-a",
+            ConsumeBatchLimits {
+                max_records: 2,
+                ..limits
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        one.iter().map(|message| message.offset).collect::<Vec<_>>(),
+        [0]
+    );
+    assert!(
+        engine
+            .poll_group_batch(
+                keyed,
+                "workers",
+                "member-b",
+                ConsumeBatchLimits {
+                    max_records: 2,
+                    ..limits
+                },
+            )
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    engine
+        .ack_group_batch(
+            keyed,
+            "workers",
+            "member-a",
+            vec![DeliveryReceipt {
+                offset: one[0].offset,
+                delivery_token: one[0].delivery_token.clone().unwrap(),
+            }],
+        )
+        .await
+        .unwrap();
+    let two = engine
+        .poll_group_batch(
+            keyed,
+            "workers",
+            "member-b",
+            ConsumeBatchLimits {
+                max_records: 2,
+                ..limits
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        two.iter().map(|message| message.offset).collect::<Vec<_>>(),
+        [1]
     );
 }
 

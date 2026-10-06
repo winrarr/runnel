@@ -1,14 +1,17 @@
 use std::collections::{BTreeMap, BTreeSet};
+use std::fmt::Display;
 use std::fs::{self, OpenOptions};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 
 #[cfg(feature = "instrumentation")]
 use runnel_engine::StageTimer;
-use runnel_engine::{BrokerError, ConsumerPolicy, Offset};
+use runnel_engine::{BrokerError, ConsumerPolicy, ConsumerStatePersistStage, Offset};
 use serde::{Deserialize, Serialize};
 
-pub(super) const MAX_CONSUMER_STATE_JOURNAL_BYTES: u64 = 64 * 1024;
+// One 1,024-record consume assignment stores a full policy snapshot for each
+// offset. Keep the journal bound large enough for that single atomic event.
+pub(super) const MAX_CONSUMER_STATE_JOURNAL_BYTES: u64 = 1024 * 1024;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(super) struct ConsumerState {
@@ -33,12 +36,25 @@ pub(super) enum ConsumerStateEvent {
         #[serde(default)]
         policy: Option<ConsumerPolicy>,
     },
+    DeliveryAttempts {
+        attempts: Vec<DeliveryAttempt>,
+    },
     Acknowledge {
         offset: Offset,
+    },
+    AcknowledgeBatch {
+        offsets: Vec<Offset>,
     },
     PolicyConfigured {
         policy: ConsumerPolicy,
     },
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub(super) struct DeliveryAttempt {
+    pub(super) offset: Offset,
+    pub(super) attempt: u32,
+    pub(super) policy: ConsumerPolicy,
 }
 
 impl ConsumerState {
@@ -83,7 +99,36 @@ impl ConsumerState {
                     }
                 }
             }
+            ConsumerStateEvent::DeliveryAttempts { attempts } => {
+                if attempts.iter().any(|attempt| attempt.attempt == 0) {
+                    return Err(BrokerError::Io(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "consumer delivery attempt must be greater than zero",
+                    )));
+                }
+                for DeliveryAttempt {
+                    offset,
+                    attempt,
+                    policy,
+                } in attempts
+                {
+                    if offset >= self.committed_offset
+                        && !self.acknowledged_offsets.contains(&offset)
+                    {
+                        self.delivery_attempts
+                            .entry(offset)
+                            .and_modify(|current| *current = (*current).max(attempt))
+                            .or_insert(attempt);
+                        self.delivery_policies.entry(offset).or_insert(policy);
+                    }
+                }
+            }
             ConsumerStateEvent::Acknowledge { offset } => self.acknowledge(offset),
+            ConsumerStateEvent::AcknowledgeBatch { offsets } => {
+                for offset in offsets {
+                    self.acknowledge(offset);
+                }
+            }
             ConsumerStateEvent::PolicyConfigured { policy } => {
                 validate_policy(&policy)?;
                 self.policy = Some(policy);
@@ -153,6 +198,21 @@ pub(super) fn persist_consumer_event(
     })
 }
 
+pub(super) fn sync_consumer_state_journal(
+    root: &Path,
+    stream: &str,
+    consumer: &str,
+) -> Result<(), BrokerError> {
+    let path = consumer_state_journal_path(root, stream, consumer);
+    let file = match OpenOptions::new().read(true).write(true).open(path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error.into()),
+    };
+    file.sync_all()?;
+    Ok(())
+}
+
 #[cfg(test)]
 pub(super) fn persist_consumer_event_with_sync_failure(
     root: &Path,
@@ -169,6 +229,41 @@ pub(super) fn persist_consumer_event_with_sync_failure(
     })
 }
 
+#[cfg(test)]
+pub(super) fn persist_consumer_event_with_partial_append_failure(
+    root: &Path,
+    stream: &str,
+    consumer: &str,
+    event: ConsumerStateEvent,
+) -> Result<(), BrokerError> {
+    let path = consumer_state_journal_path(root, stream, consumer);
+    let parent = path.parent().ok_or_else(|| {
+        persist_failure(
+            ConsumerStatePersistStage::BeforeAppend,
+            "consumer state journal has no parent",
+        )
+    })?;
+    fs::create_dir_all(parent)
+        .map_err(|error| persist_failure(ConsumerStatePersistStage::BeforeAppend, error))?;
+    let mut encoded = serde_json::to_vec(&event)
+        .map_err(|error| persist_failure(ConsumerStatePersistStage::BeforeAppend, error))?;
+    encoded.push(b'\n');
+    let mut file = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .map_err(|error| persist_failure(ConsumerStatePersistStage::BeforeAppend, error))?;
+    let partial_length = (encoded.len() / 2).max(1);
+    file.write_all(&encoded[..partial_length])
+        .map_err(|error| persist_failure(ConsumerStatePersistStage::Append, error))?;
+    file.sync_all()
+        .map_err(|error| persist_failure(ConsumerStatePersistStage::Append, error))?;
+    Err(persist_failure(
+        ConsumerStatePersistStage::Append,
+        "injected partial consumer state event append",
+    ))
+}
+
 fn persist_consumer_event_with_sync(
     root: &Path,
     stream: &str,
@@ -177,22 +272,42 @@ fn persist_consumer_event_with_sync(
     event: ConsumerStateEvent,
     sync: impl FnOnce(&fs::File) -> io::Result<()>,
 ) -> Result<(), BrokerError> {
+    let batch_event = matches!(
+        &event,
+        ConsumerStateEvent::DeliveryAttempts { .. } | ConsumerStateEvent::AcknowledgeBatch { .. }
+    );
     #[cfg(feature = "instrumentation")]
     let _stage_timer = StageTimer::new("core.consumer_state_persist");
     let path = consumer_state_journal_path(root, stream, consumer);
     let parent = path.parent().ok_or_else(|| {
-        BrokerError::Io(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "consumer state journal has no parent",
-        ))
+        map_io_failure(
+            ConsumerStatePersistStage::BeforeAppend,
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "consumer state journal has no parent",
+            ),
+            batch_event,
+        )
     })?;
-    let mut encoded = serde_json::to_vec(&event)?;
+    let mut encoded = serde_json::to_vec(&event).map_err(|error| {
+        if batch_event {
+            persist_failure(ConsumerStatePersistStage::BeforeAppend, error)
+        } else {
+            BrokerError::State(error)
+        }
+    })?;
     encoded.push(b'\n');
 
     let journal_len = match fs::metadata(&path) {
         Ok(metadata) => metadata.len(),
         Err(error) if error.kind() == io::ErrorKind::NotFound => 0,
-        Err(error) => return Err(error.into()),
+        Err(error) => {
+            return Err(map_io_failure(
+                ConsumerStatePersistStage::BeforeAppend,
+                error,
+                batch_event,
+            ));
+        }
     };
     if journal_len.saturating_add(encoded.len() as u64) > MAX_CONSUMER_STATE_JOURNAL_BYTES {
         // The checkpoint is published before the journal is truncated. If a process stops
@@ -201,15 +316,60 @@ fn persist_consumer_event_with_sync(
         let mut checkpoint = current_state.clone();
         checkpoint.stream = stream.to_owned();
         checkpoint.consumer = consumer.to_owned();
-        persist_consumer_state(root, &checkpoint)?;
-        truncate_consumer_state_journal(&path, 0)?;
+        persist_consumer_state(root, &checkpoint).map_err(|error| {
+            map_broker_failure(ConsumerStatePersistStage::BeforeAppend, error, batch_event)
+        })?;
+        truncate_consumer_state_journal(&path, 0).map_err(|error| {
+            map_broker_failure(ConsumerStatePersistStage::BeforeAppend, error, batch_event)
+        })?;
     }
 
-    fs::create_dir_all(parent)?;
-    let mut file = OpenOptions::new().create(true).append(true).open(path)?;
-    file.write_all(&encoded)?;
-    sync(&file)?;
+    fs::create_dir_all(parent).map_err(|error| {
+        map_io_failure(ConsumerStatePersistStage::BeforeAppend, error, batch_event)
+    })?;
+    let mut file = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .map_err(|error| {
+            map_io_failure(ConsumerStatePersistStage::BeforeAppend, error, batch_event)
+        })?;
+    file.write_all(&encoded)
+        .map_err(|error| map_io_failure(ConsumerStatePersistStage::Append, error, batch_event))?;
+    sync(&file)
+        .map_err(|error| map_io_failure(ConsumerStatePersistStage::Sync, error, batch_event))?;
     Ok(())
+}
+
+fn persist_failure(stage: ConsumerStatePersistStage, error: impl Display) -> BrokerError {
+    BrokerError::ConsumerStatePersistence {
+        stage,
+        message: error.to_string(),
+    }
+}
+
+fn map_io_failure(
+    stage: ConsumerStatePersistStage,
+    error: io::Error,
+    batch_event: bool,
+) -> BrokerError {
+    if batch_event {
+        persist_failure(stage, error)
+    } else {
+        BrokerError::Io(error)
+    }
+}
+
+fn map_broker_failure(
+    stage: ConsumerStatePersistStage,
+    error: BrokerError,
+    batch_event: bool,
+) -> BrokerError {
+    if batch_event {
+        persist_failure(stage, error)
+    } else {
+        error
+    }
 }
 
 fn consumer_state_path(root: &Path, stream: &str, consumer: &str) -> PathBuf {
