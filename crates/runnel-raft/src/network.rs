@@ -80,6 +80,7 @@ pub(crate) enum ForwardedOperation {
         consumer: String,
         ack_timeout_ms: u64,
         max_delivery_attempts: Option<u32>,
+        retry_delay_ms: u64,
     },
     InspectConsumer {
         stream: String,

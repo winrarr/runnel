@@ -2,14 +2,17 @@
 
 - Status: accepted
 - Date: 2026-09-06
-- Extended by: [ADR 0033](0033-fixed-consumer-retry-delay.md), which accepts the next bounded retry-delay field; runtime support remains open.
+- Extended by: [ADR 0033](0033-fixed-consumer-retry-delay.md), which accepts and implements the bounded fixed retry-delay field.
 
 ## Decision
 
-Add two additive operations to the provisional JSON-lines protocol:
+The consumer policy operations in the current provisional JSON-lines protocol
+are:
 
-- `configure_consumer(stream, consumer, ack_timeout_ms, max_delivery_attempts)`
+- `configure_consumer(stream, consumer, ack_timeout_ms, max_delivery_attempts, retry_delay_ms)`
 - `inspect_consumer(stream, consumer)`
+
+ADR 0033 adds `retry_delay_ms` to the complete durable policy.
 
 The operation returns the durable policy version, whether it is explicitly
 configured, the bounded acknowledgement timeout, and the optional positive
@@ -35,9 +38,10 @@ The prior broker-wide policy could not express different failure budgets for
 independent consumers of one stream. Persisting a small policy snapshot at the
 consumer and delivery boundaries makes policy selection application-aware
 without exposing files, nodes, or Raft groups. Pinning avoids silently changing
-the outcome for an already in-flight poison record. The additive v1 operations
-preserve existing clients and leave capability negotiation for the future
-protocol compatibility decision.
+the outcome for an already in-flight poison record. The provisional wire and
+persisted schemas have no compatibility promise for older Runnel clients or
+builds; deployments use one compatible binary across a static cluster during
+coordinated maintenance.
 
 The scope follows the evidence and alternatives in the [application-aware retry
 design](../design/application-aware-retry-policy.md): Kafka, NATS JetStream,
@@ -53,8 +57,9 @@ consumer lifecycle was durable.
 - Local and clustered consumers can select independent bounded attempt budgets.
 - Consumer policy survives local restart, Raft replay, snapshots, and ownership
   transfer because it is part of existing consumer state.
-- Legacy consumers retain current broker-wide behavior and old persisted state
-  remains readable through serde defaults.
+- Consumers without an explicit policy retain the broker-wide timeout and
+  attempt-limit fallback, with zero retry delay. Persisted state from earlier
+  policy schemas is not read forward; no conversion path is provided.
 - Dead-letter records still contain only their existing key and payload; safe
   provenance and redrive remain tracked follow-up work in TD-018.
 - The provisional protocol has no authorization or capability negotiation, so
@@ -65,6 +70,8 @@ consumer lifecycle was durable.
 
 Focused local, clustered, protocol, and real-server tests cover policy
 validation, idempotent inspection, per-consumer isolation, version pinning,
-restart persistence, and existing derived dead-letter behavior. ADR 0033 now
-decides the fixed-delay contract; its local and clustered runtime tests remain
-open along with provenance, redrive, and richer terminal dispositions.
+restart persistence, and existing derived dead-letter behavior. ADR 0033's
+fixed-delay contract is implemented with local and clustered recovery,
+ordering, batch, deadline, and real-process leader-transfer coverage. Durable
+dead-letter provenance, redrive, and richer terminal dispositions remain
+open.

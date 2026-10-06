@@ -554,11 +554,12 @@ async fn typed_client_configures_consumer_retry_policy_and_dead_letters() {
     let mut client = Client::connect(server.broker_addr).await.unwrap();
     client.create_stream("events").await.unwrap();
     let policy = client
-        .configure_consumer("events", "worker", 0, Some(2))
+        .configure_consumer("events", "worker", 0, Some(2), 300)
         .await
         .unwrap();
     assert!(policy.configured);
     assert_eq!(policy.max_delivery_attempts, Some(2));
+    assert_eq!(policy.retry_delay_ms, 300);
     client.publish("events", "poison").await.unwrap();
     assert_eq!(
         client
@@ -570,6 +571,8 @@ async fn typed_client_configures_consumer_retry_policy_and_dead_letters() {
         Some(1)
     );
     tokio::time::sleep(Duration::from_millis(5)).await;
+    assert!(client.poll("events", "worker").await.unwrap().is_none());
+    tokio::time::sleep(Duration::from_millis(320)).await;
     assert_eq!(
         client
             .poll("events", "worker")
@@ -602,20 +605,21 @@ async fn typed_client_consumer_policy_idempotency_preserves_and_advances_version
     client.create_stream("events").await.unwrap();
 
     let initial = client
-        .configure_consumer("events", "worker", 50, Some(4))
+        .configure_consumer("events", "worker", 50, Some(4), 250)
         .await
         .unwrap();
     assert!(initial.configured);
     assert_eq!(initial.version, 1);
     assert_eq!(initial.ack_timeout_ms, 50);
     assert_eq!(initial.max_delivery_attempts, Some(4));
+    assert_eq!(initial.retry_delay_ms, 250);
     assert_eq!(
         client.inspect_consumer("events", "worker").await.unwrap(),
         initial
     );
 
     let repeated = client
-        .configure_consumer("events", "worker", 50, Some(4))
+        .configure_consumer("events", "worker", 50, Some(4), 250)
         .await
         .unwrap();
     assert_eq!(repeated, initial);
@@ -625,12 +629,13 @@ async fn typed_client_consumer_policy_idempotency_preserves_and_advances_version
     );
 
     let changed = client
-        .configure_consumer("events", "worker", 75, Some(4))
+        .configure_consumer("events", "worker", 75, Some(4), 500)
         .await
         .unwrap();
     assert_eq!(changed.version, repeated.version + 1);
     assert_eq!(changed.ack_timeout_ms, 75);
     assert_eq!(changed.max_delivery_attempts, Some(4));
+    assert_eq!(changed.retry_delay_ms, 500);
     assert_eq!(
         client.inspect_consumer("events", "worker").await.unwrap(),
         changed

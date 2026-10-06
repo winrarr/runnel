@@ -105,9 +105,9 @@ They establish current recovery behavior only; they do not implement migration.
 | Root identity | \`storage.json\` is a denied-unknown-field JSON object at metadata version 1 with \`cluster_name\` and \`node_id\`. Existing mismatches, unknown versions, malformed metadata, and unmarked grouped state fail closed. | Identity is an ownership guard, not a generation selector. A staged image MUST bind cluster/node identity and cannot acquire authority by matching configuration alone. |
 | Group layout/manifest | \`groups/metadata\` is the metadata group. Stream data groups are under \`groups/data/<hex-stream>/\` and use \`group.json\` for stream, stream ID, and group ID. Startup validates paths, manifests, and group files before opening groups. | The manifest has no migration phase or generation field. It MUST NOT be overloaded without a compatibility revision. |
 | Raft log | \`raft-log.json\` has a separate denied-unknown-field format version 1, purge boundary, entries, committed ID, and vote. | Consensus-log representation is independent from retained stream data. A conversion MUST preserve committed and purge/applied boundaries and cannot use a state-machine version as a Raft-log version. |
-| State-machine checkpoint | \`state-machine/state-machine.json\` is emitted at version 2 and reads version 1 forward into current stream identity/lifecycle state. The persisted image also carries ordinary and grouped consumer progress, attempts, in-flight member/token/deadline state, lease-clock floor, request-ID deduplication, redelivery/dead-letter counters, last-applied log, and membership. | Read-forward is a parser behavior; it does not prove old writers can operate beside new writers or that all semantic fields and cross-file boundaries are preserved. A future migration must distinguish portable durable state from process-local state and validate stream/group identity rather than trusting JSON shape. |
-| Snapshot | \`snapshot.json\` wraps OpenRaft metadata and a payload that accepts version 1, including an omitted legacy version, and version 2. The payload carries the materialized stream, consumer, grouped-delivery, lease-clock, deduplication, and counters state; installation validates payload syntax/version before replacing state. | Snapshot metadata carries a committed/applied boundary and membership. Snapshot install is a recovery primitive, not a general format converter, and current validation does not by itself prove payload identity or agreement with the checkpoint/journal/Raft log. |
-| State-machine journal | \`state-machine/state-machine.log\` is a length-prefixed JSON journal with record version 1 and a 64 MiB record bound. Recovery reads the journal into memory, truncates only an incomplete final frame, and fails on complete malformed or unsupported entries. | Journal replay, checkpoint, snapshot, and Raft-log boundaries must agree before a target can serve; current preflight validates these artifacts independently rather than proving that agreement. |
+| State-machine checkpoint | \`state-machine/state-machine.json\` is emitted and accepted at version 3; older and unknown versions fail closed without mutation. The persisted image carries ordinary and grouped consumer progress, attempts, in-flight member/token/deadline state, lease-clock floor, request-ID deduplication, redelivery/dead-letter counters, last-applied log, and membership. | A future migration must distinguish portable durable state from process-local state and validate stream/group identity rather than trusting JSON shape. |
+| Snapshot | \`snapshot.json\` wraps OpenRaft metadata and a version-3 payload; older and unknown payload versions fail closed. The payload carries the materialized stream, consumer, grouped-delivery, lease-clock, deduplication, and counters state; installation validates payload syntax/version before replacing state. | Snapshot metadata carries a committed/applied boundary and membership. Snapshot install is a recovery primitive, not a general format converter, and current validation does not by itself prove payload identity or agreement with the checkpoint/journal/Raft log. |
+| State-machine journal | \`state-machine/state-machine.log\` is a length-prefixed JSON journal with record version 2 and a 64 MiB record bound. Recovery reads the journal into memory, truncates only an incomplete final frame, and fails on complete malformed or unsupported entries, including older versions. | Journal replay, checkpoint, snapshot, and Raft-log boundaries must agree before a target can serve; current preflight validates these artifacts independently rather than proving that agreement. |
 | Peer/snapshot transport | Peer RPCs use persistent or pooled TCP connections and bounded big-endian length-prefixed JSON frames without a version handshake; the outer body limit is 64 MiB. Snapshot chunks are bounded at 64 KiB, and the current receiver buffers a complete transfer in memory and retries an interruption from byte zero. | Parseability does not establish mixed-version safety. Existing snapshot retry behavior MUST NOT be described as resumable migration, and the complete in-memory receiver is a recovery/resource boundary that future transfer work must measure. |
 
 The clustered validation path is exercised by tests for [identity mismatch and
@@ -140,13 +140,13 @@ limits, identities, and test fixtures.
 | Cluster storage.json | Metadata version 1 with exact cluster/node identity. | Current version 1 only. | No rolling compatibility level. | No generation selection, migration, or downgrade. |
 | Cluster group.json | Current stream/stream-ID/group-ID/path agreement. | Current unversioned shape. | No mixed-generation group contract. | No converter. |
 | Cluster Raft log | Format version 1 only. | Format version 1 only. | No cross-release log-writer guarantee. | No log converter. |
-| State-machine checkpoint | Versions 1 and 2, with version 1 converted in memory; the image includes stream/lifecycle state, ordinary and grouped consumer state, attempts, in-flight leases, lease-clock floor, request deduplication, counters, last-applied log, and membership. | Version 2. | New reader over old bytes is observed; old/new writers, cross-artifact agreement, and command semantics are not proven. | No general migration or downgrade. |
-| Snapshot payload | Versions 1 and 2, including legacy omitted version, with materialized stream, consumer, grouped-delivery, lease-clock, deduplication, and counter state. | Version 2. | No rolling snapshot-writer guarantee. | Snapshot replacement is separate from format conversion. |
-| State-machine journal | Record version 1; incomplete final frame is a recovery exception, and each record is bounded at 64 MiB. | Record version 1. | No mixed-version journal contract. | No converter. |
+| State-machine checkpoint | Version 3 only; all current persisted fields and stream shapes are required. | Version 3. | No mixed-version writer contract. | No migration or downgrade. |
+| Snapshot payload | Version 3 only; all current persisted fields and stream shapes are required. | Version 3. | No rolling snapshot-writer guarantee. | Snapshot replacement is separate from format conversion. |
+| State-machine journal | Record version 2 only; incomplete final frame is a recovery exception, and each record is bounded at 64 MiB. | Record version 2. | No mixed-version journal contract. | No converter. |
 | Peer frames | Current persistent/pooled transport with bounded big-endian length-prefixed JSON frames. | Current shape only. | No explicit version negotiation or rolling guarantee. | No protocol migration. |
 
 The current supported opening behavior is therefore limited to the current
-layouts and the tested read-forward checkpoint/snapshot cases. It does not
+layouts and tested current-format checkpoint, snapshot, and journal recovery. It does not
 include a binary-to-binary rolling upgrade, a directory rewrite, or a
 local-to-cluster move.
 
@@ -608,8 +608,10 @@ limits, temporary-space budget, recovery work, and failure state recorded.
 
 ## Repository evidence and handoff boundary
 
-Current startup refusal, legacy read-forward, journal, snapshot, identity, and
-real-process recovery evidence remains in the linked source/tests. ADR 0037
-accepts an operational behavior contract but adds no runtime compatibility
-promise. The backlog records that accepted design milestone; migration
-implementation and end-to-end gates remain open.
+Current startup refusal, local-stream read-forward, journal, snapshot,
+identity, and real-process recovery evidence remains in the linked
+source/tests. Earlier state-machine checkpoint, snapshot, and journal formats
+fail closed; no reader or conversion path is provided. ADR 0037 accepts an
+operational behavior contract but adds no runtime compatibility promise. The
+backlog records that accepted design milestone; migration implementation and
+end-to-end gates remain open.

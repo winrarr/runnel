@@ -166,7 +166,7 @@ Goal: let multiple worker instances share one durable consumer while preserving 
 
 Rationale: small applications need a single durable worker without extra coordination, while growing applications should be able to add workers without learning about partitions or triggering application-managed rebalancing.
 
-Current progress: local and clustered grouped delivery now cover durable attempts, out-of-order acknowledgements, expiry, stale-delivery fencing, bounded expiry lookup, and real-process restart/failure paths. New local and persistent one-node recovery tests keep an offset unacknowledged after its first assignment under attempt limit 2, change the current policy to version 2 with limit 1, close and reopen the engine, then verify that the offset is delivered at attempt 2 and terminally moved only after reaching its original limit. This establishes persistence of both attempt count and the pinned snapshot across local journal recovery and persistent Raft engine reopen. The shared `assert_expired_delivery_is_fenced` conformance check requires an expired receipt to be rejected before replacement polling, followed by redelivery to a different member with a new token; both local and persistent Raft tests run it. A real three-process test also checks stale acknowledgement after expiry and before replacement polling. The leader-failure test separately verifies transfer of current policy and the pending offset's pinned snapshot to a new leader. A new real three-process test stops all nodes while a shared delivery is pending, restarts them from the same data directories, and verifies the original member receipt and token remain valid for acknowledgement. Another real three-process public-protocol test verifies that an in-flight key blocks its successor while another key progresses, preserves the held member receipt across a repeated poll, and releases the successor after acknowledgement. Lease expiry remains demand-driven, with no background timer. The shared engine also reports currently tracked in-flight deliveries. Broader failover, replay, retry-policy, dead-letter, and scalable ownership behavior remain incomplete.
+Current progress: local and clustered grouped delivery now cover durable attempts, out-of-order acknowledgements, expiry, stale-delivery fencing, bounded expiry lookup, and real-process restart/failure paths. New local and persistent one-node recovery tests keep an offset unacknowledged after its first assignment under attempt limit 2, change the current policy to version 2 with limit 1, close and reopen the engine, then verify that the offset is delivered at attempt 2 and terminally moved only after reaching its original limit. This establishes persistence of both attempt count and the pinned snapshot across local journal recovery and persistent Raft engine reopen. The shared `assert_expired_delivery_is_fenced` conformance check requires an expired receipt to be rejected before replacement polling, followed by redelivery to a different member with a new token; both local and persistent Raft tests run it. A real three-process test also checks stale acknowledgement after expiry and before replacement polling. The leader-failure test separately verifies transfer of current policy and the pending offset's pinned snapshot to a new leader. A new real three-process test stops all nodes while a shared delivery is pending, restarts them from the same data directories, and verifies the original member receipt and token remain valid for acknowledgement. Another real three-process public-protocol test verifies that an in-flight key blocks its successor while another key progresses, preserves the held member receipt across a repeated poll, and releases the successor after acknowledgement. Lease expiry remains demand-driven, with no background timer. The shared engine also reports currently tracked in-flight deliveries. Broader failover, replay, exponential/jittered backoff, dead-letter recovery, and scalable ownership behavior remain incomplete.
 
 Constraints:
 
@@ -191,23 +191,23 @@ Goal: let applications choose documented retry, backoff, dead-letter, and recove
 Rationale: a single broker-wide attempt limit is a useful local default, but event fan-out, interactive work, and long-running jobs have different failure and recovery needs.
 
 Current progress: local and clustered engines expose durable configure and
-inspect operations for bounded per-consumer acknowledgement timeouts and
-attempt limits. Policies use broker-wide settings as a legacy fallback, pin on
-first delivery, survive restart and clustered state replay, and retain the
-existing derived dead-letter transition. ADR 0033 accepts a fixed
-`retry_delay_ms` from zero through seven days, separate from the lease and
-pinned per offset; runtime implementation and verification remain open. In
-both engines, the delay starts when a committed poll or stale acknowledgement
-first durably observes lease expiry, and the persisted deadline is that
-observation time plus the pinned delay. A late observation starts a fresh full
-delay; a deadline already persisted survives restart and leader transfer. If
-restart or leader transfer precedes durable expiry observation, the first
-later operation starts the delay. Because expiry is demand-driven, a late
-observation can extend total wait beyond lease plus delay, and no command means
-no progress. Clustered timing remains subject to TD-020; local persisted
-deadlines use wall time before and after restart. Exponential or
-jittered delay, provenance, redrive, and richer terminal dispositions remain
-open.
+inspect operations for bounded per-consumer acknowledgement timeouts, attempt
+limits, and the fixed `retry_delay_ms` accepted by ADR 0033. Policies use
+broker-wide settings as a legacy fallback, pin on first delivery, survive
+restart and clustered state replay, and retain the existing derived
+dead-letter transition. The delay is separate from the lease, defaults to
+zero, is bounded to seven days, and is pinned per offset. In both engines, the
+delay starts when a committed poll or stale acknowledgement first durably
+observes lease expiry; a late observation starts a fresh full delay, and a
+deadline already persisted survives restart or leader transfer. If restart
+or leader transfer precedes durable expiry observation, the first later
+operation starts the delay. Recovery, same-key ordering, unrelated work,
+policy changes, batch delivery, and the real clustered process path now have
+focused coverage. Because expiry is demand-driven, a late observation can
+extend total wait beyond lease plus delay, and no command means no progress.
+Clustered timing remains subject to TD-020; local persisted deadlines use
+wall time before and after restart. Exponential or jittered delay, provenance,
+redrive, and richer terminal dispositions remain open.
 
 Constraints:
 
@@ -369,7 +369,7 @@ Goal: let supported broker upgrades preserve or deliberately transform acknowled
 
 Rationale: the storage layout now has separate metadata and stream data groups, so future format and placement changes need an explicit recovery and migration contract.
 
-Current progress: unsupported versions, identities, and layouts in existing clustered storage fail closed before recovery opens groups or mutates authoritative state; empty-directory startup may still initialize `storage.json` by design. The [TD-007 storage compatibility evidence note](design/td-007-storage-compatibility-evidence.md) records current read-forward fixtures and refusal tests. [ADR 0037](decisions/0037-offline-side-by-side-storage-upgrades.md) accepts the first upgrade behavior: offline side-by-side conversion, immutable source until validated target activation, and explicit offline rollback only while no target-only durable mutation has been accepted. A durable `write-pending` state blocks rollback during an unresolved first mutation; successful writes close rollback, proven no-effect failures may restore eligibility, and ambiguous outcomes fail closed. The [policy](design/storage-upgrade-policy.md) summarizes artifact boundaries and the [safety plan](design/storage-upgrade-safety-plan.md) defines implementation gates. This policy does not add runtime support: no migration command, generation selector, writer fence, supported downgrade, interrupted-transfer recovery, or rolling-upgrade path is implemented.
+Current progress: unsupported versions, identities, and layouts in existing clustered storage fail closed before recovery opens groups or mutates authoritative state; empty-directory startup may still initialize `storage.json` by design. The [TD-007 storage compatibility evidence note](design/td-007-storage-compatibility-evidence.md) records current-format recovery, local-stream read-forward fixtures, and refusal tests. Earlier state-machine checkpoint, snapshot, and journal schemas fail closed; no conversion is implemented. [ADR 0037](decisions/0037-offline-side-by-side-storage-upgrades.md) accepts the first upgrade behavior: offline side-by-side conversion, immutable source until validated target activation, and explicit offline rollback only while no target-only durable mutation has been accepted. A durable `write-pending` state blocks rollback during an unresolved first mutation; successful writes close rollback, proven no-effect failures may restore eligibility, and ambiguous outcomes fail closed. The [policy](design/storage-upgrade-policy.md) summarizes artifact boundaries and the [safety plan](design/storage-upgrade-safety-plan.md) defines implementation gates. This policy does not add runtime support: no migration command, generation selector, writer fence, supported downgrade, interrupted-transfer recovery, or rolling-upgrade path is implemented.
 
 Constraints:
 
@@ -379,9 +379,10 @@ Constraints:
 
 Acceptance criteria:
 
-- the current reopen/read-forward behavior and accepted per-artifact
-  compatibility and migration boundaries are documented, including the
-  offline side-by-side contract and unsupported rolling conversion;
+- current local-stream reopen/read-forward behavior, fail-closed handling of
+  unsupported state-machine schemas, and accepted per-artifact compatibility
+  and migration boundaries are documented, including the offline
+  side-by-side contract and unsupported rolling conversion;
 - representative old and new layouts have automated recovery or migration
   tests that preserve logical records, consumer progress, attempts, and
   producer request identity;

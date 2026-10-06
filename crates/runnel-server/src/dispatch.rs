@@ -244,8 +244,15 @@ pub(crate) async fn handle_request(
             consumer,
             ack_timeout_ms,
             max_delivery_attempts,
+            retry_delay_ms,
         } => engine
-            .configure_consumer(&stream, &consumer, ack_timeout_ms, max_delivery_attempts)
+            .configure_consumer(
+                &stream,
+                &consumer,
+                ack_timeout_ms,
+                max_delivery_attempts,
+                retry_delay_ms,
+            )
             .await
             .map(|policy| consumer_policy_response(stream, consumer, policy)),
         Request::InspectConsumer { stream, consumer } => engine
@@ -375,6 +382,7 @@ fn consumer_policy_response(stream: String, consumer: String, policy: ConsumerPo
         configured: policy.configured,
         ack_timeout_ms: policy.ack_timeout_ms,
         max_delivery_attempts: policy.max_delivery_attempts,
+        retry_delay_ms: policy.retry_delay_ms,
     }
 }
 

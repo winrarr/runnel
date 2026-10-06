@@ -69,12 +69,12 @@ The current implementation supports the following narrow properties:
   including when a client retries a poll after losing its response. Once a
   command evaluates it as expired, reassignment increments the persisted
   attempt and creates a new token; an old token remains fenced.
-- The floor and in-flight delivery state survive the current checkpoint,
+- The floor and in-flight delivery state survive current-format checkpoint,
   journal-replay, snapshot, process-restart, and tested follower/leader
-  recovery paths. Current checkpoint and snapshot readers accept versions 1 and
-  2; the floor is absent from legacy version-1 data and defaults to zero, while
-  current writers emit version 2. This is read-forward behavior for tested
-  artifacts, not a rolling-upgrade guarantee.
+  recovery paths. Checkpoint and snapshot payloads require version 3, and the
+  state-machine journal requires record version 2. Earlier schemas fail
+  closed without conversion; there is no read-forward behavior or rolling
+  upgrade guarantee.
 - Expiry is demand-driven. There is no timer or background command that
   advances the floor or reclaims a delivery. If no leader can commit a poll or
   acknowledgement (grouped or compatibility), an otherwise expired delivery
@@ -133,12 +133,10 @@ TD-020 does not currently claim:
 - that the floor solves forward jumps, positive/negative inter-node offsets,
   pause or scheduling delays, process suspension, or operator timeout drift.
 
-The state-machine version-1 compatibility tests prove that legacy state and
-snapshots remain readable, but no test establishes a rolling upgrade in which
-an older writer reads a current artifact containing `lease_clock_ms`. Peer
-frames also have no explicit version-negotiation or lease-clock capability
-level. Any release policy must be decided separately from this additive
-read-forward field.
+Tests reject pre-current state-machine checkpoint, snapshot, and journal
+schemas without mutation, and current-format recovery preserves the lease
+clock floor. Peer frames have no explicit version negotiation or lease-clock
+capability level, and mixed-version cluster operation is unsupported.
 
 ## Alternatives and recommendation
 
@@ -195,34 +193,24 @@ The focused state-machine tests cover future, equal, and past deadlines;
 forward jumps and a fixed successor offset; backward observations and the
 persisted floor; deadlines behind the floor; acknowledgement-time expiry and
 stale-token fencing; no-command expiry; journal restart and leader change; and
-snapshot round-trip. The state-machine-store test
-`legacy_snapshot_defaults_lease_floor_and_applied_commands_advance_it`
-installs a version-1 snapshot with no `lease_clock_ms`, observes the default
-floor of zero, applies a grouped poll that advances it, and then applies a
-stale-member acknowledgement on the still-active stream. That rejected ack
-advances the floor before member validation while retaining the valid in-flight
-delivery; reopening the store replays the commands and retains both the floor
-and delivery. This covers a concrete invalid-ack outcome through the
-`RaftStateMachine` apply seam. It does not cover every invalid acknowledgement
-outcome. The [three-process clustered tests](../../crates/runnel-server/tests/cluster_smoke.rs)
+current-format snapshot round-trip. The current snapshot test
+`grouped_lease_clock_floor_survives_snapshot_recovery_and_backward_time`
+round-trips the floor and grouped delivery state. Current-format journal and
+checkpoint tests reopen the applied state and retain the floor and in-flight
+delivery. Pre-retry checkpoint and snapshot schemas are rejected; no
+read-forward or migration is provided. The [three-process clustered tests](../../crates/runnel-server/tests/cluster_smoke.rs)
 cover real follower restart, leader/process failure, reassignment, durable
 attempts, and stale-token rejection. They use the host clock and do not inject
 skew or jumps. The focused [`persistent_compatibility_poll_and_ack_observe_and_persist_lease_clock_floor`](../../crates/runnel-raft/src/lib.rs) test exercises both compatibility aliases through a persistent single-node Raft group. It verifies that each command advances only the target stream group's floor and that the floor survives reopen after both poll and acknowledgement. This does not cover follower forwarding or controlled clocks.
 
 The unit fixture that advances the floor through a second stream is useful for
 state-machine arithmetic but is not evidence that one stream advances another
-stream's floor. The complementary
-`legacy_checkpoint_defaults_lease_floor_and_group_poll_survives_replay` test
-writes a version-1 checkpoint without `lease_clock_ms`, observes the default
-floor of zero, applies a grouped poll at 125 ms, then reopens the store and
-verifies journal replay preserves both the floor and the member's in-flight
-delivery through its 250 ms deadline. Together with the legacy-snapshot test,
-this establishes omitted-floor recovery and subsequent command advancement
-for both persisted state-machine entry paths. It does not establish compatibility
-with an older binary writing current artifacts or cover every acknowledgement
-outcome. There is no mixed-timeout cluster test, no clock-health telemetry, and
-no measurement of real-time redelivery error under controlled clock skew or
-process suspension.
+stream's floor. Current-format checkpoint, snapshot, and journal recovery
+preserve the observed floor and delivery state. They do not establish
+compatibility with an older binary writing or reading state, or cover every
+acknowledgement rejection path. There is no mixed-timeout cluster test, no
+clock-health telemetry, and no measurement of real-time redelivery error under
+controlled clock skew or process suspension.
 
 No performance benchmark applies to the current floor slice: it changes lease
 bookkeeping and persistence semantics without changing the intended hot-path

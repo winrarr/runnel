@@ -45,6 +45,8 @@ enum Command {
         ack_timeout_ms: u64,
         #[arg(long)]
         max_delivery_attempts: Option<u32>,
+        #[arg(long, default_value_t = 0)]
+        retry_delay_ms: u64,
     },
     InspectConsumer {
         stream: String,
@@ -121,11 +123,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             consumer,
             ack_timeout_ms,
             max_delivery_attempts,
+            retry_delay_ms,
         } => Request::ConfigureConsumer {
             stream,
             consumer,
             ack_timeout_ms,
             max_delivery_attempts,
+            retry_delay_ms,
         },
         Command::InspectConsumer { stream, consumer } => {
             Request::InspectConsumer { stream, consumer }

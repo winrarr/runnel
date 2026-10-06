@@ -175,6 +175,7 @@ assert_consumer_policy() {
     assert_policy_field "$output" configured True
     assert_policy_field "$output" ack_timeout_ms 1234
     assert_policy_field "$output" max_delivery_attempts 7
+    assert_policy_field "$output" retry_delay_ms 250
 }
 
 trap cleanup EXIT INT TERM
@@ -244,7 +245,7 @@ assert_contains "$output" '"payload": "poison"'
 curl -fsS "http://127.0.0.1:$http_port/metrics" | grep -Eq 'runnel_dead_letters_total 1'
 
 policy_output=$("$cli_binary" --server "$broker_addr" configure-consumer events retry-policy-worker 1234 \
-    --max-delivery-attempts 7)
+    --max-delivery-attempts 7 --retry-delay-ms 250)
 assert_consumer_policy "$policy_output"
 
 policy_output=$("$cli_binary" --server "$broker_addr" inspect-consumer events retry-policy-worker)
