@@ -10,8 +10,12 @@ use std::time::{Duration, Instant};
 use runnel_client::{AttemptFailure, AttemptOutcome, Client};
 use runnel_protocol::{Request, Response};
 use tempfile::TempDir;
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader as AsyncBufReader};
+use tokio::io::AsyncWriteExt;
 use tokio::net::{TcpListener as AsyncTcpListener, TcpStream as AsyncTcpStream};
+
+#[path = "support/v2_proxy.rs"]
+mod v2_proxy;
+use v2_proxy::{decode_application_response as decode_proxy_response, exchange_one_request};
 
 struct RunningServer {
     child: Child,
@@ -261,30 +265,9 @@ async fn proxy_publish_response_then_sigterm(
         .accept()
         .await
         .expect("proxy should accept the publish caller");
-    let (client_reader, client_writer) = client.into_split();
-    let mut client_reader = AsyncBufReader::new(client_reader);
-    let mut request = Vec::new();
-    client_reader
-        .read_until(b'\n', &mut request)
-        .await
-        .expect("proxy should read the publish request");
-
-    let broker = AsyncTcpStream::connect(broker_addr)
-        .await
-        .expect("proxy should connect to the broker");
-    let (broker_reader, mut broker_writer) = broker.into_split();
-    broker_writer
-        .write_all(&request)
-        .await
-        .expect("proxy should forward the publish request");
-    let mut broker_reader = AsyncBufReader::new(broker_reader);
-    let mut response = Vec::new();
-    broker_reader
-        .read_until(b'\n', &mut response)
-        .await
-        .expect("proxy should receive the publish response");
+    let (client_writer, response) = exchange_one_request(client, broker_addr).await;
     assert!(matches!(
-        serde_json::from_slice::<Response>(&response).expect("broker response should be valid"),
+        decode_proxy_response(&response),
         Response::Published { offset: 0, .. }
     ));
 
@@ -305,20 +288,7 @@ async fn proxy_connections(
 ) {
     for _ in 0..2 {
         let (client, _) = listener.accept().await.unwrap();
-        let (client_reader, mut client_writer) = client.into_split();
-        let mut client_reader = AsyncBufReader::new(client_reader);
-        let mut request = Vec::new();
-        client_reader.read_until(b'\n', &mut request).await.unwrap();
-
-        let broker = AsyncTcpStream::connect(broker_addr).await.unwrap();
-        let (broker_reader, mut broker_writer) = broker.into_split();
-        broker_writer.write_all(&request).await.unwrap();
-        let mut broker_reader = AsyncBufReader::new(broker_reader);
-        let mut response = Vec::new();
-        broker_reader
-            .read_until(b'\n', &mut response)
-            .await
-            .unwrap();
+        let (mut client_writer, response) = exchange_one_request(client, broker_addr).await;
 
         if drop_first_response.swap(false, Ordering::AcqRel) {
             continue;

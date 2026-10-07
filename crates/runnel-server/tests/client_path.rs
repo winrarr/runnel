@@ -10,12 +10,15 @@ use runnel_client::{
     ClientConfig, ClientError, ConsumeBatchLimits, PublishBatchOutcome, PublishBatchRecord,
     PublishOptions, PublishReceipt,
 };
-use runnel_protocol::v2::{self, ServerFrame};
 use runnel_protocol::{PublishBatchRecordResponse, Response};
 use tempfile::TempDir;
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
+use tokio::io::AsyncWriteExt;
 use tokio::net::{TcpListener as AsyncTcpListener, TcpStream as AsyncTcpStream};
 use tokio::sync::oneshot;
+
+#[path = "support/v2_proxy.rs"]
+mod v2_proxy;
+use v2_proxy::{decode_application_response as decode_proxy_response, exchange_one_request};
 
 struct RunningServer {
     child: Child,
@@ -1251,7 +1254,7 @@ async fn drop_first_response_proxy(listener: AsyncTcpListener, broker_addr: Sock
     let mut dropped_response = None;
     for drop_response in [true, false] {
         let (client, _) = listener.accept().await.unwrap();
-        let (mut client_writer, response) = exchange_v2_request(client, broker_addr).await;
+        let (mut client_writer, response) = exchange_one_request(client, broker_addr).await;
 
         if drop_response {
             dropped_response = Some(response);
@@ -1269,7 +1272,7 @@ async fn withhold_response_proxy(
     release_receiver: oneshot::Receiver<()>,
 ) -> Vec<u8> {
     let (client, _) = listener.accept().await.unwrap();
-    let (mut client_writer, response) = exchange_v2_request(client, broker_addr).await;
+    let (mut client_writer, response) = exchange_one_request(client, broker_addr).await;
     response_sender
         .send((response.clone(), Instant::now()))
         .expect("test should inspect the broker response before client timeout");
@@ -1279,68 +1282,6 @@ async fn withhold_response_proxy(
         .expect("test should release the withheld client response after timeout");
     let _ = client_writer.write_all(&response).await;
     response
-}
-
-async fn exchange_v2_request(
-    client: AsyncTcpStream,
-    broker_addr: SocketAddr,
-) -> (tokio::net::tcp::OwnedWriteHalf, Vec<u8>) {
-    let (mut client_reader, mut client_writer) = client.into_split();
-    let broker = AsyncTcpStream::connect(broker_addr).await.unwrap();
-    let (mut broker_reader, mut broker_writer) = broker.into_split();
-
-    let mut preface = [0; v2::PREFACE.len()];
-    client_reader.read_exact(&mut preface).await.unwrap();
-    assert_eq!(preface, v2::PREFACE);
-    broker_writer.write_all(&preface).await.unwrap();
-
-    let client_hello = read_v2_frame(&mut client_reader, v2::HELLO_MAX_BODY_BYTES).await;
-    broker_writer.write_all(&client_hello).await.unwrap();
-    let server_hello = read_v2_frame(&mut broker_reader, v2::HELLO_MAX_BODY_BYTES).await;
-    let v2::ServerHello::Accepted(accepted) = v2::decode_server_hello(&server_hello[4..]).unwrap()
-    else {
-        panic!("the broker should accept core v2 negotiation");
-    };
-    client_writer.write_all(&server_hello).await.unwrap();
-
-    if accepted.auth_required.unwrap_or(false) {
-        let auth = read_v2_frame(&mut client_reader, v2::AUTH_MAX_BODY_BYTES).await;
-        broker_writer.write_all(&auth).await.unwrap();
-        let authenticated = read_v2_frame(&mut broker_reader, v2::AUTH_MAX_BODY_BYTES).await;
-        client_writer.write_all(&authenticated).await.unwrap();
-    }
-
-    let request = read_v2_frame(&mut client_reader, accepted.client_to_server_frame_bytes).await;
-    broker_writer.write_all(&request).await.unwrap();
-    let response = read_v2_frame(&mut broker_reader, accepted.server_to_client_frame_bytes).await;
-    (client_writer, response)
-}
-
-async fn read_v2_frame<R>(reader: &mut R, maximum_body_bytes: usize) -> Vec<u8>
-where
-    R: AsyncRead + Unpin,
-{
-    let mut length_bytes = [0; 4];
-    reader.read_exact(&mut length_bytes).await.unwrap();
-    let body_bytes = u32::from_be_bytes(length_bytes) as usize;
-    assert!(body_bytes > 0 && body_bytes <= maximum_body_bytes);
-    let mut frame = Vec::with_capacity(4 + body_bytes);
-    frame.extend_from_slice(&length_bytes);
-    frame.resize(4 + body_bytes, 0);
-    reader.read_exact(&mut frame[4..]).await.unwrap();
-    frame
-}
-
-fn decode_proxy_response(frame: &[u8]) -> Response {
-    assert!(frame.len() >= 5);
-    let body_bytes = u32::from_be_bytes(frame[..4].try_into().unwrap()) as usize;
-    assert_eq!(frame.len(), 4 + body_bytes);
-    match v2::decode_server_frame(&frame[4..], v2::MAX_SERVER_TO_CLIENT_FRAME_BYTES).unwrap() {
-        ServerFrame::Application(reply) => reply.response,
-        ServerFrame::Authenticated | ServerFrame::AuthenticationFailed => {
-            panic!("the proxy should capture an application response")
-        }
-    }
 }
 
 #[cfg(unix)]
