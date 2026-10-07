@@ -20,7 +20,7 @@ use runnel_protocol::{
     PublishBatchRecordResponse, Request, Response,
 };
 use tempfile::TempDir;
-use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader as AsyncBufReader};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener as AsyncTcpListener, TcpStream as AsyncTcpStream};
 use tokio::sync::oneshot;
 #[cfg(feature = "test-replacement-recovery")]
@@ -198,7 +198,7 @@ fn three_process_cluster_replicates_and_recovers_after_failures() {
     let addresses = (0..9).map(|_| free_addr()).collect::<Vec<_>>();
     let cluster_nodes = vec![(1, addresses[6]), (2, addresses[7]), (3, addresses[8])];
     let mut nodes = vec![
-        RunningNode::start(
+        RunningNode::start_with_ack_timeout(
             1,
             addresses[0],
             addresses[3],
@@ -206,8 +206,9 @@ fn three_process_cluster_replicates_and_recovers_after_failures() {
             directory.path().join("node-1"),
             cluster_nodes.clone(),
             true,
+            REASSIGN_ACK_TIMEOUT_MS,
         ),
-        RunningNode::start(
+        RunningNode::start_with_ack_timeout(
             2,
             addresses[1],
             addresses[4],
@@ -215,8 +216,9 @@ fn three_process_cluster_replicates_and_recovers_after_failures() {
             directory.path().join("node-2"),
             cluster_nodes.clone(),
             false,
+            REASSIGN_ACK_TIMEOUT_MS,
         ),
-        RunningNode::start(
+        RunningNode::start_with_ack_timeout(
             3,
             addresses[2],
             addresses[5],
@@ -224,6 +226,7 @@ fn three_process_cluster_replicates_and_recovers_after_failures() {
             directory.path().join("node-3"),
             cluster_nodes,
             false,
+            REASSIGN_ACK_TIMEOUT_MS,
         ),
     ];
     for node in &nodes {
@@ -590,6 +593,20 @@ fn three_process_cluster_replicates_and_recovers_after_failures() {
     ));
 
     let legacy_retry_node = create_stream_on_any(&mut nodes, "legacy-retry");
+    assert!(matches!(
+        wait_for_response_at(
+            nodes[legacy_retry_node].broker_addr,
+            || Request::ConfigureConsumer {
+                stream: "legacy-retry".to_owned(),
+                consumer: "worker".to_owned(),
+                ack_timeout_ms: 50,
+                max_delivery_attempts: Some(2),
+                retry_delay_ms: 0,
+            },
+            |response| matches!(response, Response::ConsumerPolicy { .. }),
+        ),
+        Response::ConsumerPolicy { .. }
+    ));
     assert!(matches!(
         wait_for_response_at(
             nodes[legacy_retry_node].broker_addr,
@@ -1013,10 +1030,19 @@ async fn typed_batch_retry_after_leader_change_does_not_duplicate_records() {
         response = response_receiver => response.expect("proxy should deliver the broker response to the test"),
     };
 
+    let runnel_protocol::v2::ServerFrame::Application(reply) =
+        runnel_protocol::v2::decode_server_frame(
+            &broker_response,
+            runnel_protocol::v2::MAX_SERVER_TO_CLIENT_FRAME_BYTES,
+        )
+        .unwrap()
+    else {
+        panic!("the contacted leader should return an application response");
+    };
     let Response::PublishBatch {
         stream: response_stream,
         outcomes,
-    } = serde_json::from_slice::<Response>(&broker_response).unwrap()
+    } = reply.response
     else {
         panic!("the contacted leader should return a publish-batch response");
     };
@@ -2750,32 +2776,79 @@ async fn withhold_first_response_proxy(
         .accept()
         .await
         .expect("proxy should accept the typed client connection");
-    let (client_reader, client_writer) = client.into_split();
-    let mut client_reader = AsyncBufReader::new(client_reader);
-    let mut request = Vec::new();
+    let (mut client_reader, mut client_writer) = client.into_split();
+    let mut preface = [0; 8];
     client_reader
-        .read_until(b'\n', &mut request)
+        .read_exact(&mut preface)
         .await
-        .expect("proxy should read the client's batch request");
+        .expect("proxy should read the v2 preface");
+    assert_eq!(preface, runnel_protocol::v2::PREFACE);
+    let client_hello = read_v2_frame_async(
+        &mut client_reader,
+        runnel_protocol::v2::HELLO_MAX_BODY_BYTES,
+    )
+    .await
+    .expect("proxy should read the client's v2 Hello");
+    runnel_protocol::v2::decode_client_hello(&client_hello).expect("client Hello should decode");
 
     let broker = AsyncTcpStream::connect(broker_addr)
         .await
         .expect("proxy should connect to the current leader");
-    let (broker_reader, mut broker_writer) = broker.into_split();
+    let (mut broker_reader, mut broker_writer) = broker.into_split();
     broker_writer
-        .write_all(&request)
+        .write_all(&preface)
+        .await
+        .expect("proxy should forward the v2 preface");
+    write_v2_frame_async(&mut broker_writer, &client_hello)
+        .await
+        .expect("proxy should forward the client Hello");
+    let server_hello = read_v2_frame_async(
+        &mut broker_reader,
+        runnel_protocol::v2::HELLO_MAX_BODY_BYTES,
+    )
+    .await
+    .expect("proxy should read the leader's v2 Hello");
+    assert!(matches!(
+        runnel_protocol::v2::decode_server_hello(&server_hello)
+            .expect("server Hello should decode"),
+        runnel_protocol::v2::ServerHello::Accepted(ref accepted)
+            if accepted.auth_required == Some(false)
+    ));
+    write_v2_frame_async(&mut client_writer, &server_hello)
+        .await
+        .expect("proxy should forward the server Hello");
+
+    let request = read_v2_frame_async(
+        &mut client_reader,
+        runnel_protocol::v2::MAX_CLIENT_TO_SERVER_FRAME_BYTES,
+    )
+    .await
+    .expect("proxy should read the client's application request");
+    assert!(matches!(
+        runnel_protocol::v2::decode_client_frame(
+            &request,
+            runnel_protocol::v2::MAX_CLIENT_TO_SERVER_FRAME_BYTES,
+        )
+        .expect("client application frame should decode"),
+        runnel_protocol::v2::ClientFrame::Application(_)
+    ));
+    write_v2_frame_async(&mut broker_writer, &request)
         .await
         .expect("proxy should forward the batch to the leader");
-    let mut broker_reader = AsyncBufReader::new(broker_reader);
-    let mut response = Vec::new();
-    broker_reader
-        .read_until(b'\n', &mut response)
-        .await
-        .expect("proxy should read the leader's complete response");
-    assert!(
-        response.ends_with(b"\n"),
-        "broker response should be line complete"
-    );
+    let response = read_v2_frame_async(
+        &mut broker_reader,
+        runnel_protocol::v2::MAX_SERVER_TO_CLIENT_FRAME_BYTES,
+    )
+    .await
+    .expect("proxy should read the leader's application response");
+    assert!(matches!(
+        runnel_protocol::v2::decode_server_frame(
+            &response,
+            runnel_protocol::v2::MAX_SERVER_TO_CLIENT_FRAME_BYTES,
+        )
+        .expect("server application frame should decode"),
+        runnel_protocol::v2::ServerFrame::Application(_)
+    ));
     response_sender
         .send(response)
         .expect("test should inspect the successful broker response");
@@ -3459,16 +3532,94 @@ fn request_with_timeout(
     stream
         .set_read_timeout(Some(read_timeout))
         .map_err(|error| format!("set read timeout for {address}: {error}"))?;
-    let encoded = serde_json::to_string(&request)
-        .map_err(|error| format!("encode request for {address}: {error}"))?;
-    writeln!(stream, "{encoded}")
-        .map_err(|error| format!("write request to {address}: {error}"))?;
-    let mut response = String::new();
-    BufReader::new(stream)
-        .read_line(&mut response)
-        .map_err(|error| format!("read response from {address}: {error}"))?;
-    serde_json::from_str(&response)
-        .map_err(|error| format!("decode response from {address}: {error}"))
+    stream
+        .set_write_timeout(Some(read_timeout))
+        .map_err(|error| format!("set write timeout for {address}: {error}"))?;
+    use runnel_protocol::v2::{self, ClientHello, ServerFrame, ServerHello};
+
+    stream
+        .write_all(&v2::PREFACE)
+        .map_err(|error| format!("write v2 preface to {address}: {error}"))?;
+    let hello = v2::encode_client_hello(&ClientHello::core_v2())
+        .map_err(|error| format!("encode v2 Hello for {address}: {error}"))?;
+    stream
+        .write_all(hello.as_bytes())
+        .map_err(|error| format!("write v2 Hello to {address}: {error}"))?;
+    let server_hello = read_v2_frame_sync(&mut stream, v2::HELLO_MAX_BODY_BYTES)
+        .map_err(|error| format!("read v2 Hello from {address}: {error}"))?;
+    match v2::decode_server_hello(&server_hello)
+        .map_err(|error| format!("decode v2 Hello from {address}: {error}"))?
+    {
+        ServerHello::Accepted(accepted) if accepted.auth_required == Some(false) => {}
+        ServerHello::Accepted(_) => {
+            return Err(format!("server at {address} requires test credentials"));
+        }
+        ServerHello::Refused { code, diagnostic } => {
+            return Err(format!(
+                "server at {address} refused v2 ({code:?}): {diagnostic}"
+            ));
+        }
+    }
+
+    let encoded = v2::encode_application_request(&request)
+        .map_err(|error| format!("encode application request for {address}: {error}"))?;
+    stream
+        .write_all(encoded.as_bytes())
+        .map_err(|error| format!("write application request to {address}: {error}"))?;
+    let response = read_v2_frame_sync(&mut stream, v2::MAX_SERVER_TO_CLIENT_FRAME_BYTES)
+        .map_err(|error| format!("read application response from {address}: {error}"))?;
+    match v2::decode_server_frame(&response, v2::MAX_SERVER_TO_CLIENT_FRAME_BYTES)
+        .map_err(|error| format!("decode application response from {address}: {error}"))?
+    {
+        ServerFrame::Application(reply) => Ok(reply.response),
+        ServerFrame::Authenticated | ServerFrame::AuthenticationFailed => Err(format!(
+            "server at {address} returned an authentication frame before the application response"
+        )),
+    }
+}
+
+fn read_v2_frame_sync(stream: &mut impl Read, max_body_bytes: usize) -> std::io::Result<Vec<u8>> {
+    let mut length = [0; 4];
+    stream.read_exact(&mut length)?;
+    let body_bytes = u32::from_be_bytes(length) as usize;
+    if body_bytes == 0 || body_bytes > max_body_bytes {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "v2 frame length is outside the configured limit",
+        ));
+    }
+    let mut body = vec![0; body_bytes];
+    stream.read_exact(&mut body)?;
+    Ok(body)
+}
+
+async fn read_v2_frame_async(
+    stream: &mut (impl AsyncRead + Unpin),
+    max_body_bytes: usize,
+) -> std::io::Result<Vec<u8>> {
+    let mut length = [0; 4];
+    stream.read_exact(&mut length).await?;
+    let body_bytes = u32::from_be_bytes(length) as usize;
+    if body_bytes == 0 || body_bytes > max_body_bytes {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "v2 frame length is outside the configured limit",
+        ));
+    }
+    let mut body = vec![0; body_bytes];
+    stream.read_exact(&mut body).await?;
+    Ok(body)
+}
+
+async fn write_v2_frame_async(
+    stream: &mut (impl AsyncWrite + Unpin),
+    body: &[u8],
+) -> std::io::Result<()> {
+    let length = u32::try_from(body.len()).map_err(|_| {
+        std::io::Error::new(std::io::ErrorKind::InvalidInput, "v2 frame is too large")
+    })?;
+    stream.write_all(&length.to_be_bytes()).await?;
+    stream.write_all(body).await
 }
 
 fn server_binary() -> PathBuf {

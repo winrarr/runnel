@@ -265,6 +265,14 @@ async fn handle_connection(
         };
         let mut body = match frame_result {
             Ok(Ok(body)) => body,
+            Ok(Err(ConnectionProtocolError::FrameTooLarge)) => {
+                metrics
+                    .request_size_rejections
+                    .fetch_add(1, Ordering::Relaxed);
+                metrics
+                    .record_rejected_request(RequestOperation::InvalidRequest, started.elapsed());
+                return Ok(());
+            }
             Ok(Err(_)) => {
                 metrics
                     .record_rejected_request(RequestOperation::InvalidRequest, started.elapsed());
@@ -272,6 +280,8 @@ async fn handle_connection(
             }
             Err(_) => {
                 metrics.request_timeouts.fetch_add(1, Ordering::Relaxed);
+                metrics
+                    .record_rejected_request(RequestOperation::InvalidRequest, started.elapsed());
                 return Ok(());
             }
         };
@@ -303,15 +313,19 @@ async fn handle_connection(
                 &request,
             )
         });
-        let reply = if denied {
+        let (reply, request_permit, active_request) = if denied {
             metrics.record_rejected_request(operation, started.elapsed());
-            ApplicationReply::failed(
-                Response::Error {
-                    code: "authorization_denied".to_owned(),
-                    message: "operation is not permitted for this credential role".to_owned(),
-                },
-                Outcome::Rejected,
-                Stage::Validated,
+            (
+                ApplicationReply::failed(
+                    Response::Error {
+                        code: "authorization_denied".to_owned(),
+                        message: "operation is not permitted for this credential role".to_owned(),
+                    },
+                    Outcome::Rejected,
+                    Stage::Validated,
+                ),
+                None,
+                None,
             )
         } else {
             let request_permit = match Arc::clone(&request_slots).try_acquire_owned() {
@@ -338,12 +352,11 @@ async fn handle_connection(
                     continue;
                 }
             };
-            let _request_permit = request_permit;
             metrics.active_requests.fetch_add(1, Ordering::Relaxed);
-            let _active_request = ActiveRequest::new(Arc::clone(&metrics));
+            let active_request = ActiveRequest::new(Arc::clone(&metrics));
             #[cfg(feature = "instrumentation")]
             let _stage_timer = StageTimer::new("server.protocol_round_trip");
-            match tokio::time::timeout(
+            let reply = match tokio::time::timeout(
                 remaining_timeout(started, protocol_admission.request_timeout),
                 handle_request_with_metadata(
                     engine.as_ref(),
@@ -363,7 +376,8 @@ async fn handle_connection(
                         Stage::ExecutionStarted,
                     )
                 }
-            }
+            };
+            (reply, Some(request_permit), Some(active_request))
         };
         let failed = reply
             .outcome
@@ -379,6 +393,8 @@ async fn handle_connection(
             &metrics,
         )
         .await?;
+        drop(active_request);
+        drop(request_permit);
     }
 }
 
@@ -391,6 +407,7 @@ enum ConnectionProtocolError {
     Codec,
     InvalidPreface,
     InvalidNegotiation,
+    FrameTooLarge,
 }
 
 impl From<std::io::Error> for ConnectionProtocolError {
@@ -415,8 +432,11 @@ where
     let mut length = [0_u8; 4];
     reader.read_exact(&mut length).await?;
     let body_len = u32::from_be_bytes(length) as usize;
-    if body_len == 0 || body_len > max_bytes {
+    if body_len == 0 {
         return Err(ConnectionProtocolError::InvalidNegotiation);
+    }
+    if body_len > max_bytes {
+        return Err(ConnectionProtocolError::FrameTooLarge);
     }
     let mut body = vec![0; body_len];
     reader.read_exact(&mut body).await?;
