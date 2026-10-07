@@ -51,6 +51,7 @@ from cluster_scenarios import (
     MAX_PEER_FORWARDING_TIMEOUT_SECONDS,
     MAX_PEER_RESPONSE_DELAY_MS,
     MAX_PUBLISH_BATCH_SIZE,
+    MAX_PARALLEL_GROUPED_TIMEOUT_SECONDS,
     MAX_RAFT_LOG_GROWTH_BATCH_SIZE,
     MAX_RAFT_LOG_GROWTH_CYCLE_TIMEOUT_SECONDS,
     MAX_RAFT_LOG_GROWTH_LOGICAL_PAYLOAD_BYTES,
@@ -67,6 +68,7 @@ from cluster_scenarios import (
     parse_raft_log_growth_batch_size,
     parse_raft_log_growth_observation_every,
     parse_scenarios,
+    default_parallel_grouped_timeout_seconds,
     run_consume_ack,
     run_durable_publish,
     run_follower_failure_recovery,
@@ -146,6 +148,14 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument("--ack-timeout-ms", type=int, default=DEFAULT_ACK_TIMEOUT_MS)
+    parser.add_argument(
+        "--parallel-grouped-timeout-seconds",
+        type=parse_positive_float,
+        help=(
+            "bounded wall-clock budget for parallel grouped drain; by default it "
+            "scales with the requested message count"
+        ),
+    )
     parser.add_argument(
         "--slow-consumer-delay-ms",
         type=parse_nonnegative_int,
@@ -445,6 +455,25 @@ def parse_args() -> argparse.Namespace:
         parser.error("peer response delay requires the native process runtime")
     if args.ack_timeout_ms <= 0:
         parser.error("ack timeout must be positive")
+    if (
+        args.parallel_grouped_timeout_seconds is not None
+        and args.parallel_grouped_timeout_seconds > MAX_PARALLEL_GROUPED_TIMEOUT_SECONDS
+    ):
+        parser.error(
+            "parallel grouped timeout exceeds the bounded maximum of "
+            f"{MAX_PARALLEL_GROUPED_TIMEOUT_SECONDS:g} seconds"
+        )
+    if "parallel_grouped_consume_ack" in args.scenarios:
+        try:
+            if args.parallel_grouped_timeout_seconds is None:
+                args.parallel_grouped_timeout_seconds = (
+                    default_parallel_grouped_timeout_seconds(args.messages)
+                )
+                args.parallel_grouped_timeout_source = "workload-aware default"
+            else:
+                args.parallel_grouped_timeout_source = "explicit override"
+        except ValueError as error:
+            parser.error(str(error))
     if args.slow_consumer_delay_ms >= args.ack_timeout_ms:
         parser.error("slow consumer delay must be shorter than the acknowledgement timeout")
     if (
@@ -567,6 +596,7 @@ def run_scenarios(
                     payload,
                     args.messages,
                     args.concurrency,
+                    args.parallel_grouped_timeout_seconds,
                 )
             )
         if "hot_ordering" in selected_scenarios:

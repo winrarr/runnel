@@ -70,6 +70,13 @@ def build_workload(args: argparse.Namespace) -> dict[str, Any]:
         "durability": "committed by the current three-node Raft quorum and local durable state",
     }
     selected_scenarios = set(args.scenarios)
+    if "parallel_grouped_consume_ack" in selected_scenarios:
+        workload["parallel_grouped_timeout_seconds"] = (
+            args.parallel_grouped_timeout_seconds
+        )
+        workload["parallel_grouped_timeout_source"] = (
+            args.parallel_grouped_timeout_source
+        )
     if not args.skip_recovery and "cluster_retained_recovery" in selected_scenarios:
         workload["retained_recovery_messages"] = args.retained_messages
     if "peer_forwarding" in selected_scenarios:

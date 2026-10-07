@@ -12,6 +12,7 @@ from __future__ import annotations
 import argparse
 import copy
 import json
+import math
 import os
 import shutil
 import subprocess
@@ -31,6 +32,10 @@ sys.path.insert(0, str(SCRIPT_DIR))
 
 from pr_report import render_report  # noqa: E402
 from resource_scope import ResourceScopeError, resource_limits, resource_scope_command  # noqa: E402
+from cluster_scenarios import (  # noqa: E402
+    MAX_PARALLEL_GROUPED_TIMEOUT_SECONDS,
+    default_parallel_grouped_timeout_seconds,
+)
 
 
 DEFAULT_BASE_REF = "origin/main"
@@ -72,6 +77,8 @@ class BenchmarkOptions:
     concurrency: int
     payload_sizes: str
     include_recovery: bool
+    parallel_grouped_timeout_seconds: float
+    parallel_grouped_timeout_source: str
 
 
 @dataclass(frozen=True)
@@ -168,9 +175,63 @@ def benchmark_command(
             str(log_dir),
         ]
     )
+    if target.name == "pull-request" or supports_parallel_grouped_timeout(target):
+        command.extend(
+            [
+                "--parallel-grouped-timeout-seconds",
+                str(options.parallel_grouped_timeout_seconds),
+            ]
+        )
     if not options.include_recovery:
         command.append("--skip-recovery")
     return command
+
+
+def supports_parallel_grouped_timeout(target: BenchmarkTarget) -> bool:
+    """Check whether a benchmark checkout accepts the paired timeout option."""
+    cli_path = target.script.with_name("cluster_cli.py")
+    try:
+        return "--parallel-grouped-timeout-seconds" in cli_path.read_text(
+            encoding="utf-8"
+        )
+    except OSError as error:
+        raise LocalBenchmarkError(
+            f"could not inspect benchmark CLI {cli_path}: {error}"
+        ) from error
+
+
+def apply_legacy_parallel_grouped_timeout(
+    target: BenchmarkTarget, timeout_seconds: float
+) -> None:
+    """Apply only the paired deadline to an older temporary baseline harness."""
+    scenario_path = target.script.with_name("cluster_scenarios.py")
+    try:
+        source = scenario_path.read_text(encoding="utf-8")
+    except OSError as error:
+        raise LocalBenchmarkError(
+            f"could not read baseline scenario harness {scenario_path}: {error}"
+        ) from error
+
+    marker = "def run_parallel_grouped("
+    start = source.find(marker)
+    if start < 0:
+        raise LocalBenchmarkError(
+            f"baseline scenario harness has no {marker.strip()} function"
+        )
+    end = source.find("\ndef ", start + len(marker))
+    if end < 0:
+        end = len(source)
+    function = source[start:end]
+    deadline = "deadline = time.monotonic() + DEFAULT_TIMEOUT_SECONDS"
+    override = f"deadline = time.monotonic() + {timeout_seconds!r}"
+    if function.count(deadline) == 1:
+        function = function.replace(deadline, override, 1)
+    elif function.count(override) != 1:
+        raise LocalBenchmarkError(
+            "baseline parallel grouped scenario deadline does not match the "
+            "supported timeout-only adaptation"
+        )
+    scenario_path.write_text(source[:start] + function + source[end:], encoding="utf-8")
 
 
 def run_benchmark(
@@ -184,6 +245,14 @@ def run_benchmark(
 ) -> None:
     output.parent.mkdir(parents=True, exist_ok=True)
     log_dir.mkdir(parents=True, exist_ok=True)
+    baseline_timeout_override = (
+        target.name == "default-branch"
+        and not supports_parallel_grouped_timeout(target)
+    )
+    if baseline_timeout_override:
+        apply_legacy_parallel_grouped_timeout(
+            target, options.parallel_grouped_timeout_seconds
+        )
     limits = resource_limits(cpus=options.cpu_limit, memory=options.memory_limit)
     environment = os.environ.copy()
     environment.update(
@@ -262,6 +331,25 @@ def stamp_resource_limits(path: Path, options: BenchmarkOptions) -> None:
     path.write_text(json.dumps(result, indent=2) + "\n", encoding="utf-8")
 
 
+def stamp_parallel_grouped_timeout(
+    path: Path, options: BenchmarkOptions, *, baseline_override: bool
+) -> None:
+    """Record the paired deadline on old and current result envelopes alike."""
+    result = load_json(path)
+    workload = result.get("workload")
+    if not isinstance(workload, dict):
+        raise LocalBenchmarkError(f"benchmark result {path} is missing its workload")
+    workload["parallel_grouped_timeout_seconds"] = (
+        options.parallel_grouped_timeout_seconds
+    )
+    workload["parallel_grouped_timeout_source"] = (
+        "temporary baseline harness adaptation"
+        if baseline_override
+        else options.parallel_grouped_timeout_source
+    )
+    path.write_text(json.dumps(result, indent=2) + "\n", encoding="utf-8")
+
+
 def shlex_join(command: list[str]) -> str:
     import shlex
 
@@ -323,6 +411,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--warmup", type=int, default=DEFAULT_WARMUP)
     parser.add_argument("--nodes", type=int, default=DEFAULT_NODES)
     parser.add_argument("--concurrency", type=int, default=DEFAULT_CONCURRENCY)
+    parser.add_argument(
+        "--parallel-grouped-timeout-seconds",
+        type=float,
+        help=(
+            "override the parallel grouped drain deadline; the default scales "
+            "with the message count"
+        ),
+    )
     parser.add_argument("--payload-sizes", default=DEFAULT_PAYLOAD_SIZES)
     parser.add_argument(
         "--include-recovery",
@@ -349,6 +445,29 @@ def parse_args() -> argparse.Namespace:
         parser.error("messages, nodes, and concurrency must be positive; warmup cannot be negative")
     if not args.payload_sizes.strip():
         parser.error("payload sizes cannot be empty")
+    if args.parallel_grouped_timeout_seconds is None:
+        try:
+            args.parallel_grouped_timeout_seconds = (
+                default_parallel_grouped_timeout_seconds(args.messages)
+            )
+        except ValueError as error:
+            parser.error(str(error))
+        args.parallel_grouped_timeout_source = "workload-aware default"
+    else:
+        if (
+            not math.isfinite(args.parallel_grouped_timeout_seconds)
+            or args.parallel_grouped_timeout_seconds <= 0
+        ):
+            parser.error("parallel grouped timeout must be a finite positive number")
+        if (
+            args.parallel_grouped_timeout_seconds
+            > MAX_PARALLEL_GROUPED_TIMEOUT_SECONDS
+        ):
+            parser.error(
+                "parallel grouped timeout exceeds the bounded maximum of "
+                f"{MAX_PARALLEL_GROUPED_TIMEOUT_SECONDS:g} seconds"
+            )
+        args.parallel_grouped_timeout_source = "explicit override"
     return args
 
 
@@ -658,6 +777,8 @@ def main() -> int:
             concurrency=args.concurrency,
             payload_sizes=args.payload_sizes,
             include_recovery=args.include_recovery,
+            parallel_grouped_timeout_seconds=args.parallel_grouped_timeout_seconds,
+            parallel_grouped_timeout_source=args.parallel_grouped_timeout_source,
         )
         current = BenchmarkTarget(
             name="pull-request",
@@ -746,6 +867,14 @@ def run_target_once(
     # Stamp the actual enclosing scope into both results so aggregation and the
     # report cannot mistake an equivalently limited run for an unlimited one.
     stamp_resource_limits(raw, options)
+    stamp_parallel_grouped_timeout(
+        raw,
+        options,
+        baseline_override=(
+            target.name == "default-branch"
+            and not supports_parallel_grouped_timeout(target)
+        ),
+    )
     normalize(raw, normalized_path, target.root)
     return load_json(normalized_path)
 

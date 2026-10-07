@@ -37,6 +37,9 @@ if TYPE_CHECKING:
 
 
 DEFAULT_SLOW_CONSUMER_DELAY_MS = 10
+DEFAULT_PARALLEL_GROUPED_TIMEOUT_SECONDS = 30.0
+PARALLEL_GROUPED_TIMEOUT_MILLISECONDS_PER_MESSAGE = 250
+MAX_PARALLEL_GROUPED_TIMEOUT_SECONDS = 3_600.0
 DEFAULT_SLOW_CONSUMER_BACKPRESSURE_TIMEOUT_SECONDS = 60.0
 DEFAULT_PUBLISH_BATCH_SIZE = 32
 MAX_PUBLISH_BATCH_SIZE = 1_024
@@ -66,6 +69,25 @@ MAX_SLOW_CONSUMER_BACKPRESSURE_TIMEOUT_SECONDS = 300.0
 PEER_FORWARDING_INGRESS_NODE_INDEX = 1
 DEFAULT_LEADER_FAILURE_TIMEOUT_SECONDS = 60.0
 MAX_LEADER_FAILURE_TIMEOUT_SECONDS = 300.0
+
+
+def default_parallel_grouped_timeout_seconds(messages: int) -> float:
+    """Scale the grouped-drain deadline with the requested message count."""
+    if messages <= 0:
+        raise ValueError("parallel grouped message count must be positive")
+    scaled_timeout = (
+        messages * PARALLEL_GROUPED_TIMEOUT_MILLISECONDS_PER_MESSAGE + 999
+    ) // 1_000
+    if scaled_timeout > MAX_PARALLEL_GROUPED_TIMEOUT_SECONDS:
+        raise ValueError(
+            "derived parallel grouped timeout exceeds the bounded maximum of "
+            f"{MAX_PARALLEL_GROUPED_TIMEOUT_SECONDS:g} seconds; set a smaller workload"
+        )
+    timeout_seconds = max(
+        DEFAULT_PARALLEL_GROUPED_TIMEOUT_SECONDS,
+        float(scaled_timeout),
+    )
+    return timeout_seconds
 DEFAULT_SCENARIOS = (
     "durable_publish",
     "consume_ack",
@@ -1949,13 +1971,18 @@ def run_grouped_consume_ack(
 
 
 def run_parallel_grouped(
-    cluster: Cluster, stream: str, payload: str, messages: int, concurrency: int
+    cluster: Cluster,
+    stream: str,
+    payload: str,
+    messages: int,
+    concurrency: int,
+    timeout_seconds: float,
 ) -> dict[str, Any]:
     preload(cluster, stream, payload, messages)
     lock = threading.Lock()
     latencies: list[int] = []
     processed = 0
-    deadline = time.monotonic() + DEFAULT_TIMEOUT_SECONDS
+    deadline = time.monotonic() + timeout_seconds
 
     def worker(worker_index: int) -> None:
         nonlocal processed
@@ -1967,7 +1994,10 @@ def run_parallel_grouped(
                     if processed >= messages:
                         return
                 if time.monotonic() >= deadline:
-                    raise BenchmarkError("parallel grouped benchmark did not drain its messages")
+                    raise BenchmarkError(
+                        "parallel grouped benchmark did not drain its messages "
+                        f"within {timeout_seconds:g}s"
+                    )
                 started = time.perf_counter_ns()
                 response, _ = client.request(
                     {

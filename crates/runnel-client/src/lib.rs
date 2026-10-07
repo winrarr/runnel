@@ -5,7 +5,9 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 pub use runnel_protocol::BearerToken;
-use runnel_protocol::v2::{self as v2, ApplicationReply, Outcome as V2Outcome, ServerFrame};
+use runnel_protocol::v2::{
+    self as v2, ApplicationReply, ItemMetadata, Outcome as V2Outcome, ServerFrame,
+};
 use runnel_protocol::{
     AckBatchItemOutcome as WireAckBatchItemOutcome, BatchMessageResponse, BinaryPayload,
     MAX_CONSUME_BATCH_RECORDS, MAX_PUBLISH_BATCH_RECORDS,
@@ -1700,7 +1702,7 @@ impl Client {
         request: Request,
         parse: impl FnOnce(Response) -> Result<T, Box<Response>>,
     ) -> Result<T, AttemptOutcome> {
-        match typed_response(operation, self.request_with_outcome(&request).await, parse) {
+        match typed_reply(operation, self.request_with_reply(&request).await, parse) {
             TypedResponse::Value(value) => Ok(value),
             TypedResponse::Outcome(outcome) => {
                 if unexpected_response(&outcome) {
@@ -2239,6 +2241,83 @@ enum TypedResponse<T> {
     Outcome(AttemptOutcome),
 }
 
+fn typed_reply<T>(
+    operation: &'static str,
+    reply: Result<ApplicationReply, ClientError>,
+    parse: impl FnOnce(Response) -> Result<T, Box<Response>>,
+) -> TypedResponse<T> {
+    let reply = match reply {
+        Ok(reply) => reply,
+        Err(error) => {
+            return typed_response(operation, AttemptOutcome::from_client_error(error), parse);
+        }
+    };
+
+    if reply.outcome.is_some() {
+        return typed_response(operation, classify_v2_reply(reply), parse);
+    }
+
+    let ApplicationReply {
+        response, items, ..
+    } = reply;
+    if !batch_reply_metadata_matches(&response, &items) {
+        return TypedResponse::Outcome(AttemptOutcome::Unknown(AttemptFailure::Client(
+            ClientError::UnexpectedResponse {
+                operation,
+                response: Box::new(response),
+            },
+        )));
+    }
+    match parse(response) {
+        Ok(value) => TypedResponse::Value(value),
+        Err(response) => TypedResponse::Outcome(AttemptOutcome::Unknown(AttemptFailure::Client(
+            ClientError::UnexpectedResponse {
+                operation,
+                response,
+            },
+        ))),
+    }
+}
+
+fn batch_reply_metadata_matches(response: &Response, items: &[ItemMetadata]) -> bool {
+    match response {
+        Response::PollBatch { messages, .. } => {
+            messages.len() == items.len()
+                && items
+                    .iter()
+                    .all(|item| item.outcome == V2Outcome::Confirmed)
+        }
+        Response::PublishBatch { outcomes, .. } => {
+            outcomes.len() == items.len()
+                && outcomes
+                    .iter()
+                    .zip(items)
+                    .all(|(outcome, item)| match outcome {
+                        PublishBatchRecordResponse::Published { .. } => {
+                            item.outcome == V2Outcome::Confirmed
+                        }
+                        PublishBatchRecordResponse::Error { .. } => {
+                            item.outcome != V2Outcome::Confirmed
+                        }
+                    })
+        }
+        Response::AckBatch { outcomes, .. } => {
+            outcomes.len() == items.len()
+                && outcomes
+                    .iter()
+                    .zip(items)
+                    .all(|(outcome, item)| match outcome.outcome {
+                        WireAckBatchItemOutcome::Confirmed
+                        | WireAckBatchItemOutcome::AlreadyConfirmed => {
+                            item.outcome == V2Outcome::Confirmed
+                        }
+                        WireAckBatchItemOutcome::Rejected => item.outcome != V2Outcome::Confirmed,
+                    })
+        }
+        _ => false,
+    }
+}
+
 fn typed_response<T>(
     operation: &'static str,
     outcome: AttemptOutcome,
@@ -2276,6 +2355,124 @@ mod tests {
             response_timeout: Duration::from_millis(200),
             max_response_bytes: 64 * 1024,
         }
+    }
+
+    #[test]
+    fn typed_poll_batch_accepts_confirmed_items_and_empty_results() {
+        let message = BatchMessageResponse::Text {
+            stream: "events".to_owned(),
+            consumer: "worker".to_owned(),
+            member: None,
+            offset: 7,
+            key: None,
+            payload: "work".to_owned(),
+            published_at_ms: 1,
+            delivery_token: None,
+            delivery_attempt: None,
+        };
+        let parse = |response| match response {
+            Response::PollBatch { messages, .. } => Ok(messages.len()),
+            response => Err(Box::new(response)),
+        };
+        let confirmed = typed_reply(
+            "poll_batch",
+            Ok(ApplicationReply::batch(
+                Response::PollBatch {
+                    stream: "events".to_owned(),
+                    consumer: "worker".to_owned(),
+                    messages: vec![message],
+                },
+                vec![runnel_protocol::v2::ItemMetadata {
+                    outcome: V2Outcome::Confirmed,
+                    stage: runnel_protocol::v2::Stage::Durable,
+                }],
+            )),
+            parse,
+        );
+        assert!(matches!(confirmed, TypedResponse::Value(1)));
+
+        let empty = typed_reply(
+            "poll_batch",
+            Ok(ApplicationReply::batch(
+                Response::PollBatch {
+                    stream: "events".to_owned(),
+                    consumer: "worker".to_owned(),
+                    messages: Vec::new(),
+                },
+                Vec::new(),
+            )),
+            |response| match response {
+                Response::PollBatch { messages, .. } => Ok(messages.len()),
+                response => Err(Box::new(response)),
+            },
+        );
+        assert!(matches!(empty, TypedResponse::Value(0)));
+    }
+
+    #[test]
+    fn typed_batch_reply_preserves_per_item_errors_and_rejects_metadata_mismatch() {
+        let partial = typed_reply(
+            "publish_batch",
+            Ok(ApplicationReply::batch(
+                Response::PublishBatch {
+                    stream: "events".to_owned(),
+                    outcomes: vec![
+                        PublishBatchRecordResponse::Published { offset: 3 },
+                        PublishBatchRecordResponse::Error {
+                            code: "invalid_record".to_owned(),
+                            message: "record is invalid".to_owned(),
+                        },
+                    ],
+                },
+                vec![
+                    runnel_protocol::v2::ItemMetadata {
+                        outcome: V2Outcome::Confirmed,
+                        stage: runnel_protocol::v2::Stage::Durable,
+                    },
+                    runnel_protocol::v2::ItemMetadata {
+                        outcome: V2Outcome::Rejected,
+                        stage: runnel_protocol::v2::Stage::Validated,
+                    },
+                ],
+            )),
+            |response| match response {
+                Response::PublishBatch { outcomes, .. } => Ok(outcomes),
+                response => Err(Box::new(response)),
+            },
+        );
+        assert!(matches!(partial, TypedResponse::Value(outcomes) if outcomes.len() == 2));
+
+        let mismatch = typed_reply(
+            "poll_batch",
+            Ok(ApplicationReply::batch(
+                Response::PollBatch {
+                    stream: "events".to_owned(),
+                    consumer: "worker".to_owned(),
+                    messages: vec![BatchMessageResponse::Text {
+                        stream: "events".to_owned(),
+                        consumer: "worker".to_owned(),
+                        member: None,
+                        offset: 7,
+                        key: None,
+                        payload: "work".to_owned(),
+                        published_at_ms: 1,
+                        delivery_token: None,
+                        delivery_attempt: None,
+                    }],
+                },
+                Vec::new(),
+            )),
+            |response| match response {
+                Response::PollBatch { messages, .. } => Ok(messages.len()),
+                response => Err(Box::new(response)),
+            },
+        );
+        assert!(matches!(
+            mismatch,
+            TypedResponse::Outcome(AttemptOutcome::Unknown(AttemptFailure::Client(
+                ClientError::UnexpectedResponse { .. }
+            )))
+        ));
     }
 
     async fn listener() -> (TcpListener, SocketAddr) {

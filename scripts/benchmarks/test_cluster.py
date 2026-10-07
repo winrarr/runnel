@@ -49,6 +49,8 @@ from cluster_scenarios import (  # noqa: E402
     DEFAULT_SNAPSHOT_BUILD_TIMEOUT_SECONDS,
     DEFAULT_SLOW_CONSUMER_BACKPRESSURE_TIMEOUT_SECONDS,
     DEFAULT_SCENARIOS,
+    MAX_PARALLEL_GROUPED_TIMEOUT_SECONDS,
+    default_parallel_grouped_timeout_seconds,
     HotOrderingObservation,
     MAX_HOT_KEY_PROCESSING_DELAY_MS,
     MAX_HOT_ORDERING_CONCURRENCY,
@@ -176,6 +178,50 @@ class _ClientsContext:
 
 
 class ClusterBenchmarkTests(unittest.TestCase):
+    def test_parallel_grouped_timeout_scales_with_messages_and_is_bounded(self) -> None:
+        self.assertEqual(default_parallel_grouped_timeout_seconds(100), 30.0)
+        self.assertEqual(default_parallel_grouped_timeout_seconds(1_000), 250.0)
+        with self.assertRaisesRegex(ValueError, "bounded maximum"):
+            default_parallel_grouped_timeout_seconds(
+                int(MAX_PARALLEL_GROUPED_TIMEOUT_SECONDS * 4) + 1
+            )
+
+    def test_parallel_grouped_timeout_can_be_overridden_through_cli(self) -> None:
+        with patch.object(
+            sys,
+            "argv",
+            [
+                "cluster.py",
+                "--scenarios",
+                "parallel_grouped_consume_ack",
+                "--messages",
+                "1000",
+                "--parallel-grouped-timeout-seconds",
+                "180",
+            ],
+        ):
+            args = parse_args()
+
+        self.assertEqual(args.parallel_grouped_timeout_seconds, 180.0)
+        self.assertEqual(args.parallel_grouped_timeout_source, "explicit override")
+
+    def test_parallel_grouped_timeout_cli_uses_workload_default(self) -> None:
+        with patch.object(
+            sys,
+            "argv",
+            [
+                "cluster.py",
+                "--scenarios",
+                "parallel_grouped_consume_ack",
+                "--messages",
+                "1000",
+            ],
+        ):
+            args = parse_args()
+
+        self.assertEqual(args.parallel_grouped_timeout_seconds, 250.0)
+        self.assertEqual(args.parallel_grouped_timeout_source, "workload-aware default")
+
     def test_development_plaintext_override_is_container_only(self) -> None:
         node = SimpleNamespace(
             node_id=1,
