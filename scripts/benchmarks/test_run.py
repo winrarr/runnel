@@ -12,6 +12,21 @@ import run  # noqa: E402
 
 
 class RunBenchmarkArgumentTests(unittest.TestCase):
+    def test_docker_broker_uses_only_the_explicit_container_dev_override(self) -> None:
+        broker = run.DockerBroker("runnel:test", "1", "1g")
+        try:
+            command = broker.container.container.command
+            self.assertIn("--insecure-development-listen", command)
+            self.assertEqual(
+                command[command.index("--listen") + 1], "0.0.0.0:4222"
+            )
+            self.assertEqual(
+                command[command.index("--http-listen") + 1], "0.0.0.0:8080"
+            )
+            self.assertEqual(broker.container.container.published_ports, (4222, 8080))
+        finally:
+            Path(broker.container.container.data_dir).rmdir()
+
     def test_broker_client_requires_a_discovered_port(self) -> None:
         broker = run.DockerBroker.__new__(run.DockerBroker)
         broker.client_port = None

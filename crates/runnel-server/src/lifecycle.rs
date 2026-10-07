@@ -10,6 +10,7 @@ use tokio::sync::watch;
 use tracing::{error, info, warn};
 
 use crate::connection;
+use crate::connection::app_security::ApplicationSecurity;
 use crate::observability::{self, ServerMetrics};
 use crate::protocol::ProtocolAdmission;
 
@@ -23,14 +24,16 @@ pub(crate) async fn run(
     cluster: Option<Arc<GroupManager>>,
     server_metrics: Arc<ServerMetrics>,
     protocol_admission: ProtocolAdmission,
+    application_security: ApplicationSecurity,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
     let shutting_down = Arc::new(AtomicBool::new(false));
-    let mut tcp_task = connection::spawn(
+    let mut tcp_task = connection::spawn_with_security(
         tcp_listener,
         Arc::clone(&engine),
         Arc::clone(&server_metrics),
         protocol_admission,
+        application_security,
         shutdown_rx.clone(),
     );
     let mut peer_task = spawn_peer(peer, shutdown_rx.clone());

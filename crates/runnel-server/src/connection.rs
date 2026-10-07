@@ -26,23 +26,6 @@ use crate::protocol::{
     wait_for_request_data,
 };
 
-pub(crate) fn spawn(
-    listener: TcpListener,
-    engine: Arc<dyn Engine>,
-    metrics: Arc<ServerMetrics>,
-    protocol_admission: ProtocolAdmission,
-    shutdown: watch::Receiver<bool>,
-) -> JoinHandle<Result<(), std::io::Error>> {
-    spawn_with_security(
-        listener,
-        engine,
-        metrics,
-        protocol_admission,
-        app_security::ApplicationSecurity::development(),
-        shutdown,
-    )
-}
-
 pub(crate) fn spawn_with_security(
     listener: TcpListener,
     engine: Arc<dyn Engine>,
@@ -247,7 +230,11 @@ async fn handle_connection(
     .await;
     let (max_request_bytes, max_response_bytes, authenticated_role) = match negotiation {
         Ok(Ok(Some(negotiated))) => negotiated,
-        Ok(Ok(None)) | Ok(Err(_)) => return Ok(()),
+        Ok(Ok(None)) => return Ok(()),
+        Ok(Err(_)) => {
+            metrics.connection_errors.fetch_add(1, Ordering::Relaxed);
+            return Ok(());
+        }
         Err(_) => {
             metrics.request_timeouts.fetch_add(1, Ordering::Relaxed);
             return Ok(());

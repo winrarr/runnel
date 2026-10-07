@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-"""Benchmark a real three-node Runnel cluster through its public protocol.
+"""Benchmark a real three-node Runnel cluster through its public v2 protocol.
 
 This is a development baseline, not a production benchmark harness. It keeps
 the workload and durability boundary explicit: every measured publish is sent
-through the line-delimited JSON protocol and every delivery scenario includes
+through negotiated v2 Protobuf framing and every delivery scenario includes
 an acknowledgement. The broker uses the current static three-node Raft
 backend with its normal durable storage.
 """

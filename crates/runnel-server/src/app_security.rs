@@ -232,7 +232,8 @@ impl CredentialPolicy {
         Some(matched_role).flatten()
     }
 
-    pub(crate) fn credential_count(&self) -> usize {
+    #[cfg(test)]
+    fn credential_count(&self) -> usize {
         self.verifiers.len()
     }
 }
@@ -247,7 +248,8 @@ impl fmt::Debug for CredentialPolicy {
     }
 }
 
-pub(crate) fn generate_token() -> Result<(BearerToken, String), getrandom::Error> {
+#[cfg(test)]
+fn generate_token() -> Result<(BearerToken, String), getrandom::Error> {
     let mut random = [0_u8; MIN_TOKEN_BYTES];
     getrandom::fill(&mut random)?;
     let token = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(random);

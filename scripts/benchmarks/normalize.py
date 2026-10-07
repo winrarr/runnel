@@ -38,7 +38,7 @@ def raw_backends(result: dict[str, Any]) -> dict[str, Any]:
             "runtime": "container",
             "acknowledgement": "local durable append",
             "replication": "single local broker engine",
-            "measurement_boundary": "public line-delimited JSON protocol",
+            "measurement_boundary": "public negotiated v2 Protobuf protocol",
             "measurement_client": "host Python socket client",
             "client_image": "host Python runtime",
             "scenarios": scenarios,

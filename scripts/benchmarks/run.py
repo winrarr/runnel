@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-"""Run repeatable, resource-limited end-to-end benchmarks against a Runnel container.
+"""Run repeatable, resource-limited benchmarks against an isolated Runnel container.
 
-The current protocol is deliberately used as-is. Results therefore describe the
-current development protocol and broker semantics; they are not a claim about a
-future binary protocol or a different durability mode.
+The public protocol is negotiated v2 Protobuf. The broker listener uses the
+explicit development plaintext override only inside a host-loopback-published
+container; results are not a claim about remote secure deployment.
 """
 
 from __future__ import annotations
@@ -20,7 +20,7 @@ from typing import Any
 
 from common import (
     BenchmarkError,
-    LineClient,
+    ProtocolClient,
     ROOT,
     acknowledge,
     build_image,
@@ -73,6 +73,15 @@ class DockerBroker:
                 memory=memory,
                 data_dir=Path(tempfile.mkdtemp(prefix="runnel-bench-")),
                 data_target="/var/lib/runnel",
+                command=[
+                    "--data-dir",
+                    "/var/lib/runnel",
+                    "--listen",
+                    "0.0.0.0:4222",
+                    "--http-listen",
+                    "0.0.0.0:8080",
+                    "--insecure-development-listen",
+                ],
                 published_ports=(4222, 8080),
             )
         )
@@ -100,10 +109,10 @@ class DockerBroker:
             ) from error
         self.startup_ns = time.perf_counter_ns() - started
 
-    def client(self) -> LineClient:
+    def client(self) -> ProtocolClient:
         if self.client_port is None:
             raise BenchmarkError("broker client port was not discovered")
-        return LineClient("127.0.0.1", self.client_port, DEFAULT_TIMEOUT_SECONDS)
+        return ProtocolClient("127.0.0.1", self.client_port, DEFAULT_TIMEOUT_SECONDS)
 
     def metrics(self) -> dict[str, float] | None:
         if self.http_port is None:
@@ -411,8 +420,9 @@ def main() -> int:
             "concurrency": args.concurrency,
             "payload_sizes_bytes": args.payload_sizes,
             "scenarios": args.scenarios,
-            "protocol": "line-delimited JSON with UTF-8 string payloads",
-            "protocol_version": "provisional-line-json-v1",
+            "protocol": "negotiated v2 Protobuf framing with opaque binary payloads",
+            "protocol_version": "runnel-protobuf-v2",
+            "application_transport_security": "plaintext inside host-loopback-published development container",
             "payload_encoding": "utf-8",
             "compression": "none",
             "durability": "current broker default; see engine and implementation configuration",
@@ -424,7 +434,7 @@ def main() -> int:
                 "runtime": "container",
                 "acknowledgement": "local durable append",
                 "replication": "single local broker engine",
-                "measurement_boundary": "public line-delimited JSON protocol",
+                "measurement_boundary": "public negotiated v2 Protobuf protocol",
                 "measurement_client": "host Python socket client",
                 "client_image": "host Python runtime",
                 "startup_seconds": (broker.startup_ns or 0) / 1_000_000_000,

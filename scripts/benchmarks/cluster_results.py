@@ -58,8 +58,13 @@ def build_workload(args: argparse.Namespace) -> dict[str, Any]:
         "leader_failure_timeout_seconds": args.leader_failure_timeout_seconds,
         "payload_sizes_bytes": args.payload_sizes,
         "runtime": args.runtime,
-        "protocol": "line-delimited JSON with UTF-8 string payloads",
-        "protocol_version": "provisional-line-json-v1",
+        "protocol": "negotiated v2 Protobuf framing with opaque binary payloads",
+        "protocol_version": "runnel-protobuf-v2",
+        "application_transport_security": (
+            "plaintext inside an isolated development container network"
+            if args.runtime == "container"
+            else "plaintext on loopback"
+        ),
         "payload_encoding": "utf-8",
         "compression": "none",
         "durability": "committed by the current three-node Raft quorum and local durable state",
@@ -146,7 +151,7 @@ def build_result(
                 "runtime": args.runtime,
                 "acknowledgement": "durable quorum commit",
                 "replication": f"{args.nodes}-node static Multi-Raft",
-                "measurement_boundary": "public line-delimited JSON protocol",
+                "measurement_boundary": "public negotiated v2 Protobuf protocol",
                 "measurement_client": "scripts/benchmarks/cluster.py",
                 "client_image": "host Python runtime",
                 "peer_response_proxy": cluster.peer_proxy_summary(),

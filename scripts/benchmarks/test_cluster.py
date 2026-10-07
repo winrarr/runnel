@@ -113,6 +113,29 @@ class _ClientsContext:
 
 
 class ClusterBenchmarkTests(unittest.TestCase):
+    def test_development_plaintext_override_is_container_only(self) -> None:
+        node = SimpleNamespace(
+            node_id=1,
+            broker_port=0,
+            http_port=0,
+            peer_port=7000,
+            peer_address_port=7000,
+        )
+        cluster = Cluster.__new__(Cluster)
+        cluster.nodes = [node]
+        cluster.ack_timeout_ms = 1_000
+        cluster._container_name = lambda selected: f"node-{selected.node_id}"
+
+        cluster.runtime = "container"
+        container_command = cluster._node_command(node, bootstrap=False)
+        self.assertIn("--insecure-development-listen", container_command)
+        self.assertIn("0.0.0.0:4222", container_command)
+
+        cluster.runtime = "process"
+        process_command = cluster._node_command(node, bootstrap=False)
+        self.assertNotIn("--insecure-development-listen", process_command)
+        self.assertIn("127.0.0.1:4222", process_command)
+
     def test_persistence_write_counter_scrape_deltas_are_fixed_and_per_process(self) -> None:
         def metrics(*, successes: int, elapsed: int, offered: int) -> dict[str, float]:
             labels = 'role="raft_log_rewrite",operation="write_all"'
@@ -1426,8 +1449,8 @@ class ClusterBenchmarkTests(unittest.TestCase):
         self.assertEqual(
             client.request_body["records"],
             [
-                {"key": None, "payload_base64": "cGF5bG9hZA=="},
-                {"key": None, "payload_base64": "cGF5bG9hZA=="},
+                {"key": None, "payload": "payload"},
+                {"key": None, "payload": "payload"},
             ],
         )
 

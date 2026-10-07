@@ -364,7 +364,7 @@ def backend_metadata(name: str, nodes: int) -> dict[str, Any]:
             "persists a consumer checkpoint"
         )
         replication = "single local broker engine"
-        measurement_boundary = "Runnel's current line-delimited JSON protocol"
+        measurement_boundary = "Runnel's negotiated v2 Protobuf protocol"
         client_image = "host Python runtime"
         client_name = "host Python socket client"
         scenario_classes = ["publish-only", "consume-with-ack"]

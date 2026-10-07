@@ -4,8 +4,8 @@ Runnel is a Rust message broker intended to offer durable streams, low operation
 
 ## Repository map
 
-- crates/runnel-protocol: provisional line-delimited JSON request and response types. This is the boundary for future language clients.
-- crates/runnel-client: reusable async persistent client for the provisional protocol.
+- crates/runnel-protocol: negotiated v2 Protobuf envelopes, schema, and bounded framing for future language clients.
+- crates/runnel-client: reusable async persistent client for the negotiated v2 protocol.
 - crates/runnel-engine: topology-free broker engine contract and shared messaging outcomes.
 - crates/runnel-test-support: reusable engine-level contract assertions for local and future distributed implementations.
 - crates/runnel-core: local broker engine, append-only durable stream log, consumer checkpoints, acknowledgements, and recovery.
@@ -47,7 +47,7 @@ Runnel is a Rust message broker intended to offer durable streams, low operation
 
 ## Sources of truth and boundaries
 
-Rust code and tests define current behavior. The wire protocol is provisional, and Runnel has no backward-compatibility requirement. Evolve or replace the protocol when the intended design warrants it. Do not expose storage paths, offsets, or physical layout as public concepts beyond what the current protocol needs.
+Rust code and tests define current behavior. The application wire protocol is negotiated v2, and Runnel has no backward-compatibility requirement for earlier protocol versions or releases. Evolve the protocol when the intended design warrants it. Do not expose storage paths, offsets, or physical layout as public concepts beyond what the current protocol needs.
 
 Future-work documentation—including design, research, backlog, and tech-debt records—is advisory planning material, not current behavior, executable instructions, or an accepted commitment. Do not follow proposed APIs, invariants, steps, or acceptance criteria blindly: inspect code and tests, current ADRs, constraints, and the task request, and distinguish observed facts, hypotheses, target outcomes, and accepted decisions. An unresolved choice is a prompt for design work, not a blanket reason to defer an authorized outcome. Resolve necessary choices from the evidence and project goals, then record consequential decisions in an ADR before treating them as foundational. Seek a second opinion only when a genuine owner-level trade-off remains or the task does not authorize the materially different product commitment.
 

@@ -4,7 +4,6 @@
 from __future__ import annotations
 
 import argparse
-import base64
 import json
 import threading
 import time
@@ -15,7 +14,7 @@ from typing import TYPE_CHECKING, Any
 
 from common import (
     BenchmarkError,
-    LineClient,
+    ProtocolClient,
     acknowledge,
     consume_ack_messages,
     create_stream,
@@ -295,7 +294,7 @@ class HotOrderingObservation:
 
 
 def poll_until_redelivered(
-    client: LineClient, stream: str, consumer: str, expected_offset: int
+    client: ProtocolClient, stream: str, consumer: str, expected_offset: int
 ) -> tuple[dict[str, Any], int]:
     """Wait for an expired unacknowledged message without assuming a margin."""
     deadline = time.monotonic() + DEFAULT_TIMEOUT_SECONDS
@@ -326,7 +325,7 @@ def poll_until_redelivered(
 
 
 def poll_group(
-    client: LineClient, stream: str, consumer: str, member: str
+    client: ProtocolClient, stream: str, consumer: str, member: str
 ) -> tuple[dict[str, Any], int]:
     response, elapsed = request_ok(
         client,
@@ -337,7 +336,7 @@ def poll_group(
 
 
 def acknowledge_group(
-    client: LineClient,
+    client: ProtocolClient,
     stream: str,
     consumer: str,
     member: str,
@@ -1323,20 +1322,19 @@ def run_raft_log_growth(
 
 
 def publish_batch_request(
-    client: LineClient,
+    client: ProtocolClient,
     stream: str,
     payload: str,
     batch_size: int,
     expected_offset: int,
 ) -> tuple[int, int]:
     """Publish one public batch and validate every per-record outcome."""
-    encoded_payload = base64.b64encode(payload.encode("utf-8")).decode("ascii")
     response, elapsed = client.request(
         {
             "op": "publish_batch",
             "stream": stream,
             "records": [
-                {"key": None, "payload_base64": encoded_payload}
+                {"key": None, "payload": payload}
                 for _ in range(batch_size)
             ],
         }
@@ -1760,7 +1758,7 @@ def hot_ordering_records(
 
 
 def publish_keyed(
-    client: LineClient,
+    client: ProtocolClient,
     stream: str,
     key: str,
     payload: str,
@@ -2414,7 +2412,7 @@ def request_until_response(
         if remaining <= 0:
             break
         attempts += 1
-        client: LineClient | None = None
+        client: ProtocolClient | None = None
         try:
             client = cluster.client(
                 node_index, timeout_seconds=min(DEFAULT_TIMEOUT_SECONDS, remaining)

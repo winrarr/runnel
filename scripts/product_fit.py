@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Run the two local reference workloads used by the product-fit plan.
 
-The harness exercises the public JSON-lines protocol against real broker
-processes. It produces a reviewable artifact containing the pre-registered
+The harness exercises the negotiated public Protocol Buffers v2 protocol
+against real broker processes. It produces a reviewable artifact containing the pre-registered
 manifest, request transcript, message ledger, Prometheus snapshots, resource
 samples, broker logs, latency distributions, and an explicit claim matrix.
 The background-work slice also checks the in-flight gauge while two deliveries
@@ -33,6 +33,9 @@ from typing import Any
 
 
 ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT / "scripts" / "benchmarks"))
+from v2_client import V2Client, V2ProtocolError
+
 DEFAULT_MANIFEST = ROOT / "docs" / "research" / "product-fit-manifests" / "local-reference.json"
 DEFAULT_OUTPUT_ROOT = ROOT / "benchmark-results" / "product-fit"
 DEFAULT_TIMEOUT_SECONDS = 10.0
@@ -144,36 +147,32 @@ class ProtocolClient:
 
     def __init__(self, broker: "RunningBroker") -> None:
         self.broker = broker
-        self.socket = socket.create_connection(("127.0.0.1", broker.broker_port), DEFAULT_TIMEOUT_SECONDS)
-        self.reader = self.socket.makefile("rb")
+        try:
+            self.client = V2Client("127.0.0.1", broker.broker_port, DEFAULT_TIMEOUT_SECONDS)
+        except V2ProtocolError as error:
+            raise ProductFitError(str(error)) from error
 
     def request(self, request: dict[str, Any]) -> tuple[dict[str, Any], float]:
-        encoded = json.dumps(request, separators=(",", ":")).encode("utf-8") + b"\n"
-        started = time.perf_counter_ns()
-        self.socket.sendall(encoded)
-        line = self.reader.readline()
-        elapsed_ms = (time.perf_counter_ns() - started) / 1_000_000
-        if not line:
-            raise ProductFitError("broker closed the protocol connection")
         try:
-            response = json.loads(line)
-        except json.JSONDecodeError as error:
-            raise ProductFitError(f"invalid broker response: {line!r}") from error
+            response, elapsed_ns = self.client.request(request)
+        except V2ProtocolError as error:
+            raise ProductFitError(str(error)) from error
+        elapsed_ms = elapsed_ns / 1_000_000
+        transcript_response = {
+            key: value for key, value in response.items() if key != "payload_bytes"
+        }
         self.broker.transcript.append(
             {
                 "timestamp": utc_now(),
                 "request": request,
-                "response": response,
+                "response": transcript_response,
                 "elapsed_ms": elapsed_ms,
             }
         )
         return response, elapsed_ms
 
     def close(self) -> None:
-        try:
-            self.reader.close()
-        finally:
-            self.socket.close()
+        self.client.close()
 
 
 class RunningBroker:

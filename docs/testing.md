@@ -19,7 +19,7 @@ just product-fit
 just product-fit --workload background_work
 ```
 
-The harness uses a real local broker and the public JSON-lines protocol. It
+The harness uses a real local broker and the negotiated v2 Protobuf protocol. It
 loads the pre-registered manifest at
 `docs/research/product-fit-manifests/local-reference.json` and writes an
 immutable run package under `benchmark-results/product-fit/<run-id>/` (which is

@@ -455,20 +455,23 @@ reclaimable storage, resource pressure, and the remaining security and
 capacity controls are still open. The first application-client security
 contract is accepted in [ADR 0035](decisions/0035-first-application-client-security.md)
 and documented in the [source-backed research](research/client-authentication.md).
-The protocol/client slice now has TLS 1.3 configuration with system or
+The protocol/client slice provides TLS 1.3 configuration with system or
 operator-supplied trust roots, secret-safe 256-bit bearer credentials, a
 bounded Hello/auth exchange, policy verifier loading, exhaustive fixed-role
 classification, an authorization gate before dispatch, and engine-owned
-response-size preflight. Startup/bind validation and `runnelctl` runtime
-credential/trust wiring are not yet integrated; neither the TLS listener nor
-policy loader is connected to broker startup. Real-process TLS, authentication,
-authorization, and fail-closed startup evidence also remains open. This is not
-a claim that the deployment is secure: the separate HTTP listener is still
-cleartext and unauthenticated. The development Kubernetes manifest binds it
-to all pod interfaces and exposes health and metrics on the pod network;
-production deployment isolation and HTTP access controls remain open. This
-client contract does not secure the Raft peer listener or establish clustered
-security.
+response-size preflight. Server startup now loads the TLS certificate, key,
+and credential policy before binding, rejects application security with the
+Raft engine while policy replication is unsupported, and requires security on
+non-loopback binds unless the explicit development override is set. Real
+server-process tests cover startup policy, TLS/authentication, role denial,
+and unchanged state on denial; the focused suite still needs a passing rerun
+after its assertion fixes. `runnelctl` does not yet configure client trust or
+credentials. This is not a claim that the deployment is secure: the separate
+HTTP listener is still cleartext and unauthenticated. The development
+Kubernetes manifest explicitly allows unauthenticated plaintext on the broker
+Service for isolated development, and remains unsuitable for production or
+untrusted networks. HTTP access controls and peer security remain separate
+gaps.
 
 Constraints:
 

@@ -263,23 +263,28 @@ hardening remain release work.
 
 ## Implementation evidence required
 
-The current implementation supplies the v2 authentication exchange,
-secret-safe client TLS and credential configuration, TLS 1.3 policy
-construction, runtime credential-policy parsing and verifier checks, fixed-role
-classification, and a pre-dispatch authorization gate. Server startup has not
-yet wired the policy and TLS modules or secure bind validation, and the CLI
-does not yet expose runtime token/trust configuration. These focused code and
-unit boundaries are not real-process security evidence and do not establish a
-secured deployment. The HTTP operations listener remains outside this
+The implementation supplies the v2 authentication exchange, secret-safe client
+TLS and credential configuration, TLS 1.3 policy construction,
+runtime credential-policy parsing and verifier checks, fixed-role
+classification, and a pre-dispatch authorization gate. Server startup now
+loads the certificate, private key, and credential policy before binding; a
+non-loopback application listener requires the complete TLS/auth pair unless
+the explicit `--insecure-development-listen` override is set. That override
+only permits plaintext when no security settings are configured. Application
+TLS/auth settings are rejected with the Raft engine because token policy is
+local and replica consistency and rotation are not implemented. Real-process
+tests cover loopback development access, non-loopback rejection and explicit
+override, invalid-policy startup failure, TLS plus authentication on a
+non-loopback bind, failed credentials, role denial without stream mutation,
+and successful authorized operations. The CLI does not yet expose runtime
+token/trust configuration. Remaining protocol and deployment gates below are
+open; these focused implementation and process tests do not establish that a
+whole deployment is secure. The HTTP operations listener remains outside this
 contract.
 
-Before describing a secured build as ready for use, add protocol and
-real-server coverage for:
+Before describing a secured build as ready for use, complete the remaining
+protocol and real-server coverage for:
 
-- default loopback development access and startup rejection of non-loopback
-  plaintext/no-auth binds; prove the explicit development/test override is the
-  only remote plaintext exception and cannot bypass configured TLS or
-  credential policy;
 - successful TLS 1.3 client connection, TLS completion before protocol preface,
   rejection of TLS 1.2 and plaintext at the secure listener, trusted CA
   loading, certificate/name mismatch, and proof that neither the TLS library

@@ -21,11 +21,11 @@ This repository currently provides the first vertical slice:
 - an early three-node Multi-Raft development backend with any-node client routing;
 - Docker and Kubernetes starting points.
 
-The workspace also contains `runnel-engine`, the shared semantic engine contract, and `runnel-raft`, an early static Multi-Raft backend. `--engine raft` enables versioned durable Raft/state-machine files, framed TCP peer transport, topology-free client forwarding, replicated shared-consumer ownership, clustered attempt limits and dead-letter streams, and a three-node development cluster. The backend is not yet production-complete: dynamic membership, scalable placement, backoff and dead-letter provenance, security policy, and broader failure semantics remain unfinished.
+The workspace also contains `runnel-engine`, the shared semantic engine contract, and `runnel-raft`, an early static Multi-Raft backend. `--engine raft` enables versioned durable Raft/state-machine files, framed TCP peer transport, topology-free client forwarding, replicated shared-consumer ownership, clustered attempt limits and dead-letter streams, and a three-node development cluster. The backend is not yet production-complete: dynamic membership, scalable placement, backoff and dead-letter provenance, replica-consistent application security policy, and broader failure semantics remain unfinished.
 
-The workspace includes reusable `runnel-client` and `runnel-test-support` crates. The client provides persistent sequential request/response transport with bounded connection, write, response-size, and response timeouts for the provisional protocol; the test-support crate contains storage- and topology-independent assertions for the Engine contract.
+The workspace includes reusable `runnel-client` and `runnel-test-support` crates. The client provides persistent sequential request/response transport with bounded connection, write, response-size, and response timeouts for negotiated protocol v2; the test-support crate contains storage- and topology-independent assertions for the Engine contract.
 
-Retention, consume batching, compression, authentication, and TLS remain planned product work. Publish batches already provide independent per-record outcomes without batch atomicity. The current line-delimited JSON protocol is a development protocol and is not yet a compatibility promise. Broker-wide retry settings remain the fallback for local and clustered delivery; `configure_consumer` and `inspect_consumer` provide durable per-consumer acknowledgement timeouts and attempt limits while the early static Raft backend preserves replicated ownership, expiry fencing, and dead-letter recovery without exposing its internal consumer state.
+Retention and compression remain planned product work. The application listener supports negotiated v2, TLS 1.3, and bearer-token authorization for the local engine; its default loopback development mode is plaintext. `runnelctl` does not yet expose client trust-root or credential-file options, and application security configuration is rejected with the Raft engine until replica policy consistency is implemented. The separate HTTP health and metrics listener remains cleartext and unauthenticated. Protocol v2 is the only supported application wire protocol; prior Runnel wire versions are not a compatibility target. Publish batches provide independent per-record outcomes without batch atomicity. Broker-wide retry settings remain the fallback for local and clustered delivery; `configure_consumer` and `inspect_consumer` provide durable per-consumer acknowledgement timeouts and attempt limits while the early static Raft backend preserves replicated ownership, expiry fencing, and dead-letter recovery without exposing its internal consumer state.
 
 ## Quick start
 
@@ -139,16 +139,33 @@ The test suite includes core persistence and recovery tests, wire-format round-t
 
 Benchmark workflows and interpretation are documented in [docs/benchmarking.md](docs/benchmarking.md). See [scripts/benchmarks/README.md](scripts/benchmarks/README.md) for harness semantics and comparison limitations.
 
-The current protocol accepts one JSON request per TCP line. For example:
+The TCP application listener negotiates v2 with the `RNLN` preface and Protobuf
+frames. Use `runnelctl` for the current development operations:
 
-    {"op":"publish","stream":"events","payload":"hello","request_id":"optional-stable-id"}
-    {"op":"poll","stream":"events","consumer":"worker"}
-    {"op":"ack","stream":"events","consumer":"worker","offset":0}
-    {"op":"replay","stream":"events","consumer":"worker","offset":0}
-    {"op":"configure_consumer","stream":"events","consumer":"worker","ack_timeout_ms":5000,"max_delivery_attempts":5}
-    {"op":"inspect_consumer","stream":"events","consumer":"worker"}
+    cargo run -p runnel-cli -- create-stream events
+    cargo run -p runnel-cli -- publish events hello
+    cargo run -p runnel-cli -- consume events worker
+    cargo run -p runnel-cli -- ack events worker 0
+    cargo run -p runnel-cli -- replay events worker 0
+    cargo run -p runnel-cli -- configure-consumer events worker 5000 --max-delivery-attempts 5
+    cargo run -p runnel-cli -- inspect-consumer events worker
 
-Grouped delivery uses `poll_group` and `ack_group` requests with a consumer name, member name, and delivery token. These are provisional development-protocol operations.
+Grouped delivery uses `consume` with `--member` and `ack` with both
+`--member` and `--delivery-token`. The CLI currently connects to the default
+loopback development listener; it does not yet configure TLS trust roots or a
+bearer credential for a secured listener. See
+[ADR 0031](docs/decisions/0031-protocol-v2-contract.md) for the wire contract
+and [ADR 0035](docs/decisions/0035-first-application-client-security.md) for
+application listener security behavior and its remaining boundaries.
+
+For a local-engine application listener on a non-loopback address, provide
+`--app-tls-cert <path>`, `--app-tls-key <path>`, and
+`--credential-policy <path>` together. Startup validates these runtime files
+before binding and fails closed on invalid configuration. The Raft engine
+rejects application TLS/authentication settings until policy consistency across
+replicas is implemented. The separate HTTP listener is not protected by these
+application credentials. The explicitly named
+`--insecure-development-listen` flag is for isolated development only.
 
 Replay reads exactly one inclusive logical offset and does not create an
 ordinary delivery or advance the consumer checkpoint. Its response has no
@@ -171,6 +188,12 @@ Build and run a local image:
 
     docker build -t runnel:dev .
     docker volume create runnel-data
-    docker run --rm -p 4222:4222 -p 8080:8080 -v runnel-data:/var/lib/runnel runnel:dev
+    docker run --rm -p 127.0.0.1:4222:4222 -v runnel-data:/var/lib/runnel runnel:dev --listen 0.0.0.0:4222 --insecure-development-listen
 
-The Kubernetes manifest in deploy/kubernetes/runnel.yaml starts a three-node static Multi-Raft development cluster with independent persistent volumes. It does not provide TLS, authentication, upgrades, or production policy by itself; see [deploy/kubernetes/README.md](deploy/kubernetes/README.md).
+The image defaults to loopback listeners. This local-only invocation opens the
+broker inside the container for Docker port forwarding while binding the host
+port to loopback. It explicitly enables unauthenticated plaintext for isolated
+local development; do not expose it to an untrusted network. The HTTP health
+and metrics listener remains separate, unauthenticated, and unexposed here.
+
+The Kubernetes manifest in deploy/kubernetes/runnel.yaml starts a three-node static Multi-Raft development cluster with independent persistent volumes. It explicitly enables unauthenticated plaintext on the broker Service for isolated development; it is not suitable for production or untrusted networks. The manifest also does not provide HTTP security, upgrades, or production policy; see [deploy/kubernetes/README.md](deploy/kubernetes/README.md).

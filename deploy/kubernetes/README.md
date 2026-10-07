@@ -7,6 +7,13 @@ promise. It assumes a Kubernetes context that can provision three independent
 `ReadWriteOnce` persistent-volume claims and can resolve the headless Service
 names used by the broker.
 
+> **Development security warning:** the manifest sets
+> `--insecure-development-listen`, so the broker Service on port 4222 accepts
+> unauthenticated plaintext. Use it only in a trusted, isolated development
+> cluster. Never use this manifest on production or untrusted networks. The
+> HTTP health and metrics listener on port 8080 is also cleartext and
+> unauthenticated.
+
 Build the `runnel:dev` image and make it available to the cluster, then apply
 the manifest:
 
@@ -147,10 +154,13 @@ and are not a substitute for capacity planning.
 
 The pod runs as a non-root user with the default runtime seccomp profile, no
 Linux capabilities, privilege escalation disabled, and a read-only root
-filesystem. The broker and HTTP Service still have no TLS, authentication,
-authorization, or credential rotation. Keep the Services inside a trusted
-development network and do not expose them publicly without an external
-security boundary.
+filesystem. Application TLS and bearer authentication are available for the
+local engine, but the Raft backend rejects that configuration until credential
+policy is consistent across replicas. This manifest therefore explicitly
+allows unauthenticated plaintext broker traffic on port 4222. The HTTP Service
+on port 8080 remains cleartext and unauthenticated. Keep both Services inside
+a trusted, isolated development network; do not expose them publicly or to
+untrusted namespaces.
 
 ## Upgrade and rollback
 

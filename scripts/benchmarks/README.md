@@ -44,6 +44,8 @@ Use `--scenarios` to run only the named scenarios when a benchmark consumer need
 
 This is an end-to-end benchmark of the current development protocol. It is not yet a fair Kafka, Redpanda, or NATS JetStream comparison: those brokers require adapters that express equivalent acknowledgement, replication, ordering, and delivery guarantees. The comparison work belongs in the benchmark backlog. Do not compare raw numbers across brokers until the adapter semantics and environment are recorded in the result.
 
+The benchmark and product-fit harnesses use the negotiated v2 Protobuf protocol through a persistent Python socket client. The client supports stream creation, scalar and batch publish, scalar and grouped poll/acknowledgement, and replay. It does not implement TLS, bearer authentication, batch poll/acknowledgement, consumer-policy operations, or the general runnelctl configuration surface. Native benchmark processes bind the application listener to loopback. Container benchmark runs pass the explicit insecure-development listener flag only inside the per-run Docker network and publish ports on host loopback; this is development-only plaintext and does not model a secure deployment. The HTTP listener is a separate unauthenticated surface.
+
 The short `just bench-container-smoke` recipe is used by CI to verify that the image can start, accept workload traffic under limits, expose metrics, and recover an unacknowledged message. It is a workflow check, not a performance gate.
 
 ## Clustered baseline

@@ -22,7 +22,7 @@ from cluster_scenarios import DEFAULT_PEER_RESPONSE_DELAY_MS
 from common import (
     BenchmarkError,
     DEFAULT_TIMEOUT_SECONDS,
-    LineClient,
+    ProtocolClient,
     ROOT,
     prometheus_metrics,
     wait_for_ready,
@@ -130,8 +130,8 @@ class Cluster:
 
     def client(
         self, index: int, *, timeout_seconds: float = COMMAND_TIMEOUT_SECONDS
-    ) -> LineClient:
-        return LineClient(
+    ) -> ProtocolClient:
+        return ProtocolClient(
             "127.0.0.1",
             self.nodes[index % self.node_count].broker_port,
             timeout_seconds,
@@ -164,7 +164,7 @@ class Cluster:
         return peer_connection_census(self)
 
     @contextmanager
-    def connected_clients(self) -> Iterator[list[LineClient]]:
+    def connected_clients(self) -> Iterator[list[ProtocolClient]]:
         clients = [self.client(index) for index in range(self.node_count)]
         try:
             yield clients
@@ -297,6 +297,8 @@ class Cluster:
         ]
         for address in addresses:
             command.extend(["--cluster-node", address])
+        if self.runtime == "container":
+            command.append("--insecure-development-listen")
         if bootstrap:
             command.append("--bootstrap")
         return command

@@ -1,16 +1,21 @@
+use std::fs;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, Command, Output, Stdio};
 use std::sync::mpsc;
 use std::thread::sleep;
 use std::time::{Duration, Instant};
 
+use base64::Engine as _;
+use runnel_client::{Client, ClientConfig, ClientSecurityConfig, ClientTlsConfig};
 use runnel_protocol::{
     BinaryPayload, MAX_PUBLISH_BATCH_RECORDS, PublishBatchRecord, PublishBatchRecordResponse,
     Request, Response,
 };
+use sha2::Digest as _;
 use tempfile::TempDir;
+use zeroize::Zeroize;
 
 struct RunningServer {
     child: Child,
@@ -26,18 +31,7 @@ impl RunningServer {
     fn start_with_args(data_dir: &Path, extra_args: &[&str]) -> Self {
         let broker_addr = free_addr();
         let http_addr = free_addr();
-        let binary = server_binary();
-        let mut command = Command::new(binary);
-        command.args([
-            "--data-dir",
-            data_dir.to_str().expect("temporary path should be UTF-8"),
-            "--listen",
-            &broker_addr.to_string(),
-            "--http-listen",
-            &http_addr.to_string(),
-        ]);
-        command.args(extra_args);
-        let child = command
+        let child = server_command(data_dir, broker_addr, http_addr, extra_args)
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .spawn()
@@ -47,6 +41,26 @@ impl RunningServer {
         Self {
             child,
             broker_addr,
+            http_addr,
+        }
+    }
+
+    fn start_on(
+        data_dir: &Path,
+        broker_bind_addr: SocketAddr,
+        broker_connect_addr: SocketAddr,
+        extra_args: &[&str],
+    ) -> Self {
+        let http_addr = free_addr();
+        let child = server_command(data_dir, broker_bind_addr, http_addr, extra_args)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("runnel server process should start");
+        wait_for_http(http_addr);
+        Self {
+            child,
+            broker_addr: broker_connect_addr,
             http_addr,
         }
     }
@@ -62,6 +76,31 @@ impl RunningServer {
         }
         self.child.wait().expect("server should be reaped");
     }
+}
+
+fn server_command(
+    data_dir: &Path,
+    broker_addr: SocketAddr,
+    http_addr: SocketAddr,
+    extra_args: &[&str],
+) -> Command {
+    let mut command = Command::new(server_binary());
+    command.args([
+        "--data-dir",
+        data_dir.to_str().expect("temporary path should be UTF-8"),
+        "--listen",
+        &broker_addr.to_string(),
+        "--http-listen",
+        &http_addr.to_string(),
+    ]);
+    command.args(extra_args);
+    command
+}
+
+fn run_startup(data_dir: &Path, broker_addr: SocketAddr, extra_args: &[&str]) -> Output {
+    server_command(data_dir, broker_addr, free_addr(), extra_args)
+        .output()
+        .expect("runnel startup should run")
 }
 
 fn server_binary() -> PathBuf {
@@ -337,6 +376,242 @@ fn network_protocol_rejects_json_lines_without_processing_the_request() {
     assert!(matches!(
         request(server.broker_addr, Request::Health),
         Response::Health { streams: 0, .. }
+    ));
+}
+
+#[test]
+fn remote_plaintext_startup_is_rejected_without_the_development_override() {
+    let directory = TempDir::new().unwrap();
+    let output = run_startup(directory.path(), "0.0.0.0:0".parse().unwrap(), &[]);
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("non-loopback application listener"));
+
+    let connect_addr = free_addr();
+    let bind_addr = SocketAddr::from(([0, 0, 0, 0], connect_addr.port()));
+    let server = RunningServer::start_on(
+        directory.path(),
+        bind_addr,
+        connect_addr,
+        &["--insecure-development-listen"],
+    );
+    assert!(matches!(
+        request(server.broker_addr, Request::Health),
+        Response::Health { .. }
+    ));
+}
+
+#[test]
+fn invalid_security_policy_fails_before_the_listener_accepts_connections() {
+    let directory = TempDir::new().unwrap();
+    let (certificate, key, policy, _) =
+        write_application_security_files(directory.path(), &[("operator", "operator")]);
+    write_private_file(&policy, br#"{"credentials":[]}"#);
+    let broker_addr = free_addr();
+    let output = run_startup(
+        directory.path(),
+        broker_addr,
+        &[
+            "--app-tls-cert",
+            certificate.to_str().unwrap(),
+            "--app-tls-key",
+            key.to_str().unwrap(),
+            "--credential-policy",
+            policy.to_str().unwrap(),
+        ],
+    );
+    assert!(!output.status.success());
+    let startup_error = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        startup_error.contains("application credential policy is invalid"),
+        "unexpected startup error: {startup_error}"
+    );
+    assert!(TcpStream::connect(broker_addr).is_err());
+}
+
+#[test]
+fn application_tls_and_credentials_are_required_together_and_not_supported_in_raft_mode() {
+    let directory = TempDir::new().unwrap();
+    let certificate = directory.path().join("not-read.pem");
+    let key = directory.path().join("not-read.key");
+    let output = run_startup(
+        directory.path(),
+        free_addr(),
+        &[
+            "--app-tls-cert",
+            certificate.to_str().unwrap(),
+            "--app-tls-key",
+            key.to_str().unwrap(),
+        ],
+    );
+    assert!(!output.status.success());
+    assert!(
+        String::from_utf8_lossy(&output.stderr)
+            .contains("--credential-policy must be configured together")
+    );
+
+    let output = run_startup(
+        directory.path(),
+        free_addr(),
+        &[
+            "--engine",
+            "raft",
+            "--app-tls-cert",
+            certificate.to_str().unwrap(),
+            "--app-tls-key",
+            key.to_str().unwrap(),
+            "--credential-policy",
+            "not-read.json",
+        ],
+    );
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("unsupported with --engine raft"));
+}
+
+#[test]
+fn real_server_tls_authenticates_before_dispatch_and_enforces_roles() {
+    let directory = TempDir::new().unwrap();
+    let (certificate, key, policy, token_paths) = write_application_security_files(
+        directory.path(),
+        &[("operator", "operator"), ("application", "application")],
+    );
+    let broker_connect_addr = free_addr();
+    let broker_bind_addr = SocketAddr::from(([0, 0, 0, 0], broker_connect_addr.port()));
+    let secure_args = [
+        "--app-tls-cert",
+        certificate.to_str().unwrap(),
+        "--app-tls-key",
+        key.to_str().unwrap(),
+        "--credential-policy",
+        policy.to_str().unwrap(),
+        "--insecure-development-listen",
+    ];
+    let server = RunningServer::start_on(
+        directory.path(),
+        broker_bind_addr,
+        broker_connect_addr,
+        &secure_args,
+    );
+
+    let mut plaintext = TcpStream::connect(server.broker_addr).unwrap();
+    plaintext
+        .set_read_timeout(Some(Duration::from_secs(2)))
+        .unwrap();
+    plaintext.write_all(&runnel_protocol::v2::PREFACE).unwrap();
+    let mut plaintext_response = Vec::new();
+    let read_result = plaintext.read_to_end(&mut plaintext_response);
+    assert!(
+        plaintext_response.is_empty() || plaintext_response[0] != 0,
+        "the TLS listener must not return a length-prefixed v2 frame to plaintext"
+    );
+    assert!(
+        read_result.is_ok()
+            || matches!(
+                &read_result,
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        std::io::ErrorKind::ConnectionAborted
+                            | std::io::ErrorKind::ConnectionReset
+                            | std::io::ErrorKind::UnexpectedEof
+                    )
+            ),
+        "TLS listener did not close the rejected plaintext connection: {read_result:?}"
+    );
+    drop(plaintext);
+
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let tls = ClientTlsConfig::new("localhost").with_ca_file(&certificate);
+    let missing_credentials = ClientSecurityConfig::plaintext_development().with_tls(tls.clone());
+    assert!(matches!(
+        runtime.block_on(Client::connect_with_security(
+            server.broker_addr,
+            ClientConfig::default(),
+            missing_credentials,
+        )),
+        Err(runnel_client::ClientError::AuthenticationRequired)
+    ));
+
+    let (unknown_token, _) = generate_test_credential();
+    let unknown_token_path = directory.path().join("unknown.token");
+    write_private_file(&unknown_token_path, unknown_token.as_bytes());
+    let mut unknown_token = unknown_token;
+    unknown_token.zeroize();
+    let unknown_credentials = ClientSecurityConfig::plaintext_development()
+        .with_tls(tls.clone())
+        .with_token_file(&unknown_token_path)
+        .unwrap();
+    assert!(matches!(
+        runtime.block_on(Client::connect_with_security(
+            server.broker_addr,
+            ClientConfig::default(),
+            unknown_credentials,
+        )),
+        Err(runnel_client::ClientError::AuthenticationFailed)
+    ));
+
+    let wrong_name = ClientSecurityConfig::plaintext_development()
+        .with_tls(ClientTlsConfig::new("wrong.example").with_ca_file(&certificate))
+        .with_token_file(&token_paths[0])
+        .unwrap();
+    assert!(matches!(
+        runtime.block_on(Client::connect_with_security(
+            server.broker_addr,
+            ClientConfig::default(),
+            wrong_name,
+        )),
+        Err(runnel_client::ClientError::TlsHandshake)
+    ));
+
+    let application_security = ClientSecurityConfig::plaintext_development()
+        .with_tls(tls.clone())
+        .with_token_file(&token_paths[1])
+        .unwrap();
+    let mut application = runtime
+        .block_on(Client::connect_with_security(
+            server.broker_addr,
+            ClientConfig::default(),
+            application_security,
+        ))
+        .unwrap();
+    assert!(matches!(
+        runtime.block_on(application.request(&Request::CreateStream {
+            stream: "denied".to_owned(),
+        })),
+        Ok(Response::Error { code, .. }) if code == "authorization_denied"
+    ));
+
+    let operator_security = ClientSecurityConfig::plaintext_development()
+        .with_tls(tls)
+        .with_token_file(&token_paths[0])
+        .unwrap();
+    let mut operator = runtime
+        .block_on(Client::connect_with_security(
+            server.broker_addr,
+            ClientConfig::default(),
+            operator_security,
+        ))
+        .unwrap();
+    assert!(matches!(
+        runtime.block_on(operator.request(&Request::Health)),
+        Ok(Response::Health { streams: 0, .. })
+    ));
+    assert!(matches!(
+        runtime.block_on(operator.request(&Request::CreateStream {
+            stream: "events".to_owned(),
+        })),
+        Ok(Response::StreamCreated { created: true, .. })
+    ));
+    assert!(matches!(
+        runtime.block_on(application.request(&Request::Publish {
+            stream: "events".to_owned(),
+            key: None,
+            payload: "authorized".to_owned(),
+            request_id: None,
+        })),
+        Ok(Response::Published { offset: 0, .. })
     ));
 }
 
@@ -1555,6 +1830,62 @@ fn free_addr() -> SocketAddr {
         .unwrap()
         .local_addr()
         .unwrap()
+}
+
+fn write_application_security_files(
+    directory: &Path,
+    roles: &[(&str, &str)],
+) -> (PathBuf, PathBuf, PathBuf, Vec<PathBuf>) {
+    let certificate_path = directory.join("application-cert.pem");
+    let key_path = directory.join("application-key.pem");
+    let policy_path = directory.join("credentials.json");
+    fs::write(
+        &certificate_path,
+        include_str!("fixtures/application-security-cert.pem"),
+    )
+    .unwrap();
+    write_private_file(
+        &key_path,
+        include_str!("fixtures/application-security-key.pem").as_bytes(),
+    );
+
+    let mut policy_credentials = Vec::with_capacity(roles.len());
+    let mut token_paths = Vec::with_capacity(roles.len());
+    for (id, role) in roles {
+        let (token, digest) = generate_test_credential();
+        let token_path = directory.join(format!("{id}.token"));
+        write_private_file(&token_path, token.as_bytes());
+        let mut token = token;
+        token.zeroize();
+        token_paths.push(token_path);
+        policy_credentials.push(format!(
+            r#"{{"id":"{id}","sha256":"{digest}","role":"{role}"}}"#
+        ));
+    }
+    write_private_file(
+        &policy_path,
+        format!(r#"{{"credentials":[{}]}}"#, policy_credentials.join(",")).as_bytes(),
+    );
+    (certificate_path, key_path, policy_path, token_paths)
+}
+
+fn generate_test_credential() -> (String, String) {
+    let mut random = [0_u8; 32];
+    getrandom::fill(&mut random).expect("test credential randomness should be available");
+    let token = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(random);
+    random.fill(0);
+    let digest = sha2::Sha256::digest(token.as_bytes());
+    let digest = digest.iter().map(|byte| format!("{byte:02x}")).collect();
+    (token, digest)
+}
+
+fn write_private_file(path: &Path, content: &[u8]) {
+    fs::write(path, content).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(path, fs::Permissions::from_mode(0o600)).unwrap();
+    }
 }
 
 fn http_metrics(address: SocketAddr) -> String {

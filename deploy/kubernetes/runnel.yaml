@@ -1,5 +1,7 @@
-# Development-only static-cluster manifest. This file intentionally does not
-# provide topology spread, backup policy, ServiceMonitor, TLS/authentication,
+# Development-only static-cluster manifest. The application listener explicitly
+# allows unauthenticated plaintext for isolated development; never expose this
+# Service to production or untrusted networks. This file also does not provide
+# topology spread, backup policy, ServiceMonitor, HTTP security,
 # storage-capacity policy, or a supported rolling upgrade. See README.md for
 # the readiness, liveness, persistence, disruption, control-plane, resource,
 # metrics, and compatibility assumptions.
@@ -8,8 +10,8 @@ kind: Service
 metadata:
   name: runnel
 spec:
-  # Client and HTTP traffic use readiness-filtered endpoints. This Service
-  # does not provide TLS, authentication, or a metrics scrape policy.
+  # Client and HTTP traffic use readiness-filtered endpoints. Broker traffic
+  # is unauthenticated plaintext; the HTTP listener also has no access policy.
   selector:
     app.kubernetes.io/name: runnel
   ports:
@@ -97,6 +99,7 @@ spec:
                 --node-id "$node_id" \
                 --data-dir /var/lib/runnel \
                 --listen 0.0.0.0:4222 \
+                --insecure-development-listen \
                 --http-listen 0.0.0.0:8080 \
                 --peer-listen 0.0.0.0:7000 \
                 --cluster-node 0=runnel-0.runnel-headless:7000 \
