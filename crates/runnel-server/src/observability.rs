@@ -656,6 +656,17 @@ fn format_metrics(
     .unwrap();
     writeln!(
         output,
+        "# HELP runnel_broker_max_response_bytes Configured maximum broker protocol response frame size in bytes."
+    )
+    .unwrap();
+    writeln!(
+        output,
+        "# TYPE runnel_broker_max_response_bytes gauge\nrunnel_broker_max_response_bytes {}",
+        admission.max_response_bytes
+    )
+    .unwrap();
+    writeln!(
+        output,
         "# HELP runnel_broker_request_timeout_seconds Configured maximum broker protocol request duration in seconds."
     )
     .unwrap();
@@ -1021,7 +1032,8 @@ mod tests {
         };
         let admission = ProtocolAdmission {
             max_connections: 1,
-            max_request_bytes: 1,
+            max_request_bytes: 1024,
+            max_response_bytes: 1024,
             max_in_flight_requests: 1,
             request_timeout: Duration::from_secs(1),
         };
@@ -1060,7 +1072,8 @@ mod tests {
     fn default_metrics_formatter_does_not_include_write_counter_series() {
         let admission = ProtocolAdmission {
             max_connections: 1,
-            max_request_bytes: 1,
+            max_request_bytes: 1024,
+            max_response_bytes: 1024,
             max_in_flight_requests: 1,
             request_timeout: Duration::from_secs(1),
         };

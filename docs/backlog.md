@@ -529,6 +529,8 @@ Acceptance criteria:
 
 ### Make overload and abusive-client behavior bounded
 
+Request and response frame-size limits are now configurable within the protocol bounds, negotiated per connection, and exposed as broker metrics.
+
 Goal: keep the broker responsive and explicit when clients create more connections, requests, payload bytes, or outstanding work than the configured deployment can safely serve.
 
 Rationale: predictable resource usage requires admission limits before authentication or ordinary application mistakes can turn unbounded network input into memory exhaustion, runtime starvation, or storage failure.
@@ -544,7 +546,7 @@ Constraints:
 
 Acceptance criteria:
 
-- request size, connection count, in-flight work, and relevant queue limits are configurable with safe defaults;
+- request and response sizes, connection count, in-flight work, and relevant queue limits are configurable with safe defaults;
 - overload produces documented rejection or backpressure responses rather than silent loss or unbounded growth;
 - slow-reader, slow-writer, oversized-request, connection-flood, and storage-stall tests demonstrate bounded memory and recovery;
 - metrics distinguish active work, rejected admission, timeouts, and saturation by limiting resource.

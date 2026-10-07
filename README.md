@@ -170,6 +170,12 @@ replicas is implemented. The separate HTTP listener is not protected by these
 application credentials. The explicitly named
 `--insecure-development-listen` flag is for isolated development only.
 
+Protocol frame limits default to 1 MiB for requests (`--max-request-bytes`) and
+65 MiB for responses (`--max-response-bytes`). The request limit can be raised
+up to 64 MiB or lowered to at least 1 KiB; the response limit can be lowered to
+at least 1 KiB. These limits are negotiated per connection, and a response
+that cannot fit is rejected before the operation has an effect.
+
 Replay reads exactly one inclusive logical offset and does not create an
 ordinary delivery or advance the consumer checkpoint. Its response has no
 delivery token; an unavailable offset returns `history_unavailable` with the

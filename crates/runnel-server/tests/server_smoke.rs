@@ -1939,6 +1939,81 @@ fn real_server_rejects_batches_that_could_exceed_the_negotiated_reply_limit_befo
 }
 
 #[test]
+fn server_response_limit_is_negotiated_and_preflights_batches_before_effects() {
+    use runnel_protocol::v2::{self, ClientHello, ServerHello};
+
+    let directory = TempDir::new().unwrap();
+    let server =
+        RunningServer::start_with_args(directory.path(), &["--max-response-bytes", "1024"]);
+
+    let mut raw = TcpStream::connect(server.broker_addr).unwrap();
+    raw.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+    raw.write_all(&v2::PREFACE).unwrap();
+    let hello = v2::encode_client_hello(&ClientHello::core_v2()).unwrap();
+    raw.write_all(hello.as_bytes()).unwrap();
+    let mut length = [0; 4];
+    raw.read_exact(&mut length).unwrap();
+    let mut body = vec![0; u32::from_be_bytes(length) as usize];
+    raw.read_exact(&mut body).unwrap();
+    let ServerHello::Accepted(accepted) = v2::decode_server_hello(&body).unwrap() else {
+        panic!("server should accept the core v2 Hello");
+    };
+    assert_eq!(accepted.max_outbound_frame_bytes, 1_024);
+    assert_eq!(accepted.server_to_client_frame_bytes, 1_024);
+    drop(raw);
+
+    assert!(matches!(
+        request(
+            server.broker_addr,
+            Request::CreateStream {
+                stream: "events".to_owned(),
+            },
+        ),
+        Response::StreamCreated { created: true, .. }
+    ));
+
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let mut client = runtime
+        .block_on(Client::connect(server.broker_addr))
+        .unwrap();
+    assert!(matches!(
+        runtime.block_on(client.request(&Request::PublishBatch {
+            stream: "events".to_owned(),
+            records: (0..8)
+                .map(|index| PublishBatchRecord {
+                    key: None,
+                    payload: BinaryPayload::new(format!("record-{index}").into_bytes()),
+                    request_id: None,
+                })
+                .collect(),
+        })),
+        Ok(Response::Error { code, .. }) if code == "response_too_large"
+    ));
+    assert!(matches!(
+        request(
+            server.broker_addr,
+            Request::Publish {
+                stream: "events".to_owned(),
+                key: None,
+                payload: "after-rejected-batch".to_owned(),
+                request_id: None,
+            },
+        ),
+        Response::Published { offset: 0, .. }
+    ));
+
+    let metrics = http_metrics(server.http_addr);
+    assert!(
+        metrics
+            .lines()
+            .any(|line| line == "runnel_broker_max_response_bytes 1024")
+    );
+}
+
+#[test]
 fn network_protocol_returns_partial_publish_batch_outcomes() {
     let directory = TempDir::new().unwrap();
     let server = RunningServer::start(directory.path());

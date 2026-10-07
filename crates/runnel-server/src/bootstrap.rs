@@ -18,6 +18,7 @@ use crate::protocol::{self, ProtocolAdmission};
 
 const DEFAULT_MAX_CONNECTIONS: usize = 1_024;
 const DEFAULT_MAX_REQUEST_BYTES: usize = 1_048_576;
+const DEFAULT_MAX_RESPONSE_BYTES: usize = runnel_protocol::v2::DEFAULT_SERVER_TO_CLIENT_FRAME_BYTES;
 const DEFAULT_MAX_IN_FLIGHT_REQUESTS: usize = 256;
 const DEFAULT_REQUEST_TIMEOUT_MS: u64 = 30_000;
 
@@ -60,6 +61,8 @@ struct Args {
         default_value_t = DEFAULT_MAX_REQUEST_BYTES
     )]
     max_request_bytes: usize,
+    #[arg(long, default_value_t = DEFAULT_MAX_RESPONSE_BYTES)]
+    max_response_bytes: usize,
     #[arg(
         long,
         default_value_t = DEFAULT_MAX_IN_FLIGHT_REQUESTS
@@ -102,6 +105,7 @@ pub(crate) async fn run() -> Result<(), Box<dyn std::error::Error>> {
     protocol::validate_admission_config(
         args.max_connections,
         args.max_request_bytes,
+        args.max_response_bytes,
         args.max_in_flight_requests,
         args.request_timeout_ms,
     )?;
@@ -181,6 +185,7 @@ pub(crate) async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let protocol_admission = ProtocolAdmission {
         max_connections: args.max_connections,
         max_request_bytes: args.max_request_bytes,
+        max_response_bytes: args.max_response_bytes,
         max_in_flight_requests: args.max_in_flight_requests,
         request_timeout: Duration::from_millis(args.request_timeout_ms),
     };

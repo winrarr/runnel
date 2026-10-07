@@ -476,8 +476,14 @@ fn select_server_hello(
     if admission.max_request_bytes > v2::MAX_CLIENT_TO_SERVER_FRAME_BYTES {
         return refusal(RefusalCode::LimitTooLarge);
     }
+    if admission.max_response_bytes < v2::MIN_FRAME_BODY_BYTES {
+        return refusal(RefusalCode::LimitTooSmall);
+    }
+    if admission.max_response_bytes > v2::MAX_SERVER_TO_CLIENT_FRAME_BYTES {
+        return refusal(RefusalCode::LimitTooLarge);
+    }
     let server_inbound = admission.max_request_bytes;
-    let server_outbound = v2::MAX_SERVER_TO_CLIENT_FRAME_BYTES;
+    let server_outbound = admission.max_response_bytes;
     v2::ServerHello::Accepted(v2::HelloAccepted {
         major: v2::CURRENT_MAJOR,
         minor: v2::CURRENT_MINOR,

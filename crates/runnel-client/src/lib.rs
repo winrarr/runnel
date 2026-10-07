@@ -146,10 +146,10 @@ pub enum ClientError {
     #[error("broker returned an invalid v2 response")]
     InvalidResponse,
 
-    #[error("unexpected response for {operation}: {response:?}")]
+    #[error("unexpected {response_kind} response for {operation}")]
     UnexpectedResponse {
         operation: &'static str,
-        response: Box<Response>,
+        response_kind: &'static str,
     },
 }
 
@@ -2058,7 +2058,7 @@ fn publish_batch_attempt(
 fn publish_batch_unexpected(record_count: usize, response: Response) -> PublishBatchAttempt {
     let failure = AttemptFailure::Client(ClientError::UnexpectedResponse {
         operation: "publish_batch",
-        response: Box::new(response),
+        response_kind: response.kind(),
     });
     publish_batch_failure(record_count, BatchFailureKind::Unknown, failure)
 }
@@ -2169,7 +2169,7 @@ fn attempt_failure_details(failure: &AttemptFailure) -> (String, String) {
         }
         AttemptFailure::Broker(response) => (
             "unexpected_response".to_owned(),
-            format!("unexpected response: {response:?}"),
+            format!("unexpected {} response", response.kind()),
         ),
         AttemptFailure::Client(error) => ("client_error".to_owned(), error.to_string()),
     }
@@ -2264,7 +2264,7 @@ fn typed_reply<T>(
         return TypedResponse::Outcome(AttemptOutcome::Unknown(AttemptFailure::Client(
             ClientError::UnexpectedResponse {
                 operation,
-                response: Box::new(response),
+                response_kind: response.kind(),
             },
         )));
     }
@@ -2273,7 +2273,7 @@ fn typed_reply<T>(
         Err(response) => TypedResponse::Outcome(AttemptOutcome::Unknown(AttemptFailure::Client(
             ClientError::UnexpectedResponse {
                 operation,
-                response,
+                response_kind: response.kind(),
             },
         ))),
     }
@@ -2329,7 +2329,7 @@ fn typed_response<T>(
             Err(response) => TypedResponse::Outcome(AttemptOutcome::Unknown(
                 AttemptFailure::Client(ClientError::UnexpectedResponse {
                     operation,
-                    response,
+                    response_kind: response.kind(),
                 }),
             )),
         },
@@ -2473,6 +2473,48 @@ mod tests {
                 ClientError::UnexpectedResponse { .. }
             )))
         ));
+    }
+
+    #[test]
+    fn unexpected_response_diagnostics_omit_application_fields() {
+        let response = Response::Message {
+            stream: "secret-stream-marker".to_owned(),
+            consumer: "secret-consumer-marker".to_owned(),
+            member: Some("secret-member-marker".to_owned()),
+            offset: 7,
+            key: Some("secret-key-marker".to_owned()),
+            payload: "secret-payload-marker".to_owned(),
+            published_at_ms: 1,
+            delivery_token: Some("secret-token-marker".to_owned()),
+            delivery_attempt: Some(2),
+        };
+        let typed: TypedResponse<()> = typed_reply(
+            "poll",
+            Ok(ApplicationReply::confirmed(response.clone(), false)),
+            |response| Err(Box::new(response)),
+        );
+        let TypedResponse::Outcome(AttemptOutcome::Unknown(AttemptFailure::Client(error))) = typed
+        else {
+            panic!("an unexpected response should be classified as unknown");
+        };
+
+        let display = error.to_string();
+        let debug = format!("{error:?}");
+        let (_, broker_detail) = attempt_failure_details(&AttemptFailure::Broker(response));
+        for rendered in [display.as_str(), debug.as_str(), broker_detail.as_str()] {
+            for marker in [
+                "secret-stream-marker",
+                "secret-consumer-marker",
+                "secret-member-marker",
+                "secret-key-marker",
+                "secret-payload-marker",
+                "secret-token-marker",
+            ] {
+                assert!(!rendered.contains(marker), "diagnostic leaked {marker}");
+            }
+        }
+        assert_eq!(display, "unexpected message response for poll");
+        assert_eq!(broker_detail, "unexpected message response");
     }
 
     async fn listener() -> (TcpListener, SocketAddr) {

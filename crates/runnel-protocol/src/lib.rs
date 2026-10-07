@@ -428,6 +428,26 @@ pub enum Response {
 }
 
 impl Response {
+    /// Return the static variant name without formatting application fields.
+    pub const fn kind(&self) -> &'static str {
+        match self {
+            Self::StreamCreated { .. } => "stream_created",
+            Self::Published { .. } => "published",
+            Self::PublishBatch { .. } => "publish_batch",
+            Self::PollBatch { .. } => "poll_batch",
+            Self::Message { .. } => "message",
+            Self::MessageBytes { .. } => "message_bytes",
+            Self::ReplayMessage { .. } => "replay_message",
+            Self::ReplayMessageBytes { .. } => "replay_message_bytes",
+            Self::Empty { .. } => "empty",
+            Self::Acknowledged { .. } => "acknowledged",
+            Self::AckBatch { .. } => "ack_batch",
+            Self::ConsumerPolicy { .. } => "consumer_policy",
+            Self::Health { .. } => "health",
+            Self::Error { .. } => "error",
+        }
+    }
+
     /// Return the payload representation used by this response, if it carries a payload.
     pub const fn payload_encoding(&self) -> Option<PayloadEncoding> {
         match self {
