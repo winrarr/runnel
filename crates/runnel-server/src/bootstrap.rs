@@ -7,7 +7,7 @@ use std::time::Duration;
 use clap::{Parser, ValueEnum};
 use runnel_core::{Broker, BrokerConfig};
 use runnel_engine::Engine;
-use runnel_raft::{NodeId, PersistentEngine};
+use runnel_raft::{NodeId, PeerTlsConfig, PersistentEngine};
 use tokio::net::TcpListener;
 use tracing::info;
 
@@ -82,6 +82,12 @@ struct Args {
     bootstrap: bool,
     #[arg(long, default_value = "runnel")]
     cluster_name: String,
+    #[arg(long)]
+    peer_trust_bundle: Option<PathBuf>,
+    #[arg(long)]
+    peer_cert_chain: Option<PathBuf>,
+    #[arg(long)]
+    peer_private_key: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
@@ -106,6 +112,9 @@ pub(crate) async fn run() -> Result<(), Box<dyn std::error::Error>> {
 
     let (engine, peer, cluster) = match args.engine {
         EngineKind::Local => {
+            if has_peer_tls_paths(&args) {
+                return Err("peer TLS paths are only valid with --engine raft".into());
+            }
             let broker = Broker::open(
                 &args.data_dir,
                 BrokerConfig {
@@ -126,8 +135,22 @@ pub(crate) async fn run() -> Result<(), Box<dyn std::error::Error>> {
             if !peers.contains_key(&node_id) {
                 return Err(format!("cluster nodes do not contain node {node_id}").into());
             }
+            let peer_tls = Arc::new(PeerTlsConfig::from_files(
+                node_id,
+                &args.cluster_name,
+                &peers,
+                args.peer_trust_bundle
+                    .as_deref()
+                    .ok_or("--peer-trust-bundle is required for --engine raft")?,
+                args.peer_cert_chain
+                    .as_deref()
+                    .ok_or("--peer-cert-chain is required for --engine raft")?,
+                args.peer_private_key
+                    .as_deref()
+                    .ok_or("--peer-private-key is required for --engine raft")?,
+            )?);
             let peer_listener = TcpListener::bind(peer_listen).await?;
-            let raft_engine = PersistentEngine::open_with_config(
+            let raft_engine = PersistentEngine::open_with_peer_tls(
                 node_id,
                 args.cluster_name.clone(),
                 &args.data_dir,
@@ -135,6 +158,7 @@ pub(crate) async fn run() -> Result<(), Box<dyn std::error::Error>> {
                 args.bootstrap,
                 Duration::from_millis(args.ack_timeout_ms),
                 args.max_delivery_attempts,
+                peer_tls,
             )
             .await?;
             let manager = raft_engine.manager();
@@ -225,6 +249,12 @@ fn load_application_security(
         Some(tls_acceptor),
         Some(credentials),
     )?)
+}
+
+fn has_peer_tls_paths(args: &Args) -> bool {
+    args.peer_trust_bundle.is_some()
+        || args.peer_cert_chain.is_some()
+        || args.peer_private_key.is_some()
 }
 
 fn parse_cluster_nodes(

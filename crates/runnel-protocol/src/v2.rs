@@ -706,11 +706,13 @@ fn request_to_wire(request: &Request) -> Result<wire::application_request::Opera
             consumer,
             ack_timeout_ms,
             max_delivery_attempts,
+            retry_delay_ms,
         } => Operation::ConfigureConsumer(wire::ConfigureConsumerRequest {
             stream: stream.clone(),
             consumer: consumer.clone(),
             ack_timeout_ms: *ack_timeout_ms,
             max_delivery_attempts: *max_delivery_attempts,
+            retry_delay_ms: *retry_delay_ms,
         }),
         Request::InspectConsumer { stream, consumer } => {
             Operation::InspectConsumer(wire::InspectConsumerRequest {
@@ -834,6 +836,7 @@ fn request_from_wire(operation: wire::application_request::Operation) -> Result<
             consumer: request.consumer,
             ack_timeout_ms: request.ack_timeout_ms,
             max_delivery_attempts: request.max_delivery_attempts,
+            retry_delay_ms: request.retry_delay_ms,
         },
         Operation::InspectConsumer(request) => Request::InspectConsumer {
             stream: request.stream,
@@ -1036,11 +1039,12 @@ fn reply_to_wire(reply: &ApplicationReply) -> Result<wire::ApplicationResponse, 
                 }), true,
             )
         }
-        Response::ConsumerPolicy { stream, consumer, version, configured, ack_timeout_ms, max_delivery_attempts } => (
+        Response::ConsumerPolicy { stream, consumer, version, configured, ack_timeout_ms, max_delivery_attempts, retry_delay_ms } => (
             ResultBody::ConsumerPolicy(wire::ConsumerPolicyResult {
                 stream: stream.clone(), consumer: consumer.clone(), version: *version,
                 configured: *configured, ack_timeout_ms: *ack_timeout_ms,
                 max_delivery_attempts: *max_delivery_attempts,
+                retry_delay_ms: *retry_delay_ms,
             }), false,
         ),
         Response::Health { status, streams, storage_bytes } => (
@@ -1177,6 +1181,7 @@ fn reply_from_wire(reply: wire::ApplicationResponse) -> Result<ApplicationReply,
             configured: result.configured,
             ack_timeout_ms: result.ack_timeout_ms,
             max_delivery_attempts: result.max_delivery_attempts,
+            retry_delay_ms: result.retry_delay_ms,
         },
         ResultBody::Health(result) => Response::Health {
             status: result.status,

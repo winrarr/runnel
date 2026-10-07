@@ -14,6 +14,13 @@ names used by the broker.
 > HTTP health and metrics listener on port 8080 is also cleartext and
 > unauthenticated.
 
+Every Raft node requires static peer mutual TLS credentials before it can
+start. The manifest passes the peer credential file paths but does not create
+or mount credentials. Supply an overlay or secret provider that projects the
+files below `/var/run/runnel/peer-tls` separately into each pod before
+applying it; without those files, startup fails closed and the probes remain
+unready.
+
 Build the `runnel:dev` image and make it available to the cluster, then apply
 the manifest:
 
@@ -80,6 +87,48 @@ claim can remove the only local copy held by that replica.
 
 The command line uses the server's default cluster name, `runnel`. Keep that
 identity and the pod-to-node mapping stable for the lifetime of these claims.
+
+## Peer transport credentials
+
+The peer listener requires TLS 1.3 mutual authentication before it reads any
+Raft, snapshot, forwarding, or data-group setup frame. Each pod needs these
+files at the paths already passed by the manifest:
+
+| Path | Contents |
+| --- | --- |
+| `/var/run/runnel/peer-tls/ca.pem` | Explicit peer trust bundle for this cluster |
+| `/var/run/runnel/peer-tls/tls.crt` | This pod's leaf certificate and any required intermediates |
+| `/var/run/runnel/peer-tls/tls.key` | Matching private key for this pod only |
+
+Issue a distinct key and certificate per ordinal. The certificate SAN must
+bind the configured unsigned node ID and exact cluster name using the profile
+in [ADR 0032](../../docs/decisions/0032-static-cluster-peer-mutual-tls.md); a
+certificate for one ordinal cannot be reused by another. Do not project a
+Secret containing every node's private key into every pod. Kubernetes Secret
+objects do not provide a safe ordinal-to-key selection in this shared
+StatefulSet template, so use a per-pod Secret/CSI projection or an overlay
+that selects exactly one leaf and key for each ordinal. Keep the trust bundle
+and private keys out of the image, command arguments, and `/var/lib/runnel`.
+Mount credential material read-only with access restricted to the Runnel
+process.
+
+This is peer-only TLS. The broker Service on port 4222 and the HTTP
+health/metrics listener on port 8080 remain plaintext and need separate
+network isolation or a future public-listener security design. Peer TLS does
+not make those listeners private.
+
+This server does not communicate with earlier plaintext peer processes and
+has no legacy-peer or mixed-transport mode. A cluster transition must be a
+coordinated cutover: stop every old process before starting the credentialed
+binary on all nodes with the same static membership. Preserve the durable data
+directories; peer transport security does not change their recovery format or
+provide a storage migration path. Leaf renewal and CA replacement require
+process restarts because files are loaded only at startup. For CA replacement, first distribute a
+bundle containing both old and new anchors, restart one pod at a time while
+preserving quorum, replace leaves one at a time, then remove the old anchor
+and restart one pod at a time again. Verify peer traffic and readiness after
+each step. The manifest does not implement rotation automation, online
+revocation, or rolling peer upgrades.
 
 The 10 GiB request is a storage allocation request, not a broker retention
 limit or a guarantee of available free space. The broker has no retention or
@@ -161,6 +210,14 @@ allows unauthenticated plaintext broker traffic on port 4222. The HTTP Service
 on port 8080 remains cleartext and unauthenticated. Keep both Services inside
 a trusted, isolated development network; do not expose them publicly or to
 untrusted namespaces.
+filesystem. Application TLS and bearer authentication are available for the
+local engine, but Raft rejects application credentials until policy is
+consistent across replicas. The broker Service therefore accepts unauthenticated
+plaintext on port 4222, and the HTTP Service on port 8080 remains cleartext and
+unauthenticated. This manifest does not automate peer credential rotation;
+follow the coordinated restart and trust-overlap procedure above. Keep both
+Services inside a trusted, isolated development network; do not expose them
+publicly or to untrusted namespaces.
 
 ## Upgrade and rollback
 
@@ -176,12 +233,13 @@ constrain workload-controller rolling updates, so the PDB is not an upgrade
 safety mechanism.
 
 There is no supported rolling-upgrade, downgrade, or rollback procedure for
-this deployment. Clustered storage layout and peer/protocol compatibility are
-still under development; a new binary can fail closed on an unsupported
-volume, and reverting a binary after it has written incompatible state is not
-defined. Use a disposable cluster for upgrade experiments and preserve any
-claims needed for recovery before changing the image. `kubectl rollout
-restart` is not a compatibility test or an upgrade procedure.
+this deployment. Mixed-version Raft peers are unsupported, and no tested
+upgrade procedure exists. Clustered storage layout and protocol-version
+compatibility remain under development; a new binary can fail closed on an
+unsupported volume, and reverting a binary after it has written incompatible
+state is not defined. Use a disposable cluster for upgrade experiments and
+preserve any claims needed for recovery before changing the image. `kubectl
+rollout restart` is not a compatibility test or an upgrade procedure.
 
 ## Metrics and monitoring
 

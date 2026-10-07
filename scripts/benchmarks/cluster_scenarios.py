@@ -7,6 +7,7 @@ import argparse
 import json
 import threading
 import time
+import zlib
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
@@ -908,17 +909,301 @@ def _file_size(path: Path) -> int:
         return 0
 
 
+RAFT_LOG_SEGMENT_MAGIC = b"RSG2"
+RAFT_LOG_BATCH_MAGIC = b"BAT2"
+RAFT_LOG_BATCH_END = b"END2"
+RAFT_LOG_SEGMENT_HEADER_BYTES = 16
+RAFT_LOG_BATCH_HEADER_BYTES = 36
+RAFT_LOG_BATCH_TRAILER_BYTES = 8
+
+
+def _raft_log_index(value: Any, field: str) -> int | None:
+    if value is None:
+        return None
+    if not isinstance(value, dict):
+        raise BenchmarkError(f"Raft-log control field {field} is not a log id")
+    index = value.get("index")
+    if type(index) is not int or index < 0:
+        raise BenchmarkError(f"Raft-log control field {field} has an invalid index")
+    return index
+
+
+def _read_regular_artifact(path: Path) -> bytes:
+    if not path.exists() and not path.is_symlink():
+        raise BenchmarkError(f"Raft-log artifact {path} is missing")
+    if path.is_symlink() or not path.is_file():
+        raise BenchmarkError(f"Raft-log artifact {path} is not a regular file")
+    try:
+        return path.read_bytes()
+    except OSError as error:
+        raise BenchmarkError(f"could not read Raft-log artifact {path}: {error}") from error
+
+
+def _is_raft_log_temporary_artifact(name: str) -> bool:
+    def is_process_id(value: str) -> bool:
+        if (
+            not value
+            or len(value) > 10
+            or not value.isascii()
+            or not value.isdecimal()
+            or value.startswith("0")
+        ):
+            return False
+        return 0 < int(value) <= 0xFFFFFFFF
+
+    if name.startswith("control.tmp-"):
+        process_id = name.removeprefix("control.tmp-")
+        return is_process_id(process_id)
+
+    if not name.startswith("segment-"):
+        return False
+    segment, separator, process_id = name.removeprefix("segment-").partition(".tmp-")
+    if not separator:
+        return False
+    if (
+        len(segment) != 20
+        or not segment.isascii()
+        or not segment.isdecimal()
+        or int(segment) > 0xFFFFFFFFFFFFFFFF
+    ):
+        return False
+    return is_process_id(process_id)
+
+
+def _parse_v2_control(directory: Path) -> tuple[dict[str, Any], bytes]:
+    control_path = directory / "control.json"
+    control_bytes = _read_regular_artifact(control_path)
+    try:
+        record = json.loads(control_bytes)
+    except (json.JSONDecodeError, UnicodeDecodeError) as error:
+        raise BenchmarkError(f"could not parse Raft-log control state {control_path}: {error}") from error
+    if not isinstance(record, dict) or set(record) != {"state", "checksum"}:
+        raise BenchmarkError(f"Raft-log control state {control_path} has an invalid shape")
+
+    state = record["state"]
+    if not isinstance(state, dict) or set(state) != {
+        "generation",
+        "truncation_pending_from",
+        "last_purged_log_id",
+        "committed",
+        "vote",
+    }:
+        raise BenchmarkError(f"Raft-log control state {control_path} has an invalid shape")
+    checksum = record["checksum"]
+    if type(checksum) is not int or not 0 <= checksum <= 0xFFFFFFFF:
+        raise BenchmarkError(f"Raft-log control state {control_path} has an invalid checksum")
+    serialized_state = json.dumps(state, separators=(",", ":"), ensure_ascii=False).encode(
+        "utf-8"
+    )
+    if zlib.crc32(serialized_state) & 0xFFFFFFFF != checksum:
+        raise BenchmarkError(f"Raft-log control checksum mismatch in {control_path}")
+
+    generation = state["generation"]
+    pending = state["truncation_pending_from"]
+    if type(generation) is not int or generation < 0:
+        raise BenchmarkError(f"Raft-log control state {control_path} has an invalid generation")
+    if pending is not None and (type(pending) is not int or pending < 0):
+        raise BenchmarkError(
+            f"Raft-log control state {control_path} has an invalid truncation boundary"
+        )
+    if pending is not None:
+        raise BenchmarkError(
+            f"Raft-log control state {control_path} contains an unfinished truncation"
+        )
+    purged_index = _raft_log_index(state["last_purged_log_id"], "last_purged_log_id")
+    committed_index = _raft_log_index(state["committed"], "committed")
+    return {
+        "last_purged_log_index": purged_index,
+        "committed_log_index": committed_index,
+    }, control_bytes
+
+
+def _read_v2_segment(path: Path, expected_start: int) -> tuple[list[int], int]:
+    data = _read_regular_artifact(path)
+    if len(data) < RAFT_LOG_SEGMENT_HEADER_BYTES:
+        raise BenchmarkError(f"truncated Raft-log segment header in {path}")
+    if data[:4] != RAFT_LOG_SEGMENT_MAGIC:
+        raise BenchmarkError(f"invalid Raft-log segment magic in {path}")
+    version = int.from_bytes(data[4:8], "little")
+    if version != 2:
+        raise BenchmarkError(f"unsupported Raft-log segment version {version} in {path}")
+    start_index = int.from_bytes(data[8:16], "little")
+    if start_index != expected_start:
+        raise BenchmarkError(
+            f"Raft-log segment filename index {expected_start} does not match header index {start_index}"
+        )
+
+    indexes: list[int] = []
+    offset = RAFT_LOG_SEGMENT_HEADER_BYTES
+    first_batch = True
+    while offset < len(data):
+        remaining = len(data) - offset
+        if remaining < RAFT_LOG_BATCH_HEADER_BYTES:
+            raise BenchmarkError(f"incomplete trailing Raft-log batch header in {path}")
+        if data[offset : offset + 4] != RAFT_LOG_BATCH_MAGIC:
+            raise BenchmarkError(f"invalid Raft-log batch marker in {path} at byte {offset}")
+        batch_start = int.from_bytes(data[offset + 12 : offset + 20], "little")
+        count = int.from_bytes(data[offset + 20 : offset + 24], "little")
+        payload_length = int.from_bytes(data[offset + 24 : offset + 32], "little")
+        header_checksum = int.from_bytes(data[offset + 32 : offset + 36], "little")
+        if zlib.crc32(data[offset : offset + 32]) & 0xFFFFFFFF != header_checksum:
+            raise BenchmarkError(f"Raft-log batch header checksum mismatch in {path}")
+        if count == 0:
+            raise BenchmarkError(f"Raft-log batch is empty in {path}")
+
+        frame_length = (
+            RAFT_LOG_BATCH_HEADER_BYTES + payload_length + RAFT_LOG_BATCH_TRAILER_BYTES
+        )
+        if frame_length > remaining:
+            raise BenchmarkError(f"incomplete trailing Raft-log batch in {path}")
+        checksum_position = offset + RAFT_LOG_BATCH_HEADER_BYTES + payload_length
+        checksum = int.from_bytes(data[checksum_position : checksum_position + 4], "little")
+        if data[checksum_position + 4 : checksum_position + 8] != RAFT_LOG_BATCH_END:
+            raise BenchmarkError(f"invalid Raft-log batch completion marker in {path}")
+        if zlib.crc32(data[offset:checksum_position]) & 0xFFFFFFFF != checksum:
+            raise BenchmarkError(f"Raft-log batch checksum mismatch in {path}")
+        if first_batch and batch_start != start_index:
+            raise BenchmarkError(f"Raft-log segment batch does not begin at its header index in {path}")
+        first_batch = False
+
+        payload_offset = offset + RAFT_LOG_BATCH_HEADER_BYTES
+        payload_end = checksum_position
+        for ordinal in range(count):
+            if payload_offset + 4 > payload_end:
+                raise BenchmarkError(f"truncated entry length in completed Raft-log batch in {path}")
+            entry_length = int.from_bytes(data[payload_offset : payload_offset + 4], "little")
+            payload_offset += 4
+            entry_end = payload_offset + entry_length
+            if entry_end > payload_end:
+                raise BenchmarkError(f"truncated entry in completed Raft-log batch in {path}")
+            try:
+                entry = json.loads(data[payload_offset:entry_end])
+            except (json.JSONDecodeError, UnicodeDecodeError) as error:
+                raise BenchmarkError(f"could not parse Raft-log entry in {path}: {error}") from error
+            log_id = entry.get("log_id") if isinstance(entry, dict) else None
+            index = log_id.get("index") if isinstance(log_id, dict) else None
+            expected_index = batch_start + ordinal
+            if type(index) is not int or index != expected_index:
+                raise BenchmarkError(
+                    f"Raft-log entry index {index!r} does not match batch index {expected_index} in {path}"
+                )
+            indexes.append(index)
+            payload_offset = entry_end
+        if payload_offset != payload_end:
+            raise BenchmarkError(f"Raft-log batch has trailing entry payload bytes in {path}")
+        offset += frame_length
+
+    if first_batch:
+        raise BenchmarkError(f"Raft-log segment contains no complete batch in {path}")
+    return indexes, len(data)
+
+
+def _raft_log_v2_state(
+    node_id: int,
+    directory: Path,
+    marker_bytes: bytes,
+) -> dict[str, Any]:
+    family = directory / "raft-log.segments"
+    if family.is_symlink() or not family.is_dir():
+        raise BenchmarkError(f"Raft-log segment family {family} is missing or not a directory")
+    control, control_bytes = _parse_v2_control(family)
+
+    segment_paths: list[tuple[int, Path]] = []
+    for path in family.iterdir():
+        if path.is_symlink() or not path.is_file():
+            raise BenchmarkError(f"unexpected Raft-log artifact {path}")
+        if path.name == "control.json":
+            continue
+        if _is_raft_log_temporary_artifact(path.name):
+            continue
+        if (
+            not path.name.startswith("segment-")
+            or not path.name.endswith(".rlog")
+        ):
+            raise BenchmarkError(f"unexpected Raft-log artifact {path}")
+        start_text = path.name[len("segment-") : -len(".rlog")]
+        if len(start_text) != 20 or not start_text.isascii() or not start_text.isdecimal():
+            raise BenchmarkError(f"invalid Raft-log segment filename {path.name!r}")
+        start_index = int(start_text)
+        if path.name != f"segment-{start_index:020d}.rlog":
+            raise BenchmarkError(f"invalid Raft-log segment filename {path.name!r}")
+        segment_paths.append((start_index, path))
+    segment_paths.sort(key=lambda item: item[0])
+    if len({start for start, _ in segment_paths}) != len(segment_paths):
+        raise BenchmarkError(f"duplicate Raft-log segment filename in {family}")
+
+    purged_index = control["last_purged_log_index"]
+    expected_retained_index = purged_index + 1 if purged_index is not None else 0
+    first_retained_index = None
+    last_retained_index = None
+    retained_count = 0
+    segment_file_bytes = 0
+    for start_index, path in segment_paths:
+        indexes, file_bytes = _read_v2_segment(path, start_index)
+        segment_file_bytes += file_bytes
+        for index in indexes:
+            if purged_index is not None and index <= purged_index:
+                continue
+            if index != expected_retained_index:
+                raise BenchmarkError(
+                    f"non-contiguous retained Raft log: expected index {expected_retained_index}, found {index}"
+                )
+            if first_retained_index is None:
+                first_retained_index = index
+            last_retained_index = index
+            retained_count += 1
+            expected_retained_index += 1
+
+    state_directory = directory / "state-machine"
+    return {
+        "node_id": node_id,
+        "group_id": directory.name,
+        "paths": {
+            "raft_log": {
+                "format_version": 2,
+                "file_bytes": len(marker_bytes) + len(control_bytes) + segment_file_bytes,
+                "marker_file_bytes": len(marker_bytes),
+                "control_file_bytes": len(control_bytes),
+                "segment_count": len(segment_paths),
+                "segment_file_bytes": segment_file_bytes,
+                "retained_log_entries": retained_count,
+                "first_log_index": first_retained_index,
+                "last_log_index": last_retained_index,
+                "last_purged_log_index": purged_index,
+                "committed_log_index": control["committed_log_index"],
+            },
+            "state_machine_journal": {
+                "file_bytes": _file_size(state_directory / "state-machine.log")
+            },
+            "state_machine_checkpoint": {
+                "file_bytes": _file_size(state_directory / "state-machine.json")
+            },
+            "snapshot": {
+                "file_bytes": _file_size(state_directory / "snapshot.json")
+            },
+        },
+    }
+
+
 def _raft_data_group_state(node_id: int, directory: Path) -> dict[str, Any] | None:
     log_path = directory / "raft-log.json"
-    try:
-        log_bytes = log_path.read_bytes()
-    except FileNotFoundError:
+    if not log_path.exists() and not log_path.is_symlink():
         return None
+    log_bytes = _read_regular_artifact(log_path)
     try:
         persisted = json.loads(log_bytes)
-    except json.JSONDecodeError as error:
+    except (json.JSONDecodeError, UnicodeDecodeError) as error:
         raise BenchmarkError(f"could not parse benchmark Raft log {log_path}: {error}") from error
-    if not isinstance(persisted, dict) or persisted.get("version") != 1:
+    if not isinstance(persisted, dict):
+        raise BenchmarkError("unsupported Raft log format in benchmark data group: None")
+    version = persisted.get("version")
+    if type(version) is int and version == 2:
+        if set(persisted) != {"version", "artifact"} or persisted.get(
+            "artifact"
+        ) != "runnel-raft-log-segments":
+            raise BenchmarkError(f"invalid Raft-log segment marker in {log_path}")
+        return _raft_log_v2_state(node_id, directory, log_bytes)
+    if type(version) is not int or version != 1:
         version = persisted.get("version") if isinstance(persisted, dict) else None
         raise BenchmarkError(
             f"unsupported Raft log format in benchmark data group: {version!r}"
@@ -935,6 +1220,7 @@ def _raft_data_group_state(node_id: int, directory: Path) -> dict[str, Any] | No
         "group_id": directory.name,
         "paths": {
             "raft_log": {
+                "format_version": 1,
                 "file_bytes": len(log_bytes),
                 "retained_log_entries": len(log),
                 "first_log_index": min(indexes) if indexes else None,
@@ -1184,7 +1470,9 @@ def run_raft_log_growth(
                     observer_duration_ns / elapsed_ns if elapsed_ns else 0.0
                 ),
                 "observed_state_samples": len(observations),
-                "consensus_history_source": "per-node data-group raft-log.json",
+                "consensus_history_source": (
+                    "per-node data-group Raft-log marker, control state, and segments"
+                ),
                 "message_history_boundary": (
                     "public stream offsets 0 through measured_messages; offset 0 is setup"
                 ),

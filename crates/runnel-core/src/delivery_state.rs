@@ -59,6 +59,10 @@ impl InFlight {
         self.delivery_attempt
     }
 
+    pub(super) fn key(&self) -> Option<&str> {
+        self.key.as_deref()
+    }
+
     pub(super) fn delivery_token(&self) -> &str {
         &self.delivery_token
     }
@@ -97,6 +101,7 @@ impl DeliveryState {
         Self::default()
     }
 
+    #[cfg(test)]
     pub(super) fn expire(&mut self, now: Instant) -> bool {
         let mut expired_any = false;
         while let Some((&deadline, _)) = self.in_flight_deadlines.first_key_value() {
@@ -119,6 +124,17 @@ impl DeliveryState {
             }
         }
         expired_any
+    }
+
+    pub(super) fn expired_deliveries(&self, consumer: &str, now: Instant) -> Vec<InFlight> {
+        self.in_flight_deadlines
+            .range(..=now)
+            .flat_map(|(_, keys)| keys)
+            .filter(|key| key.consumer == consumer)
+            .filter_map(|key| self.in_flight.get(key))
+            .filter(|delivery| delivery.deadline <= now)
+            .cloned()
+            .collect()
     }
 
     pub(super) fn member_delivery(

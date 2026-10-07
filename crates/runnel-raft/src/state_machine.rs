@@ -14,9 +14,7 @@ use super::delivery;
 pub enum Command {
     CreateStream {
         stream: String,
-        #[serde(default)]
         stream_id: Option<String>,
-        #[serde(default)]
         group_id: Option<String>,
     },
     InitializeDataStream {
@@ -32,7 +30,6 @@ pub enum Command {
         key: Option<String>,
         payload: Vec<u8>,
         published_at_ms: u64,
-        #[serde(default)]
         request_id: Option<String>,
     },
     Ack {
@@ -45,6 +42,7 @@ pub enum Command {
         consumer: String,
         ack_timeout_ms: u64,
         max_delivery_attempts: Option<u32>,
+        retry_delay_ms: u64,
     },
     Replay {
         stream: String,
@@ -61,31 +59,23 @@ pub enum Command {
         max_response_bytes: usize,
         now_ms: u64,
         lease_deadline_ms: u64,
-        #[serde(default)]
         max_delivery_attempts: Option<u32>,
-        #[serde(default)]
         legacy_ack_timeout_ms: Option<u64>,
-        #[serde(default)]
         policy_version: Option<u64>,
     },
     PollGroupBatch {
         stream: String,
         consumer: String,
         member: String,
-        #[serde(default)]
         response_member: Option<String>,
         max_records: usize,
         max_bytes: usize,
         token_seed: String,
         now_ms: u64,
         lease_deadline_ms: u64,
-        #[serde(default)]
         max_delivery_attempts: Option<u32>,
-        #[serde(default)]
         legacy_ack_timeout_ms: Option<u64>,
-        #[serde(default)]
         policy_version: Option<u64>,
-        #[serde(default)]
         transition_only: bool,
     },
     AckGroup {
@@ -246,17 +236,13 @@ impl StreamState {
 pub(super) struct SnapshotState {
     pub(super) streams: BTreeMap<String, StreamState>,
     pub(super) consumers: BTreeMap<(String, String), Offset>,
-    #[serde(default)]
     pub(super) group_consumers: BTreeMap<(String, String), delivery::GroupConsumerState>,
     // The lease evaluator is a replicated, persisted floor of command
     // observations. It prevents a backward wall-clock step from moving
     // expiry backwards after recovery or leader changes.
-    #[serde(default)]
     pub(super) lease_clock_ms: u64,
     pub(super) dedup: BTreeMap<String, BTreeMap<String, Offset>>,
-    #[serde(default)]
     pub(super) redeliveries: u64,
-    #[serde(default)]
     pub(super) dead_letters: u64,
 }
 
@@ -430,6 +416,7 @@ pub(super) fn apply_command(
             consumer,
             ack_timeout_ms,
             max_delivery_attempts,
+            retry_delay_ms,
         } => {
             if matches!(kind, GroupKind::Metadata)
                 || !state
@@ -439,7 +426,9 @@ pub(super) fn apply_command(
             {
                 return CommandResponse::StreamNotFound;
             }
-            if validate_consumer_policy(ack_timeout_ms, max_delivery_attempts).is_err() {
+            if validate_consumer_policy(ack_timeout_ms, max_delivery_attempts, retry_delay_ms)
+                .is_err()
+            {
                 return CommandResponse::Noop;
             }
             let key = (stream, consumer);
@@ -447,6 +436,7 @@ pub(super) fn apply_command(
             if let Some(current) = state_entry.policy.as_ref()
                 && current.ack_timeout_ms == ack_timeout_ms
                 && current.max_delivery_attempts == max_delivery_attempts
+                && current.retry_delay_ms == retry_delay_ms
             {
                 return CommandResponse::ConsumerPolicy {
                     policy: current.clone(),
@@ -460,7 +450,12 @@ pub(super) fn apply_command(
             if version == 0 {
                 return CommandResponse::Noop;
             }
-            let policy = ConsumerPolicy::configured(version, ack_timeout_ms, max_delivery_attempts);
+            let policy = ConsumerPolicy::configured(
+                version,
+                ack_timeout_ms,
+                max_delivery_attempts,
+                retry_delay_ms,
+            );
             state_entry.policy = Some(policy.clone());
             CommandResponse::ConsumerPolicy { policy }
         }

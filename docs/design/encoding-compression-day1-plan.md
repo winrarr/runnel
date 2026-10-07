@@ -10,9 +10,10 @@
 
 This plan is advisory. It does not authorize a public binary protocol, a new
 durable default, a rolling-upgrade promise, or a codec choice. The current
-JSON-lines protocol, base64 binary payload variants, `RNL1`/`RNL2`/`RNL3`
-readers, peer JSON frames, and clustered JSON persistence remain the observed
-baseline until a future ADR and implementation evidence say otherwise.
+JSON-lines protocol, base64 binary payload variants, peer JSON frames, and
+clustered JSON persistence remain the observed baseline. Local retained
+records now use only RNL3 version 2 under [ADR 0039](../decisions/0039-rnl1-write-admission-and-legacy-read-compatibility.md);
+RNL1, RNL2, and RNL3 version 1 are refused before recovery mutation.
 
 ## Boundary to protect
 
@@ -37,15 +38,15 @@ request must not cause a replica to persist a representation it cannot decode.
 | Area | Current behavior relevant to this plan |
 |---|---|
 | Public protocol | UTF-8 JSON lines. Text uses `payload`; arbitrary bytes use explicit padded-base64 request/response variants. The protocol crate, reusable client, and server share a source-level `runnel-json-lines` v1 support declaration, but there is no runtime handshake or negotiated codec. |
-| Local stream log | One `.log` file per stream. `RNL1` is legacy raw and unchecksummed. `RNL2` is version 1, checksummed, uncompressed, and opt-in through the core API. `RNL3` is version 1, checksummed, and adds request identity without compression metadata. The reader dispatches by magic and truncates an incomplete final suffix. |
+| Local stream log | One `.log` file per stream, with checksummed RNL3 version-2 frames for all records. Identity flags distinguish ordinary records, public request IDs, and dead-letter moves. Recovery validates every stream before incomplete-tail repair; RNL1, RNL2, and RNL3 version 1 are refused without mutation. |
 | Peer transport | Big-endian `u32` length prefix around JSON, 64 MiB body limit, persistent/pool connections, and no preface or capability negotiation. The same outer frame carries control RPCs, forwarding, and snapshot chunks. Peer `Vec<u8>` fields serialize as JSON integer arrays; the outbound frame is materialized before its encoded-size cap is checked. |
 | Clustered persistence | Raft log, state-machine journal, checkpoints, and snapshots are separate JSON formats and recovery paths. `Command::Publish` payloads serialize as JSON integer arrays in those artifacts. They are not part of the first retained-message codec experiment. |
 | Existing planning boundaries | [Storage-upgrade policy](storage-upgrade-policy.md) owns generation, fence, migration, and rollback questions. [TD-003](../tech-debt.md#td-003-provisional-json-lines-protocol-and-limited-payload-compatibility), [TD-007](../tech-debt.md#td-007-storage-conversion-and-artifact-compatibility-remain-open), [TD-011](../tech-debt.md#td-011-end-to-end-benchmark-coverage-is-incomplete), and [TD-012](../tech-debt.md#td-012-peer-rpc-connection-strategy-remains-incomplete) track adjacent open debt. |
 
-The current `RNL2` fields are valuable test material, but its exact 44-byte
-header and `compression = none` restriction do not by themselves establish an
-evolution policy. `RNL3` has a separate request-identity layout and must not be
-treated as an interchangeable version of `RNL2`.
+RNL3 version 2 is the accepted current frame for every local record. Future
+codec work must deliberately extend that contract or define a new frame
+family, with explicit version, limits, checksum coverage, and recovery
+behavior. It does not need to retain readers for RNL1, RNL2, or RNL3 version 1.
 
 ## Design guardrails
 
@@ -91,8 +92,8 @@ boundary measurable before codec complexity is introduced.
 
    Capture representative bytes and logical results for:
 
-   - legacy `RNL1` records, checksummed `RNL2` records, and request-aware
-     `RNL3` records;
+   - current RNL3 version-2 ordinary and typed-identity records, plus explicit
+     non-mutating refusal of RNL1, RNL2, and RNL3 version-1 files;
    - empty, UTF-8, binary, large, and already-compressed payloads through the
      current public JSON/base64 path;
    - current peer JSON frames, including a forwarded binary payload and a
@@ -104,9 +105,9 @@ boundary measurable before codec complexity is introduced.
 
 2. **Choose the candidate family and exact descriptor in an ADR.**
 
-   Before writing a new format, decide whether the candidate formally extends
-   the `RNL2` family or uses a new format-tagged segment family. Do not add an
-   untracked magic or infer a compatibility contract from Rust struct layout.
+   Before writing a codec extension, decide whether to extend the current
+   RNL3 v2 frame or use a new format-tagged segment family. Do not add an
+   untracked magic or infer a format contract from Rust struct layout.
    The descriptor proposal should make these fields unambiguous:
 
    - magic, format/schema version, header length, flags, and reserved values;
@@ -169,7 +170,8 @@ boundary measurable before codec complexity is introduced.
 The slice is ready for codec experiments only when all of the following are
 true:
 
-- current `RNL1`/`RNL2`/`RNL3` fixtures remain readable as documented;
+- current RNL3 v2 fixtures remain readable, and obsolete local frame versions
+  fail explicitly without mutation;
 - candidate records preserve payload bytes, keys, offsets, timestamps, request
   identities, acknowledgements, redelivery, replay, and dead-letter semantics;
 - every allocation and decompression boundary is bounded before work begins;

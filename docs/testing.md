@@ -89,11 +89,23 @@ cargo run -q -p runnel-cli -- consume jobs.dead-letter dead-letter-inspector
 
 The dead-letter stream preserves the original key and payload. The current move is at least once across the source checkpoint and dead-letter log, so crash recovery may expose a duplicate dead-letter record.
 
-The clustered grouped-consumer policy uses the same command-line settings:
+The clustered grouped-consumer policy uses the same retry and attempt-limit
+settings. Each Raft process also needs its own peer certificate and key plus
+the explicit cluster trust bundle. Peer sockets require TLS 1.3; the public
+client and HTTP listeners remain separate plaintext boundaries. For example,
+start node 1 with protected credential files already provisioned at these
+paths:
 
 ```text
-cargo run -q -p runnel-server -- --engine raft --node-id 1 --cluster-name local --data-dir ./data-1 --peer 1=127.0.0.1:7101 --peer 2=127.0.0.1:7102 --peer 3=127.0.0.1:7103 --bootstrap --ack-timeout-ms 50 --max-delivery-attempts 2
+cargo run -q -p runnel-server -- --engine raft --node-id 1 --cluster-name local --data-dir ./data-1 --peer-listen 127.0.0.1:7101 --cluster-node 1=127.0.0.1:7101 --cluster-node 2=127.0.0.1:7102 --cluster-node 3=127.0.0.1:7103 --peer-trust-bundle /run/runnel/peer-tls/ca.pem --peer-cert-chain /run/runnel/peer-tls/node-1.crt --peer-private-key /run/runnel/peer-tls/node-1.key --bootstrap --ack-timeout-ms 50 --max-delivery-attempts 2
 ```
+
+Provision each other node with a distinct leaf certificate/key whose SAN
+matches its configured node ID and the exact `local` cluster name. Do not put
+private key contents in command arguments or the broker data directory. See
+[ADR 0032](decisions/0032-static-cluster-peer-mutual-tls.md) and the
+[Kubernetes peer credential guidance](../deploy/kubernetes/README.md) for
+identity, cutover, and restart-based trust-rotation details.
 
 The three-node process test exercises both grouped and non-grouped clustered paths through the public protocol. Their dead-letter transitions are committed with source progress in the stream data group.
 
@@ -111,7 +123,7 @@ The Criterion suite includes durable publish, legacy publish/poll/ack, two-membe
 - `just cluster-replacement-test` explicitly enables the test-only permissive recovery feature and runs the experimental empty replacement-node snapshot recovery and interrupted snapshot transfer checks.
 - `just bench-cluster-peer-forwarding-smoke` runs the bounded multi-stream follower-forwarding scenario against three real broker processes; it is a correctness/lifecycle smoke, not performance evidence.
 - `just bench-cluster-peer-forwarding-container-smoke` runs the same bounded forwarding workload in three broker containers and fails unless both settled-boundary samples contain available non-negative socket counts for all three nodes with direct procfs provenance; it is a diagnostic lifecycle check, not performance evidence.
-- `just bench-test` runs the Python script test suite, including benchmark normalization/dashboard tests and the RNL1 size-audit parser fixtures.
+- `just bench-test` runs the Python script test suite, including benchmark normalization and dashboard tests.
 - `just ci` runs `just verify` and `just integration`; integration exercises the isolated process smoke, peer-forwarding process smoke, and single-node, three-node, and three-node peer-forwarding container smoke workflows, building an image unless a prebuilt integration image is supplied.
 
 ## Pull-request CI path selection

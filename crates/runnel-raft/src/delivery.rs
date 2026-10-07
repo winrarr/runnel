@@ -18,24 +18,62 @@ pub(super) struct GroupDelivery {
     pub(super) key: Option<String>,
     pub(super) delivery_attempt: u32,
     pub(super) delivery_token: String,
-    #[serde(default)]
     pub(super) requires_receipt: bool,
     pub(super) deadline_ms: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub(super) struct GroupRetrySchedule {
+    pub(super) retry_not_before_ms: u64,
+    pub(super) key: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub(super) struct GroupConsumerState {
     pub(super) committed_offset: Offset,
-    #[serde(default)]
     pub(super) acknowledged_offsets: BTreeSet<Offset>,
-    #[serde(default)]
     pub(super) delivery_attempts: BTreeMap<Offset, u32>,
-    #[serde(default)]
     pub(super) policy: Option<ConsumerPolicy>,
-    #[serde(default)]
     pub(super) delivery_policies: BTreeMap<Offset, ConsumerPolicy>,
-    #[serde(default)]
     pub(super) in_flight: BTreeMap<Offset, GroupDelivery>,
+    pub(super) retry_not_before: BTreeMap<Offset, GroupRetrySchedule>,
+}
+
+impl GroupConsumerState {
+    pub(super) fn validate_pinned_policies(&self) -> Result<(), &'static str> {
+        if self
+            .delivery_attempts
+            .keys()
+            .ne(self.delivery_policies.keys())
+        {
+            return Err("delivery attempts and pinned policies must have identical offsets");
+        }
+        if self.delivery_attempts.values().any(|attempt| *attempt == 0) {
+            return Err("delivery attempts must be positive");
+        }
+        if self.in_flight.iter().any(|(offset, delivery)| {
+            self.delivery_attempts.get(offset) != Some(&delivery.delivery_attempt)
+        }) {
+            return Err("in-flight delivery must match its pinned attempt");
+        }
+        if self.retry_not_before.keys().any(|offset| {
+            !self.delivery_attempts.contains_key(offset) || self.in_flight.contains_key(offset)
+        }) {
+            return Err("retry schedule must belong to a non-in-flight attempted offset");
+        }
+        if self
+            .in_flight
+            .keys()
+            .any(|offset| *offset < self.committed_offset)
+            || self
+                .delivery_attempts
+                .keys()
+                .any(|offset| *offset < self.committed_offset)
+        {
+            return Err("uncommitted delivery state must be at or after the committed offset");
+        }
+        Ok(())
+    }
 }
 
 pub(super) struct GroupPollRequest {
@@ -121,6 +159,10 @@ pub(super) fn apply_group_poll(
         policy_version,
     } = request;
     let now_ms = observe_lease_clock(state, now_ms);
+    let legacy_policy = ConsumerPolicy::legacy(
+        legacy_ack_timeout_ms.unwrap_or_default(),
+        max_delivery_attempts,
+    );
 
     let consumer_key = (stream.clone(), consumer.clone());
     if !state.group_consumers.contains_key(&consumer_key) {
@@ -137,27 +179,16 @@ pub(super) fn apply_group_poll(
             },
         );
     }
-    let existing = {
-        let consumer_state = state
-            .group_consumers
-            .entry(consumer_key.clone())
-            .or_default();
-        let expired = consumer_state
-            .in_flight
-            .iter()
-            .filter_map(|(offset, delivery)| {
-                lease_expired(delivery.deadline_ms, now_ms).then_some(*offset)
-            })
-            .collect::<Vec<_>>();
-        for offset in expired {
-            consumer_state.in_flight.remove(&offset);
-        }
-        consumer_state
-            .in_flight
-            .iter()
-            .find(|(_, delivery)| delivery.member == member)
-            .map(|(offset, delivery)| (*offset, delivery.clone()))
-    };
+    observe_expired_deliveries(state, &stream, &consumer, now_ms, &legacy_policy);
+
+    let existing = state
+        .group_consumers
+        .get(&consumer_key)
+        .expect("group consumer state was initialized above")
+        .in_flight
+        .iter()
+        .find(|(_, delivery)| delivery.member == member)
+        .map(|(offset, delivery)| (*offset, delivery.clone()));
 
     if let Some((offset, delivery)) = existing {
         let messages = &state
@@ -178,6 +209,7 @@ pub(super) fn apply_group_poll(
                 .streams
                 .get(&stream)
                 .expect("stream was checked above");
+            let (retry_offsets, retry_keys) = retry_filter(consumer_state, now_ms);
             stream_state
                 .messages
                 .iter()
@@ -187,14 +219,16 @@ pub(super) fn apply_group_poll(
                 .find(|(offset, message)| {
                     if consumer_state.acknowledged_offsets.contains(offset)
                         || consumer_state.in_flight.contains_key(offset)
+                        || retry_offsets.contains(offset)
                     {
                         return false;
                     }
                     message.key.as_ref().is_none_or(|key| {
-                        !consumer_state
-                            .in_flight
-                            .values()
-                            .any(|delivery| delivery.key.as_ref() == Some(key))
+                        !retry_keys.contains(key)
+                            && !consumer_state
+                                .in_flight
+                                .values()
+                                .any(|delivery| delivery.key.as_ref() == Some(key))
                     })
                 })
                 .map(|(offset, message)| (offset, message.key.clone()))
@@ -213,10 +247,6 @@ pub(super) fn apply_group_poll(
             .get(&offset)
             .copied()
             .unwrap_or_default();
-        let legacy_policy = ConsumerPolicy::legacy(
-            legacy_ack_timeout_ms.unwrap_or_default(),
-            max_delivery_attempts,
-        );
         let policy = group_policy_for_offset(
             state
                 .group_consumers
@@ -277,6 +307,7 @@ pub(super) fn apply_group_poll(
                 .delivery_policies
                 .entry(offset)
                 .or_insert_with(|| policy.clone());
+            consumer_state.retry_not_before.remove(&offset);
             let delivery = GroupDelivery {
                 member: member.clone(),
                 key,
@@ -334,6 +365,10 @@ pub(super) fn apply_group_batch_poll(
         return CommandResponse::StreamNotFound;
     }
     let now_ms = observe_lease_clock(state, now_ms);
+    let legacy_policy = ConsumerPolicy::legacy(
+        legacy_ack_timeout_ms.unwrap_or_default(),
+        max_delivery_attempts,
+    );
     let consumer_key = (stream.clone(), consumer.clone());
     if !state.group_consumers.contains_key(&consumer_key) {
         let committed_offset = state
@@ -350,22 +385,7 @@ pub(super) fn apply_group_batch_poll(
         );
     }
 
-    {
-        let consumer_state = state
-            .group_consumers
-            .get_mut(&consumer_key)
-            .expect("group consumer state was initialized above");
-        let expired = consumer_state
-            .in_flight
-            .iter()
-            .filter_map(|(offset, delivery)| {
-                lease_expired(delivery.deadline_ms, now_ms).then_some(*offset)
-            })
-            .collect::<Vec<_>>();
-        for offset in expired {
-            consumer_state.in_flight.remove(&offset);
-        }
-    }
+    observe_expired_deliveries(state, &stream, &consumer, now_ms, &legacy_policy);
 
     let existing = state
         .group_consumers
@@ -411,10 +431,6 @@ pub(super) fn apply_group_batch_poll(
         };
     }
 
-    let legacy_policy = ConsumerPolicy::legacy(
-        legacy_ack_timeout_ms.unwrap_or_default(),
-        max_delivery_attempts,
-    );
     let mut selected_offsets = BTreeSet::new();
     let mut selected_keys = BTreeSet::new();
     let mut pending = Vec::with_capacity(max_records);
@@ -432,6 +448,7 @@ pub(super) fn apply_group_batch_poll(
                 .streams
                 .get(&stream)
                 .expect("stream was checked above");
+            let (retry_offsets, retry_keys) = retry_filter(consumer_state, now_ms);
             stream_state
                 .messages
                 .iter()
@@ -441,12 +458,14 @@ pub(super) fn apply_group_batch_poll(
                 .find(|(offset, message)| {
                     if consumer_state.acknowledged_offsets.contains(offset)
                         || consumer_state.in_flight.contains_key(offset)
+                        || retry_offsets.contains(offset)
                         || selected_offsets.contains(offset)
                     {
                         return false;
                     }
                     message.key.as_ref().is_none_or(|key| {
                         !selected_keys.contains(key)
+                            && !retry_keys.contains(key)
                             && !consumer_state
                                 .in_flight
                                 .values()
@@ -582,6 +601,7 @@ pub(super) fn apply_group_batch_poll(
             .delivery_policies
             .entry(offset)
             .or_insert(policy);
+        consumer_state.retry_not_before.remove(&offset);
         consumer_state.in_flight.insert(offset, delivery);
         if *attempt > 1 {
             state.redeliveries = state.redeliveries.saturating_add(1);
@@ -676,6 +696,41 @@ pub(super) fn preview_group_batch(
         request.legacy_ack_timeout_ms.unwrap_or_default(),
         request.max_delivery_attempts,
     );
+    let (mut retry_offsets, mut retry_keys) = consumer_state
+        .map(|consumer| retry_filter(consumer, now_ms))
+        .unwrap_or_default();
+    if let Some(consumer) = consumer_state {
+        for (&offset, delivery) in &consumer.in_flight {
+            if !lease_expired(delivery.deadline_ms, now_ms)
+                || consumer.retry_not_before.contains_key(&offset)
+            {
+                continue;
+            }
+            let attempts = consumer
+                .delivery_attempts
+                .get(&offset)
+                .copied()
+                .unwrap_or_default();
+            let policy = group_policy_for_offset(
+                consumer,
+                offset,
+                attempts,
+                &legacy_policy,
+                request.policy_version,
+            );
+            if policy.retry_delay_ms == 0
+                || policy
+                    .max_delivery_attempts
+                    .is_some_and(|maximum| attempts >= maximum)
+            {
+                continue;
+            }
+            retry_offsets.insert(offset);
+            if let Some(key) = delivery.key.as_ref() {
+                retry_keys.insert(key.clone());
+            }
+        }
+    }
     let mut selected_offsets = BTreeSet::new();
     let mut selected_keys = BTreeSet::new();
     let mut terminal_offsets = BTreeSet::new();
@@ -701,6 +756,7 @@ pub(super) fn preview_group_batch(
             .find(|(offset, message)| {
                 if consumer_state.is_some_and(|consumer| {
                     consumer.acknowledged_offsets.contains(offset)
+                        || retry_offsets.contains(offset)
                         || consumer
                             .in_flight
                             .get(offset)
@@ -712,6 +768,7 @@ pub(super) fn preview_group_batch(
                 }
                 message.key.as_ref().is_none_or(|key| {
                     !selected_keys.contains(key)
+                        && !retry_keys.contains(key)
                         && !consumer_state.is_some_and(|consumer| {
                             consumer.in_flight.values().any(|delivery| {
                                 !lease_expired(delivery.deadline_ms, now_ms)
@@ -804,28 +861,27 @@ fn advance_preview_committed_offset(
     }
 }
 
-fn group_policy_for_offset(
+pub(super) fn group_policy_for_offset(
     consumer_state: &GroupConsumerState,
     offset: Offset,
     attempts: u32,
     legacy_policy: &ConsumerPolicy,
     policy_version: Option<u64>,
 ) -> ConsumerPolicy {
-    let policy = consumer_state
-        .delivery_policies
-        .get(&offset)
-        .cloned()
-        .or_else(|| {
-            if attempts > 0 {
-                Some(legacy_policy.clone())
-            } else {
-                consumer_state
-                    .policy
-                    .clone()
-                    .or_else(|| Some(legacy_policy.clone()))
-            }
-        })
-        .expect("legacy policy is always available");
+    let policy = if attempts > 0 {
+        consumer_state
+            .delivery_policies
+            .get(&offset)
+            .expect("every attempted offset has a pinned policy")
+            .clone()
+    } else {
+        consumer_state
+            .delivery_policies
+            .get(&offset)
+            .or(consumer_state.policy.as_ref())
+            .cloned()
+            .unwrap_or_else(|| legacy_policy.clone())
+    };
     if policy_version.is_some_and(|version| {
         consumer_state
             .policy
@@ -863,7 +919,8 @@ pub(super) fn apply_group_batch_ack(
         return CommandResponse::StreamNotFound;
     }
     let now_ms = observe_lease_clock(state, now_ms);
-    let consumer_key = (stream, consumer.clone());
+    let legacy_policy = ConsumerPolicy::legacy(0, None);
+    let consumer_key = (stream.clone(), consumer.clone());
     if !state.group_consumers.contains_key(&consumer_key) {
         let committed_offset = state
             .consumers
@@ -878,20 +935,11 @@ pub(super) fn apply_group_batch_ack(
             },
         );
     }
+    observe_expired_deliveries(state, &stream, &consumer, now_ms, &legacy_policy);
     let consumer_state = state
         .group_consumers
         .get_mut(&consumer_key)
         .expect("group consumer state was initialized above");
-    let expired = consumer_state
-        .in_flight
-        .iter()
-        .filter_map(|(offset, delivery)| {
-            lease_expired(delivery.deadline_ms, now_ms).then_some(*offset)
-        })
-        .collect::<Vec<_>>();
-    for offset in expired {
-        consumer_state.in_flight.remove(&offset);
-    }
 
     let mut valid_offsets = Vec::new();
     let mut outcomes = Vec::with_capacity(receipts.len());
@@ -1093,18 +1141,24 @@ pub(super) fn apply_group_ack(
     }
 
     let now_ms = observe_lease_clock(state, now_ms);
-    let consumer_key = (stream, consumer.clone());
-    let consumer_state = state.group_consumers.entry(consumer_key).or_default();
-    let expired = consumer_state
-        .in_flight
-        .iter()
-        .filter_map(|(offset, delivery)| {
-            lease_expired(delivery.deadline_ms, now_ms).then_some(*offset)
-        })
-        .collect::<Vec<_>>();
-    for expired_offset in expired {
-        consumer_state.in_flight.remove(&expired_offset);
+    let legacy_policy = ConsumerPolicy::legacy(0, None);
+    let consumer_key = (stream.clone(), consumer.clone());
+    if !state.group_consumers.contains_key(&consumer_key) {
+        let committed_offset = state
+            .consumers
+            .get(&consumer_key)
+            .copied()
+            .unwrap_or_default();
+        state.group_consumers.insert(
+            consumer_key.clone(),
+            GroupConsumerState {
+                committed_offset,
+                ..GroupConsumerState::default()
+            },
+        );
     }
+    observe_expired_deliveries(state, &stream, &consumer, now_ms, &legacy_policy);
+    let consumer_state = state.group_consumers.entry(consumer_key).or_default();
 
     if offset < consumer_state.committed_offset
         || consumer_state.acknowledged_offsets.contains(&offset)
@@ -1136,10 +1190,75 @@ pub(super) fn apply_group_ack(
     CommandResponse::GroupAcknowledged
 }
 
+fn observe_expired_deliveries(
+    state: &mut SnapshotState,
+    stream: &str,
+    consumer: &str,
+    now_ms: u64,
+    legacy_policy: &ConsumerPolicy,
+) {
+    let consumer_state = state
+        .group_consumers
+        .get_mut(&(stream.to_owned(), consumer.to_owned()))
+        .expect("group consumer state was initialized above");
+    let expired = consumer_state
+        .in_flight
+        .iter()
+        .filter_map(|(&offset, delivery)| {
+            lease_expired(delivery.deadline_ms, now_ms).then_some((offset, delivery.clone()))
+        })
+        .collect::<Vec<_>>();
+    for (offset, delivery) in expired {
+        consumer_state.in_flight.remove(&offset);
+        if consumer_state.retry_not_before.contains_key(&offset) {
+            continue;
+        }
+        let attempts = consumer_state
+            .delivery_attempts
+            .get(&offset)
+            .copied()
+            .unwrap_or_default();
+        let policy = group_policy_for_offset(consumer_state, offset, attempts, legacy_policy, None);
+        if policy
+            .max_delivery_attempts
+            .is_some_and(|maximum| attempts >= maximum)
+            || policy.retry_delay_ms == 0
+        {
+            continue;
+        }
+        consumer_state.retry_not_before.insert(
+            offset,
+            GroupRetrySchedule {
+                retry_not_before_ms: now_ms.saturating_add(policy.retry_delay_ms),
+                key: delivery.key,
+            },
+        );
+    }
+}
+
+fn retry_filter(
+    consumer_state: &GroupConsumerState,
+    now_ms: u64,
+) -> (BTreeSet<Offset>, BTreeSet<String>) {
+    let mut offsets = BTreeSet::new();
+    let mut keys = BTreeSet::new();
+    for (&offset, schedule) in &consumer_state.retry_not_before {
+        if schedule.retry_not_before_ms <= now_ms {
+            continue;
+        }
+        offsets.insert(offset);
+        if let Some(key) = schedule.key.as_ref() {
+            keys.insert(key.clone());
+        }
+    }
+    (offsets, keys)
+}
+
 fn acknowledge_group_offset(consumer_state: &mut GroupConsumerState, offset: Offset) {
     consumer_state.in_flight.remove(&offset);
     consumer_state.delivery_attempts.remove(&offset);
     consumer_state.delivery_policies.remove(&offset);
+    consumer_state.retry_not_before.remove(&offset);
     if offset == consumer_state.committed_offset {
         consumer_state.committed_offset = consumer_state.committed_offset.saturating_add(1);
         while consumer_state
@@ -1148,6 +1267,9 @@ fn acknowledge_group_offset(consumer_state: &mut GroupConsumerState, offset: Off
         {
             consumer_state
                 .delivery_policies
+                .remove(&consumer_state.committed_offset);
+            consumer_state
+                .retry_not_before
                 .remove(&consumer_state.committed_offset);
             consumer_state.committed_offset = consumer_state.committed_offset.saturating_add(1);
         }
@@ -1188,4 +1310,337 @@ fn is_dead_letter_stream(state: &SnapshotState, stream: &str) -> bool {
         .streams
         .keys()
         .any(|source| dead_letter_stream_name(source) == stream)
+}
+
+#[cfg(test)]
+mod retry_delay_tests {
+    use super::*;
+    use crate::state_machine::{SnapshotState, StoredMessage, StreamState};
+
+    fn state(max_attempts: Option<u32>, retry_delay_ms: u64) -> SnapshotState {
+        let mut state = SnapshotState::default();
+        let mut stream = StreamState::active("events-id".to_owned(), "group-id".to_owned());
+        stream.messages.push(StoredMessage {
+            key: Some("same".to_owned()),
+            payload: b"first".to_vec(),
+            published_at_ms: 1,
+        });
+        stream.messages.push(StoredMessage {
+            key: Some("same".to_owned()),
+            payload: b"successor".to_vec(),
+            published_at_ms: 2,
+        });
+        stream.messages.push(StoredMessage {
+            key: Some("other".to_owned()),
+            payload: b"unrelated".to_vec(),
+            published_at_ms: 3,
+        });
+        state.streams.insert("events".to_owned(), stream);
+        state.group_consumers.insert(
+            ("events".to_owned(), "workers".to_owned()),
+            GroupConsumerState {
+                policy: Some(ConsumerPolicy::configured(
+                    1,
+                    10,
+                    max_attempts,
+                    retry_delay_ms,
+                )),
+                ..GroupConsumerState::default()
+            },
+        );
+        state
+    }
+
+    fn log_id(index: u64) -> openraft::LogId<crate::NodeId> {
+        openraft::LogId {
+            leader_id: openraft::CommittedLeaderId::new(1, 1),
+            index,
+        }
+    }
+
+    fn poll_request(now_ms: u64, lease_deadline_ms: u64, member: &str) -> GroupPollRequest {
+        GroupPollRequest {
+            stream: "events".to_owned(),
+            consumer: "workers".to_owned(),
+            member: member.to_owned(),
+            now_ms,
+            lease_deadline_ms,
+            max_delivery_attempts: None,
+            legacy_ack_timeout_ms: Some(10),
+            policy_version: Some(1),
+        }
+    }
+
+    fn message(response: CommandResponse) -> Message {
+        let CommandResponse::GroupPoll {
+            result: PollResult::Message(message),
+        } = response
+        else {
+            panic!("expected grouped message")
+        };
+        message
+    }
+
+    #[test]
+    fn retry_deadline_is_pinned_persisted_and_keeps_same_key_reserved() {
+        let mut state = state(None, 100);
+        let first = message(apply_group_poll(
+            &mut state,
+            poll_request(100, 110, "member-a"),
+            log_id(1),
+            &GroupKind::Combined,
+        ));
+        assert_eq!(first.offset, 0);
+
+        let response = apply_group_ack(
+            &mut state,
+            GroupAckRequest {
+                stream: "events".to_owned(),
+                consumer: "workers".to_owned(),
+                member: "member-a".to_owned(),
+                offset: 0,
+                delivery_token: first.delivery_token.unwrap(),
+                now_ms: 110,
+            },
+            &GroupKind::Combined,
+        );
+        assert_eq!(
+            response,
+            CommandResponse::GroupStaleDelivery {
+                consumer: "workers".to_owned(),
+                offset: 0,
+            }
+        );
+
+        // A later configuration applies only to records without a pinned attempt policy.
+        state
+            .group_consumers
+            .get_mut(&("events".to_owned(), "workers".to_owned()))
+            .unwrap()
+            .policy = Some(ConsumerPolicy::configured(2, 10, None, 0));
+        let consumer_key = ("events".to_owned(), "workers".to_owned());
+        let persisted_consumer: GroupConsumerState = serde_json::from_slice(
+            &serde_json::to_vec(state.group_consumers.get(&consumer_key).unwrap()).unwrap(),
+        )
+        .unwrap();
+        state
+            .group_consumers
+            .insert(consumer_key.clone(), persisted_consumer);
+        assert_eq!(
+            state.group_consumers[&consumer_key].retry_not_before[&0].retry_not_before_ms,
+            210
+        );
+
+        let unrelated = message(apply_group_poll(
+            &mut state,
+            poll_request(209, 219, "member-b"),
+            log_id(3),
+            &GroupKind::Combined,
+        ));
+        assert_eq!(unrelated.offset, 2);
+        assert_eq!(
+            apply_group_poll(
+                &mut state,
+                poll_request(209, 219, "member-c"),
+                log_id(4),
+                &GroupKind::Combined,
+            ),
+            CommandResponse::GroupPoll {
+                result: PollResult::Empty,
+            }
+        );
+        let retry = message(apply_group_poll(
+            &mut state,
+            poll_request(210, 220, "member-d"),
+            log_id(5),
+            &GroupKind::Combined,
+        ));
+        assert_eq!(retry.offset, 0);
+        assert_eq!(retry.delivery_attempt, Some(2));
+    }
+
+    #[test]
+    fn batch_retry_deadline_reserves_its_key_but_allows_unrelated_work() {
+        let mut state = state(None, 100);
+        let first = apply_group_batch_poll(
+            &mut state,
+            GroupBatchPollRequest {
+                stream: "events".to_owned(),
+                consumer: "workers".to_owned(),
+                member: "member-a".to_owned(),
+                response_member: None,
+                max_records: 1,
+                max_bytes: 65_536,
+                token_seed: "first".to_owned(),
+                now_ms: 100,
+                lease_deadline_ms: 110,
+                max_delivery_attempts: None,
+                legacy_ack_timeout_ms: Some(10),
+                policy_version: Some(1),
+                transition_only: false,
+            },
+            &GroupKind::Combined,
+        );
+        let first_token = match first {
+            CommandResponse::GroupBatchPoll { messages, .. } => {
+                assert_eq!(messages.len(), 1);
+                assert_eq!(messages[0].offset, 0);
+                messages[0].delivery_token.clone().unwrap()
+            }
+            response => panic!("expected first batch delivery, got {response:?}"),
+        };
+
+        let acknowledgement = apply_group_batch_ack(
+            &mut state,
+            GroupBatchAckRequest {
+                stream: "events".to_owned(),
+                consumer: "workers".to_owned(),
+                member: "member-a".to_owned(),
+                receipts: vec![DeliveryReceipt {
+                    offset: 0,
+                    delivery_token: first_token,
+                }],
+                now_ms: 110,
+            },
+            &GroupKind::Combined,
+        );
+        assert!(matches!(
+            acknowledgement,
+            CommandResponse::GroupBatchAcknowledged { result }
+                if matches!(result.outcomes[0].outcome, AckBatchOutcome::Rejected {
+                    reason: AckBatchRejection::StaleDelivery
+                })
+        ));
+
+        let consumer_key = ("events".to_owned(), "workers".to_owned());
+        let persisted_consumer: GroupConsumerState = serde_json::from_slice(
+            &serde_json::to_vec(state.group_consumers.get(&consumer_key).unwrap()).unwrap(),
+        )
+        .unwrap();
+        state
+            .group_consumers
+            .insert(consumer_key.clone(), persisted_consumer);
+        assert_eq!(
+            state.group_consumers[&consumer_key].retry_not_before[&0].retry_not_before_ms,
+            210
+        );
+
+        let poll_batch = |state: &mut SnapshotState, now_ms, member: &str, index| {
+            apply_group_batch_poll(
+                state,
+                GroupBatchPollRequest {
+                    stream: "events".to_owned(),
+                    consumer: "workers".to_owned(),
+                    member: member.to_owned(),
+                    response_member: None,
+                    max_records: 1,
+                    max_bytes: 65_536,
+                    token_seed: format!("batch-{index}"),
+                    now_ms,
+                    lease_deadline_ms: now_ms + 10,
+                    max_delivery_attempts: None,
+                    legacy_ack_timeout_ms: Some(10),
+                    policy_version: Some(1),
+                    transition_only: false,
+                },
+                &GroupKind::Combined,
+            )
+        };
+
+        let unrelated = poll_batch(&mut state, 209, "member-b", 2);
+        assert!(matches!(
+            unrelated,
+            CommandResponse::GroupBatchPoll { messages, .. }
+                if messages.len() == 1 && messages[0].offset == 2
+        ));
+        assert!(matches!(
+            poll_batch(&mut state, 209, "member-c", 3),
+            CommandResponse::GroupBatchPoll { ref messages, .. } if messages.is_empty()
+        ));
+        assert!(matches!(
+            poll_batch(&mut state, 210, "member-d", 4),
+            CommandResponse::GroupBatchPoll { ref messages, .. }
+                if messages.len() == 1
+                    && messages[0].offset == 0
+                    && messages[0].delivery_attempt == Some(2)
+        ));
+    }
+
+    #[test]
+    fn zero_retry_delay_keeps_immediate_redelivery_without_a_schedule_entry() {
+        let mut state = state(None, 0);
+        let first = message(apply_group_poll(
+            &mut state,
+            poll_request(100, 110, "member-a"),
+            log_id(1),
+            &GroupKind::Combined,
+        ));
+        assert_eq!(first.delivery_attempt, Some(1));
+
+        assert_eq!(
+            apply_group_ack(
+                &mut state,
+                GroupAckRequest {
+                    stream: "events".to_owned(),
+                    consumer: "workers".to_owned(),
+                    member: "member-a".to_owned(),
+                    offset: 0,
+                    delivery_token: first.delivery_token.unwrap(),
+                    now_ms: 110,
+                },
+                &GroupKind::Combined,
+            ),
+            CommandResponse::GroupStaleDelivery {
+                consumer: "workers".to_owned(),
+                offset: 0,
+            }
+        );
+
+        let consumer = &state.group_consumers[&("events".to_owned(), "workers".to_owned())];
+        assert!(!consumer.retry_not_before.contains_key(&0));
+        let retry = message(apply_group_poll(
+            &mut state,
+            poll_request(110, 120, "member-b"),
+            log_id(3),
+            &GroupKind::Combined,
+        ));
+        assert_eq!(retry.offset, 0);
+        assert_eq!(retry.delivery_attempt, Some(2));
+    }
+
+    #[test]
+    fn terminal_attempt_is_dead_lettered_at_expiry_without_retry_delay() {
+        let mut state = state(Some(1), 100);
+        let first = message(apply_group_poll(
+            &mut state,
+            poll_request(100, 110, "member-a"),
+            log_id(1),
+            &GroupKind::Combined,
+        ));
+        assert_eq!(first.delivery_attempt, Some(1));
+        let terminal = apply_group_poll(
+            &mut state,
+            poll_request(110, 120, "member-b"),
+            log_id(2),
+            &GroupKind::Combined,
+        );
+        assert_eq!(
+            terminal,
+            CommandResponse::GroupPoll {
+                result: PollResult::Message(Message {
+                    stream: "events".to_owned(),
+                    offset: 1,
+                    key: Some("same".to_owned()),
+                    payload: b"successor".to_vec(),
+                    published_at_ms: 2,
+                    delivery_token: Some(format!("raft-{}", log_id(2))),
+                    delivery_attempt: Some(1),
+                }),
+            }
+        );
+        let consumer = &state.group_consumers[&("events".to_owned(), "workers".to_owned())];
+        assert!(!consumer.retry_not_before.contains_key(&0));
+        assert_eq!(state.dead_letters, 1);
+        assert_eq!(state.streams["events.dead-letter"].messages.len(), 1);
+    }
 }

@@ -313,8 +313,15 @@ pub(crate) async fn handle_request_with_metadata(
             consumer,
             ack_timeout_ms,
             max_delivery_attempts,
+            retry_delay_ms,
         } => engine
-            .configure_consumer(&stream, &consumer, ack_timeout_ms, max_delivery_attempts)
+            .configure_consumer(
+                &stream,
+                &consumer,
+                ack_timeout_ms,
+                max_delivery_attempts,
+                retry_delay_ms,
+            )
             .await
             .map(|policy| consumer_policy_response(stream, consumer, policy)),
         Request::InspectConsumer { stream, consumer } => engine
@@ -505,6 +512,7 @@ fn consumer_policy_response(stream: String, consumer: String, policy: ConsumerPo
         configured: policy.configured,
         ack_timeout_ms: policy.ack_timeout_ms,
         max_delivery_attempts: policy.max_delivery_attempts,
+        retry_delay_ms: policy.retry_delay_ms,
     }
 }
 
@@ -664,6 +672,7 @@ fn message_response(message: MessageResponse) -> Response {
 fn error_response(error: &BrokerError) -> Response {
     let code = match error {
         BrokerError::InvalidName { .. } => "invalid_name",
+        BrokerError::InvalidRecord(_) => "invalid_record",
         BrokerError::StreamNotFound(_) => "stream_not_found",
         BrokerError::StreamNotReady(_) => "stream_not_ready",
         BrokerError::AckNotInFlight { .. } => "ack_not_in_flight",
@@ -694,8 +703,8 @@ fn error_response(error: &BrokerError) -> Response {
 }
 
 fn publish_batch_error_response(error: &BrokerError) -> Response {
-    if let BrokerError::Io(io_error) = error
-        && io_error.kind() == std::io::ErrorKind::InvalidInput
+    if matches!(error, BrokerError::InvalidRecord(_))
+        || matches!(error, BrokerError::Io(io_error) if io_error.kind() == std::io::ErrorKind::InvalidInput)
     {
         return Response::Error {
             code: "invalid_record".to_owned(),

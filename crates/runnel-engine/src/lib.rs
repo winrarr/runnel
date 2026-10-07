@@ -60,6 +60,9 @@ pub type Offset = u64;
 /// unchanged for existing deployments.
 pub const MAX_CONSUMER_POLICY_ACK_TIMEOUT_MS: u64 = 7 * 24 * 60 * 60 * 1_000;
 
+/// Maximum retry delay accepted by a consumer-scoped policy.
+pub const MAX_CONSUMER_POLICY_RETRY_DELAY_MS: u64 = MAX_CONSUMER_POLICY_ACK_TIMEOUT_MS;
+
 /// Maximum number of records accepted by one publish-batch engine operation.
 pub const MAX_PUBLISH_BATCH_RECORDS: usize = 1024;
 
@@ -368,6 +371,7 @@ pub struct ConsumerPolicy {
     pub configured: bool,
     pub ack_timeout_ms: u64,
     pub max_delivery_attempts: Option<u32>,
+    pub retry_delay_ms: u64,
 }
 
 impl ConsumerPolicy {
@@ -378,6 +382,7 @@ impl ConsumerPolicy {
             configured: false,
             ack_timeout_ms,
             max_delivery_attempts,
+            retry_delay_ms: 0,
         }
     }
 
@@ -386,12 +391,14 @@ impl ConsumerPolicy {
         version: u64,
         ack_timeout_ms: u64,
         max_delivery_attempts: Option<u32>,
+        retry_delay_ms: u64,
     ) -> Self {
         Self {
             version,
             configured: true,
             ack_timeout_ms,
             max_delivery_attempts,
+            retry_delay_ms,
         }
     }
 }
@@ -400,6 +407,7 @@ impl ConsumerPolicy {
 pub fn validate_consumer_policy(
     ack_timeout_ms: u64,
     max_delivery_attempts: Option<u32>,
+    retry_delay_ms: u64,
 ) -> Result<(), BrokerError> {
     if ack_timeout_ms > MAX_CONSUMER_POLICY_ACK_TIMEOUT_MS {
         return Err(BrokerError::Configuration(format!(
@@ -410,6 +418,11 @@ pub fn validate_consumer_policy(
         return Err(BrokerError::Configuration(
             "max delivery attempts must be greater than zero".to_owned(),
         ));
+    }
+    if retry_delay_ms > MAX_CONSUMER_POLICY_RETRY_DELAY_MS {
+        return Err(BrokerError::Configuration(format!(
+            "consumer retry delay must not exceed {MAX_CONSUMER_POLICY_RETRY_DELAY_MS} milliseconds"
+        )));
     }
     Ok(())
 }
@@ -540,6 +553,8 @@ pub enum ConsumerStatePersistStage {
 pub enum BrokerError {
     #[error("invalid {kind} name '{name}'; use 1-128 ASCII letters, digits, '.', '_', or '-'")]
     InvalidName { kind: &'static str, name: String },
+    #[error("invalid message record: {0}")]
+    InvalidRecord(String),
     #[error("stream '{0}' does not exist")]
     StreamNotFound(String),
     #[error("stream '{0}' is not ready")]
@@ -603,7 +618,7 @@ impl BrokerError {
     /// JSON state file, a lock, or a distributed transport.
     pub fn kind(&self) -> BrokerErrorKind {
         match self {
-            Self::InvalidName { .. } => BrokerErrorKind::InvalidRequest,
+            Self::InvalidName { .. } | Self::InvalidRecord(_) => BrokerErrorKind::InvalidRequest,
             Self::StreamNotFound(_) => BrokerErrorKind::ResourceNotFound,
             Self::StreamNotReady(_) => BrokerErrorKind::ResourceNotReady,
             Self::AckNotInFlight { .. }
@@ -756,6 +771,7 @@ pub trait Engine: Send + Sync {
         _consumer: &'a str,
         _ack_timeout_ms: u64,
         _max_delivery_attempts: Option<u32>,
+        _retry_delay_ms: u64,
     ) -> EngineFuture<'a, ConsumerPolicy> {
         Box::pin(async {
             Err(BrokerError::Cluster(
@@ -879,7 +895,7 @@ pub trait Engine: Send + Sync {
 mod tests {
     use super::{
         BrokerError, BrokerErrorKind, BrokerErrorOutcome, MAX_CONSUMER_POLICY_ACK_TIMEOUT_MS,
-        validate_consumer_policy,
+        MAX_CONSUMER_POLICY_RETRY_DELAY_MS, validate_consumer_policy,
     };
     use std::io;
 
@@ -892,6 +908,11 @@ mod tests {
                     kind: "stream",
                     name: "bad/name".to_owned(),
                 },
+                BrokerErrorKind::InvalidRequest,
+                BrokerErrorOutcome::Rejected,
+            ),
+            (
+                BrokerError::InvalidRecord("payload exceeds write limit".to_owned()),
                 BrokerErrorKind::InvalidRequest,
                 BrokerErrorOutcome::Rejected,
             ),
@@ -1014,10 +1035,12 @@ mod tests {
 
     #[test]
     fn validates_consumer_policy_bounds() {
-        assert!(validate_consumer_policy(0, Some(1)).is_ok());
-        assert!(validate_consumer_policy(MAX_CONSUMER_POLICY_ACK_TIMEOUT_MS, None).is_ok());
-        assert!(validate_consumer_policy(0, Some(0)).is_err());
-        assert!(validate_consumer_policy(MAX_CONSUMER_POLICY_ACK_TIMEOUT_MS + 1, None).is_err());
+        assert!(validate_consumer_policy(0, Some(1), 0).is_ok());
+        assert!(validate_consumer_policy(MAX_CONSUMER_POLICY_ACK_TIMEOUT_MS, None, 0).is_ok());
+        assert!(validate_consumer_policy(0, Some(0), 0).is_err());
+        assert!(validate_consumer_policy(MAX_CONSUMER_POLICY_ACK_TIMEOUT_MS + 1, None, 0).is_err());
+        assert!(validate_consumer_policy(0, None, MAX_CONSUMER_POLICY_RETRY_DELAY_MS).is_ok());
+        assert!(validate_consumer_policy(0, None, MAX_CONSUMER_POLICY_RETRY_DELAY_MS + 1).is_err());
     }
 
     #[test]

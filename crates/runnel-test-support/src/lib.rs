@@ -522,7 +522,7 @@ pub async fn assert_consume_batch_contract(engine: &dyn Engine) {
         .await
         .unwrap();
     engine
-        .configure_consumer(expiry, "workers", 25, None)
+        .configure_consumer(expiry, "workers", 25, None, 0)
         .await
         .unwrap();
     let expiry_limits = ConsumeBatchLimits {
@@ -584,7 +584,7 @@ pub async fn assert_consume_batch_contract(engine: &dyn Engine) {
     let policy = "contract.consume-batch-policy";
     assert!(engine.create_stream(policy).await.unwrap());
     engine
-        .configure_consumer(policy, "workers", 25, Some(3))
+        .configure_consumer(policy, "workers", 25, Some(3), 0)
         .await
         .unwrap();
     engine
@@ -601,7 +601,7 @@ pub async fn assert_consume_batch_contract(engine: &dyn Engine) {
         .await
         .unwrap();
     engine
-        .configure_consumer(policy, "workers", 500, Some(1))
+        .configure_consumer(policy, "workers", 500, Some(1), 0)
         .await
         .unwrap();
     tokio::time::sleep(Duration::from_millis(40)).await;
@@ -997,16 +997,17 @@ pub async fn assert_consumer_policy_configuration_contract(engine: &dyn Engine) 
     assert_eq!(other_fallback, fallback);
 
     let configured = engine
-        .configure_consumer("contract.policy", "worker", 500, Some(2))
+        .configure_consumer("contract.policy", "worker", 500, Some(2), 250)
         .await
         .unwrap();
     assert_eq!(configured.version, 1);
     assert!(configured.configured);
     assert_eq!(configured.ack_timeout_ms, 500);
     assert_eq!(configured.max_delivery_attempts, Some(2));
+    assert_eq!(configured.retry_delay_ms, 250);
 
     let repeated = engine
-        .configure_consumer("contract.policy", "worker", 500, Some(2))
+        .configure_consumer("contract.policy", "worker", 500, Some(2), 250)
         .await
         .unwrap();
     assert_eq!(repeated, configured);
@@ -1026,12 +1027,13 @@ pub async fn assert_consumer_policy_configuration_contract(engine: &dyn Engine) 
     );
 
     let updated = engine
-        .configure_consumer("contract.policy", "worker", 501, Some(3))
+        .configure_consumer("contract.policy", "worker", 501, Some(3), 500)
         .await
         .unwrap();
     assert!(updated.version > configured.version);
     assert_eq!(updated.ack_timeout_ms, 501);
     assert_eq!(updated.max_delivery_attempts, Some(3));
+    assert_eq!(updated.retry_delay_ms, 500);
     assert_eq!(
         engine
             .inspect_consumer("contract.policy", "worker")
@@ -1041,7 +1043,7 @@ pub async fn assert_consumer_policy_configuration_contract(engine: &dyn Engine) 
     );
 
     let invalid = engine
-        .configure_consumer("contract.policy", "worker", 777, Some(0))
+        .configure_consumer("contract.policy", "worker", 777, Some(0), 0)
         .await
         .expect_err("a zero attempt limit must be rejected");
     assert_eq!(invalid.kind(), BrokerErrorKind::Configuration);

@@ -25,6 +25,7 @@ const SHARED_TAIL_HISTORY_MESSAGE_COUNT: u64 = 2_048;
 const SHARED_TAIL_START_OFFSET: u64 = 1_900;
 const SHARED_TAIL_POLL_COUNT: u64 = 100;
 const SHARED_UNACKED_MEMBER_COUNTS: &[usize] = &[1, 4, 16, 64];
+const RETRY_SCHEDULE_COUNTS: &[u64] = &[0, 64, 256];
 const PUBLISH_BATCH_RECORD_COUNT: u64 = 32;
 
 fn configured_group<'a, M: Measurement>(
@@ -245,6 +246,80 @@ fn shared_consumer_keyed_poll_ack(c: &mut Criterion) {
     group.finish();
 }
 
+fn retry_schedule_poll_lookup(c: &mut Criterion) {
+    let mut group = configured_group(c, "retry_schedule_poll_lookup", 10);
+    for pending_count in RETRY_SCHEDULE_COUNTS {
+        for scheduled in [false, true] {
+            let scenario = if scheduled {
+                "future_retry_schedules"
+            } else {
+                "active_in_flight"
+            };
+            group.bench_function(BenchmarkId::new(scenario, pending_count), |benchmark| {
+                benchmark.iter_batched(
+                    || {
+                        let directory = TempDir::new().unwrap();
+                        let broker = Broker::open(
+                            directory.path(),
+                            BrokerConfig {
+                                ack_timeout: if scheduled {
+                                    Duration::ZERO
+                                } else {
+                                    Duration::from_secs(60)
+                                },
+                                max_delivery_attempts: None,
+                            },
+                        )
+                        .unwrap();
+                        broker.create_stream("bench").unwrap();
+                        broker
+                            .configure_consumer(
+                                "bench",
+                                "workers",
+                                if scheduled { 0 } else { 60_000 },
+                                None,
+                                if scheduled { 60_000 } else { 0 },
+                            )
+                            .unwrap();
+                        for offset in 0..*pending_count {
+                            broker
+                                .publish("bench", Some(format!("key-{offset}")), PAYLOAD.to_vec())
+                                .unwrap();
+                        }
+                        for offset in 0..*pending_count {
+                            assert!(matches!(
+                                broker
+                                    .poll_group(
+                                        "bench",
+                                        "workers",
+                                        &format!("member-{offset}"),
+                                    )
+                                    .unwrap(),
+                                PollResult::Message(message) if message.offset == offset
+                            ));
+                        }
+                        if scheduled && *pending_count > 0 {
+                            assert_eq!(
+                                broker.poll_group("bench", "workers", "settle").unwrap(),
+                                PollResult::Empty
+                            );
+                        }
+                        (directory, broker)
+                    },
+                    |(_directory, broker)| {
+                        assert_eq!(
+                            black_box(broker.poll_group("bench", "workers", "measure").unwrap()),
+                            PollResult::Empty
+                        );
+                    },
+                    BatchSize::PerIteration,
+                );
+            });
+        }
+    }
+    group.finish();
+}
+
 fn shared_consumer_many_in_flight(c: &mut Criterion) {
     let mut group = configured_group(c, "shared_consumer_many_in_flight", 20);
     for member_count in SHARED_UNACKED_MEMBER_COUNTS {
@@ -440,7 +515,8 @@ fn write_consumer_checkpoint(directory: &TempDir, consumer: &str, committed_offs
         format!(
             "{{\"stream\":\"recovery\",\"consumer\":\"{consumer}\",\
              \"committed_offset\":{committed_offset},\
-             \"acknowledged_offsets\":[],\"delivery_attempts\":{{}}}}"
+             \"acknowledged_offsets\":[],\"delivery_attempts\":{{}},\
+             \"policy\":null,\"delivery_policies\":{{}},\"retry_not_before\":{{}}}}"
         ),
     )
     .unwrap();
@@ -620,6 +696,7 @@ criterion_group!(
     publish_poll_ack,
     shared_consumer_poll_ack,
     shared_consumer_keyed_poll_ack,
+    retry_schedule_poll_lookup,
     shared_consumer_many_in_flight,
     shared_consumer_tail_candidate_lookup,
     concurrent_publish_same_stream,

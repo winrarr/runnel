@@ -20,13 +20,15 @@ use runnel_protocol::{
     PublishBatchRecordResponse, Request, Response,
 };
 use tempfile::TempDir;
-#[cfg(feature = "test-replacement-recovery")]
-use tokio::io::AsyncReadExt;
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader as AsyncBufReader};
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader as AsyncBufReader};
 use tokio::net::{TcpListener as AsyncTcpListener, TcpStream as AsyncTcpStream};
 use tokio::sync::oneshot;
 #[cfg(feature = "test-replacement-recovery")]
 use tokio::sync::{mpsc, watch};
+
+#[path = "support/peer_tls.rs"]
+mod peer_tls;
+use peer_tls::PeerCredentials;
 
 // Restart and log replay can be substantially slower on contended CI disks;
 // keep the assertion bounded without treating an intermediate empty poll as
@@ -61,6 +63,7 @@ struct RunningNode {
     data_dir: PathBuf,
     cluster_nodes: Vec<(u64, SocketAddr)>,
     ack_timeout_ms: u64,
+    peer_credentials: PeerCredentials,
     child: Option<Child>,
 }
 
@@ -99,6 +102,17 @@ impl RunningNode {
         bootstrap: bool,
         ack_timeout_ms: u64,
     ) -> Self {
+        let peer_map = cluster_nodes
+            .iter()
+            .map(|(id, address)| (*id, address.to_string()))
+            .collect();
+        let peer_credentials = PeerCredentials::for_cluster(
+            data_dir
+                .parent()
+                .expect("cluster node data directory should have a common parent"),
+            "runnel",
+            &peer_map,
+        );
         let child = Some(spawn_node(
             node_id,
             broker_addr,
@@ -108,6 +122,7 @@ impl RunningNode {
             &cluster_nodes,
             bootstrap,
             ack_timeout_ms,
+            &peer_credentials,
         ));
         Self {
             node_id,
@@ -117,6 +132,7 @@ impl RunningNode {
             data_dir,
             cluster_nodes,
             ack_timeout_ms,
+            peer_credentials,
             child,
         }
     }
@@ -132,6 +148,7 @@ impl RunningNode {
             &self.cluster_nodes,
             false,
             self.ack_timeout_ms,
+            &self.peer_credentials,
         ));
         wait_for_http(self.http_addr);
     }
@@ -149,6 +166,7 @@ impl RunningNode {
             &self.cluster_nodes,
             false,
             self.ack_timeout_ms,
+            &self.peer_credentials,
         ));
         wait_for_http(self.http_addr);
     }
@@ -211,6 +229,8 @@ fn three_process_cluster_replicates_and_recovers_after_failures() {
     for node in &nodes {
         wait_for_http(node.http_addr);
     }
+
+    assert_peer_tls_rejects_plaintext_and_unconfigured_members(&nodes);
 
     let leader = create_stream_on_any(&mut nodes, "events");
     let jobs_node = create_stream_on_any(&mut nodes, "jobs");
@@ -360,6 +380,7 @@ fn three_process_cluster_replicates_and_recovers_after_failures() {
                 consumer: "workers".to_owned(),
                 ack_timeout_ms: 60_000,
                 max_delivery_attempts: None,
+                retry_delay_ms: 0,
             },
             |response| matches!(response, Response::ConsumerPolicy { .. }),
         ),
@@ -2142,7 +2163,8 @@ fn three_process_cluster_transfers_consumer_policy_and_delivery_snapshot_after_l
                 stream: "policy-transfer-jobs".to_owned(),
                 consumer: "workers".to_owned(),
                 ack_timeout_ms: 0,
-                max_delivery_attempts: Some(1),
+                max_delivery_attempts: Some(3),
+                retry_delay_ms: 2_500,
             },
             |response| matches!(
                 response,
@@ -2150,7 +2172,8 @@ fn three_process_cluster_transfers_consumer_policy_and_delivery_snapshot_after_l
                     version: 1,
                     configured: true,
                     ack_timeout_ms: 0,
-                    max_delivery_attempts: Some(1),
+                    max_delivery_attempts: Some(3),
+                    retry_delay_ms: 2_500,
                     ..
                 }
             ),
@@ -2159,7 +2182,8 @@ fn three_process_cluster_transfers_consumer_policy_and_delivery_snapshot_after_l
             version: 1,
             configured: true,
             ack_timeout_ms: 0,
-            max_delivery_attempts: Some(1),
+            max_delivery_attempts: Some(3),
+            retry_delay_ms: 2_500,
             ..
         }
     ));
@@ -2212,6 +2236,7 @@ fn three_process_cluster_transfers_consumer_policy_and_delivery_snapshot_after_l
                 consumer: "workers".to_owned(),
                 ack_timeout_ms: 10_000,
                 max_delivery_attempts: Some(3),
+                retry_delay_ms: 0,
             },
             |response| matches!(
                 response,
@@ -2220,6 +2245,7 @@ fn three_process_cluster_transfers_consumer_policy_and_delivery_snapshot_after_l
                     configured: true,
                     ack_timeout_ms: 10_000,
                     max_delivery_attempts: Some(3),
+                    retry_delay_ms: 0,
                     ..
                 }
             ),
@@ -2229,8 +2255,25 @@ fn three_process_cluster_transfers_consumer_policy_and_delivery_snapshot_after_l
             configured: true,
             ack_timeout_ms: 10_000,
             max_delivery_attempts: Some(3),
+            retry_delay_ms: 0,
             ..
         }
+    ));
+    // A poll durably observes the first delivery's immediate lease expiry and
+    // starts the retry delay pinned to policy version 1 before this leader is
+    // stopped. The later policy version has a zero delay, so the interval
+    // across leadership change also verifies that delivery-policy pinning and
+    // the replicated not-before deadline survive replay.
+    assert!(matches!(
+        request(
+            nodes[initial_leader].broker_addr,
+            Request::PollGroup {
+                stream: "policy-transfer-jobs".to_owned(),
+                consumer: "workers".to_owned(),
+                member: "member-after-expiry".to_owned(),
+            },
+        ),
+        Ok(Response::Empty { .. })
     ));
     sleep(Duration::from_millis(10));
     nodes[initial_leader].stop();
@@ -2264,9 +2307,7 @@ fn three_process_cluster_transfers_consumer_policy_and_delivery_snapshot_after_l
         }
     ));
 
-    // Version 1's immediate expiry and one-attempt budget terminally move the
-    // first delivery. Version 2 would allow a second attempt, so this Empty
-    // response distinguishes the delivery snapshot from current consumer state.
+    // A new leader still honors the not-before deadline pinned to version 1.
     assert!(matches!(
         request(
             nodes[new_leader].broker_addr,
@@ -2278,19 +2319,20 @@ fn three_process_cluster_transfers_consumer_policy_and_delivery_snapshot_after_l
         ),
         Ok(Response::Empty { .. })
     ));
+    sleep(Duration::from_millis(2_600));
     assert!(matches!(
         request(
             nodes[new_leader].broker_addr,
             Request::PollGroup {
-                stream: "policy-transfer-jobs.dead-letter".to_owned(),
-                consumer: "inspector".to_owned(),
-                member: "inspector-1".to_owned(),
+                stream: "policy-transfer-jobs".to_owned(),
+                consumer: "workers".to_owned(),
+                member: "member-after-delay".to_owned(),
             },
         ),
         Ok(Response::Message {
             offset: 0,
             payload,
-            delivery_attempt: Some(1),
+            delivery_attempt: Some(2),
             delivery_token: Some(_),
             ..
         }) if payload == "use-pinned-policy"
@@ -2306,15 +2348,22 @@ async fn replacement_node_recovers_after_repeated_snapshot_interruptions() {
     let proxy_used = Arc::new(AtomicBool::new(false));
     let (snapshot_chunk_sender, mut snapshot_chunk_receiver) = mpsc::unbounded_channel();
     let (release_snapshot_sender, release_snapshot_receiver) = watch::channel(false);
+    let cluster_nodes = vec![(1, addresses[6]), (2, addresses[9]), (3, addresses[8])];
+    let peer_map = cluster_nodes
+        .iter()
+        .map(|(id, address)| (*id, address.to_string()))
+        .collect();
+    let peer_credentials = PeerCredentials::for_cluster(directory.path(), "runnel", &peer_map);
     let replacement_proxy = AsyncTcpListener::bind(addresses[9]).await.unwrap();
     let proxy = tokio::spawn(replacement_snapshot_gate_proxy(
         replacement_proxy,
         addresses[7],
+        peer_credentials.clone(),
+        cluster_nodes.iter().map(|(id, _)| *id).collect(),
         Arc::clone(&proxy_used),
         snapshot_chunk_sender,
         release_snapshot_receiver,
     ));
-    let cluster_nodes = vec![(1, addresses[6]), (2, addresses[9]), (3, addresses[8])];
     let mut nodes = vec![
         RunningNode::start(
             1,
@@ -2412,8 +2461,11 @@ async fn replacement_node_recovers_after_repeated_snapshot_interruptions() {
         .expect("replacement did not receive a non-final events data-group snapshot chunk")
         .expect("snapshot gate proxy stopped before observing the events data group");
     assert!(proxy_used.load(Ordering::Acquire));
-    let transfer_leader_response =
-        direct_peer_inspect_consumer(nodes[transfer_leader].peer_addr, "events");
+    let transfer_leader_response = direct_peer_inspect_consumer(
+        &nodes[transfer_leader],
+        source_peer_id(&nodes[transfer_leader]),
+        "events",
+    );
     assert!(
         transfer_leader_response["Forward"]["ConsumerPolicy"]["Ok"].is_object(),
         "the original data-group leader lost authority before the held snapshot chunk: {transfer_leader_response}"
@@ -2569,9 +2621,13 @@ fn spawn_node(
     cluster_nodes: &[(u64, SocketAddr)],
     bootstrap: bool,
     ack_timeout_ms: u64,
+    peer_credentials: &PeerCredentials,
 ) -> Child {
     let mut command = Command::new(server_binary());
     let ack_timeout_ms = ack_timeout_ms.to_string();
+    let trust_bundle = peer_credentials.trust_bundle();
+    let cert_chain = peer_credentials.certificate_chain(node_id);
+    let private_key = peer_credentials.private_key(node_id);
     command
         .args([
             "--engine",
@@ -2590,6 +2646,16 @@ fn spawn_node(
             &peer_addr.to_string(),
             "--data-dir",
             data_dir.to_str().expect("temporary path should be UTF-8"),
+            "--peer-trust-bundle",
+            trust_bundle
+                .to_str()
+                .expect("temporary path should be UTF-8"),
+            "--peer-cert-chain",
+            cert_chain.to_str().expect("temporary path should be UTF-8"),
+            "--peer-private-key",
+            private_key
+                .to_str()
+                .expect("temporary path should be UTF-8"),
         ])
         .stdout(Stdio::null())
         .stderr(Stdio::null());
@@ -2651,7 +2717,7 @@ fn data_group_leader_excluding(
             if node.child.is_none() || excluded_index == Some(index) {
                 continue;
             }
-            let response = direct_peer_inspect_consumer(node.peer_addr, stream);
+            let response = direct_peer_inspect_consumer(node, source_peer_id(node), stream);
             let result = &response["Forward"]["ConsumerPolicy"];
             if result["Ok"].is_object() {
                 assert!(
@@ -2721,7 +2787,11 @@ async fn withhold_first_response_proxy(
     drop(client_writer);
 }
 
-fn direct_peer_inspect_consumer(peer_addr: SocketAddr, stream: &str) -> serde_json::Value {
+fn direct_peer_inspect_consumer(
+    target: &RunningNode,
+    source_node_id: u64,
+    stream: &str,
+) -> serde_json::Value {
     let request = serde_json::json!({
         "Forward": {
             "InspectConsumer": {
@@ -2731,29 +2801,159 @@ fn direct_peer_inspect_consumer(peer_addr: SocketAddr, stream: &str) -> serde_js
         }
     });
     let encoded = serde_json::to_vec(&request).expect("peer probe request should encode");
-    let frame_size = u32::try_from(encoded.len()).expect("peer probe frame should fit in u32");
-    let mut connection = TcpStream::connect_timeout(&peer_addr, REQUEST_ATTEMPT_TIMEOUT)
-        .expect("peer probe should connect to a live process");
-    connection
-        .set_read_timeout(Some(REQUEST_ATTEMPT_TIMEOUT))
-        .expect("peer probe read timeout should be set");
-    connection
-        .set_write_timeout(Some(REQUEST_ATTEMPT_TIMEOUT))
-        .expect("peer probe write timeout should be set");
-    connection
-        .write_all(&frame_size.to_be_bytes())
-        .and_then(|()| connection.write_all(&encoded))
-        .expect("peer probe request should be written");
-
-    let mut response_size = [0; 4];
-    connection
-        .read_exact(&mut response_size)
-        .expect("peer probe response frame should be readable");
-    let mut response = vec![0; u32::from_be_bytes(response_size) as usize];
-    connection
-        .read_exact(&mut response)
-        .expect("peer probe response should be readable");
+    let response = tls_peer_frame_response(
+        target.peer_addr,
+        target.node_id,
+        source_node_id,
+        &target.peer_credentials,
+        &encoded,
+    )
+    .expect("authenticated peer probe should receive a response");
     serde_json::from_slice(&response).expect("peer probe response should decode")
+}
+
+fn source_peer_id(target: &RunningNode) -> u64 {
+    target
+        .cluster_nodes
+        .iter()
+        .map(|(node_id, _)| *node_id)
+        .find(|node_id| *node_id != target.node_id)
+        .expect("a multi-node cluster should have a different peer identity")
+}
+
+fn assert_peer_tls_rejects_plaintext_and_unconfigured_members(nodes: &[RunningNode]) {
+    let target = &nodes[0];
+    let plaintext_stream = "plaintext-peer-attack";
+    let plaintext_request = serde_json::to_vec(&serde_json::json!({
+        "Forward": {"CreateStream": {"stream": plaintext_stream}}
+    }))
+    .expect("plaintext peer request should encode");
+    write_plaintext_peer_frame(target.peer_addr, &plaintext_request)
+        .expect("plaintext peer connection should close without a peer response");
+    assert_stream_creation_succeeds(nodes, plaintext_stream);
+
+    let unknown_stream = "unconfigured-peer-attack";
+    let unknown_request = serde_json::to_vec(&serde_json::json!({
+        "Forward": {"CreateStream": {"stream": unknown_stream}}
+    }))
+    .expect("unconfigured peer request should encode");
+    assert!(
+        tls_peer_frame_response(
+            target.peer_addr,
+            target.node_id,
+            target.peer_credentials.unknown_node_id(),
+            &target.peer_credentials,
+            &unknown_request,
+        )
+        .is_err(),
+        "an unconfigured, CA-signed identity must not receive a peer response"
+    );
+    assert_stream_creation_succeeds(nodes, unknown_stream);
+}
+
+fn assert_stream_creation_succeeds(nodes: &[RunningNode], stream: &str) {
+    assert!(matches!(
+        request(
+            nodes[0].broker_addr,
+            Request::CreateStream {
+                stream: stream.to_owned(),
+            },
+        ),
+        Ok(Response::StreamCreated { created: true, .. })
+    ));
+}
+
+fn write_plaintext_peer_frame(peer_addr: SocketAddr, payload: &[u8]) -> std::io::Result<()> {
+    let frame_size = u32::try_from(payload.len()).map_err(|_| {
+        std::io::Error::new(std::io::ErrorKind::InvalidInput, "peer frame is too large")
+    })?;
+    let mut connection = TcpStream::connect_timeout(&peer_addr, REQUEST_ATTEMPT_TIMEOUT)?;
+    connection.set_read_timeout(Some(REQUEST_ATTEMPT_TIMEOUT))?;
+    connection.set_write_timeout(Some(REQUEST_ATTEMPT_TIMEOUT))?;
+    connection.write_all(&frame_size.to_be_bytes())?;
+    connection.write_all(payload)?;
+    connection.shutdown(std::net::Shutdown::Write)?;
+    let mut response = [0; 256];
+    loop {
+        match connection.read(&mut response) {
+            Ok(0) => return Ok(()),
+            Ok(_) => continue,
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::ConnectionReset | std::io::ErrorKind::BrokenPipe
+                ) =>
+            {
+                return Ok(());
+            }
+            Err(error) => return Err(error),
+        }
+    }
+}
+
+fn tls_peer_frame_response(
+    peer_addr: SocketAddr,
+    target_node_id: u64,
+    source_node_id: u64,
+    credentials: &PeerCredentials,
+    payload: &[u8],
+) -> std::io::Result<Vec<u8>> {
+    let credentials = credentials.clone();
+    let payload = payload.to_vec();
+    std::thread::spawn(move || {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("peer test runtime should build")
+            .block_on(async move {
+                let exchange = async {
+                    let stream = AsyncTcpStream::connect(peer_addr).await?;
+                    let name = rustls::pki_types::ServerName::try_from(
+                        credentials.peer_identity(target_node_id),
+                    )
+                    .map_err(|_| {
+                        std::io::Error::new(
+                            std::io::ErrorKind::InvalidInput,
+                            "peer test identity should be valid",
+                        )
+                    })?;
+                    let mut connection =
+                        tokio_rustls::TlsConnector::from(credentials.client_config(source_node_id))
+                            .connect(name, stream)
+                            .await
+                            .map_err(std::io::Error::other)?;
+                    let frame_size = u32::try_from(payload.len()).map_err(|_| {
+                        std::io::Error::new(
+                            std::io::ErrorKind::InvalidInput,
+                            "peer frame is too large",
+                        )
+                    })?;
+                    connection.write_all(&frame_size.to_be_bytes()).await?;
+                    connection.write_all(&payload).await?;
+                    connection.flush().await?;
+                    let response_size = connection.read_u32().await?;
+                    if response_size > 64 * 1024 * 1024 {
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::InvalidData,
+                            "peer response frame is too large",
+                        ));
+                    }
+                    let mut response = vec![0; response_size as usize];
+                    connection.read_exact(&mut response).await?;
+                    Ok(response)
+                };
+                tokio::time::timeout(REQUEST_ATTEMPT_TIMEOUT, exchange)
+                    .await
+                    .map_err(|_| {
+                        std::io::Error::new(
+                            std::io::ErrorKind::TimedOut,
+                            "peer test request timed out",
+                        )
+                    })?
+            })
+    })
+    .join()
+    .map_err(|_| std::io::Error::other("peer test request thread panicked"))?
 }
 
 fn wait_for_stream_on_any(nodes: &mut [RunningNode], stream: &str) -> usize {
@@ -3010,22 +3210,56 @@ fn wait_for_active_snapshot_transfer(address: SocketAddr, attempt: usize) {
 async fn replacement_snapshot_gate_proxy(
     listener: AsyncTcpListener,
     backend_address: SocketAddr,
+    peer_credentials: PeerCredentials,
+    peer_node_ids: Vec<u64>,
     gate_used: Arc<AtomicBool>,
     gate_sender: mpsc::UnboundedSender<()>,
     release_receiver: watch::Receiver<bool>,
 ) {
+    let acceptor = peer_credentials.server_acceptor(2);
     loop {
-        let (mut client, _) = listener
+        let (client, _) = listener
             .accept()
             .await
             .expect("snapshot proxy should accept peer connections");
-        let Ok(mut backend) = AsyncTcpStream::connect(backend_address).await else {
-            continue;
-        };
+        let acceptor = acceptor.clone();
+        let peer_credentials = peer_credentials.clone();
+        let peer_node_ids = peer_node_ids.clone();
         let gate_used = Arc::clone(&gate_used);
         let gate_sender = gate_sender.clone();
         let mut release_receiver = release_receiver.clone();
         tokio::spawn(async move {
+            let Ok(mut client) = acceptor.accept(client).await else {
+                return;
+            };
+            let Some(client_certificate) = client
+                .get_ref()
+                .1
+                .peer_certificates()
+                .and_then(|certificates| certificates.first())
+            else {
+                return;
+            };
+            let Some(source_node_id) = peer_credentials
+                .node_id_for_certificate(client_certificate.as_ref(), &peer_node_ids)
+            else {
+                return;
+            };
+            let Ok(backend) = AsyncTcpStream::connect(backend_address).await else {
+                return;
+            };
+            let Ok(server_name) =
+                rustls::pki_types::ServerName::try_from(peer_credentials.peer_identity(2))
+            else {
+                return;
+            };
+            let Ok(mut backend) =
+                tokio_rustls::TlsConnector::from(peer_credentials.client_config(source_node_id))
+                    .connect(server_name, backend)
+                    .await
+            else {
+                return;
+            };
             loop {
                 let request = match read_peer_frame(&mut client).await {
                     Ok(request) => request,
@@ -3087,7 +3321,10 @@ fn is_successful_snapshot_response(frame: &[u8]) -> bool {
 }
 
 #[cfg(feature = "test-replacement-recovery")]
-async fn read_peer_frame(stream: &mut AsyncTcpStream) -> Result<Vec<u8>, std::io::Error> {
+async fn read_peer_frame<S>(stream: &mut S) -> Result<Vec<u8>, std::io::Error>
+where
+    S: tokio::io::AsyncRead + Unpin,
+{
     let length = stream.read_u32().await?;
     if length > 64 * 1024 * 1024 {
         return Err(std::io::Error::new(
@@ -3101,7 +3338,10 @@ async fn read_peer_frame(stream: &mut AsyncTcpStream) -> Result<Vec<u8>, std::io
 }
 
 #[cfg(feature = "test-replacement-recovery")]
-async fn write_peer_frame(stream: &mut AsyncTcpStream, frame: &[u8]) -> Result<(), std::io::Error> {
+async fn write_peer_frame<S>(stream: &mut S, frame: &[u8]) -> Result<(), std::io::Error>
+where
+    S: tokio::io::AsyncWrite + Unpin,
+{
     let length = u32::try_from(frame.len()).map_err(|_| {
         std::io::Error::new(
             std::io::ErrorKind::InvalidData,

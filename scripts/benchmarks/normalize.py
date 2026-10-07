@@ -138,6 +138,7 @@ def normalize_result(result: dict[str, Any], *, source_name: str = "comparison")
                 "measurement_boundary",
                 "measurement_client",
                 "client_image",
+                "client_resource_limits",
                 "semantic_metadata",
                 "startup_seconds",
                 "nodes",

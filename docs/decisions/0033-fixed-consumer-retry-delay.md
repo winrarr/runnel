@@ -33,12 +33,18 @@ zero through seven days, matching the existing maximum for `ack_timeout_ms`.
 The seven-day bound applies to each field independently, so the maximum
 configured lease-plus-delay sum is fourteen days. Demand-driven expiry
 observation can extend actual assignment-to-redelivery time beyond that sum.
-Missing values in existing requests and persisted policies mean zero. Zero is
-the default for configured and legacy consumers and preserves current behavior.
-`configure_consumer` is a complete policy replacement: omitting
-`retry_delay_ms` resets it to zero rather than preserving a previously
-configured delay. Mixed-version policy writes are therefore unsupported while
-any consumer relies on a nonzero delay.
+The current configure request and persisted policy schema require
+`retry_delay_ms`; current clients pass zero explicitly when they want immediate
+retry eligibility. The CLI uses zero as its option default, and legacy broker
+fallback policies also use zero. `configure_consumer` is a complete policy
+replacement, so passing zero clears a previously configured delay. No
+serialization shim or migration is provided for data written by older Runnel
+builds. The provisional public protocol and static cluster do not promise
+mixed-version operation or online rollback. Cluster binary and protocol
+changes require the coordinated maintenance described in
+[ADR 0031](0031-protocol-v2-contract.md) and
+[ADR 0032](0032-static-cluster-peer-mutual-tls.md); retry-delay support adds no
+separate capability negotiation.
 
 For each assigned attempt, the acknowledgement lease remains exactly
 `ack_timeout_ms`. An acknowledgement received at or after the lease deadline
@@ -50,8 +56,10 @@ the lease has expired, it durably schedules the next attempt at:
 retry_not_before = first_durable_expiry_observation + pinned_retry_delay
 ```
 
-A zero delay makes the deadline equal the observation time and preserves
-immediate retry eligibility under the existing poll lifecycle.
+A zero delay preserves immediate retry eligibility under the existing poll
+lifecycle. The engines do not retain a separate per-offset deadline entry for
+this no-wait case: the pinned policy remains zero, and the expired offset is
+immediately eligible for reassignment.
 The delay starts when expiry is first durably observed, not at the lease
 deadline. A late poll or stale acknowledgement therefore starts a fresh full
 delay from that observation; a poll after `retry_not_before` can assign the
@@ -78,9 +86,10 @@ Both engines use the first durable expiry observation as the delay start:
 - **Local:** active leases continue to use their process-local monotonic
   deadline. The first local poll or stale acknowledgement that observes
   expiry persists `retry_not_before = local_wall_time_at_observation +
-  retry_delay_ms` as part of its durable transition. A zero delay makes a
-  poll eligible for immediate reassignment under the existing lifecycle. The
-  schedule remains visible to candidate selection, including its ordering-key
+  retry_delay_ms` as part of its durable transition when the pinned delay is
+  positive. A zero delay needs no separate schedule entry and remains
+  immediately eligible under the existing lifecycle. A persisted schedule
+  remains visible to candidate selection, including its ordering-key
   gate, and survives later restarts. If restart discards the active lease
   before any operation durably observed expiry, the first post-restart
   operation that observes expiry starts and persists the full delay. Local
@@ -90,8 +99,9 @@ Both engines use the first durable expiry observation as the delay start:
   process restart, snapshot recovery, and leader transfer. The first committed
   operation that observes expiry persists
   `retry_not_before = effective_observation_time + retry_delay_ms` in
-  replicated per-offset delivery state. A zero delay makes a poll eligible
-  for immediate reassignment under the existing lifecycle. The existing effective clock,
+  replicated per-offset delivery state when the pinned delay is positive. A
+  zero delay needs no separate schedule entry and remains immediately eligible
+  under the existing lifecycle. The existing effective clock,
   `max(persisted_lease_clock, command_observation)`, determines the observation
   time and whether the deadline is due. No periodic timer is introduced; a
   committed poll or stale-acknowledgement command makes progress. A node
@@ -153,11 +163,12 @@ observations and recovery one rule across both engines.
 
 ## Consequences and implementation gates
 
-- Existing configurations and persisted policies read with
-  `retry_delay_ms = 0`; no default timing changes.
-- Policy serialization and protocol fixtures must cover an absent field,
-  zero, the seven-day maximum, rejection above the maximum, and policy-version
-  pinning across a later configuration change.
+- Legacy broker fallback policies and the current CLI option default to zero;
+  the current wire request and persisted policy schema require an explicit
+  `retry_delay_ms` field.
+- Policy serialization and protocol fixtures must cover explicit zero, the
+  seven-day maximum, rejection above the maximum, failure on a missing required
+  field, and policy-version pinning across a later configuration change.
 - Local tests must cover the exact lease-expiry observation and
   `retry_not_before` boundaries, late poll and stale-ack observation, same-key
   exclusion, unrelated work, restart before expiry is durably observed,
@@ -173,10 +184,11 @@ observations and recovery one rule across both engines.
 - A real multi-process test must establish the externally visible clustered
   behavior. The state-machine clock should be controllable in deterministic
   tests; process-level tests must not claim hard real-time precision.
-- Rolling upgrades or rollback across binaries that do not know this policy
-  field are not covered by the provisional protocol. Runtime work must either
-  reject unsafe mixed-version policy use or establish a compatibility gate;
-  silently dropping a nonzero field is not acceptable.
+- Mixed-binary cluster operation and online rollback are unsupported. Run
+  coordinated whole-cluster maintenance so every node uses the same current
+  binary when policies with a nonzero delay are in use.
+  The provisional public protocol also makes no mixed-version compatibility
+  promise. No retry-delay-specific runtime capability gate is provided.
 
 Clustered not-before deadlines inherit TD-020: a forward wall-clock jump may
 make the retry due early, a backward jump can delay it until the persisted

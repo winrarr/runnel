@@ -116,6 +116,7 @@ message ConfigureConsumerRequest {
   string consumer = 2;
   uint64 ack_timeout_ms = 3;
   optional uint32 max_delivery_attempts = 4;
+  uint64 retry_delay_ms = 5;
 }
 message InspectConsumerRequest { string stream = 1; string consumer = 2; }
 message AckRequest { string stream = 1; string consumer = 2; uint64 offset = 3; }
@@ -251,6 +252,7 @@ message ConsumerPolicyResult {
   bool configured = 4;
   uint64 ack_timeout_ms = 5;
   optional uint32 max_delivery_attempts = 6;
+  uint64 retry_delay_ms = 7;
 }
 message HealthResult { string status = 1; uint64 streams = 2; uint64 storage_bytes = 3; }
 message ErrorResult { string code = 1; string diagnostic = 2; }

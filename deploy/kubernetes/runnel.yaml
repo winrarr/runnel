@@ -1,17 +1,18 @@
-# Development-only static-cluster manifest. The application listener explicitly
-# allows unauthenticated plaintext for isolated development; never expose this
-# Service to production or untrusted networks. This file also does not provide
-# topology spread, backup policy, ServiceMonitor, HTTP security,
-# storage-capacity policy, or a supported rolling upgrade. See README.md for
-# the readiness, liveness, persistence, disruption, control-plane, resource,
-# metrics, and compatibility assumptions.
+# Development-only static-cluster manifest. Supply a per-pod peer TLS secret
+# projection at /var/run/runnel/peer-tls before applying this manifest. The
+# application listener explicitly allows unauthenticated plaintext for isolated
+# development; never expose the Services to production or untrusted networks.
+# This file also does not provide topology spread, backup policy, ServiceMonitor,
+# HTTP security, storage-capacity policy, or a supported rolling upgrade. See
+# README.md for the readiness, persistence, resource, and compatibility assumptions.
 apiVersion: v1
 kind: Service
 metadata:
   name: runnel
 spec:
-  # Client and HTTP traffic use readiness-filtered endpoints. Broker traffic
-  # is unauthenticated plaintext; the HTTP listener also has no access policy.
+  # Client and HTTP traffic use readiness-filtered endpoints. Peer traffic has
+  # its own mutually authenticated TLS transport; broker traffic is explicitly
+  # unauthenticated plaintext and HTTP has no access policy or scrape policy.
   selector:
     app.kubernetes.io/name: runnel
   ports:
@@ -63,8 +64,8 @@ spec:
   serviceName: runnel-headless
   podManagementPolicy: Parallel
   replicas: 3
-  # Keep image changes explicit while clustered storage and peer compatibility
-  # remain undefined. Delete/restart one pod at a time for experiments.
+  # Keep image changes explicit: mixed-version peers are unsupported and no
+  # tested upgrade procedure exists. Restart one pod at a time for experiments.
   updateStrategy:
     type: OnDelete
   selector:
@@ -105,6 +106,9 @@ spec:
                 --cluster-node 0=runnel-0.runnel-headless:7000 \
                 --cluster-node 1=runnel-1.runnel-headless:7000 \
                 --cluster-node 2=runnel-2.runnel-headless:7000 \
+                --peer-trust-bundle /var/run/runnel/peer-tls/ca.pem \
+                --peer-cert-chain /var/run/runnel/peer-tls/tls.crt \
+                --peer-private-key /var/run/runnel/peer-tls/tls.key \
                 $bootstrap_args
           ports:
             - name: broker

@@ -19,6 +19,7 @@ from typing import Any
 from cluster_faults import PeerResponseDelayProxy
 from cluster_resources import ProcessStats, peer_connection_census
 from cluster_scenarios import DEFAULT_PEER_RESPONSE_DELAY_MS
+from peer_tls import PeerCredentials
 from common import (
     BenchmarkError,
     DEFAULT_TIMEOUT_SECONDS,
@@ -85,6 +86,7 @@ class Cluster:
         self.peer_response_delay_ms = peer_response_delay_ms
         self.root = Path(tempfile.mkdtemp(prefix="runnel-cluster-bench-"))
         self.root.chmod(0o777)
+        self.cluster_name = f"runnel-benchmark-{os.getpid()}"
         self.network = f"runnel-cluster-net-{os.getpid()}-{time.time_ns()}"
         self.network_created = False
         self.image_id: str | None = None
@@ -102,11 +104,19 @@ class Cluster:
             )
             for index in range(node_count)
         ]
+        self.peer_credentials = PeerCredentials(
+            self.root,
+            self.cluster_name,
+            list(range(1, node_count + 1)),
+        )
         for node in self.nodes:
             node.peer_address_port = node.peer_port
             if self.peer_response_delay_ms:
                 node.peer_proxy = PeerResponseDelayProxy(
-                    node.peer_port, self.peer_response_delay_ms
+                    node.peer_port,
+                    self.peer_response_delay_ms,
+                    self.peer_credentials,
+                    node.node_id,
                 )
         self.stats = ProcessStats(self)
         self.startup_ns = 0
@@ -270,6 +280,11 @@ class Cluster:
             listen = "0.0.0.0"
             data_dir = "/var/lib/runnel"
             peer_port = 7000
+            peer_tls_paths = {
+                "--peer-trust-bundle": "/run/runnel/peer-tls/ca.pem",
+                "--peer-cert-chain": "/run/runnel/peer-tls/tls.crt",
+                "--peer-private-key": "/run/runnel/peer-tls/tls.key",
+            }
         else:
             addresses = [
                 f"{other.node_id}=127.0.0.1:{other.peer_address_port}" for other in self.nodes
@@ -277,13 +292,19 @@ class Cluster:
             listen = "127.0.0.1"
             data_dir = str(node.data_dir)
             peer_port = node.peer_port
+            node_credentials = self.peer_credentials.node(node.node_id)
+            peer_tls_paths = {
+                "--peer-trust-bundle": str(node_credentials.trust_bundle),
+                "--peer-cert-chain": str(node_credentials.certificate_chain),
+                "--peer-private-key": str(node_credentials.private_key),
+            }
         command = [
             "--engine",
             "raft",
             "--node-id",
             str(node.node_id),
             "--cluster-name",
-            f"runnel-benchmark-{os.getpid()}",
+            self.cluster_name,
             "--data-dir",
             data_dir,
             "--listen",
@@ -295,6 +316,8 @@ class Cluster:
             "--ack-timeout-ms",
             str(self.ack_timeout_ms),
         ]
+        for flag, path in peer_tls_paths.items():
+            command.extend([flag, path])
         for address in addresses:
             command.extend(["--cluster-node", address])
         if self.runtime == "container":
@@ -314,6 +337,8 @@ class Cluster:
             data_target="/var/lib/runnel",
             command=command,
             published_ports=(4222, 8080),
+            extra_mounts=((self.peer_credentials.node(node.node_id).directory, "/run/runnel/peer-tls"),),
+            user=f"{os.getuid()}:{os.getgid()}",
         )
         node.container = container
         try:

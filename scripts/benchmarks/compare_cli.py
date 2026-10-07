@@ -1,10 +1,10 @@
-"""Run a first-pass native-tool comparison of Runnel, Kafka, Redpanda, and JetStream.
+"""Run a first-pass non-ranking comparison of Runnel, Kafka, Redpanda, and JetStream.
 
-The default comparison preserves each broker's native benchmark client and
-single-node topology. ``--nodes 3`` adds a competitor-only, durable-publish
-comparison with three broker nodes and replication factor three. It deliberately
-does not include Runnel or a consumer result because those paths do not yet have
-matching distributed semantics in this harness.
+The default comparison uses each broker's current benchmark client and a
+single-node topology. ``--nodes 3`` runs durable publish on three broker nodes
+for every selected backend. Runnel uses the existing clustered public-protocol
+runner; differences in client behavior and durability boundaries remain
+explicit, so results are not eligible for cross-product ranking.
 """
 
 from __future__ import annotations
@@ -23,6 +23,7 @@ from compare_backends import (
     run_kafka_family,
     run_nats,
     run_runnel,
+    run_runnel_cluster,
     start_kafka_services,
     start_nats_services,
     start_redpanda_services,
@@ -62,7 +63,7 @@ def parse_args() -> argparse.Namespace:
         type=int,
         choices=(DEFAULT_NODES, THREE_NODE_COUNT),
         default=DEFAULT_NODES,
-        help="broker count; 3 enables competitor-only replicated durable publish",
+        help="broker count; 3 enables replicated durable publish for all selected backends",
     )
     parser.add_argument("--messages", type=int, default=DEFAULT_MESSAGES)
     parser.add_argument("--payload-sizes", type=parse_sizes, default=[100, 1024])
@@ -72,10 +73,8 @@ def parse_args() -> argparse.Namespace:
     valid = {"runnel", "kafka", "redpanda", "nats"}
     if not args.backends or any(backend not in valid for backend in args.backends):
         parser.error(f"backends must be selected from: {', '.join(sorted(valid))}")
-    if args.nodes == THREE_NODE_COUNT and "runnel" in args.backends:
-        parser.error("--nodes 3 supports only kafka, redpanda, and nats; Runnel has no comparison adapter")
-    if args.nodes == THREE_NODE_COUNT and args.build_runnel:
-        parser.error("--build-runnel is only valid for the single-node comparison")
+    if args.build_runnel and "runnel" not in args.backends:
+        parser.error("--build-runnel requires the runnel backend to be selected")
     if args.messages <= 0:
         parser.error("messages must be positive")
     return args
@@ -89,9 +88,9 @@ def main() -> int:
     timestamp = datetime.now(UTC)
     run_id = timestamp.strftime("%Y%m%d%H%M%S%f")
     comparison_mode = (
-        "three-node replicated durable publish; native broker tools; publish-only first slice"
+        "three-node replicated durable publish; backend-specific clients; publish-only first slice"
         if args.nodes == THREE_NODE_COUNT
-        else "native broker tools; first-pass, not a final apples-to-apples claim"
+        else "backend-specific clients; single-node first pass; not an apples-to-apples claim"
     )
     metadata = result_metadata(
         run_id,
@@ -109,7 +108,8 @@ def main() -> int:
         for backend in args.backends:
             services = []
             if backend == "runnel":
-                result = run_runnel(
+                runner = run_runnel_cluster if args.nodes == THREE_NODE_COUNT else run_runnel
+                result = runner(
                     image=args.runnel_image,
                     cpus=args.cpus,
                     memory=args.memory,
@@ -179,6 +179,10 @@ def main() -> int:
             "broker_memory": args.memory,
             "client_cpu": args.client_cpus,
             "client_memory": args.client_memory,
+            "client_scope": (
+                "Runnel uses an unbounded host-side Python client; native competitor clients "
+                "run in containers with the declared client limits"
+            ),
         },
         "workload": {
             "messages": args.messages,

@@ -49,6 +49,10 @@ advertised only after its compatible behavior is implemented. Its
 logical payload is an opaque byte field for both text and binary client helpers;
 stream and consumer identifiers and optional ordering keys remain UTF-8 text.
 The initial v2 release has no compression.
+The core v2 `ConfigureConsumer` request includes `retry_delay_ms`, and its
+`ConsumerPolicy` response returns the configured value. This field carries the
+accepted fixed-delay policy from ADR 0033; it is part of the sole current
+schema and does not require a capability or compatibility fallback.
 
 A v2 connection starts with the exact eight-byte preface `52 4e 4c 4e 01 00 00 00`:
 ASCII `RNLN`, bootstrap revision 1, and three zero reserved bytes. This
@@ -340,8 +344,9 @@ justify them.
   generated Protobuf schemas, bounded frame readers and writers, Hello
   negotiation, typed refusals, and v2 client/server behavior. The current
   implementation also supplies the TLS/auth policy modules, pre-dispatch role
-  gate, and engine response admission; startup/security configuration wiring
-  and the process-level evidence gates below remain open.
+  gate, engine response admission, fail-closed startup/security configuration,
+  and real-process application-listener coverage. Focused exact-head checks
+  remain required before release.
 - The client can trust explicit outcomes instead of maintaining code-based
   retry lists. An outcome still does not automate retry policy or provide a
   generic resolution identity.

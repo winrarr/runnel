@@ -26,7 +26,7 @@ use super::forwarding::ClientForwarder;
 use super::group_manager;
 use super::state_machine::{Command, CommandResponse, StreamMetadata, stream_identity};
 use super::state_machine_store::StateMachineStore;
-use super::{GroupManager, NodeId, Raft, TypeConfig, validate_name};
+use super::{GroupManager, NodeId, PeerTlsConfig, Raft, TypeConfig, validate_name};
 
 pub(super) const DEFAULT_RAFT_ACK_TIMEOUT: Duration = Duration::from_secs(30);
 static BATCH_TOKEN_SEQUENCE: AtomicU64 = AtomicU64::new(0);
@@ -549,10 +549,11 @@ impl RaftGroup {
         consumer: String,
         ack_timeout_ms: u64,
         max_delivery_attempts: Option<u32>,
+        retry_delay_ms: u64,
     ) -> Result<ConsumerPolicy, BrokerError> {
         validate_name("stream", &stream)?;
         validate_name("consumer", &consumer)?;
-        validate_consumer_policy(ack_timeout_ms, max_delivery_attempts)?;
+        validate_consumer_policy(ack_timeout_ms, max_delivery_attempts, retry_delay_ms)?;
         let response = self
             .raft
             .client_write(Command::ConfigureConsumer {
@@ -560,6 +561,7 @@ impl RaftGroup {
                 consumer,
                 ack_timeout_ms,
                 max_delivery_attempts,
+                retry_delay_ms,
             })
             .await
             .map_err(map_client_write_error)?;
@@ -871,7 +873,7 @@ impl RaftGroup {
                 policy_version: policy.configured.then_some(policy.version),
                 transition_only: false,
             };
-            let (preview, next_expiry_ms) = self
+            let (preview, next_expiry_ms, needs_retry_schedule) = self
                 .state_machine
                 .preview_group_batch(request.clone())
                 .await?;
@@ -886,7 +888,7 @@ impl RaftGroup {
                 }
             };
 
-            if terminal_transitions > 0 {
+            if needs_retry_schedule || terminal_transitions > 0 {
                 let mut transition_request = request;
                 transition_request.transition_only = true;
                 self.submit_group_batch_poll(transition_request).await?;
@@ -1102,6 +1104,7 @@ impl Engine for SingleNodeEngine {
         consumer: &'a str,
         ack_timeout_ms: u64,
         max_delivery_attempts: Option<u32>,
+        retry_delay_ms: u64,
     ) -> EngineFuture<'a, ConsumerPolicy> {
         Box::pin(async move {
             self.group
@@ -1110,6 +1113,7 @@ impl Engine for SingleNodeEngine {
                     consumer.to_owned(),
                     ack_timeout_ms,
                     max_delivery_attempts,
+                    retry_delay_ms,
                 )
                 .await
         })
@@ -1283,6 +1287,7 @@ pub struct PersistentEngine {
 }
 
 impl PersistentEngine {
+    #[cfg(test)]
     pub async fn open(
         node_id: NodeId,
         cluster_name: String,
@@ -1301,6 +1306,7 @@ impl PersistentEngine {
         .await
     }
 
+    #[cfg(test)]
     pub async fn open_with_ack_timeout(
         node_id: NodeId,
         cluster_name: String,
@@ -1321,6 +1327,7 @@ impl PersistentEngine {
         .await
     }
 
+    #[cfg(test)]
     pub async fn open_with_config(
         node_id: NodeId,
         cluster_name: String,
@@ -1330,6 +1337,63 @@ impl PersistentEngine {
         ack_timeout: Duration,
         max_delivery_attempts: Option<u32>,
     ) -> Result<Self, BrokerError> {
+        Self::open_internal(
+            node_id,
+            cluster_name,
+            data_dir,
+            peers,
+            bootstrap,
+            ack_timeout,
+            max_delivery_attempts,
+            None,
+        )
+        .await
+    }
+
+    /// Open a clustered engine with static peer TLS credentials. Production
+    /// Raft listeners and all outbound peer operations use this constructor.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn open_with_peer_tls(
+        node_id: NodeId,
+        cluster_name: String,
+        data_dir: impl AsRef<std::path::Path>,
+        peers: BTreeMap<NodeId, String>,
+        bootstrap: bool,
+        ack_timeout: Duration,
+        max_delivery_attempts: Option<u32>,
+        peer_tls: Arc<PeerTlsConfig>,
+    ) -> Result<Self, BrokerError> {
+        peer_tls.validate_for(node_id, &cluster_name, &peers)?;
+        Self::open_internal(
+            node_id,
+            cluster_name,
+            data_dir,
+            peers,
+            bootstrap,
+            ack_timeout,
+            max_delivery_attempts,
+            Some(peer_tls),
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn open_internal(
+        node_id: NodeId,
+        cluster_name: String,
+        data_dir: impl AsRef<std::path::Path>,
+        peers: BTreeMap<NodeId, String>,
+        bootstrap: bool,
+        ack_timeout: Duration,
+        max_delivery_attempts: Option<u32>,
+        peer_tls: Option<Arc<PeerTlsConfig>>,
+    ) -> Result<Self, BrokerError> {
+        #[cfg(not(test))]
+        if peer_tls.is_none() {
+            return Err(BrokerError::Configuration(
+                "static Raft peers require mutual TLS credentials".to_owned(),
+            ));
+        }
         if max_delivery_attempts == Some(0) {
             return Err(BrokerError::Configuration(
                 "max delivery attempts must be greater than zero".to_owned(),
@@ -1361,6 +1425,7 @@ impl PersistentEngine {
             peers.clone(),
             ack_timeout,
             max_delivery_attempts,
+            peer_tls,
         )
         .await?;
         let metadata_group = manager.metadata_group().await;
@@ -1564,6 +1629,7 @@ impl Engine for PersistentEngine {
         consumer: &'a str,
         ack_timeout_ms: u64,
         max_delivery_attempts: Option<u32>,
+        retry_delay_ms: u64,
     ) -> EngineFuture<'a, ConsumerPolicy> {
         Box::pin(async move {
             let stream_name = stream.to_owned();
@@ -1573,6 +1639,7 @@ impl Engine for PersistentEngine {
                 consumer: consumer_name.clone(),
                 ack_timeout_ms,
                 max_delivery_attempts,
+                retry_delay_ms,
             };
             match self
                 .manager
@@ -1581,6 +1648,7 @@ impl Engine for PersistentEngine {
                     consumer_name,
                     ack_timeout_ms,
                     max_delivery_attempts,
+                    retry_delay_ms,
                 )
                 .await
             {

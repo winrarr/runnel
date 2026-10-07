@@ -20,8 +20,8 @@ use super::forwarding::forward_error_to_broker;
 use super::state_machine::{GroupKind, StreamLifecycle, StreamMetadata, stream_identity};
 use super::state_machine_store::{StateMachineStore, validate_state_machine_storage};
 use super::{
-    METADATA_GROUP_ID, NodeId, Raft, SnapshotMetricsSnapshot, TypeConfig, atomic_write, log_store,
-    network, path_component, validate_name,
+    METADATA_GROUP_ID, NodeId, PeerTlsConfig, Raft, SnapshotMetricsSnapshot, TypeConfig,
+    atomic_write, log_store, network, path_component, validate_name,
 };
 
 // These defaults keep the consensus log bounded while the snapshot format is
@@ -111,6 +111,7 @@ pub struct GroupManager {
     groups: RwLock<BTreeMap<String, Arc<RaftGroup>>>,
     creation_lock: Mutex<()>,
     replication_progress_cursor: Mutex<Option<String>>,
+    peer_tls: Option<Arc<PeerTlsConfig>>,
     peer_transport: Arc<network::PeerTransport>,
 }
 
@@ -144,7 +145,9 @@ impl GroupManager {
         peers: BTreeMap<NodeId, String>,
         ack_timeout: Duration,
         max_delivery_attempts: Option<u32>,
+        peer_tls: Option<Arc<PeerTlsConfig>>,
     ) -> Result<Arc<Self>, BrokerError> {
+        let peer_transport = network::PeerTransport::new(peer_tls.clone());
         let manager = Arc::new(Self {
             node_id,
             cluster_name,
@@ -155,7 +158,8 @@ impl GroupManager {
             groups: RwLock::new(BTreeMap::new()),
             creation_lock: Mutex::new(()),
             replication_progress_cursor: Mutex::new(None),
-            peer_transport: network::PeerTransport::new(),
+            peer_tls,
+            peer_transport,
         });
         let metadata = manager
             .open_group(
@@ -303,6 +307,10 @@ impl GroupManager {
         &self.peer_transport
     }
 
+    pub(crate) fn peer_tls(&self) -> Option<&Arc<PeerTlsConfig>> {
+        self.peer_tls.as_ref()
+    }
+
     pub(crate) fn node_id(&self) -> NodeId {
         self.node_id
     }
@@ -418,6 +426,7 @@ impl GroupManager {
             }
             network::ensure_data_group(
                 &self.peer_transport,
+                *node_id,
                 address,
                 stream.to_owned(),
                 metadata.stream_id.clone(),
@@ -485,6 +494,7 @@ impl GroupManager {
                 })?;
                 let response = network::forward(
                     &self.peer_transport,
+                    target,
                     address,
                     network::ForwardedOperation::InitializeDataStream {
                         stream: stream.to_owned(),
@@ -560,10 +570,17 @@ impl GroupManager {
         consumer: String,
         ack_timeout_ms: u64,
         max_delivery_attempts: Option<u32>,
+        retry_delay_ms: u64,
     ) -> Result<ConsumerPolicy, BrokerError> {
         self.data_group_for_stream(&stream)
             .await?
-            .configure_consumer(stream, consumer, ack_timeout_ms, max_delivery_attempts)
+            .configure_consumer(
+                stream,
+                consumer,
+                ack_timeout_ms,
+                max_delivery_attempts,
+                retry_delay_ms,
+            )
             .await
     }
 
@@ -1005,15 +1022,17 @@ mod tests {
         assert_eq!(total.build_duration_nanos_max, 2_000_000_000);
     }
 
-    fn empty_raft_log() -> Vec<u8> {
-        serde_json::to_vec(&serde_json::json!({
-            "version": 1,
-            "last_purged_log_id": null,
-            "log": {},
-            "committed": null,
-            "vote": null,
-        }))
-        .unwrap()
+    fn initialize_empty_raft_log(path: &Path) -> Vec<(PathBuf, Vec<u8>)> {
+        let store = log_store::LogStore::<TypeConfig>::open(path).unwrap();
+        drop(store);
+        let family = crate::raft_log_segments::family_directory(path);
+        vec![
+            (path.to_path_buf(), fs::read(path).unwrap()),
+            (
+                family.join("control.json"),
+                fs::read(family.join("control.json")).unwrap(),
+            ),
+        ]
     }
 
     fn write_current_layout_fixture(directory: &Path, stream: &str) -> Vec<(PathBuf, Vec<u8>)> {
@@ -1033,8 +1052,7 @@ mod tests {
         fs::write(&metadata_path, &metadata_bytes).unwrap();
 
         let metadata_log_path = metadata_group.join("raft-log.json");
-        let metadata_log = empty_raft_log();
-        fs::write(&metadata_log_path, &metadata_log).unwrap();
+        let mut log_files = initialize_empty_raft_log(&metadata_log_path);
 
         let manifest_path = data_group.join("group.json");
         let manifest = DataGroupManifest {
@@ -1046,15 +1064,15 @@ mod tests {
         fs::write(&manifest_path, &manifest_bytes).unwrap();
 
         let data_log_path = data_group.join("raft-log.json");
-        let data_log = empty_raft_log();
-        fs::write(&data_log_path, &data_log).unwrap();
+        log_files.extend(initialize_empty_raft_log(&data_log_path));
 
         vec![
             (metadata_path, metadata_bytes),
-            (metadata_log_path, metadata_log),
             (manifest_path, manifest_bytes),
-            (data_log_path, data_log),
         ]
+        .into_iter()
+        .chain(log_files)
+        .collect()
     }
 
     #[test]

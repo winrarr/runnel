@@ -44,10 +44,10 @@ current code demonstrates.
 
 | Artifact | Observed current behavior | What it does not establish |
 | --- | --- | --- |
-| Local stream history | `streams/<stream>.log` can contain legacy `RNL1`, versioned checksummed `RNL2`, and request-aware checksummed `RNL3` frames. The reader dispatches by magic; a partial final frame is discarded on normal open. | No durable root generation marker, offset-continuity proof, cross-release mixed-writer guarantee, or conversion path. |
+| Local stream history | streams/<stream>.log contains only checksummed RNL3 version-2 frames. Startup validates every stream before repairing incomplete suffixes; RNL1, RNL2, and RNL3 version 1 fail explicitly without mutation. | Current-format recovery tests do not establish a release-pair or conversion contract. No local format selector or old-format recovery path exists. |
 | Local consumer state | A JSON checkpoint stores contiguous progress, out-of-order acknowledgements, and persisted delivery attempts. A bounded JSON-lines journal records events; its incomplete final line is recoverable. | In-flight delivery tokens and deadlines are volatile, and checkpoint/journal bytes have no migration manifest or cross-release writer contract. |
 | Cluster root and groups | `storage.json` binds cluster and node identity. `groups/metadata` and per-stream `groups/data/<hex-stream>` groups are validated before groups open. Unsupported versions, identities, legacy paths, and partial layouts fail closed in the tested paths. | The identity marker is not an active-generation selector. Validation is not a migration, backup, or rollback workflow. |
-| Clustered state | Checkpoint and snapshot payloads accept the current version 2 and a narrow version-1 read-forward form. The Raft log and state-machine journal have separate version 1 formats and separate persistence boundaries. | Read-forward parsing does not prove mixed-version command, snapshot, peer, consumer, or producer-deduplication semantics. |
+| Clustered state | Checkpoint and snapshot payloads require version 3; the state-machine journal requires record version 2. The Raft log has its separate version-1 format and persistence boundary. Older state-machine schemas fail closed without mutation. | Current-format recovery does not prove mixed-version command, snapshot, peer, consumer, or producer-deduplication semantics. |
 | Peer and snapshot transfer | Peer frames are length-bounded JSON without a version handshake. OpenRaft snapshot chunks are bounded; the current receiver retries an interrupted transfer from byte zero. | Successful decoding is not a rolling-upgrade contract, and snapshot replacement is not a general format migration. |
 
 For the precise distinction between existing-storage validation and
@@ -75,8 +75,8 @@ The current supported opening behavior is deliberately narrow:
 
 - a current binary can reopen the current local or split clustered layout,
   subject to its existing validation and identity checks;
-- `runnel-core` can read the recognized `RNL1`, `RNL2`, and `RNL3` families and
-  recover its documented incomplete-tail case;
+- runnel-core reads only RNL3 version-2 stream files and repairs an
+  incomplete final frame after every stream passes validation;
 - `runnel-raft` can read the tested version-1 checkpoint and snapshot payloads
   through its version-2 in-memory representation; and
 - no current binary pair has a supported clustered rolling-upgrade contract.
