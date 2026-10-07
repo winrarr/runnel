@@ -35,6 +35,7 @@ mod log_store;
 mod network;
 mod peer_tls;
 mod persistence_write;
+mod raft_log_segments;
 mod state_machine;
 mod state_machine_journal;
 mod state_machine_store;
@@ -2214,7 +2215,7 @@ mod tests {
         fs::write(&manifest_path, &manifest_before).unwrap();
         let log_path = data_group_directory.join("raft-log.json");
         let log_before = serde_json::to_vec(&serde_json::json!({
-            "version": 2,
+            "version": 99,
             "last_purged_log_id": null,
             "log": {},
             "committed": null,
@@ -2236,7 +2237,7 @@ mod tests {
             Ok(_) => panic!("unsupported data-group log must be rejected"),
             Err(error) => error.to_string(),
         };
-        assert!(error.contains("unsupported log format version"));
+        assert!(error.contains("unsupported Raft-log format version"));
         assert!(error.contains(log_path.to_str().unwrap()));
         assert_eq!(fs::read(&manifest_path).unwrap(), manifest_before);
         assert_eq!(fs::read(&log_path).unwrap(), log_before);

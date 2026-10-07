@@ -1022,15 +1022,17 @@ mod tests {
         assert_eq!(total.build_duration_nanos_max, 2_000_000_000);
     }
 
-    fn empty_raft_log() -> Vec<u8> {
-        serde_json::to_vec(&serde_json::json!({
-            "version": 1,
-            "last_purged_log_id": null,
-            "log": {},
-            "committed": null,
-            "vote": null,
-        }))
-        .unwrap()
+    fn initialize_empty_raft_log(path: &Path) -> Vec<(PathBuf, Vec<u8>)> {
+        let store = log_store::LogStore::<TypeConfig>::open(path).unwrap();
+        drop(store);
+        let family = crate::raft_log_segments::family_directory(path);
+        vec![
+            (path.to_path_buf(), fs::read(path).unwrap()),
+            (
+                family.join("control.json"),
+                fs::read(family.join("control.json")).unwrap(),
+            ),
+        ]
     }
 
     fn write_current_layout_fixture(directory: &Path, stream: &str) -> Vec<(PathBuf, Vec<u8>)> {
@@ -1050,8 +1052,7 @@ mod tests {
         fs::write(&metadata_path, &metadata_bytes).unwrap();
 
         let metadata_log_path = metadata_group.join("raft-log.json");
-        let metadata_log = empty_raft_log();
-        fs::write(&metadata_log_path, &metadata_log).unwrap();
+        let mut log_files = initialize_empty_raft_log(&metadata_log_path);
 
         let manifest_path = data_group.join("group.json");
         let manifest = DataGroupManifest {
@@ -1063,15 +1064,15 @@ mod tests {
         fs::write(&manifest_path, &manifest_bytes).unwrap();
 
         let data_log_path = data_group.join("raft-log.json");
-        let data_log = empty_raft_log();
-        fs::write(&data_log_path, &data_log).unwrap();
+        log_files.extend(initialize_empty_raft_log(&data_log_path));
 
         vec![
             (metadata_path, metadata_bytes),
-            (metadata_log_path, metadata_log),
             (manifest_path, manifest_bytes),
-            (data_log_path, data_log),
         ]
+        .into_iter()
+        .chain(log_files)
+        .collect()
     }
 
     #[test]
