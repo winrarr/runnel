@@ -181,7 +181,9 @@ impl<'a> ClientForwarder<'a> {
             )
             .await?
         {
-            ForwardedResponse::Poll(result) => result.map_err(forward_error_to_broker),
+            ForwardedResponse::Poll(result) => {
+                result.map(Into::into).map_err(forward_error_to_broker)
+            }
             _ => Err(BrokerError::Cluster(
                 "leader returned the wrong poll response".to_owned(),
             )),
@@ -206,7 +208,9 @@ impl<'a> ClientForwarder<'a> {
             )
             .await?
         {
-            ForwardedResponse::Poll(result) => result.map_err(forward_error_to_broker),
+            ForwardedResponse::Poll(result) => {
+                result.map(Into::into).map_err(forward_error_to_broker)
+            }
             _ => Err(BrokerError::Cluster(
                 "leader returned the wrong poll response".to_owned(),
             )),
@@ -219,7 +223,9 @@ impl<'a> ClientForwarder<'a> {
         leader_id: Option<NodeId>,
     ) -> Result<ReplayMessage, BrokerError> {
         match self.operation(operation, leader_id).await? {
-            ForwardedResponse::Replay(result) => result.map_err(forward_error_to_broker),
+            ForwardedResponse::Replay(result) => {
+                result.map(Into::into).map_err(forward_error_to_broker)
+            }
             _ => Err(BrokerError::Cluster(
                 "leader returned the wrong replay response".to_owned(),
             )),
@@ -279,7 +285,9 @@ impl<'a> ClientForwarder<'a> {
             )
             .await?
         {
-            ForwardedResponse::PollGroup(result) => result.map_err(forward_error_to_broker),
+            ForwardedResponse::PollGroup(result) => {
+                result.map(Into::into).map_err(forward_error_to_broker)
+            }
             _ => Err(BrokerError::Cluster(
                 "leader returned the wrong grouped poll response".to_owned(),
             )),
@@ -306,7 +314,9 @@ impl<'a> ClientForwarder<'a> {
             )
             .await?
         {
-            ForwardedResponse::PollGroup(result) => result.map_err(forward_error_to_broker),
+            ForwardedResponse::PollGroup(result) => {
+                result.map(Into::into).map_err(forward_error_to_broker)
+            }
             _ => Err(BrokerError::Cluster(
                 "leader returned the wrong grouped poll response".to_owned(),
             )),

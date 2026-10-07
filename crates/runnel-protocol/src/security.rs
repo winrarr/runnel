@@ -197,9 +197,11 @@ mod tests {
                 }],
             },
         ];
-        assert!(application_requests
-            .iter()
-            .all(|request| request.required_role() == SecurityRole::Application));
+        assert!(
+            application_requests
+                .iter()
+                .all(|request| request.required_role() == SecurityRole::Application)
+        );
 
         let operator_requests = [
             Request::CreateStream {
@@ -210,12 +212,15 @@ mod tests {
                 consumer: "c".to_owned(),
                 ack_timeout_ms: 100,
                 max_delivery_attempts: None,
+                retry_delay_ms: 0,
             },
             Request::Health,
         ];
-        assert!(operator_requests
-            .iter()
-            .all(|request| request.required_role() == SecurityRole::Operator));
+        assert!(
+            operator_requests
+                .iter()
+                .all(|request| request.required_role() == SecurityRole::Operator)
+        );
     }
 
     #[test]

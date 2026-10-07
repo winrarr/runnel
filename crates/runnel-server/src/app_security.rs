@@ -101,9 +101,7 @@ fn read_certificates(path: &Path) -> Result<Vec<CertificateDer<'static>>, Securi
 
 fn read_private_key(path: &Path) -> Result<PrivateKeyDer<'static>, SecurityConfigError> {
     let file = File::open(path).map_err(|_| SecurityConfigError::TlsFiles)?;
-    let metadata = file
-        .metadata()
-        .map_err(|_| SecurityConfigError::TlsFiles)?;
+    let metadata = file.metadata().map_err(|_| SecurityConfigError::TlsFiles)?;
     validate_private_file(&metadata).map_err(|_| SecurityConfigError::InvalidTlsIdentity)?;
     let mut reader = BufReader::new(file);
     rustls_pemfile::private_key(&mut reader)
@@ -191,8 +189,8 @@ impl CredentialPolicy {
             if !valid_credential_id(&credential.id) || !ids.insert(credential.id.clone()) {
                 return Err(SecurityConfigError::InvalidPolicy);
             }
-            let digest = decode_digest(&credential.sha256)
-                .ok_or(SecurityConfigError::InvalidPolicy)?;
+            let digest =
+                decode_digest(&credential.sha256).ok_or(SecurityConfigError::InvalidPolicy)?;
             if verifiers
                 .iter()
                 .any(|entry: &CredentialVerifier| bool::from(entry.digest.ct_eq(&digest)))
@@ -265,7 +263,11 @@ pub(crate) fn request_is_authorized(role: SecurityRole, request: &Request) -> bo
 }
 
 fn decode_digest(value: &str) -> Option<[u8; 32]> {
-    if value.len() != 64 || !value.bytes().all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase()) {
+    if value.len() != 64
+        || !value
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+    {
         return None;
     }
     let mut digest = [0; 32];
@@ -288,9 +290,9 @@ fn hex_nibble(value: u8) -> Option<u8> {
 fn valid_credential_id(value: &str) -> bool {
     !value.is_empty()
         && value.len() <= 128
-        && value.bytes().all(|byte| {
-            byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-')
-        })
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
 }
 
 #[cfg(unix)]

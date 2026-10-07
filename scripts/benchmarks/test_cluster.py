@@ -179,6 +179,7 @@ class ClusterBenchmarkTests(unittest.TestCase):
     def test_development_plaintext_override_is_container_only(self) -> None:
         node = SimpleNamespace(
             node_id=1,
+            data_dir=Path("node-1"),
             broker_port=0,
             http_port=0,
             peer_port=7000,
@@ -186,8 +187,16 @@ class ClusterBenchmarkTests(unittest.TestCase):
         )
         cluster = Cluster.__new__(Cluster)
         cluster.nodes = [node]
+        cluster.cluster_name = "test-cluster"
         cluster.ack_timeout_ms = 1_000
         cluster._container_name = lambda selected: f"node-{selected.node_id}"
+        cluster.peer_credentials = SimpleNamespace(
+            node=lambda _node_id: SimpleNamespace(
+                trust_bundle=Path("ca.pem"),
+                certificate_chain=Path("tls.crt"),
+                private_key=Path("tls.key"),
+            )
+        )
 
         cluster.runtime = "container"
         container_command = cluster._node_command(node, bootstrap=False)

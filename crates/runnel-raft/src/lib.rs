@@ -1064,6 +1064,43 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn single_node_raft_rejects_over_cap_poll_before_committing_a_lease() {
+        let engine = SingleNodeEngine::new(1).await.unwrap();
+        engine.create_stream("events").await.unwrap();
+        engine
+            .publish("events", None, b"bounded".to_vec(), None)
+            .await
+            .unwrap();
+
+        assert!(matches!(
+            engine
+                .poll_group_with_response_limit(
+                    "events",
+                    "workers",
+                    "member-a",
+                    runnel_engine::MAX_CONSUME_BATCH_RESPONSE_BYTES + 1,
+                )
+                .await,
+            Err(BrokerError::InvalidBatchRequest(_))
+        ));
+
+        let PollResult::Message(message) = engine
+            .poll_group_with_response_limit(
+                "events",
+                "workers",
+                "member-a",
+                runnel_engine::MAX_CONSUME_BATCH_RESPONSE_BYTES,
+            )
+            .await
+            .unwrap()
+        else {
+            panic!("expected first delivery after rejected over-cap poll");
+        };
+        assert_eq!(message.offset, 0);
+        assert_eq!(message.delivery_attempt, Some(1));
+    }
+
+    #[tokio::test]
     async fn persistent_raft_implements_shared_delivery_contract() {
         let directory = tempfile::tempdir().unwrap();
         let peers = BTreeMap::from([(1, "127.0.0.1:0".to_owned())]);
@@ -2342,12 +2379,12 @@ mod tests {
 
     #[test]
     fn unsupported_state_machine_journals_are_rejected_without_mutation() {
-        for version in [1, STATE_MACHINE_JOURNAL_FORMAT_VERSION + 1] {
+        for version in [1, 2, STATE_MACHINE_JOURNAL_FORMAT_VERSION + 1] {
             let directory = tempfile::tempdir().unwrap();
             let state_directory = directory.path().join("state-machine");
             fs::create_dir_all(&state_directory).unwrap();
             let journal_path = state_directory.join(STATE_MACHINE_JOURNAL_FILE);
-            let record = serde_json::to_vec(&StateMachineJournalEntry {
+            let mut record_value = serde_json::to_value(StateMachineJournalEntry {
                 version,
                 log_id: LogId {
                     leader_id: openraft::CommittedLeaderId::new(1, 1),
@@ -2356,6 +2393,19 @@ mod tests {
                 payload: EntryPayload::Blank,
             })
             .unwrap();
+            record_value["payload"] = serde_json::json!({
+                "Normal": {
+                    "Publish": {
+                        "stream": "events",
+                        "key": null,
+                        // Old command encoding stored Vec<u8> as JSON integer arrays.
+                        "payload": [0, 255],
+                        "published_at_ms": 1,
+                        "request_id": null,
+                    }
+                }
+            });
+            let record = serde_json::to_vec(&record_value).unwrap();
             let mut journal_before = (record.len() as u32).to_le_bytes().to_vec();
             journal_before.extend_from_slice(&record);
             fs::write(&journal_path, &journal_before).unwrap();

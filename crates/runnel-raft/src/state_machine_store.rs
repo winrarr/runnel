@@ -1335,6 +1335,8 @@ mod tests {
                     stream: "events".to_owned(),
                     consumer: "workers".to_owned(),
                     member: "member-a".to_owned(),
+                    response_member: None,
+                    max_response_bytes: runnel_engine::MAX_CONSUME_BATCH_RESPONSE_BYTES,
                     now_ms: 100,
                     lease_deadline_ms: 100,
                     max_delivery_attempts: None,
@@ -1404,6 +1406,8 @@ mod tests {
                         stream: "events".to_owned(),
                         consumer: "workers".to_owned(),
                         member: format!("member-{index}"),
+                        response_member: None,
+                        max_response_bytes: runnel_engine::MAX_CONSUME_BATCH_RESPONSE_BYTES,
                         now_ms,
                         lease_deadline_ms: now_ms,
                         max_delivery_attempts: None,
@@ -1500,7 +1504,7 @@ mod tests {
         assert_eq!(recovered_snapshot.snapshot.into_inner(), second_data);
     }
     #[tokio::test]
-    async fn legacy_snapshot_defaults_lease_floor_and_applied_commands_advance_it() {
+    async fn current_snapshot_preserves_lease_floor_and_applied_commands_advance_it() {
         let directory = tempfile::tempdir().unwrap();
         let state_directory = directory.path().join("state-machine");
         let kind = GroupKind::Data {
@@ -1509,28 +1513,35 @@ mod tests {
             group_id: "group/events/data".to_owned(),
         };
         let store = Arc::new(StateMachineStore::open(&state_directory, kind.clone()).unwrap());
-        let legacy_snapshot_value = serde_json::json!({
-            "version": 1,
+        let snapshot_value = serde_json::json!({
+            "version": FORMAT_VERSION,
             "streams": {
-                "events": [{
-                    "key": null,
-                    "payload": [108, 101, 103, 97, 99, 121],
-                    "published_at_ms": 1
-                }]
+                "events": {
+                    "stream_id": "stream/events",
+                    "group_id": "group/events/data",
+                    "lifecycle": "Active",
+                    "messages": [{
+                        "key": null,
+                        "payload": [108, 101, 103, 97, 99, 121],
+                        "published_at_ms": 1
+                    }]
+                }
             },
-            "consumers": []
+            "consumers": [],
+            "group_consumers": [],
+            "lease_clock_ms": 0,
+            "dedup": {},
+            "redeliveries": 0,
+            "dead_letters": 0
         });
-        assert_eq!(legacy_snapshot_value["version"], 1);
-        assert!(legacy_snapshot_value.get("lease_clock_ms").is_none());
-        let legacy_snapshot = serde_json::to_vec(&legacy_snapshot_value).unwrap();
-        let snapshot_meta = snapshot_meta(1, "legacy-lease-floor");
+        assert_eq!(snapshot_value["version"], FORMAT_VERSION);
+        assert_eq!(snapshot_value["lease_clock_ms"], 0);
+        let snapshot_data = serde_json::to_vec(&snapshot_value).unwrap();
+        let snapshot_meta = snapshot_meta(1, "current-lease-floor");
 
         let mut state_machine = store.clone();
         state_machine
-            .install_snapshot(
-                &snapshot_meta,
-                Box::new(Cursor::new(legacy_snapshot.clone())),
-            )
+            .install_snapshot(&snapshot_meta, Box::new(Cursor::new(snapshot_data.clone())))
             .await
             .unwrap();
 
@@ -1608,7 +1619,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn legacy_checkpoint_defaults_lease_floor_and_group_poll_survives_replay() {
+    async fn current_checkpoint_preserves_lease_floor_and_group_poll_survives_replay() {
         let directory = tempfile::tempdir().unwrap();
         let state_directory = directory.path().join("state-machine");
         fs::create_dir_all(&state_directory).unwrap();
@@ -1621,27 +1632,37 @@ mod tests {
             leader_id: openraft::CommittedLeaderId::new(1, 1),
             index: 1,
         };
-        let legacy_checkpoint = serde_json::json!({
-            "version": 1,
+        let checkpoint = serde_json::json!({
+            "version": FORMAT_VERSION,
             "last_applied_log": serde_json::to_value(checkpoint_log_id).unwrap(),
             "last_membership": serde_json::to_value(
                 StoredMembership::<NodeId, BasicNode>::default()
             )
             .unwrap(),
             "streams": {
-                "events": [{
-                    "key": null,
-                    "payload": [108, 101, 103, 97, 99, 121],
-                    "published_at_ms": 1
-                }]
+                "events": {
+                    "stream_id": "stream/events",
+                    "group_id": "group/events/data",
+                    "lifecycle": "Active",
+                    "messages": [{
+                        "key": null,
+                        "payload": [108, 101, 103, 97, 99, 121],
+                        "published_at_ms": 1
+                    }]
+                }
             },
-            "consumers": []
+            "consumers": [],
+            "group_consumers": [],
+            "lease_clock_ms": 0,
+            "dedup": {},
+            "redeliveries": 0,
+            "dead_letters": 0
         });
-        assert_eq!(legacy_checkpoint["version"], 1);
-        assert!(legacy_checkpoint.get("lease_clock_ms").is_none());
+        assert_eq!(checkpoint["version"], FORMAT_VERSION);
+        assert_eq!(checkpoint["lease_clock_ms"], 0);
         fs::write(
             state_directory.join("state-machine.json"),
-            serde_json::to_vec(&legacy_checkpoint).unwrap(),
+            serde_json::to_vec(&checkpoint).unwrap(),
         )
         .unwrap();
 

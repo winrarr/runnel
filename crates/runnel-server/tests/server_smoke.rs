@@ -10,8 +10,8 @@ use std::time::{Duration, Instant};
 use base64::Engine as _;
 use runnel_client::{Client, ClientConfig, ClientSecurityConfig, ClientTlsConfig};
 use runnel_protocol::{
-    BinaryPayload, MAX_PUBLISH_BATCH_RECORDS, PublishBatchRecord, PublishBatchRecordResponse,
-    Request, Response,
+    BatchDeliveryReceipt, BinaryPayload, MAX_PUBLISH_BATCH_RECORDS, PublishBatchRecord,
+    PublishBatchRecordResponse, Request, Response,
 };
 use sha2::Digest as _;
 use tempfile::TempDir;
@@ -595,14 +595,19 @@ fn real_server_tls_authenticates_before_dispatch_and_enforces_roles() {
         .unwrap();
     let tls = ClientTlsConfig::new("localhost").with_ca_file(&certificate);
     let missing_credentials = ClientSecurityConfig::plaintext_development().with_tls(tls.clone());
-    assert!(matches!(
-        runtime.block_on(Client::connect_with_security(
-            server.broker_addr,
-            ClientConfig::default(),
-            missing_credentials,
-        )),
-        Err(runnel_client::ClientError::AuthenticationRequired)
+    let missing_auth_result = runtime.block_on(Client::connect_with_security(
+        server.broker_addr,
+        ClientConfig::default(),
+        missing_credentials,
     ));
+    assert!(
+        matches!(
+            &missing_auth_result,
+            Err(runnel_client::ClientError::AuthenticationRequired)
+        ),
+        "missing-credential connection returned {:?}",
+        missing_auth_result.as_ref().err()
+    );
 
     let (unknown_token, _) = generate_test_credential();
     let unknown_token_path = directory.path().join("unknown.token");
@@ -1830,6 +1835,110 @@ fn network_protocol_rejects_publish_batches_over_record_bound() {
 }
 
 #[test]
+fn real_server_rejects_batches_that_could_exceed_the_negotiated_reply_limit_before_effects() {
+    let directory = TempDir::new().unwrap();
+    let server = RunningServer::start(directory.path());
+    assert!(matches!(
+        request(
+            server.broker_addr,
+            Request::CreateStream {
+                stream: "events".to_owned(),
+            },
+        ),
+        Response::StreamCreated { created: true, .. }
+    ));
+
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let config = ClientConfig {
+        max_response_bytes: 1_024,
+        ..ClientConfig::default()
+    };
+    let mut bounded_client = runtime
+        .block_on(Client::connect_with_config(server.broker_addr, config))
+        .unwrap();
+
+    assert!(matches!(
+        runtime.block_on(bounded_client.request(&Request::PublishBatch {
+            stream: "events".to_owned(),
+            records: (0..8)
+                .map(|index| PublishBatchRecord {
+                    key: None,
+                    payload: BinaryPayload::new(format!("record-{index}").into_bytes()),
+                    request_id: None,
+                })
+                .collect(),
+        })),
+        Ok(Response::Error { code, .. }) if code == "response_too_large"
+    ));
+    assert!(matches!(
+        request(
+            server.broker_addr,
+            Request::Publish {
+                stream: "events".to_owned(),
+                key: None,
+                payload: "after-rejected-batch".to_owned(),
+                request_id: None,
+            },
+        ),
+        Response::Published { offset: 0, .. }
+    ));
+
+    let delivered = request(
+        server.broker_addr,
+        Request::PollGroup {
+            stream: "events".to_owned(),
+            consumer: "workers".to_owned(),
+            member: "member-a".to_owned(),
+        },
+    );
+    let (offset, delivery_token) = match delivered {
+        Response::Message {
+            offset,
+            delivery_token: Some(token),
+            ..
+        } => (offset, token),
+        response => panic!("expected a group delivery receipt, got {response:?}"),
+    };
+    let receipts = std::iter::once(BatchDeliveryReceipt {
+        offset,
+        delivery_token: delivery_token.clone(),
+    })
+    .chain((100..107).map(|fake_offset| BatchDeliveryReceipt {
+        offset: fake_offset,
+        delivery_token: "unknown-token".to_owned(),
+    }))
+    .collect();
+    assert!(matches!(
+        runtime.block_on(bounded_client.request(&Request::AckGroupBatch {
+            stream: "events".to_owned(),
+            consumer: "workers".to_owned(),
+            member: "member-a".to_owned(),
+            receipts,
+        })),
+        Ok(Response::Error { code, .. }) if code == "response_too_large"
+    ));
+    assert!(matches!(
+        request(
+            server.broker_addr,
+            Request::AckGroup {
+                stream: "events".to_owned(),
+                consumer: "workers".to_owned(),
+                member: "member-a".to_owned(),
+                offset,
+                delivery_token,
+            },
+        ),
+        Response::Acknowledged {
+            already_acknowledged: false,
+            ..
+        }
+    ));
+}
+
+#[test]
 fn network_protocol_returns_partial_publish_batch_outcomes() {
     let directory = TempDir::new().unwrap();
     let server = RunningServer::start(directory.path());
@@ -1908,12 +2017,12 @@ fn network_protocol_rejects_oversized_rnl1_records_without_consuming_offsets() {
                 records: vec![
                     PublishBatchRecord {
                         key: Some("k".repeat(129)),
-                        payload_base64: BinaryPayload::new(b"rejected".to_vec()),
+                        payload: BinaryPayload::new(b"rejected".to_vec()),
                         request_id: None,
                     },
                     PublishBatchRecord {
                         key: None,
-                        payload_base64: BinaryPayload::new(b"accepted".to_vec()),
+                        payload: BinaryPayload::new(b"accepted".to_vec()),
                         request_id: None,
                     },
                 ],
@@ -2028,14 +2137,12 @@ fn write_application_security_files(
     let certificate_path = directory.join("application-cert.pem");
     let key_path = directory.join("application-key.pem");
     let policy_path = directory.join("credentials.json");
-    fs::write(
-        &certificate_path,
-        include_str!("fixtures/application-security-cert.pem"),
-    )
-    .unwrap();
+    let certificate = rcgen::generate_simple_self_signed(vec!["localhost".to_owned()])
+        .expect("localhost test certificate should generate");
+    fs::write(&certificate_path, certificate.cert.pem()).unwrap();
     write_private_file(
         &key_path,
-        include_str!("fixtures/application-security-key.pem").as_bytes(),
+        certificate.signing_key.serialize_pem().as_bytes(),
     );
 
     let mut policy_credentials = Vec::with_capacity(roles.len());

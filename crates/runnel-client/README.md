@@ -58,6 +58,10 @@ negotiate the exact v2 contract after the `RNLN` preface, and message payloads
 are opaque bytes on the wire. The client supports TLS 1.3 and bearer
 credentials when configured; no prior protocol version is supported.
 
+For TLS, configure the DNS name present in the broker certificate. A supplied
+CA bundle is exclusive: the client trusts only those roots. When no CA bundle
+is supplied, it uses platform trust roots.
+
 ## End-to-end coverage
 
 The example demonstrates API composition; its normal local run does not inject

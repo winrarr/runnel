@@ -5,10 +5,10 @@ use std::time::Instant;
 use runnel_engine::Engine;
 #[cfg(feature = "instrumentation")]
 use runnel_engine::StageTimer;
+use runnel_protocol::Response;
 use runnel_protocol::v2::{
     self as v2, ApplicationReply, ClientFrame, Outcome, RefusalCode, ServerFrame, Stage,
 };
-use runnel_protocol::Response;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, watch};
@@ -34,28 +34,30 @@ pub(crate) fn spawn_with_security(
     security: app_security::ApplicationSecurity,
     shutdown: watch::Receiver<bool>,
 ) -> JoinHandle<Result<(), std::io::Error>> {
-    let connection_slots = Arc::new(Semaphore::new(protocol_admission.max_connections));
-    let request_slots = Arc::new(Semaphore::new(protocol_admission.max_in_flight_requests));
-    tokio::spawn(run_tcp(
-        listener,
+    let context = ConnectionContext {
         engine,
         metrics,
-        connection_slots,
-        request_slots,
+        connection_slots: Arc::new(Semaphore::new(protocol_admission.max_connections)),
+        request_slots: Arc::new(Semaphore::new(protocol_admission.max_in_flight_requests)),
         protocol_admission,
         security,
-        shutdown,
-    ))
+    };
+    tokio::spawn(run_tcp(listener, context, shutdown))
 }
 
-async fn run_tcp(
-    listener: TcpListener,
+#[derive(Clone)]
+struct ConnectionContext {
     engine: Arc<dyn Engine>,
     metrics: Arc<ServerMetrics>,
     connection_slots: Arc<Semaphore>,
     request_slots: Arc<Semaphore>,
     protocol_admission: ProtocolAdmission,
     security: app_security::ApplicationSecurity,
+}
+
+async fn run_tcp(
+    listener: TcpListener,
+    context: ConnectionContext,
     mut shutdown: watch::Receiver<bool>,
 ) -> Result<(), std::io::Error> {
     let mut connections = JoinSet::new();
@@ -81,16 +83,16 @@ async fn run_tcp(
                 if *shutdown.borrow() {
                     continue;
                 }
-                metrics
+                context.metrics
                     .connections_accepted
                     .fetch_add(1, Ordering::Relaxed);
-                let connection_permit = match Arc::clone(&connection_slots).try_acquire_owned() {
+                let connection_permit = match Arc::clone(&context.connection_slots).try_acquire_owned() {
                     Ok(permit) => permit,
                     Err(_) => {
-                        metrics
+                        context.metrics
                             .connections_rejected
                             .fetch_add(1, Ordering::Relaxed);
-                        metrics
+                        context.metrics
                             .connections_closed
                             .fetch_add(1, Ordering::Relaxed);
                         drop(stream);
@@ -98,25 +100,18 @@ async fn run_tcp(
                         continue;
                     }
                 };
-                let engine = Arc::clone(&engine);
-                let connection_metrics = Arc::clone(&metrics);
-                let connection_request_slots = Arc::clone(&request_slots);
+                let connection_context = context.clone();
                 let connection_shutdown = shutdown.clone();
-                let connection_security = security.clone();
                 connections.spawn(async move {
                     if let Err(error) = handle_connection(
                         stream,
-                        engine,
-                        Arc::clone(&connection_metrics),
+                        connection_context.clone(),
                         connection_permit,
-                        connection_request_slots,
-                        protocol_admission,
-                        connection_security,
                         connection_shutdown,
                     )
                     .await
                     {
-                        connection_metrics
+                        connection_context.metrics
                             .connection_errors
                             .fetch_add(1, Ordering::Relaxed);
                         warn!(%peer, %error, "connection closed with error");
@@ -129,23 +124,24 @@ async fn run_tcp(
 
 async fn handle_connection(
     stream: TcpStream,
-    engine: Arc<dyn Engine>,
-    metrics: Arc<ServerMetrics>,
+    context: ConnectionContext,
     _connection_permit: OwnedSemaphorePermit,
-    request_slots: Arc<Semaphore>,
-    protocol_admission: ProtocolAdmission,
-    security: app_security::ApplicationSecurity,
     mut shutdown: watch::Receiver<bool>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let ConnectionContext {
+        engine,
+        metrics,
+        request_slots,
+        protocol_admission,
+        security,
+        ..
+    } = context;
     metrics.active_connections.fetch_add(1, Ordering::Relaxed);
     let _active_connection = ActiveConnection::new(Arc::clone(&metrics));
 
     let stream: Box<dyn ApplicationIo> = if let Some(acceptor) = security.tls_acceptor.clone() {
-        match tokio::time::timeout(
-            protocol_admission.request_timeout,
-            acceptor.accept(stream),
-        )
-        .await
+        match tokio::time::timeout(protocol_admission.request_timeout, acceptor.accept(stream))
+            .await
         {
             Ok(Ok(stream)) => Box::new(stream),
             Ok(Err(_)) => return Err("TLS handshake failed".into()),
@@ -167,7 +163,8 @@ async fn handle_connection(
         }
         let body = read_bounded_frame(&mut reader, v2::HELLO_MAX_BODY_BYTES).await?;
         let hello = v2::decode_client_hello(&body)?;
-        let server_hello = select_server_hello(&hello, protocol_admission, security.auth_required());
+        let server_hello =
+            select_server_hello(&hello, protocol_admission, security.auth_required());
         let accepted = match &server_hello {
             v2::ServerHello::Accepted(accepted) => Some((
                 accepted.client_to_server_frame_bytes,
@@ -269,7 +266,8 @@ async fn handle_connection(
         let mut body = match frame_result {
             Ok(Ok(body)) => body,
             Ok(Err(_)) => {
-                metrics.record_rejected_request(RequestOperation::InvalidRequest, started.elapsed());
+                metrics
+                    .record_rejected_request(RequestOperation::InvalidRequest, started.elapsed());
                 return Ok(());
             }
             Err(_) => {
@@ -278,12 +276,15 @@ async fn handle_connection(
             }
         };
 
-        metrics.request_bytes.fetch_add(body.len() as u64 + 4, Ordering::Relaxed);
+        metrics
+            .request_bytes
+            .fetch_add(body.len() as u64 + 4, Ordering::Relaxed);
         let client_frame = match v2::decode_client_frame(&body, max_request_bytes) {
             Ok(frame) => frame,
             Err(_) => {
                 body.zeroize();
-                metrics.record_rejected_request(RequestOperation::InvalidRequest, started.elapsed());
+                metrics
+                    .record_rejected_request(RequestOperation::InvalidRequest, started.elapsed());
                 return Ok(());
             }
         };
@@ -316,7 +317,9 @@ async fn handle_connection(
             let request_permit = match Arc::clone(&request_slots).try_acquire_owned() {
                 Ok(permit) => permit,
                 Err(_) => {
-                    metrics.request_saturation_rejections.fetch_add(1, Ordering::Relaxed);
+                    metrics
+                        .request_saturation_rejections
+                        .fetch_add(1, Ordering::Relaxed);
                     let reply = ApplicationReply::failed(
                         saturated_response(),
                         Outcome::Retryable,
@@ -362,7 +365,9 @@ async fn handle_connection(
                 }
             }
         };
-        let failed = reply.outcome.is_some_and(|outcome| outcome != Outcome::Confirmed)
+        let failed = reply
+            .outcome
+            .is_some_and(|outcome| outcome != Outcome::Confirmed)
             || matches!(&reply.response, Response::Error { .. });
         metrics.record_request(operation, started.elapsed(), failed);
         write_application_reply(
@@ -374,14 +379,11 @@ async fn handle_connection(
             &metrics,
         )
         .await?;
-        }
+    }
 }
 
 trait ApplicationIo: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send {}
-impl<T> ApplicationIo for T where
-    T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send
-{
-}
+impl<T> ApplicationIo for T where T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send {}
 
 #[derive(Debug)]
 enum ConnectionProtocolError {
@@ -403,7 +405,10 @@ impl From<v2::V2ProtocolError> for ConnectionProtocolError {
     }
 }
 
-async fn read_bounded_frame<R>(reader: &mut R, max_bytes: usize) -> Result<Vec<u8>, ConnectionProtocolError>
+async fn read_bounded_frame<R>(
+    reader: &mut R,
+    max_bytes: usize,
+) -> Result<Vec<u8>, ConnectionProtocolError>
 where
     R: AsyncRead + Unpin,
 {
@@ -441,8 +446,7 @@ fn select_server_hello(
     }
     if !client.versions.iter().any(|range| {
         range.major == v2::CURRENT_MAJOR
-            && range.min_minor <= v2::CURRENT_MINOR
-            && range.max_minor >= v2::CURRENT_MINOR
+            && (range.min_minor..=range.max_minor).contains(&v2::CURRENT_MINOR)
     }) {
         return refusal(RefusalCode::UnsupportedVersion);
     }
@@ -460,12 +464,8 @@ fn select_server_hello(
         capabilities: Vec::new(),
         max_inbound_frame_bytes: server_inbound,
         max_outbound_frame_bytes: server_outbound,
-        client_to_server_frame_bytes: client
-            .max_outbound_frame_bytes
-            .min(server_inbound),
-        server_to_client_frame_bytes: client
-            .max_inbound_frame_bytes
-            .min(server_outbound),
+        client_to_server_frame_bytes: client.max_outbound_frame_bytes.min(server_inbound),
+        server_to_client_frame_bytes: client.max_inbound_frame_bytes.min(server_outbound),
         auth_required: Some(auth_required),
     })
 }
@@ -482,11 +482,18 @@ where
     match tokio::time::timeout(timeout, writer.write_all(frame.as_bytes())).await {
         Ok(result) => result?,
         Err(_) => {
-            metrics.response_write_timeouts.fetch_add(1, Ordering::Relaxed);
-            return Err(std::io::Error::new(std::io::ErrorKind::TimedOut, "protocol response write timed out"));
+            metrics
+                .response_write_timeouts
+                .fetch_add(1, Ordering::Relaxed);
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "protocol response write timed out",
+            ));
         }
     }
-    metrics.response_bytes.fetch_add(frame.len() as u64, Ordering::Relaxed);
+    metrics
+        .response_bytes
+        .fetch_add(frame.len() as u64, Ordering::Relaxed);
     Ok(())
 }
 
@@ -510,8 +517,8 @@ where
                 code: "response_too_large".to_owned(),
                 message: "response exceeds the negotiated maximum".to_owned(),
             },
-            Outcome::Rejected,
-            Stage::Validated,
+            Outcome::Unknown,
+            Stage::ExecutionStarted,
         );
         let bounded = v2::encode_server_frame(&ServerFrame::Application(too_large))
             .map_err(|_| std::io::Error::other("bounded error response encoding failed"))?;

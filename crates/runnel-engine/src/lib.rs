@@ -132,6 +132,18 @@ pub fn validate_consume_batch_limits(limits: ConsumeBatchLimits) -> Result<(), B
     Ok(())
 }
 
+/// Validate the encoded-response ceiling accepted by scalar poll operations.
+/// This keeps the clustered peer representation bounded before a delivery
+/// lease is committed.
+pub fn validate_poll_response_limit(max_response_bytes: usize) -> Result<(), BrokerError> {
+    if !(1..=MAX_CONSUME_BATCH_RESPONSE_BYTES).contains(&max_response_bytes) {
+        return Err(BrokerError::InvalidBatchRequest(format!(
+            "max_response_bytes must be between 1 and {MAX_CONSUME_BATCH_RESPONSE_BYTES}"
+        )));
+    }
+    Ok(())
+}
+
 /// Validate a receipt vector before the engine reads or mutates consumer state.
 pub fn validate_ack_batch_receipts(receipts: &[DeliveryReceipt]) -> Result<(), BrokerError> {
     if receipts.is_empty() || receipts.len() > MAX_CONSUME_BATCH_RECORDS {
@@ -193,7 +205,7 @@ pub fn poll_message_response_upper_bound_parts(
     delivery_attempt: Option<u32>,
     include_delivery_token: bool,
 ) -> usize {
-    let message_len = message_result_upper_bound(
+    let message_len = message_result_upper_bound(&MessageResultMetadata {
         stream,
         consumer,
         member,
@@ -204,9 +216,9 @@ pub fn poll_message_response_upper_bound_parts(
         delivery_token,
         delivery_attempt,
         include_delivery_token,
-    );
-    let application_response_len = 4usize
-        .saturating_add(length_delimited_field_upper_bound(message_len));
+    });
+    let application_response_len =
+        4usize.saturating_add(length_delimited_field_upper_bound(message_len));
     length_delimited_field_upper_bound(application_response_len)
 }
 
@@ -272,53 +284,55 @@ fn batch_message_item_upper_bound(
     consumer: &str,
     member: Option<&str>,
 ) -> usize {
-    let message_len = message_result_upper_bound(
-        &message.stream,
+    let message_len = message_result_upper_bound(&MessageResultMetadata {
+        stream: &message.stream,
         consumer,
         member,
-        message.offset,
-        message.key.as_deref(),
-        message.payload.len(),
-        message.published_at_ms,
-        message.delivery_token.as_deref(),
-        message.delivery_attempt,
-        message.delivery_token.is_some(),
-    );
+        offset: message.offset,
+        key: message.key.as_deref(),
+        payload_len: message.payload.len(),
+        published_at_ms: message.published_at_ms,
+        delivery_token: message.delivery_token.as_deref(),
+        delivery_attempt: message.delivery_attempt,
+        include_delivery_token: message.delivery_token.is_some(),
+    });
     // Each item carries confirmed outcome and stage fields, then embeds the
     // message. The item itself is repeated as field 3 of PollBatchResult.
     let item_len = 4usize.saturating_add(length_delimited_field_upper_bound(message_len));
     length_delimited_field_upper_bound(item_len)
 }
 
-fn message_result_upper_bound(
-    stream: &str,
-    consumer: &str,
-    member: Option<&str>,
+struct MessageResultMetadata<'a> {
+    stream: &'a str,
+    consumer: &'a str,
+    member: Option<&'a str>,
     offset: Offset,
-    key: Option<&str>,
+    key: Option<&'a str>,
     payload_len: usize,
     published_at_ms: u64,
-    delivery_token: Option<&str>,
+    delivery_token: Option<&'a str>,
     delivery_attempt: Option<u32>,
     include_delivery_token: bool,
-) -> usize {
-    let mut length = protobuf_string_field_upper_bound(stream)
-        .saturating_add(protobuf_string_field_upper_bound(consumer))
-        .saturating_add(protobuf_varint_field_upper_bound(offset))
-        .saturating_add(protobuf_bytes_field_upper_bound(payload_len))
-        .saturating_add(protobuf_varint_field_upper_bound(published_at_ms));
-    if let Some(member) = member {
+}
+
+fn message_result_upper_bound(message: &MessageResultMetadata<'_>) -> usize {
+    let mut length = protobuf_string_field_upper_bound(message.stream)
+        .saturating_add(protobuf_string_field_upper_bound(message.consumer))
+        .saturating_add(protobuf_varint_field_upper_bound(message.offset))
+        .saturating_add(protobuf_bytes_field_upper_bound(message.payload_len))
+        .saturating_add(protobuf_varint_field_upper_bound(message.published_at_ms));
+    if let Some(member) = message.member {
         length = length.saturating_add(protobuf_string_field_upper_bound(member));
     }
-    if let Some(key) = key {
+    if let Some(key) = message.key {
         length = length.saturating_add(protobuf_string_field_upper_bound(key));
     }
-    if include_delivery_token
-        && let Some(token) = delivery_token
+    if message.include_delivery_token
+        && let Some(token) = message.delivery_token
     {
         length = length.saturating_add(protobuf_string_field_upper_bound(token));
     }
-    if let Some(attempt) = delivery_attempt {
+    if let Some(attempt) = message.delivery_attempt {
         length = length.saturating_add(protobuf_varint_field_upper_bound(u64::from(attempt)));
     }
     length
@@ -634,9 +648,7 @@ impl BrokerError {
             Self::Configuration(_) => BrokerErrorKind::Configuration,
             Self::InvalidBatchRequest(_)
             | Self::ConsumeBatchRecordTooLarge { .. }
-            | Self::ResponseTooLarge { .. } => {
-                BrokerErrorKind::InvalidRequest
-            }
+            | Self::ResponseTooLarge { .. } => BrokerErrorKind::InvalidRequest,
             Self::NotLeader { .. } => BrokerErrorKind::Routing,
             Self::Cluster(_) => BrokerErrorKind::Cluster,
         }
@@ -894,8 +906,9 @@ pub trait Engine: Send + Sync {
 #[cfg(test)]
 mod tests {
     use super::{
-        BrokerError, BrokerErrorKind, BrokerErrorOutcome, MAX_CONSUMER_POLICY_ACK_TIMEOUT_MS,
-        MAX_CONSUMER_POLICY_RETRY_DELAY_MS, validate_consumer_policy,
+        BrokerError, BrokerErrorKind, BrokerErrorOutcome, MAX_CONSUME_BATCH_RESPONSE_BYTES,
+        MAX_CONSUMER_POLICY_ACK_TIMEOUT_MS, MAX_CONSUMER_POLICY_RETRY_DELAY_MS,
+        validate_consumer_policy, validate_poll_response_limit,
     };
     use std::io;
 
@@ -1031,6 +1044,20 @@ mod tests {
             assert_eq!(error.kind(), expected_kind, "{error}");
             assert_eq!(error.outcome(), expected_outcome, "{error}");
         }
+    }
+
+    #[test]
+    fn scalar_poll_response_limit_rejects_zero_and_values_above_the_wire_ceiling() {
+        assert!(validate_poll_response_limit(1).is_ok());
+        assert!(validate_poll_response_limit(MAX_CONSUME_BATCH_RESPONSE_BYTES).is_ok());
+        assert!(matches!(
+            validate_poll_response_limit(0),
+            Err(BrokerError::InvalidBatchRequest(_))
+        ));
+        assert!(matches!(
+            validate_poll_response_limit(MAX_CONSUME_BATCH_RESPONSE_BYTES + 1),
+            Err(BrokerError::InvalidBatchRequest(_))
+        ));
     }
 
     #[test]

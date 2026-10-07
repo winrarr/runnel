@@ -4,20 +4,20 @@ use std::io::{self, BufReader as IoBufReader, Read};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+pub use runnel_protocol::BearerToken;
+use runnel_protocol::v2::{self as v2, ApplicationReply, Outcome as V2Outcome, ServerFrame};
 use runnel_protocol::{
     AckBatchItemOutcome as WireAckBatchItemOutcome, BatchMessageResponse, BinaryPayload,
     MAX_CONSUME_BATCH_RECORDS, MAX_PUBLISH_BATCH_RECORDS,
     PublishBatchRecord as WirePublishBatchRecord, PublishBatchRecordResponse, Request, Response,
 };
-use runnel_protocol::v2::{
-    self as v2, ApplicationReply, Outcome as V2Outcome, ServerFrame,
-};
 pub use runnel_protocol::{PayloadEncoding, ProtocolSupport, ProtocolVersionRange};
-pub use runnel_protocol::BearerToken;
 use rustls::RootCertStore;
 use rustls::pki_types::ServerName;
 use thiserror::Error;
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader, ReadHalf, WriteHalf};
+use tokio::io::{
+    AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader, ReadHalf, WriteHalf,
+};
 use tokio::net::{TcpStream, ToSocketAddrs};
 use tokio_rustls::TlsConnector;
 use zeroize::Zeroize;
@@ -151,12 +151,12 @@ pub enum ClientError {
     },
 }
 
-/// TLS server identity and optional private trust roots for a broker connection.
+/// TLS server identity and an optional exclusive trust bundle for a broker connection.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ClientTlsConfig {
     /// DNS name or IP literal that must appear in the server certificate.
     pub server_name: String,
-    /// Optional PEM trust bundle added to the platform trust roots.
+    /// Optional PEM trust bundle. When set, only these roots are trusted; otherwise platform roots are used.
     pub ca_file: Option<PathBuf>,
 }
 
@@ -614,12 +614,7 @@ impl Client {
         address: impl ToSocketAddrs,
         config: ClientConfig,
     ) -> Result<Self, ClientError> {
-        Self::connect_with_security(
-            address,
-            config,
-            ClientSecurityConfig::default(),
-        )
-        .await
+        Self::connect_with_security(address, config, ClientSecurityConfig::default()).await
     }
 
     /// Connect with explicit transport security, trust roots, credentials, and timeouts.
@@ -1467,9 +1462,7 @@ impl Client {
         );
         let minimum_bytes = v2::encode_server_frame(&ServerFrame::Application(empty_reply))
             .map(|frame| frame.len().saturating_sub(4))
-            .map_err(|_| {
-                AttemptOutcome::Rejected(AttemptFailure::Client(ClientError::Protocol))
-            })?;
+            .map_err(|_| AttemptOutcome::Rejected(AttemptFailure::Client(ClientError::Protocol)))?;
         if minimum_bytes > max_bytes {
             return Err(AttemptOutcome::Rejected(AttemptFailure::Client(
                 ClientError::InvalidBatch {
@@ -1794,7 +1787,8 @@ async fn negotiate(
     .map_err(|_| ClientError::ResponseTimeout {
         timeout: config.response_timeout,
     })??;
-    let server_hello = v2::decode_server_hello(&hello_body).map_err(|_| ClientError::InvalidHello)?;
+    let server_hello =
+        v2::decode_server_hello(&hello_body).map_err(|_| ClientError::InvalidHello)?;
     let v2::ServerHello::Accepted(accepted) = server_hello else {
         let v2::ServerHello::Refused { code, .. } = server_hello else {
             unreachable!()
@@ -1813,14 +1807,17 @@ async fn negotiate(
             .token
             .as_ref()
             .ok_or(ClientError::AuthenticationRequired)?;
-        let auth_frame = v2::encode_bearer_auth(token)
-            .map_err(|_| ClientError::InvalidSecurityConfiguration)?;
-        tokio::time::timeout(config.request_timeout, connection.writer.write_all(auth_frame.as_bytes()))
-            .await
-            .map_err(|_| ClientError::WriteTimeout {
-                timeout: config.request_timeout,
-            })?
-            .map_err(|source| ClientError::Write { source })?;
+        let auth_frame =
+            v2::encode_bearer_auth(token).map_err(|_| ClientError::InvalidSecurityConfiguration)?;
+        tokio::time::timeout(
+            config.request_timeout,
+            connection.writer.write_all(auth_frame.as_bytes()),
+        )
+        .await
+        .map_err(|_| ClientError::WriteTimeout {
+            timeout: config.request_timeout,
+        })?
+        .map_err(|source| ClientError::Write { source })?;
         let reply = tokio::time::timeout(
             config.response_timeout,
             read_v2_frame(&mut connection.reader, v2::AUTH_MAX_BODY_BYTES),
@@ -1856,9 +1853,10 @@ fn validate_server_hello(
         || server.max_inbound_frame_bytes > v2::MAX_CLIENT_TO_SERVER_FRAME_BYTES
         || server.max_outbound_frame_bytes < v2::MIN_FRAME_BODY_BYTES
         || server.max_outbound_frame_bytes > v2::MAX_SERVER_TO_CLIENT_FRAME_BYTES
-        || server.capabilities.iter().any(|capability| {
-            !client.offered_capabilities.contains(capability)
-        })
+        || server
+            .capabilities
+            .iter()
+            .any(|capability| !client.offered_capabilities.contains(capability))
         || !client
             .required_capabilities
             .iter()
@@ -1893,17 +1891,20 @@ fn refusal_name(code: v2::RefusalCode) -> &'static str {
     }
 }
 
-fn client_tls_config(tls: &ClientTlsConfig) -> Result<std::sync::Arc<rustls::ClientConfig>, ClientError> {
+fn client_tls_config(
+    tls: &ClientTlsConfig,
+) -> Result<std::sync::Arc<rustls::ClientConfig>, ClientError> {
+    let roots = client_trust_roots(tls)?;
+    let mut config =
+        rustls::ClientConfig::builder_with_protocol_versions(&[&rustls::version::TLS13])
+            .with_root_certificates(roots)
+            .with_no_client_auth();
+    config.enable_early_data = false;
+    Ok(std::sync::Arc::new(config))
+}
+
+fn client_trust_roots(tls: &ClientTlsConfig) -> Result<RootCertStore, ClientError> {
     let mut roots = RootCertStore::empty();
-    let system = rustls_native_certs::load_native_certs();
-    if !system.errors.is_empty() || system.certs.is_empty() {
-        return Err(ClientError::InvalidTrustRoots);
-    }
-    for certificate in system.certs {
-        roots
-            .add(certificate)
-            .map_err(|_| ClientError::InvalidTrustRoots)?;
-    }
     if let Some(path) = &tls.ca_file {
         let file = fs::File::open(path).map_err(|_| ClientError::InvalidTrustRoots)?;
         let certificates = rustls_pemfile::certs(&mut IoBufReader::new(file))
@@ -1917,12 +1918,19 @@ fn client_tls_config(tls: &ClientTlsConfig) -> Result<std::sync::Arc<rustls::Cli
                 .add(certificate)
                 .map_err(|_| ClientError::InvalidTrustRoots)?;
         }
+        return Ok(roots);
     }
-    let mut config = rustls::ClientConfig::builder_with_protocol_versions(&[&rustls::version::TLS13])
-        .with_root_certificates(roots)
-        .with_no_client_auth();
-    config.enable_early_data = false;
-    Ok(std::sync::Arc::new(config))
+
+    let system = rustls_native_certs::load_native_certs();
+    if !system.errors.is_empty() || system.certs.is_empty() {
+        return Err(ClientError::InvalidTrustRoots);
+    }
+    for certificate in system.certs {
+        roots
+            .add(certificate)
+            .map_err(|_| ClientError::InvalidTrustRoots)?;
+    }
+    Ok(roots)
 }
 
 async fn read_v2_frame<R>(reader: &mut R, max_body_bytes: usize) -> Result<Vec<u8>, ClientError>
@@ -1930,7 +1938,10 @@ where
     R: AsyncRead + Unpin,
 {
     let mut length_bytes = [0; 4];
-    reader.read_exact(&mut length_bytes).await.map_err(map_read_error)?;
+    reader
+        .read_exact(&mut length_bytes)
+        .await
+        .map_err(map_read_error)?;
     let body_bytes = u32::from_be_bytes(length_bytes) as usize;
     if body_bytes == 0 || body_bytes > max_body_bytes {
         return Err(ClientError::ResponseTooLarge {
@@ -1952,9 +1963,7 @@ fn map_read_error(source: io::Error) -> ClientError {
 
 fn read_token_file(path: &Path) -> Result<BearerToken, ClientError> {
     let file = fs::File::open(path).map_err(|_| ClientError::CredentialFile)?;
-    let metadata = file
-        .metadata()
-        .map_err(|_| ClientError::CredentialFile)?;
+    let metadata = file.metadata().map_err(|_| ClientError::CredentialFile)?;
     if !metadata.is_file() || metadata.len() > 256 {
         return Err(ClientError::CredentialFile);
     }
@@ -2005,12 +2014,8 @@ fn classify_v2_reply(reply: ApplicationReply) -> AttemptOutcome {
         Some(V2Outcome::Confirmed) if !matches!(response, Response::Error { .. }) => {
             AttemptOutcome::Confirmed(response)
         }
-        Some(V2Outcome::Rejected) => {
-            AttemptOutcome::Rejected(AttemptFailure::Broker(response))
-        }
-        Some(V2Outcome::Retryable) => {
-            AttemptOutcome::Retryable(AttemptFailure::Broker(response))
-        }
+        Some(V2Outcome::Rejected) => AttemptOutcome::Rejected(AttemptFailure::Broker(response)),
+        Some(V2Outcome::Retryable) => AttemptOutcome::Retryable(AttemptFailure::Broker(response)),
         Some(V2Outcome::Unknown) | Some(V2Outcome::Confirmed) | None => {
             AttemptOutcome::Unknown(AttemptFailure::Broker(response))
         }
@@ -2035,9 +2040,7 @@ fn publish_batch_attempt(
     outcome: AttemptOutcome,
 ) -> PublishBatchAttempt {
     match outcome {
-        AttemptOutcome::Confirmed(response) => match response {
-            response => publish_batch_unexpected(record_count, response),
-        },
+        AttemptOutcome::Confirmed(response) => publish_batch_unexpected(record_count, response),
         AttemptOutcome::Rejected(failure) => {
             publish_batch_failure(record_count, BatchFailureKind::Rejected, failure)
         }
@@ -2094,9 +2097,7 @@ fn publish_batch_reply(
         return publish_batch_attempt(stream, record_count, classify_v2_reply(reply));
     }
     let ApplicationReply {
-        response,
-        items,
-        ..
+        response, items, ..
     } = reply;
     let Response::PublishBatch {
         stream: response_stream,
@@ -2105,7 +2106,10 @@ fn publish_batch_reply(
     else {
         return publish_batch_unexpected(record_count, response);
     };
-    if response_stream != stream || items.len() != record_count || wire_outcomes.len() != record_count {
+    if response_stream != stream
+        || items.len() != record_count
+        || wire_outcomes.len() != record_count
+    {
         return publish_batch_unexpected(
             record_count,
             Response::PublishBatch {
@@ -2257,12 +2261,12 @@ fn typed_response<T>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::net::SocketAddr;
     use runnel_protocol::v2::{
-        self as v2, ClientFrame, ClientHello, HelloAccepted, ServerHello, VersionRange,
-        DEFAULT_SERVER_TO_CLIENT_FRAME_BYTES, HELLO_MAX_BODY_BYTES,
-        MAX_CLIENT_TO_SERVER_FRAME_BYTES, MAX_SERVER_TO_CLIENT_FRAME_BYTES, PREFACE,
+        self as v2, ClientFrame, ClientHello, DEFAULT_SERVER_TO_CLIENT_FRAME_BYTES,
+        HELLO_MAX_BODY_BYTES, HelloAccepted, MAX_CLIENT_TO_SERVER_FRAME_BYTES,
+        MAX_SERVER_TO_CLIENT_FRAME_BYTES, PREFACE, ServerHello, VersionRange,
     };
+    use std::net::SocketAddr;
     use tokio::net::TcpListener;
 
     fn test_config() -> ClientConfig {
@@ -2355,7 +2359,10 @@ mod tests {
         let (listener, address) = listener().await;
         let server = tokio::spawn(async move {
             let mut reader = accept_v2(&listener, MAX_CLIENT_TO_SERVER_FRAME_BYTES, false).await;
-            assert!(matches!(read_application_request(&mut reader).await, Request::Health));
+            assert!(matches!(
+                read_application_request(&mut reader).await,
+                Request::Health
+            ));
             write_response(
                 &mut reader,
                 Response::Health {
@@ -2379,13 +2386,20 @@ mod tests {
             .await;
         });
 
-        let mut client = Client::connect_with_config(address, test_config()).await.unwrap();
+        let mut client = Client::connect_with_config(address, test_config())
+            .await
+            .unwrap();
         assert!(matches!(
             client.request(&Request::Health).await.unwrap(),
             Response::Health { status, .. } if status == "ok"
         ));
         assert!(matches!(
-            client.request(&Request::CreateStream { stream: "events".to_owned() }).await.unwrap(),
+            client
+                .request(&Request::CreateStream {
+                    stream: "events".to_owned()
+                })
+                .await
+                .unwrap(),
             Response::StreamCreated { created: true, .. }
         ));
         server.await.unwrap();
@@ -2397,12 +2411,11 @@ mod tests {
         let server = tokio::spawn(async move {
             let mut reader = accept_v2(&listener, MAX_CLIENT_TO_SERVER_FRAME_BYTES, true).await;
             let mut length = [0; 4];
-            let result = tokio::time::timeout(
-                Duration::from_secs(1),
-                reader.read_exact(&mut length),
-            )
-            .await;
-            assert!(matches!(result, Ok(Err(error)) if error.kind() == io::ErrorKind::UnexpectedEof));
+            let result =
+                tokio::time::timeout(Duration::from_secs(1), reader.read_exact(&mut length)).await;
+            assert!(
+                matches!(result, Ok(Err(error)) if error.kind() == io::ErrorKind::UnexpectedEof)
+            );
         });
 
         let result = Client::connect_with_config(address, test_config()).await;
@@ -2415,7 +2428,10 @@ mod tests {
         let (listener, address) = listener().await;
         let server = tokio::spawn(async move {
             let mut reader = accept_v2(&listener, 1_024, false).await;
-            assert!(matches!(read_application_request(&mut reader).await, Request::Health));
+            assert!(matches!(
+                read_application_request(&mut reader).await,
+                Request::Health
+            ));
             write_response(
                 &mut reader,
                 Response::Health {
@@ -2427,7 +2443,9 @@ mod tests {
             .await;
         });
 
-        let mut client = Client::connect_with_config(address, test_config()).await.unwrap();
+        let mut client = Client::connect_with_config(address, test_config())
+            .await
+            .unwrap();
         let result = client
             .request(&Request::Publish {
                 stream: "events".to_owned(),
@@ -2436,8 +2454,14 @@ mod tests {
                 request_id: None,
             })
             .await;
-        assert!(matches!(result, Err(ClientError::RequestTooLarge { max_bytes: 1_024 })));
-        assert!(matches!(client.request(&Request::Health).await.unwrap(), Response::Health { .. }));
+        assert!(matches!(
+            result,
+            Err(ClientError::RequestTooLarge { max_bytes: 1_024 })
+        ));
+        assert!(matches!(
+            client.request(&Request::Health).await.unwrap(),
+            Response::Health { .. }
+        ));
         server.await.unwrap();
     }
 
@@ -2445,7 +2469,10 @@ mod tests {
     async fn rejects_a_zero_response_limit_before_connecting() {
         let result = Client::connect_with_config(
             "127.0.0.1:1",
-            ClientConfig { max_response_bytes: 0, ..test_config() },
+            ClientConfig {
+                max_response_bytes: 0,
+                ..test_config()
+            },
         )
         .await;
         assert!(matches!(result, Err(ClientError::InvalidResponseLimit)));
@@ -2472,12 +2499,29 @@ mod tests {
     #[test]
     fn client_hello_limits_are_protocol_bounded() {
         let hello = ClientHello::core_v2();
-        assert_eq!(hello.versions, vec![VersionRange {
-            major: 2,
-            min_minor: 0,
-            max_minor: 0,
-        }]);
+        assert_eq!(
+            hello.versions,
+            vec![VersionRange {
+                major: 2,
+                min_minor: 0,
+                max_minor: 0,
+            }]
+        );
         assert!(hello.max_outbound_frame_bytes <= MAX_CLIENT_TO_SERVER_FRAME_BYTES);
         assert!(hello.max_inbound_frame_bytes <= DEFAULT_SERVER_TO_CLIENT_FRAME_BYTES);
+    }
+
+    #[test]
+    fn custom_trust_bundle_replaces_platform_roots() {
+        let directory = tempfile::tempdir().unwrap();
+        let certificate =
+            rcgen::generate_simple_self_signed(vec!["private.example".to_owned()]).unwrap();
+        let bundle = directory.path().join("private-ca.pem");
+        std::fs::write(&bundle, certificate.cert.pem()).unwrap();
+
+        let roots =
+            client_trust_roots(&ClientTlsConfig::new("private.example").with_ca_file(&bundle))
+                .unwrap();
+        assert_eq!(roots.len(), 1);
     }
 }

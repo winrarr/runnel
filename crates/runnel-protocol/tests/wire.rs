@@ -1,5 +1,6 @@
 use runnel_protocol::{
-    BinaryPayload, PayloadEncoding, PROTOCOL_NAME, PROTOCOL_SUPPORT, PROTOCOL_VERSION, Request,
+    BinaryPayload, PROTOCOL_NAME, PROTOCOL_SUPPORT, PROTOCOL_VERSION, PayloadEncoding, Request,
+    Response,
     v2::{self, ClientFrame, MAX_CLIENT_TO_SERVER_FRAME_BYTES},
 };
 
@@ -28,12 +29,9 @@ fn binary_request_payload_is_encoded_as_opaque_bytes() {
     }))
     .unwrap();
 
-    let ClientFrame::Application(Request::PublishBytes { payload: decoded, .. }) =
-        v2::decode_client_frame(
-            &frame.as_bytes()[4..],
-            MAX_CLIENT_TO_SERVER_FRAME_BYTES,
-        )
-        .unwrap()
+    let ClientFrame::Application(Request::PublishBytes {
+        payload: decoded, ..
+    }) = v2::decode_client_frame(&frame.as_bytes()[4..], MAX_CLIENT_TO_SERVER_FRAME_BYTES).unwrap()
     else {
         panic!("binary publish should decode as an application request");
     };
@@ -55,11 +53,8 @@ fn retry_delay_round_trips_through_v2_request_and_policy_response() {
         max_delivery_attempts,
         retry_delay_ms,
         ..
-    }) = v2::decode_client_frame(
-        &encoded.as_bytes()[4..],
-        MAX_CLIENT_TO_SERVER_FRAME_BYTES,
-    )
-    .unwrap()
+    }) = v2::decode_client_frame(&encoded.as_bytes()[4..], MAX_CLIENT_TO_SERVER_FRAME_BYTES)
+        .unwrap()
     else {
         panic!("configured consumer must decode as a v2 application request");
     };
@@ -84,8 +79,7 @@ fn retry_delay_round_trips_through_v2_request_and_policy_response() {
         &encoded.as_bytes()[4..],
         runnel_protocol::v2::MAX_SERVER_TO_CLIENT_FRAME_BYTES,
     )
-    .unwrap()
-    else {
+    .unwrap() else {
         panic!("consumer policy should decode as a v2 application response");
     };
     assert!(matches!(

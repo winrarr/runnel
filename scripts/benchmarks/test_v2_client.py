@@ -172,13 +172,9 @@ class V2ClientTests(unittest.TestCase):
         client_frame = v2_client._parse_fields(
             v2_client._one(frame_fields, 2, 2, required=True)
         )
-        application = v2_client._parse_fields(
-            v2_client._one(client_frame, 2, 2, required=True)
+        batch = v2_client._parse_fields(
+            v2_client._one(client_frame, 3, 2, required=True)
         )
-        request = v2_client._parse_fields(
-            v2_client._one(application, 1, 2, required=True)
-        )
-        batch = v2_client._parse_fields(v2_client._one(request, 3, 2, required=True))
         record = v2_client._parse_fields(v2_client._repeated(batch, 2, 2)[0])
         self.assertEqual(v2_client._one(record, 2, 2), b"\x00\xffbytes")
 

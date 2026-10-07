@@ -170,15 +170,17 @@ impl fmt::Debug for ClientFrame {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::BearerAuth(_) => formatter.write_str("BearerAuth([REDACTED])"),
-            Self::Application(request) => formatter
-                .debug_tuple("Application")
-                .field(request)
-                .finish(),
+            Self::Application(request) => {
+                formatter.debug_tuple("Application").field(request).finish()
+            }
         }
     }
 }
 
 #[derive(Debug)]
+// Boxing would allocate once per application response; this enum is short-lived
+// and the 208-byte largest variant is bounded by the protocol response model.
+#[allow(clippy::large_enum_variant)]
 pub enum ServerFrame {
     Authenticated,
     AuthenticationFailed,
@@ -270,7 +272,9 @@ pub fn validate_client_hello(hello: &ClientHello) -> Result<(), RefusalCode> {
     Ok(())
 }
 
-fn validate_capability_set(values: &[String]) -> Result<std::collections::BTreeSet<&str>, RefusalCode> {
+fn validate_capability_set(
+    values: &[String],
+) -> Result<std::collections::BTreeSet<&str>, RefusalCode> {
     let mut set = std::collections::BTreeSet::new();
     for value in values {
         let bytes = value.as_bytes();
@@ -348,8 +352,8 @@ pub fn decode_server_hello(body: &[u8]) -> Result<ServerHello, V2ProtocolError> 
         return Err(V2ProtocolError::MissingMessage);
     };
     match server.result.ok_or(V2ProtocolError::MissingMessage)? {
-        wire::server_hello::Result::Accepted(accepted) => Ok(ServerHello::Accepted(
-            HelloAccepted {
+        wire::server_hello::Result::Accepted(accepted) => {
+            Ok(ServerHello::Accepted(HelloAccepted {
                 major: accepted.major,
                 minor: accepted.minor,
                 capabilities: accepted.capabilities,
@@ -358,8 +362,8 @@ pub fn decode_server_hello(body: &[u8]) -> Result<ServerHello, V2ProtocolError> 
                 client_to_server_frame_bytes: accepted.client_to_server_frame_bytes as usize,
                 server_to_client_frame_bytes: accepted.server_to_client_frame_bytes as usize,
                 auth_required: accepted.auth_required,
-            },
-        )),
+            }))
+        }
         wire::server_hello::Result::Refusal(refusal) => Ok(ServerHello::Refused {
             code: refusal_from_wire(refusal.code)?,
             diagnostic: refusal.diagnostic,
@@ -405,9 +409,7 @@ pub fn encode_application_request(request: &Request) -> Result<EncodedFrame, V2P
 }
 
 pub fn decode_client_frame(body: &[u8], max_bytes: usize) -> Result<ClientFrame, V2ProtocolError> {
-    if client_frame_kind(body)? == ClientFrameKind::BearerAuth
-        && body.len() > AUTH_MAX_BODY_BYTES
-    {
+    if client_frame_kind(body)? == ClientFrameKind::BearerAuth && body.len() > AUTH_MAX_BODY_BYTES {
         return Err(V2ProtocolError::FrameTooLarge);
     }
     let frame = decode_message::<wire::ClientFrame>(body, max_bytes)?;
@@ -416,7 +418,9 @@ pub fn decode_client_frame(body: &[u8], max_bytes: usize) -> Result<ClientFrame,
             Ok(ClientFrame::BearerAuth(BearerToken::from_wire(auth.token)))
         }
         wire::client_frame::Body::Application(application) => {
-            let operation = application.operation.ok_or(V2ProtocolError::MissingOperation)?;
+            let operation = application
+                .operation
+                .ok_or(V2ProtocolError::MissingOperation)?;
             Ok(ClientFrame::Application(request_from_wire(operation)?))
         }
     }
@@ -491,7 +495,9 @@ pub fn encode_server_frame(frame: &ServerFrame) -> Result<EncodedFrame, V2Protoc
         ServerFrame::AuthenticationFailed => {
             wire::server_frame::Body::AuthenticationFailed(wire::AuthenticationFailed {})
         }
-        ServerFrame::Application(reply) => wire::server_frame::Body::Application(reply_to_wire(reply)?),
+        ServerFrame::Application(reply) => {
+            wire::server_frame::Body::Application(reply_to_wire(reply)?)
+        }
     };
     encode_message(
         &wire::ServerFrame { body: Some(body) },
@@ -504,24 +510,32 @@ pub fn decode_server_frame(body: &[u8], max_bytes: usize) -> Result<ServerFrame,
     let frame = decode_message::<wire::ServerFrame>(body, max_bytes)?;
     match frame.body.ok_or(V2ProtocolError::MissingMessage)? {
         wire::server_frame::Body::Authenticated(_) => Ok(ServerFrame::Authenticated),
-        wire::server_frame::Body::AuthenticationFailed(_) => {
-            Ok(ServerFrame::AuthenticationFailed)
-        }
+        wire::server_frame::Body::AuthenticationFailed(_) => Ok(ServerFrame::AuthenticationFailed),
         wire::server_frame::Body::Application(reply) => {
             Ok(ServerFrame::Application(reply_from_wire(reply)?))
         }
     }
 }
 
-pub fn encode_delimited<M: Message>(message: &M, max_bytes: usize) -> Result<EncodedFrame, V2ProtocolError> {
+pub fn encode_delimited<M: Message>(
+    message: &M,
+    max_bytes: usize,
+) -> Result<EncodedFrame, V2ProtocolError> {
     encode_message(message, max_bytes, false)
 }
 
-pub fn decode_body<M: Message + Default>(body: &[u8], max_bytes: usize) -> Result<M, V2ProtocolError> {
+pub fn decode_body<M: Message + Default>(
+    body: &[u8],
+    max_bytes: usize,
+) -> Result<M, V2ProtocolError> {
     decode_message(body, max_bytes)
 }
 
-fn encode_message<M: Message>(message: &M, max_bytes: usize, contains_secret: bool) -> Result<EncodedFrame, V2ProtocolError> {
+fn encode_message<M: Message>(
+    message: &M,
+    max_bytes: usize,
+    contains_secret: bool,
+) -> Result<EncodedFrame, V2ProtocolError> {
     let body_len = message.encoded_len();
     if body_len == 0 || body_len > max_bytes || body_len > u32::MAX as usize {
         return Err(V2ProtocolError::FrameTooLarge);
@@ -540,7 +554,10 @@ fn encode_message<M: Message>(message: &M, max_bytes: usize, contains_secret: bo
     })
 }
 
-fn decode_message<M: Message + Default>(body: &[u8], max_bytes: usize) -> Result<M, V2ProtocolError> {
+fn decode_message<M: Message + Default>(
+    body: &[u8],
+    max_bytes: usize,
+) -> Result<M, V2ProtocolError> {
     if body.is_empty() || body.len() > max_bytes || body.len() > u32::MAX as usize {
         return Err(V2ProtocolError::FrameTooLarge);
     }
@@ -610,7 +627,9 @@ fn refusal_from_wire(value: i32) -> Result<RefusalCode, V2ProtocolError> {
     }
 }
 
-fn request_to_wire(request: &Request) -> Result<wire::application_request::Operation, V2ProtocolError> {
+fn request_to_wire(
+    request: &Request,
+) -> Result<wire::application_request::Operation, V2ProtocolError> {
     use wire::application_request::Operation;
     Ok(match request {
         Request::CreateStream { stream } => Operation::CreateStream(wire::CreateStreamRequest {
@@ -778,7 +797,9 @@ fn request_to_wire(request: &Request) -> Result<wire::application_request::Opera
     })
 }
 
-fn request_from_wire(operation: wire::application_request::Operation) -> Result<Request, V2ProtocolError> {
+fn request_from_wire(
+    operation: wire::application_request::Operation,
+) -> Result<Request, V2ProtocolError> {
     use wire::application_request::Operation;
     Ok(match operation {
         Operation::CreateStream(request) => Request::CreateStream {
@@ -901,7 +922,10 @@ fn reply_to_wire(reply: &ApplicationReply) -> Result<wire::ApplicationResponse, 
             false,
         ),
         Response::PublishBatch { stream, outcomes } => {
-            if reply.outcome.is_some() || reply.stage.is_some() || reply.items.len() != outcomes.len() {
+            if reply.outcome.is_some()
+                || reply.stage.is_some()
+                || reply.items.len() != outcomes.len()
+            {
                 return Err(V2ProtocolError::InvalidResponse);
             }
             let items = outcomes
@@ -942,8 +966,15 @@ fn reply_to_wire(reply: &ApplicationReply) -> Result<wire::ApplicationResponse, 
                 true,
             )
         }
-        Response::PollBatch { stream, consumer, messages } => {
-            if reply.outcome.is_some() || reply.stage.is_some() || reply.items.len() != messages.len() {
+        Response::PollBatch {
+            stream,
+            consumer,
+            messages,
+        } => {
+            if reply.outcome.is_some()
+                || reply.stage.is_some()
+                || reply.items.len() != messages.len()
+            {
                 return Err(V2ProtocolError::InvalidResponse);
             }
             let items = messages
@@ -969,47 +1000,120 @@ fn reply_to_wire(reply: &ApplicationReply) -> Result<wire::ApplicationResponse, 
                 true,
             )
         }
-        Response::Message { stream, consumer, member, offset, key, payload, published_at_ms, delivery_token, delivery_attempt } => (
+        Response::Message {
+            stream,
+            consumer,
+            member,
+            offset,
+            key,
+            payload,
+            published_at_ms,
+            delivery_token,
+            delivery_attempt,
+        } => (
             ResultBody::Message(wire::MessageResult {
-                stream: stream.clone(), consumer: consumer.clone(), member: member.clone(),
-                offset: *offset, key: key.clone(), payload: payload.as_bytes().to_vec(),
-                published_at_ms: *published_at_ms, delivery_token: delivery_token.clone(),
+                stream: stream.clone(),
+                consumer: consumer.clone(),
+                member: member.clone(),
+                offset: *offset,
+                key: key.clone(),
+                payload: payload.as_bytes().to_vec(),
+                published_at_ms: *published_at_ms,
+                delivery_token: delivery_token.clone(),
                 delivery_attempt: *delivery_attempt,
-            }), false,
+            }),
+            false,
         ),
-        Response::MessageBytes { stream, consumer, member, offset, key, payload, published_at_ms, delivery_token, delivery_attempt } => (
+        Response::MessageBytes {
+            stream,
+            consumer,
+            member,
+            offset,
+            key,
+            payload,
+            published_at_ms,
+            delivery_token,
+            delivery_attempt,
+        } => (
             ResultBody::Message(wire::MessageResult {
-                stream: stream.clone(), consumer: consumer.clone(), member: member.clone(),
-                offset: *offset, key: key.clone(), payload: payload.as_bytes().to_vec(),
-                published_at_ms: *published_at_ms, delivery_token: delivery_token.clone(),
+                stream: stream.clone(),
+                consumer: consumer.clone(),
+                member: member.clone(),
+                offset: *offset,
+                key: key.clone(),
+                payload: payload.as_bytes().to_vec(),
+                published_at_ms: *published_at_ms,
+                delivery_token: delivery_token.clone(),
                 delivery_attempt: *delivery_attempt,
-            }), false,
+            }),
+            false,
         ),
-        Response::ReplayMessage { stream, consumer, offset, key, payload, published_at_ms } => (
+        Response::ReplayMessage {
+            stream,
+            consumer,
+            offset,
+            key,
+            payload,
+            published_at_ms,
+        } => (
             ResultBody::Replay(wire::ReplayResult {
-                stream: stream.clone(), consumer: consumer.clone(), offset: *offset,
-                key: key.clone(), payload: payload.as_bytes().to_vec(), published_at_ms: *published_at_ms,
-            }), false,
+                stream: stream.clone(),
+                consumer: consumer.clone(),
+                offset: *offset,
+                key: key.clone(),
+                payload: payload.as_bytes().to_vec(),
+                published_at_ms: *published_at_ms,
+            }),
+            false,
         ),
-        Response::ReplayMessageBytes { stream, consumer, offset, key, payload, published_at_ms } => (
+        Response::ReplayMessageBytes {
+            stream,
+            consumer,
+            offset,
+            key,
+            payload,
+            published_at_ms,
+        } => (
             ResultBody::Replay(wire::ReplayResult {
-                stream: stream.clone(), consumer: consumer.clone(), offset: *offset,
-                key: key.clone(), payload: payload.as_bytes().to_vec(), published_at_ms: *published_at_ms,
-            }), false,
+                stream: stream.clone(),
+                consumer: consumer.clone(),
+                offset: *offset,
+                key: key.clone(),
+                payload: payload.as_bytes().to_vec(),
+                published_at_ms: *published_at_ms,
+            }),
+            false,
         ),
         Response::Empty { stream, consumer } => (
             ResultBody::Empty(wire::EmptyResult {
-                stream: stream.clone(), consumer: consumer.clone(),
-            }), false,
+                stream: stream.clone(),
+                consumer: consumer.clone(),
+            }),
+            false,
         ),
-        Response::Acknowledged { stream, consumer, offset, already_acknowledged } => (
+        Response::Acknowledged {
+            stream,
+            consumer,
+            offset,
+            already_acknowledged,
+        } => (
             ResultBody::Acknowledged(wire::AcknowledgedResult {
-                stream: stream.clone(), consumer: consumer.clone(), offset: *offset,
+                stream: stream.clone(),
+                consumer: consumer.clone(),
+                offset: *offset,
                 already_acknowledged: *already_acknowledged,
-            }), false,
+            }),
+            false,
         ),
-        Response::AckBatch { stream, consumer, outcomes } => {
-            if reply.outcome.is_some() || reply.stage.is_some() || reply.items.len() != outcomes.len() {
+        Response::AckBatch {
+            stream,
+            consumer,
+            outcomes,
+        } => {
+            if reply.outcome.is_some()
+                || reply.stage.is_some()
+                || reply.items.len() != outcomes.len()
+            {
                 return Err(V2ProtocolError::InvalidResponse);
             }
             let items = outcomes
@@ -1017,11 +1121,17 @@ fn reply_to_wire(reply: &ApplicationReply) -> Result<wire::ApplicationResponse, 
                 .zip(&reply.items)
                 .map(|(item, metadata)| {
                     let (status, code, diagnostic) = match &item.outcome {
-                        crate::AckBatchItemOutcome::Confirmed => (wire::AckStatus::Confirmed, None, None),
-                        crate::AckBatchItemOutcome::AlreadyConfirmed => (wire::AckStatus::AlreadyConfirmed, None, None),
-                        crate::AckBatchItemOutcome::Rejected => {
-                            (wire::AckStatus::Rejected, item.code.clone(), item.message.clone())
+                        crate::AckBatchItemOutcome::Confirmed => {
+                            (wire::AckStatus::Confirmed, None, None)
                         }
+                        crate::AckBatchItemOutcome::AlreadyConfirmed => {
+                            (wire::AckStatus::AlreadyConfirmed, None, None)
+                        }
+                        crate::AckBatchItemOutcome::Rejected => (
+                            wire::AckStatus::Rejected,
+                            item.code.clone(),
+                            item.message.clone(),
+                        ),
                     };
                     Ok(wire::AckItemResult {
                         offset: item.offset,
@@ -1035,27 +1145,51 @@ fn reply_to_wire(reply: &ApplicationReply) -> Result<wire::ApplicationResponse, 
                 .collect::<Result<Vec<_>, V2ProtocolError>>()?;
             (
                 ResultBody::AckBatch(wire::AckBatchResult {
-                    stream: stream.clone(), consumer: consumer.clone(), items,
-                }), true,
+                    stream: stream.clone(),
+                    consumer: consumer.clone(),
+                    items,
+                }),
+                true,
             )
         }
-        Response::ConsumerPolicy { stream, consumer, version, configured, ack_timeout_ms, max_delivery_attempts, retry_delay_ms } => (
+        Response::ConsumerPolicy {
+            stream,
+            consumer,
+            version,
+            configured,
+            ack_timeout_ms,
+            max_delivery_attempts,
+            retry_delay_ms,
+        } => (
             ResultBody::ConsumerPolicy(wire::ConsumerPolicyResult {
-                stream: stream.clone(), consumer: consumer.clone(), version: *version,
-                configured: *configured, ack_timeout_ms: *ack_timeout_ms,
+                stream: stream.clone(),
+                consumer: consumer.clone(),
+                version: *version,
+                configured: *configured,
+                ack_timeout_ms: *ack_timeout_ms,
                 max_delivery_attempts: *max_delivery_attempts,
                 retry_delay_ms: *retry_delay_ms,
-            }), false,
+            }),
+            false,
         ),
-        Response::Health { status, streams, storage_bytes } => (
+        Response::Health {
+            status,
+            streams,
+            storage_bytes,
+        } => (
             ResultBody::Health(wire::HealthResult {
-                status: status.clone(), streams: *streams as u64, storage_bytes: *storage_bytes,
-            }), false,
+                status: status.clone(),
+                streams: *streams as u64,
+                storage_bytes: *storage_bytes,
+            }),
+            false,
         ),
         Response::Error { code, message } => (
             ResultBody::Error(wire::ErrorResult {
-                code: code.clone(), diagnostic: message.clone(),
-            }), false,
+                code: code.clone(),
+                diagnostic: message.clone(),
+            }),
+            false,
         ),
     };
     let (outcome, stage) = if batched {
@@ -1065,8 +1199,12 @@ fn reply_to_wire(reply: &ApplicationReply) -> Result<wire::ApplicationResponse, 
             return Err(V2ProtocolError::InvalidResponse);
         }
         (
-            Some(outcome_to_wire(reply.outcome.ok_or(V2ProtocolError::InvalidResponse)?)),
-            Some(stage_to_wire(reply.stage.ok_or(V2ProtocolError::InvalidResponse)?)),
+            Some(outcome_to_wire(
+                reply.outcome.ok_or(V2ProtocolError::InvalidResponse)?,
+            )),
+            Some(stage_to_wire(
+                reply.stage.ok_or(V2ProtocolError::InvalidResponse)?,
+            )),
         )
     };
     Ok(wire::ApplicationResponse {
@@ -1079,7 +1217,10 @@ fn reply_to_wire(reply: &ApplicationReply) -> Result<wire::ApplicationResponse, 
 fn reply_from_wire(reply: wire::ApplicationResponse) -> Result<ApplicationReply, V2ProtocolError> {
     use wire::application_response::Result as ResultBody;
     let result = reply.result.ok_or(V2ProtocolError::InvalidResponse)?;
-    let is_batch = matches!(result, ResultBody::PublishBatch(_) | ResultBody::PollBatch(_) | ResultBody::AckBatch(_));
+    let is_batch = matches!(
+        result,
+        ResultBody::PublishBatch(_) | ResultBody::PollBatch(_) | ResultBody::AckBatch(_)
+    );
     if is_batch && (reply.outcome.is_some() || reply.stage.is_some()) {
         return Err(V2ProtocolError::InvalidResponse);
     }
@@ -1101,7 +1242,10 @@ fn reply_from_wire(reply: wire::ApplicationResponse) -> Result<ApplicationReply,
                     stage: stage_from_wire(item.stage)?,
                 };
                 if let Some(offset) = item.offset {
-                    if metadata.outcome != Outcome::Confirmed || item.code.is_some() || item.diagnostic.is_some() {
+                    if metadata.outcome != Outcome::Confirmed
+                        || item.code.is_some()
+                        || item.diagnostic.is_some()
+                    {
                         return Err(V2ProtocolError::InvalidResponse);
                     }
                     outcomes.push(crate::PublishBatchRecordResponse::Published { offset });
@@ -1115,7 +1259,10 @@ fn reply_from_wire(reply: wire::ApplicationResponse) -> Result<ApplicationReply,
                 }
                 items.push(metadata);
             }
-            Response::PublishBatch { stream: result.stream, outcomes }
+            Response::PublishBatch {
+                stream: result.stream,
+                outcomes,
+            }
         }
         ResultBody::PollBatch(result) => {
             let mut messages = Vec::with_capacity(result.items.len());
@@ -1155,9 +1302,15 @@ fn reply_from_wire(reply: wire::ApplicationResponse) -> Result<ApplicationReply,
                 let outcome = outcome_from_wire(item.outcome)?;
                 let stage = stage_from_wire(item.stage)?;
                 let status = match wire::AckStatus::try_from(item.status) {
-                    Ok(wire::AckStatus::Confirmed) if outcome == Outcome::Confirmed => crate::AckBatchItemOutcome::Confirmed,
-                    Ok(wire::AckStatus::AlreadyConfirmed) if outcome == Outcome::Confirmed => crate::AckBatchItemOutcome::AlreadyConfirmed,
-                    Ok(wire::AckStatus::Rejected) if outcome != Outcome::Confirmed => crate::AckBatchItemOutcome::Rejected,
+                    Ok(wire::AckStatus::Confirmed) if outcome == Outcome::Confirmed => {
+                        crate::AckBatchItemOutcome::Confirmed
+                    }
+                    Ok(wire::AckStatus::AlreadyConfirmed) if outcome == Outcome::Confirmed => {
+                        crate::AckBatchItemOutcome::AlreadyConfirmed
+                    }
+                    Ok(wire::AckStatus::Rejected) if outcome != Outcome::Confirmed => {
+                        crate::AckBatchItemOutcome::Rejected
+                    }
                     _ => return Err(V2ProtocolError::InvalidResponse),
                 };
                 let has_failure = matches!(status, crate::AckBatchItemOutcome::Rejected);
@@ -1172,7 +1325,11 @@ fn reply_from_wire(reply: wire::ApplicationResponse) -> Result<ApplicationReply,
                 });
                 items.push(ItemMetadata { outcome, stage });
             }
-            Response::AckBatch { stream: result.stream, consumer: result.consumer, outcomes }
+            Response::AckBatch {
+                stream: result.stream,
+                consumer: result.consumer,
+                outcomes,
+            }
         }
         ResultBody::ConsumerPolicy(result) => Response::ConsumerPolicy {
             stream: result.stream,
@@ -1185,7 +1342,8 @@ fn reply_from_wire(reply: wire::ApplicationResponse) -> Result<ApplicationReply,
         },
         ResultBody::Health(result) => Response::Health {
             status: result.status,
-            streams: usize::try_from(result.streams).map_err(|_| V2ProtocolError::InvalidResponse)?,
+            streams: usize::try_from(result.streams)
+                .map_err(|_| V2ProtocolError::InvalidResponse)?,
             storage_bytes: result.storage_bytes,
         },
         ResultBody::Error(result) => Response::Error {
@@ -1198,8 +1356,12 @@ fn reply_from_wire(reply: wire::ApplicationResponse) -> Result<ApplicationReply,
     } else {
         Ok(ApplicationReply {
             response,
-            outcome: Some(outcome_from_wire(reply.outcome.ok_or(V2ProtocolError::InvalidResponse)?)?),
-            stage: Some(stage_from_wire(reply.stage.ok_or(V2ProtocolError::InvalidResponse)?)?),
+            outcome: Some(outcome_from_wire(
+                reply.outcome.ok_or(V2ProtocolError::InvalidResponse)?,
+            )?),
+            stage: Some(stage_from_wire(
+                reply.stage.ok_or(V2ProtocolError::InvalidResponse)?,
+            )?),
             items,
         })
     }
@@ -1267,31 +1429,88 @@ fn replay_from_wire(result: wire::ReplayResult) -> Result<Response, V2ProtocolEr
 
 fn batch_message_to_wire(result: &crate::BatchMessageResponse) -> wire::MessageResult {
     match result {
-        crate::BatchMessageResponse::Text { stream, consumer, member, offset, key, payload, published_at_ms, delivery_token, delivery_attempt } => wire::MessageResult {
-            stream: stream.clone(), consumer: consumer.clone(), member: member.clone(), offset: *offset,
-            key: key.clone(), payload: payload.as_bytes().to_vec(), published_at_ms: *published_at_ms,
-            delivery_token: delivery_token.clone(), delivery_attempt: *delivery_attempt,
+        crate::BatchMessageResponse::Text {
+            stream,
+            consumer,
+            member,
+            offset,
+            key,
+            payload,
+            published_at_ms,
+            delivery_token,
+            delivery_attempt,
+        } => wire::MessageResult {
+            stream: stream.clone(),
+            consumer: consumer.clone(),
+            member: member.clone(),
+            offset: *offset,
+            key: key.clone(),
+            payload: payload.as_bytes().to_vec(),
+            published_at_ms: *published_at_ms,
+            delivery_token: delivery_token.clone(),
+            delivery_attempt: *delivery_attempt,
         },
-        crate::BatchMessageResponse::Bytes { stream, consumer, member, offset, key, payload, published_at_ms, delivery_token, delivery_attempt } => wire::MessageResult {
-            stream: stream.clone(), consumer: consumer.clone(), member: member.clone(), offset: *offset,
-            key: key.clone(), payload: payload.as_bytes().to_vec(), published_at_ms: *published_at_ms,
-            delivery_token: delivery_token.clone(), delivery_attempt: *delivery_attempt,
+        crate::BatchMessageResponse::Bytes {
+            stream,
+            consumer,
+            member,
+            offset,
+            key,
+            payload,
+            published_at_ms,
+            delivery_token,
+            delivery_attempt,
+        } => wire::MessageResult {
+            stream: stream.clone(),
+            consumer: consumer.clone(),
+            member: member.clone(),
+            offset: *offset,
+            key: key.clone(),
+            payload: payload.as_bytes().to_vec(),
+            published_at_ms: *published_at_ms,
+            delivery_token: delivery_token.clone(),
+            delivery_attempt: *delivery_attempt,
         },
     }
 }
 
-fn batch_message_from_wire(result: wire::MessageResult) -> Result<crate::BatchMessageResponse, V2ProtocolError> {
+fn batch_message_from_wire(
+    result: wire::MessageResult,
+) -> Result<crate::BatchMessageResponse, V2ProtocolError> {
     let wire::MessageResult {
-        stream, consumer, member, offset, key, payload, published_at_ms, delivery_token, delivery_attempt,
+        stream,
+        consumer,
+        member,
+        offset,
+        key,
+        payload,
+        published_at_ms,
+        delivery_token,
+        delivery_attempt,
     } = result;
     if let Ok(payload) = String::from_utf8(payload.clone()) {
         Ok(crate::BatchMessageResponse::Text {
-            stream, consumer, member, offset, key, payload, published_at_ms, delivery_token, delivery_attempt,
+            stream,
+            consumer,
+            member,
+            offset,
+            key,
+            payload,
+            published_at_ms,
+            delivery_token,
+            delivery_attempt,
         })
     } else {
         Ok(crate::BatchMessageResponse::Bytes {
-            stream, consumer, member, offset, key,
-            payload: crate::BinaryPayload::new(payload), published_at_ms, delivery_token, delivery_attempt,
+            stream,
+            consumer,
+            member,
+            offset,
+            key,
+            payload: crate::BinaryPayload::new(payload),
+            published_at_ms,
+            delivery_token,
+            delivery_attempt,
         })
     }
 }
@@ -1364,7 +1583,10 @@ mod tests {
             encoded.as_bytes(),
             &[0, 0, 0, 12, 10, 10, 10, 2, 8, 2, 32, 128, 8, 40, 128, 8]
         );
-        assert_eq!(decode_client_hello(&encoded.as_bytes()[4..]).unwrap(), hello);
+        assert_eq!(
+            decode_client_hello(&encoded.as_bytes()[4..]).unwrap(),
+            hello
+        );
     }
 
     #[test]
@@ -1372,15 +1594,24 @@ mod tests {
         let mut hello = ClientHello::core_v2();
         assert_eq!(validate_client_hello(&hello), Ok(()));
         hello.versions.push(hello.versions[0].clone());
-        assert_eq!(validate_client_hello(&hello), Err(RefusalCode::InvalidHello));
+        assert_eq!(
+            validate_client_hello(&hello),
+            Err(RefusalCode::InvalidHello)
+        );
 
         let mut hello = ClientHello::core_v2();
         hello.offered_capabilities = vec!["consume_batch".to_owned(), "consume_batch".to_owned()];
-        assert_eq!(validate_client_hello(&hello), Err(RefusalCode::InvalidHello));
+        assert_eq!(
+            validate_client_hello(&hello),
+            Err(RefusalCode::InvalidHello)
+        );
 
         let mut hello = ClientHello::core_v2();
         hello.required_capabilities.push("future".to_owned());
-        assert_eq!(validate_client_hello(&hello), Err(RefusalCode::InvalidHello));
+        assert_eq!(
+            validate_client_hello(&hello),
+            Err(RefusalCode::InvalidHello)
+        );
     }
 
     #[test]
@@ -1428,11 +1659,8 @@ mod tests {
             payload,
             request_id,
             ..
-        }) = decode_client_frame(
-            &encoded.as_bytes()[4..],
-            MAX_CLIENT_TO_SERVER_FRAME_BYTES,
-        )
-        .unwrap()
+        }) = decode_client_frame(&encoded.as_bytes()[4..], MAX_CLIENT_TO_SERVER_FRAME_BYTES)
+            .unwrap()
         else {
             panic!("v2 publish should retain its opaque byte field");
         };
@@ -1450,17 +1678,18 @@ mod tests {
             true,
         );
         let encoded = encode_server_frame(&ServerFrame::Application(reply)).unwrap();
-        let ServerFrame::Application(decoded) = decode_server_frame(
-            &encoded.as_bytes()[4..],
-            MAX_SERVER_TO_CLIENT_FRAME_BYTES,
-        )
-        .unwrap()
+        let ServerFrame::Application(decoded) =
+            decode_server_frame(&encoded.as_bytes()[4..], MAX_SERVER_TO_CLIENT_FRAME_BYTES)
+                .unwrap()
         else {
             panic!("application result should decode");
         };
         assert_eq!(decoded.outcome, Some(Outcome::Confirmed));
         assert_eq!(decoded.stage, Some(Stage::Durable));
-        assert!(matches!(decoded.response, Response::Published { offset: 9, .. }));
+        assert!(matches!(
+            decoded.response,
+            Response::Published { offset: 9, .. }
+        ));
     }
 
     #[test]
@@ -1488,11 +1717,9 @@ mod tests {
             ],
         );
         let encoded = encode_server_frame(&ServerFrame::Application(reply)).unwrap();
-        let ServerFrame::Application(decoded) = decode_server_frame(
-            &encoded.as_bytes()[4..],
-            MAX_SERVER_TO_CLIENT_FRAME_BYTES,
-        )
-        .unwrap()
+        let ServerFrame::Application(decoded) =
+            decode_server_frame(&encoded.as_bytes()[4..], MAX_SERVER_TO_CLIENT_FRAME_BYTES)
+                .unwrap()
         else {
             panic!("batch result should decode");
         };
@@ -1517,7 +1744,10 @@ mod tests {
             Err(V2ProtocolError::FrameTooLarge)
         );
         assert!(matches!(
-            decode_client_frame(&vec![0; AUTH_MAX_BODY_BYTES + 1], MAX_CLIENT_TO_SERVER_FRAME_BYTES),
+            decode_client_frame(
+                &vec![0; AUTH_MAX_BODY_BYTES + 1],
+                MAX_CLIENT_TO_SERVER_FRAME_BYTES
+            ),
             Err(V2ProtocolError::InvalidFrame)
         ));
     }
@@ -1533,11 +1763,9 @@ mod tests {
             }],
         };
         let encoded = encode_client_frame(&ClientFrame::Application(request)).unwrap();
-        let ClientFrame::Application(Request::PublishBatch { records, .. }) = decode_client_frame(
-            &encoded.as_bytes()[4..],
-            MAX_CLIENT_TO_SERVER_FRAME_BYTES,
-        )
-        .unwrap()
+        let ClientFrame::Application(Request::PublishBatch { records, .. }) =
+            decode_client_frame(&encoded.as_bytes()[4..], MAX_CLIENT_TO_SERVER_FRAME_BYTES)
+                .unwrap()
         else {
             panic!("batch operation should decode");
         };
@@ -1638,13 +1866,13 @@ mod tests {
     fn scalar_and_batch_response_bounds_cover_generated_protobuf_frames() {
         let message = binary_message();
         let scalar = encoded_application_body(scalar_binary_reply(&message));
-        let scalar_bound = poll_message_response_upper_bound(
-            &message,
-            "worker",
-            Some("member-a"),
-            true,
+        let scalar_bound =
+            poll_message_response_upper_bound(&message, "worker", Some("member-a"), true);
+        assert!(
+            scalar_bound >= scalar.len(),
+            "{scalar_bound} < {}",
+            scalar.len()
         );
-        assert!(scalar_bound >= scalar.len(), "{scalar_bound} < {}", scalar.len());
 
         let batch = encoded_application_body(batch_binary_reply(&message));
         let batch_bound = poll_batch_response_len(
@@ -1653,6 +1881,10 @@ mod tests {
             Some("member-a"),
             std::slice::from_ref(&message),
         );
-        assert!(batch_bound >= batch.len(), "{batch_bound} < {}", batch.len());
+        assert!(
+            batch_bound >= batch.len(),
+            "{batch_bound} < {}",
+            batch.len()
+        );
     }
 }

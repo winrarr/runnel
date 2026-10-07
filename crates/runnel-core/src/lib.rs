@@ -211,12 +211,7 @@ impl Engine for Broker {
         let consumer = consumer.to_owned();
         let member = member.to_owned();
         Arc::clone(&self.inner.storage_executor).dispatch_stream(stream, move |stream| {
-            broker.poll_group_with_response_limit(
-                stream,
-                &consumer,
-                &member,
-                max_response_bytes,
-            )
+            broker.poll_group_with_response_limit(stream, &consumer, &member, max_response_bytes)
         })
     }
 
@@ -1191,9 +1186,7 @@ mod tests {
     fn oversized_scalar_poll_does_not_persist_a_delivery_attempt() {
         let directory = tempdir().unwrap();
         let broker = Broker::open(directory.path(), BrokerConfig::default()).unwrap();
-        broker
-            .publish("events", None, vec![0xff; 2_048])
-            .unwrap();
+        broker.publish("events", None, vec![0xff; 2_048]).unwrap();
 
         assert!(matches!(
             broker.poll_with_response_limit("events", "worker", 1_024),
@@ -1218,6 +1211,90 @@ mod tests {
     }
 
     #[test]
+    fn oversized_poll_does_not_commit_expiry_retry_or_member_changes() {
+        use crate::delivery_state::InFlight;
+        use std::time::Instant;
+
+        let directory = tempdir().unwrap();
+        let broker = Broker::open(directory.path(), BrokerConfig::default()).unwrap();
+        broker.create_stream("events").unwrap();
+        broker
+            .configure_consumer("events", "workers", 60_000, None, 60_000)
+            .unwrap();
+        broker
+            .publish("events", None, b"expired-small".to_vec())
+            .unwrap();
+        broker.publish("events", None, vec![0xff; 2_048]).unwrap();
+
+        let expired = match broker
+            .poll_group("events", "workers", "expired-member")
+            .unwrap()
+        {
+            PollResult::Message(message) => message,
+            PollResult::Empty => panic!("expected the first delivery"),
+        };
+        let active = match broker
+            .poll_group("events", "workers", "target-member")
+            .unwrap()
+        {
+            PollResult::Message(message) => message,
+            PollResult::Empty => panic!("expected the second delivery"),
+        };
+
+        let stream_state = broker.inner.streams.read().unwrap()["events"].clone();
+        let mut stream_state = stream_state.lock().unwrap();
+        stream_state.delivery.remove("workers", expired.offset);
+        stream_state.delivery.insert(
+            "workers",
+            InFlight::new(
+                "expired-member",
+                expired.offset,
+                expired.key,
+                expired.delivery_attempt.unwrap(),
+                expired.delivery_token.unwrap(),
+                false,
+                Instant::now() - Duration::from_millis(1),
+            ),
+        );
+        assert_eq!(
+            stream_state
+                .delivery
+                .member_delivery("workers", "target-member")
+                .unwrap()
+                .unwrap()
+                .offset(),
+            active.offset
+        );
+        drop(stream_state);
+
+        assert!(matches!(
+            broker.poll_group_with_response_limit("events", "workers", "target-member", 1_024),
+            Err(BrokerError::ResponseTooLarge { max_bytes: 1_024 })
+        ));
+
+        let state = load_consumer_state(directory.path(), "events", "workers").unwrap();
+        assert_eq!(state.delivery_attempts.get(&expired.offset), Some(&1));
+        assert!(state.retry_not_before.is_empty());
+        assert_eq!(state.delivery_attempts.get(&active.offset), Some(&1));
+        let stream_state = broker.inner.streams.read().unwrap()["events"].clone();
+        let stream_state = stream_state.lock().unwrap();
+        assert!(
+            stream_state
+                .delivery
+                .member_delivery("workers", "expired-member")
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            stream_state
+                .delivery
+                .member_delivery("workers", "target-member")
+                .unwrap()
+                .is_some()
+        );
+    }
+
+    #[test]
     fn oversized_poll_does_not_commit_staged_dead_letter_transitions() {
         let directory = tempdir().unwrap();
         let broker = Broker::open(
@@ -1229,9 +1306,7 @@ mod tests {
         )
         .unwrap();
         broker.publish("events", None, b"poison".to_vec()).unwrap();
-        broker
-            .publish("events", None, vec![0xff; 2_048])
-            .unwrap();
+        broker.publish("events", None, vec![0xff; 2_048]).unwrap();
         assert!(matches!(
             broker.poll("events", "worker").unwrap(),
             PollResult::Message(Message { offset: 0, .. })
@@ -1259,6 +1334,38 @@ mod tests {
         assert_eq!(source.committed_offset, 1);
         assert_eq!(source.delivery_attempts.get(&1), Some(&1));
         assert_eq!(broker.health().unwrap().dead_letters, 1);
+    }
+
+    #[test]
+    fn over_cap_poll_limit_is_rejected_before_creating_a_delivery() {
+        let directory = tempdir().unwrap();
+        let broker = Broker::open(directory.path(), BrokerConfig::default()).unwrap();
+        broker.create_stream("events").unwrap();
+        broker.publish("events", None, b"bounded".to_vec()).unwrap();
+
+        assert!(matches!(
+            broker.poll_group_with_response_limit(
+                "events",
+                "workers",
+                "member-a",
+                runnel_engine::MAX_CONSUME_BATCH_RESPONSE_BYTES + 1,
+            ),
+            Err(BrokerError::InvalidBatchRequest(_))
+        ));
+
+        let PollResult::Message(message) = broker
+            .poll_group_with_response_limit(
+                "events",
+                "workers",
+                "member-a",
+                runnel_engine::MAX_CONSUME_BATCH_RESPONSE_BYTES,
+            )
+            .unwrap()
+        else {
+            panic!("expected first delivery after rejected over-cap poll");
+        };
+        assert_eq!(message.offset, 0);
+        assert_eq!(message.delivery_attempt, Some(1));
     }
 
     #[test]

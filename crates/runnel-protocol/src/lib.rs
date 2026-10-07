@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 
-pub mod v2;
 mod security;
+pub mod v2;
 pub use security::{BearerToken, SecurityRole, TokenFormatError};
 
 /// Name of the v2 Protobuf application protocol.

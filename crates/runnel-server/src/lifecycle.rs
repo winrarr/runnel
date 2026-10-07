@@ -16,16 +16,27 @@ use crate::protocol::ProtocolAdmission;
 
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(25);
 
+pub(crate) struct RuntimeServices {
+    pub(super) peer: Option<(TcpListener, Arc<GroupManager>)>,
+    pub(super) cluster: Option<Arc<GroupManager>>,
+    pub(super) server_metrics: Arc<ServerMetrics>,
+    pub(super) protocol_admission: ProtocolAdmission,
+    pub(super) application_security: ApplicationSecurity,
+}
+
 pub(crate) async fn run(
     tcp_listener: TcpListener,
     http_listener: TcpListener,
     engine: Arc<dyn Engine>,
-    peer: Option<(TcpListener, Arc<GroupManager>)>,
-    cluster: Option<Arc<GroupManager>>,
-    server_metrics: Arc<ServerMetrics>,
-    protocol_admission: ProtocolAdmission,
-    application_security: ApplicationSecurity,
+    services: RuntimeServices,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    let RuntimeServices {
+        peer,
+        cluster,
+        server_metrics,
+        protocol_admission,
+        application_security,
+    } = services;
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
     let shutting_down = Arc::new(AtomicBool::new(false));
     let mut tcp_task = connection::spawn_with_security(

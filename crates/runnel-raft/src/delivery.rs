@@ -1079,9 +1079,7 @@ fn group_poll_response_upper_bound(
                         .any(|delivery| delivery.key.as_ref() == Some(key))
                 })
             });
-        let Some((offset, stored)) = candidate else {
-            return None;
-        };
+        let (offset, stored) = candidate?;
         let attempts = consumer_state
             .delivery_attempts
             .get(&offset)
@@ -1363,6 +1361,8 @@ mod retry_delay_tests {
             stream: "events".to_owned(),
             consumer: "workers".to_owned(),
             member: member.to_owned(),
+            response_member: None,
+            max_response_bytes: runnel_engine::MAX_CONSUME_BATCH_RESPONSE_BYTES,
             now_ms,
             lease_deadline_ms,
             max_delivery_attempts: None,

@@ -188,11 +188,13 @@ pub(crate) async fn run() -> Result<(), Box<dyn std::error::Error>> {
         tcp_listener,
         http_listener,
         engine,
-        peer,
-        cluster,
-        server_metrics,
-        protocol_admission,
-        application_security,
+        lifecycle::RuntimeServices {
+            peer,
+            cluster,
+            server_metrics,
+            protocol_admission,
+            application_security,
+        },
     )
     .await
 }

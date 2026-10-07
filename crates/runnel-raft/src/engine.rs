@@ -16,8 +16,9 @@ use openraft::raft::{
 use runnel_engine::StageTimer;
 use runnel_engine::{
     AckBatchResult, AckResult, BrokerError, ConsumeBatchLimits, ConsumerPolicy, DeliveryReceipt,
-    Engine, EngineFuture, Message, Offset, PollResult, ReplayMessage, validate_ack_batch_receipts,
-    validate_consume_batch_limits, validate_consumer_policy, MAX_CONSUME_BATCH_RESPONSE_BYTES,
+    Engine, EngineFuture, MAX_CONSUME_BATCH_RESPONSE_BYTES, Message, Offset, PollResult,
+    ReplayMessage, validate_ack_batch_receipts, validate_consume_batch_limits,
+    validate_consumer_policy, validate_poll_response_limit,
 };
 use serde::{Deserialize, Serialize};
 use tokio::sync::RwLock;
@@ -701,6 +702,7 @@ impl RaftGroup {
         response_member: Option<String>,
         max_response_bytes: usize,
     ) -> Result<PollResult, BrokerError> {
+        validate_poll_response_limit(max_response_bytes)?;
         #[cfg(feature = "instrumentation")]
         let _stage_timer = StageTimer::new("raft.poll_quorum");
         let now_ms = now_ms();

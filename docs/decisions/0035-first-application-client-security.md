@@ -112,7 +112,8 @@ wire schema.
 - The reusable Rust client must accept the token through a secret-safe config
   path that is neither `Copy` nor capable of revealing it through `Debug`.
   Clients validate the server against system trust roots or operator-supplied
-  roots and the DNS/IP name they dial. `runnelctl` reads a protected credential
+  roots and the DNS/IP name they dial. A supplied trust bundle replaces system
+  roots so private trust does not implicitly authorize public roots. `runnelctl` reads a protected credential
   file by path; no client or CLI accepts a token as an argument or environment
   variable.
 - Define two fixed roles and no custom permission language:
@@ -264,7 +265,8 @@ hardening remain release work.
 ## Implementation evidence required
 
 The implementation supplies the v2 authentication exchange, secret-safe client
-TLS and credential configuration, TLS 1.3 policy construction,
+TLS and credential configuration, TLS 1.3 policy construction, system roots by
+default and exclusive operator-supplied roots when a custom bundle is set,
 runtime credential-policy parsing and verifier checks, fixed-role
 classification, and a pre-dispatch authorization gate. Server startup now
 loads the certificate, private key, and credential policy before binding; a
@@ -275,33 +277,31 @@ TLS/auth settings are rejected with the Raft engine because token policy is
 local and replica consistency and rotation are not implemented. Real-process
 tests cover loopback development access, non-loopback rejection and explicit
 override, invalid-policy startup failure, TLS plus authentication on a
-non-loopback bind, failed credentials, role denial without stream mutation,
-and successful authorized operations. The CLI does not yet expose runtime
-token/trust configuration. Remaining protocol and deployment gates below are
-open; these focused implementation and process tests do not establish that a
-whole deployment is secure. The HTTP operations listener remains outside this
-contract.
+non-loopback bind, missing and unknown credentials, server-name mismatch,
+role denial without stream mutation, and successful authorized operations.
+Focused response-admission tests also verify oversized publish and ack batches
+are rejected before state changes. The Rust client test proves a custom trust
+bundle replaces platform roots. The focused real-process security and response
+size tests pass, along with the full Raft library suite (131 tests). The CLI
+does not yet expose runtime token/trust configuration. Remaining protocol and
+deployment gates below are open; these focused implementation and process
+tests do not establish that a whole deployment is secure. The HTTP operations
+listener remains outside this contract.
 
 Before describing a secured build as ready for use, complete the remaining
 protocol and real-server coverage for:
 
-- successful TLS 1.3 client connection, TLS completion before protocol preface,
-  rejection of TLS 1.2 and plaintext at the secure listener, trusted CA
-  loading, certificate/name mismatch, and proof that neither the TLS library
-  nor the server accepts 0-RTT application operations; incomplete handshakes,
-  oversized pre-authentication input, and repeated failed authentication
-  remain within configured resource/time bounds;
-- in secured core v2, require `auth_required=true` in the `Hello` reply and
-  complete the bounded `bearer_auth` exchange. Treat omission as a protocol
-  violation; reject false or unavailable authentication before application
-  dispatch. Exercise valid, missing, unknown, and malformed credentials and
-  prove no application request reaches dispatch before success; then verify
-  role-permitted operations, application-role denials for stream creation,
-  consumer-policy changes, and protocol health, plus exhaustive handling when
-  protocol operations are added;
-- invalid or unreadable policy/certificate files failing before listener
-  acceptance, and proof that tokens/digests never appear in client/server
-  debug output, logs, errors, or metrics;
+- end-to-end rejection of a TLS 1.2-only client at the application listener
+  and attempts to submit application data as TLS early data; incomplete
+  handshakes, oversized pre-authentication input, and repeated failed
+  authentication must remain within configured resource/time bounds;
+- proof across the real process boundary that no application request reaches
+  dispatch before the bounded `bearer_auth` exchange succeeds; add a malformed
+  credential case, and retain exhaustive protocol-variant authorization tests
+  as operations are added;
+- unreadable policy/certificate files failing before listener acceptance, and
+  proof that tokens/digests never appear in client/server logs, errors, or
+  metrics (debug formatting is already covered by unit tests);
 - overlapping credentials across a restart, successful client migration,
   retired-token rejection after restart, connection interruption, and explicit
   client handling of requests whose outcome may already be unknown;
@@ -310,13 +310,14 @@ protocol and real-server coverage for:
   test that health probes and the designated scraper work while untrusted
   namespaces/ingress cannot reach port 8080. Exercise any required NetworkPolicy
   with the supported CNI rather than treating its YAML presence as proof;
-- if security configuration is supported in clustered mode, verify consistent
-  role/token policy on every client-serving replica during startup, restart,
-  and rotation. Otherwise reject or clearly disable the claimed cluster-secure
-  mode until peer security and replica coordination are designed.
+- if application security is later supported in clustered mode, verify
+  consistent role/token policy on every client-serving replica during startup,
+  restart, and rotation. The current startup path explicitly rejects this
+  configuration, so no clustered application-security guarantee is claimed.
 
-No runtime test is applicable to this docs-only decision change. The tests
-above are release gates for implementation. The existing
+These remaining items are release gates for claiming the complete deployment
+contract; the implemented single-node slice and its tests do not establish
+that the deployment is secure. The existing
 [single-node deployment backlog outcome](../backlog.md#make-the-single-node-deployment-ready-for-real-use)
 remains open until code, actual deployment isolation, client ergonomics,
 documentation, and these tests are complete. The separate

@@ -1,7 +1,7 @@
 # TD-007: Storage compatibility evidence
 
 - Status: source and test evidence only; runtime conversion remains unimplemented
-- Last reviewed: 2026-10-06
+- Last reviewed: 2026-10-07
 - Baseline: `6b53cc0ed3a83017e59d42319ce696f825fb388f`
 - Scope: local durable files, clustered durable artifacts, and the boundary
   between same-binary recovery and supported release upgrades
@@ -14,10 +14,13 @@
   [ADR 0019](../decisions/0019-clustered-storage-identity.md), with the
   accepted behavior in [ADR 0037](../decisions/0037-offline-side-by-side-storage-upgrades.md)
 
-This note records what the source and tests at the stated baseline establish.
-ADR 0037 separately accepts the first operational upgrade behavior; this note
-does not describe a migration command or claim that conversion, rolling
-upgrade, downgrade, or new-format runtime support has been implemented.
+The Baseline field identifies the historical source revision used for the
+original compatibility survey. The current conclusion and evidence matrix
+also record the v3 persistence implementation and focused refusal tests added
+after that survey. ADR 0037 separately accepts the first operational upgrade
+behavior; this note does not describe a migration command or claim that
+conversion, rolling upgrade, downgrade, or new-format migration support has
+been implemented.
 
 ## Current conclusion
 
@@ -34,16 +37,20 @@ version boundaries:
   and snapshots before `GroupManager` opens groups. Invalid known state is
   refused in the tested cases. The standalone layout validator has a
   read-only fixture test; this does not make all engine startup read-only.
-- Clustered Raft logs use a version-2 marker, bounded entry segments, and a
-  bounded control record. Version-1 whole-map artifacts fail without mutation;
-  no v1 reader, writer, or conversion is retained. Focused tests cover v2
-  reopen, vote/commit recovery, truncation, purge, incomplete-tail repair,
-  completed-batch corruption, and explicit v1 refusal. Real-process
+- Clustered Raft logs use a version-3 marker, bounded entry segments, and a
+  bounded control record. Version-1 and version-2 artifacts fail without
+  mutation; no older reader, writer, or conversion is retained. Focused tests
+  cover v3 reopen, vote/commit recovery, truncation, purge, incomplete-tail
+  repair, completed-batch corruption, and explicit prior-version refusal. Real-process
   follower/snapshot/purge interaction and the complete storage fault matrix
-  remain open. The state-machine journal uses version 2; checkpoints and
-  snapshot payloads use version 3. Those readers require the current version
-  and every current field, with no pre-retry format read-forward. Tests reject
-  prior and future checkpoint, snapshot, and journal versions without mutation.
+  remain open. The state-machine journal now uses version 3 with a 96 MiB
+  record bound; checkpoints and snapshot payloads use version 3. Publish
+  command payloads in Raft entries and journal records use compact
+  text/base64 JSON, so the Raft log and journal versions were bumped and old
+  array-encoded commands fail closed before deserialization. Those readers
+  require the current version and every current field, with no older-format
+  read-forward. Tests reject prior and future checkpoint, snapshot, and journal
+  versions without mutation.
 - Snapshot installation and the test-only empty-replica experiment establish
   recovery mechanisms under their tested conditions. [ADR 0018](../decisions/0018-safe-replica-recovery-boundary.md)
   explicitly excludes empty-replica replacement from the production
@@ -66,7 +73,7 @@ startup conversion is provided for those state artifacts.
 | Local consumer state | JSON checkpoints persist committed and out-of-order acknowledgement progress, delivery attempts, and policy; a bounded JSON-lines journal replays events and discards an incomplete final line. Tests cover reopen after an acknowledgement journal failure, partial-tail recovery, the journal bound, and rejection of oversized journal data. [`consumer_state.rs`](../../crates/runnel-core/src/consumer_state.rs#L13) [`consumer_state.rs`](../../crates/runnel-core/src/consumer_state.rs#L120) [`consumer_state.rs`](../../crates/runnel-core/src/consumer_state.rs#L228) [`lib.rs`](../../crates/runnel-core/src/lib.rs#L1882) [`lib.rs`](../../crates/runnel-core/src/lib.rs#L1941) [`lib.rs`](../../crates/runnel-core/src/lib.rs#L2155) [`lib.rs`](../../crates/runnel-core/src/lib.rs#L2253) | Checkpoint and journal records have no explicit schema version or release-pair writer contract. Delivery tokens and deadlines are volatile. No old-binary/new-state reopen test exists. |
 | Cluster storage identity | `storage.json` records metadata version 1, cluster name, and node ID. Existing mismatched, malformed, or unsupported metadata and unmarked grouped state fail before group open in covered cases. [`engine.rs`](../../crates/runnel-raft/src/engine.rs#L29) [`engine.rs`](../../crates/runnel-raft/src/engine.rs#L48) [`engine.rs`](../../crates/runnel-raft/src/engine.rs#L901) [`lib.rs`](../../crates/runnel-raft/src/lib.rs#L1639) [`lib.rs`](../../crates/runnel-raft/src/lib.rs#L1859) [`lib.rs`](../../crates/runnel-raft/src/lib.rs#L2093) | The marker identifies cluster and node ownership; it is not a generation selector, migration record, or downgrade authority. New-store initialization may write it. |
 | Clustered layout preflight | Startup rejects recognized old single-group paths. Validation checks the metadata group, data-group directory names, stream/group identity in `group.json`, Raft logs, checkpoints, journals, and snapshots before `GroupManager` opens groups. `group.json` has no explicit schema-version field. Tests cover old root layouts, missing metadata group, unsupported data-group log, contradictory manifest, and an unchanged current-layout fixture. [`engine.rs`](../../crates/runnel-raft/src/engine.rs#L32) [`engine.rs`](../../crates/runnel-raft/src/engine.rs#L901) [`group_manager.rs`](../../crates/runnel-raft/src/group_manager.rs#L86) [`group_manager.rs`](../../crates/runnel-raft/src/group_manager.rs#L671) [`group_manager.rs`](../../crates/runnel-raft/src/group_manager.rs#L686) [`group_manager.rs`](../../crates/runnel-raft/src/group_manager.rs#L816) [`lib.rs`](../../crates/runnel-raft/src/lib.rs#L1797) [`lib.rs`](../../crates/runnel-raft/src/lib.rs#L1893) [`lib.rs`](../../crates/runnel-raft/src/lib.rs#L1954) | The fixture verifies the validator on a known current layout. It is not an end-to-end migration from the old layout, proof against arbitrary filesystem contents, or crash-safe activation evidence. The manifest shape is an identity check, not a release compatibility contract. |
-| Cluster Raft log and state-machine journal | The Raft log uses a version-2 marker, checksummed segment family, and bounded control record; it rejects v1 without mutation or empty-store fallback. Tests cover current-format reopen and control recovery, truncation, purge, incomplete-tail recovery, completed-batch corruption, and v1 refusal. The separate state-machine journal uses strict version-2 frames, rejects other versions, and discards an incomplete final record. [`log_store.rs`](../../crates/runnel-raft/src/log_store.rs) [`raft_log_segments.rs`](../../crates/runnel-raft/src/raft_log_segments.rs) [`state_machine_journal.rs`](../../crates/runnel-raft/src/state_machine_journal.rs) [`lib.rs`](../../crates/runnel-raft/src/lib.rs) | Current-format recovery tests do not establish all real-process follower/snapshot interactions or the complete storage fault matrix. No cross-release OpenRaft log or command compatibility is established; current envelope versions do not promise release stability. |
+| Cluster Raft log and state-machine journal | The Raft log uses a version-3 marker, checksummed segment family, and bounded control record; versions 1 and 2 fail without mutation or empty-store fallback. Tests cover v3 reopen and control recovery, truncation, purge, incomplete-tail recovery, completed-batch corruption, and prior-version refusal. The separate state-machine journal uses strict version-3 frames, a 96 MiB record bound, and rejects prior versions before decoding command payloads; incomplete final records remain recoverable. [`log_store.rs`](../../crates/runnel-raft/src/log_store.rs) [`raft_log_segments.rs`](../../crates/runnel-raft/src/raft_log_segments.rs) [`state_machine_journal.rs`](../../crates/runnel-raft/src/state_machine_journal.rs) [`lib.rs`](../../crates/runnel-raft/src/lib.rs) | Current-format recovery tests do not establish all real-process follower/snapshot interactions or the complete storage fault matrix. No cross-release OpenRaft log or command compatibility is established; current envelope versions do not promise release stability. |
 | Cluster state-machine checkpoint | Current writer emits version 3 and the reader accepts only version 3. Required fields and current stream shapes must be present. Tests reject versions 1 and 2 and a future version without rewriting the checkpoint or creating a journal. [`lib.rs`](../../crates/runnel-raft/src/lib.rs#L94) [`state_machine_store.rs`](../../crates/runnel-raft/src/state_machine_store.rs#L44) [`state_machine_store.rs`](../../crates/runnel-raft/src/state_machine_store.rs#L374) [`lib.rs`](../../crates/runnel-raft/src/lib.rs#L2298) | No old-format migration or cross-release state compatibility is provided. |
 | Cluster snapshot payload and install | Current snapshot payload writer emits version 3 and the reader accepts only version 3 with all required fields and current stream shapes. Tests reject versions 1 and 2 and a future version without changing the snapshot or creating a journal. Installation validates before publishing in-memory state and persists the snapshot/checkpoint before replacing the in-memory image; current-format failure tests retain the prior state. [`state_machine_store.rs`](../../crates/runnel-raft/src/state_machine_store.rs#L56) [`state_machine_store.rs`](../../crates/runnel-raft/src/state_machine_store.rs#L175) [`state_machine_store.rs`](../../crates/runnel-raft/src/state_machine_store.rs#L863) [`lib.rs`](../../crates/runnel-raft/src/lib.rs#L2360) [`state_machine_store.rs`](../../crates/runnel-raft/src/state_machine_store.rs#L964) | No old-format migration, resumable transfer, or proof that different binary versions can exchange snapshots is provided. |
 | Peer protocol boundary | Peer requests are a set of operation variants carried in bounded, length-prefixed JSON frames; the request enum has no explicit protocol version or handshake. [`network.rs`](../../crates/runnel-raft/src/network.rs#L17) [`framing.rs`](../../crates/runnel-raft/src/network/framing.rs#L9) | No old/new peer interoperability matrix establishes that mixed binaries can exchange Raft entries, commands, forwarded operations, or snapshots safely. |

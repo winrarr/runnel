@@ -188,7 +188,7 @@ def _decode_server_hello(body: bytes) -> tuple[int, int]:
 
     accepted = _parse_fields(result[0][1])  # type: ignore[arg-type]
     major = _uint(_one(accepted, 1, 0, required=True), MAX_UINT32, "major")
-    minor = _uint(_one(accepted, 2, 0, required=True), MAX_UINT32, "minor")
+    minor = _uint(_one(accepted, 2, 0, default=0), MAX_UINT32, "minor")
     capabilities = [_text(value, "capabilities") for value in _repeated(accepted, 3, 2)]
     server_inbound = _uint(
         _one(accepted, 4, 0, required=True), MAX_UINT32, "server inbound limit"
@@ -308,8 +308,7 @@ def _encode_application_request(request: dict[str, Any]) -> bytes:
     else:
         raise V2ProtocolError(f"unsupported workflow operation: {operation!r}")
     application_request = _bytes_field(number, message)
-    application = _bytes_field(1, application_request)
-    return _bytes_field(2, application)
+    return _bytes_field(2, application_request)
 
 
 def _decode_message(fields: list[tuple[int, int, int | bytes]]) -> dict[str, Any]:

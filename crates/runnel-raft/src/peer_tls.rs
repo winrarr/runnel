@@ -24,9 +24,14 @@ const MAX_SIMULTANEOUS_HANDSHAKES: usize = 32;
 // address the same broker. Admission waits are bounded by the RPC TTL.
 const MAX_ACTIVE_PEER_CONNECTIONS: usize = 256;
 const FRAME_MEMORY_QUANTUM: usize = 1024 * 1024;
-// Charges at most 256 MiB of encoded frame bytes per process. The decoded heap size
-// is type-dependent and is not an exact allocation budget.
-const MAX_CONCURRENT_PEER_FRAME_MEMORY: usize = 256 * 1024 * 1024;
+// Charges at most 192 MiB for buffered frames plus an estimate of decoded
+// objects per process. A 96 MiB input frame consumes the full budget; the cap
+// also allows two concurrent maximum-size outbound frames.
+const MAX_CONCURRENT_PEER_FRAME_MEMORY: usize = 192 * 1024 * 1024;
+// Reserve decoded poll/replay results together with their serialized peer
+// frame before dispatch, so the per-operation public response bound also
+// limits aggregate response memory.
+const MAX_CONCURRENT_PEER_RESPONSE_MEMORY: usize = 256 * 1024 * 1024;
 const MAX_CONCURRENT_FRAME_WRITES: usize = 4;
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -49,6 +54,7 @@ pub struct PeerTlsConfig {
     inbound_connections: Arc<Semaphore>,
     outbound_connections: Arc<Semaphore>,
     frame_memory: Arc<Semaphore>,
+    response_memory: Arc<Semaphore>,
     frame_writes: Arc<Semaphore>,
 }
 
@@ -166,6 +172,9 @@ impl PeerTlsConfig {
             frame_memory: Arc::new(Semaphore::new(
                 MAX_CONCURRENT_PEER_FRAME_MEMORY / FRAME_MEMORY_QUANTUM,
             )),
+            response_memory: Arc::new(Semaphore::new(
+                MAX_CONCURRENT_PEER_RESPONSE_MEMORY / FRAME_MEMORY_QUANTUM,
+            )),
             frame_writes: Arc::new(Semaphore::new(MAX_CONCURRENT_FRAME_WRITES)),
         })
     }
@@ -225,6 +234,10 @@ impl PeerTlsConfig {
 
     pub(crate) fn frame_memory(&self) -> Arc<Semaphore> {
         Arc::clone(&self.frame_memory)
+    }
+
+    pub(crate) fn response_memory(&self) -> Arc<Semaphore> {
+        Arc::clone(&self.response_memory)
     }
 
     pub(crate) fn frame_write_slots(&self) -> Arc<Semaphore> {

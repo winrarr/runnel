@@ -1,7 +1,7 @@
 # TD-009: Clustered snapshot scalability and compatibility evidence
 
 - Status: snapshot-build telemetry and a bounded measurement probe are implemented; representation and recovery changes remain exploratory
-- Last reviewed: 2026-10-05
+- Last reviewed: 2026-10-07
 - Baseline: `821f2c24b6b8feafdc6563cc6eb76746f75c34d1`
 - Scope: OpenRaft state-machine snapshot creation, transfer, installation,
   recovery, and the path toward incremental or streaming snapshots
@@ -11,8 +11,10 @@
 - Related evidence: [TD-007 storage compatibility](td-007-storage-compatibility-evidence.md), [TD-010 retained-state materialization](td-010-retained-state-evidence.md), [TD-026 clustered log and snapshot observations](../research/td-026-log-store-persistence-baseline.md), and [bounded snapshot-build hot-path samples](../research/td-009-snapshot-build-hot-path.csv)
 
 This note records what the current clustered backend proves and what it does
-not prove about snapshot cost and compatibility. It is not an implementation
-plan, a public snapshot API, or authorization to change the format. [ADR
+not prove about snapshot cost and compatibility. The artifact table reflects
+the current v3 Raft-log and state-machine journal formats; the Baseline field
+retains the revision used for the original snapshot survey. This is not an
+implementation plan, a public snapshot API, or authorization to change the format. [ADR
 0023](../decisions/0023-independent-retained-storage-and-placement.md) accepts
 the architectural outcome that replicated snapshots should not require copying
 all retained payloads; this note does not choose a representation, transfer
@@ -53,9 +55,9 @@ the group directory:
 
 | Artifact | Current representation | Recovery role |
 | --- | --- | --- |
-| `raft-log.json` | Version-1 JSON Raft log with committed, vote, purge, and retained entries | Consensus history; may be purged after a snapshot. It is not retained broker history. |
+| `raft-log.json` | Version-3 marker selecting checksummed Raft-log segments and bounded control state; versions 1 and 2 fail without mutation | Consensus history; may be purged after a snapshot. It is not retained broker history. |
 | `state-machine/state-machine.json` | Version-3 JSON checkpoint containing applied log, membership, and materialized state; only version 3 is accepted | Full checkpoint fallback and restart recovery. |
-| `state-machine/state-machine.log` | Length-prefixed JSON apply journal, record version 2, with a 64 MiB per-record limit | Durable apply record replayed after the selected checkpoint or snapshot. Only an incomplete final frame is truncated; old and unknown complete record versions fail startup. |
+| `state-machine/state-machine.log` | Length-prefixed JSON apply journal, record version 3, with a 96 MiB per-record limit | Durable apply record replayed after the selected checkpoint or snapshot. Only an incomplete final frame is truncated; old and unknown complete record versions fail startup. |
 | `state-machine/snapshot.json` | JSON `StoredSnapshot` wrapper containing OpenRaft `SnapshotMeta` and a JSON snapshot payload | Current snapshot cache and persisted recovery image. The atomic replacement syncs the file and parent directory. |
 
 On [`StateMachineStore::open`](../../crates/runnel-raft/src/state_machine_store.rs#L391-L442), recovery loads the checkpoint, validates and selects the snapshot only when its applied log boundary is newer, then reads the journal and replays entries strictly after the selected boundary. Journal reading materializes its contents before replay; only a partial final frame is truncated, while a complete malformed or unsupported record fails startup. Cluster identity, group manifest, and persisted-artifact preflight are owned by the surrounding clustered storage layer. The [TD-007 evidence note](td-007-storage-compatibility-evidence.md) records that preflight validates artifact shapes and identities but does not prove mixed-release compatibility or every cross-file boundary.
@@ -85,7 +87,7 @@ payload parsing alone does not prove cross-artifact agreement. See the
 [TD-007 compatibility evidence](td-007-storage-compatibility-evidence.md).
 
 The state-machine checkpoint and snapshot readers accept only version 3, and
-the current journal reader accepts only version 2. All persisted state fields
+the current journal reader accepts only version 3. All persisted state fields
 and current stream shapes are required; pre-retry checkpoint, snapshot, and
 journal schemas are rejected. Nested retained-message and grouped-delivery
 structs do not uniformly reject unknown fields. Snapshot payload validation
@@ -164,7 +166,7 @@ uses:
 - a replication-lag threshold of 64 entries; and
 - a maximum snapshot chunk size of 64 KiB.
 
-Peer frames have a 64 MiB limit in
+Peer frames have a 96 MiB limit in
 [`network/framing.rs`](../../crates/runnel-raft/src/network/framing.rs#L9-L44).
 Snapshot chunks are carried over the group-addressed framed peer protocol. The
 feature-gated real-process replacement experiment in
@@ -212,7 +214,7 @@ The current tests establish these properties:
    OpenRaft log-store interaction, process-crash or device-failure behavior,
    journal-compaction failure recovery, or every install boundary.
 5. **Pre-retry schemas fail closed.** Checkpoints and snapshot payloads before
-   version 3, and state-machine journal records before version 2, are not
+   version 3, and state-machine journal records before version 3, are not
    decoded or migrated. Current-format restart, replay, and snapshot recovery
    remain covered; this is not a mixed-version writer contract or a downgrade
    guarantee.
