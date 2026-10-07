@@ -26,6 +26,16 @@ class BenchmarkError(RuntimeError):
     """An expected benchmark setup or protocol failure."""
 
 
+class BrokerResponseError(BenchmarkError):
+    """A typed broker error response, including its stable protocol code."""
+
+    def __init__(self, operation: str, code: str, message: str) -> None:
+        self.operation = operation
+        self.code = code
+        self.message = message
+        super().__init__(f"broker rejected {operation}: {code}: {message}")
+
+
 class ProtocolClient:
     """Persistent client for the negotiated public Protocol Buffers v2 wire."""
 
@@ -46,9 +56,10 @@ class ProtocolClient:
         except V2ProtocolError as error:
             raise BenchmarkError(str(error)) from error
         if response.get("type") == "error":
-            raise BenchmarkError(
-                f"broker rejected {request.get('op')}: {response.get('code')}: "
-                f"{response.get('message')}"
+            raise BrokerResponseError(
+                str(request.get("op")),
+                str(response.get("code", "")),
+                str(response.get("message", "")),
             )
         return response, elapsed
 

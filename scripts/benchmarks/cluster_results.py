@@ -40,6 +40,7 @@ def build_workload(args: argparse.Namespace) -> dict[str, Any]:
         "scenarios": args.scenarios,
         "nodes": args.nodes,
         "ack_timeout_ms": args.ack_timeout_ms,
+        "preload_readiness_timeout_seconds": args.preload_readiness_timeout_seconds,
         "slow_consumer_delay_ms": args.slow_consumer_delay_ms,
         "slow_consumer_timeout_seconds": args.slow_consumer_timeout_seconds,
         "batch_size": args.batch_size,
@@ -164,6 +165,9 @@ def build_result(
                 "peer_response_proxy": cluster.peer_proxy_summary(),
                 "startup_seconds": cluster.startup_ns / 1_000_000_000,
                 "resource_samples": cluster.stats.summary(),
+                "preload_readiness": list(
+                    getattr(cluster, "preload_readiness", [])
+                ),
                 "scenarios": scenarios,
             }
         },

@@ -15,6 +15,7 @@ use runnel_client::{
     AttemptFailure, Client, ClientConfig, ClientError, PublishBatchOutcome, PublishBatchRecord,
     PublishOptions, PublishReceipt,
 };
+use runnel_protocol::v2::{ApplicationReply, Outcome as V2Outcome, Stage as V2Stage};
 use runnel_protocol::{
     AckBatchItemOutcome, BatchDeliveryReceipt, BatchMessageResponse, BinaryPayload,
     PublishBatchRecordResponse, Request, Response,
@@ -237,6 +238,93 @@ fn three_process_cluster_replicates_and_recovers_after_failures() {
 
     let leader = create_stream_on_any(&mut nodes, "events");
     let jobs_node = create_stream_on_any(&mut nodes, "jobs");
+
+    let readiness_stream = "follower-created-readiness";
+    let readiness_follower = (data_group_leader(&nodes, "events") + 1) % nodes.len();
+    let create_reply = request_reply(
+        nodes[readiness_follower].broker_addr,
+        Request::CreateStream {
+            stream: readiness_stream.to_owned(),
+        },
+    )
+    .expect("a follower endpoint should forward stream creation");
+    assert!(matches!(
+        create_reply.response,
+        Response::StreamCreated { created: true, .. }
+    ));
+    assert_eq!(create_reply.outcome, Some(V2Outcome::Confirmed));
+    assert_eq!(create_reply.stage, Some(V2Stage::Durable));
+
+    let readiness_publish = || Request::Publish {
+        stream: readiness_stream.to_owned(),
+        key: None,
+        payload: "single-readiness-record".to_owned(),
+        request_id: Some("single-readiness-record".to_owned()),
+    };
+    let first_publish = request_reply(nodes[readiness_follower].broker_addr, readiness_publish())
+        .expect("the first follower publish should return a broker outcome");
+    match &first_publish.response {
+        Response::Published { offset: 0, .. } => {
+            assert_eq!(first_publish.outcome, Some(V2Outcome::Confirmed));
+        }
+        Response::Error { code, .. } if code == "stream_not_ready" => {
+            assert_eq!(first_publish.outcome, Some(V2Outcome::Retryable));
+            assert_eq!(first_publish.stage, Some(V2Stage::ExecutionStarted));
+            assert!(matches!(
+                wait_for_response_at(
+                    nodes[readiness_follower].broker_addr,
+                    || Request::Poll {
+                        stream: readiness_stream.to_owned(),
+                        consumer: "readiness-observer".to_owned(),
+                    },
+                    |response| matches!(response, Response::Empty { .. }),
+                ),
+                Response::Empty { .. }
+            ));
+            let retry = wait_for_response_at(
+                nodes[readiness_follower].broker_addr,
+                readiness_publish,
+                |response| matches!(response, Response::Published { offset: 0, .. }),
+            );
+            assert!(matches!(retry, Response::Published { offset: 0, .. }));
+        }
+        response => panic!("unexpected first follower publish outcome: {response:?}"),
+    }
+    assert!(matches!(
+        wait_for_response_at(
+            nodes[readiness_follower].broker_addr,
+            || Request::Poll {
+                stream: readiness_stream.to_owned(),
+                consumer: "readiness-observer".to_owned(),
+            },
+            |response| matches!(response, Response::Message { offset: 0, .. }),
+        ),
+        Response::Message { offset: 0, .. }
+    ));
+    assert!(matches!(
+        wait_for_response_at(
+            nodes[readiness_follower].broker_addr,
+            || Request::Ack {
+                stream: readiness_stream.to_owned(),
+                consumer: "readiness-observer".to_owned(),
+                offset: 0,
+            },
+            |response| matches!(response, Response::Acknowledged { .. }),
+        ),
+        Response::Acknowledged { .. }
+    ));
+    assert!(matches!(
+        wait_for_response_at(
+            nodes[readiness_follower].broker_addr,
+            || Request::Poll {
+                stream: readiness_stream.to_owned(),
+                consumer: "readiness-observer".to_owned(),
+            },
+            |response| matches!(response, Response::Empty { .. }),
+        ),
+        Response::Empty { .. }
+    ));
+
     assert!(matches!(
         wait_for_response_at(
             nodes[jobs_node].broker_addr,
@@ -3522,11 +3610,23 @@ fn request(address: SocketAddr, request: Request) -> Result<Response, String> {
     request_with_timeout(address, request, REQUEST_READ_TIMEOUT)
 }
 
+fn request_reply(address: SocketAddr, request: Request) -> Result<ApplicationReply, String> {
+    request_reply_with_timeout(address, request, REQUEST_READ_TIMEOUT)
+}
+
 fn request_with_timeout(
     address: SocketAddr,
     request: Request,
     read_timeout: Duration,
 ) -> Result<Response, String> {
+    request_reply_with_timeout(address, request, read_timeout).map(|reply| reply.response)
+}
+
+fn request_reply_with_timeout(
+    address: SocketAddr,
+    request: Request,
+    read_timeout: Duration,
+) -> Result<ApplicationReply, String> {
     let mut stream =
         TcpStream::connect(address).map_err(|error| format!("connect to {address}: {error}"))?;
     stream
@@ -3571,7 +3671,7 @@ fn request_with_timeout(
     match v2::decode_server_frame(&response, v2::MAX_SERVER_TO_CLIENT_FRAME_BYTES)
         .map_err(|error| format!("decode application response from {address}: {error}"))?
     {
-        ServerFrame::Application(reply) => Ok(reply.response),
+        ServerFrame::Application(reply) => Ok(reply),
         ServerFrame::Authenticated | ServerFrame::AuthenticationFailed => Err(format!(
             "server at {address} returned an authentication frame before the application response"
         )),

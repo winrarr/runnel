@@ -30,6 +30,7 @@ from cluster_scenarios import (
     DEFAULT_PEER_FORWARDING_STREAM_COUNT,
     DEFAULT_PEER_FORWARDING_TIMEOUT_SECONDS,
     DEFAULT_PEER_RESPONSE_DELAY_MS,
+    DEFAULT_PRELOAD_READINESS_TIMEOUT_SECONDS,
     DEFAULT_PUBLISH_BATCH_SIZE,
     DEFAULT_RAFT_LOG_GROWTH_BATCH_SIZE,
     DEFAULT_RAFT_LOG_GROWTH_CYCLE_TIMEOUT_SECONDS,
@@ -52,6 +53,7 @@ from cluster_scenarios import (
     MAX_PEER_RESPONSE_DELAY_MS,
     MAX_PUBLISH_BATCH_SIZE,
     MAX_PARALLEL_GROUPED_TIMEOUT_SECONDS,
+    MAX_PRELOAD_READINESS_TIMEOUT_SECONDS,
     MAX_RAFT_LOG_GROWTH_BATCH_SIZE,
     MAX_RAFT_LOG_GROWTH_CYCLE_TIMEOUT_SECONDS,
     MAX_RAFT_LOG_GROWTH_LOGICAL_PAYLOAD_BYTES,
@@ -148,6 +150,15 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument("--ack-timeout-ms", type=int, default=DEFAULT_ACK_TIMEOUT_MS)
+    parser.add_argument(
+        "--preload-readiness-timeout-seconds",
+        type=parse_positive_float,
+        default=DEFAULT_PRELOAD_READINESS_TIMEOUT_SECONDS,
+        help=(
+            "bounded wait for retryable stream_not_ready responses during setup-only "
+            "preload publishes"
+        ),
+    )
     parser.add_argument(
         "--parallel-grouped-timeout-seconds",
         type=parse_positive_float,
@@ -455,6 +466,11 @@ def parse_args() -> argparse.Namespace:
         parser.error("peer response delay requires the native process runtime")
     if args.ack_timeout_ms <= 0:
         parser.error("ack timeout must be positive")
+    if args.preload_readiness_timeout_seconds > MAX_PRELOAD_READINESS_TIMEOUT_SECONDS:
+        parser.error(
+            "preload readiness timeout exceeds the bounded maximum of "
+            f"{MAX_PRELOAD_READINESS_TIMEOUT_SECONDS:g} seconds"
+        )
     if (
         args.parallel_grouped_timeout_seconds is not None
         and args.parallel_grouped_timeout_seconds > MAX_PARALLEL_GROUPED_TIMEOUT_SECONDS
@@ -683,6 +699,7 @@ def main() -> int:
         cpus=args.cpus,
         memory=args.memory,
         peer_response_delay_ms=args.peer_response_delay_ms,
+        preload_readiness_timeout_seconds=args.preload_readiness_timeout_seconds,
     )
     try:
         cluster.start()
