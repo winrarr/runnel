@@ -15,7 +15,7 @@ use runnel_protocol::{
 };
 pub use runnel_protocol::{PayloadEncoding, ProtocolSupport, ProtocolVersionRange};
 use rustls::RootCertStore;
-use rustls::pki_types::ServerName;
+use rustls::pki_types::{CertificateDer, ServerName, pem::PemObject};
 use thiserror::Error;
 use tokio::io::{
     AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader, ReadHalf, WriteHalf,
@@ -1909,7 +1909,7 @@ fn client_trust_roots(tls: &ClientTlsConfig) -> Result<RootCertStore, ClientErro
     let mut roots = RootCertStore::empty();
     if let Some(path) = &tls.ca_file {
         let file = fs::File::open(path).map_err(|_| ClientError::InvalidTrustRoots)?;
-        let certificates = rustls_pemfile::certs(&mut IoBufReader::new(file))
+        let certificates = CertificateDer::pem_reader_iter(IoBufReader::new(file))
             .collect::<Result<Vec<_>, _>>()
             .map_err(|_| ClientError::InvalidTrustRoots)?;
         if certificates.is_empty() {

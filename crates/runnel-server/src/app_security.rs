@@ -8,7 +8,7 @@ use std::sync::Arc;
 use base64::Engine as _;
 use runnel_protocol::{BearerToken, Request, SecurityRole};
 use rustls::ServerConfig;
-use rustls::pki_types::{CertificateDer, PrivateKeyDer};
+use rustls::pki_types::{CertificateDer, PrivateKeyDer, pem::PemObject};
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use subtle::ConstantTimeEq;
@@ -90,7 +90,7 @@ pub(crate) fn load_tls_acceptor(
 fn read_certificates(path: &Path) -> Result<Vec<CertificateDer<'static>>, SecurityConfigError> {
     let file = File::open(path).map_err(|_| SecurityConfigError::TlsFiles)?;
     let mut reader = BufReader::new(file);
-    let certificates = rustls_pemfile::certs(&mut reader)
+    let certificates = CertificateDer::pem_reader_iter(&mut reader)
         .collect::<Result<Vec<_>, _>>()
         .map_err(|_| SecurityConfigError::InvalidTlsIdentity)?;
     if certificates.is_empty() {
@@ -104,7 +104,9 @@ fn read_private_key(path: &Path) -> Result<PrivateKeyDer<'static>, SecurityConfi
     let metadata = file.metadata().map_err(|_| SecurityConfigError::TlsFiles)?;
     validate_private_file(&metadata).map_err(|_| SecurityConfigError::InvalidTlsIdentity)?;
     let mut reader = BufReader::new(file);
-    rustls_pemfile::private_key(&mut reader)
+    PrivateKeyDer::pem_reader_iter(&mut reader)
+        .next()
+        .transpose()
         .map_err(|_| SecurityConfigError::InvalidTlsIdentity)?
         .ok_or(SecurityConfigError::InvalidTlsIdentity)
 }

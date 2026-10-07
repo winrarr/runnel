@@ -26,7 +26,6 @@ runnel-engine = { path = "../runnel-engine" }
 runnel-raft = { path = "../runnel-raft" }
 runnel-protocol = { path = "../runnel-protocol" }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
-rustls-pemfile = "2"
 serde.workspace = true
 serde_json.workspace = true
 sha2 = "0.10"
@@ -43,7 +42,6 @@ runnel-client = { path = "../runnel-client" }
 data-encoding.workspace = true
 rcgen = "0.14"
 rustls.workspace = true
-rustls-pemfile.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
 socket2 = "0.6"
