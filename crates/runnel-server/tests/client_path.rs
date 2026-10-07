@@ -13,7 +13,7 @@ use runnel_client::{
 use runnel_protocol::{PublishBatchRecordResponse, Response};
 use tempfile::TempDir;
 use tokio::io::AsyncWriteExt;
-use tokio::net::{TcpListener as AsyncTcpListener, TcpStream as AsyncTcpStream};
+use tokio::net::TcpListener as AsyncTcpListener;
 use tokio::sync::oneshot;
 
 #[path = "support/v2_proxy.rs"]

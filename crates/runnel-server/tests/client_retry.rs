@@ -11,7 +11,7 @@ use runnel_client::{AttemptFailure, AttemptOutcome, Client};
 use runnel_protocol::{Request, Response};
 use tempfile::TempDir;
 use tokio::io::AsyncWriteExt;
-use tokio::net::{TcpListener as AsyncTcpListener, TcpStream as AsyncTcpStream};
+use tokio::net::TcpListener as AsyncTcpListener;
 
 #[path = "support/v2_proxy.rs"]
 mod v2_proxy;
