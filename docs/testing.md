@@ -111,6 +111,8 @@ The three-node process test exercises both grouped and non-grouped clustered pat
 
 ## Verification layers
 
+Use fast unit and engine-contract tests for broad coverage of ordinary behavior, boundaries, and failure combinations. Keep always-on pull-request end-to-end coverage to a small set of representative critical flows and process/network guarantees. Add focused real-process tests when a particular change needs evidence across a network, crash/recovery, or other integration boundary that lower-level tests cannot establish, and run the relevant case when that boundary changes. Keep unrelated and combinatorial process scenarios in targeted or opt-in verification instead of expanding the required CI suite into a broad matrix. This keeps CI bounded without replacing necessary end-to-end evidence with unit tests.
+
 The Criterion suite includes durable publish, legacy publish/poll/ack, two-member shared-consumer, keyed shared-consumer, and local concurrency-scaling baselines. Interpret every result with its durability mode, message size, membership, and ordering-key distribution.
 
 - `just test` runs workspace unit, integration, and benchmark-target tests.
