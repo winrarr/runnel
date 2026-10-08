@@ -78,16 +78,17 @@ Constraints:
 - keep the public vocabulary small and intent-oriented;
 - do not expose storage layout, physical placement, or broker topology as normal application concepts;
 - support message payloads without requiring them to be text;
-- do not claim compatibility until compatibility and upgrade behavior are defined.
+- evolve v2 schemas under the accepted within-major rules, but make no prior-release compatibility promise;
+- do not claim cross-language interoperability until an independent generated client is verified.
 
 Acceptance criteria:
 
 - clients can distinguish confirmed success, confirmed rejection, retryable failure, and unknown outcome;
 - a producer can safely retry according to documented semantics without creating an unintended duplicate when deduplication is requested;
-- the contract has a documented compatibility policy;
-- behavior is covered by interoperability and compatibility tests.
+- the protocol's within-major evolution policy and lack of a prior-release promise are documented;
+- behavior is covered by wire fixtures, real-process negotiation/reconnect tests, and independent generated-client evidence before cross-language support is claimed.
 
-Decision progress: [ADR 0031](decisions/0031-protocol-v2-contract.md) accepts the first v2 handshake, Protobuf schema policy, directional bounds, rollout boundary, publish-ID mismatch behavior, and outcome/stage vocabulary. [ADR 0034](decisions/0034-publish-request-id-content-contract.md) now implements the content-conflict behavior in the current provisional v1 engines and server mapping. V2 runtime negotiation, generated-client fixtures, v2-specific real-server mismatch/reconnect/outcome tests, and interoperability evidence remain open; v1 and v2 are not yet a cross-release compatibility promise.
+Decision progress: [ADR 0031](decisions/0031-protocol-v2-contract.md) accepts the v2 handshake, Protobuf schema policy, directional bounds, v2-only operation, publish-ID mismatch behavior, and outcome/stage vocabulary. The implementation now replaces JSON-lines with generated Protobuf v2 framing and typed application envelopes, validates Hello negotiation, uses opaque payload bytes, and implements bounded response admission before delivery mutation in both engines. The reusable client negotiates v2 and preserves the accepted outcome model. An independently generated Python Protobuf 7.36.2 client has also negotiated v2 with a real local server and completed stream creation, binary publish/poll, and acknowledgement for a 128 KiB arbitrary-byte payload. This verifies that flow only and does not establish full cross-language, TLS, or authentication support. Repeat the focused independent-client check when the wire contract materially changes or another language client is introduced; routine CI coverage is not required for this check. There is no v1 fallback or cross-release compatibility promise.
 
 ### Provide a production-usable client path
 
@@ -277,7 +278,7 @@ Goal: amortize protocol and durability overhead for publish and consume workload
 
 Rationale: batching is necessary for efficient small-message workloads, but an underspecified batch can hide partial success or force unsafe retries.
 
-Current progress: bounded binary-safe publish batches now return ordered per-record outcomes, preserve request-ID deduplication, and use explicit local and clustered durability boundaries. Real-process typed-client tests cover mixed outcomes, binary payloads, request-ID replay, response loss, restart, and publish-batch leader change. An opt-in clustered publish-batch baseline records per-record throughput and batch round-trip latency. The consume-batch runtime now provides bounded ordered active sets, byte-aware text/base64 responses, per-record receipt fencing and mixed ack outcomes, a single local journal transition or committed Raft command for each valid ack subset, and collection waits outside stream locks and Raft apply. Reusable engine assertions run against local, single-node Raft, and persistent Raft engines; they cover limits, oversized messages, repeated-set recovery, scalar-ack fence rejection, mixed acknowledgements, publish/ack wakeups, expiry, pinned policy, and same-key exclusion. Real broker-process tests cover typed-client binary batch responses, partial ack and restart replay, request timeout before assignment, ack response loss with exact retry, and clustered partial ack through follower restart and leader change. The cluster-process test confirms legacy offset-only ack cannot acknowledge a batch-assigned lease. Clustered polls through a follower preserve text and arbitrary binary payloads and per-record receipts using a private compact peer-response DTO; a worst-shape serializer check verifies a 65 MiB public response fits the 66 MiB peer-frame ceiling. All cluster nodes must use a consistent binary because the private peer JSON format has no version negotiation. Local journal tests cover retryable failure before append, partial-append recovery, and uncertain post-write sync outcomes. Remaining evidence includes committed cluster response loss for batch acknowledgements, disconnect while reading a batch response, additional attempt-limit/dead-letter combinations across both engines, and representative consume-batch performance and resource evidence. [ADR 0030](decisions/0030-consume-batch-contract.md) accepts the consume-batch semantics; provisional operation names remain implementation details pending protocol-contract reconciliation. No performance improvement or supported workload bound is claimed.
+Current progress: bounded binary-safe publish batches now return ordered per-record outcomes, preserve request-ID deduplication, and use explicit local and clustered durability boundaries. Real-process typed-client tests cover mixed outcomes, binary payloads, request-ID replay, response loss, restart, and publish-batch leader change. An opt-in clustered publish-batch baseline records per-record throughput and batch round-trip latency. The consume-batch runtime now provides bounded ordered active sets, Protobuf response-byte limits, per-record receipt fencing and mixed ack outcomes, a single local journal transition or committed Raft command for each valid ack subset, and collection waits outside stream locks and Raft apply. Reusable engine assertions run against local, single-node Raft, and persistent Raft engines; they cover limits, oversized messages, repeated-set recovery, scalar-ack fence rejection, mixed acknowledgements, publish/ack wakeups, expiry, pinned policy, and same-key exclusion. Real broker-process tests cover typed-client binary batch responses, partial ack and restart replay, request timeout before assignment, ack response loss with exact retry, and clustered partial ack through follower restart and leader change. The cluster-process test confirms legacy offset-only ack cannot acknowledge a batch-assigned lease. Clustered polls through a follower preserve text and arbitrary binary payloads and per-record receipts using private compact peer DTOs; command and forwarded payloads avoid JSON integer-array expansion. Worst-shape serializer tests verify a 65 MiB public response fits the 96 MiB peer-frame ceiling. A pre-dispatch weighted response budget admits one maximum response, while shared frame admission bounds largest reads and generic writes; the tested peer-buffer envelope is at most 480 MiB per process, excluding TLS/socket buffers and application/storage state. All cluster nodes must use a consistent binary because the private peer JSON format has no version negotiation. Local journal tests cover retryable failure before append, partial-append recovery, and uncertain post-write sync outcomes. Remaining evidence includes committed cluster response loss for batch acknowledgements, disconnect while reading a batch response, additional attempt-limit/dead-letter combinations across both engines, and representative consume-batch performance and peak-resource measurements. [ADR 0030](decisions/0030-consume-batch-contract.md) accepts the consume-batch semantics; [ADR 0031](decisions/0031-protocol-v2-contract.md) owns the v2 wire contract. No performance improvement or supported workload bound is claimed.
 
 Constraints:
 
@@ -401,7 +402,7 @@ Goal: reduce storage, network, and CPU overhead with efficient message represent
 
 Rationale: small messages and long-lived streams make framing, copying, encoding, and compression costs significant parts of Runnel's performance and storage profile.
 
-Current progress: the provisional protocol and reusable client support validated binary-safe payloads through padded base64 while retaining the legacy text path. Current review confirms that peer commands and clustered persistence encode payload `Vec<u8>` values as JSON integer arrays, local RNL3 version-2 records remain uncompressed, and public/peer codecs are not negotiated. The [message encoding and compression study](research/message-encoding-and-compression.md) compares compression placement across client batches, public and peer frames, retained blocks, and separate Raft/state-machine artifacts; the [day-one plan](design/encoding-compression-day1-plan.md) keeps the candidate frame and codec work exploratory. Version negotiation, compression, and representative resource measurements remain open.
+Current progress: public v2 Protobuf messages carry raw payload bytes, while the private Raft peer JSON DTOs and replicated Publish command use compact text/base64 encoding instead of JSON integer arrays. Local RNL3 records remain binary and uncompressed; clustered snapshots/checkpoints still materialize retained payload bytes in JSON-backed state. The [message encoding and compression study](research/message-encoding-and-compression.md) compares compression placement across client batches, public and peer frames, retained blocks, and separate Raft/state-machine artifacts; the [day-one plan](design/encoding-compression-day1-plan.md) keeps compression candidates exploratory. Compression and representative end-to-end CPU, allocation, and resource measurements remain open.
 
 Constraints:
 
@@ -486,17 +487,25 @@ acceptance adds no metric or runtime guarantee. Aggregate lag metrics remain
 future work requiring a complete bounded catalogue and one logical cluster
 collector. The first application-client security
 contract is accepted in [ADR 0035](decisions/0035-first-application-client-security.md)
-and documented in the [source-backed research](research/client-authentication.md):
-secured non-loopback listeners will terminate TLS 1.3 in Runnel, require a
-runtime bearer credential, and distinguish fixed application and operator
-roles. This is a planning decision only; the listener, client/CLI credential
-support, authorization checks, rotation behavior, and real-server security
-coverage remain unimplemented. The separate HTTP listener is still cleartext
-and unauthenticated. In particular, the development Kubernetes manifest binds
-it to all pod interfaces and exposes health and metrics on the pod network;
-production deployment isolation and HTTP access controls remain open. This
-client contract does not secure the Raft peer listener or establish clustered
-security.
+and documented in the [source-backed research](research/client-authentication.md).
+The protocol/client slice provides TLS 1.3 configuration with system roots
+when no custom bundle is configured and exclusive operator-supplied trust
+roots when one is, secret-safe 256-bit bearer credentials, a
+bounded Hello/auth exchange, policy verifier loading, exhaustive fixed-role
+classification, an authorization gate before dispatch, and engine-owned
+response-size preflight. Server startup now loads the TLS certificate, key,
+and credential policy before binding, rejects application security with the
+Raft engine while policy replication is unsupported, and requires security on
+non-loopback binds unless the explicit development override is set. Real
+server-process tests cover fail-closed policy startup, TLS/authentication,
+role denial, and unchanged state on denial; the targeted security and
+response-size process tests currently pass. `runnelctl` does not yet configure client trust or
+credentials. This is not a claim that the deployment is secure: the separate
+HTTP listener is still cleartext and unauthenticated. The development
+Kubernetes manifest explicitly allows unauthenticated plaintext on the broker
+Service for isolated development, and remains unsuitable for production or
+untrusted networks. HTTP access controls and peer security remain separate
+gaps.
 
 Constraints:
 
@@ -520,6 +529,8 @@ Acceptance criteria:
 
 ### Make overload and abusive-client behavior bounded
 
+Request and response frame-size limits are now configurable within the protocol bounds, negotiated per connection, and exposed as broker metrics.
+
 Goal: keep the broker responsive and explicit when clients create more connections, requests, payload bytes, or outstanding work than the configured deployment can safely serve.
 
 Rationale: predictable resource usage requires admission limits before authentication or ordinary application mistakes can turn unbounded network input into memory exhaustion, runtime starvation, or storage failure.
@@ -535,7 +546,7 @@ Constraints:
 
 Acceptance criteria:
 
-- request size, connection count, in-flight work, and relevant queue limits are configurable with safe defaults;
+- request and response sizes, connection count, in-flight work, and relevant queue limits are configurable with safe defaults;
 - overload produces documented rejection or backpressure responses rather than silent loss or unbounded growth;
 - slow-reader, slow-writer, oversized-request, connection-flood, and storage-stall tests demonstrate bounded memory and recovery;
 - metrics distinguish active work, rejected admission, timeouts, and saturation by limiting resource.
@@ -781,7 +792,7 @@ Acceptance criteria:
 - clients can distinguish confirmed success, confirmed rejection, retryable failure, and unknown outcome;
 - safe retries do not create unintended duplicate messages when deduplication is requested.
 
-Decision progress: [ADR 0031](decisions/0031-protocol-v2-contract.md) accepts the public v2 outcome/stage vocabulary and its topology-neutral durability boundary. The current provisional v1 engine classification, error mapping, and focused ID-conflict tests are implemented under ADR 0034. V2 server/client fields, v2 response-loss resolution, broader supported-node failure evidence, and a compatibility promise remain open, so this outcome stays open.
+Decision progress: [ADR 0031](decisions/0031-protocol-v2-contract.md) accepts the public v2 outcome/stage vocabulary and its topology-neutral durability boundary. V2 server/client envelopes now carry operation outcomes and stages; local and clustered poll paths reject responses that cannot fit before changing delivery state. [ADR 0034](decisions/0034-publish-request-id-content-contract.md) implements content-conflict behavior in both engines and the v2 mapping. Real-process response-loss and supported-node failure evidence remain open, so this outcome stays open. No cross-release compatibility promise is part of the v2 contract.
 
 ### Make the clustered deployment operable
 

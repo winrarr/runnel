@@ -18,12 +18,15 @@ from typing import Any
 
 from cluster_faults import PeerResponseDelayProxy
 from cluster_resources import ProcessStats, peer_connection_census
-from cluster_scenarios import DEFAULT_PEER_RESPONSE_DELAY_MS
+from cluster_scenarios import (
+    DEFAULT_PEER_RESPONSE_DELAY_MS,
+    DEFAULT_PRELOAD_READINESS_TIMEOUT_SECONDS,
+)
 from peer_tls import PeerCredentials
 from common import (
     BenchmarkError,
     DEFAULT_TIMEOUT_SECONDS,
-    LineClient,
+    ProtocolClient,
     ROOT,
     prometheus_metrics,
     wait_for_ready,
@@ -71,6 +74,7 @@ class Cluster:
         cpus: str = "2",
         memory: str = "2g",
         peer_response_delay_ms: int = DEFAULT_PEER_RESPONSE_DELAY_MS,
+        preload_readiness_timeout_seconds: float = DEFAULT_PRELOAD_READINESS_TIMEOUT_SECONDS,
     ) -> None:
         if runtime not in {"process", "container"}:
             raise ValueError(f"unsupported cluster runtime: {runtime}")
@@ -84,6 +88,8 @@ class Cluster:
         self.cpus = cpus
         self.memory = memory
         self.peer_response_delay_ms = peer_response_delay_ms
+        self.preload_readiness_timeout_seconds = preload_readiness_timeout_seconds
+        self.preload_readiness: list[dict[str, Any]] = []
         self.root = Path(tempfile.mkdtemp(prefix="runnel-cluster-bench-"))
         self.root.chmod(0o777)
         self.cluster_name = f"runnel-benchmark-{os.getpid()}"
@@ -140,8 +146,8 @@ class Cluster:
 
     def client(
         self, index: int, *, timeout_seconds: float = COMMAND_TIMEOUT_SECONDS
-    ) -> LineClient:
-        return LineClient(
+    ) -> ProtocolClient:
+        return ProtocolClient(
             "127.0.0.1",
             self.nodes[index % self.node_count].broker_port,
             timeout_seconds,
@@ -174,7 +180,7 @@ class Cluster:
         return peer_connection_census(self)
 
     @contextmanager
-    def connected_clients(self) -> Iterator[list[LineClient]]:
+    def connected_clients(self) -> Iterator[list[ProtocolClient]]:
         clients = [self.client(index) for index in range(self.node_count)]
         try:
             yield clients
@@ -320,6 +326,8 @@ class Cluster:
             command.extend([flag, path])
         for address in addresses:
             command.extend(["--cluster-node", address])
+        if self.runtime == "container":
+            command.append("--insecure-development-listen")
         if bootstrap:
             command.append("--bootstrap")
         return command

@@ -376,7 +376,7 @@ def backend_metadata(name: str, nodes: int) -> dict[str, Any]:
                 "and durable local state"
             )
             replication = "three-node static Multi-Raft; one data group per stream"
-            measurement_boundary = "Runnel's clustered line-delimited JSON public protocol"
+            measurement_boundary = "Runnel's clustered negotiated v2 Protobuf public protocol"
             client_name = "host Python clustered benchmark client"
             scenario_classes = ["publish-only"]
             scenario_boundaries = {
@@ -407,7 +407,7 @@ def backend_metadata(name: str, nodes: int) -> dict[str, Any]:
                 "persists a consumer checkpoint"
             )
             replication = "single local broker engine"
-            measurement_boundary = "Runnel's current line-delimited JSON protocol"
+            measurement_boundary = "Runnel's negotiated v2 Protobuf protocol"
             client_name = "host Python socket client"
             scenario_classes = ["publish-only", "consume-with-ack"]
             scenario_boundaries = {

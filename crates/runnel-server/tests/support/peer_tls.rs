@@ -13,7 +13,7 @@ use rcgen::{
 };
 #[cfg(feature = "test-replacement-recovery")]
 use rustls::ServerConfig;
-use rustls::pki_types::{CertificateDer, PrivateKeyDer};
+use rustls::pki_types::{CertificateDer, PrivateKeyDer, pem::PemObject};
 use rustls::{ClientConfig, RootCertStore};
 use sha2::{Digest, Sha256};
 #[cfg(feature = "test-replacement-recovery")]
@@ -174,7 +174,7 @@ fn identity_for(node_id: u64, cluster_name: &str) -> String {
 }
 
 fn read_certificates(path: &Path) -> Vec<CertificateDer<'static>> {
-    rustls_pemfile::certs(&mut BufReader::new(
+    CertificateDer::pem_reader_iter(BufReader::new(
         File::open(path).expect("test certificate file should be readable"),
     ))
     .collect::<Result<Vec<_>, _>>()
@@ -182,9 +182,10 @@ fn read_certificates(path: &Path) -> Vec<CertificateDer<'static>> {
 }
 
 fn read_private_key(path: &Path) -> PrivateKeyDer<'static> {
-    rustls_pemfile::private_key(&mut BufReader::new(
+    PrivateKeyDer::pem_reader_iter(BufReader::new(
         File::open(path).expect("test private key file should be readable"),
     ))
-    .expect("test private key PEM should be valid")
+    .next()
     .expect("test private key should be present")
+    .expect("test private key PEM should be valid")
 }

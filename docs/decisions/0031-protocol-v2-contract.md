@@ -49,6 +49,10 @@ advertised only after its compatible behavior is implemented. Its
 logical payload is an opaque byte field for both text and binary client helpers;
 stream and consumer identifiers and optional ordering keys remain UTF-8 text.
 The initial v2 release has no compression.
+The core v2 `ConfigureConsumer` request includes `retry_delay_ms`, and its
+`ConsumerPolicy` response returns the configured value. This field carries the
+accepted fixed-delay policy from ADR 0033; it is part of the sole current
+schema and does not require a capability or compatibility fallback.
 
 A v2 connection starts with the exact eight-byte preface `52 4e 4c 4e 01 00 00 00`:
 ASCII `RNLN`, bootstrap revision 1, and three zero reserved bytes. This
@@ -301,12 +305,10 @@ in-place. The peer and mismatch rules are:
 | v2 client connects to v1-only listener | Client fails the bounded handshake on EOF, timeout, or non-v2 response; it sends no application request and never retries as v1. |
 | Reconnect after peer restart, leader change, or failure | Client repeats transport setup, the complete preface and Hello, and required authentication; no prior selection, limits, or authentication carry over. |
 
-The initial v2 release replaces provisional v1 at a coordinated breaking
-release boundary for server, reusable Rust client, and CLI. Its listener is
-v2-only. It does not dual-dispatch v1, add a separate transition listener,
-expose implicit v1 mode, or silently fall back. If evidence later establishes
-an independently deployed v1 population, a separate decision must define a
-bounded transition and removal point.
+The v2 listener replaces provisional v1 and is v2-only. It does not
+dual-dispatch v1, add a separate transition listener, expose implicit v1 mode,
+or silently fall back. Prior Runnel protocol compatibility is not a product
+goal.
 
 This decision does not promise mixed-version cluster upgrades or rollback,
 and public negotiation does not establish compatibility of internal peer RPC
@@ -338,12 +340,13 @@ justify them.
 
 ## Consequences
 
-- The current listener and client remain unchanged until a separate runtime
-  implementation adopts this contract. Current v1 tests and support constants
-  are not compatibility evidence.
-- A v2 runtime requires generated Protobuf schemas, bounded frame readers and
-  writers, Hello negotiation, typed refusals, and changed v1 client/server
-  behavior at a coordinated breaking boundary.
+- The v2 runtime implementation replaces the provisional JSON-lines path with
+  generated Protobuf schemas, bounded frame readers and writers, Hello
+  negotiation, typed refusals, and v2 client/server behavior. The current
+  implementation also supplies the TLS/auth policy modules, pre-dispatch role
+  gate, engine response admission, fail-closed startup/security configuration,
+  and real-process application-listener coverage. Focused exact-head checks
+  remain required before release.
 - The client can trust explicit outcomes instead of maintaining code-based
   retry lists. An outcome still does not automate retry policy or provide a
   generic resolution identity.
@@ -358,25 +361,26 @@ justify them.
   accepted here. TLS policy and authorization semantics remain governed by
   ADR 0035; this ADR accepts no security guarantee beyond its stated v2
   authentication exchange and ordering.
-- TD-003 and TD-025 remain open until the implementation and real-process
-  evidence gates in the [protocol compatibility design](../design/protocol-compatibility.md)
-  pass. The client-interactions backlog outcome remains open.
+- TD-003 and TD-025 remain open until startup integration and real-process
+  evidence in the [protocol compatibility design](../design/protocol-compatibility.md)
+  pass. The client-interactions backlog outcome remains open. Cross-release
+  compatibility is not an implementation or release gate.
 
-## Verification required before runtime support
+## Remaining runtime and interoperability evidence
 
 The [protocol compatibility design](../design/protocol-compatibility.md)
-records the required tests. In particular, real-server tests must cover exact
-preface/Hello negotiation, no-overlap and capability refusal, reconnect,
-TLS-before-preface and disabled 0-RTT use, explicit auth-required negotiation,
-bounded bearer authentication, generic authentication failure and connection
-closure, and proof that no operation is accepted before authentication.
-Additional tests cover malformed and oversized frames, both directional
-limits, no mutation when a response cannot fit, every outcome/stage class in
-local and clustered paths, response loss after durable application, and v2
-request-ID conflict and replay across restart and leader change.
-Language-neutral golden frames and an independent generated client/decoder
-are required before claiming cross-language interoperability. No runtime
-behavior or such test is included in this ADR.
+records the required tests. Focused protocol/client/connection tests cover the
+exact preface and Hello/auth framing, typed negotiation boundaries,
+authentication ordering, role classification, raw-byte responses, and
+generated-Protobuf response-size bounds. The current implementation also
+preflights local and clustered delivery responses before mutation. Remaining
+real-process tests must cover startup failure and bind policy, TLS-before-preface
+and disabled 0-RTT use, trusted roots and identity failures, bounded
+authentication failures, authorization denials with unchanged durable state,
+reconnect, response loss, and local/clustered outcome behavior. A
+language-neutral golden frame and an independent generated client/decoder are
+required before claiming cross-language interoperability. None of these
+gates implies a cross-release compatibility promise.
 
 ## References
 

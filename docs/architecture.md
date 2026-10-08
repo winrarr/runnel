@@ -2,7 +2,7 @@
 
 Runnel separates the semantic engine contract, local storage, experimental distributed engine, transport, public protocol, client, CLI, and reusable conformance assertions into workspace crates so those boundaries can evolve independently.
 
-    runnelctl --TCP/JSON lines--> runnel-server --> runnel-engine contract
+    runnelctl --TCP/RNLN v2 + Protobuf--> runnel-server --> runnel-engine contract
                                           |              +--> runnel-core (local engine) --> streams/*.log
                                           |              +--> runnel-raft (metadata + per-stream Multi-Raft backend)
                                           +--HTTP--> health and metrics
@@ -35,17 +35,17 @@ This establishes an at-least-once vertical slice for both independent consumers 
 
 The clustered state machine appends one framed, durable journal record per committed apply entry and replays records after the last durable checkpoint during recovery. Snapshot installation writes a checkpoint and compacts the journal with an atomic replacement, so normal message processing no longer pays for a complete state-file replacement per apply batch. The materialized state and journal are still JSON-based, so this is a correctness-preserving first storage step rather than a final performance architecture.
 
-The external and peer protocols and clustered materialized persistence use JSON; local retained records use binary frames. The local async engine dispatches synchronous filesystem operations through a bounded `StorageExecutor` on Tokio's blocking pool, with per-stream lanes and locks. This isolates async request handling but does not make filesystem calls interruptible or remove per-operation durability costs. Server admission bounds connections, request frames, active requests, and request duration; broader sustained resource-pressure evidence remains incomplete. Peer traffic reuses connections through OpenRaft network clients or a bounded `GroupManager`-owned compatibility pool that closes with its owner; connection ownership is split and the framed protocol is not multiplexed. Measure material changes to these paths using [benchmarking.md](benchmarking.md), with explicit durability and resource boundaries.
+The external application protocol uses negotiated v2 Protobuf envelopes; peer RPC and clustered materialized persistence use JSON, while local retained records use binary frames. The local async engine dispatches synchronous filesystem operations through a bounded `StorageExecutor` on Tokio's blocking pool, with per-stream lanes and locks. This isolates async request handling but does not make filesystem calls interruptible or remove per-operation durability costs. Server admission bounds connections, request frames, active requests, and request duration; broader sustained resource-pressure evidence remains incomplete. Peer traffic reuses connections through OpenRaft network clients or a bounded `GroupManager`-owned compatibility pool that closes with its owner; connection ownership is split and the framed protocol is not multiplexed. Measure material changes to these paths using [benchmarking.md](benchmarking.md), with explicit durability and resource boundaries.
 
 ## Deliberate boundaries
 
 - runnel-core owns persistence and delivery state; it must not depend on a particular network transport.
 - runnel-engine owns the topology-free semantic contract shared by local and distributed engines. `BrokerError::kind()` and `BrokerError::outcome()` provide a stable semantic failure boundary; concrete backend causes remain available for diagnostics, while stage-aware public outcomes remain a future protocol concern.
 - runnel-raft owns the early static Multi-Raft backend, including the metadata group, one data group per stream, versioned local Raft/state-machine files, group-addressed framed TCP peer transport, topology-free client forwarding, replicated publish request deduplication, replicated shared-consumer ownership and policy, clustered retry limits and dead-letter outcomes, consensus-log compaction, and snapshot transfer. It is not yet a complete production cluster: safe empty-replica replacement, dynamic membership, scalable placement, final lease/fencing policy, backoff and dead-letter provenance, repeated-interruption cost controls, and broader failure semantics remain unfinished.
-- runnel-protocol owns the provisional external request/response representation; it must not encode filesystem layout.
+- runnel-protocol owns the negotiated v2 Protobuf request/response envelopes and wire framing; it must not encode filesystem layout.
 - runnel-server owns sockets, HTTP, shutdown, and mapping core errors into protocol responses.
 - runnel-cli is a development client and is not a compatibility reference for future language SDKs.
-- runnel-client owns reusable persistent client transport, bounded response buffering, typed operations, and explicit outcome classification for the provisional protocol.
+- runnel-client owns reusable persistent v2 transport, bounded response buffering, typed operations, and explicit outcome classification.
 - runnel-test-support owns reusable semantic conformance assertions shared by engine implementations.
 
 Future architectural work should preserve these boundaries while addressing segmented storage, remaining overload and storage-stall evidence, migration between local and clustered durable state, and safe membership and placement changes. The backlog and design notes describe candidate work, not a required execution order.

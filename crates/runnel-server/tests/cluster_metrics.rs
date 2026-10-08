@@ -339,13 +339,62 @@ fn request(address: SocketAddr, request: Request) -> Result<Response, String> {
     stream
         .set_read_timeout(Some(Duration::from_secs(2)))
         .map_err(|error| error.to_string())?;
-    let encoded = serde_json::to_string(&request).map_err(|error| error.to_string())?;
-    writeln!(stream, "{encoded}").map_err(|error| error.to_string())?;
-    let mut response = String::new();
-    BufReader::new(stream)
-        .read_line(&mut response)
-        .map_err(|error| error.to_string())?;
-    serde_json::from_str(&response).map_err(|error| error.to_string())
+    use runnel_protocol::v2::{self, ClientHello, ServerFrame, ServerHello};
+
+    stream
+        .write_all(&v2::PREFACE)
+        .map_err(|error| format!("write v2 preface to {address}: {error}"))?;
+    let hello = v2::encode_client_hello(&ClientHello::core_v2())
+        .map_err(|error| format!("encode v2 Hello for {address}: {error}"))?;
+    stream
+        .write_all(hello.as_bytes())
+        .map_err(|error| format!("write v2 Hello to {address}: {error}"))?;
+    let server_hello = read_v2_frame(&mut stream, v2::HELLO_MAX_BODY_BYTES)
+        .map_err(|error| format!("read v2 Hello from {address}: {error}"))?;
+    match v2::decode_server_hello(&server_hello)
+        .map_err(|error| format!("decode v2 Hello from {address}: {error}"))?
+    {
+        ServerHello::Accepted(accepted) if accepted.auth_required == Some(false) => {}
+        ServerHello::Accepted(_) => {
+            return Err(format!("server at {address} requires test credentials"));
+        }
+        ServerHello::Refused { code, diagnostic } => {
+            return Err(format!(
+                "server at {address} refused v2 ({code:?}): {diagnostic}"
+            ));
+        }
+    }
+
+    let encoded = v2::encode_application_request(&request)
+        .map_err(|error| format!("encode application request for {address}: {error}"))?;
+    stream
+        .write_all(encoded.as_bytes())
+        .map_err(|error| format!("write application request to {address}: {error}"))?;
+    let response = read_v2_frame(&mut stream, v2::MAX_SERVER_TO_CLIENT_FRAME_BYTES)
+        .map_err(|error| format!("read application response from {address}: {error}"))?;
+    match v2::decode_server_frame(&response, v2::MAX_SERVER_TO_CLIENT_FRAME_BYTES)
+        .map_err(|error| format!("decode application response from {address}: {error}"))?
+    {
+        ServerFrame::Application(reply) => Ok(reply.response),
+        ServerFrame::Authenticated | ServerFrame::AuthenticationFailed => Err(format!(
+            "server at {address} returned an authentication frame before the application response"
+        )),
+    }
+}
+
+fn read_v2_frame(stream: &mut impl Read, max_body_bytes: usize) -> std::io::Result<Vec<u8>> {
+    let mut length = [0; 4];
+    stream.read_exact(&mut length)?;
+    let body_bytes = u32::from_be_bytes(length) as usize;
+    if body_bytes == 0 || body_bytes > max_body_bytes {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "v2 frame length is outside the configured limit",
+        ));
+    }
+    let mut body = vec![0; body_bytes];
+    stream.read_exact(&mut body)?;
+    Ok(body)
 }
 
 fn http_metrics(address: SocketAddr) -> String {

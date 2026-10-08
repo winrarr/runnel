@@ -8,7 +8,7 @@ use std::time::Duration;
 
 use data_encoding::BASE32_NOPAD;
 use rustls::client::danger::ServerCertVerifier;
-use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
+use rustls::pki_types::{CertificateDer, PrivateKeyDer, ServerName, UnixTime, pem::PemObject};
 use rustls::server::WebPkiClientVerifier;
 use rustls::{ClientConfig, RootCertStore, ServerConfig};
 use sha2::{Digest, Sha256};
@@ -24,9 +24,14 @@ const MAX_SIMULTANEOUS_HANDSHAKES: usize = 32;
 // address the same broker. Admission waits are bounded by the RPC TTL.
 const MAX_ACTIVE_PEER_CONNECTIONS: usize = 256;
 const FRAME_MEMORY_QUANTUM: usize = 1024 * 1024;
-// Charges at most 256 MiB of encoded frame bytes per process. The decoded heap size
-// is type-dependent and is not an exact allocation budget.
-const MAX_CONCURRENT_PEER_FRAME_MEMORY: usize = 256 * 1024 * 1024;
+// Charges at most 192 MiB for buffered frames plus an estimate of decoded
+// objects per process. A 96 MiB input frame consumes the full budget; the cap
+// also allows two concurrent maximum-size outbound frames.
+const MAX_CONCURRENT_PEER_FRAME_MEMORY: usize = 192 * 1024 * 1024;
+// Reserve decoded poll/replay results together with their serialized peer
+// frame before dispatch, so the per-operation public response bound also
+// limits aggregate response memory.
+const MAX_CONCURRENT_PEER_RESPONSE_MEMORY: usize = 256 * 1024 * 1024;
 const MAX_CONCURRENT_FRAME_WRITES: usize = 4;
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -49,6 +54,7 @@ pub struct PeerTlsConfig {
     inbound_connections: Arc<Semaphore>,
     outbound_connections: Arc<Semaphore>,
     frame_memory: Arc<Semaphore>,
+    response_memory: Arc<Semaphore>,
     frame_writes: Arc<Semaphore>,
 }
 
@@ -92,7 +98,7 @@ impl PeerTlsConfig {
         let mut root_reader =
             BufReader::new(open_file(trust_bundle.as_ref(), "peer trust bundle")?);
         let mut root_count = 0usize;
-        for certificate in rustls_pemfile::certs(&mut root_reader) {
+        for certificate in CertificateDer::pem_reader_iter(&mut root_reader) {
             let certificate =
                 certificate.map_err(|_| invalid_config("peer trust bundle PEM is malformed"))?;
             roots.add(certificate).map_err(|_| {
@@ -108,7 +114,7 @@ impl PeerTlsConfig {
             certificate_chain.as_ref(),
             "peer certificate chain",
         )?);
-        let certificates = rustls_pemfile::certs(&mut chain_reader)
+        let certificates = CertificateDer::pem_reader_iter(&mut chain_reader)
             .collect::<Result<Vec<_>, _>>()
             .map_err(|_| invalid_config("peer certificate chain PEM is malformed"))?;
         let Some(leaf) = certificates.first() else {
@@ -118,7 +124,9 @@ impl PeerTlsConfig {
         };
 
         let mut key_reader = BufReader::new(open_file(private_key.as_ref(), "peer private key")?);
-        let key = rustls_pemfile::private_key(&mut key_reader)
+        let key = PrivateKeyDer::pem_reader_iter(&mut key_reader)
+            .next()
+            .transpose()
             .map_err(|_| invalid_config("peer private key PEM is malformed"))?
             .ok_or_else(|| invalid_config("peer private key file contains no supported key"))?;
 
@@ -165,6 +173,9 @@ impl PeerTlsConfig {
             outbound_connections: Arc::new(Semaphore::new(MAX_ACTIVE_PEER_CONNECTIONS)),
             frame_memory: Arc::new(Semaphore::new(
                 MAX_CONCURRENT_PEER_FRAME_MEMORY / FRAME_MEMORY_QUANTUM,
+            )),
+            response_memory: Arc::new(Semaphore::new(
+                MAX_CONCURRENT_PEER_RESPONSE_MEMORY / FRAME_MEMORY_QUANTUM,
             )),
             frame_writes: Arc::new(Semaphore::new(MAX_CONCURRENT_FRAME_WRITES)),
         })
@@ -225,6 +236,10 @@ impl PeerTlsConfig {
 
     pub(crate) fn frame_memory(&self) -> Arc<Semaphore> {
         Arc::clone(&self.frame_memory)
+    }
+
+    pub(crate) fn response_memory(&self) -> Arc<Semaphore> {
+        Arc::clone(&self.response_memory)
     }
 
     pub(crate) fn frame_write_slots(&self) -> Arc<Semaphore> {
@@ -561,15 +576,17 @@ pub(crate) mod tests {
         fn tls12_client(&self) -> Arc<ClientConfig> {
             let mut root_reader = BufReader::new(File::open(&self.ca).unwrap());
             let mut roots = RootCertStore::empty();
-            for certificate in rustls_pemfile::certs(&mut root_reader) {
+            for certificate in CertificateDer::pem_reader_iter(&mut root_reader) {
                 roots.add(certificate.unwrap()).unwrap();
             }
             let mut cert_reader = BufReader::new(File::open(&self.cert).unwrap());
-            let certificates = rustls_pemfile::certs(&mut cert_reader)
+            let certificates = CertificateDer::pem_reader_iter(&mut cert_reader)
                 .collect::<Result<Vec<_>, _>>()
                 .unwrap();
             let mut key_reader = BufReader::new(File::open(&self.key).unwrap());
-            let key = rustls_pemfile::private_key(&mut key_reader)
+            let key = PrivateKeyDer::pem_reader_iter(&mut key_reader)
+                .next()
+                .transpose()
                 .unwrap()
                 .unwrap();
             Arc::new(
@@ -677,7 +694,10 @@ pub(crate) mod tests {
     fn peer_identity_must_match_the_exact_node_and_cluster_name() {
         let files = CredentialFiles::new(2, "events");
         let mut reader = BufReader::new(File::open(files.cert).unwrap());
-        let certificate = rustls_pemfile::certs(&mut reader).next().unwrap().unwrap();
+        let certificate = CertificateDer::pem_reader_iter(&mut reader)
+            .next()
+            .unwrap()
+            .unwrap();
         assert!(require_exact_peer_identity(&certificate, &identity_for(2, "events")).is_ok());
         assert!(require_exact_peer_identity(&certificate, &identity_for(3, "events")).is_err());
         assert!(
@@ -741,7 +761,10 @@ pub(crate) mod tests {
     fn wildcard_and_multiple_peer_sans_do_not_produce_an_identity() {
         let wildcard = CredentialFiles::new_with_sans(vec!["*.peer.runnel.invalid".to_owned()]);
         let mut reader = BufReader::new(File::open(wildcard.cert).unwrap());
-        let certificate = rustls_pemfile::certs(&mut reader).next().unwrap().unwrap();
+        let certificate = CertificateDer::pem_reader_iter(&mut reader)
+            .next()
+            .unwrap()
+            .unwrap();
         assert!(require_exact_peer_identity(&certificate, &identity_for(0, "events")).is_err());
 
         let multiple = CredentialFiles::new_with_sans(vec![
@@ -749,7 +772,10 @@ pub(crate) mod tests {
             identity_for(1, "events"),
         ]);
         let mut reader = BufReader::new(File::open(multiple.cert).unwrap());
-        let certificate = rustls_pemfile::certs(&mut reader).next().unwrap().unwrap();
+        let certificate = CertificateDer::pem_reader_iter(&mut reader)
+            .next()
+            .unwrap()
+            .unwrap();
         assert!(peer_identity_from_certificate(&certificate).is_err());
     }
 

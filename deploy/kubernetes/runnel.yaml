@@ -1,16 +1,18 @@
 # Development-only static-cluster manifest. Supply a per-pod peer TLS secret
-# projection at /var/run/runnel/peer-tls before applying this manifest. It
-# intentionally does not provide topology spread, backup policy,
-# ServiceMonitor, public client/HTTP TLS or authentication, storage-capacity
-# policy, or a supported rolling upgrade. See README.md for the assumptions.
+# projection at /var/run/runnel/peer-tls before applying this manifest. The
+# application listener explicitly allows unauthenticated plaintext for isolated
+# development; never expose the Services to production or untrusted networks.
+# This file also does not provide topology spread, backup policy, ServiceMonitor,
+# HTTP security, storage-capacity policy, or a supported rolling upgrade. See
+# README.md for the readiness, persistence, resource, and compatibility assumptions.
 apiVersion: v1
 kind: Service
 metadata:
   name: runnel
 spec:
   # Client and HTTP traffic use readiness-filtered endpoints. Peer traffic has
-  # its own mutually authenticated TLS transport; this Service does not add
-  # public client or HTTP TLS/authentication or a metrics scrape policy.
+  # its own mutually authenticated TLS transport; broker traffic is explicitly
+  # unauthenticated plaintext and HTTP has no access policy or scrape policy.
   selector:
     app.kubernetes.io/name: runnel
   ports:
@@ -98,6 +100,7 @@ spec:
                 --node-id "$node_id" \
                 --data-dir /var/lib/runnel \
                 --listen 0.0.0.0:4222 \
+                --insecure-development-listen \
                 --http-listen 0.0.0.0:8080 \
                 --peer-listen 0.0.0.0:7000 \
                 --cluster-node 0=runnel-0.runnel-headless:7000 \

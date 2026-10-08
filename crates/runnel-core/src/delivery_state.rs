@@ -205,6 +205,32 @@ impl DeliveryState {
             .map(|index| (&index.offsets, &index.keys))
     }
 
+    pub(super) fn in_flight_filter_excluding(
+        &self,
+        consumer: &str,
+        excluded_offsets: &HashSet<Offset>,
+    ) -> (HashSet<Offset>, HashSet<String>) {
+        if excluded_offsets.is_empty() {
+            return self
+                .in_flight_filter(consumer)
+                .map(|(offsets, keys)| (offsets.clone(), keys.clone()))
+                .unwrap_or_default();
+        }
+
+        let mut offsets = HashSet::new();
+        let mut keys = HashSet::new();
+        for (delivery_key, delivery) in &self.in_flight {
+            if delivery_key.consumer != consumer || excluded_offsets.contains(&delivery.offset) {
+                continue;
+            }
+            offsets.insert(delivery.offset);
+            if let Some(key) = delivery.key.as_ref() {
+                keys.insert(key.clone());
+            }
+        }
+        (offsets, keys)
+    }
+
     pub(super) fn get_in_flight(&self, consumer: &str, offset: Offset) -> Option<&InFlight> {
         self.in_flight.get(&DeliveryKey {
             consumer: consumer.to_owned(),

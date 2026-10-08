@@ -1,0 +1,277 @@
+syntax = "proto3";
+
+package runnel.v2;
+
+message VersionRange {
+  uint32 major = 1;
+  uint32 min_minor = 2;
+  uint32 max_minor = 3;
+}
+
+message ClientHello {
+  repeated VersionRange versions = 1;
+  repeated string offered_capabilities = 2;
+  repeated string required_capabilities = 3;
+  uint32 max_outbound_frame_bytes = 4;
+  uint32 max_inbound_frame_bytes = 5;
+}
+
+message HelloAccepted {
+  uint32 major = 1;
+  uint32 minor = 2;
+  repeated string capabilities = 3;
+  uint32 max_inbound_frame_bytes = 4;
+  uint32 max_outbound_frame_bytes = 5;
+  uint32 client_to_server_frame_bytes = 6;
+  uint32 server_to_client_frame_bytes = 7;
+  optional bool auth_required = 8;
+}
+
+enum RefusalCode {
+  REFUSAL_CODE_UNSPECIFIED = 0;
+  REFUSAL_CODE_INVALID_HELLO = 1;
+  REFUSAL_CODE_UNSUPPORTED_VERSION = 2;
+  REFUSAL_CODE_UNSUPPORTED_CAPABILITY = 3;
+  REFUSAL_CODE_LIMIT_TOO_SMALL = 4;
+  REFUSAL_CODE_LIMIT_TOO_LARGE = 5;
+}
+
+message HelloRefusal {
+  RefusalCode code = 1;
+  string diagnostic = 2;
+}
+
+message ServerHello {
+  oneof result {
+    HelloAccepted accepted = 1;
+    HelloRefusal refusal = 2;
+  }
+}
+
+message HelloFrame {
+  oneof message {
+    ClientHello client = 1;
+    ServerHello server = 2;
+  }
+}
+
+message BearerAuth {
+  string token = 1;
+}
+
+message Authenticated {}
+message AuthenticationFailed {}
+
+message ClientFrame {
+  oneof body {
+    BearerAuth bearer_auth = 1;
+    ApplicationRequest application = 2;
+  }
+}
+
+message ServerFrame {
+  oneof body {
+    Authenticated authenticated = 1;
+    AuthenticationFailed authentication_failed = 2;
+    ApplicationResponse application = 3;
+  }
+}
+
+message CreateStreamRequest { string stream = 1; }
+message PublishRequest {
+  string stream = 1;
+  optional string key = 2;
+  bytes payload = 3;
+  optional string request_id = 4;
+}
+message PublishBatchRecord {
+  optional string key = 1;
+  bytes payload = 2;
+  optional string request_id = 3;
+}
+message PublishBatchRequest {
+  string stream = 1;
+  repeated PublishBatchRecord records = 2;
+}
+message PollRequest { string stream = 1; string consumer = 2; }
+message PollBatchRequest {
+  string stream = 1;
+  string consumer = 2;
+  uint32 max_records = 3;
+  uint32 max_bytes = 4;
+  uint64 max_wait_ms = 5;
+}
+message ReplayRequest { string stream = 1; string consumer = 2; uint64 offset = 3; }
+message PollGroupRequest { string stream = 1; string consumer = 2; string member = 3; }
+message PollGroupBatchRequest {
+  string stream = 1;
+  string consumer = 2;
+  string member = 3;
+  uint32 max_records = 4;
+  uint32 max_bytes = 5;
+  uint64 max_wait_ms = 6;
+}
+message ConfigureConsumerRequest {
+  string stream = 1;
+  string consumer = 2;
+  uint64 ack_timeout_ms = 3;
+  optional uint32 max_delivery_attempts = 4;
+  uint64 retry_delay_ms = 5;
+}
+message InspectConsumerRequest { string stream = 1; string consumer = 2; }
+message AckRequest { string stream = 1; string consumer = 2; uint64 offset = 3; }
+message DeliveryReceipt { uint64 offset = 1; string delivery_token = 2; }
+message AckBatchRequest {
+  string stream = 1;
+  string consumer = 2;
+  repeated DeliveryReceipt receipts = 3;
+}
+message AckGroupRequest {
+  string stream = 1;
+  string consumer = 2;
+  string member = 3;
+  uint64 offset = 4;
+  string delivery_token = 5;
+}
+message AckGroupBatchRequest {
+  string stream = 1;
+  string consumer = 2;
+  string member = 3;
+  repeated DeliveryReceipt receipts = 4;
+}
+message HealthRequest {}
+
+message ApplicationRequest {
+  oneof operation {
+    CreateStreamRequest create_stream = 1;
+    PublishRequest publish = 2;
+    PublishBatchRequest publish_batch = 3;
+    PollRequest poll = 4;
+    PollBatchRequest poll_batch = 5;
+    ReplayRequest replay = 6;
+    PollGroupRequest poll_group = 7;
+    PollGroupBatchRequest poll_group_batch = 8;
+    ConfigureConsumerRequest configure_consumer = 9;
+    InspectConsumerRequest inspect_consumer = 10;
+    AckRequest ack = 11;
+    AckBatchRequest ack_batch = 12;
+    AckGroupRequest ack_group = 13;
+    AckGroupBatchRequest ack_group_batch = 14;
+    HealthRequest health = 15;
+  }
+}
+
+enum Outcome {
+  OUTCOME_UNSPECIFIED = 0;
+  OUTCOME_CONFIRMED = 1;
+  OUTCOME_REJECTED = 2;
+  OUTCOME_RETRYABLE = 3;
+  OUTCOME_UNKNOWN = 4;
+}
+
+enum Stage {
+  STAGE_UNSPECIFIED = 0;
+  STAGE_RECEIVED = 1;
+  STAGE_VALIDATED = 2;
+  STAGE_EXECUTION_STARTED = 3;
+  STAGE_DURABLE = 4;
+  STAGE_COMPLETED = 5;
+  STAGE_UNKNOWN = 6;
+}
+
+message ApplicationRequestEnvelope { ApplicationRequest request = 1; }
+message StreamCreatedResult { string stream = 1; bool created = 2; }
+message PublishedResult { string stream = 1; uint64 offset = 2; }
+message PublishItemResult {
+  Outcome outcome = 1;
+  Stage stage = 2;
+  optional uint64 offset = 3;
+  optional string code = 4;
+  optional string diagnostic = 5;
+}
+message PublishBatchResult { string stream = 1; repeated PublishItemResult items = 2; }
+message MessageResult {
+  string stream = 1;
+  string consumer = 2;
+  optional string member = 3;
+  uint64 offset = 4;
+  optional string key = 5;
+  bytes payload = 6;
+  uint64 published_at_ms = 7;
+  optional string delivery_token = 8;
+  optional uint32 delivery_attempt = 9;
+}
+message MessageItemResult {
+  Outcome outcome = 1;
+  Stage stage = 2;
+  MessageResult message = 3;
+}
+message PollBatchResult {
+  string stream = 1;
+  string consumer = 2;
+  repeated MessageItemResult items = 3;
+}
+message ReplayResult {
+  string stream = 1;
+  string consumer = 2;
+  uint64 offset = 3;
+  optional string key = 4;
+  bytes payload = 5;
+  uint64 published_at_ms = 6;
+}
+message EmptyResult { string stream = 1; string consumer = 2; }
+message AcknowledgedResult {
+  string stream = 1;
+  string consumer = 2;
+  uint64 offset = 3;
+  bool already_acknowledged = 4;
+}
+enum AckStatus {
+  ACK_STATUS_UNSPECIFIED = 0;
+  ACK_STATUS_CONFIRMED = 1;
+  ACK_STATUS_ALREADY_CONFIRMED = 2;
+  ACK_STATUS_REJECTED = 3;
+}
+message AckItemResult {
+  uint64 offset = 1;
+  Outcome outcome = 2;
+  Stage stage = 3;
+  AckStatus status = 4;
+  optional string code = 5;
+  optional string diagnostic = 6;
+}
+message AckBatchResult {
+  string stream = 1;
+  string consumer = 2;
+  repeated AckItemResult items = 3;
+}
+message ConsumerPolicyResult {
+  string stream = 1;
+  string consumer = 2;
+  uint64 version = 3;
+  bool configured = 4;
+  uint64 ack_timeout_ms = 5;
+  optional uint32 max_delivery_attempts = 6;
+  uint64 retry_delay_ms = 7;
+}
+message HealthResult { string status = 1; uint64 streams = 2; uint64 storage_bytes = 3; }
+message ErrorResult { string code = 1; string diagnostic = 2; }
+
+message ApplicationResponse {
+  optional Outcome outcome = 1;
+  optional Stage stage = 2;
+  oneof result {
+    StreamCreatedResult stream_created = 3;
+    PublishedResult published = 4;
+    PublishBatchResult publish_batch = 5;
+    PollBatchResult poll_batch = 6;
+    MessageResult message = 7;
+    ReplayResult replay = 8;
+    EmptyResult empty = 9;
+    AcknowledgedResult acknowledged = 10;
+    AckBatchResult ack_batch = 11;
+    ConsumerPolicyResult consumer_policy = 12;
+    HealthResult health = 13;
+    ErrorResult error = 14;
+  }
+}

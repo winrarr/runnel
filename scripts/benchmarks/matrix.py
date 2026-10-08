@@ -853,8 +853,8 @@ def run_matrix(
         "case_timeout_seconds": args.case_timeout_seconds,
         "failure_timeout_seconds": args.failure_timeout_seconds,
         "durability": "current clustered broker quorum and local durable state",
-        "protocol": "line-delimited JSON with UTF-8 string payloads",
-        "protocol_version": "provisional-line-json-v1",
+        "protocol": "negotiated v2 Protobuf framing with opaque binary payloads",
+        "protocol_version": "runnel-protobuf-v2",
     }
     result = {
         **result_metadata(

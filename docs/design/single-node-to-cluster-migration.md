@@ -1,7 +1,7 @@
 # Single-node to clustered migration boundary
 
 - Status: accepted migration boundary; runtime implementation deferred by [ADR 0043](../decisions/0043-offline-local-to-cluster-migration.md)
-- Last reviewed: 2026-10-06
+- Last reviewed: 2026-10-07
 - Baseline: `66cacafc8545f010dc710b49a1947c65e8dad53d`
 - Reading guide: [design-note conventions](README.md)
 - Scope: backlog outcome [Make growth from one node to a cluster non-disruptive](../backlog.md#make-growth-from-one-node-to-a-cluster-non-disruptive)
@@ -142,8 +142,10 @@ The clustered state machine currently materializes complete retained messages.
 `state-machine.json` and snapshot payloads emit and require format version 3;
 older schemas fail closed without mutation. The OpenRaft `snapshot.json`
 wrapper also carries snapshot metadata. `state-machine.log` is a separate
-length-prefixed JSON journal with record format version 2 and a 64 MiB record
-bound; older record versions fail closed. These are
+length-prefixed JSON journal with record format version 3 and a 96 MiB record
+bound; older record versions fail closed. Publish command payloads use compact
+text/base64 JSON, and the journal version bump rejects older array-encoded
+commands before deserialization. These are
 separate persistence and recovery boundaries, as documented in the [TD-009
 snapshot evidence note](td-009-snapshot-evidence.md) and [TD-010 retained-state
 evidence note](td-010-retained-state-evidence.md). Its state includes:
@@ -675,7 +677,7 @@ small compatibility matrix:
 | --- | --- | --- |
 | Public protocol | The target implements the negotiated application protocol accepted by [ADR 0031](../decisions/0031-protocol-v2-contract.md). Migration adds no previous-version compatibility or automatic client reconnection promise. | Provisional v1 declaration, mixed-version operation, or topology fields as migration evidence. |
 | Local record encoding | A future migration-aware source release that writes and reads only its single `RNL3` local stream format and supported consumer-state schema, subject to target representability. No source is eligible at the recorded baseline. | `RNL1`, `RNL2`, mixed histories, old software generations, obsolete state schemas, unknown or malformed complete records, unbounded lengths, and guessed conversion. Historical reader support creates no compatibility promise. |
-| Cluster representation | Current target metadata/data-group layout: `storage.json` and the Raft log use their exact supported schemas; the state-machine journal uses record version 2, checkpoint and snapshot payloads require version 3, and the current `group.json` manifest shape binds stream/group identity. Earlier state-machine formats fail closed. | Import into an older target, unknown target schema, or arbitrary OpenRaft on-disk layout. |
+| Cluster representation | Current target metadata/data-group layout: `storage.json`, the Raft log, and the state-machine journal use their exact supported schemas; the Raft log and journal use version 3, the journal record bound is 96 MiB, checkpoint and snapshot payloads require version 3, and the current `group.json` manifest shape binds stream/group identity. Earlier state-machine formats fail closed. | Import into an older target, unknown target schema, or arbitrary OpenRaft on-disk layout. |
 | Consumer semantics | Local committed and out-of-order acknowledged progress, attempts, configured policy/version including retry delay, durable retry scheduling, and per-offset policy snapshots convert into coherent clustered state. Outstanding local tokens/deadlines are dropped and redelivered under target rules. | Transferring local receipts or monotonic deadlines, dropping a pinned policy or scheduled delay, or changing retry/ack semantics. |
 | Producer identity | Public IDs preserve original offsets and exact comparison content under ADR 0034; internal dead-letter identities remain distinct under ADR 0029. | Deduplicating requests without IDs, inventing IDs, merging identity kinds, or changing key/payload conflict behavior. |
 | Configuration | Preserve configured policies/versions, retry delays, and per-offset snapshots; require equivalent source/target fallbacks for acknowledgement timeout, attempt limit, and retry delay where effective behavior depends on them. Preserve retained-history floors/pins and offset/timestamp replay semantics. | Unreviewed policy changes that alter redelivery, dead letters, retention, or replay; resetting versions or pinned snapshots. |

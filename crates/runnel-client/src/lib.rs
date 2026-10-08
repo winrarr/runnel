@@ -1,21 +1,32 @@
-use std::io;
+use std::fmt;
+use std::fs;
+use std::io::{self, BufReader as IoBufReader, Read};
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+pub use runnel_protocol::BearerToken;
+use runnel_protocol::v2::{
+    self as v2, ApplicationReply, ItemMetadata, Outcome as V2Outcome, ServerFrame,
+};
 use runnel_protocol::{
     AckBatchItemOutcome as WireAckBatchItemOutcome, BatchMessageResponse, BinaryPayload,
-    MAX_CONSUME_BATCH_RECORDS, MAX_PUBLISH_BATCH_BYTES, MAX_PUBLISH_BATCH_RECORDS,
-    MAX_RESPONSE_BYTES, PublishBatchRecord as WirePublishBatchRecord, PublishBatchRecordResponse,
-    Request, Response,
+    MAX_CONSUME_BATCH_RECORDS, MAX_PUBLISH_BATCH_RECORDS,
+    PublishBatchRecord as WirePublishBatchRecord, PublishBatchRecordResponse, Request, Response,
 };
 pub use runnel_protocol::{PayloadEncoding, ProtocolSupport, ProtocolVersionRange};
+use rustls::RootCertStore;
+use rustls::pki_types::{CertificateDer, ServerName, pem::PemObject};
 use thiserror::Error;
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, ReadHalf, WriteHalf};
+use tokio::io::{
+    AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader, ReadHalf, WriteHalf,
+};
 use tokio::net::{TcpStream, ToSocketAddrs};
+use tokio_rustls::TlsConnector;
+use zeroize::Zeroize;
 
 /// Protocol compatibility declared by this client and its broker-facing types.
 ///
-/// The current JSON-lines listener has no runtime handshake, so this is a
-/// source-level declaration rather than a negotiated connection property.
+/// Connections negotiate this supported range on each v2 connection.
 pub const PROTOCOL_SUPPORT: ProtocolSupport = runnel_protocol::PROTOCOL_SUPPORT;
 
 /// Timeouts applied to each stage of a client connection and request.
@@ -23,14 +34,13 @@ pub const PROTOCOL_SUPPORT: ProtocolSupport = runnel_protocol::PROTOCOL_SUPPORT;
 pub struct ClientConfig {
     /// Maximum time allowed to establish the TCP connection.
     pub connect_timeout: Duration,
-    /// Maximum time allowed to write one complete request line.
+    /// Maximum time allowed to write one complete application frame.
     pub request_timeout: Duration,
-    /// Maximum time allowed to read one complete response line.
+    /// Maximum time allowed to read one complete response frame.
     pub response_timeout: Duration,
-    /// Maximum encoded response size, including the optional line terminator.
+    /// Maximum encoded Protobuf response body.
     ///
-    /// The default is [`runnel_protocol::MAX_RESPONSE_BYTES`], which covers
-    /// responses for the largest request the provisional protocol accepts.
+    /// The default is [`runnel_protocol::v2::DEFAULT_SERVER_TO_CLIENT_FRAME_BYTES`].
     /// Lower this bound when a client needs a smaller memory budget. A response
     /// that exceeds the bound invalidates the connection and is classified as
     /// an unknown operation outcome once its request may have been sent.
@@ -43,7 +53,7 @@ impl Default for ClientConfig {
             connect_timeout: Duration::from_secs(5),
             request_timeout: Duration::from_secs(5),
             response_timeout: Duration::from_secs(30),
-            max_response_bytes: MAX_RESPONSE_BYTES,
+            max_response_bytes: v2::DEFAULT_SERVER_TO_CLIENT_FRAME_BYTES,
         }
     }
 }
@@ -60,15 +70,48 @@ pub enum ClientError {
         source: io::Error,
     },
 
+    #[error("TLS and token configuration is incomplete or invalid")]
+    InvalidSecurityConfiguration,
+
+    #[error("credential file is missing, unreadable, or not protected")]
+    CredentialFile,
+
+    #[error("server TLS certificate validation or handshake failed")]
+    TlsHandshake,
+
+    #[error("server TLS trust roots could not be loaded")]
+    InvalidTrustRoots,
+
+    #[error("server name is invalid for TLS verification")]
+    InvalidServerName,
+
+    #[error("server refused v2 negotiation: {code}")]
+    HandshakeRefused { code: &'static str },
+
+    #[error("server's v2 Hello response is invalid")]
+    InvalidHello,
+
+    #[error("server requires a bearer credential")]
+    AuthenticationRequired,
+
+    #[error("server authentication failed")]
+    AuthenticationFailed,
+
+    #[error("secure client configuration does not match the server Hello")]
+    SecurityMismatch,
+
+    #[error("v2 protocol frame is invalid")]
+    Protocol,
+
+    #[error("encoded request exceeds the negotiated frame limit of {max_bytes} bytes")]
+    RequestTooLarge { max_bytes: usize },
+
     /// No usable connection remains after a failed or cancelled request.
     #[error("client connection is unavailable; reconnect before sending another request")]
     ConnectionUnavailable,
 
-    #[error("encoding request as JSON failed: {source}")]
-    EncodeRequest {
-        #[source]
-        source: serde_json::Error,
-    },
+    #[error("request cannot be represented by the v2 protocol")]
+    RequestEncoding,
 
     #[error("invalid publish batch: {message}")]
     InvalidBatch { message: String },
@@ -100,17 +143,92 @@ pub enum ClientError {
     #[error("broker closed the connection before sending a response")]
     Eof,
 
-    #[error("decoding response as JSON failed: {source}")]
-    InvalidResponse {
-        #[source]
-        source: serde_json::Error,
-    },
+    #[error("broker returned an invalid v2 response")]
+    InvalidResponse,
 
-    #[error("unexpected response for {operation}: {response:?}")]
+    #[error("unexpected {response_kind} response for {operation}")]
     UnexpectedResponse {
         operation: &'static str,
-        response: Box<Response>,
+        response_kind: &'static str,
     },
+}
+
+/// TLS server identity and an optional exclusive trust bundle for a broker connection.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClientTlsConfig {
+    /// DNS name or IP literal that must appear in the server certificate.
+    pub server_name: String,
+    /// Optional PEM trust bundle. When set, only these roots are trusted; otherwise platform roots are used.
+    pub ca_file: Option<PathBuf>,
+}
+
+impl ClientTlsConfig {
+    pub fn new(server_name: impl Into<String>) -> Self {
+        Self {
+            server_name: server_name.into(),
+            ca_file: None,
+        }
+    }
+
+    pub fn with_ca_file(mut self, path: impl Into<PathBuf>) -> Self {
+        self.ca_file = Some(path.into());
+        self
+    }
+}
+
+/// Per-connection TLS and bearer settings. A token is never accepted from an
+/// argument or environment variable and is redacted from formatting.
+pub struct ClientSecurityConfig {
+    tls: Option<ClientTlsConfig>,
+    token: Option<BearerToken>,
+}
+
+impl ClientSecurityConfig {
+    pub fn plaintext_development() -> Self {
+        Self {
+            tls: None,
+            token: None,
+        }
+    }
+
+    pub fn with_tls(mut self, tls: ClientTlsConfig) -> Self {
+        self.tls = Some(tls);
+        self
+    }
+
+    pub fn with_token_file(mut self, path: impl AsRef<Path>) -> Result<Self, ClientError> {
+        self.token = Some(read_token_file(path.as_ref())?);
+        Ok(self)
+    }
+
+    pub fn with_bearer_token(mut self, token: BearerToken) -> Self {
+        self.token = Some(token);
+        self
+    }
+
+    pub fn has_tls(&self) -> bool {
+        self.tls.is_some()
+    }
+
+    pub fn has_bearer_token(&self) -> bool {
+        self.token.is_some()
+    }
+}
+
+impl Default for ClientSecurityConfig {
+    fn default() -> Self {
+        Self::plaintext_development()
+    }
+}
+
+impl fmt::Debug for ClientSecurityConfig {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ClientSecurityConfig")
+            .field("tls", &self.tls)
+            .field("bearer_token", &self.token.as_ref().map(|_| "[REDACTED]"))
+            .finish()
+    }
 }
 
 /// Optional fields for a text publish.
@@ -267,7 +385,7 @@ pub struct Message {
     pub offset: u64,
     /// The optional ordering key attached to the message.
     pub key: Option<String>,
-    /// The UTF-8 payload returned by the legacy text response.
+    /// The UTF-8 payload returned through the text convenience API.
     pub payload: String,
     /// The broker timestamp associated with the publish.
     pub published_at_ms: u64,
@@ -374,11 +492,10 @@ pub struct ConsumerPolicy {
     pub retry_delay_ms: u64,
 }
 
-/// The result classification for one request attempt.
+/// The result classification for one v2 request attempt.
 ///
 /// The classification is deliberately not serialized. It describes what the
-/// client can safely infer about an attempt from the existing provisional
-/// protocol and transport behavior.
+/// client can safely infer from v2 response metadata and transport behavior.
 #[derive(Debug)]
 pub enum AttemptOutcome {
     /// The broker returned a non-error response, so the operation is confirmed.
@@ -410,9 +527,19 @@ impl AttemptOutcome {
             ClientError::ConnectTimeout { .. }
             | ClientError::Connect { .. }
             | ClientError::ConnectionUnavailable => Self::Retryable(AttemptFailure::Client(error)),
-            ClientError::EncodeRequest { .. } => Self::Rejected(AttemptFailure::Client(error)),
-            ClientError::InvalidBatch { .. } => Self::Rejected(AttemptFailure::Client(error)),
-            ClientError::InvalidResponseLimit => Self::Rejected(AttemptFailure::Client(error)),
+            ClientError::RequestEncoding
+            | ClientError::InvalidBatch { .. }
+            | ClientError::InvalidResponseLimit
+            | ClientError::InvalidSecurityConfiguration
+            | ClientError::CredentialFile
+            | ClientError::InvalidTrustRoots
+            | ClientError::InvalidServerName
+            | ClientError::HandshakeRefused { .. }
+            | ClientError::InvalidHello
+            | ClientError::AuthenticationRequired
+            | ClientError::AuthenticationFailed
+            | ClientError::SecurityMismatch
+            | ClientError::RequestTooLarge { .. } => Self::Rejected(AttemptFailure::Client(error)),
             _ => Self::Unknown(AttemptFailure::Client(error)),
         }
     }
@@ -444,7 +571,7 @@ impl AttemptOutcome {
     }
 }
 
-/// A persistent, sequential TCP client for the provisional JSON-lines protocol.
+/// A persistent, sequential client for the negotiated Runnel v2 protocol.
 ///
 /// A client sends one request and reads one response per [`Client::request`] call.
 /// Calls borrow the client mutably so responses cannot be interleaved. Use
@@ -465,11 +592,17 @@ impl AttemptOutcome {
 pub struct Client {
     connection: Option<Connection>,
     config: ClientConfig,
+    security: ClientSecurityConfig,
 }
 
+trait ApplicationIo: AsyncRead + AsyncWrite + Unpin + Send {}
+impl<T: AsyncRead + AsyncWrite + Unpin + Send> ApplicationIo for T {}
+
 struct Connection {
-    reader: BufReader<ReadHalf<TcpStream>>,
-    writer: WriteHalf<TcpStream>,
+    reader: BufReader<ReadHalf<Box<dyn ApplicationIo>>>,
+    writer: WriteHalf<Box<dyn ApplicationIo>>,
+    max_request_bytes: usize,
+    max_response_bytes: usize,
 }
 
 impl Client {
@@ -483,14 +616,26 @@ impl Client {
         address: impl ToSocketAddrs,
         config: ClientConfig,
     ) -> Result<Self, ClientError> {
-        if config.max_response_bytes == 0 {
+        Self::connect_with_security(address, config, ClientSecurityConfig::default()).await
+    }
+
+    /// Connect with explicit transport security, trust roots, credentials, and timeouts.
+    pub async fn connect_with_security(
+        address: impl ToSocketAddrs,
+        config: ClientConfig,
+        security: ClientSecurityConfig,
+    ) -> Result<Self, ClientError> {
+        if config.max_response_bytes < v2::MIN_FRAME_BODY_BYTES
+            || config.max_response_bytes > v2::MAX_SERVER_TO_CLIENT_FRAME_BYTES
+        {
             return Err(ClientError::InvalidResponseLimit);
         }
-        let connection = connect(address, config).await?;
+        let connection = connect(address, config, &security).await?;
 
         Ok(Self {
             connection: Some(connection),
             config,
+            security,
         })
     }
 
@@ -521,7 +666,7 @@ impl Client {
     /// method never replays the failed request.
     pub async fn reconnect(&mut self, address: impl ToSocketAddrs) -> Result<(), ClientError> {
         let config = self.config;
-        let connection = connect(address, config).await?;
+        let connection = connect(address, config, &self.security).await?;
         self.connection = Some(connection);
         Ok(())
     }
@@ -529,20 +674,36 @@ impl Client {
     /// Send one request and read exactly one response from this connection.
     ///
     /// After a write, response timeout, read, EOF, or response-decoding error,
-    /// the connection is discarded automatically. The broker's
-    /// `request_too_large` response also closes the protocol connection, so it
-    /// is discarded even though the response itself was received. Reconnect
-    /// before issuing another request. If this future is cancelled after
+    /// the connection is discarded automatically. A broker result such as
+    /// `response_too_large` is a completed protocol response and leaves the
+    /// connection reusable. If this future is cancelled after
     /// polling begins, its connection is also discarded; the request outcome
     /// is unknown and must be resolved explicitly before retrying.
     ///
     /// A local request-encoding error occurs before the connection is taken and
     /// leaves an otherwise healthy connection available for reuse.
     pub async fn request(&mut self, request: &Request) -> Result<Response, ClientError> {
-        let mut request_bytes =
-            serde_json::to_vec(request).map_err(|source| ClientError::EncodeRequest { source })?;
-        request_bytes.push(b'\n');
+        self.request_with_reply(request)
+            .await
+            .map(|reply| reply.response)
+    }
 
+    /// Send one request and preserve its negotiated safety classification and stage.
+    pub async fn request_with_reply(
+        &mut self,
+        request: &Request,
+    ) -> Result<ApplicationReply, ClientError> {
+        let request_bytes =
+            v2::encode_application_request(request).map_err(|_| ClientError::RequestEncoding)?;
+        let request_body_bytes = request_bytes.len().saturating_sub(4);
+        let Some(current) = self.connection.as_ref() else {
+            return Err(ClientError::ConnectionUnavailable);
+        };
+        if request_body_bytes > current.max_request_bytes {
+            return Err(ClientError::RequestTooLarge {
+                max_bytes: current.max_request_bytes,
+            });
+        }
         let mut connection = self
             .connection
             .take()
@@ -551,7 +712,7 @@ impl Client {
         let result = async {
             tokio::time::timeout(
                 config.request_timeout,
-                connection.writer.write_all(&request_bytes),
+                connection.writer.write_all(request_bytes.as_bytes()),
             )
             .await
             .map_err(|_| ClientError::WriteTimeout {
@@ -559,22 +720,26 @@ impl Client {
             })?
             .map_err(|source| ClientError::Write { source })?;
 
+            let max_response_bytes = connection.max_response_bytes;
             let response = tokio::time::timeout(
                 config.response_timeout,
-                read_response(&mut connection.reader, config.max_response_bytes),
+                read_v2_frame(&mut connection.reader, max_response_bytes),
             )
             .await
             .map_err(|_| ClientError::ResponseTimeout {
                 timeout: config.response_timeout,
             })??;
 
-            Ok(response)
+            match v2::decode_server_frame(&response, max_response_bytes) {
+                Ok(ServerFrame::Application(reply)) => Ok(reply),
+                Ok(ServerFrame::AuthenticationFailed) => Err(ClientError::AuthenticationFailed),
+                Ok(ServerFrame::Authenticated) => Err(ClientError::Protocol),
+                Err(_) => Err(ClientError::InvalidResponse),
+            }
         }
         .await;
 
-        if let Ok(response) = &result
-            && !response_closes_connection(response)
-        {
+        if result.is_ok() {
             self.connection = Some(connection);
         }
         result
@@ -591,8 +756,8 @@ impl Client {
     /// produce an [`AttemptOutcome`]; callers must apply the same unknown
     /// outcome rule when cancellation may have followed a partial write.
     pub async fn request_with_outcome(&mut self, request: &Request) -> AttemptOutcome {
-        match self.request(request).await {
-            Ok(response) => classify_response(response),
+        match self.request_with_reply(request).await {
+            Ok(reply) => classify_v2_reply(reply),
             Err(error) => AttemptOutcome::from_client_error(error),
         }
     }
@@ -694,7 +859,7 @@ impl Client {
             Request::PublishBytes {
                 stream: stream.clone(),
                 key: options.key,
-                payload_base64: BinaryPayload::new(payload),
+                payload: BinaryPayload::new(payload),
                 request_id: options.request_id,
             },
             move |response| match response {
@@ -748,34 +913,19 @@ impl Client {
                 .into_iter()
                 .map(|record| WirePublishBatchRecord {
                     key: record.key,
-                    payload_base64: BinaryPayload::new(record.payload),
+                    payload: BinaryPayload::new(record.payload),
                     request_id: record.request_id,
                 })
                 .collect(),
         };
-        let encoded_size = match serde_json::to_vec(&request) {
-            Ok(encoded) => encoded.len(),
-            Err(source) => {
-                return publish_batch_failure(
-                    record_count,
-                    BatchFailureKind::Rejected,
-                    AttemptFailure::Client(ClientError::EncodeRequest { source }),
-                );
-            }
-        };
-        if encoded_size > MAX_PUBLISH_BATCH_BYTES {
-            return publish_batch_invalid(
+        let attempt = match self.request_with_reply(&request).await {
+            Ok(reply) => publish_batch_reply(stream, record_count, reply),
+            Err(error) => publish_batch_attempt(
+                stream,
                 record_count,
-                format!(
-                    "encoded publish batch exceeds the maximum of {MAX_PUBLISH_BATCH_BYTES} bytes"
-                ),
-            );
-        }
-        let attempt = publish_batch_attempt(
-            stream,
-            record_count,
-            self.request_with_outcome(&request).await,
-        );
+                AttemptOutcome::from_client_error(error),
+            ),
+        };
         if matches!(
             &attempt.attempt,
             Some(AttemptFailure::Client(
@@ -1030,7 +1180,7 @@ impl Client {
                     consumer: response_consumer,
                     offset: response_offset,
                     key,
-                    payload_base64,
+                    payload,
                     published_at_ms,
                 } if response_stream == stream
                     && response_consumer == consumer
@@ -1041,7 +1191,7 @@ impl Client {
                         consumer: response_consumer,
                         offset: response_offset,
                         key,
-                        payload: payload_base64.into_bytes(),
+                        payload: payload.into_bytes(),
                         published_at_ms,
                     })
                 }
@@ -1053,8 +1203,8 @@ impl Client {
 
     /// Poll a consumer and return the exact application payload bytes.
     ///
-    /// Legacy UTF-8 responses are converted to their UTF-8 bytes. Messages
-    /// that require the binary representation are decoded from base64.
+    /// Text convenience responses are converted to their UTF-8 bytes. Binary
+    /// responses preserve their exact Protobuf `bytes` field.
     pub async fn poll_bytes(
         &mut self,
         stream: impl Into<String>,
@@ -1294,25 +1444,27 @@ impl Client {
                 },
             )));
         }
+        let negotiated_response_bytes = self
+            .connection
+            .as_ref()
+            .map_or(self.config.max_response_bytes, |connection| {
+                connection.max_response_bytes
+            });
         let max_bytes = limits
             .max_bytes
-            .min(self.config.max_response_bytes)
-            .min(MAX_RESPONSE_BYTES);
-        let empty_response = Response::PollBatch {
-            stream: stream.clone(),
-            consumer: consumer.clone(),
-            messages: Vec::new(),
-        };
-        let minimum_bytes = serde_json::to_vec(&empty_response)
-            .map(|mut bytes| {
-                bytes.push(b'\n');
-                bytes.len()
-            })
-            .map_err(|source| {
-                AttemptOutcome::Rejected(AttemptFailure::Client(ClientError::EncodeRequest {
-                    source,
-                }))
-            })?;
+            .min(negotiated_response_bytes)
+            .min(v2::MAX_SERVER_TO_CLIENT_FRAME_BYTES);
+        let empty_reply = ApplicationReply::batch(
+            Response::PollBatch {
+                stream: stream.clone(),
+                consumer: consumer.clone(),
+                messages: Vec::new(),
+            },
+            Vec::new(),
+        );
+        let minimum_bytes = v2::encode_server_frame(&ServerFrame::Application(empty_reply))
+            .map(|frame| frame.len().saturating_sub(4))
+            .map_err(|_| AttemptOutcome::Rejected(AttemptFailure::Client(ClientError::Protocol)))?;
         if minimum_bytes > max_bytes {
             return Err(AttemptOutcome::Rejected(AttemptFailure::Client(
                 ClientError::InvalidBatch {
@@ -1515,7 +1667,7 @@ impl Client {
                 member: response_member,
                 offset,
                 key,
-                payload_base64,
+                payload,
                 published_at_ms,
                 delivery_token,
                 delivery_attempt,
@@ -1529,7 +1681,7 @@ impl Client {
                     member: response_member,
                     offset,
                     key,
-                    payload: payload_base64.into_bytes(),
+                    payload: payload.into_bytes(),
                     published_at_ms,
                     delivery_token,
                     delivery_attempt,
@@ -1550,7 +1702,7 @@ impl Client {
         request: Request,
         parse: impl FnOnce(Response) -> Result<T, Box<Response>>,
     ) -> Result<T, AttemptOutcome> {
-        match typed_response(operation, self.request_with_outcome(&request).await, parse) {
+        match typed_reply(operation, self.request_with_reply(&request).await, parse) {
             TypedResponse::Value(value) => Ok(value),
             TypedResponse::Outcome(outcome) => {
                 if unexpected_response(&outcome) {
@@ -1571,93 +1723,304 @@ fn unexpected_response(outcome: &AttemptOutcome) -> bool {
     )
 }
 
-fn response_closes_connection(response: &Response) -> bool {
-    matches!(
-        response,
-        Response::Error { code, .. } if code == "request_too_large"
-    )
-}
-
 async fn connect(
     address: impl ToSocketAddrs,
     config: ClientConfig,
+    security: &ClientSecurityConfig,
 ) -> Result<Connection, ClientError> {
+    if security.token.is_some() && security.tls.is_none() {
+        return Err(ClientError::InvalidSecurityConfiguration);
+    }
     let stream = tokio::time::timeout(config.connect_timeout, TcpStream::connect(address))
         .await
         .map_err(|_| ClientError::ConnectTimeout {
             timeout: config.connect_timeout,
         })?
         .map_err(|source| ClientError::Connect { source })?;
+
+    let stream: Box<dyn ApplicationIo> = if let Some(tls) = &security.tls {
+        let name = ServerName::try_from(tls.server_name.clone())
+            .map_err(|_| ClientError::InvalidServerName)?;
+        let tls_config = client_tls_config(tls)?;
+        let connector = TlsConnector::from(tls_config);
+        let stream = tokio::time::timeout(config.connect_timeout, connector.connect(name, stream))
+            .await
+            .map_err(|_| ClientError::TlsHandshake)?
+            .map_err(|_| ClientError::TlsHandshake)?;
+        Box::new(stream)
+    } else {
+        Box::new(stream)
+    };
+
     let (reader, writer) = tokio::io::split(stream);
-    Ok(Connection {
+    let mut connection = Connection {
         reader: BufReader::new(reader),
         writer,
-    })
+        max_request_bytes: v2::MAX_CLIENT_TO_SERVER_FRAME_BYTES,
+        max_response_bytes: config.max_response_bytes,
+    };
+    negotiate(&mut connection, config, security).await?;
+    Ok(connection)
 }
 
-async fn read_response(
-    reader: &mut BufReader<ReadHalf<TcpStream>>,
-    max_response_bytes: usize,
-) -> Result<Response, ClientError> {
-    let mut response_bytes = Vec::with_capacity(max_response_bytes.min(8 * 1024));
+async fn negotiate(
+    connection: &mut Connection,
+    config: ClientConfig,
+    security: &ClientSecurityConfig,
+) -> Result<(), ClientError> {
+    let mut hello = v2::ClientHello::core_v2();
+    hello.max_inbound_frame_bytes = config.max_response_bytes;
+    let hello_frame = v2::encode_client_hello(&hello).map_err(|_| ClientError::InvalidHello)?;
+    tokio::time::timeout(config.request_timeout, async {
+        connection.writer.write_all(&v2::PREFACE).await?;
+        connection.writer.write_all(hello_frame.as_bytes()).await
+    })
+    .await
+    .map_err(|_| ClientError::WriteTimeout {
+        timeout: config.request_timeout,
+    })?
+    .map_err(|source| ClientError::Write { source })?;
 
-    loop {
-        let buffered = reader
-            .fill_buf()
-            .await
-            .map_err(|source| ClientError::Read { source })?;
-        if buffered.is_empty() {
-            if response_bytes.is_empty() {
-                return Err(ClientError::Eof);
-            }
-            return serde_json::from_slice(&response_bytes)
-                .map_err(|source| ClientError::InvalidResponse { source });
+    let hello_body = tokio::time::timeout(
+        config.response_timeout,
+        read_v2_frame(&mut connection.reader, v2::HELLO_MAX_BODY_BYTES),
+    )
+    .await
+    .map_err(|_| ClientError::ResponseTimeout {
+        timeout: config.response_timeout,
+    })??;
+    let server_hello =
+        v2::decode_server_hello(&hello_body).map_err(|_| ClientError::InvalidHello)?;
+    let v2::ServerHello::Accepted(accepted) = server_hello else {
+        let v2::ServerHello::Refused { code, .. } = server_hello else {
+            unreachable!()
+        };
+        return Err(ClientError::HandshakeRefused {
+            code: refusal_name(code),
+        });
+    };
+    validate_server_hello(&hello, &accepted)?;
+    let auth_required = accepted.auth_required.ok_or(ClientError::InvalidHello)?;
+    if !auth_required && (security.tls.is_some() || security.token.is_some()) {
+        return Err(ClientError::SecurityMismatch);
+    }
+    if auth_required {
+        let token = security
+            .token
+            .as_ref()
+            .ok_or(ClientError::AuthenticationRequired)?;
+        let auth_frame =
+            v2::encode_bearer_auth(token).map_err(|_| ClientError::InvalidSecurityConfiguration)?;
+        tokio::time::timeout(
+            config.request_timeout,
+            connection.writer.write_all(auth_frame.as_bytes()),
+        )
+        .await
+        .map_err(|_| ClientError::WriteTimeout {
+            timeout: config.request_timeout,
+        })?
+        .map_err(|source| ClientError::Write { source })?;
+        let reply = tokio::time::timeout(
+            config.response_timeout,
+            read_v2_frame(&mut connection.reader, v2::AUTH_MAX_BODY_BYTES),
+        )
+        .await
+        .map_err(|_| ClientError::ResponseTimeout {
+            timeout: config.response_timeout,
+        })??;
+        match v2::decode_server_frame(&reply, v2::AUTH_MAX_BODY_BYTES)
+            .map_err(|_| ClientError::Protocol)?
+        {
+            ServerFrame::Authenticated => {}
+            ServerFrame::AuthenticationFailed => return Err(ClientError::AuthenticationFailed),
+            ServerFrame::Application(_) => return Err(ClientError::Protocol),
         }
+    }
+    connection.max_request_bytes = accepted.client_to_server_frame_bytes;
+    connection.max_response_bytes = accepted.server_to_client_frame_bytes;
+    Ok(())
+}
 
-        let newline = buffered.iter().position(|byte| *byte == b'\n');
-        let bytes_to_consume = newline.map_or(buffered.len(), |index| index + 1);
-        if bytes_to_consume > max_response_bytes.saturating_sub(response_bytes.len()) {
-            return Err(ClientError::ResponseTooLarge {
-                max_bytes: max_response_bytes,
-            });
-        }
+fn validate_server_hello(
+    client: &v2::ClientHello,
+    server: &v2::HelloAccepted,
+) -> Result<(), ClientError> {
+    if server.major != v2::CURRENT_MAJOR
+        || !client.versions.iter().any(|range| {
+            range.major == server.major
+                && server.minor >= range.min_minor
+                && server.minor <= range.max_minor
+        })
+        || server.max_inbound_frame_bytes < v2::MIN_FRAME_BODY_BYTES
+        || server.max_inbound_frame_bytes > v2::MAX_CLIENT_TO_SERVER_FRAME_BYTES
+        || server.max_outbound_frame_bytes < v2::MIN_FRAME_BODY_BYTES
+        || server.max_outbound_frame_bytes > v2::MAX_SERVER_TO_CLIENT_FRAME_BYTES
+        || server
+            .capabilities
+            .iter()
+            .any(|capability| !client.offered_capabilities.contains(capability))
+        || !client
+            .required_capabilities
+            .iter()
+            .all(|capability| server.capabilities.contains(capability))
+    {
+        return Err(ClientError::InvalidHello);
+    }
+    let client_to_server = client
+        .max_outbound_frame_bytes
+        .min(server.max_inbound_frame_bytes);
+    let server_to_client = client
+        .max_inbound_frame_bytes
+        .min(server.max_outbound_frame_bytes);
+    if server.client_to_server_frame_bytes != client_to_server
+        || server.server_to_client_frame_bytes != server_to_client
+        || client_to_server < v2::MIN_FRAME_BODY_BYTES
+        || server_to_client < v2::MIN_FRAME_BODY_BYTES
+        || server.auth_required.is_none()
+    {
+        return Err(ClientError::InvalidHello);
+    }
+    Ok(())
+}
 
-        response_bytes.extend_from_slice(&buffered[..bytes_to_consume]);
-        reader.consume(bytes_to_consume);
-        if newline.is_some() {
-            return serde_json::from_slice(&response_bytes)
-                .map_err(|source| ClientError::InvalidResponse { source });
-        }
-
-        // An EOF-terminated JSON response was accepted by the previous
-        // read_line-based implementation. If the buffer is exactly full, make
-        // one bounded probe for either EOF (still parseable) or another byte
-        // (definitively oversized) without retaining that extra byte.
-        if response_bytes.len() == max_response_bytes {
-            let next = reader
-                .fill_buf()
-                .await
-                .map_err(|source| ClientError::Read { source })?;
-            if !next.is_empty() {
-                return Err(ClientError::ResponseTooLarge {
-                    max_bytes: max_response_bytes,
-                });
-            }
-            return serde_json::from_slice(&response_bytes)
-                .map_err(|source| ClientError::InvalidResponse { source });
-        }
+fn refusal_name(code: v2::RefusalCode) -> &'static str {
+    match code {
+        v2::RefusalCode::InvalidHello => "invalid_hello",
+        v2::RefusalCode::UnsupportedVersion => "unsupported_version",
+        v2::RefusalCode::UnsupportedCapability => "unsupported_capability",
+        v2::RefusalCode::LimitTooSmall => "limit_too_small",
+        v2::RefusalCode::LimitTooLarge => "limit_too_large",
     }
 }
 
-fn classify_response(response: Response) -> AttemptOutcome {
-    let Response::Error { ref code, .. } = response else {
-        return AttemptOutcome::Confirmed(response);
-    };
+fn client_tls_config(
+    tls: &ClientTlsConfig,
+) -> Result<std::sync::Arc<rustls::ClientConfig>, ClientError> {
+    let roots = client_trust_roots(tls)?;
+    let mut config =
+        rustls::ClientConfig::builder_with_protocol_versions(&[&rustls::version::TLS13])
+            .with_root_certificates(roots)
+            .with_no_client_auth();
+    config.enable_early_data = false;
+    Ok(std::sync::Arc::new(config))
+}
 
-    match classify_error_code(code) {
-        BatchFailureKind::Retryable => AttemptOutcome::Retryable(AttemptFailure::Broker(response)),
-        BatchFailureKind::Unknown => AttemptOutcome::Unknown(AttemptFailure::Broker(response)),
-        BatchFailureKind::Rejected => AttemptOutcome::Rejected(AttemptFailure::Broker(response)),
+fn client_trust_roots(tls: &ClientTlsConfig) -> Result<RootCertStore, ClientError> {
+    let mut roots = RootCertStore::empty();
+    if let Some(path) = &tls.ca_file {
+        let file = fs::File::open(path).map_err(|_| ClientError::InvalidTrustRoots)?;
+        let certificates = CertificateDer::pem_reader_iter(IoBufReader::new(file))
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|_| ClientError::InvalidTrustRoots)?;
+        if certificates.is_empty() {
+            return Err(ClientError::InvalidTrustRoots);
+        }
+        for certificate in certificates {
+            roots
+                .add(certificate)
+                .map_err(|_| ClientError::InvalidTrustRoots)?;
+        }
+        return Ok(roots);
+    }
+
+    let system = rustls_native_certs::load_native_certs();
+    if !system.errors.is_empty() || system.certs.is_empty() {
+        return Err(ClientError::InvalidTrustRoots);
+    }
+    for certificate in system.certs {
+        roots
+            .add(certificate)
+            .map_err(|_| ClientError::InvalidTrustRoots)?;
+    }
+    Ok(roots)
+}
+
+async fn read_v2_frame<R>(reader: &mut R, max_body_bytes: usize) -> Result<Vec<u8>, ClientError>
+where
+    R: AsyncRead + Unpin,
+{
+    let mut length_bytes = [0; 4];
+    reader
+        .read_exact(&mut length_bytes)
+        .await
+        .map_err(map_read_error)?;
+    let body_bytes = u32::from_be_bytes(length_bytes) as usize;
+    if body_bytes == 0 || body_bytes > max_body_bytes {
+        return Err(ClientError::ResponseTooLarge {
+            max_bytes: max_body_bytes,
+        });
+    }
+    let mut body = vec![0; body_bytes];
+    reader.read_exact(&mut body).await.map_err(map_read_error)?;
+    Ok(body)
+}
+
+fn map_read_error(source: io::Error) -> ClientError {
+    if source.kind() == io::ErrorKind::UnexpectedEof {
+        ClientError::Eof
+    } else {
+        ClientError::Read { source }
+    }
+}
+
+fn read_token_file(path: &Path) -> Result<BearerToken, ClientError> {
+    let file = fs::File::open(path).map_err(|_| ClientError::CredentialFile)?;
+    let metadata = file.metadata().map_err(|_| ClientError::CredentialFile)?;
+    if !metadata.is_file() || metadata.len() > 256 {
+        return Err(ClientError::CredentialFile);
+    }
+    validate_credential_file_permissions(&metadata)?;
+    let mut bytes = Vec::with_capacity(metadata.len() as usize);
+    file.take(257)
+        .read_to_end(&mut bytes)
+        .map_err(|_| ClientError::CredentialFile)?;
+    if bytes.len() > 256 {
+        bytes.zeroize();
+        return Err(ClientError::CredentialFile);
+    }
+    if bytes.ends_with(b"\r\n") {
+        bytes.truncate(bytes.len() - 2);
+    } else if bytes.ends_with(b"\n") {
+        bytes.truncate(bytes.len() - 1);
+    }
+    let token = match std::str::from_utf8(&bytes) {
+        Ok(value) => BearerToken::parse(value.to_owned()).map_err(|_| ClientError::CredentialFile),
+        Err(_) => Err(ClientError::CredentialFile),
+    };
+    bytes.zeroize();
+    token
+}
+
+#[cfg(unix)]
+fn validate_credential_file_permissions(metadata: &fs::Metadata) -> Result<(), ClientError> {
+    use std::os::unix::fs::PermissionsExt;
+    if metadata.permissions().mode() & 0o077 != 0 {
+        return Err(ClientError::CredentialFile);
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn validate_credential_file_permissions(_: &fs::Metadata) -> Result<(), ClientError> {
+    Ok(())
+}
+
+fn classify_v2_reply(reply: ApplicationReply) -> AttemptOutcome {
+    let ApplicationReply {
+        response,
+        outcome,
+        stage: _,
+        items: _,
+    } = reply;
+    match outcome {
+        Some(V2Outcome::Confirmed) if !matches!(response, Response::Error { .. }) => {
+            AttemptOutcome::Confirmed(response)
+        }
+        Some(V2Outcome::Rejected) => AttemptOutcome::Rejected(AttemptFailure::Broker(response)),
+        Some(V2Outcome::Retryable) => AttemptOutcome::Retryable(AttemptFailure::Broker(response)),
+        Some(V2Outcome::Unknown) | Some(V2Outcome::Confirmed) | None => {
+            AttemptOutcome::Unknown(AttemptFailure::Broker(response))
+        }
     }
 }
 
@@ -1668,60 +2031,18 @@ enum BatchFailureKind {
     Unknown,
 }
 
-fn classify_error_code(code: &str) -> BatchFailureKind {
-    match code {
-        "request_id_content_conflict" => BatchFailureKind::Rejected,
-        "connection_limit"
-        | "request_saturated"
-        | "stream_not_ready"
-        | "consumer_state_retryable" => BatchFailureKind::Retryable,
-        "request_timeout"
-        | "storage_error"
-        | "consumer_state_error"
-        | "internal_error"
-        | "cluster_error"
-        | "corrupt_record" => BatchFailureKind::Unknown,
-        _ => BatchFailureKind::Rejected,
-    }
-}
-
 fn publish_batch_invalid(record_count: usize, message: String) -> PublishBatchAttempt {
     let error = AttemptFailure::Client(ClientError::InvalidBatch { message });
     publish_batch_failure(record_count, BatchFailureKind::Rejected, error)
 }
 
 fn publish_batch_attempt(
-    stream: String,
+    _stream: String,
     record_count: usize,
     outcome: AttemptOutcome,
 ) -> PublishBatchAttempt {
     match outcome {
-        AttemptOutcome::Confirmed(response) => match response {
-            Response::PublishBatch {
-                stream: response_stream,
-                outcomes,
-            } if response_stream == stream && outcomes.len() == record_count => {
-                let outcomes = outcomes
-                    .into_iter()
-                    .map(|outcome| match outcome {
-                        PublishBatchRecordResponse::Published { offset } => {
-                            PublishBatchOutcome::Confirmed(PublishReceipt {
-                                stream: stream.clone(),
-                                offset,
-                            })
-                        }
-                        PublishBatchRecordResponse::Error { code, message } => {
-                            publish_batch_record_error(code, message)
-                        }
-                    })
-                    .collect();
-                PublishBatchAttempt {
-                    outcomes,
-                    attempt: None,
-                }
-            }
-            response => publish_batch_unexpected(record_count, response),
-        },
+        AttemptOutcome::Confirmed(response) => publish_batch_unexpected(record_count, response),
         AttemptOutcome::Rejected(failure) => {
             publish_batch_failure(record_count, BatchFailureKind::Rejected, failure)
         }
@@ -1737,7 +2058,7 @@ fn publish_batch_attempt(
 fn publish_batch_unexpected(record_count: usize, response: Response) -> PublishBatchAttempt {
     let failure = AttemptFailure::Client(ClientError::UnexpectedResponse {
         operation: "publish_batch",
-        response: Box::new(response),
+        response_kind: response.kind(),
     });
     publish_batch_failure(record_count, BatchFailureKind::Unknown, failure)
 }
@@ -1757,10 +2078,6 @@ fn publish_batch_failure(
     }
 }
 
-fn publish_batch_record_error(code: String, message: String) -> PublishBatchOutcome {
-    publish_batch_record_failure(classify_error_code(&code), code, message)
-}
-
 fn publish_batch_record_failure(
     kind: BatchFailureKind,
     code: String,
@@ -1773,6 +2090,78 @@ fn publish_batch_record_failure(
     }
 }
 
+fn publish_batch_reply(
+    stream: String,
+    record_count: usize,
+    reply: ApplicationReply,
+) -> PublishBatchAttempt {
+    if reply.outcome.is_some() {
+        return publish_batch_attempt(stream, record_count, classify_v2_reply(reply));
+    }
+    let ApplicationReply {
+        response, items, ..
+    } = reply;
+    let Response::PublishBatch {
+        stream: response_stream,
+        outcomes: wire_outcomes,
+    } = response
+    else {
+        return publish_batch_unexpected(record_count, response);
+    };
+    if response_stream != stream
+        || items.len() != record_count
+        || wire_outcomes.len() != record_count
+    {
+        return publish_batch_unexpected(
+            record_count,
+            Response::PublishBatch {
+                stream: response_stream,
+                outcomes: wire_outcomes,
+            },
+        );
+    }
+
+    let outcomes = items
+        .into_iter()
+        .zip(wire_outcomes)
+        .map(|(metadata, outcome)| match (metadata.outcome, outcome) {
+            (V2Outcome::Confirmed, PublishBatchRecordResponse::Published { offset }) => {
+                Some(PublishBatchOutcome::Confirmed(PublishReceipt {
+                    stream: stream.clone(),
+                    offset,
+                }))
+            }
+            (
+                V2Outcome::Rejected | V2Outcome::Retryable | V2Outcome::Unknown,
+                PublishBatchRecordResponse::Error { code, message },
+            ) => Some(publish_batch_record_failure(
+                match metadata.outcome {
+                    V2Outcome::Rejected => BatchFailureKind::Rejected,
+                    V2Outcome::Retryable => BatchFailureKind::Retryable,
+                    V2Outcome::Unknown => BatchFailureKind::Unknown,
+                    V2Outcome::Confirmed => unreachable!(),
+                },
+                code,
+                message,
+            )),
+            _ => None,
+        })
+        .collect::<Option<Vec<_>>>();
+    match outcomes {
+        Some(outcomes) => PublishBatchAttempt {
+            outcomes,
+            attempt: None,
+        },
+        None => publish_batch_unexpected(
+            record_count,
+            Response::PublishBatch {
+                stream: response_stream,
+                outcomes: Vec::new(),
+            },
+        ),
+    }
+}
+
 fn attempt_failure_details(failure: &AttemptFailure) -> (String, String) {
     match failure {
         AttemptFailure::Broker(Response::Error { code, message }) => {
@@ -1780,7 +2169,7 @@ fn attempt_failure_details(failure: &AttemptFailure) -> (String, String) {
         }
         AttemptFailure::Broker(response) => (
             "unexpected_response".to_owned(),
-            format!("unexpected response: {response:?}"),
+            format!("unexpected {} response", response.kind()),
         ),
         AttemptFailure::Client(error) => ("client_error".to_owned(), error.to_string()),
     }
@@ -1820,7 +2209,7 @@ fn decode_batch_message(
             member: response_member,
             offset,
             key,
-            payload_base64,
+            payload,
             published_at_ms,
             delivery_token,
             delivery_attempt,
@@ -1830,7 +2219,7 @@ fn decode_batch_message(
             member: response_member,
             offset,
             key,
-            payload: payload_base64.into_bytes(),
+            payload: payload.into_bytes(),
             published_at_ms,
             delivery_token,
             delivery_attempt,
@@ -1852,6 +2241,83 @@ enum TypedResponse<T> {
     Outcome(AttemptOutcome),
 }
 
+fn typed_reply<T>(
+    operation: &'static str,
+    reply: Result<ApplicationReply, ClientError>,
+    parse: impl FnOnce(Response) -> Result<T, Box<Response>>,
+) -> TypedResponse<T> {
+    let reply = match reply {
+        Ok(reply) => reply,
+        Err(error) => {
+            return typed_response(operation, AttemptOutcome::from_client_error(error), parse);
+        }
+    };
+
+    if reply.outcome.is_some() {
+        return typed_response(operation, classify_v2_reply(reply), parse);
+    }
+
+    let ApplicationReply {
+        response, items, ..
+    } = reply;
+    if !batch_reply_metadata_matches(&response, &items) {
+        return TypedResponse::Outcome(AttemptOutcome::Unknown(AttemptFailure::Client(
+            ClientError::UnexpectedResponse {
+                operation,
+                response_kind: response.kind(),
+            },
+        )));
+    }
+    match parse(response) {
+        Ok(value) => TypedResponse::Value(value),
+        Err(response) => TypedResponse::Outcome(AttemptOutcome::Unknown(AttemptFailure::Client(
+            ClientError::UnexpectedResponse {
+                operation,
+                response_kind: response.kind(),
+            },
+        ))),
+    }
+}
+
+fn batch_reply_metadata_matches(response: &Response, items: &[ItemMetadata]) -> bool {
+    match response {
+        Response::PollBatch { messages, .. } => {
+            messages.len() == items.len()
+                && items
+                    .iter()
+                    .all(|item| item.outcome == V2Outcome::Confirmed)
+        }
+        Response::PublishBatch { outcomes, .. } => {
+            outcomes.len() == items.len()
+                && outcomes
+                    .iter()
+                    .zip(items)
+                    .all(|(outcome, item)| match outcome {
+                        PublishBatchRecordResponse::Published { .. } => {
+                            item.outcome == V2Outcome::Confirmed
+                        }
+                        PublishBatchRecordResponse::Error { .. } => {
+                            item.outcome != V2Outcome::Confirmed
+                        }
+                    })
+        }
+        Response::AckBatch { outcomes, .. } => {
+            outcomes.len() == items.len()
+                && outcomes
+                    .iter()
+                    .zip(items)
+                    .all(|(outcome, item)| match outcome.outcome {
+                        WireAckBatchItemOutcome::Confirmed
+                        | WireAckBatchItemOutcome::AlreadyConfirmed => {
+                            item.outcome == V2Outcome::Confirmed
+                        }
+                        WireAckBatchItemOutcome::Rejected => item.outcome != V2Outcome::Confirmed,
+                    })
+        }
+        _ => false,
+    }
+}
+
 fn typed_response<T>(
     operation: &'static str,
     outcome: AttemptOutcome,
@@ -1863,7 +2329,7 @@ fn typed_response<T>(
             Err(response) => TypedResponse::Outcome(AttemptOutcome::Unknown(
                 AttemptFailure::Client(ClientError::UnexpectedResponse {
                     operation,
-                    response,
+                    response_kind: response.kind(),
                 }),
             )),
         },
@@ -1874,18 +2340,181 @@ fn typed_response<T>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use runnel_protocol::v2::{
+        self as v2, ClientFrame, ClientHello, DEFAULT_SERVER_TO_CLIENT_FRAME_BYTES,
+        HELLO_MAX_BODY_BYTES, HelloAccepted, MAX_CLIENT_TO_SERVER_FRAME_BYTES,
+        MAX_SERVER_TO_CLIENT_FRAME_BYTES, PREFACE, ServerHello, VersionRange,
+    };
     use std::net::SocketAddr;
-    use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
-    use tokio::sync::oneshot;
 
     fn test_config() -> ClientConfig {
         ClientConfig {
             connect_timeout: Duration::from_secs(1),
             request_timeout: Duration::from_secs(1),
-            response_timeout: Duration::from_millis(100),
+            response_timeout: Duration::from_millis(200),
             max_response_bytes: 64 * 1024,
         }
+    }
+
+    #[test]
+    fn typed_poll_batch_accepts_confirmed_items_and_empty_results() {
+        let message = BatchMessageResponse::Text {
+            stream: "events".to_owned(),
+            consumer: "worker".to_owned(),
+            member: None,
+            offset: 7,
+            key: None,
+            payload: "work".to_owned(),
+            published_at_ms: 1,
+            delivery_token: None,
+            delivery_attempt: None,
+        };
+        let parse = |response| match response {
+            Response::PollBatch { messages, .. } => Ok(messages.len()),
+            response => Err(Box::new(response)),
+        };
+        let confirmed = typed_reply(
+            "poll_batch",
+            Ok(ApplicationReply::batch(
+                Response::PollBatch {
+                    stream: "events".to_owned(),
+                    consumer: "worker".to_owned(),
+                    messages: vec![message],
+                },
+                vec![runnel_protocol::v2::ItemMetadata {
+                    outcome: V2Outcome::Confirmed,
+                    stage: runnel_protocol::v2::Stage::Durable,
+                }],
+            )),
+            parse,
+        );
+        assert!(matches!(confirmed, TypedResponse::Value(1)));
+
+        let empty = typed_reply(
+            "poll_batch",
+            Ok(ApplicationReply::batch(
+                Response::PollBatch {
+                    stream: "events".to_owned(),
+                    consumer: "worker".to_owned(),
+                    messages: Vec::new(),
+                },
+                Vec::new(),
+            )),
+            |response| match response {
+                Response::PollBatch { messages, .. } => Ok(messages.len()),
+                response => Err(Box::new(response)),
+            },
+        );
+        assert!(matches!(empty, TypedResponse::Value(0)));
+    }
+
+    #[test]
+    fn typed_batch_reply_preserves_per_item_errors_and_rejects_metadata_mismatch() {
+        let partial = typed_reply(
+            "publish_batch",
+            Ok(ApplicationReply::batch(
+                Response::PublishBatch {
+                    stream: "events".to_owned(),
+                    outcomes: vec![
+                        PublishBatchRecordResponse::Published { offset: 3 },
+                        PublishBatchRecordResponse::Error {
+                            code: "invalid_record".to_owned(),
+                            message: "record is invalid".to_owned(),
+                        },
+                    ],
+                },
+                vec![
+                    runnel_protocol::v2::ItemMetadata {
+                        outcome: V2Outcome::Confirmed,
+                        stage: runnel_protocol::v2::Stage::Durable,
+                    },
+                    runnel_protocol::v2::ItemMetadata {
+                        outcome: V2Outcome::Rejected,
+                        stage: runnel_protocol::v2::Stage::Validated,
+                    },
+                ],
+            )),
+            |response| match response {
+                Response::PublishBatch { outcomes, .. } => Ok(outcomes),
+                response => Err(Box::new(response)),
+            },
+        );
+        assert!(matches!(partial, TypedResponse::Value(outcomes) if outcomes.len() == 2));
+
+        let mismatch = typed_reply(
+            "poll_batch",
+            Ok(ApplicationReply::batch(
+                Response::PollBatch {
+                    stream: "events".to_owned(),
+                    consumer: "worker".to_owned(),
+                    messages: vec![BatchMessageResponse::Text {
+                        stream: "events".to_owned(),
+                        consumer: "worker".to_owned(),
+                        member: None,
+                        offset: 7,
+                        key: None,
+                        payload: "work".to_owned(),
+                        published_at_ms: 1,
+                        delivery_token: None,
+                        delivery_attempt: None,
+                    }],
+                },
+                Vec::new(),
+            )),
+            |response| match response {
+                Response::PollBatch { messages, .. } => Ok(messages.len()),
+                response => Err(Box::new(response)),
+            },
+        );
+        assert!(matches!(
+            mismatch,
+            TypedResponse::Outcome(AttemptOutcome::Unknown(AttemptFailure::Client(
+                ClientError::UnexpectedResponse { .. }
+            )))
+        ));
+    }
+
+    #[test]
+    fn unexpected_response_diagnostics_omit_application_fields() {
+        let response = Response::Message {
+            stream: "secret-stream-marker".to_owned(),
+            consumer: "secret-consumer-marker".to_owned(),
+            member: Some("secret-member-marker".to_owned()),
+            offset: 7,
+            key: Some("secret-key-marker".to_owned()),
+            payload: "secret-payload-marker".to_owned(),
+            published_at_ms: 1,
+            delivery_token: Some("secret-token-marker".to_owned()),
+            delivery_attempt: Some(2),
+        };
+        let typed: TypedResponse<()> = typed_reply(
+            "poll",
+            Ok(ApplicationReply::confirmed(response.clone(), false)),
+            |response| Err(Box::new(response)),
+        );
+        let TypedResponse::Outcome(AttemptOutcome::Unknown(AttemptFailure::Client(error))) = typed
+        else {
+            panic!("an unexpected response should be classified as unknown");
+        };
+
+        let display = error.to_string();
+        let debug = format!("{error:?}");
+        let (_, broker_detail) = attempt_failure_details(&AttemptFailure::Broker(response));
+        for rendered in [display.as_str(), debug.as_str(), broker_detail.as_str()] {
+            for marker in [
+                "secret-stream-marker",
+                "secret-consumer-marker",
+                "secret-member-marker",
+                "secret-key-marker",
+                "secret-payload-marker",
+                "secret-token-marker",
+            ] {
+                assert!(!rendered.contains(marker), "diagnostic leaked {marker}");
+            }
+        }
+        assert_eq!(display, "unexpected message response for poll");
+        assert_eq!(broker_detail, "unexpected message response");
     }
 
     async fn listener() -> (TcpListener, SocketAddr) {
@@ -1894,223 +2523,84 @@ mod tests {
         (listener, address)
     }
 
-    async fn read_request(reader: &mut BufReader<tokio::net::TcpStream>) -> Request {
-        let mut line = String::new();
-        reader.read_line(&mut line).await.unwrap();
-        serde_json::from_str(&line).unwrap()
+    async fn read_frame<R>(reader: &mut R, maximum: usize) -> io::Result<Vec<u8>>
+    where
+        R: AsyncRead + Unpin,
+    {
+        let mut length = [0; 4];
+        reader.read_exact(&mut length).await?;
+        let length = u32::from_be_bytes(length) as usize;
+        if length == 0 || length > maximum {
+            return Err(io::Error::new(io::ErrorKind::InvalidData, "frame length"));
+        }
+        let mut body = vec![0; length];
+        reader.read_exact(&mut body).await?;
+        Ok(body)
     }
 
-    async fn write_response(reader: &mut BufReader<tokio::net::TcpStream>, response: Response) {
-        let mut encoded = serde_json::to_vec(&response).unwrap();
-        encoded.push(b'\n');
-        reader.get_mut().write_all(&encoded).await.unwrap();
+    async fn accept_v2(
+        listener: &TcpListener,
+        request_limit: usize,
+        auth_required: bool,
+    ) -> tokio::io::BufReader<tokio::net::TcpStream> {
+        let (stream, _) = listener.accept().await.unwrap();
+        let mut reader = tokio::io::BufReader::new(stream);
+        let mut preface = [0; PREFACE.len()];
+        reader.read_exact(&mut preface).await.unwrap();
+        assert_eq!(preface, PREFACE);
+
+        let hello_body = read_frame(&mut reader, HELLO_MAX_BODY_BYTES).await.unwrap();
+        let hello = v2::decode_client_hello(&hello_body).unwrap();
+        let inbound = request_limit.min(MAX_CLIENT_TO_SERVER_FRAME_BYTES);
+        let outbound = MAX_SERVER_TO_CLIENT_FRAME_BYTES;
+        let accepted = HelloAccepted {
+            major: v2::CURRENT_MAJOR,
+            minor: v2::CURRENT_MINOR,
+            capabilities: Vec::new(),
+            max_inbound_frame_bytes: inbound,
+            max_outbound_frame_bytes: outbound,
+            client_to_server_frame_bytes: hello.max_outbound_frame_bytes.min(inbound),
+            server_to_client_frame_bytes: hello.max_inbound_frame_bytes.min(outbound),
+            auth_required: Some(auth_required),
+        };
+        let hello = v2::encode_server_hello(&ServerHello::Accepted(accepted)).unwrap();
+        reader.get_mut().write_all(hello.as_bytes()).await.unwrap();
+        reader
+    }
+
+    async fn read_application_request(
+        reader: &mut tokio::io::BufReader<tokio::net::TcpStream>,
+    ) -> Request {
+        let body = read_frame(reader, MAX_CLIENT_TO_SERVER_FRAME_BYTES)
+            .await
+            .unwrap();
+        match v2::decode_client_frame(&body, MAX_CLIENT_TO_SERVER_FRAME_BYTES).unwrap() {
+            ClientFrame::Application(request) => request,
+            ClientFrame::BearerAuth(_) => panic!("unexpected auth frame"),
+        }
+    }
+
+    async fn write_response(
+        reader: &mut tokio::io::BufReader<tokio::net::TcpStream>,
+        response: Response,
+    ) {
+        let reply = if matches!(response, Response::Error { .. }) {
+            ApplicationReply::failed(response, V2Outcome::Rejected, v2::Stage::Validated)
+        } else {
+            ApplicationReply::confirmed(response, false)
+        };
+        let frame = v2::encode_server_frame(&ServerFrame::Application(reply)).unwrap();
+        reader.get_mut().write_all(frame.as_bytes()).await.unwrap();
     }
 
     #[tokio::test]
-    async fn sends_sequential_requests_on_one_connection() {
+    async fn negotiates_v2_and_reuses_one_persistent_connection() {
         let (listener, address) = listener().await;
         let server = tokio::spawn(async move {
-            let (stream, _) = listener.accept().await.unwrap();
-            let mut reader = BufReader::new(stream);
-
-            let mut first_request = String::new();
-            reader.read_line(&mut first_request).await.unwrap();
+            let mut reader = accept_v2(&listener, MAX_CLIENT_TO_SERVER_FRAME_BYTES, false).await;
             assert!(matches!(
-                serde_json::from_str::<Request>(&first_request).unwrap(),
+                read_application_request(&mut reader).await,
                 Request::Health
-            ));
-            reader
-                .get_mut()
-                .write_all(
-                    b"{\"type\":\"health\",\"status\":\"ok\",\"streams\":0,\"storage_bytes\":0}\n",
-                )
-                .await
-                .unwrap();
-
-            let mut second_request = String::new();
-            reader.read_line(&mut second_request).await.unwrap();
-            assert!(matches!(
-                serde_json::from_str::<Request>(&second_request).unwrap(),
-                Request::CreateStream { stream } if stream == "events"
-            ));
-            reader
-                .get_mut()
-                .write_all(
-                    b"{\"type\":\"stream_created\",\"stream\":\"events\",\"created\":true}\n",
-                )
-                .await
-                .unwrap();
-        });
-
-        let mut client = Client::connect_with_config(address, test_config())
-            .await
-            .unwrap();
-        let health = client.request(&Request::Health).await.unwrap();
-        assert!(matches!(health, Response::Health { status, .. } if status == "ok"));
-
-        let created = client
-            .request(&Request::CreateStream {
-                stream: "events".to_owned(),
-            })
-            .await
-            .unwrap();
-        assert!(matches!(
-            created,
-            Response::StreamCreated { stream, created } if stream == "events" && created
-        ));
-        server.await.unwrap();
-    }
-
-    #[tokio::test]
-    async fn publish_batch_returns_ordered_per_record_outcomes() {
-        let (listener, address) = listener().await;
-        let server = tokio::spawn(async move {
-            let (stream, _) = listener.accept().await.unwrap();
-            let mut reader = BufReader::new(stream);
-            match read_request(&mut reader).await {
-                Request::PublishBatch { stream, records } => {
-                    assert_eq!(stream, "events");
-                    assert_eq!(records.len(), 2);
-                    assert_eq!(records[0].payload_base64.as_bytes(), [0, 255]);
-                    assert_eq!(records[0].request_id.as_deref(), Some("record-1"));
-                    assert_eq!(records[1].payload_base64.as_bytes(), b"second");
-                }
-                request => panic!("expected publish batch, got {request:?}"),
-            }
-            write_response(
-                &mut reader,
-                Response::PublishBatch {
-                    stream: "events".to_owned(),
-                    outcomes: vec![
-                        PublishBatchRecordResponse::Published { offset: 3 },
-                        PublishBatchRecordResponse::Error {
-                            code: "request_saturated".to_owned(),
-                            message: "busy".to_owned(),
-                        },
-                    ],
-                },
-            )
-            .await;
-        });
-
-        let mut client = Client::connect_with_config(address, test_config())
-            .await
-            .unwrap();
-        let attempt = client
-            .publish_batch(
-                "events",
-                [
-                    PublishBatchRecord::with_options(
-                        vec![0, 255],
-                        PublishOptions::default().with_request_id("record-1"),
-                    ),
-                    PublishBatchRecord::text("second"),
-                ],
-            )
-            .await;
-        assert!(attempt.attempt.is_none());
-        assert_eq!(
-            attempt.outcomes,
-            vec![
-                PublishBatchOutcome::Confirmed(PublishReceipt {
-                    stream: "events".to_owned(),
-                    offset: 3,
-                }),
-                PublishBatchOutcome::Retryable {
-                    code: "request_saturated".to_owned(),
-                    message: "busy".to_owned(),
-                },
-            ]
-        );
-        server.await.unwrap();
-    }
-
-    #[tokio::test]
-    async fn publish_batch_marks_every_record_unknown_after_disconnect() {
-        let (listener, address) = listener().await;
-        let server = tokio::spawn(async move {
-            let (stream, _) = listener.accept().await.unwrap();
-            let mut reader = BufReader::new(stream);
-            assert!(matches!(
-                read_request(&mut reader).await,
-                Request::PublishBatch { records, .. } if records.len() == 2
-            ));
-        });
-
-        let mut client = Client::connect_with_config(address, test_config())
-            .await
-            .unwrap();
-        let attempt = client
-            .publish_batch(
-                "events",
-                [
-                    PublishBatchRecord::with_options(
-                        "first",
-                        PublishOptions::default().with_request_id("first"),
-                    ),
-                    PublishBatchRecord::with_options(
-                        "second",
-                        PublishOptions::default().with_request_id("second"),
-                    ),
-                ],
-            )
-            .await;
-        assert!(matches!(
-            attempt.attempt,
-            Some(AttemptFailure::Client(ClientError::Eof))
-        ));
-        assert!(attempt.outcomes.iter().all(|outcome| matches!(
-            outcome,
-            PublishBatchOutcome::Unknown { code, .. } if code == "client_error"
-        )));
-        server.await.unwrap();
-    }
-
-    #[tokio::test]
-    async fn publish_batch_marks_every_record_unknown_after_response_timeout() {
-        let (listener, address) = listener().await;
-        let server = tokio::spawn(async move {
-            let (stream, _) = listener.accept().await.unwrap();
-            let mut reader = BufReader::new(stream);
-            assert!(matches!(
-                read_request(&mut reader).await,
-                Request::PublishBatch { records, .. } if records.len() == 2
-            ));
-            tokio::time::sleep(Duration::from_millis(250)).await;
-        });
-
-        let mut client = Client::connect_with_config(address, test_config())
-            .await
-            .unwrap();
-        let attempt = client
-            .publish_batch(
-                "events",
-                [
-                    PublishBatchRecord::new("first"),
-                    PublishBatchRecord::new("second"),
-                ],
-            )
-            .await;
-        assert!(matches!(
-            attempt.attempt,
-            Some(AttemptFailure::Client(ClientError::ResponseTimeout { .. }))
-        ));
-        assert!(attempt.outcomes.iter().all(|outcome| matches!(
-            outcome,
-            PublishBatchOutcome::Unknown { code, .. } if code == "client_error"
-        )));
-        server.await.unwrap();
-    }
-
-    #[tokio::test]
-    async fn publish_batch_response_mismatch_invalidates_connection() {
-        let (listener, address) = listener().await;
-        let server = tokio::spawn(async move {
-            let (stream, _) = listener.accept().await.unwrap();
-            let mut reader = BufReader::new(stream);
-            assert!(matches!(
-                read_request(&mut reader).await,
-                Request::PublishBatch { .. }
             ));
             write_response(
                 &mut reader,
@@ -2121,36 +2611,8 @@ mod tests {
                 },
             )
             .await;
-        });
-
-        let mut client = Client::connect_with_config(address, test_config())
-            .await
-            .unwrap();
-        let attempt = client
-            .publish_batch("events", [PublishBatchRecord::text("hello")])
-            .await;
-        assert!(matches!(
-            attempt.attempt,
-            Some(AttemptFailure::Client(
-                ClientError::UnexpectedResponse { .. }
-            ))
-        ));
-        assert!(matches!(
-            client.request(&Request::Health).await,
-            Err(ClientError::ConnectionUnavailable)
-        ));
-        server.await.unwrap();
-    }
-
-    #[tokio::test]
-    async fn typed_operations_map_current_protocol_results() {
-        let (listener, address) = listener().await;
-        let server = tokio::spawn(async move {
-            let (stream, _) = listener.accept().await.unwrap();
-            let mut reader = BufReader::new(stream);
-
             assert!(matches!(
-                read_request(&mut reader).await,
+                read_application_request(&mut reader).await,
                 Request::CreateStream { stream } if stream == "events"
             ));
             write_response(
@@ -2161,697 +2623,54 @@ mod tests {
                 },
             )
             .await;
-
-            match read_request(&mut reader).await {
-                Request::Publish {
-                    stream,
-                    key,
-                    payload,
-                    request_id,
-                } => {
-                    assert_eq!(stream, "events");
-                    assert_eq!(key.as_deref(), Some("order-1"));
-                    assert_eq!(payload, "hello");
-                    assert_eq!(request_id.as_deref(), Some("publish-1"));
-                }
-                request => panic!("expected publish, got {request:?}"),
-            }
-            write_response(
-                &mut reader,
-                Response::Published {
-                    stream: "events".to_owned(),
-                    offset: 4,
-                },
-            )
-            .await;
-
-            assert!(matches!(
-                read_request(&mut reader).await,
-                Request::Poll { stream, consumer }
-                    if stream == "events" && consumer == "reader"
-            ));
-            write_response(
-                &mut reader,
-                Response::Message {
-                    stream: "events".to_owned(),
-                    consumer: "reader".to_owned(),
-                    member: None,
-                    offset: 4,
-                    key: Some("order-1".to_owned()),
-                    payload: "hello".to_owned(),
-                    published_at_ms: 123,
-                    delivery_token: None,
-                    delivery_attempt: None,
-                },
-            )
-            .await;
-
-            assert!(matches!(
-                read_request(&mut reader).await,
-                Request::Poll { stream, consumer }
-                    if stream == "events" && consumer == "reader"
-            ));
-            write_response(
-                &mut reader,
-                Response::Empty {
-                    stream: "events".to_owned(),
-                    consumer: "reader".to_owned(),
-                },
-            )
-            .await;
-
-            assert!(matches!(
-                read_request(&mut reader).await,
-                Request::PollGroup {
-                    stream,
-                    consumer,
-                    member,
-                } if stream == "events" && consumer == "workers" && member == "member-a"
-            ));
-            write_response(
-                &mut reader,
-                Response::Message {
-                    stream: "events".to_owned(),
-                    consumer: "workers".to_owned(),
-                    member: Some("member-a".to_owned()),
-                    offset: 5,
-                    key: None,
-                    payload: "grouped".to_owned(),
-                    published_at_ms: 456,
-                    delivery_token: Some("token-5".to_owned()),
-                    delivery_attempt: Some(2),
-                },
-            )
-            .await;
-
-            assert!(matches!(
-                read_request(&mut reader).await,
-                Request::Ack {
-                    stream,
-                    consumer,
-                    offset,
-                } if stream == "events" && consumer == "reader" && offset == 4
-            ));
-            write_response(
-                &mut reader,
-                Response::Acknowledged {
-                    stream: "events".to_owned(),
-                    consumer: "reader".to_owned(),
-                    offset: 4,
-                    already_acknowledged: false,
-                },
-            )
-            .await;
-
-            match read_request(&mut reader).await {
-                Request::AckGroup {
-                    stream,
-                    consumer,
-                    member,
-                    offset,
-                    delivery_token,
-                } => {
-                    assert_eq!(stream, "events");
-                    assert_eq!(consumer, "workers");
-                    assert_eq!(member, "member-a");
-                    assert_eq!(offset, 5);
-                    assert_eq!(delivery_token, "token-5");
-                }
-                request => panic!("expected grouped acknowledgement, got {request:?}"),
-            }
-            write_response(
-                &mut reader,
-                Response::Acknowledged {
-                    stream: "events".to_owned(),
-                    consumer: "workers".to_owned(),
-                    offset: 5,
-                    already_acknowledged: true,
-                },
-            )
-            .await;
-
-            assert!(matches!(read_request(&mut reader).await, Request::Health));
-            write_response(
-                &mut reader,
-                Response::Health {
-                    status: "ok".to_owned(),
-                    streams: 1,
-                    storage_bytes: 4096,
-                },
-            )
-            .await;
         });
 
         let mut client = Client::connect_with_config(address, test_config())
             .await
             .unwrap();
-        assert_eq!(
-            client.create_stream("events").await.unwrap(),
-            StreamCreation {
-                stream: "events".to_owned(),
-                created: true,
-            }
-        );
-        assert_eq!(
+        assert!(matches!(
+            client.request(&Request::Health).await.unwrap(),
+            Response::Health { status, .. } if status == "ok"
+        ));
+        assert!(matches!(
             client
-                .publish_with_options(
-                    "events",
-                    "hello",
-                    PublishOptions::default()
-                        .with_key("order-1")
-                        .with_request_id("publish-1"),
-                )
+                .request(&Request::CreateStream {
+                    stream: "events".to_owned()
+                })
                 .await
                 .unwrap(),
-            PublishReceipt {
-                stream: "events".to_owned(),
-                offset: 4,
-            }
-        );
-        assert_eq!(
-            client.poll("events", "reader").await.unwrap(),
-            Some(Message {
-                stream: "events".to_owned(),
-                consumer: "reader".to_owned(),
-                member: None,
-                offset: 4,
-                key: Some("order-1".to_owned()),
-                payload: "hello".to_owned(),
-                published_at_ms: 123,
-                delivery_token: None,
-                delivery_attempt: None,
-            })
-        );
-        assert_eq!(client.poll("events", "reader").await.unwrap(), None);
-        assert_eq!(
-            client
-                .poll_group("events", "workers", "member-a")
-                .await
-                .unwrap(),
-            Some(Message {
-                stream: "events".to_owned(),
-                consumer: "workers".to_owned(),
-                member: Some("member-a".to_owned()),
-                offset: 5,
-                key: None,
-                payload: "grouped".to_owned(),
-                published_at_ms: 456,
-                delivery_token: Some("token-5".to_owned()),
-                delivery_attempt: Some(2),
-            })
-        );
-        assert_eq!(
-            client.ack("events", "reader", 4).await.unwrap(),
-            Acknowledgement {
-                stream: "events".to_owned(),
-                consumer: "reader".to_owned(),
-                offset: 4,
-                already_acknowledged: false,
-            }
-        );
-        assert_eq!(
-            client
-                .ack_group("events", "workers", "member-a", 5, "token-5")
-                .await
-                .unwrap(),
-            Acknowledgement {
-                stream: "events".to_owned(),
-                consumer: "workers".to_owned(),
-                offset: 5,
-                already_acknowledged: true,
-            }
-        );
-        assert_eq!(
-            client.health().await.unwrap(),
-            Health {
-                status: "ok".to_owned(),
-                streams: 1,
-                storage_bytes: 4096,
-            }
-        );
+            Response::StreamCreated { created: true, .. }
+        ));
         server.await.unwrap();
     }
 
     #[tokio::test]
-    async fn binary_publish_and_poll_preserve_payload_bytes() {
+    async fn does_not_send_application_data_when_server_requires_missing_credentials() {
         let (listener, address) = listener().await;
-        let payload = vec![0, 1, 255, b'\n', b'_'];
-        let server_payload = payload.clone();
         let server = tokio::spawn(async move {
-            let (stream, _) = listener.accept().await.unwrap();
-            let mut reader = BufReader::new(stream);
+            let mut reader = accept_v2(&listener, MAX_CLIENT_TO_SERVER_FRAME_BYTES, true).await;
+            let mut length = [0; 4];
+            let result =
+                tokio::time::timeout(Duration::from_secs(1), reader.read_exact(&mut length)).await;
+            assert!(
+                matches!(result, Ok(Err(error)) if error.kind() == io::ErrorKind::UnexpectedEof)
+            );
+        });
 
-            match read_request(&mut reader).await {
-                Request::PublishBytes {
-                    stream,
-                    key,
-                    payload_base64,
-                    request_id,
-                } => {
-                    assert_eq!(stream, "events");
-                    assert_eq!(key.as_deref(), Some("binary-key"));
-                    assert_eq!(payload_base64.as_bytes(), server_payload.as_slice());
-                    assert_eq!(request_id.as_deref(), Some("binary-publish-1"));
-                }
-                request => panic!("expected binary publish, got {request:?}"),
-            }
-            write_response(
-                &mut reader,
-                Response::Published {
-                    stream: "events".to_owned(),
-                    offset: 8,
-                },
-            )
-            .await;
+        let result = Client::connect_with_config(address, test_config()).await;
+        assert!(matches!(result, Err(ClientError::AuthenticationRequired)));
+        server.await.unwrap();
+    }
 
+    #[tokio::test]
+    async fn request_larger_than_negotiated_limit_is_rejected_before_write() {
+        let (listener, address) = listener().await;
+        let server = tokio::spawn(async move {
+            let mut reader = accept_v2(&listener, 1_024, false).await;
             assert!(matches!(
-                read_request(&mut reader).await,
-                Request::Poll { stream, consumer }
-                    if stream == "events" && consumer == "reader"
-            ));
-            write_response(
-                &mut reader,
-                Response::MessageBytes {
-                    stream: "events".to_owned(),
-                    consumer: "reader".to_owned(),
-                    member: None,
-                    offset: 8,
-                    key: Some("binary-key".to_owned()),
-                    payload_base64: BinaryPayload::new(server_payload),
-                    published_at_ms: 123,
-                    delivery_token: None,
-                    delivery_attempt: Some(1),
-                },
-            )
-            .await;
-        });
-
-        let mut client = Client::connect_with_config(address, test_config())
-            .await
-            .unwrap();
-        assert_eq!(
-            client
-                .publish_bytes_with_options(
-                    "events",
-                    payload,
-                    PublishOptions::default()
-                        .with_key("binary-key")
-                        .with_request_id("binary-publish-1"),
-                )
-                .await
-                .unwrap(),
-            PublishReceipt {
-                stream: "events".to_owned(),
-                offset: 8,
-            }
-        );
-        assert_eq!(
-            client.poll_bytes("events", "reader").await.unwrap(),
-            Some(BinaryMessage {
-                stream: "events".to_owned(),
-                consumer: "reader".to_owned(),
-                member: None,
-                offset: 8,
-                key: Some("binary-key".to_owned()),
-                payload: vec![0, 1, 255, b'\n', b'_'],
-                published_at_ms: 123,
-                delivery_token: None,
-                delivery_attempt: Some(1),
-            })
-        );
-        server.await.unwrap();
-    }
-
-    #[tokio::test]
-    async fn replay_is_read_only_and_reports_unavailable_history() {
-        let (listener, address) = listener().await;
-        let server = tokio::spawn(async move {
-            let (stream, _) = listener.accept().await.unwrap();
-            let mut reader = BufReader::new(stream);
-
-            assert!(matches!(
-                read_request(&mut reader).await,
-                Request::Replay {
-                    stream,
-                    consumer,
-                    offset: 4,
-                } if stream == "events" && consumer == "worker"
-            ));
-            write_response(
-                &mut reader,
-                Response::ReplayMessage {
-                    stream: "events".to_owned(),
-                    consumer: "worker".to_owned(),
-                    offset: 4,
-                    key: Some("order-1".to_owned()),
-                    payload: "replayed".to_owned(),
-                    published_at_ms: 12,
-                },
-            )
-            .await;
-
-            assert!(matches!(
-                read_request(&mut reader).await,
-                Request::Replay {
-                    stream,
-                    consumer,
-                    offset: 99,
-                } if stream == "events" && consumer == "worker"
-            ));
-            write_response(
-                &mut reader,
-                Response::Error {
-                    code: "history_unavailable".to_owned(),
-                    message: "requested offset is unavailable".to_owned(),
-                },
-            )
-            .await;
-        });
-
-        let mut client = Client::connect_with_config(address, test_config())
-            .await
-            .unwrap();
-        assert_eq!(
-            client.replay("events", "worker", 4).await.unwrap(),
-            ReplayMessage {
-                stream: "events".to_owned(),
-                consumer: "worker".to_owned(),
-                offset: 4,
-                key: Some("order-1".to_owned()),
-                payload: "replayed".to_owned(),
-                published_at_ms: 12,
-            }
-        );
-        assert!(matches!(
-            client.replay("events", "worker", 99).await,
-            Err(AttemptOutcome::Rejected(AttemptFailure::Broker(
-                Response::Error { code, .. }
-            ))) if code == "history_unavailable"
-        ));
-        server.await.unwrap();
-    }
-
-    #[tokio::test]
-    async fn typed_response_mismatch_is_an_unknown_outcome() {
-        let (listener, address) = listener().await;
-        let server = tokio::spawn(async move {
-            let (stream, _) = listener.accept().await.unwrap();
-            let mut reader = BufReader::new(stream);
-            assert!(matches!(
-                read_request(&mut reader).await,
-                Request::CreateStream { stream } if stream == "events"
-            ));
-            write_response(
-                &mut reader,
-                Response::Health {
-                    status: "ok".to_owned(),
-                    streams: 0,
-                    storage_bytes: 0,
-                },
-            )
-            .await;
-        });
-
-        let mut client = Client::connect_with_config(address, test_config())
-            .await
-            .unwrap();
-        let result = client.create_stream("events").await;
-        assert!(matches!(
-            result,
-            Err(AttemptOutcome::Unknown(AttemptFailure::Client(
-                ClientError::UnexpectedResponse {
-                    operation: "create_stream",
-                    response,
-                }
-            ))) if matches!(response.as_ref(), Response::Health { .. })
-        ));
-        assert!(matches!(
-            client.request(&Request::Health).await,
-            Err(ClientError::ConnectionUnavailable)
-        ));
-        server.await.unwrap();
-    }
-
-    #[tokio::test]
-    async fn typed_operation_preserves_broker_outcome_classification() {
-        let (listener, address) = listener().await;
-        let server = tokio::spawn(async move {
-            let (stream, _) = listener.accept().await.unwrap();
-            let mut reader = BufReader::new(stream);
-            assert!(matches!(
-                read_request(&mut reader).await,
-                Request::Publish { stream, payload, .. }
-                    if stream == "events" && payload == "hello"
-            ));
-            write_response(
-                &mut reader,
-                Response::Error {
-                    code: "request_saturated".to_owned(),
-                    message: "busy".to_owned(),
-                },
-            )
-            .await;
-        });
-
-        let mut client = Client::connect_with_config(address, test_config())
-            .await
-            .unwrap();
-        assert!(matches!(
-            client.publish("events", "hello").await,
-            Err(AttemptOutcome::Retryable(AttemptFailure::Broker(
-                Response::Error { code, .. }
-            ))) if code == "request_saturated"
-        ));
-        server.await.unwrap();
-    }
-
-    #[tokio::test]
-    async fn cancelled_typed_request_is_not_retried_and_reconnect_is_explicit() {
-        let (listener, address) = listener().await;
-        let (started_tx, started_rx) = oneshot::channel();
-        let server = tokio::spawn(async move {
-            let (stream, _) = listener.accept().await.unwrap();
-            let mut reader = BufReader::new(stream);
-            assert!(matches!(read_request(&mut reader).await, Request::Health));
-            started_tx.send(()).unwrap();
-
-            let (stream, _) = listener.accept().await.unwrap();
-            let mut reader = BufReader::new(stream);
-            assert!(matches!(read_request(&mut reader).await, Request::Health));
-            write_response(
-                &mut reader,
-                Response::Health {
-                    status: "ok".to_owned(),
-                    streams: 0,
-                    storage_bytes: 0,
-                },
-            )
-            .await;
-        });
-
-        let mut client = Client::connect_with_config(
-            address,
-            ClientConfig {
-                response_timeout: Duration::from_secs(5),
-                ..test_config()
-            },
-        )
-        .await
-        .unwrap();
-        let mut operation = Box::pin(client.health());
-        tokio::select! {
-            result = &mut operation => panic!("health request unexpectedly completed: {result:?}"),
-            _ = started_rx => {}
-        }
-        drop(operation);
-
-        assert!(matches!(
-            client.health().await,
-            Err(AttemptOutcome::Retryable(AttemptFailure::Client(
-                ClientError::ConnectionUnavailable
-            )))
-        ));
-        client.reconnect(address).await.unwrap();
-        assert_eq!(
-            client.health().await.unwrap(),
-            Health {
-                status: "ok".to_owned(),
-                streams: 0,
-                storage_bytes: 0,
-            }
-        );
-        server.await.unwrap();
-    }
-
-    #[tokio::test]
-    async fn typed_publish_retry_requires_reconnect_and_stable_identity() {
-        let (listener, address) = listener().await;
-        let server = tokio::spawn(async move {
-            let (stream, _) = listener.accept().await.unwrap();
-            let mut reader = BufReader::new(stream);
-            match read_request(&mut reader).await {
-                Request::Publish {
-                    stream,
-                    payload,
-                    request_id,
-                    ..
-                } => {
-                    assert_eq!(stream, "events");
-                    assert_eq!(payload, "once");
-                    assert_eq!(request_id.as_deref(), Some("publish-1"));
-                }
-                request => panic!("expected publish, got {request:?}"),
-            }
-            drop(reader);
-
-            let (stream, _) = listener.accept().await.unwrap();
-            let mut reader = BufReader::new(stream);
-            match read_request(&mut reader).await {
-                Request::Publish {
-                    stream,
-                    payload,
-                    request_id,
-                    ..
-                } => {
-                    assert_eq!(stream, "events");
-                    assert_eq!(payload, "once");
-                    assert_eq!(request_id.as_deref(), Some("publish-1"));
-                }
-                request => panic!("expected retried publish, got {request:?}"),
-            }
-            write_response(
-                &mut reader,
-                Response::Published {
-                    stream: "events".to_owned(),
-                    offset: 0,
-                },
-            )
-            .await;
-        });
-
-        let mut client = Client::connect_with_config(address, test_config())
-            .await
-            .unwrap();
-        let options = PublishOptions::default().with_request_id("publish-1");
-        assert!(matches!(
-            client
-                .publish_with_options("events", "once", options.clone())
-                .await,
-            Err(AttemptOutcome::Unknown(AttemptFailure::Client(
-                ClientError::Eof
-            )))
-        ));
-
-        client.reconnect(address).await.unwrap();
-        assert_eq!(
-            client
-                .publish_with_options("events", "once", options)
-                .await
-                .unwrap(),
-            PublishReceipt {
-                stream: "events".to_owned(),
-                offset: 0,
-            }
-        );
-        server.await.unwrap();
-    }
-
-    #[tokio::test]
-    async fn times_out_when_response_is_not_sent() {
-        let (listener, address) = listener().await;
-        let server = tokio::spawn(async move {
-            let (stream, _) = listener.accept().await.unwrap();
-            let mut reader = BufReader::new(stream);
-            let mut request = String::new();
-            reader.read_line(&mut request).await.unwrap();
-            tokio::time::sleep(Duration::from_millis(250)).await;
-        });
-
-        let mut client = Client::connect_with_config(address, test_config())
-            .await
-            .unwrap();
-        let result = client.request(&Request::Health).await;
-        assert!(matches!(result, Err(ClientError::ResponseTimeout { .. })));
-        assert!(matches!(
-            client.request(&Request::Health).await,
-            Err(ClientError::ConnectionUnavailable)
-        ));
-        drop(client);
-        server.await.unwrap();
-    }
-
-    #[tokio::test]
-    async fn reports_eof_before_a_response() {
-        let (listener, address) = listener().await;
-        let server = tokio::spawn(async move {
-            let (stream, _) = listener.accept().await.unwrap();
-            let mut reader = BufReader::new(stream);
-            let mut request = String::new();
-            reader.read_line(&mut request).await.unwrap();
-        });
-
-        let mut client = Client::connect_with_config(address, test_config())
-            .await
-            .unwrap();
-        let result = client.request(&Request::Health).await;
-        assert!(matches!(result, Err(ClientError::Eof)));
-        server.await.unwrap();
-    }
-
-    #[tokio::test]
-    async fn reconnects_explicitly_after_unknown_response_failure() {
-        let (listener, address) = listener().await;
-        let server = tokio::spawn(async move {
-            let (stream, _) = listener.accept().await.unwrap();
-            let mut reader = BufReader::new(stream);
-            let mut first_request = String::new();
-            reader.read_line(&mut first_request).await.unwrap();
-            assert!(matches!(
-                serde_json::from_str::<Request>(&first_request).unwrap(),
+                read_application_request(&mut reader).await,
                 Request::Health
             ));
-            drop(reader);
-
-            let (stream, _) = listener.accept().await.unwrap();
-            let mut reader = BufReader::new(stream);
-            let mut second_request = String::new();
-            reader.read_line(&mut second_request).await.unwrap();
-            assert!(matches!(
-                serde_json::from_str::<Request>(&second_request).unwrap(),
-                Request::Health
-            ));
-            reader
-                .get_mut()
-                .write_all(
-                    b"{\"type\":\"health\",\"status\":\"ok\",\"streams\":0,\"storage_bytes\":0}\n",
-                )
-                .await
-                .unwrap();
-        });
-
-        let mut client = Client::connect_with_config(address, test_config())
-            .await
-            .unwrap();
-        assert!(matches!(
-            client.request_with_outcome(&Request::Health).await,
-            AttemptOutcome::Unknown(AttemptFailure::Client(ClientError::Eof))
-        ));
-
-        client.reconnect(address).await.unwrap();
-        assert!(matches!(
-            client.request(&Request::Health).await,
-            Ok(Response::Health { status, .. }) if status == "ok"
-        ));
-        server.await.unwrap();
-    }
-
-    #[tokio::test]
-    async fn failed_reconnect_keeps_a_healthy_existing_connection() {
-        let (server_listener, address) = listener().await;
-        let server = tokio::spawn(async move {
-            let (stream, _) = server_listener.accept().await.unwrap();
-            let mut reader = BufReader::new(stream);
-            assert!(matches!(read_request(&mut reader).await, Request::Health));
             write_response(
                 &mut reader,
                 Response::Health {
@@ -2866,404 +2685,82 @@ mod tests {
         let mut client = Client::connect_with_config(address, test_config())
             .await
             .unwrap();
-        let (unavailable_listener, unavailable_address) = listener().await;
-        drop(unavailable_listener);
-        assert!(matches!(
-            client.reconnect(unavailable_address).await,
-            Err(ClientError::Connect { .. } | ClientError::ConnectTimeout { .. })
-        ));
-        assert_eq!(
-            client.health().await.unwrap(),
-            Health {
-                status: "ok".to_owned(),
-                streams: 0,
-                storage_bytes: 0,
-            }
-        );
-        server.await.unwrap();
-    }
-
-    #[tokio::test]
-    async fn failed_reconnect_does_not_change_unknown_outcome() {
-        let (server_listener, address) = listener().await;
-        let server = tokio::spawn(async move {
-            let (stream, _) = server_listener.accept().await.unwrap();
-            let mut reader = BufReader::new(stream);
-            let mut request = String::new();
-            reader.read_line(&mut request).await.unwrap();
-            assert!(matches!(
-                serde_json::from_str::<Request>(&request).unwrap(),
-                Request::Publish { .. }
-            ));
-            drop(reader);
-        });
-
-        let mut client = Client::connect_with_config(address, test_config())
-            .await
-            .unwrap();
-        let outcome = client
-            .request_with_outcome(&Request::Publish {
+        let result = client
+            .request(&Request::Publish {
                 stream: "events".to_owned(),
                 key: None,
-                payload: "once".to_owned(),
+                payload: "x".repeat(2_048),
                 request_id: None,
             })
             .await;
         assert!(matches!(
-            &outcome,
-            AttemptOutcome::Unknown(AttemptFailure::Client(ClientError::Eof))
-        ));
-
-        let (unavailable_listener, unavailable_address) = listener().await;
-        drop(unavailable_listener);
-        assert!(matches!(
-            client.reconnect(unavailable_address).await,
-            Err(ClientError::Connect { .. } | ClientError::ConnectTimeout { .. })
+            result,
+            Err(ClientError::RequestTooLarge { max_bytes: 1_024 })
         ));
         assert!(matches!(
-            &outcome,
-            AttemptOutcome::Unknown(AttemptFailure::Client(ClientError::Eof))
+            client.request(&Request::Health).await.unwrap(),
+            Response::Health { .. }
         ));
-        server.await.unwrap();
-    }
-
-    #[tokio::test]
-    async fn reports_invalid_response() {
-        let (listener, address) = listener().await;
-        let server = tokio::spawn(async move {
-            let (stream, _) = listener.accept().await.unwrap();
-            let mut reader = BufReader::new(stream);
-            let mut request = String::new();
-            reader.read_line(&mut request).await.unwrap();
-            reader.get_mut().write_all(b"not-json\n").await.unwrap();
-        });
-
-        let mut client = Client::connect_with_config(address, test_config())
-            .await
-            .unwrap();
-        let result = client.request(&Request::Health).await;
-        assert!(matches!(result, Err(ClientError::InvalidResponse { .. })));
         server.await.unwrap();
     }
 
     #[tokio::test]
     async fn rejects_a_zero_response_limit_before_connecting() {
-        let (listener, address) = listener().await;
         let result = Client::connect_with_config(
-            address,
+            "127.0.0.1:1",
             ClientConfig {
                 max_response_bytes: 0,
                 ..test_config()
             },
         )
         .await;
-
         assert!(matches!(result, Err(ClientError::InvalidResponseLimit)));
-        drop(listener);
-    }
-
-    #[tokio::test]
-    async fn request_too_large_response_invalidates_persistent_connection() {
-        let (listener, address) = listener().await;
-        let server = tokio::spawn(async move {
-            let (stream, _) = listener.accept().await.unwrap();
-            let mut reader = BufReader::new(stream);
-            assert!(matches!(read_request(&mut reader).await, Request::Health));
-            write_response(
-                &mut reader,
-                Response::Error {
-                    code: "request_too_large".to_owned(),
-                    message: "request exceeds the configured maximum".to_owned(),
-                },
-            )
-            .await;
-        });
-
-        let mut client = Client::connect_with_config(address, test_config())
-            .await
-            .unwrap();
-        assert!(matches!(
-            client.request(&Request::Health).await,
-            Ok(Response::Error { code, .. }) if code == "request_too_large"
-        ));
-        assert!(matches!(
-            client.request(&Request::Health).await,
-            Err(ClientError::ConnectionUnavailable)
-        ));
-        server.await.unwrap();
-    }
-
-    #[tokio::test]
-    async fn oversized_terminated_response_is_bounded_and_invalidates_connection() {
-        let (listener, address) = listener().await;
-        let max_response_bytes = 64;
-        let server = tokio::spawn(async move {
-            let (stream, _) = listener.accept().await.unwrap();
-            let mut reader = BufReader::new(stream);
-            assert!(matches!(read_request(&mut reader).await, Request::Health));
-            let mut response = vec![b'{'; max_response_bytes + 1];
-            response.push(b'}');
-            response.push(b'\n');
-            reader.get_mut().write_all(&response).await.unwrap();
-        });
-
-        let mut client = Client::connect_with_config(
-            address,
-            ClientConfig {
-                max_response_bytes,
-                ..test_config()
-            },
-        )
-        .await
-        .unwrap();
-        let result = client.request(&Request::Health).await;
-        assert!(
-            matches!(
-                result,
-                Err(ClientError::ResponseTooLarge { max_bytes }) if max_bytes == max_response_bytes
-            ),
-            "unexpected result: {result:?}"
-        );
-        assert!(matches!(
-            client.request(&Request::Health).await,
-            Err(ClientError::ConnectionUnavailable)
-        ));
-        server.await.unwrap();
-    }
-
-    #[tokio::test]
-    async fn oversized_unterminated_response_is_bounded_and_invalidates_connection() {
-        let (listener, address) = listener().await;
-        let max_response_bytes = 64;
-        let server = tokio::spawn(async move {
-            let (stream, _) = listener.accept().await.unwrap();
-            let mut reader = BufReader::new(stream);
-            assert!(matches!(read_request(&mut reader).await, Request::Health));
-            reader
-                .get_mut()
-                .write_all(&vec![b'x'; max_response_bytes + 1])
-                .await
-                .unwrap();
-        });
-
-        let mut client = Client::connect_with_config(
-            address,
-            ClientConfig {
-                max_response_bytes,
-                ..test_config()
-            },
-        )
-        .await
-        .unwrap();
-        let result = client.request(&Request::Health).await;
-        assert!(
-            matches!(
-                result,
-                Err(ClientError::ResponseTooLarge { max_bytes }) if max_bytes == max_response_bytes
-            ),
-            "unexpected result: {result:?}"
-        );
-        assert!(matches!(
-            client.request(&Request::Health).await,
-            Err(ClientError::ConnectionUnavailable)
-        ));
-        server.await.unwrap();
-    }
-
-    #[tokio::test]
-    async fn oversized_response_is_unknown_after_the_request_was_sent() {
-        let (listener, address) = listener().await;
-        let max_response_bytes = 64;
-        let server = tokio::spawn(async move {
-            let (stream, _) = listener.accept().await.unwrap();
-            let mut reader = BufReader::new(stream);
-            assert!(matches!(read_request(&mut reader).await, Request::Health));
-            reader
-                .get_mut()
-                .write_all(&vec![b'x'; max_response_bytes + 1])
-                .await
-                .unwrap();
-        });
-
-        let mut client = Client::connect_with_config(
-            address,
-            ClientConfig {
-                max_response_bytes,
-                ..test_config()
-            },
-        )
-        .await
-        .unwrap();
-        assert!(matches!(
-            client.request_with_outcome(&Request::Health).await,
-            AttemptOutcome::Unknown(AttemptFailure::Client(
-                ClientError::ResponseTooLarge { max_bytes }
-            )) if max_bytes == max_response_bytes
-        ));
-        server.await.unwrap();
-    }
-
-    #[tokio::test]
-    async fn accepts_a_fragmented_response_at_the_configured_limit() {
-        let (listener, address) = listener().await;
-        let response = serde_json::to_vec(&Response::Health {
-            status: "ok".to_owned(),
-            streams: 0,
-            storage_bytes: 0,
-        })
-        .unwrap();
-        let max_response_bytes = response.len() + 5;
-        let server = tokio::spawn(async move {
-            let (stream, _) = listener.accept().await.unwrap();
-            let mut reader = BufReader::new(stream);
-            assert!(matches!(read_request(&mut reader).await, Request::Health));
-            let split = response.len() / 2;
-            reader
-                .get_mut()
-                .write_all(&response[..split])
-                .await
-                .unwrap();
-            reader
-                .get_mut()
-                .write_all(&response[split..])
-                .await
-                .unwrap();
-            reader.get_mut().write_all(&[b' '; 4]).await.unwrap();
-            reader.get_mut().write_all(b"\n").await.unwrap();
-        });
-
-        let mut client = Client::connect_with_config(
-            address,
-            ClientConfig {
-                max_response_bytes,
-                ..test_config()
-            },
-        )
-        .await
-        .unwrap();
-        assert!(matches!(
-            client.request(&Request::Health).await,
-            Ok(Response::Health { status, .. }) if status == "ok"
-        ));
-        server.await.unwrap();
-    }
-
-    async fn request_outcome(response: Response) -> AttemptOutcome {
-        let (listener, address) = listener().await;
-        let server = tokio::spawn(async move {
-            let (stream, _) = listener.accept().await.unwrap();
-            let mut reader = BufReader::new(stream);
-            let mut request = String::new();
-            reader.read_line(&mut request).await.unwrap();
-            let mut encoded = serde_json::to_vec(&response).unwrap();
-            encoded.push(b'\n');
-            reader.get_mut().write_all(&encoded).await.unwrap();
-        });
-
-        let mut client = Client::connect_with_config(address, test_config())
-            .await
-            .unwrap();
-        let outcome = client.request_with_outcome(&Request::Health).await;
-        server.await.unwrap();
-        outcome
-    }
-
-    #[tokio::test]
-    async fn classifies_success_as_confirmed() {
-        let outcome = request_outcome(Response::Health {
-            status: "ok".to_owned(),
-            streams: 0,
-            storage_bytes: 0,
-        })
-        .await;
-
-        assert!(matches!(
-            outcome,
-            AttemptOutcome::Confirmed(Response::Health { .. })
-        ));
-    }
-
-    #[tokio::test]
-    async fn classifies_deterministic_broker_rejection() {
-        let outcome = request_outcome(Response::Error {
-            code: "invalid_name".to_owned(),
-            message: "invalid stream".to_owned(),
-        })
-        .await;
-
-        assert!(
-            matches!(outcome, AttemptOutcome::Rejected(AttemptFailure::Broker(Response::Error { code, .. })) if code == "invalid_name")
-        );
-    }
-
-    #[tokio::test]
-    async fn classifies_admission_response_as_retryable() {
-        let outcome = request_outcome(Response::Error {
-            code: "request_saturated".to_owned(),
-            message: "busy".to_owned(),
-        })
-        .await;
-
-        assert!(
-            matches!(outcome, AttemptOutcome::Retryable(AttemptFailure::Broker(Response::Error { code, .. })) if code == "request_saturated")
-        );
-    }
-
-    #[tokio::test]
-    async fn classifies_preappend_consumer_state_failure_as_retryable() {
-        let outcome = request_outcome(Response::Error {
-            code: "consumer_state_retryable".to_owned(),
-            message: "append was not attempted".to_owned(),
-        })
-        .await;
-
-        assert!(matches!(
-            outcome,
-            AttemptOutcome::Retryable(AttemptFailure::Broker(Response::Error { code, .. }))
-                if code == "consumer_state_retryable"
-        ));
-    }
-
-    #[tokio::test]
-    async fn classifies_timeout_response_as_unknown() {
-        let outcome = request_outcome(Response::Error {
-            code: "request_timeout".to_owned(),
-            message: "deadline exceeded".to_owned(),
-        })
-        .await;
-
-        assert!(
-            matches!(outcome, AttemptOutcome::Unknown(AttemptFailure::Broker(Response::Error { code, .. })) if code == "request_timeout")
-        );
     }
 
     #[test]
-    fn classifies_connection_failure_before_writing_as_retryable() {
-        let outcome = AttemptOutcome::from_client_error(ClientError::Connect {
-            source: io::Error::new(io::ErrorKind::ConnectionRefused, "refused"),
-        });
-
-        assert!(matches!(
-            outcome,
-            AttemptOutcome::Retryable(AttemptFailure::Client(ClientError::Connect { .. }))
-        ));
+    fn bearer_credentials_are_redacted_from_security_configuration_debug() {
+        let secret = "A".repeat(43);
+        let token = BearerToken::parse(secret.clone()).unwrap();
+        let security = ClientSecurityConfig::plaintext_development().with_bearer_token(token);
+        assert!(!format!("{security:?}").contains(&secret));
+        assert!(format!("{security:?}").contains("[REDACTED]"));
     }
 
     #[test]
-    fn classifies_missing_connection_before_writing_as_retryable() {
-        let outcome = AttemptOutcome::from_client_error(ClientError::ConnectionUnavailable);
-
-        assert!(matches!(
-            outcome,
-            AttemptOutcome::Retryable(AttemptFailure::Client(ClientError::ConnectionUnavailable))
-        ));
-    }
-
-    #[test]
-    fn client_uses_shared_protocol_support() {
+    fn client_uses_shared_v2_protocol_support() {
         assert_eq!(PROTOCOL_SUPPORT, runnel_protocol::PROTOCOL_SUPPORT);
         assert!(PROTOCOL_SUPPORT.supports_version(runnel_protocol::PROTOCOL_VERSION));
+        assert!(!PROTOCOL_SUPPORT.supports_version(1));
         assert!(PROTOCOL_SUPPORT.supports_payload_encoding(PayloadEncoding::Utf8Text));
-        assert!(PROTOCOL_SUPPORT.supports_payload_encoding(PayloadEncoding::Base64));
+        assert!(PROTOCOL_SUPPORT.supports_payload_encoding(PayloadEncoding::Binary));
+    }
+
+    #[test]
+    fn client_hello_limits_are_protocol_bounded() {
+        let hello = ClientHello::core_v2();
+        assert_eq!(
+            hello.versions,
+            vec![VersionRange {
+                major: 2,
+                min_minor: 0,
+                max_minor: 0,
+            }]
+        );
+        assert!(hello.max_outbound_frame_bytes <= MAX_CLIENT_TO_SERVER_FRAME_BYTES);
+        assert!(hello.max_inbound_frame_bytes <= DEFAULT_SERVER_TO_CLIENT_FRAME_BYTES);
+    }
+
+    #[test]
+    fn custom_trust_bundle_replaces_platform_roots() {
+        let directory = tempfile::tempdir().unwrap();
+        let certificate =
+            rcgen::generate_simple_self_signed(vec!["private.example".to_owned()]).unwrap();
+        let bundle = directory.path().join("private-ca.pem");
+        std::fs::write(&bundle, certificate.cert.pem()).unwrap();
+
+        let roots =
+            client_trust_roots(&ClientTlsConfig::new("private.example").with_ca_file(&bundle))
+                .unwrap();
+        assert_eq!(roots.len(), 1);
     }
 }

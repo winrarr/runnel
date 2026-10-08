@@ -114,7 +114,13 @@ async fn write_peer_frame<T: Serialize>(
                     "peer TLS configuration is missing",
                 )
             })?;
-            write_frame_bounded(stream.as_mut(), request, &tls.frame_write_slots()).await
+            write_frame_bounded(
+                stream.as_mut(),
+                request,
+                &tls.frame_write_slots(),
+                &tls.frame_memory(),
+            )
+            .await
         }
         #[cfg(test)]
         PeerStream::Plain(stream) => write_frame(stream, request).await,
@@ -1055,6 +1061,7 @@ mod tests {
                 &mut stream,
                 &PeerResponse::Forward(ForwardedResponse::CreateStream(Ok(true))),
                 &server_tls.frame_write_slots(),
+                &server_tls.frame_memory(),
             )
             .await
             .unwrap();

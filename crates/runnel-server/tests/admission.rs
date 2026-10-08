@@ -338,13 +338,7 @@ fn connection_flood_is_rejected_and_durable_traffic_recovers() {
     rejected
         .set_read_timeout(Some(Duration::from_secs(1)))
         .unwrap();
-    let mut response = String::new();
-    BufReader::new(&mut rejected)
-        .read_line(&mut response)
-        .expect("connection rejection response should be readable");
-    assert!(
-        matches!(decode_response(&response), Response::Error { code, .. } if code == "connection_limit")
-    );
+    assert_connection_closed(&mut rejected);
 
     let metrics = wait_for_metric_at_least(
         server.http_addr,
@@ -356,10 +350,7 @@ fn connection_flood_is_rejected_and_durable_traffic_recovers() {
     drop(first);
     drop(second);
     wait_for_metric_at_most(server.http_addr, "runnel_active_connections", 0);
-    let mut recovered = TcpStream::connect(server.broker_addr).unwrap();
-    recovered
-        .set_read_timeout(Some(Duration::from_secs(2)))
-        .unwrap();
+    let mut recovered = connect_v2(server.broker_addr, Duration::from_secs(2)).unwrap();
     assert!(matches!(
         send_on_connection(
             &mut recovered,
@@ -392,23 +383,17 @@ fn oversized_unterminated_frame_is_bounded_and_rejected() {
     let directory = TempDir::new().unwrap();
     let server = RunningServer::start(
         directory.path(),
-        &["--max-request-bytes", "128", "--request-timeout-ms", "500"],
+        &["--max-request-bytes", "1024", "--request-timeout-ms", "500"],
     );
 
-    let mut connection = TcpStream::connect(server.broker_addr).unwrap();
+    let mut connection = connect_v2(server.broker_addr, Duration::from_secs(1)).unwrap();
     connection
         .set_read_timeout(Some(Duration::from_secs(1)))
         .unwrap();
     connection
-        .write_all(&[b'x'; 129])
-        .expect("oversized frame should be writable");
-    let mut response = String::new();
-    BufReader::new(&mut connection)
-        .read_line(&mut response)
-        .expect("oversized frame response should be readable");
-    assert!(
-        matches!(decode_response(&response), Response::Error { code, .. } if code == "request_too_large")
-    );
+        .write_all(&1025_u32.to_be_bytes())
+        .expect("oversized frame header should be writable");
+    assert_connection_closed(&mut connection);
 
     let metrics = wait_for_metric_at_least(
         server.http_addr,
@@ -449,19 +434,12 @@ fn partial_request_times_out_and_unrelated_health_recovers() {
         ],
     );
 
-    let mut slow = TcpStream::connect(server.broker_addr).unwrap();
-    slow.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
     let metrics_before = http_metrics(server.http_addr);
     let requests_rejected_before =
         metric_value(&metrics_before, "runnel_broker_requests_rejected_total");
-    slow.write_all(br#"{"op":"health"}"#).unwrap();
-    let mut response = String::new();
-    BufReader::new(&mut slow)
-        .read_line(&mut response)
-        .expect("timed-out request response should be readable");
-    assert!(
-        matches!(decode_response(&response), Response::Error { code, .. } if code == "request_timeout")
-    );
+    let mut slow = connect_v2(server.broker_addr, Duration::from_secs(2)).unwrap();
+    write_partial_application_request(&mut slow);
+    assert_connection_closed(&mut slow);
 
     let metrics =
         wait_for_metric_at_least(server.http_addr, "runnel_broker_request_timeouts_total", 1);
@@ -471,7 +449,7 @@ fn partial_request_times_out_and_unrelated_health_recovers() {
         requests_rejected_before + 1
     );
 
-    let mut recovered = TcpStream::connect(server.broker_addr).unwrap();
+    let mut recovered = connect_v2(server.broker_addr, Duration::from_secs(2)).unwrap();
     recovered
         .set_read_timeout(Some(Duration::from_secs(2)))
         .unwrap();
@@ -506,13 +484,11 @@ fn slow_reader_does_not_consume_in_flight_capacity() {
         ],
     );
 
-    let mut slow_reader = TcpStream::connect(server.broker_addr).unwrap();
+    let mut slow_reader = connect_v2(server.broker_addr, Duration::from_secs(2)).unwrap();
     slow_reader
         .set_read_timeout(Some(Duration::from_secs(2)))
         .unwrap();
-    slow_reader
-        .write_all(br#"{"op":"health"}"#)
-        .expect("partial request should be writable");
+    write_partial_application_request(&mut slow_reader);
 
     let started = Instant::now();
     assert!(matches!(
@@ -524,13 +500,7 @@ fn slow_reader_does_not_consume_in_flight_capacity() {
         "a slow reader must not consume the only in-flight request permit"
     );
 
-    let mut response = String::new();
-    BufReader::new(&mut slow_reader)
-        .read_line(&mut response)
-        .expect("slow reader timeout response should be readable");
-    assert!(
-        matches!(decode_response(&response), Response::Error { code, .. } if code == "request_timeout")
-    );
+    assert_connection_closed(&mut slow_reader);
 
     let metrics =
         wait_for_metric_at_least(server.http_addr, "runnel_broker_request_timeouts_total", 1);
@@ -544,14 +514,14 @@ fn slow_writer_and_in_flight_admission_are_bounded() {
         directory.path(),
         &[
             "--max-request-bytes",
-            "8388608",
+            "52428800",
             "--request-timeout-ms",
-            "500",
+            "3000",
             "--max-in-flight-requests",
             "1",
         ],
     );
-    let payload = "x".repeat(6 * 1024 * 1024);
+    let payload = "x".repeat(40 * 1024 * 1024);
 
     assert!(matches!(
         request(
@@ -574,6 +544,7 @@ fn slow_writer_and_in_flight_admission_are_bounded() {
         ),
         Response::Published { offset: 0, .. }
     ));
+    wait_for_metric_at_most(server.http_addr, "runnel_active_connections", 0);
 
     let metrics_before = http_metrics(server.http_addr);
     let request_timeouts_before =
@@ -587,26 +558,27 @@ fn slow_writer_and_in_flight_admission_are_bounded() {
         "runnel_broker_response_write_timeouts_total",
     );
 
-    let mut slow_writer = TcpStream::connect(server.broker_addr).unwrap();
-    slow_writer
-        .write_all(
-            &serde_json::to_vec(&Request::Poll {
-                stream: "slow-writer".to_owned(),
-                consumer: "unread".to_owned(),
-            })
-            .unwrap(),
-        )
-        .unwrap();
-    slow_writer.write_all(b"\n").unwrap();
+    let mut pressure = connect_v2(server.broker_addr, Duration::from_secs(2)).unwrap();
+    let mut slow_writer =
+        connect_v2_with_small_receive_buffer(server.broker_addr, Duration::from_secs(2)).unwrap();
+    write_application_request(
+        &mut slow_writer,
+        Request::Poll {
+            stream: "slow-writer".to_owned(),
+            consumer: "unread".to_owned(),
+        },
+    );
 
     let metrics = wait_for_metric_at_least(server.http_addr, "runnel_active_requests", 1);
     assert_eq!(metric_value(&metrics, "runnel_active_requests"), 1);
 
     let started = Instant::now();
-    assert!(matches!(
-        request(server.broker_addr, Request::Health),
-        Response::Error { code, .. } if code == "request_saturated"
-    ));
+    let saturation_response = send_on_connection(&mut pressure, Request::Health);
+    assert!(
+        matches!(&saturation_response, Response::Error { code, .. } if code == "request_saturated"),
+        "expected saturation while the slow writer was active, got {saturation_response:?}"
+    );
+    drop(pressure);
     assert!(
         started.elapsed() < Duration::from_secs(1),
         "a full in-flight budget must reject unrelated work promptly"
@@ -671,14 +643,14 @@ fn sustained_in_flight_pressure_reports_metrics_and_recovers() {
             "--max-connections",
             "4",
             "--max-request-bytes",
-            "8388608",
+            "52428800",
             "--request-timeout-ms",
-            "1000",
+            "3000",
             "--max-in-flight-requests",
             "1",
         ],
     );
-    let payload = "x".repeat(6 * 1024 * 1024);
+    let payload = "x".repeat(40 * 1024 * 1024);
 
     assert!(matches!(
         request(
@@ -701,6 +673,7 @@ fn sustained_in_flight_pressure_reports_metrics_and_recovers() {
         ),
         Response::Published { offset: 0, .. }
     ));
+    wait_for_metric_at_most(server.http_addr, "runnel_active_connections", 0);
 
     let metrics_before = http_metrics(server.http_addr);
     let saturation_before = metric_value(&metrics_before, "runnel_broker_request_saturation_total");
@@ -729,40 +702,43 @@ fn sustained_in_flight_pressure_reports_metrics_and_recovers() {
         "counter",
     );
 
-    let mut slow_writer = TcpStream::connect(server.broker_addr).unwrap();
-    slow_writer
-        .write_all(
-            &serde_json::to_vec(&Request::Poll {
-                stream: "sustained-pressure".to_owned(),
-                consumer: "unread".to_owned(),
-            })
-            .unwrap(),
-        )
-        .unwrap();
-    slow_writer.write_all(b"\n").unwrap();
-    wait_for_metric_at_least(server.http_addr, "runnel_active_requests", 1);
-
     let mut pressure_connections = Vec::new();
     for _ in 0..3 {
-        let connection = TcpStream::connect(server.broker_addr).unwrap();
-        connection
-            .set_read_timeout(Some(Duration::from_secs(2)))
-            .unwrap();
-        pressure_connections.push(connection);
+        pressure_connections.push(connect_v2(server.broker_addr, Duration::from_secs(2)).unwrap());
     }
+    let mut slow_writer =
+        connect_v2_with_small_receive_buffer(server.broker_addr, Duration::from_secs(2)).unwrap();
+    write_application_request(
+        &mut slow_writer,
+        Request::Poll {
+            stream: "sustained-pressure".to_owned(),
+            consumer: "unread".to_owned(),
+        },
+    );
+    wait_for_metric_at_least(server.http_addr, "runnel_active_requests", 1);
+
     let metrics = wait_for_metric_at_least(server.http_addr, "runnel_active_connections", 4);
     assert_eq!(metric_value(&metrics, "runnel_active_requests"), 1);
 
+    let slow_writer_started = Instant::now();
     let attempts = 8;
     for _ in 0..attempts {
         for connection in &mut pressure_connections {
-            assert!(matches!(
-                send_on_connection(connection, Request::Health),
-                Response::Error { code, .. } if code == "request_saturated"
-            ));
+            let response = send_on_connection(connection, Request::Health);
+            assert!(
+                matches!(&response, Response::Error { code, .. } if code == "request_saturated"),
+                "expected saturation while the slow writer was active, got {response:?}"
+            );
         }
         let metrics = http_metrics(server.http_addr);
-        assert_eq!(metric_value(&metrics, "runnel_active_requests"), 1);
+        assert_eq!(
+            metric_value(&metrics, "runnel_active_requests"),
+            1,
+            "slow writer elapsed {:?}, response write timeouts {}, request timeouts {}",
+            slow_writer_started.elapsed(),
+            metric_value(&metrics, "runnel_broker_response_write_timeouts_total"),
+            metric_value(&metrics, "runnel_broker_request_timeouts_total")
+        );
     }
 
     let expected_rejections = (attempts * pressure_connections.len()) as u64;
@@ -1041,10 +1017,7 @@ fn sustained_storage_pressure_is_bounded_observable_and_recovers() {
         Response::Published { offset: 0, .. }
     ));
 
-    let mut retry_connection = TcpStream::connect(server.broker_addr).unwrap();
-    retry_connection
-        .set_read_timeout(Some(Duration::from_secs(2)))
-        .unwrap();
+    let mut retry_connection = connect_v2(server.broker_addr, Duration::from_secs(2)).unwrap();
     for attempt in 0..24 {
         let started = Instant::now();
         assert!(matches!(
@@ -1733,7 +1706,7 @@ fn served_persistent_connection_drains_promptly_on_shutdown() {
         directory.path(),
         &["--max-connections", "1", "--request-timeout-ms", "5000"],
     );
-    let mut connection = TcpStream::connect(server.broker_addr).unwrap();
+    let mut connection = connect_v2(server.broker_addr, Duration::from_secs(2)).unwrap();
     connection
         .set_read_timeout(Some(Duration::from_secs(2)))
         .unwrap();
@@ -1747,22 +1720,14 @@ fn served_persistent_connection_drains_promptly_on_shutdown() {
     // A served persistent connection can begin another frame before shutdown.
     // The partial frame must not keep its connection task alive until the
     // request timeout expires.
-    connection
-        .write_all(br#"{"op":"health"}"#)
-        .expect("partial follow-up request should be writable");
+    write_partial_application_request(&mut connection);
     sleep(Duration::from_millis(100));
 
     let mut rejected = TcpStream::connect(server.broker_addr).unwrap();
     rejected
         .set_read_timeout(Some(Duration::from_secs(1)))
         .unwrap();
-    let mut response = String::new();
-    BufReader::new(&mut rejected)
-        .read_line(&mut response)
-        .expect("connection rejection response should be readable");
-    assert!(
-        matches!(decode_response(&response), Response::Error { code, .. } if code == "connection_limit")
-    );
+    assert_connection_closed(&mut rejected);
     let metrics = wait_for_metric_at_least(
         server.http_addr,
         "runnel_broker_connections_rejected_total",
@@ -2313,33 +2278,14 @@ fn wait_for_server_exit(server: &mut RunningServer, description: &str) -> Durati
     }
 }
 
-fn decode_response(encoded: &str) -> Response {
-    serde_json::from_str(encoded).expect("response should be valid JSON")
-}
-
 #[cfg(unix)]
 fn try_request(
     address: SocketAddr,
     request: Request,
     read_timeout: Duration,
 ) -> Result<Response, String> {
-    let mut stream = TcpStream::connect(address).map_err(|error| error.to_string())?;
-    stream
-        .set_read_timeout(Some(read_timeout))
-        .map_err(|error| error.to_string())?;
-    let encoded = serde_json::to_vec(&request).map_err(|error| error.to_string())?;
-    stream
-        .write_all(&encoded)
-        .map_err(|error| error.to_string())?;
-    stream.write_all(b"\n").map_err(|error| error.to_string())?;
-    let mut response = String::new();
-    BufReader::new(&mut stream)
-        .read_line(&mut response)
-        .map_err(|error| error.to_string())?;
-    if response.is_empty() {
-        return Err("server closed the connection without a response".to_owned());
-    }
-    serde_json::from_str(&response).map_err(|error| error.to_string())
+    let mut stream = connect_v2(address, read_timeout)?;
+    send_on_connection_result(&mut stream, request)
 }
 
 #[cfg(unix)]
@@ -2350,45 +2296,153 @@ fn try_request_after_send(
     sent_sender: Sender<usize>,
     index: usize,
 ) -> Result<(Response, Duration), String> {
-    let mut stream = TcpStream::connect(address).map_err(|error| error.to_string())?;
-    stream
-        .set_read_timeout(Some(read_timeout))
-        .map_err(|error| error.to_string())?;
-    let encoded = serde_json::to_vec(&request).map_err(|error| error.to_string())?;
-    stream
-        .write_all(&encoded)
-        .map_err(|error| error.to_string())?;
-    stream.write_all(b"\n").map_err(|error| error.to_string())?;
+    let mut stream = connect_v2(address, read_timeout)?;
+    write_application_request_result(&mut stream, request)?;
     sent_sender.send(index).map_err(|error| error.to_string())?;
     let started = Instant::now();
-    let mut response = String::new();
-    BufReader::new(&mut stream)
-        .read_line(&mut response)
-        .map_err(|error| error.to_string())?;
-    if response.is_empty() {
-        return Err("server closed the connection without a response".to_owned());
-    }
-    let response = serde_json::from_str(&response).map_err(|error| error.to_string())?;
+    let response = read_application_response(&mut stream).map_err(|error| error.to_string())?;
     Ok((response, started.elapsed()))
 }
 
 fn request(address: SocketAddr, request: Request) -> Response {
-    let mut stream = TcpStream::connect(address).expect("broker should accept connections");
-    stream
-        .set_read_timeout(Some(Duration::from_secs(2)))
-        .expect("read timeout should be set");
+    let mut stream = connect_v2(address, Duration::from_secs(2))
+        .expect("broker should accept and negotiate v2 connections");
     send_on_connection(&mut stream, request)
 }
 
 fn send_on_connection(stream: &mut TcpStream, request: Request) -> Response {
-    let encoded = serde_json::to_vec(&request).unwrap();
-    stream.write_all(&encoded).unwrap();
-    stream.write_all(b"\n").unwrap();
-    let mut response = String::new();
-    BufReader::new(&mut *stream)
-        .read_line(&mut response)
-        .expect("broker response should be readable");
-    decode_response(&response)
+    send_on_connection_result(stream, request).expect("broker v2 response should be readable")
+}
+
+fn send_on_connection_result(stream: &mut TcpStream, request: Request) -> Result<Response, String> {
+    write_application_request_result(stream, request)?;
+    read_application_response(stream).map_err(|error| error.to_string())
+}
+
+fn connect_v2(address: SocketAddr, timeout: Duration) -> Result<TcpStream, String> {
+    let mut stream = TcpStream::connect(address).map_err(|error| error.to_string())?;
+    negotiate_v2(&mut stream, timeout)?;
+    Ok(stream)
+}
+
+fn connect_v2_with_small_receive_buffer(
+    address: SocketAddr,
+    timeout: Duration,
+) -> Result<TcpStream, String> {
+    let socket = socket2::Socket::new(
+        socket2::Domain::for_address(address),
+        socket2::Type::STREAM,
+        Some(socket2::Protocol::TCP),
+    )
+    .map_err(|error| error.to_string())?;
+    socket
+        .set_recv_buffer_size(1024)
+        .map_err(|error| error.to_string())?;
+    socket
+        .connect_timeout(&socket2::SockAddr::from(address), timeout)
+        .map_err(|error| error.to_string())?;
+    let mut stream: TcpStream = socket.into();
+    negotiate_v2(&mut stream, timeout)?;
+    Ok(stream)
+}
+
+fn negotiate_v2(stream: &mut TcpStream, timeout: Duration) -> Result<(), String> {
+    stream
+        .set_read_timeout(Some(timeout))
+        .map_err(|error| error.to_string())?;
+    stream
+        .set_write_timeout(Some(timeout))
+        .map_err(|error| error.to_string())?;
+    use runnel_protocol::v2::{self, ServerHello};
+
+    stream
+        .write_all(&v2::PREFACE)
+        .map_err(|error| error.to_string())?;
+    let hello =
+        v2::encode_client_hello(&v2::ClientHello::core_v2()).map_err(|error| error.to_string())?;
+    stream
+        .write_all(hello.as_bytes())
+        .map_err(|error| error.to_string())?;
+    let body = read_frame(stream, v2::HELLO_MAX_BODY_BYTES).map_err(|error| error.to_string())?;
+    match v2::decode_server_hello(&body).map_err(|error| error.to_string())? {
+        ServerHello::Accepted(accepted) if accepted.auth_required == Some(false) => Ok(()),
+        ServerHello::Accepted(_) => {
+            Err("test server unexpectedly requires authentication".to_owned())
+        }
+        ServerHello::Refused { code, diagnostic } => Err(format!(
+            "server refused v2 negotiation ({code:?}): {diagnostic}"
+        )),
+    }
+}
+
+fn write_application_request(stream: &mut TcpStream, request: Request) {
+    write_application_request_result(stream, request)
+        .expect("v2 application request should be writable");
+}
+
+fn write_application_request_result(
+    stream: &mut TcpStream,
+    request: Request,
+) -> Result<(), String> {
+    let frame = runnel_protocol::v2::encode_application_request(&request)
+        .map_err(|error| error.to_string())?;
+    stream
+        .write_all(frame.as_bytes())
+        .map_err(|error| error.to_string())
+}
+
+fn write_partial_application_request(stream: &mut TcpStream) {
+    let frame = runnel_protocol::v2::encode_application_request(&Request::Health).unwrap();
+    stream
+        .write_all(&frame.as_bytes()[..2])
+        .expect("partial v2 frame header should be writable");
+}
+
+fn read_application_response(stream: &mut TcpStream) -> std::io::Result<Response> {
+    use runnel_protocol::v2::{self, ServerFrame};
+
+    let body = read_frame(stream, v2::MAX_SERVER_TO_CLIENT_FRAME_BYTES)?;
+    match v2::decode_server_frame(&body, v2::MAX_SERVER_TO_CLIENT_FRAME_BYTES) {
+        Ok(ServerFrame::Application(reply)) => Ok(reply.response),
+        Ok(_) => Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "expected an application response frame",
+        )),
+        Err(error) => Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            error.to_string(),
+        )),
+    }
+}
+
+fn read_frame(stream: &mut TcpStream, max_body_bytes: usize) -> std::io::Result<Vec<u8>> {
+    let mut length = [0; 4];
+    stream.read_exact(&mut length)?;
+    let body_bytes = u32::from_be_bytes(length) as usize;
+    if body_bytes == 0 || body_bytes > max_body_bytes {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "v2 frame length is outside the configured limit",
+        ));
+    }
+    let mut body = vec![0; body_bytes];
+    stream.read_exact(&mut body)?;
+    Ok(body)
+}
+
+fn assert_connection_closed(stream: &mut TcpStream) {
+    let mut byte = [0; 1];
+    match stream.read(&mut byte) {
+        Ok(0) => {}
+        Err(error)
+            if matches!(
+                error.kind(),
+                std::io::ErrorKind::ConnectionAborted
+                    | std::io::ErrorKind::ConnectionReset
+                    | std::io::ErrorKind::UnexpectedEof
+            ) => {}
+        result => panic!("connection should close without an application frame: {result:?}"),
+    }
 }
 
 fn free_addr() -> SocketAddr {

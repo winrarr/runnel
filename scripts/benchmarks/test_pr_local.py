@@ -3,6 +3,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 
 SCRIPT_DIR = Path(__file__).resolve().parent
@@ -15,13 +16,34 @@ from pr_local import (  # noqa: E402
     assess_stability,
     benchmark_command,
     benchmark_interpretation,
+    apply_legacy_parallel_grouped_timeout,
     reportable_result,
+    parse_args,
     require_stable,
     stamp_resource_limits,
+    supports_parallel_grouped_timeout,
 )
 
 
 class PrLocalTests(unittest.TestCase):
+    def test_comparison_timeout_defaults_from_message_count(self) -> None:
+        with patch.object(sys, "argv", ["pr_local.py", "--messages", "1000"]):
+            args = parse_args()
+
+        self.assertEqual(args.parallel_grouped_timeout_seconds, 250.0)
+        self.assertEqual(args.parallel_grouped_timeout_source, "workload-aware default")
+
+    def test_comparison_timeout_accepts_explicit_override(self) -> None:
+        with patch.object(
+            sys,
+            "argv",
+            ["pr_local.py", "--messages", "1000", "--parallel-grouped-timeout-seconds", "300"],
+        ):
+            args = parse_args()
+
+        self.assertEqual(args.parallel_grouped_timeout_seconds, 300.0)
+        self.assertEqual(args.parallel_grouped_timeout_source, "explicit override")
+
     def target(self) -> BenchmarkTarget:
         return BenchmarkTarget(
             name="pull-request",
@@ -47,6 +69,8 @@ class PrLocalTests(unittest.TestCase):
             concurrency=2,
             payload_sizes="100,1024",
             include_recovery=include_recovery,
+            parallel_grouped_timeout_seconds=250.0,
+            parallel_grouped_timeout_source="workload-aware default",
         )
 
     def test_command_is_a_three_node_comparison_workload(self) -> None:
@@ -63,6 +87,8 @@ class PrLocalTests(unittest.TestCase):
         self.assertIn("3", command)
         self.assertIn("--payload-sizes", command)
         self.assertIn("100,1024", command)
+        self.assertIn("--parallel-grouped-timeout-seconds", command)
+        self.assertIn("250.0", command)
         self.assertIn("--skip-recovery", command)
         self.assertNotIn("--include-recovery", command)
 
@@ -184,6 +210,61 @@ class PrLocalTests(unittest.TestCase):
             result = json.loads(path.read_text(encoding="utf-8"))
         self.assertEqual(result["resource_limits"]["cpu"], "2")
         self.assertEqual(result["resource_limits"]["memory"], "2G")
+
+    def test_timeout_adapts_only_legacy_baseline_grouped_deadline(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            benchmark_dir = root / "scripts" / "benchmarks"
+            benchmark_dir.mkdir(parents=True)
+            (benchmark_dir / "cluster.py").write_text("", encoding="utf-8")
+            (benchmark_dir / "cluster_cli.py").write_text(
+                "# legacy parser without grouped timeout option\n", encoding="utf-8"
+            )
+            scenario_path = benchmark_dir / "cluster_scenarios.py"
+            scenario_path.write_text(
+                "def run_parallel_grouped():\n"
+                "    deadline = time.monotonic() + DEFAULT_TIMEOUT_SECONDS\n"
+                "    return deadline\n\n"
+                "def next_scenario():\n"
+                "    return None\n",
+                encoding="utf-8",
+            )
+            target = BenchmarkTarget(
+                name="default-branch",
+                root=root,
+                target_dir=root / "target",
+                output_dir=root / "results",
+                log_dir=root / "logs",
+            )
+
+            self.assertFalse(supports_parallel_grouped_timeout(target))
+            apply_legacy_parallel_grouped_timeout(target, 250.0)
+
+            source = scenario_path.read_text(encoding="utf-8")
+        self.assertIn("deadline = time.monotonic() + 250.0", source)
+        self.assertIn("def next_scenario():", source)
+
+    def test_timeout_adaptation_rejects_unexpected_legacy_source(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            benchmark_dir = root / "scripts" / "benchmarks"
+            benchmark_dir.mkdir(parents=True)
+            (benchmark_dir / "cluster.py").write_text("", encoding="utf-8")
+            scenario_path = benchmark_dir / "cluster_scenarios.py"
+            scenario_path.write_text(
+                "def run_parallel_grouped():\n    return None\n",
+                encoding="utf-8",
+            )
+            target = BenchmarkTarget(
+                name="default-branch",
+                root=root,
+                target_dir=root / "target",
+                output_dir=root / "results",
+                log_dir=root / "logs",
+            )
+
+            with self.assertRaisesRegex(LocalBenchmarkError, "does not match"):
+                apply_legacy_parallel_grouped_timeout(target, 250.0)
 
 
 if __name__ == "__main__":

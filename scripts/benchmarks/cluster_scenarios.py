@@ -4,7 +4,6 @@
 from __future__ import annotations
 
 import argparse
-import base64
 import json
 import threading
 import time
@@ -16,7 +15,8 @@ from typing import TYPE_CHECKING, Any
 
 from common import (
     BenchmarkError,
-    LineClient,
+    BrokerResponseError,
+    ProtocolClient,
     acknowledge,
     consume_ack_messages,
     create_stream,
@@ -28,7 +28,6 @@ from common import (
     poll,
     publish,
     publish_messages,
-    publish_stream,
     request_ok,
     DEFAULT_TIMEOUT_SECONDS,
 )
@@ -38,6 +37,12 @@ if TYPE_CHECKING:
 
 
 DEFAULT_SLOW_CONSUMER_DELAY_MS = 10
+DEFAULT_PARALLEL_GROUPED_TIMEOUT_SECONDS = 30.0
+PARALLEL_GROUPED_TIMEOUT_MILLISECONDS_PER_MESSAGE = 250
+MAX_PARALLEL_GROUPED_TIMEOUT_SECONDS = 3_600.0
+DEFAULT_PRELOAD_READINESS_TIMEOUT_SECONDS = 10.0
+MAX_PRELOAD_READINESS_TIMEOUT_SECONDS = 300.0
+PRELOAD_READINESS_RETRY_INTERVAL_SECONDS = 0.025
 DEFAULT_SLOW_CONSUMER_BACKPRESSURE_TIMEOUT_SECONDS = 60.0
 DEFAULT_PUBLISH_BATCH_SIZE = 32
 MAX_PUBLISH_BATCH_SIZE = 1_024
@@ -67,6 +72,25 @@ MAX_SLOW_CONSUMER_BACKPRESSURE_TIMEOUT_SECONDS = 300.0
 PEER_FORWARDING_INGRESS_NODE_INDEX = 1
 DEFAULT_LEADER_FAILURE_TIMEOUT_SECONDS = 60.0
 MAX_LEADER_FAILURE_TIMEOUT_SECONDS = 300.0
+
+
+def default_parallel_grouped_timeout_seconds(messages: int) -> float:
+    """Scale the grouped-drain deadline with the requested message count."""
+    if messages <= 0:
+        raise ValueError("parallel grouped message count must be positive")
+    scaled_timeout = (
+        messages * PARALLEL_GROUPED_TIMEOUT_MILLISECONDS_PER_MESSAGE + 999
+    ) // 1_000
+    if scaled_timeout > MAX_PARALLEL_GROUPED_TIMEOUT_SECONDS:
+        raise ValueError(
+            "derived parallel grouped timeout exceeds the bounded maximum of "
+            f"{MAX_PARALLEL_GROUPED_TIMEOUT_SECONDS:g} seconds; set a smaller workload"
+        )
+    timeout_seconds = max(
+        DEFAULT_PARALLEL_GROUPED_TIMEOUT_SECONDS,
+        float(scaled_timeout),
+    )
+    return timeout_seconds
 DEFAULT_SCENARIOS = (
     "durable_publish",
     "consume_ack",
@@ -296,7 +320,7 @@ class HotOrderingObservation:
 
 
 def poll_until_redelivered(
-    client: LineClient, stream: str, consumer: str, expected_offset: int
+    client: ProtocolClient, stream: str, consumer: str, expected_offset: int
 ) -> tuple[dict[str, Any], int]:
     """Wait for an expired unacknowledged message without assuming a margin."""
     deadline = time.monotonic() + DEFAULT_TIMEOUT_SECONDS
@@ -327,7 +351,7 @@ def poll_until_redelivered(
 
 
 def poll_group(
-    client: LineClient, stream: str, consumer: str, member: str
+    client: ProtocolClient, stream: str, consumer: str, member: str
 ) -> tuple[dict[str, Any], int]:
     response, elapsed = request_ok(
         client,
@@ -338,7 +362,7 @@ def poll_group(
 
 
 def acknowledge_group(
-    client: LineClient,
+    client: ProtocolClient,
     stream: str,
     consumer: str,
     member: str,
@@ -363,11 +387,7 @@ def acknowledge_group(
 def run_durable_publish(
     cluster: Cluster, stream: str, payload: str, messages: int, warmup: int
 ) -> dict[str, Any]:
-    setup = cluster.client(0)
-    try:
-        publish_stream(setup, stream, payload, warmup)
-    finally:
-        setup.close()
+    preload(cluster, stream, payload, warmup)
     with cluster.connected_clients() as clients:
         return measure_message_batch(
             cluster.stats,
@@ -387,10 +407,146 @@ def run_durable_publish(
 
 def preload(cluster: Cluster, stream: str, payload: str, messages: int) -> None:
     client = cluster.client(0)
+    timeout_seconds = cluster.preload_readiness_timeout_seconds
+    readiness_started: float | None = None
+    deadline: float | None = None
+    readiness_wait_seconds = 0.0
+    first_outcome: dict[str, Any] | None = None
+    last_outcome: dict[str, Any] | None = None
+    first_readiness_error: dict[str, Any] | None = None
+    last_readiness_error: dict[str, Any] | None = None
+    retry_count = 0
     try:
-        publish_stream(client, stream, payload, messages)
+        create_stream(client, stream)
+        for expected_offset in range(messages):
+            while True:
+                try:
+                    offset, _ = publish(client, stream, payload)
+                except BrokerResponseError as error:
+                    outcome = {
+                        "type": "error",
+                        "code": error.code,
+                        "message": error.message,
+                    }
+                    if error.code == "stream_not_ready":
+                        outcome["outcome"] = "retryable"
+                        if first_readiness_error is None:
+                            first_readiness_error = outcome
+                        last_readiness_error = outcome
+                        now = time.monotonic()
+                        if readiness_started is None:
+                            readiness_started = now
+                            deadline = now + timeout_seconds
+                    if first_outcome is None:
+                        first_outcome = outcome
+                    last_outcome = outcome
+                    if error.code != "stream_not_ready":
+                        cluster.preload_readiness.append(
+                            _preload_readiness_report(
+                                stream,
+                                timeout_seconds,
+                                readiness_started,
+                                readiness_wait_seconds,
+                                retry_count,
+                                first_outcome,
+                                last_outcome,
+                                first_readiness_error,
+                                last_readiness_error,
+                                completed=False,
+                            )
+                        )
+                        raise
+                    assert deadline is not None
+                    remaining_seconds = deadline - now
+                    if remaining_seconds <= 0:
+                        report = _preload_readiness_report(
+                            stream,
+                            timeout_seconds,
+                            readiness_started,
+                            readiness_wait_seconds,
+                            retry_count,
+                            first_outcome,
+                            last_outcome,
+                            first_readiness_error,
+                            last_readiness_error,
+                            completed=False,
+                        )
+                        cluster.preload_readiness.append(report)
+                        raise BenchmarkError(
+                            "preload stream readiness timed out; "
+                            f"first outcome={first_outcome!r}; "
+                            f"last outcome={last_outcome!r}"
+                        ) from error
+                    retry_count += 1
+                    delay_seconds = min(
+                        PRELOAD_READINESS_RETRY_INTERVAL_SECONDS,
+                        remaining_seconds,
+                    )
+                    time.sleep(delay_seconds)
+                    readiness_wait_seconds += delay_seconds
+                    continue
+
+                outcome = {
+                    "type": "published",
+                    "outcome": "confirmed",
+                    "offset": offset,
+                }
+                if first_outcome is None:
+                    first_outcome = outcome
+                last_outcome = outcome
+                if offset != expected_offset:
+                    raise BenchmarkError(
+                        f"expected preload offset {expected_offset}, got {offset}"
+                    )
+                break
+
+        cluster.preload_readiness.append(
+            _preload_readiness_report(
+                stream,
+                timeout_seconds,
+                readiness_started,
+                readiness_wait_seconds,
+                retry_count,
+                first_outcome,
+                last_outcome,
+                first_readiness_error,
+                last_readiness_error,
+                completed=True,
+            )
+        )
     finally:
         client.close()
+
+
+def _preload_readiness_report(
+    stream: str,
+    timeout_seconds: float,
+    readiness_started: float | None,
+    readiness_wait_seconds: float,
+    retry_count: int,
+    first_outcome: dict[str, Any] | None,
+    last_outcome: dict[str, Any] | None,
+    first_readiness_error: dict[str, Any] | None,
+    last_readiness_error: dict[str, Any] | None,
+    *,
+    completed: bool,
+) -> dict[str, Any]:
+    return {
+        "stream": stream,
+        "completed": completed,
+        "timeout_seconds": timeout_seconds,
+        "readiness_elapsed_seconds": (
+            0.0
+            if readiness_started is None
+            else time.monotonic() - readiness_started
+        ),
+        "readiness_wait_seconds": readiness_wait_seconds,
+        "retry_count": retry_count,
+        "first_outcome": first_outcome,
+        "last_outcome": last_outcome,
+        "first_readiness_error": first_readiness_error,
+        "last_readiness_error": last_readiness_error,
+    }
 
 
 def run_consume_ack(
@@ -1611,20 +1767,19 @@ def run_raft_log_growth(
 
 
 def publish_batch_request(
-    client: LineClient,
+    client: ProtocolClient,
     stream: str,
     payload: str,
     batch_size: int,
     expected_offset: int,
 ) -> tuple[int, int]:
     """Publish one public batch and validate every per-record outcome."""
-    encoded_payload = base64.b64encode(payload.encode("utf-8")).decode("ascii")
     response, elapsed = client.request(
         {
             "op": "publish_batch",
             "stream": stream,
             "records": [
-                {"key": None, "payload_base64": encoded_payload}
+                {"key": None, "payload": payload}
                 for _ in range(batch_size)
             ],
         }
@@ -1687,11 +1842,7 @@ def run_publish_batch(
     batch_size: int,
 ) -> dict[str, Any]:
     """Measure clustered public publish_batch round trips and outcomes."""
-    setup = cluster.client(0)
-    try:
-        publish_stream(setup, stream, payload, warmup)
-    finally:
-        setup.close()
+    preload(cluster, stream, payload, warmup)
 
     with cluster.connected_clients() as clients:
         def operation() -> dict[str, Any]:
@@ -1951,13 +2102,18 @@ def run_grouped_consume_ack(
 
 
 def run_parallel_grouped(
-    cluster: Cluster, stream: str, payload: str, messages: int, concurrency: int
+    cluster: Cluster,
+    stream: str,
+    payload: str,
+    messages: int,
+    concurrency: int,
+    timeout_seconds: float,
 ) -> dict[str, Any]:
     preload(cluster, stream, payload, messages)
     lock = threading.Lock()
     latencies: list[int] = []
     processed = 0
-    deadline = time.monotonic() + DEFAULT_TIMEOUT_SECONDS
+    deadline = time.monotonic() + timeout_seconds
 
     def worker(worker_index: int) -> None:
         nonlocal processed
@@ -1969,7 +2125,10 @@ def run_parallel_grouped(
                     if processed >= messages:
                         return
                 if time.monotonic() >= deadline:
-                    raise BenchmarkError("parallel grouped benchmark did not drain its messages")
+                    raise BenchmarkError(
+                        "parallel grouped benchmark did not drain its messages "
+                        f"within {timeout_seconds:g}s"
+                    )
                 started = time.perf_counter_ns()
                 response, _ = client.request(
                     {
@@ -2048,7 +2207,7 @@ def hot_ordering_records(
 
 
 def publish_keyed(
-    client: LineClient,
+    client: ProtocolClient,
     stream: str,
     key: str,
     payload: str,
@@ -2484,12 +2643,8 @@ def run_peer_forwarding(
         stream if stream_count == 1 else f"{stream}-{stream_index + 1}"
         for stream_index in range(stream_count)
     ]
-    setup = cluster.client(0)
-    try:
-        for stream_name in stream_names:
-            publish_stream(setup, stream_name, payload, warmup)
-    finally:
-        setup.close()
+    for stream_name in stream_names:
+        preload(cluster, stream_name, payload, warmup)
 
     latencies: list[int] = []
     offsets_by_stream: list[list[int]] = [[] for _ in stream_names]
@@ -2702,7 +2857,7 @@ def request_until_response(
         if remaining <= 0:
             break
         attempts += 1
-        client: LineClient | None = None
+        client: ProtocolClient | None = None
         try:
             client = cluster.client(
                 node_index, timeout_seconds=min(DEFAULT_TIMEOUT_SECONDS, remaining)

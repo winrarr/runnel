@@ -1335,6 +1335,8 @@ mod tests {
                     stream: "events".to_owned(),
                     consumer: "workers".to_owned(),
                     member: "member-a".to_owned(),
+                    response_member: None,
+                    max_response_bytes: runnel_engine::MAX_CONSUME_BATCH_RESPONSE_BYTES,
                     now_ms: 100,
                     lease_deadline_ms: 100,
                     max_delivery_attempts: None,
@@ -1404,6 +1406,8 @@ mod tests {
                         stream: "events".to_owned(),
                         consumer: "workers".to_owned(),
                         member: format!("member-{index}"),
+                        response_member: None,
+                        max_response_bytes: runnel_engine::MAX_CONSUME_BATCH_RESPONSE_BYTES,
                         now_ms,
                         lease_deadline_ms: now_ms,
                         max_delivery_attempts: None,
@@ -1498,5 +1502,228 @@ mod tests {
             .expect("reopen must select the complete newer persisted snapshot");
         assert_eq!(recovered_snapshot.meta, second_meta);
         assert_eq!(recovered_snapshot.snapshot.into_inner(), second_data);
+    }
+    #[tokio::test]
+    async fn current_snapshot_preserves_lease_floor_and_applied_commands_advance_it() {
+        let directory = tempfile::tempdir().unwrap();
+        let state_directory = directory.path().join("state-machine");
+        let kind = GroupKind::Data {
+            stream: "events".to_owned(),
+            stream_id: "stream/events".to_owned(),
+            group_id: "group/events/data".to_owned(),
+        };
+        let store = Arc::new(StateMachineStore::open(&state_directory, kind.clone()).unwrap());
+        let snapshot_value = serde_json::json!({
+            "version": FORMAT_VERSION,
+            "streams": {
+                "events": {
+                    "stream_id": "stream/events",
+                    "group_id": "group/events/data",
+                    "lifecycle": "Active",
+                    "messages": [{
+                        "key": null,
+                        "payload": [108, 101, 103, 97, 99, 121],
+                        "published_at_ms": 1
+                    }]
+                }
+            },
+            "consumers": [],
+            "group_consumers": [],
+            "lease_clock_ms": 0,
+            "dedup": {},
+            "redeliveries": 0,
+            "dead_letters": 0
+        });
+        assert_eq!(snapshot_value["version"], FORMAT_VERSION);
+        assert_eq!(snapshot_value["lease_clock_ms"], 0);
+        let snapshot_data = serde_json::to_vec(&snapshot_value).unwrap();
+        let snapshot_meta = snapshot_meta(1, "current-lease-floor");
+
+        let mut state_machine = store.clone();
+        state_machine
+            .install_snapshot(&snapshot_meta, Box::new(Cursor::new(snapshot_data.clone())))
+            .await
+            .unwrap();
+
+        assert_eq!(store.state.read().await.state.lease_clock_ms, 0);
+
+        let poll_responses = state_machine
+            .apply(std::iter::once(Entry {
+                log_id: LogId {
+                    leader_id: openraft::CommittedLeaderId::new(1, 1),
+                    index: 2,
+                },
+                payload: EntryPayload::Normal(crate::Command::PollGroup {
+                    stream: "events".to_owned(),
+                    consumer: "workers".to_owned(),
+                    member: "member-a".to_owned(),
+                    response_member: Some("member-a".to_owned()),
+                    max_response_bytes: runnel_engine::MAX_CONSUME_BATCH_RESPONSE_BYTES,
+                    now_ms: 125,
+                    lease_deadline_ms: 250,
+                    max_delivery_attempts: None,
+                    legacy_ack_timeout_ms: None,
+                    policy_version: None,
+                }),
+            }))
+            .await
+            .unwrap();
+        let delivery_token = match &poll_responses[0] {
+            CommandResponse::GroupPoll {
+                result: PollResult::Message(message),
+            } => message
+                .delivery_token
+                .clone()
+                .expect("poll should create a lease"),
+            response => panic!("unexpected poll response: {response:?}"),
+        };
+        assert_eq!(store.state.read().await.state.lease_clock_ms, 125);
+
+        let stale_ack = state_machine
+            .apply(std::iter::once(Entry {
+                log_id: LogId {
+                    leader_id: openraft::CommittedLeaderId::new(1, 1),
+                    index: 3,
+                },
+                payload: EntryPayload::Normal(crate::Command::AckGroup {
+                    stream: "events".to_owned(),
+                    consumer: "workers".to_owned(),
+                    member: "member-b".to_owned(),
+                    offset: 0,
+                    delivery_token,
+                    now_ms: 175,
+                }),
+            }))
+            .await
+            .unwrap();
+        assert_eq!(
+            stale_ack,
+            vec![CommandResponse::GroupStaleDelivery {
+                consumer: "workers".to_owned(),
+                offset: 0,
+            }]
+        );
+        assert_eq!(store.state.read().await.state.lease_clock_ms, 175);
+
+        drop(state_machine);
+        drop(store);
+        let recovered = StateMachineStore::open(&state_directory, kind).unwrap();
+        let state = recovered.state.read().await;
+        assert_eq!(state.state.lease_clock_ms, 175);
+        let delivery = state.state.group_consumers[&("events".to_owned(), "workers".to_owned())]
+            .in_flight
+            .get(&0)
+            .expect("stale member acknowledgement must leave the live lease intact");
+        assert_eq!(delivery.member, "member-a");
+        assert_eq!(delivery.deadline_ms, 250);
+    }
+
+    #[tokio::test]
+    async fn current_checkpoint_preserves_lease_floor_and_group_poll_survives_replay() {
+        let directory = tempfile::tempdir().unwrap();
+        let state_directory = directory.path().join("state-machine");
+        fs::create_dir_all(&state_directory).unwrap();
+        let kind = GroupKind::Data {
+            stream: "events".to_owned(),
+            stream_id: "stream/events".to_owned(),
+            group_id: "group/events/data".to_owned(),
+        };
+        let checkpoint_log_id = LogId {
+            leader_id: openraft::CommittedLeaderId::new(1, 1),
+            index: 1,
+        };
+        let checkpoint = serde_json::json!({
+            "version": FORMAT_VERSION,
+            "last_applied_log": serde_json::to_value(checkpoint_log_id).unwrap(),
+            "last_membership": serde_json::to_value(
+                StoredMembership::<NodeId, BasicNode>::default()
+            )
+            .unwrap(),
+            "streams": {
+                "events": {
+                    "stream_id": "stream/events",
+                    "group_id": "group/events/data",
+                    "lifecycle": "Active",
+                    "messages": [{
+                        "key": null,
+                        "payload": [108, 101, 103, 97, 99, 121],
+                        "published_at_ms": 1
+                    }]
+                }
+            },
+            "consumers": [],
+            "group_consumers": [],
+            "lease_clock_ms": 0,
+            "dedup": {},
+            "redeliveries": 0,
+            "dead_letters": 0
+        });
+        assert_eq!(checkpoint["version"], FORMAT_VERSION);
+        assert_eq!(checkpoint["lease_clock_ms"], 0);
+        fs::write(
+            state_directory.join("state-machine.json"),
+            serde_json::to_vec(&checkpoint).unwrap(),
+        )
+        .unwrap();
+
+        let store = Arc::new(StateMachineStore::open(&state_directory, kind.clone()).unwrap());
+        {
+            let state = store.state.read().await;
+            assert_eq!(state.last_applied_log, Some(checkpoint_log_id));
+            assert_eq!(state.state.lease_clock_ms, 0);
+            assert_eq!(state.state.streams["events"].messages[0].payload, b"legacy");
+        }
+
+        let log_id = LogId {
+            leader_id: openraft::CommittedLeaderId::new(1, 1),
+            index: 2,
+        };
+        let mut state_machine = store.clone();
+        let responses = state_machine
+            .apply(std::iter::once(Entry {
+                log_id,
+                payload: EntryPayload::Normal(crate::Command::PollGroup {
+                    stream: "events".to_owned(),
+                    consumer: "workers".to_owned(),
+                    member: "member-a".to_owned(),
+                    response_member: Some("member-a".to_owned()),
+                    max_response_bytes: runnel_engine::MAX_CONSUME_BATCH_RESPONSE_BYTES,
+                    now_ms: 125,
+                    lease_deadline_ms: 250,
+                    max_delivery_attempts: None,
+                    legacy_ack_timeout_ms: None,
+                    policy_version: None,
+                }),
+            }))
+            .await
+            .unwrap();
+        let delivery_token = match &responses[0] {
+            CommandResponse::GroupPoll {
+                result: PollResult::Message(message),
+            } => message
+                .delivery_token
+                .clone()
+                .expect("poll should create a lease"),
+            response => panic!("unexpected poll response: {response:?}"),
+        };
+        {
+            let state = store.state.read().await;
+            assert_eq!(state.state.lease_clock_ms, 125);
+            assert_eq!(state.last_applied_log, Some(log_id));
+        }
+
+        drop(state_machine);
+        drop(store);
+        let recovered = StateMachineStore::open(&state_directory, kind).unwrap();
+        let state = recovered.state.read().await;
+        assert_eq!(state.state.lease_clock_ms, 125);
+        assert_eq!(state.last_applied_log, Some(log_id));
+        let delivery = state.state.group_consumers[&("events".to_owned(), "workers".to_owned())]
+            .in_flight
+            .get(&0)
+            .expect("journal replay must retain the grouped poll lease");
+        assert_eq!(delivery.member, "member-a");
+        assert_eq!(delivery.deadline_ms, 250);
+        assert_eq!(delivery.delivery_token, delivery_token);
     }
 }

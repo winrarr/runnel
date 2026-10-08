@@ -5,48 +5,59 @@ use std::time::Instant;
 use runnel_engine::Engine;
 #[cfg(feature = "instrumentation")]
 use runnel_engine::StageTimer;
-use runnel_protocol::{Request, Response};
-use tokio::io::BufReader;
+use runnel_protocol::Response;
+use runnel_protocol::v2::{
+    self as v2, ApplicationReply, ClientFrame, Outcome, RefusalCode, ServerFrame, Stage,
+};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, watch};
 use tokio::task::{JoinHandle, JoinSet};
 use tracing::warn;
+use zeroize::Zeroize;
 
-use crate::dispatch::handle_request;
+#[path = "app_security.rs"]
+pub(crate) mod app_security;
+
+use crate::dispatch::handle_request_with_metadata;
 use crate::observability::{ActiveConnection, ActiveRequest, RequestOperation, ServerMetrics};
 use crate::protocol::{
-    Frame, ProtocolAdmission, invalid_request_response, read_frame, reject_connection,
-    remaining_timeout, request_line, request_size_response, response_write_timeout,
-    saturated_response, send_response, timeout_response, wait_for_request_data,
+    ProtocolAdmission, remaining_timeout, saturated_response, timeout_response,
+    wait_for_request_data,
 };
 
-pub(crate) fn spawn(
+pub(crate) fn spawn_with_security(
     listener: TcpListener,
     engine: Arc<dyn Engine>,
     metrics: Arc<ServerMetrics>,
     protocol_admission: ProtocolAdmission,
+    security: app_security::ApplicationSecurity,
     shutdown: watch::Receiver<bool>,
 ) -> JoinHandle<Result<(), std::io::Error>> {
-    let connection_slots = Arc::new(Semaphore::new(protocol_admission.max_connections));
-    let request_slots = Arc::new(Semaphore::new(protocol_admission.max_in_flight_requests));
-    tokio::spawn(run_tcp(
-        listener,
+    let context = ConnectionContext {
         engine,
         metrics,
-        connection_slots,
-        request_slots,
+        connection_slots: Arc::new(Semaphore::new(protocol_admission.max_connections)),
+        request_slots: Arc::new(Semaphore::new(protocol_admission.max_in_flight_requests)),
         protocol_admission,
-        shutdown,
-    ))
+        security,
+    };
+    tokio::spawn(run_tcp(listener, context, shutdown))
 }
 
-async fn run_tcp(
-    listener: TcpListener,
+#[derive(Clone)]
+struct ConnectionContext {
     engine: Arc<dyn Engine>,
     metrics: Arc<ServerMetrics>,
     connection_slots: Arc<Semaphore>,
     request_slots: Arc<Semaphore>,
     protocol_admission: ProtocolAdmission,
+    security: app_security::ApplicationSecurity,
+}
+
+async fn run_tcp(
+    listener: TcpListener,
+    context: ConnectionContext,
     mut shutdown: watch::Receiver<bool>,
 ) -> Result<(), std::io::Error> {
     let mut connections = JoinSet::new();
@@ -72,40 +83,35 @@ async fn run_tcp(
                 if *shutdown.borrow() {
                     continue;
                 }
-                metrics
+                context.metrics
                     .connections_accepted
                     .fetch_add(1, Ordering::Relaxed);
-                let connection_permit = match Arc::clone(&connection_slots).try_acquire_owned() {
+                let connection_permit = match Arc::clone(&context.connection_slots).try_acquire_owned() {
                     Ok(permit) => permit,
                     Err(_) => {
-                        metrics
+                        context.metrics
                             .connections_rejected
                             .fetch_add(1, Ordering::Relaxed);
-                        metrics
+                        context.metrics
                             .connections_closed
                             .fetch_add(1, Ordering::Relaxed);
-                        reject_connection(stream).await;
+                        drop(stream);
                         warn!(%peer, "broker connection rejected at connection limit");
                         continue;
                     }
                 };
-                let engine = Arc::clone(&engine);
-                let connection_metrics = Arc::clone(&metrics);
-                let connection_request_slots = Arc::clone(&request_slots);
+                let connection_context = context.clone();
                 let connection_shutdown = shutdown.clone();
                 connections.spawn(async move {
                     if let Err(error) = handle_connection(
                         stream,
-                        engine,
-                        Arc::clone(&connection_metrics),
+                        connection_context.clone(),
                         connection_permit,
-                        connection_request_slots,
-                        protocol_admission,
                         connection_shutdown,
                     )
                     .await
                     {
-                        connection_metrics
+                        connection_context.metrics
                             .connection_errors
                             .fetch_add(1, Ordering::Relaxed);
                         warn!(%peer, %error, "connection closed with error");
@@ -118,23 +124,121 @@ async fn run_tcp(
 
 async fn handle_connection(
     stream: TcpStream,
-    engine: Arc<dyn Engine>,
-    metrics: Arc<ServerMetrics>,
+    context: ConnectionContext,
     _connection_permit: OwnedSemaphorePermit,
-    request_slots: Arc<Semaphore>,
-    protocol_admission: ProtocolAdmission,
     mut shutdown: watch::Receiver<bool>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let ConnectionContext {
+        engine,
+        metrics,
+        request_slots,
+        protocol_admission,
+        security,
+        ..
+    } = context;
     metrics.active_connections.fetch_add(1, Ordering::Relaxed);
     let _active_connection = ActiveConnection::new(Arc::clone(&metrics));
-    let (reader, mut writer) = stream.into_split();
-    let mut reader = BufReader::new(reader);
+
+    let stream: Box<dyn ApplicationIo> = if let Some(acceptor) = security.tls_acceptor.clone() {
+        match tokio::time::timeout(protocol_admission.request_timeout, acceptor.accept(stream))
+            .await
+        {
+            Ok(Ok(stream)) => Box::new(stream),
+            Ok(Err(_)) => return Err("TLS handshake failed".into()),
+            Err(_) => {
+                metrics.request_timeouts.fetch_add(1, Ordering::Relaxed);
+                return Err("TLS handshake timed out".into());
+            }
+        }
+    } else {
+        Box::new(stream)
+    };
+    let mut reader = BufReader::new(stream);
+
+    let negotiation = tokio::time::timeout(protocol_admission.request_timeout, async {
+        let mut preface = [0_u8; v2::PREFACE.len()];
+        reader.read_exact(&mut preface).await?;
+        if preface != v2::PREFACE {
+            return Err(ConnectionProtocolError::InvalidPreface);
+        }
+        let body = read_bounded_frame(&mut reader, v2::HELLO_MAX_BODY_BYTES).await?;
+        let hello = v2::decode_client_hello(&body)?;
+        let server_hello =
+            select_server_hello(&hello, protocol_admission, security.auth_required());
+        let accepted = match &server_hello {
+            v2::ServerHello::Accepted(accepted) => Some((
+                accepted.client_to_server_frame_bytes,
+                accepted.server_to_client_frame_bytes,
+                accepted.auth_required.unwrap_or(false),
+            )),
+            v2::ServerHello::Refused { .. } => None,
+        };
+        let encoded = v2::encode_server_hello(&server_hello)?;
+        write_encoded_frame(
+            reader.get_mut(),
+            &encoded,
+            protocol_admission.request_timeout,
+            &metrics,
+        )
+        .await?;
+        let Some((max_request_bytes, max_response_bytes, auth_required)) = accepted else {
+            return Ok::<_, ConnectionProtocolError>(None);
+        };
+        if auth_required {
+            let auth_max = v2::AUTH_MAX_BODY_BYTES.min(max_request_bytes);
+            let mut auth_body = read_bounded_frame(&mut reader, auth_max).await?;
+            let auth_frame = v2::decode_client_frame(&auth_body, auth_max);
+            auth_body.zeroize();
+            let auth_frame = match auth_frame {
+                Ok(frame) => frame,
+                Err(_) => return Ok(None),
+            };
+            let role = match auth_frame {
+                ClientFrame::BearerAuth(token) => security
+                    .credentials
+                    .as_ref()
+                    .and_then(|credentials| credentials.authenticate(&token)),
+                ClientFrame::Application(_) => None,
+            };
+            let Some(role) = role else {
+                let failed = v2::encode_server_frame(&ServerFrame::AuthenticationFailed)?;
+                write_encoded_frame(
+                    reader.get_mut(),
+                    &failed,
+                    protocol_admission.request_timeout,
+                    &metrics,
+                )
+                .await?;
+                return Ok(None);
+            };
+            let authenticated = v2::encode_server_frame(&ServerFrame::Authenticated)?;
+            write_encoded_frame(
+                reader.get_mut(),
+                &authenticated,
+                protocol_admission.request_timeout,
+                &metrics,
+            )
+            .await?;
+            Ok(Some((max_request_bytes, max_response_bytes, Some(role))))
+        } else {
+            Ok(Some((max_request_bytes, max_response_bytes, None)))
+        }
+    })
+    .await;
+    let (max_request_bytes, max_response_bytes, authenticated_role) = match negotiation {
+        Ok(Ok(Some(negotiated))) => negotiated,
+        Ok(Ok(None)) => return Ok(()),
+        Ok(Err(_)) => {
+            metrics.connection_errors.fetch_add(1, Ordering::Relaxed);
+            return Ok(());
+        }
+        Err(_) => {
+            metrics.request_timeouts.fetch_add(1, Ordering::Relaxed);
+            return Ok(());
+        }
+    };
+
     loop {
-        // Waiting for the first byte is intentionally not timed. An idle
-        // persistent connection is valid; once a request starts, its frame
-        // must complete within the request deadline. Both idle reads and
-        // partial frame reads observe shutdown so a persistent connection
-        // cannot extend the graceful-drain window.
         let has_data = match wait_for_request_data(&mut reader, &mut shutdown).await? {
             Some(has_data) => has_data,
             None => return Ok(()),
@@ -147,7 +251,7 @@ async fn handle_connection(
         let frame_result = tokio::select! {
             result = tokio::time::timeout(
                 protocol_admission.request_timeout,
-                read_frame(&mut reader, protocol_admission.max_request_bytes),
+                read_bounded_frame(&mut reader, max_request_bytes),
             ) => Some(result),
             changed = shutdown.changed() => {
                 if changed.is_err() || *shutdown.borrow() {
@@ -159,154 +263,304 @@ async fn handle_connection(
         let Some(frame_result) = frame_result else {
             continue;
         };
-        let frame = match frame_result {
-            Ok(result) => result?,
-            Err(_) => {
-                metrics.request_timeouts.fetch_add(1, Ordering::Relaxed);
-                metrics
-                    .record_rejected_request(RequestOperation::InvalidRequest, started.elapsed());
-                send_response(
-                    &mut writer,
-                    &timeout_response(),
-                    protocol_admission.request_timeout,
-                    &metrics,
-                )
-                .await?;
-                return Ok(());
-            }
-        };
-
-        match frame {
-            Frame::End => return Ok(()),
-            Frame::TooLarge { bytes } => {
-                metrics
-                    .request_bytes
-                    .fetch_add(bytes.len() as u64, Ordering::Relaxed);
+        let mut body = match frame_result {
+            Ok(Ok(body)) => body,
+            Ok(Err(ConnectionProtocolError::FrameTooLarge)) => {
                 metrics
                     .request_size_rejections
                     .fetch_add(1, Ordering::Relaxed);
                 metrics
                     .record_rejected_request(RequestOperation::InvalidRequest, started.elapsed());
-                let response = request_size_response(protocol_admission.max_request_bytes);
-                send_response(
-                    &mut writer,
-                    &response,
-                    response_write_timeout(started, protocol_admission.request_timeout, &response),
-                    &metrics,
-                )
-                .await?;
                 return Ok(());
             }
-            Frame::Unterminated { bytes } => {
-                metrics
-                    .request_bytes
-                    .fetch_add(bytes.len() as u64, Ordering::Relaxed);
+            Ok(Err(_)) => {
                 metrics
                     .record_rejected_request(RequestOperation::InvalidRequest, started.elapsed());
-                let response = invalid_request_response("request frame must end with a newline");
-                send_response(
-                    &mut writer,
-                    &response,
-                    response_write_timeout(started, protocol_admission.request_timeout, &response),
-                    &metrics,
-                )
-                .await?;
                 return Ok(());
             }
-            Frame::Complete { bytes } => {
+            Err(_) => {
+                metrics.request_timeouts.fetch_add(1, Ordering::Relaxed);
                 metrics
-                    .request_bytes
-                    .fetch_add(bytes.len() as u64, Ordering::Relaxed);
-                let line = request_line(&bytes);
-                match serde_json::from_slice::<Request>(line) {
-                    Ok(request) => {
-                        let operation = RequestOperation::from_request(&request);
-                        let request_permit = match Arc::clone(&request_slots).try_acquire_owned() {
-                            Ok(permit) => permit,
-                            Err(_) => {
-                                metrics
-                                    .request_saturation_rejections
-                                    .fetch_add(1, Ordering::Relaxed);
-                                let response = saturated_response();
-                                metrics.record_rejected_request(operation, started.elapsed());
-                                send_response(
-                                    &mut writer,
-                                    &response,
-                                    response_write_timeout(
-                                        started,
-                                        protocol_admission.request_timeout,
-                                        &response,
-                                    ),
-                                    &metrics,
-                                )
-                                .await?;
-                                continue;
-                            }
-                        };
-                        // Keep response serialization and socket writes inside the in-flight
-                        // bound so slow response writers cannot consume unbounded request work.
-                        let _request_permit = request_permit;
-                        metrics.active_requests.fetch_add(1, Ordering::Relaxed);
-                        let _active_request = ActiveRequest::new(Arc::clone(&metrics));
-                        #[cfg(feature = "instrumentation")]
-                        let _stage_timer = StageTimer::new("server.protocol_round_trip");
-                        let response = match tokio::time::timeout(
-                            remaining_timeout(started, protocol_admission.request_timeout),
-                            handle_request(engine.as_ref(), request, &metrics),
-                        )
-                        .await
-                        {
-                            Ok(response) => response,
-                            Err(_) => {
-                                metrics.request_timeouts.fetch_add(1, Ordering::Relaxed);
-                                timeout_response()
-                            }
-                        };
-                        let failed = matches!(&response, Response::Error { .. });
-                        metrics.record_request(operation, started.elapsed(), failed);
-                        send_response(
-                            &mut writer,
-                            &response,
-                            response_write_timeout(
-                                started,
-                                protocol_admission.request_timeout,
-                                &response,
-                            ),
-                            &metrics,
-                        )
-                        .await?;
-                    }
-                    Err(error) => {
-                        if std::str::from_utf8(line).is_err() {
-                            metrics.record_rejected_request(
-                                RequestOperation::InvalidRequest,
-                                started.elapsed(),
-                            );
-                            return Err(std::io::Error::new(
-                                std::io::ErrorKind::InvalidData,
-                                "request frame was not valid UTF-8",
-                            )
-                            .into());
-                        }
-                        let response = invalid_request_response(&error.to_string());
-                        metrics.record_rejected_request(
-                            RequestOperation::InvalidRequest,
-                            started.elapsed(),
-                        );
-                        send_response(
-                            &mut writer,
-                            &response,
-                            response_write_timeout(
-                                started,
-                                protocol_admission.request_timeout,
-                                &response,
-                            ),
-                            &metrics,
-                        )
-                        .await?;
-                    }
-                }
+                    .record_rejected_request(RequestOperation::InvalidRequest, started.elapsed());
+                return Ok(());
             }
+        };
+
+        metrics
+            .request_bytes
+            .fetch_add(body.len() as u64 + 4, Ordering::Relaxed);
+        let client_frame = match v2::decode_client_frame(&body, max_request_bytes) {
+            Ok(frame) => frame,
+            Err(_) => {
+                body.zeroize();
+                metrics
+                    .record_rejected_request(RequestOperation::InvalidRequest, started.elapsed());
+                return Ok(());
+            }
+        };
+        let request = match client_frame {
+            ClientFrame::BearerAuth(token) => {
+                drop(token);
+                body.zeroize();
+                return Ok(());
+            }
+            ClientFrame::Application(request) => request,
+        };
+        let operation = RequestOperation::from_request(&request);
+        let denied = security.credentials.as_ref().is_some_and(|_| {
+            !app_security::request_is_authorized(
+                authenticated_role.expect("secure connections authenticate before application"),
+                &request,
+            )
+        });
+        let (reply, request_permit, active_request) = if denied {
+            metrics.record_rejected_request(operation, started.elapsed());
+            (
+                ApplicationReply::failed(
+                    Response::Error {
+                        code: "authorization_denied".to_owned(),
+                        message: "operation is not permitted for this credential role".to_owned(),
+                    },
+                    Outcome::Rejected,
+                    Stage::Validated,
+                ),
+                None,
+                None,
+            )
+        } else {
+            let request_permit = match Arc::clone(&request_slots).try_acquire_owned() {
+                Ok(permit) => permit,
+                Err(_) => {
+                    metrics
+                        .request_saturation_rejections
+                        .fetch_add(1, Ordering::Relaxed);
+                    let reply = ApplicationReply::failed(
+                        saturated_response(),
+                        Outcome::Retryable,
+                        Stage::Received,
+                    );
+                    metrics.record_rejected_request(operation, started.elapsed());
+                    write_application_reply(
+                        reader.get_mut(),
+                        &reply,
+                        max_response_bytes,
+                        started,
+                        protocol_admission.request_timeout,
+                        &metrics,
+                    )
+                    .await?;
+                    continue;
+                }
+            };
+            metrics.active_requests.fetch_add(1, Ordering::Relaxed);
+            let active_request = ActiveRequest::new(Arc::clone(&metrics));
+            #[cfg(feature = "instrumentation")]
+            let _stage_timer = StageTimer::new("server.protocol_round_trip");
+            let reply = match tokio::time::timeout(
+                remaining_timeout(started, protocol_admission.request_timeout),
+                handle_request_with_metadata(
+                    engine.as_ref(),
+                    request,
+                    &metrics,
+                    max_response_bytes,
+                ),
+            )
+            .await
+            {
+                Ok(reply) => reply,
+                Err(_) => {
+                    metrics.request_timeouts.fetch_add(1, Ordering::Relaxed);
+                    ApplicationReply::failed(
+                        timeout_response(),
+                        Outcome::Unknown,
+                        Stage::ExecutionStarted,
+                    )
+                }
+            };
+            (reply, Some(request_permit), Some(active_request))
+        };
+        let failed = reply
+            .outcome
+            .is_some_and(|outcome| outcome != Outcome::Confirmed)
+            || matches!(&reply.response, Response::Error { .. });
+        metrics.record_request(operation, started.elapsed(), failed);
+        write_application_reply(
+            reader.get_mut(),
+            &reply,
+            max_response_bytes,
+            started,
+            protocol_admission.request_timeout,
+            &metrics,
+        )
+        .await?;
+        drop(active_request);
+        drop(request_permit);
+    }
+}
+
+trait ApplicationIo: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send {}
+impl<T> ApplicationIo for T where T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send {}
+
+#[derive(Debug)]
+enum ConnectionProtocolError {
+    Io,
+    Codec,
+    InvalidPreface,
+    InvalidNegotiation,
+    FrameTooLarge,
+}
+
+impl From<std::io::Error> for ConnectionProtocolError {
+    fn from(_: std::io::Error) -> Self {
+        Self::Io
+    }
+}
+
+impl From<v2::V2ProtocolError> for ConnectionProtocolError {
+    fn from(_: v2::V2ProtocolError) -> Self {
+        Self::Codec
+    }
+}
+
+async fn read_bounded_frame<R>(
+    reader: &mut R,
+    max_bytes: usize,
+) -> Result<Vec<u8>, ConnectionProtocolError>
+where
+    R: AsyncRead + Unpin,
+{
+    let mut length = [0_u8; 4];
+    reader.read_exact(&mut length).await?;
+    let body_len = u32::from_be_bytes(length) as usize;
+    if body_len == 0 {
+        return Err(ConnectionProtocolError::InvalidNegotiation);
+    }
+    if body_len > max_bytes {
+        return Err(ConnectionProtocolError::FrameTooLarge);
+    }
+    let mut body = vec![0; body_len];
+    reader.read_exact(&mut body).await?;
+    Ok(body)
+}
+
+fn select_server_hello(
+    client: &v2::ClientHello,
+    admission: ProtocolAdmission,
+    auth_required: bool,
+) -> v2::ServerHello {
+    let refusal = |code| v2::ServerHello::Refused {
+        code,
+        diagnostic: match code {
+            RefusalCode::InvalidHello => "Hello is invalid".to_owned(),
+            RefusalCode::UnsupportedVersion => "no supported protocol version".to_owned(),
+            RefusalCode::UnsupportedCapability => "required capability is unsupported".to_owned(),
+            RefusalCode::LimitTooSmall => "frame limit is below the minimum".to_owned(),
+            RefusalCode::LimitTooLarge => "frame limit exceeds the protocol maximum".to_owned(),
+        },
+    };
+    if let Err(code) = v2::validate_client_hello(client) {
+        return refusal(code);
+    }
+    if client.required_capabilities.iter().any(|_| true) {
+        return refusal(RefusalCode::UnsupportedCapability);
+    }
+    if !client.versions.iter().any(|range| {
+        range.major == v2::CURRENT_MAJOR
+            && (range.min_minor..=range.max_minor).contains(&v2::CURRENT_MINOR)
+    }) {
+        return refusal(RefusalCode::UnsupportedVersion);
+    }
+    if admission.max_request_bytes < v2::MIN_FRAME_BODY_BYTES {
+        return refusal(RefusalCode::LimitTooSmall);
+    }
+    if admission.max_request_bytes > v2::MAX_CLIENT_TO_SERVER_FRAME_BYTES {
+        return refusal(RefusalCode::LimitTooLarge);
+    }
+    if admission.max_response_bytes < v2::MIN_FRAME_BODY_BYTES {
+        return refusal(RefusalCode::LimitTooSmall);
+    }
+    if admission.max_response_bytes > v2::MAX_SERVER_TO_CLIENT_FRAME_BYTES {
+        return refusal(RefusalCode::LimitTooLarge);
+    }
+    let server_inbound = admission.max_request_bytes;
+    let server_outbound = admission.max_response_bytes;
+    v2::ServerHello::Accepted(v2::HelloAccepted {
+        major: v2::CURRENT_MAJOR,
+        minor: v2::CURRENT_MINOR,
+        capabilities: Vec::new(),
+        max_inbound_frame_bytes: server_inbound,
+        max_outbound_frame_bytes: server_outbound,
+        client_to_server_frame_bytes: client.max_outbound_frame_bytes.min(server_inbound),
+        server_to_client_frame_bytes: client.max_inbound_frame_bytes.min(server_outbound),
+        auth_required: Some(auth_required),
+    })
+}
+
+async fn write_encoded_frame<W>(
+    writer: &mut W,
+    frame: &v2::EncodedFrame,
+    timeout: std::time::Duration,
+    metrics: &ServerMetrics,
+) -> std::io::Result<()>
+where
+    W: AsyncWrite + Unpin,
+{
+    match tokio::time::timeout(timeout, writer.write_all(frame.as_bytes())).await {
+        Ok(result) => result?,
+        Err(_) => {
+            metrics
+                .response_write_timeouts
+                .fetch_add(1, Ordering::Relaxed);
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "protocol response write timed out",
+            ));
         }
     }
+    metrics
+        .response_bytes
+        .fetch_add(frame.len() as u64, Ordering::Relaxed);
+    Ok(())
+}
+
+async fn write_application_reply<W>(
+    writer: &mut W,
+    reply: &ApplicationReply,
+    max_response_bytes: usize,
+    started: Instant,
+    request_timeout: std::time::Duration,
+    metrics: &ServerMetrics,
+) -> std::io::Result<()>
+where
+    W: AsyncWrite + Unpin,
+{
+    let frame = v2::encode_server_frame(&ServerFrame::Application(reply.clone()))
+        .map_err(|_| std::io::Error::other("application response encoding failed"))?;
+    let body_bytes = frame.len().saturating_sub(4);
+    if body_bytes > max_response_bytes {
+        let too_large = ApplicationReply::failed(
+            Response::Error {
+                code: "response_too_large".to_owned(),
+                message: "response exceeds the negotiated maximum".to_owned(),
+            },
+            Outcome::Unknown,
+            Stage::ExecutionStarted,
+        );
+        let bounded = v2::encode_server_frame(&ServerFrame::Application(too_large))
+            .map_err(|_| std::io::Error::other("bounded error response encoding failed"))?;
+        return write_encoded_frame(
+            writer,
+            &bounded,
+            remaining_timeout(started, request_timeout),
+            metrics,
+        )
+        .await;
+    }
+    write_encoded_frame(
+        writer,
+        &frame,
+        remaining_timeout(started, request_timeout),
+        metrics,
+    )
+    .await
 }

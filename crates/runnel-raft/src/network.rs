@@ -57,6 +57,7 @@ pub(crate) enum ForwardedOperation {
     Publish {
         stream: String,
         key: Option<String>,
+        #[serde(with = "forwarded_payload")]
         payload: Vec<u8>,
         request_id: Option<String>,
         published_at_ms: u64,
@@ -64,6 +65,8 @@ pub(crate) enum ForwardedOperation {
     Poll {
         stream: String,
         consumer: String,
+        #[serde(default)]
+        max_response_bytes: Option<usize>,
     },
     Replay {
         stream: String,
@@ -90,6 +93,8 @@ pub(crate) enum ForwardedOperation {
         stream: String,
         consumer: String,
         member: String,
+        #[serde(default)]
+        max_response_bytes: Option<usize>,
     },
     PollGroupBatch {
         stream: String,
@@ -125,11 +130,11 @@ pub(crate) enum ForwardedOperation {
 pub(crate) enum ForwardedResponse {
     CreateStream(Result<bool, ForwardError>),
     Publish(Result<Offset, ForwardError>),
-    Poll(Result<PollResult, ForwardError>),
-    Replay(Result<ReplayMessage, ForwardError>),
+    Poll(Result<ForwardedPollResult, ForwardError>),
+    Replay(Result<ForwardedReplayMessage, ForwardError>),
     Ack(Result<AckResult, ForwardError>),
     ConsumerPolicy(Result<ConsumerPolicy, ForwardError>),
-    PollGroup(Result<PollResult, ForwardError>),
+    PollGroup(Result<ForwardedPollResult, ForwardError>),
     PollGroupBatch(Result<Vec<ForwardedBatchMessage>, ForwardError>),
     AckGroup(Result<AckResult, ForwardError>),
     AckGroupBatch(Result<AckBatchResult, ForwardError>),
@@ -138,14 +143,14 @@ pub(crate) enum ForwardedResponse {
 
 /// Compact message representation used only in Raft peer forwarding.
 ///
-/// `Message` derives JSON serialization for byte vectors as integer arrays,
-/// which can be several times larger than the public response. This shape
-/// preserves UTF-8 payloads as strings and encodes other bytes as base64 so a
-/// response admitted by the public batch byte bound remains forwardable.
+/// Payloads and keys use JSON strings only when they need no escaping;
+/// otherwise they use base64. This keeps peer-frame expansion bounded for
+/// every public batch admitted by the protobuf response limit.
 #[derive(Debug, Serialize, Deserialize)]
 pub(crate) struct ForwardedBatchMessage {
     stream: String,
     offset: Offset,
+    #[serde(with = "forwarded_key")]
     key: Option<String>,
     #[serde(with = "forwarded_payload")]
     payload: Vec<u8>,
@@ -156,10 +161,70 @@ pub(crate) struct ForwardedBatchMessage {
     delivery_attempt: Option<u32>,
 }
 
+#[derive(Debug, Serialize, Deserialize)]
+pub(crate) enum ForwardedPollResult {
+    Message(ForwardedBatchMessage),
+    Empty,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub(crate) struct ForwardedReplayMessage {
+    stream: String,
+    offset: Offset,
+    #[serde(with = "forwarded_key")]
+    key: Option<String>,
+    #[serde(with = "forwarded_payload")]
+    payload: Vec<u8>,
+    published_at_ms: u64,
+}
+
+impl From<PollResult> for ForwardedPollResult {
+    fn from(result: PollResult) -> Self {
+        match result {
+            PollResult::Message(message) => Self::Message(ForwardedBatchMessage::from(message)),
+            PollResult::Empty => Self::Empty,
+        }
+    }
+}
+
+impl From<ForwardedPollResult> for PollResult {
+    fn from(result: ForwardedPollResult) -> Self {
+        match result {
+            ForwardedPollResult::Message(message) => Self::Message(message.into()),
+            ForwardedPollResult::Empty => Self::Empty,
+        }
+    }
+}
+
+impl From<ReplayMessage> for ForwardedReplayMessage {
+    fn from(message: ReplayMessage) -> Self {
+        Self {
+            stream: message.stream,
+            offset: message.offset,
+            key: message.key,
+            payload: message.payload,
+            published_at_ms: message.published_at_ms,
+        }
+    }
+}
+
+impl From<ForwardedReplayMessage> for ReplayMessage {
+    fn from(message: ForwardedReplayMessage) -> Self {
+        Self {
+            stream: message.stream,
+            offset: message.offset,
+            key: message.key,
+            payload: message.payload,
+            published_at_ms: message.published_at_ms,
+        }
+    }
+}
+
 #[derive(Serialize)]
 struct ForwardedBatchMessageRef<'a> {
     stream: &'a str,
     offset: Offset,
+    #[serde(with = "forwarded_key")]
     key: Option<&'a str>,
     #[serde(with = "forwarded_payload")]
     payload: &'a [u8],
@@ -204,6 +269,13 @@ pub(crate) fn forwarded_batch_response_frame_len(
     let mut counter = CountingWriter::default();
     serde_json::to_writer(&mut counter, &response)?;
     Ok(counter.bytes_written)
+}
+
+fn compact_peer_text(bytes: &[u8]) -> Option<&str> {
+    let text = std::str::from_utf8(bytes).ok()?;
+    text.bytes()
+        .all(|byte| (b' '..=b'~').contains(&byte) && !matches!(byte, b'"' | b'\\'))
+        .then_some(text)
 }
 
 pub(crate) fn ensure_forwarded_batch_response_fits(
@@ -275,6 +347,8 @@ mod forwarded_payload {
     use serde::de::Error as _;
     use serde::{Deserialize, Serialize, Serializer};
 
+    use super::compact_peer_text;
+
     #[derive(Serialize)]
     #[serde(untagged)]
     enum PayloadRef<'a> {
@@ -284,18 +358,21 @@ mod forwarded_payload {
 
     #[derive(Deserialize)]
     #[serde(untagged)]
-    enum Payload {
+    enum Payload<'a> {
         Utf8(String),
-        Binary { base64: String },
+        Binary {
+            #[serde(borrow)]
+            base64: &'a str,
+        },
     }
 
     pub(super) fn serialize<S>(payload: &[u8], serializer: S) -> Result<S::Ok, S::Error>
     where
         S: Serializer,
     {
-        let encoded = match std::str::from_utf8(payload) {
-            Ok(text) => PayloadRef::Utf8(text),
-            Err(_) => PayloadRef::Binary {
+        let encoded = match compact_peer_text(payload) {
+            Some(text) => PayloadRef::Utf8(text),
+            None => PayloadRef::Binary {
                 base64: STANDARD.encode(payload),
             },
         };
@@ -309,6 +386,64 @@ mod forwarded_payload {
         match Payload::deserialize(deserializer)? {
             Payload::Utf8(text) => Ok(text.into_bytes()),
             Payload::Binary { base64 } => STANDARD.decode(base64).map_err(D::Error::custom),
+        }
+    }
+}
+
+mod forwarded_key {
+    use base64::{Engine as _, engine::general_purpose::STANDARD};
+    use serde::de::Error as _;
+    use serde::{Deserialize, Serialize, Serializer};
+
+    use super::compact_peer_text;
+
+    #[derive(Serialize)]
+    #[serde(untagged)]
+    enum KeyRef<'a> {
+        Text(&'a str),
+        Binary { base64: String },
+    }
+
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum Key<'a> {
+        Text(String),
+        Binary {
+            #[serde(borrow)]
+            base64: &'a str,
+        },
+    }
+
+    pub(super) fn serialize<S, T>(key: &Option<T>, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+        T: AsRef<str>,
+    {
+        let encoded = key.as_ref().map(|key| {
+            let text = key.as_ref();
+            match compact_peer_text(text.as_bytes()) {
+                Some(text) => KeyRef::Text(text),
+                None => KeyRef::Binary {
+                    base64: STANDARD.encode(text.as_bytes()),
+                },
+            }
+        });
+        encoded.serialize(serializer)
+    }
+
+    pub(super) fn deserialize<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let Some(key) = Option::<Key>::deserialize(deserializer)? else {
+            return Ok(None);
+        };
+        match key {
+            Key::Text(text) => Ok(Some(text)),
+            Key::Binary { base64 } => {
+                let bytes = STANDARD.decode(base64).map_err(D::Error::custom)?;
+                String::from_utf8(bytes).map(Some).map_err(D::Error::custom)
+            }
         }
     }
 }
@@ -333,7 +468,7 @@ mod forwarded_batch_tests {
             Message {
                 stream: "events".to_owned(),
                 offset: 9,
-                key: None,
+                key: Some("control\0key".to_owned()),
                 payload: vec![0, 0xff, b'\n'],
                 published_at_ms: 124,
                 delivery_token: Some("receipt-b".to_owned()),
@@ -371,6 +506,64 @@ mod forwarded_batch_tests {
     }
 
     #[test]
+    fn compact_forwarded_scalar_poll_replay_and_publish_preserve_arbitrary_bytes() {
+        let message = Message {
+            stream: "events".to_owned(),
+            offset: 9,
+            key: Some("control\0key".to_owned()),
+            payload: vec![0, 0xff, b'\n'],
+            published_at_ms: 124,
+            delivery_token: Some("receipt-b".to_owned()),
+            delivery_attempt: Some(5),
+        };
+        let poll = PeerResponse::Forward(ForwardedResponse::Poll(Ok(ForwardedPollResult::from(
+            PollResult::Message(message.clone()),
+        ))));
+        let decoded =
+            serde_json::from_slice::<PeerResponse>(&serde_json::to_vec(&poll).unwrap()).unwrap();
+        let PeerResponse::Forward(ForwardedResponse::Poll(Ok(decoded))) = decoded else {
+            panic!("expected compact scalar poll response");
+        };
+        assert_eq!(
+            PollResult::from(decoded),
+            PollResult::Message(message.clone())
+        );
+
+        let replay = ReplayMessage {
+            stream: message.stream.clone(),
+            offset: message.offset,
+            key: message.key.clone(),
+            payload: message.payload.clone(),
+            published_at_ms: message.published_at_ms,
+        };
+        let response = PeerResponse::Forward(ForwardedResponse::Replay(Ok(
+            ForwardedReplayMessage::from(replay.clone()),
+        )));
+        let decoded =
+            serde_json::from_slice::<PeerResponse>(&serde_json::to_vec(&response).unwrap())
+                .unwrap();
+        let PeerResponse::Forward(ForwardedResponse::Replay(Ok(decoded))) = decoded else {
+            panic!("expected compact replay response");
+        };
+        assert_eq!(ReplayMessage::from(decoded), replay);
+
+        let request = PeerRequest::Forward(ForwardedOperation::Publish {
+            stream: message.stream,
+            key: message.key,
+            payload: vec![0xff; 1024],
+            request_id: None,
+            published_at_ms: message.published_at_ms,
+        });
+        let encoded = serde_json::to_vec(&request).unwrap();
+        assert!(encoded.len() < 2 * 1024);
+        let decoded = serde_json::from_slice::<PeerRequest>(&encoded).unwrap();
+        let PeerRequest::Forward(ForwardedOperation::Publish { payload, .. }) = decoded else {
+            panic!("expected compact forwarded publish request");
+        };
+        assert_eq!(payload, vec![0xff; 1024]);
+    }
+
+    #[test]
     fn largest_public_batch_shape_fits_the_bounded_peer_frame() {
         let stream = "s".repeat(128);
         let consumer = "c".repeat(128);
@@ -379,12 +572,8 @@ mod forwarded_batch_tests {
             .map(|index| Message {
                 stream: stream.clone(),
                 offset: u64::MAX - index,
-                key: Some("k".repeat(128)),
-                payload: if index % 2 == 0 {
-                    vec![b'x'; 32 * 1024]
-                } else {
-                    vec![0xff; 32 * 1024]
-                },
+                key: Some("\0".repeat(128)),
+                payload: vec![0xff; 32 * 1024],
                 published_at_ms: u64::MAX,
                 delivery_token: Some("f".repeat(64)),
                 delivery_attempt: Some(u32::MAX),
@@ -394,24 +583,23 @@ mod forwarded_batch_tests {
         let current_public_len =
             poll_batch_response_len(&stream, &consumer, Some(&member), &messages);
         assert!(current_public_len < MAX_CONSUME_BATCH_RESPONSE_BYTES);
-        let extra_text_bytes = MAX_CONSUME_BATCH_RESPONSE_BYTES - current_public_len;
-        let text_message_count = messages.len() / 2;
-        let bytes_per_message = extra_text_bytes / text_message_count;
-        let remainder = extra_text_bytes % text_message_count;
-        for message in messages.iter_mut().step_by(2) {
+        let extra_bytes = MAX_CONSUME_BATCH_RESPONSE_BYTES - current_public_len;
+        let bytes_per_message = extra_bytes / messages.len();
+        let remainder = extra_bytes % messages.len();
+        for message in &mut messages {
             message
                 .payload
-                .resize(message.payload.len() + bytes_per_message, b'x');
+                .resize(message.payload.len() + bytes_per_message, 0xff);
         }
-        let first_text_payload_len = messages[0].payload.len();
+        let first_payload_len = messages[0].payload.len();
         messages[0]
             .payload
-            .resize(first_text_payload_len + remainder, b'x');
+            .resize(first_payload_len + remainder, 0xff);
 
         let public_len = poll_batch_response_len(&stream, &consumer, Some(&member), &messages);
         let peer_len = forwarded_batch_response_frame_len(&messages).unwrap();
         assert_eq!(public_len, MAX_CONSUME_BATCH_RESPONSE_BYTES);
-        assert!(peer_len <= public_len + 1024 * 1024);
+        assert!(peer_len <= public_len + public_len / 3 + 1024 * 1024);
         assert!(peer_len <= framing::MAX_FRAME_SIZE as usize);
         ensure_forwarded_batch_response_fits(&messages).unwrap();
     }
@@ -432,6 +620,9 @@ pub(crate) enum ForwardError {
     },
     InvalidBatchRequest(String),
     ConsumeBatchRecordTooLarge {
+        max_bytes: usize,
+    },
+    ResponseTooLarge {
         max_bytes: usize,
     },
     RequestIdContentConflict,

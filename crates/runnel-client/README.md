@@ -1,7 +1,7 @@
 # Runnel Rust client
 
-`runnel-client` is the supported async Rust client for the current provisional
-JSON-lines protocol. It keeps one TCP connection open and sends sequential
+`runnel-client` is the supported async Rust client for negotiated v2 Protobuf.
+It keeps one TCP connection open and sends sequential
 requests over it. Use the typed methods for streams, binary-safe publishing,
 polling, and acknowledgements; they expose outcome classifications instead of
 retrying operations silently.
@@ -45,7 +45,7 @@ equivalent key and payload returns the original offset; different representable
 key or payload bytes are rejected without appending a record. For ID comparison,
 an absent key and an empty key compare alike because the current local durable
 format stores both as zero key bytes; this does not make their ordering intent
-equivalent. The provisional server response uses `request_id_content_conflict`
+equivalent. The server response uses `request_id_content_conflict`
 for this rejection. A new identity can create a duplicate if an earlier
 publish was accepted but its response was lost. The client does not retry
 automatically. For requests that time out or are cancelled after they may have
@@ -53,10 +53,14 @@ started writing, treat the outcome as unknown, replace the connection, and
 decide explicitly whether to retry. Keep retries bounded and apply application
 backoff where a response classifies an operation as retryable.
 
-The crate and broker currently declare `runnel-json-lines` protocol version 1,
-including UTF-8 text and base64-encoded opaque bytes. This declaration is
-checked in the source; the listener does not negotiate a version at runtime, so
-it is not a cross-version compatibility guarantee.
+The crate and broker declare `runnel-protobuf` protocol version 2. Connections
+negotiate the exact v2 contract after the `RNLN` preface, and message payloads
+are opaque bytes on the wire. The client supports TLS 1.3 and bearer
+credentials when configured; no prior protocol version is supported.
+
+For TLS, configure the DNS name present in the broker certificate. A supplied
+CA bundle is exclusive: the client trusts only those roots. When no CA bundle
+is supplied, it uses platform trust roots.
 
 ## End-to-end coverage
 

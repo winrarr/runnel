@@ -6,7 +6,7 @@ mod observability;
 mod protocol;
 
 #[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
+async fn main() {
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
@@ -14,5 +14,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         )
         .init();
 
-    bootstrap::run().await
+    if let Err(error) = bootstrap::run().await {
+        eprintln!("Error: {error}");
+        std::process::exit(1);
+    }
 }

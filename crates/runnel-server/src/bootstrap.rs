@@ -11,12 +11,14 @@ use runnel_raft::{NodeId, PeerTlsConfig, PersistentEngine};
 use tokio::net::TcpListener;
 use tracing::info;
 
+use crate::connection::app_security::{self, ApplicationSecurity};
 use crate::lifecycle;
 use crate::observability::ServerMetrics;
 use crate::protocol::{self, ProtocolAdmission};
 
 const DEFAULT_MAX_CONNECTIONS: usize = 1_024;
 const DEFAULT_MAX_REQUEST_BYTES: usize = 1_048_576;
+const DEFAULT_MAX_RESPONSE_BYTES: usize = runnel_protocol::v2::DEFAULT_SERVER_TO_CLIENT_FRAME_BYTES;
 const DEFAULT_MAX_IN_FLIGHT_REQUESTS: usize = 256;
 const DEFAULT_REQUEST_TIMEOUT_MS: u64 = 30_000;
 
@@ -31,6 +33,20 @@ struct Args {
     listen: SocketAddr,
     #[arg(long, default_value = "127.0.0.1:8080")]
     http_listen: SocketAddr,
+    #[arg(long, help = "PEM certificate chain for the application TLS listener")]
+    app_tls_cert: Option<PathBuf>,
+    #[arg(long, help = "PEM private key for the application TLS listener")]
+    app_tls_key: Option<PathBuf>,
+    #[arg(
+        long,
+        help = "Protected runtime JSON credential policy for the application listener"
+    )]
+    credential_policy: Option<PathBuf>,
+    #[arg(
+        long,
+        help = "Allow an unauthenticated non-loopback application listener for isolated development only"
+    )]
+    insecure_development_listen: bool,
     #[arg(long, default_value_t = 30_000)]
     ack_timeout_ms: u64,
     #[arg(
@@ -45,6 +61,8 @@ struct Args {
         default_value_t = DEFAULT_MAX_REQUEST_BYTES
     )]
     max_request_bytes: usize,
+    #[arg(long, default_value_t = DEFAULT_MAX_RESPONSE_BYTES)]
+    max_response_bytes: usize,
     #[arg(
         long,
         default_value_t = DEFAULT_MAX_IN_FLIGHT_REQUESTS
@@ -87,9 +105,12 @@ pub(crate) async fn run() -> Result<(), Box<dyn std::error::Error>> {
     protocol::validate_admission_config(
         args.max_connections,
         args.max_request_bytes,
+        args.max_response_bytes,
         args.max_in_flight_requests,
         args.request_timeout_ms,
     )?;
+    validate_application_security_options(&args)?;
+    let application_security = load_application_security(&args)?;
     let tcp_listener = TcpListener::bind(args.listen).await?;
     let http_listener = TcpListener::bind(args.http_listen).await?;
 
@@ -164,6 +185,7 @@ pub(crate) async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let protocol_admission = ProtocolAdmission {
         max_connections: args.max_connections,
         max_request_bytes: args.max_request_bytes,
+        max_response_bytes: args.max_response_bytes,
         max_in_flight_requests: args.max_in_flight_requests,
         request_timeout: Duration::from_millis(args.request_timeout_ms),
     };
@@ -171,12 +193,69 @@ pub(crate) async fn run() -> Result<(), Box<dyn std::error::Error>> {
         tcp_listener,
         http_listener,
         engine,
-        peer,
-        cluster,
-        server_metrics,
-        protocol_admission,
+        lifecycle::RuntimeServices {
+            peer,
+            cluster,
+            server_metrics,
+            protocol_admission,
+            application_security,
+        },
     )
     .await
+}
+
+fn validate_application_security_options(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
+    if args.app_tls_cert.is_some() != args.app_tls_key.is_some() {
+        return Err("--app-tls-cert and --app-tls-key must be configured together".into());
+    }
+    let tls_configured = args.app_tls_cert.is_some();
+    if tls_configured != args.credential_policy.is_some() {
+        return Err(
+            "application TLS certificate/key and --credential-policy must be configured together"
+                .into(),
+        );
+    }
+
+    let any_security_configured = tls_configured || args.credential_policy.is_some();
+    if matches!(args.engine, EngineKind::Raft) && any_security_configured {
+        return Err(
+            "application TLS and credential policy are unsupported with --engine raft until replica policy consistency is implemented"
+                .into(),
+        );
+    }
+
+    if !args.listen.ip().is_loopback()
+        && !any_security_configured
+        && !args.insecure_development_listen
+    {
+        return Err(
+            "a non-loopback application listener requires TLS and authentication; use --insecure-development-listen only for isolated development"
+                .into(),
+        );
+    }
+    Ok(())
+}
+
+fn load_application_security(
+    args: &Args,
+) -> Result<ApplicationSecurity, Box<dyn std::error::Error>> {
+    let Some(certificate_path) = args.app_tls_cert.as_deref() else {
+        return Ok(ApplicationSecurity::development());
+    };
+    let key_path = args
+        .app_tls_key
+        .as_deref()
+        .ok_or("--app-tls-key must be configured with --app-tls-cert")?;
+    let policy_path = args
+        .credential_policy
+        .as_deref()
+        .ok_or("--credential-policy must be configured with application TLS")?;
+    let tls_acceptor = app_security::load_tls_acceptor(certificate_path, key_path)?;
+    let credentials = app_security::CredentialPolicy::load(policy_path)?;
+    Ok(ApplicationSecurity::new(
+        Some(tls_acceptor),
+        Some(credentials),
+    )?)
 }
 
 fn has_peer_tls_paths(args: &Args) -> bool {

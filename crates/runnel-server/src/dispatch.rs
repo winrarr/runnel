@@ -2,8 +2,9 @@ use std::sync::atomic::Ordering;
 
 use runnel_engine::{
     AckBatchOutcome, AckBatchRejection, AckResult, BrokerError, ConsumeBatchLimits, ConsumerPolicy,
-    Engine, PollResult, PublishRecord, ReplayMessage,
+    Engine, MAX_CONSUME_BATCH_RECORDS, PollResult, PublishRecord, ReplayMessage,
 };
+use runnel_protocol::v2::{ApplicationReply, ItemMetadata, Outcome, ServerFrame, Stage};
 use runnel_protocol::{
     AckBatchItemOutcome, AckBatchItemResponse, BatchMessageResponse, BinaryPayload,
     MAX_PUBLISH_BATCH_RECORDS, PublishBatchRecordResponse, Request, Response,
@@ -15,22 +16,69 @@ use runnel_engine::StageTimer;
 use crate::observability::{ServerMetrics, record_batch_delivery, record_delivery};
 use crate::protocol::invalid_request_response;
 
-pub(crate) async fn handle_request(
+const MAX_BATCH_DIAGNOSTIC_BYTES: usize = 256;
+
+pub(crate) async fn handle_request_with_metadata(
     engine: &dyn Engine,
     request: Request,
     metrics: &ServerMetrics,
-) -> Response {
+    max_response_bytes: usize,
+) -> ApplicationReply {
     #[cfg(feature = "instrumentation")]
     let _stage_timer = StageTimer::new("server.engine_request");
+    let batch_request = matches!(
+        &request,
+        Request::PublishBatch { .. }
+            | Request::PollBatch { .. }
+            | Request::PollGroupBatch { .. }
+            | Request::AckBatch { .. }
+            | Request::AckGroupBatch { .. }
+    );
+    let state_changing = matches!(
+        &request,
+        Request::CreateStream { .. }
+            | Request::Publish { .. }
+            | Request::PublishBytes { .. }
+            | Request::PublishBatch { .. }
+            | Request::PollGroup { .. }
+            | Request::PollGroupBatch { .. }
+            | Request::ConfigureConsumer { .. }
+            | Request::Ack { .. }
+            | Request::AckBatch { .. }
+            | Request::AckGroup { .. }
+            | Request::AckGroupBatch { .. }
+    );
+    let grouped_poll = matches!(&request, Request::PollGroup { .. });
+    let mut item_metadata = Vec::new();
     if let Request::PublishBatch { records, .. } = &request {
         if records.is_empty() {
-            return invalid_request_response("publish batch must contain at least one record");
+            return ApplicationReply::failed(
+                invalid_request_response("publish batch must contain at least one record"),
+                Outcome::Rejected,
+                Stage::Validated,
+            );
         }
         if records.len() > MAX_PUBLISH_BATCH_RECORDS {
-            return invalid_request_response(&format!(
-                "publish batch contains more than {MAX_PUBLISH_BATCH_RECORDS} records"
-            ));
+            return ApplicationReply::failed(
+                invalid_request_response(&format!(
+                    "publish batch contains more than {MAX_PUBLISH_BATCH_RECORDS} records"
+                )),
+                Outcome::Rejected,
+                Stage::Validated,
+            );
         }
+    }
+    if let Some(response_bound) = batch_response_upper_bound(&request)
+        && response_bound > max_response_bytes
+    {
+        return ApplicationReply::failed(
+            Response::Error {
+                code: "response_too_large".to_owned(),
+                message: "request result could exceed the negotiated response bound".to_owned(),
+            },
+            Outcome::Rejected,
+            Stage::Validated,
+        );
     }
     let result = match request {
         Request::CreateStream { stream } => engine.create_stream(&stream).await.map(|created| {
@@ -60,12 +108,12 @@ pub(crate) async fn handle_request(
         Request::PublishBytes {
             stream,
             key,
-            payload_base64,
+            payload,
             request_id,
         } => {
-            let payload_bytes = payload_base64.as_bytes().len() as u64;
+            let payload_bytes = payload.as_bytes().len() as u64;
             engine
-                .publish(&stream, key, payload_base64.into_bytes(), request_id)
+                .publish(&stream, key, payload.into_bytes(), request_id)
                 .await
                 .map(|offset| {
                     metrics.publishes.fetch_add(1, Ordering::Relaxed);
@@ -78,13 +126,13 @@ pub(crate) async fn handle_request(
         Request::PublishBatch { stream, records } => {
             let payload_sizes = records
                 .iter()
-                .map(|record| record.payload_base64.as_bytes().len() as u64)
+                .map(|record| record.payload.as_bytes().len() as u64)
                 .collect::<Vec<_>>();
             let records = records
                 .into_iter()
                 .map(|record| PublishRecord {
                     key: record.key,
-                    payload: record.payload_base64.into_bytes(),
+                    payload: record.payload.into_bytes(),
                     request_id: record.request_id,
                 })
                 .collect();
@@ -102,6 +150,10 @@ pub(crate) async fn handle_request(
                         .zip(payload_sizes)
                         .map(|(outcome, payload_bytes)| match outcome {
                             Ok(offset) => {
+                                item_metadata.push(ItemMetadata {
+                                    outcome: Outcome::Confirmed,
+                                    stage: Stage::Durable,
+                                });
                                 metrics.publishes.fetch_add(1, Ordering::Relaxed);
                                 metrics
                                     .published_bytes
@@ -109,6 +161,10 @@ pub(crate) async fn handle_request(
                                 PublishBatchRecordResponse::Published { offset }
                             }
                             Err(error) => {
+                                item_metadata.push(ItemMetadata {
+                                    outcome: broker_outcome(error.outcome()),
+                                    stage: Stage::ExecutionStarted,
+                                });
                                 let Response::Error { code, message } =
                                     publish_batch_error_response(&error)
                                 else {
@@ -122,7 +178,9 @@ pub(crate) async fn handle_request(
                 })
         }
         Request::Poll { stream, consumer } => {
-            let result = engine.poll(&stream, &consumer).await;
+            let result = engine
+                .poll_with_response_limit(&stream, &consumer, max_response_bytes)
+                .await;
             record_delivery(metrics, &result);
             result.map(|result| match result {
                 PollResult::Message(message) => message_response(MessageResponse {
@@ -152,13 +210,24 @@ pub(crate) async fn handle_request(
                     &consumer,
                     ConsumeBatchLimits {
                         max_records,
-                        max_bytes,
+                        max_bytes: max_bytes.min(max_response_bytes),
                         max_wait_ms,
                     },
                 )
                 .await;
             match result {
                 Ok(messages) => {
+                    item_metadata = messages
+                        .iter()
+                        .map(|message| ItemMetadata {
+                            outcome: Outcome::Confirmed,
+                            stage: if message.delivery_token.is_some() {
+                                Stage::Durable
+                            } else {
+                                Stage::Completed
+                            },
+                        })
+                        .collect();
                     record_batch_delivery(metrics, &messages);
                     Ok(Response::PollBatch {
                         stream,
@@ -185,7 +254,9 @@ pub(crate) async fn handle_request(
             consumer,
             member,
         } => {
-            let result = engine.poll_group(&stream, &consumer, &member).await;
+            let result = engine
+                .poll_group_with_response_limit(&stream, &consumer, &member, max_response_bytes)
+                .await;
             record_delivery(metrics, &result);
             result.map(|result| match result {
                 PollResult::Message(message) => message_response(MessageResponse {
@@ -217,13 +288,20 @@ pub(crate) async fn handle_request(
                     &member,
                     ConsumeBatchLimits {
                         max_records,
-                        max_bytes,
+                        max_bytes: max_bytes.min(max_response_bytes),
                         max_wait_ms,
                     },
                 )
                 .await;
             match result {
                 Ok(messages) => {
+                    item_metadata = messages
+                        .iter()
+                        .map(|_| ItemMetadata {
+                            outcome: Outcome::Confirmed,
+                            stage: Stage::Durable,
+                        })
+                        .collect();
                     record_batch_delivery(metrics, &messages);
                     Ok(Response::PollBatch {
                         stream,
@@ -290,6 +368,22 @@ pub(crate) async fn handle_request(
             )
             .await
             .map(|result| {
+                item_metadata = result
+                    .outcomes
+                    .iter()
+                    .map(|item| match item.outcome {
+                        AckBatchOutcome::Confirmed | AckBatchOutcome::AlreadyConfirmed => {
+                            ItemMetadata {
+                                outcome: Outcome::Confirmed,
+                                stage: Stage::Durable,
+                            }
+                        }
+                        AckBatchOutcome::Rejected { .. } => ItemMetadata {
+                            outcome: Outcome::Rejected,
+                            stage: Stage::ExecutionStarted,
+                        },
+                    })
+                    .collect();
                 metrics.acknowledgements.fetch_add(
                     result
                         .outcomes
@@ -346,6 +440,22 @@ pub(crate) async fn handle_request(
             )
             .await
             .map(|result| {
+                item_metadata = result
+                    .outcomes
+                    .iter()
+                    .map(|item| match item.outcome {
+                        AckBatchOutcome::Confirmed | AckBatchOutcome::AlreadyConfirmed => {
+                            ItemMetadata {
+                                outcome: Outcome::Confirmed,
+                                stage: Stage::Durable,
+                            }
+                        }
+                        AckBatchOutcome::Rejected { .. } => ItemMetadata {
+                            outcome: Outcome::Rejected,
+                            stage: Stage::ExecutionStarted,
+                        },
+                    })
+                    .collect();
                 metrics.acknowledgements.fetch_add(
                     result
                         .outcomes
@@ -371,7 +481,36 @@ pub(crate) async fn handle_request(
         }),
     };
 
-    result.unwrap_or_else(|error| error_response(&error))
+    match result {
+        Ok(response) if batch_request => ApplicationReply::batch(response, item_metadata),
+        Ok(response) => {
+            let stage = match (&response, grouped_poll) {
+                (Response::Message { .. } | Response::MessageBytes { .. }, true) => Stage::Durable,
+                (Response::Empty { .. }, true) => Stage::Completed,
+                _ if state_changing => Stage::Durable,
+                _ => Stage::Completed,
+            };
+            ApplicationReply {
+                response,
+                outcome: Some(Outcome::Confirmed),
+                stage: Some(stage),
+                items: Vec::new(),
+            }
+        }
+        Err(error) => ApplicationReply::failed(
+            error_response(&error),
+            broker_outcome(error.outcome()),
+            Stage::ExecutionStarted,
+        ),
+    }
+}
+
+fn broker_outcome(outcome: runnel_engine::BrokerErrorOutcome) -> Outcome {
+    match outcome {
+        runnel_engine::BrokerErrorOutcome::Rejected => Outcome::Rejected,
+        runnel_engine::BrokerErrorOutcome::Retryable => Outcome::Retryable,
+        runnel_engine::BrokerErrorOutcome::Unknown => Outcome::Unknown,
+    }
 }
 
 fn consumer_policy_response(stream: String, consumer: String, policy: ConsumerPolicy) -> Response {
@@ -419,7 +558,7 @@ fn batch_message_response(
             member: member.map(str::to_owned),
             offset,
             key,
-            payload_base64: BinaryPayload::new(payload),
+            payload: BinaryPayload::new(payload),
             published_at_ms,
             delivery_token,
             delivery_attempt,
@@ -483,7 +622,7 @@ fn replay_message_response(message: ReplayMessage, consumer: String) -> Response
             consumer,
             offset,
             key,
-            payload_base64: BinaryPayload::new(error.into_bytes()),
+            payload: BinaryPayload::new(error.into_bytes()),
             published_at_ms,
         },
     }
@@ -531,7 +670,7 @@ fn message_response(message: MessageResponse) -> Response {
             member,
             offset,
             key,
-            payload_base64: BinaryPayload::new(error.into_bytes()),
+            payload: BinaryPayload::new(error.into_bytes()),
             published_at_ms,
             delivery_token,
             delivery_attempt,
@@ -562,12 +701,13 @@ fn error_response(error: &BrokerError) -> Response {
         BrokerError::Configuration(_) => "invalid_configuration",
         BrokerError::InvalidBatchRequest(_) => "invalid_batch_request",
         BrokerError::ConsumeBatchRecordTooLarge { .. } => "consume_batch_record_too_large",
+        BrokerError::ResponseTooLarge { .. } => "response_too_large",
         BrokerError::NotLeader { .. } => "cluster_error",
         BrokerError::Cluster(_) => "cluster_error",
     };
     Response::Error {
         code: code.to_owned(),
-        message: error.to_string(),
+        message: bounded_diagnostic(&error.to_string()),
     }
 }
 
@@ -577,8 +717,250 @@ fn publish_batch_error_response(error: &BrokerError) -> Response {
     {
         return Response::Error {
             code: "invalid_record".to_owned(),
-            message: error.to_string(),
+            message: bounded_diagnostic(&error.to_string()),
         };
     }
     error_response(error)
+}
+
+fn bounded_diagnostic(message: &str) -> String {
+    if message.len() <= MAX_BATCH_DIAGNOSTIC_BYTES {
+        return message.to_owned();
+    }
+    let mut end = MAX_BATCH_DIAGNOSTIC_BYTES;
+    while !message.is_char_boundary(end) {
+        end -= 1;
+    }
+    message[..end].to_owned()
+}
+
+fn batch_response_upper_bound(request: &Request) -> Option<usize> {
+    match request {
+        Request::PublishBatch { stream, records } => {
+            let count = records.len();
+            let worst_errors = (0..count)
+                .map(|_| PublishBatchRecordResponse::Error {
+                    code: "request_id_content_conflict".to_owned(),
+                    message: "x".repeat(MAX_BATCH_DIAGNOSTIC_BYTES),
+                })
+                .collect();
+            let error_reply = ApplicationReply::batch(
+                Response::PublishBatch {
+                    stream: stream.clone(),
+                    outcomes: worst_errors,
+                },
+                vec![
+                    ItemMetadata {
+                        outcome: Outcome::Unknown,
+                        stage: Stage::ExecutionStarted,
+                    };
+                    count
+                ],
+            );
+            let worst_successes = (0..count)
+                .map(|_| PublishBatchRecordResponse::Published { offset: u64::MAX })
+                .collect();
+            let success_reply = ApplicationReply::batch(
+                Response::PublishBatch {
+                    stream: stream.clone(),
+                    outcomes: worst_successes,
+                },
+                vec![
+                    ItemMetadata {
+                        outcome: Outcome::Confirmed,
+                        stage: Stage::Durable,
+                    };
+                    count
+                ],
+            );
+            Some(encoded_body_len(&error_reply).max(encoded_body_len(&success_reply)))
+        }
+        Request::AckBatch {
+            stream,
+            consumer,
+            receipts,
+        }
+        | Request::AckGroupBatch {
+            stream,
+            consumer,
+            receipts,
+            ..
+        } => {
+            let count = receipts.len();
+            if count == 0 || count > MAX_CONSUME_BATCH_RECORDS {
+                return None;
+            }
+            let worst_rejections = (0..count)
+                .map(|_| AckBatchItemResponse {
+                    offset: u64::MAX,
+                    outcome: AckBatchItemOutcome::Rejected,
+                    code: Some("ack_not_in_flight".to_owned()),
+                    message: Some("x".repeat(MAX_BATCH_DIAGNOSTIC_BYTES)),
+                })
+                .collect();
+            let rejected_reply = ApplicationReply::batch(
+                Response::AckBatch {
+                    stream: stream.clone(),
+                    consumer: consumer.clone(),
+                    outcomes: worst_rejections,
+                },
+                vec![
+                    ItemMetadata {
+                        outcome: Outcome::Rejected,
+                        stage: Stage::ExecutionStarted,
+                    };
+                    count
+                ],
+            );
+            let worst_confirmed = (0..count)
+                .map(|_| AckBatchItemResponse {
+                    offset: u64::MAX,
+                    outcome: AckBatchItemOutcome::Confirmed,
+                    code: None,
+                    message: None,
+                })
+                .collect();
+            let confirmed_reply = ApplicationReply::batch(
+                Response::AckBatch {
+                    stream: stream.clone(),
+                    consumer: consumer.clone(),
+                    outcomes: worst_confirmed,
+                },
+                vec![
+                    ItemMetadata {
+                        outcome: Outcome::Confirmed,
+                        stage: Stage::Durable,
+                    };
+                    count
+                ],
+            );
+            Some(encoded_body_len(&rejected_reply).max(encoded_body_len(&confirmed_reply)))
+        }
+        _ => None,
+    }
+}
+
+fn encoded_body_len(reply: &ApplicationReply) -> usize {
+    runnel_protocol::v2::encode_server_frame(&ServerFrame::Application(reply.clone()))
+        .map(|frame| frame.len().saturating_sub(4))
+        .unwrap_or(usize::MAX)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use runnel_protocol::{BatchDeliveryReceipt, PublishBatchRecord};
+
+    #[test]
+    fn batch_response_bounds_cover_generated_success_and_diagnostic_frames() {
+        let publish_request = Request::PublishBatch {
+            stream: "events".to_owned(),
+            records: (0..8)
+                .map(|_| PublishBatchRecord {
+                    key: None,
+                    payload: BinaryPayload::new(Vec::new()),
+                    request_id: None,
+                })
+                .collect(),
+        };
+        let publish_bound = batch_response_upper_bound(&publish_request).unwrap();
+        let publish_success = ApplicationReply::batch(
+            Response::PublishBatch {
+                stream: "events".to_owned(),
+                outcomes: (0..8)
+                    .map(|_| PublishBatchRecordResponse::Published { offset: u64::MAX })
+                    .collect(),
+            },
+            vec![
+                ItemMetadata {
+                    outcome: Outcome::Confirmed,
+                    stage: Stage::Durable,
+                };
+                8
+            ],
+        );
+        let publish_errors = ApplicationReply::batch(
+            Response::PublishBatch {
+                stream: "events".to_owned(),
+                outcomes: (0..8)
+                    .map(|_| PublishBatchRecordResponse::Error {
+                        code: "request_id_content_conflict".to_owned(),
+                        message: bounded_diagnostic(&"x".repeat(1_000)),
+                    })
+                    .collect(),
+            },
+            vec![
+                ItemMetadata {
+                    outcome: Outcome::Unknown,
+                    stage: Stage::ExecutionStarted,
+                };
+                8
+            ],
+        );
+        assert!(encoded_body_len(&publish_success) <= publish_bound);
+        assert!(encoded_body_len(&publish_errors) <= publish_bound);
+
+        let ack_request = Request::AckBatch {
+            stream: "events".to_owned(),
+            consumer: "workers".to_owned(),
+            receipts: (0..8)
+                .map(|offset| BatchDeliveryReceipt {
+                    offset,
+                    delivery_token: "token".to_owned(),
+                })
+                .collect(),
+        };
+        let ack_bound = batch_response_upper_bound(&ack_request).unwrap();
+        let ack_success = ApplicationReply::batch(
+            Response::AckBatch {
+                stream: "events".to_owned(),
+                consumer: "workers".to_owned(),
+                outcomes: (0..8)
+                    .map(|_| AckBatchItemResponse {
+                        offset: u64::MAX,
+                        outcome: AckBatchItemOutcome::Confirmed,
+                        code: None,
+                        message: None,
+                    })
+                    .collect(),
+            },
+            vec![
+                ItemMetadata {
+                    outcome: Outcome::Confirmed,
+                    stage: Stage::Durable,
+                };
+                8
+            ],
+        );
+        let ack_errors = ApplicationReply::batch(
+            Response::AckBatch {
+                stream: "events".to_owned(),
+                consumer: "workers".to_owned(),
+                outcomes: (0..8)
+                    .map(|_| AckBatchItemResponse {
+                        offset: u64::MAX,
+                        outcome: AckBatchItemOutcome::Rejected,
+                        code: Some("ack_not_in_flight".to_owned()),
+                        message: Some(bounded_diagnostic(&"x".repeat(1_000))),
+                    })
+                    .collect(),
+            },
+            vec![
+                ItemMetadata {
+                    outcome: Outcome::Rejected,
+                    stage: Stage::ExecutionStarted,
+                };
+                8
+            ],
+        );
+        assert!(encoded_body_len(&ack_success) <= ack_bound);
+        assert!(encoded_body_len(&ack_errors) <= ack_bound);
+    }
+
+    #[test]
+    fn error_diagnostics_are_bounded_on_utf8_boundaries() {
+        let diagnostic = bounded_diagnostic(&format!("{}é", "x".repeat(255)));
+        assert_eq!(diagnostic.len(), 255);
+        assert!(diagnostic.is_char_boundary(diagnostic.len()));
+    }
 }

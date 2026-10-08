@@ -112,14 +112,28 @@ an uncommitted or timed-out write is resolved by retrying the same member poll.
 - Require `1..=1024` records per request, using the existing publish-batch
   count ceiling as an initial protocol cap. Keep this cap subject to workload
   evidence because a consume set also expands per-member in-flight state.
-- Bound the fully serialized response, including JSON/base64 expansion,
-  metadata, and the line delimiter, by the client's configured response limit
-  and the protocol hard limit (`MAX_RESPONSE_BYTES`). The typed client must
+- Bound the fully encoded v2 Protobuf response, including metadata, by the
+  client's configured response limit and the protocol hard limit
+  (`MAX_RESPONSE_BYTES`). The typed client must
   reject or cap `max_bytes` against its own response-buffer setting.
   `max_bytes` counts this same encoded form. If the first eligible record does
   not fit, reject the request before assignment with an explicit
   oversized-record result; do not silently exceed the caller's bound or strand
   it as an empty poll.
+- In the Raft peer path, compact binary payload encoding keeps a maximum
+  65 MiB public batch below the 96 MiB frame cap. Before dispatch can build a
+  poll or replay result, the receiving broker reserves up to 246 MiB from a
+  process-wide 256 MiB response budget for the decoded result, temporary
+  base64 strings, serialized frame, and fixed metadata headroom. One maximum
+  response is admitted at a time; smaller responses can share the budget.
+  Peer frame reads and generic writes share a separate 192 MiB budget, with
+  64 KiB retained read buffers across at most 256 inbound and 256 outbound
+  connections. This bounds peer frame and response buffers to about 470 MiB
+  in aggregate (a maximum response, maximum read, and retained buffers total
+  about 470 MiB; the remaining response-budget capacity can admit smaller
+  replies), excluding TLS/socket buffers and application, storage, and Raft
+  state. The budgets are separate so a request waiting for
+  response admission cannot block an already admitted response's write.
 - Stop collecting when the record cap, byte cap, or `max_wait_ms` deadline is
   reached. `max_wait_ms = 0` returns immediately; otherwise it must be less
   than the remaining server request deadline so the broker can serialize and
@@ -357,20 +371,20 @@ verifies that legacy offset-only `Ack` cannot acknowledge a batch-assigned
 lease. A clustered engine test verifies collection returns when leadership is
 lost.
 
-For peer forwarding, successful batch-poll responses use a private compact DTO:
-valid UTF-8 payload bytes are serialized as JSON text and other payload bytes
-as standard base64, while stream, offset, key, publish time, receipt token, and
-attempt number are preserved. This avoids the integer-array expansion of
-`Vec<u8>` in the private peer JSON response. The peer frame limit is 66 MiB in
-both directions, an increase of 2 MiB over the previous shared 64 MiB limit.
-The public batch response ceiling is 65 MiB, leaving up to 1 MiB for private
-response-envelope overhead; the additional 1 MiB is fixed headroom, not a new
-request-size allowance at the public server boundary. Peer writes stop
-serialization at the frame limit, and receivers reject an over-limit length
-before resizing their frame buffer. Existing public request configuration
-remains capped at 64 MiB. The peer JSON response change has no version
-negotiation, so mixed-binary cluster upgrades are not supported; use one
-consistent binary across cluster nodes.
+For peer forwarding, successful batch-poll responses use a private compact DTO.
+Payloads and keys use JSON text only when they are printable ASCII that needs no
+escaping; other values use standard base64. This avoids integer-array expansion
+of `Vec<u8>` and keeps JSON escaping from multiplying the size of valid public
+keys or payloads. Stream, offset, publish time, receipt token, and attempt
+number are preserved. The peer frame limit is 96 MiB in both directions. This
+covers a public batch response up to 65 MiB, including base64 expansion and
+bounded per-record JSON framing overhead. It is a separate internal peer-frame
+limit, not a larger public response allowance. Peer writes stop serialization
+at the frame limit, and receivers reject an over-limit length before resizing
+their frame buffer. Existing public request configuration remains capped at 64
+MiB. The peer JSON response change has no version negotiation, so mixed-binary
+cluster upgrades are not supported; use one consistent binary across cluster
+nodes.
 
 The pre-commit peer-frame check serializes into a counting sink before
 assignment commits. Binary payloads therefore incur a temporary per-record

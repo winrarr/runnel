@@ -7,12 +7,18 @@ use std::sync::Arc;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
-const FRAME_MEMORY_QUANTUM: usize = 1024 * 1024;
-const MAX_BUFFERED_FRAME_MEMORY: usize = 256 * 1024 * 1024;
+pub(super) const FRAME_MEMORY_QUANTUM: usize = 1024 * 1024;
+pub(super) const MAX_BUFFERED_FRAME_MEMORY: usize = 192 * 1024 * 1024;
 const FRAME_ADMISSION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
-pub(super) const MAX_FRAME_SIZE: u32 = 66 * 1024 * 1024;
-pub(super) const MAX_REUSABLE_FRAME_BUFFER_SIZE: usize = 1024 * 1024;
+// A maximum public consume-batch body may expand by roughly 4/3 when a peer
+// encodes arbitrary payload bytes as base64 inside its bounded JSON RPC frame.
+// Keep enough headroom for the JSON envelope and per-record metadata.
+pub(super) const MAX_FRAME_SIZE: u32 = 96 * 1024 * 1024;
+// Bound retained input buffers across all 256 inbound and 256 outbound peer
+// connections to 32 MiB per process. Large one-off frames are dropped after
+// parsing instead of remaining attached to otherwise idle connections.
+pub(super) const MAX_REUSABLE_FRAME_BUFFER_SIZE: usize = 64 * 1024;
 
 /// Parsed frame and its encoded-length admission charge. The caller keeps this
 /// value alive while using the deserialized contents so admission covers the
@@ -74,6 +80,50 @@ pub(super) async fn write_frame<T: Serialize>(
 }
 
 pub(super) async fn write_frame_bounded<T: Serialize, S: AsyncWrite + Unpin>(
+    stream: &mut S,
+    value: &T,
+    write_slots: &Arc<Semaphore>,
+    memory_budget: &Arc<Semaphore>,
+) -> Result<(), io::Error> {
+    let _permit =
+        tokio::time::timeout(FRAME_ADMISSION_TIMEOUT, write_slots.clone().acquire_owned())
+            .await
+            .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "peer frame admission timed out"))?
+            .map_err(|_| {
+                io::Error::new(io::ErrorKind::BrokenPipe, "peer frame admission is closed")
+            })?;
+    let memory_units = (MAX_FRAME_SIZE as usize).div_ceil(FRAME_MEMORY_QUANTUM);
+    if memory_units > MAX_BUFFERED_FRAME_MEMORY / FRAME_MEMORY_QUANTUM {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "peer RPC exceeds the buffered frame memory limit",
+        ));
+    }
+    let _memory_permit = tokio::time::timeout(
+        FRAME_ADMISSION_TIMEOUT,
+        memory_budget
+            .clone()
+            .acquire_many_owned(memory_units as u32),
+    )
+    .await
+    .map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::TimedOut,
+            "peer frame memory admission timed out",
+        )
+    })?
+    .map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::BrokenPipe,
+            "peer frame memory admission is closed",
+        )
+    })?;
+    write_frame(stream, value).await
+}
+
+/// Write a response whose decoded result and serialized frame already have a
+/// caller-owned weighted memory reservation acquired before dispatch.
+pub(super) async fn write_frame_response_bounded<T: Serialize, S: AsyncWrite + Unpin>(
     stream: &mut S,
     value: &T,
     write_slots: &Arc<Semaphore>,
@@ -157,7 +207,10 @@ async fn read_frame_inner<T: DeserializeOwned, S: AsyncRead + Unpin>(
         ));
     }
     let memory_permit = if let Some(memory_budget) = memory_budget {
-        let units = (length as usize).div_ceil(FRAME_MEMORY_QUANTUM).max(1);
+        // Charge both the encoded input buffer and an approximate decoded
+        // object graph while the request or response is being processed.
+        let memory_bytes = (length as usize).saturating_mul(2);
+        let units = memory_bytes.div_ceil(FRAME_MEMORY_QUANTUM).max(1);
         if units > MAX_BUFFERED_FRAME_MEMORY / FRAME_MEMORY_QUANTUM {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -242,6 +295,28 @@ mod tests {
         assert_eq!(budget.available_permits(), 0);
         drop(frame);
         assert_eq!(budget.available_permits(), 1);
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn bounded_response_writer_uses_pre_reserved_reply_memory() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut payload = Vec::new();
+            let response = read_frame::<String>(&mut stream, &mut payload)
+                .await
+                .unwrap();
+            assert_eq!(response, "bounded-response");
+        });
+
+        let mut stream = TcpStream::connect(address).await.unwrap();
+        let write_slots = Arc::new(Semaphore::new(1));
+        write_frame_response_bounded(&mut stream, &"bounded-response", &write_slots)
+            .await
+            .unwrap();
+        assert_eq!(write_slots.available_permits(), 1);
         server.await.unwrap();
     }
 

@@ -902,41 +902,59 @@ mod tests {
     }
 
     #[test]
-    fn version_one_log_is_rejected_without_rewriting_or_creating_segments() {
+    fn prior_raft_log_versions_are_rejected_without_rewriting_or_creating_segments() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("raft-log.json");
-        let mut old_configure_consumer =
-            serde_json::to_value(blank_entry(0, 1)).expect("serialize old log entry shape");
-        old_configure_consumer["payload"] = serde_json::json!({
-            "Normal": {
-                "ConfigureConsumer": {
-                    "stream": "events",
-                    "consumer": "worker",
-                    "ack_timeout_ms": 30_000,
-                    "max_delivery_attempts": null,
-                }
-            }
-        });
-        let old_bytes = serde_json::to_vec(&serde_json::json!({
-            "version": 1,
-            "last_purged_log_id": null,
-            "log": {"0": old_configure_consumer},
-            "committed": null,
-            "vote": null,
-        }))
-        .unwrap();
-        fs::write(&path, &old_bytes).unwrap();
+        for version in [1, 2] {
+            let mut old_entry =
+                serde_json::to_value(blank_entry(0, 1)).expect("serialize old log entry shape");
+            old_entry["payload"] = match version {
+                1 => serde_json::json!({
+                    "Normal": {
+                        "ConfigureConsumer": {
+                            "stream": "events",
+                            "consumer": "worker",
+                            "ack_timeout_ms": 30_000,
+                            "max_delivery_attempts": null,
+                        }
+                    }
+                }),
+                2 => serde_json::json!({
+                    "Normal": {
+                        "Publish": {
+                            "stream": "events",
+                            "key": null,
+                            // Version 2 serialized Vec<u8> as JSON integer arrays.
+                            "payload": [0, 255],
+                            "published_at_ms": 1,
+                            "request_id": null,
+                        }
+                    }
+                }),
+                _ => unreachable!("test only uses known prior versions"),
+            };
+            let old_bytes = serde_json::to_vec(&serde_json::json!({
+                "version": version,
+                "last_purged_log_id": null,
+                "log": {"0": old_entry},
+                "committed": null,
+                "vote": null,
+            }))
+            .unwrap();
+            fs::write(&path, &old_bytes).unwrap();
 
-        let validation_error = LogStore::<crate::TypeConfig>::validate(&path)
-            .unwrap_err()
-            .to_string();
-        assert!(validation_error.contains("unsupported Raft-log format version 1"));
-        let error = LogStore::<crate::TypeConfig>::open(&path)
-            .unwrap_err()
-            .to_string();
-        assert!(error.contains("unsupported Raft-log format version 1"));
-        assert_eq!(fs::read(&path).unwrap(), old_bytes);
-        assert!(!raft_log_segments::family_directory(&path).exists());
+            let expected = format!("unsupported Raft-log format version {version}");
+            let validation_error = LogStore::<crate::TypeConfig>::validate(&path)
+                .unwrap_err()
+                .to_string();
+            assert!(validation_error.contains(&expected));
+            let error = LogStore::<crate::TypeConfig>::open(&path)
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains(&expected));
+            assert_eq!(fs::read(&path).unwrap(), old_bytes);
+            assert!(!raft_log_segments::family_directory(&path).exists());
+        }
     }
 
     #[test]

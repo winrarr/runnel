@@ -10,27 +10,41 @@ use tokio::sync::watch;
 use tracing::{error, info, warn};
 
 use crate::connection;
+use crate::connection::app_security::ApplicationSecurity;
 use crate::observability::{self, ServerMetrics};
 use crate::protocol::ProtocolAdmission;
 
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(25);
 
+pub(crate) struct RuntimeServices {
+    pub(super) peer: Option<(TcpListener, Arc<GroupManager>)>,
+    pub(super) cluster: Option<Arc<GroupManager>>,
+    pub(super) server_metrics: Arc<ServerMetrics>,
+    pub(super) protocol_admission: ProtocolAdmission,
+    pub(super) application_security: ApplicationSecurity,
+}
+
 pub(crate) async fn run(
     tcp_listener: TcpListener,
     http_listener: TcpListener,
     engine: Arc<dyn Engine>,
-    peer: Option<(TcpListener, Arc<GroupManager>)>,
-    cluster: Option<Arc<GroupManager>>,
-    server_metrics: Arc<ServerMetrics>,
-    protocol_admission: ProtocolAdmission,
+    services: RuntimeServices,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    let RuntimeServices {
+        peer,
+        cluster,
+        server_metrics,
+        protocol_admission,
+        application_security,
+    } = services;
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
     let shutting_down = Arc::new(AtomicBool::new(false));
-    let mut tcp_task = connection::spawn(
+    let mut tcp_task = connection::spawn_with_security(
         tcp_listener,
         Arc::clone(&engine),
         Arc::clone(&server_metrics),
         protocol_admission,
+        application_security,
         shutdown_rx.clone(),
     );
     let mut peer_task = spawn_peer(peer, shutdown_rx.clone());

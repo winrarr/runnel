@@ -88,7 +88,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 Request::PublishBytes {
                     stream,
                     key,
-                    payload_base64: payload,
+                    payload,
                     request_id,
                 }
             }

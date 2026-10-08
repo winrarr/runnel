@@ -6,7 +6,6 @@ import argparse
 import json
 import os
 import platform
-import socket
 import subprocess
 import sys
 import time
@@ -15,6 +14,8 @@ import urllib.request
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Callable
+
+from v2_client import V2Client, V2ProtocolError
 
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -25,8 +26,18 @@ class BenchmarkError(RuntimeError):
     """An expected benchmark setup or protocol failure."""
 
 
-class LineClient:
-    """A persistent client for Runnel's current line-delimited protocol."""
+class BrokerResponseError(BenchmarkError):
+    """A typed broker error response, including its stable protocol code."""
+
+    def __init__(self, operation: str, code: str, message: str) -> None:
+        self.operation = operation
+        self.code = code
+        self.message = message
+        super().__init__(f"broker rejected {operation}: {code}: {message}")
+
+
+class ProtocolClient:
+    """Persistent client for the negotiated public Protocol Buffers v2 wire."""
 
     def __init__(
         self,
@@ -34,37 +45,30 @@ class LineClient:
         port: int,
         timeout_seconds: float = DEFAULT_TIMEOUT_SECONDS,
     ) -> None:
-        self.socket = socket.create_connection((host, port), timeout=timeout_seconds)
-        self.reader = self.socket.makefile("rb")
+        try:
+            self.client = V2Client(host, port, timeout_seconds)
+        except V2ProtocolError as error:
+            raise BenchmarkError(str(error)) from error
 
     def request(self, request: dict[str, Any]) -> tuple[dict[str, Any], int]:
-        encoded = json.dumps(request, separators=(",", ":")).encode("utf-8") + b"\n"
-        started = time.perf_counter_ns()
-        self.socket.sendall(encoded)
-        line = self.reader.readline()
-        elapsed = time.perf_counter_ns() - started
-        if not line:
-            raise BenchmarkError("broker closed the protocol connection")
         try:
-            response = json.loads(line)
-        except json.JSONDecodeError as error:
-            raise BenchmarkError(f"invalid broker response: {line!r}") from error
+            response, elapsed = self.client.request(request)
+        except V2ProtocolError as error:
+            raise BenchmarkError(str(error)) from error
         if response.get("type") == "error":
-            raise BenchmarkError(
-                f"broker rejected {request.get('op')}: {response.get('code')}: "
-                f"{response.get('message')}"
+            raise BrokerResponseError(
+                str(request.get("op")),
+                str(response.get("code", "")),
+                str(response.get("message", "")),
             )
         return response, elapsed
 
     def close(self) -> None:
-        try:
-            self.reader.close()
-        finally:
-            self.socket.close()
+        self.client.close()
 
 
 def request_ok(
-    client: LineClient,
+    client: ProtocolClient,
     request: dict[str, Any],
     response_type: str,
 ) -> tuple[dict[str, Any], int]:
@@ -142,11 +146,11 @@ def result_metadata(
     }
 
 
-def create_stream(client: LineClient, stream: str) -> None:
+def create_stream(client: ProtocolClient, stream: str) -> None:
     request_ok(client, {"op": "create_stream", "stream": stream}, "stream_created")
 
 
-def publish(client: LineClient, stream: str, payload: str) -> tuple[int, int]:
+def publish(client: ProtocolClient, stream: str, payload: str) -> tuple[int, int]:
     response, elapsed = request_ok(
         client,
         {"op": "publish", "stream": stream, "payload": payload},
@@ -156,7 +160,7 @@ def publish(client: LineClient, stream: str, payload: str) -> tuple[int, int]:
 
 
 def publish_messages(
-    client_for: Callable[[int], LineClient],
+    client_for: Callable[[int], ProtocolClient],
     stream: str,
     payload: str,
     messages: int,
@@ -176,7 +180,7 @@ def publish_messages(
 
 
 def publish_stream(
-    client: LineClient,
+    client: ProtocolClient,
     stream: str,
     payload: str,
     messages: int,
@@ -195,7 +199,7 @@ def publish_stream(
 
 
 def poll(
-    client: LineClient,
+    client: ProtocolClient,
     stream: str,
     consumer: str,
     expected_offset: int | None = None,
@@ -210,7 +214,7 @@ def poll(
     return response, elapsed
 
 
-def acknowledge(client: LineClient, stream: str, consumer: str, offset: int) -> int:
+def acknowledge(client: ProtocolClient, stream: str, consumer: str, offset: int) -> int:
     _, elapsed = request_ok(
         client,
         {"op": "ack", "stream": stream, "consumer": consumer, "offset": offset},
@@ -220,12 +224,12 @@ def acknowledge(client: LineClient, stream: str, consumer: str, offset: int) -> 
 
 
 def consume_ack_messages(
-    poll_client_for: Callable[[int], LineClient],
+    poll_client_for: Callable[[int], ProtocolClient],
     stream: str,
     consumer: str,
     messages: int,
     *,
-    ack_client_for: Callable[[int], LineClient] | None = None,
+    ack_client_for: Callable[[int], ProtocolClient] | None = None,
 ) -> list[int]:
     """Poll and acknowledge a bounded sequence, returning request latencies."""
     ack_client_for = ack_client_for or poll_client_for

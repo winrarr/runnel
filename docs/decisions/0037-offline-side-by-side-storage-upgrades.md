@@ -67,6 +67,22 @@ even if a historical reader can decode them. Extending a conversion to
 another source generation requires an explicitly accepted artifact-specific
 decision; parser compatibility alone is not eligibility.
 
+### Current artifact versions
+
+The offline conversion workflow remains unimplemented. The current clustered
+writer uses version-3 Raft-log segments and version-3 state-machine journal,
+checkpoint, and snapshot payloads. Journal records are capped at 96 MiB. A
+`Command::Publish` payload is now compact text/base64 JSON rather than a JSON
+integer array; its worst accepted 64 MiB payload expands to about 85.4 MiB
+before command metadata and remains below the 96 MiB peer-frame and journal
+record limits. The Raft-log segment and journal formats were bumped to version
+3 for this representation change. Versions 1 and 2 of those artifacts are
+rejected before command decoding or recovery mutation, with no read-forward,
+conversion, or empty-store fallback. Focused fixtures verify refusal leaves
+the old bytes unchanged. This is the current pre-release boundary, not a
+release-upgrade promise; the conversion policy above applies only if a future
+conversion outcome is separately implemented and validated.
+
 For a conversion, recovery selects exactly one complete source or target
 generation. It never chooses by directory order, timestamps, or the first
 parsable file, and never treats an invalid store as empty. A generation

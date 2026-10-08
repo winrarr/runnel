@@ -522,7 +522,7 @@ pub async fn assert_consume_batch_contract(engine: &dyn Engine) {
         .await
         .unwrap();
     engine
-        .configure_consumer(expiry, "workers", 25, None, 0)
+        .configure_consumer(expiry, "workers", 1_000, None, 0)
         .await
         .unwrap();
     let expiry_limits = ConsumeBatchLimits {
@@ -534,7 +534,7 @@ pub async fn assert_consume_batch_contract(engine: &dyn Engine) {
         .poll_group_batch(expiry, "workers", "member-a", expiry_limits)
         .await
         .unwrap();
-    tokio::time::sleep(Duration::from_millis(40)).await;
+    tokio::time::sleep(Duration::from_millis(1_010)).await;
     let redelivered = engine
         .poll_group_batch(expiry, "workers", "member-b", expiry_limits)
         .await

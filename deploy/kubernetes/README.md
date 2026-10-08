@@ -7,6 +7,13 @@ promise. It assumes a Kubernetes context that can provision three independent
 `ReadWriteOnce` persistent-volume claims and can resolve the headless Service
 names used by the broker.
 
+> **Development security warning:** the manifest sets
+> `--insecure-development-listen`, so the broker Service on port 4222 accepts
+> unauthenticated plaintext. Use it only in a trusted, isolated development
+> cluster. Never use this manifest on production or untrusted networks. The
+> HTTP health and metrics listener on port 8080 is also cleartext and
+> unauthenticated.
+
 Every Raft node requires static peer mutual TLS credentials before it can
 start. The manifest passes the peer credential file paths but does not create
 or mount credentials. Supply an overlay or secret provider that projects the
@@ -196,11 +203,21 @@ and are not a substitute for capacity planning.
 
 The pod runs as a non-root user with the default runtime seccomp profile, no
 Linux capabilities, privilege escalation disabled, and a read-only root
-filesystem. The broker and HTTP Service still have no TLS, authentication,
-or authorization. The manifest does not automate peer credential rotation;
-follow the coordinated restart and trust-overlap procedure above. Keep the
-public Services inside a trusted development network and do not expose them
-publicly without an external security boundary.
+filesystem. Application TLS and bearer authentication are available for the
+local engine, but the Raft backend rejects that configuration until credential
+policy is consistent across replicas. This manifest therefore explicitly
+allows unauthenticated plaintext broker traffic on port 4222. The HTTP Service
+on port 8080 remains cleartext and unauthenticated. Keep both Services inside
+a trusted, isolated development network; do not expose them publicly or to
+untrusted namespaces.
+filesystem. Application TLS and bearer authentication are available for the
+local engine, but Raft rejects application credentials until policy is
+consistent across replicas. The broker Service therefore accepts unauthenticated
+plaintext on port 4222, and the HTTP Service on port 8080 remains cleartext and
+unauthenticated. This manifest does not automate peer credential rotation;
+follow the coordinated restart and trust-overlap procedure above. Keep both
+Services inside a trusted, isolated development network; do not expose them
+publicly or to untrusted namespaces.
 
 ## Upgrade and rollback
 

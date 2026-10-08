@@ -123,6 +123,31 @@ class CommonBenchmarkTests(unittest.TestCase):
                     expected_offset=0,
                 )
 
+    def test_protocol_client_preserves_broker_error_code(self) -> None:
+        broker = type(
+            "FakeV2Client",
+            (),
+            {
+                "request": lambda _self, _request: (
+                    {
+                        "type": "error",
+                        "code": "stream_not_ready",
+                        "message": "not active",
+                    },
+                    100,
+                ),
+                "close": lambda _self: None,
+            },
+        )()
+        with patch.object(common, "V2Client", return_value=broker):
+            client = common.ProtocolClient("127.0.0.1", 4222)
+
+        with self.assertRaises(common.BrokerResponseError) as raised:
+            client.request({"op": "publish"})
+        self.assertEqual(raised.exception.code, "stream_not_ready")
+        self.assertEqual(raised.exception.operation, "publish")
+        self.assertIn("stream_not_ready", str(raised.exception))
+
     def test_consume_ack_messages_can_route_poll_and_ack_to_different_nodes(self) -> None:
         poll_clients = [object(), object()]
         ack_clients = [object(), object()]

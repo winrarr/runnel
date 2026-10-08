@@ -11,11 +11,11 @@ use serde::{Deserialize, Serialize};
 use crate::persistence_write::{serialize_json, write_all};
 use crate::{NodeId, PersistenceWriteOperation, PersistenceWriteRole, atomic_write_with_role};
 
-pub(super) const FORMAT_VERSION: u32 = 2;
+pub(super) const FORMAT_VERSION: u32 = 3;
 const SEGMENT_TARGET_BYTES: usize = 1024 * 1024;
-const SEGMENT_MAGIC: &[u8; 4] = b"RSG2";
-const BATCH_MAGIC: &[u8; 4] = b"BAT2";
-const BATCH_END: &[u8; 4] = b"END2";
+const SEGMENT_MAGIC: &[u8; 4] = b"RSG3";
+const BATCH_MAGIC: &[u8; 4] = b"BAT3";
+const BATCH_END: &[u8; 4] = b"END3";
 const SEGMENT_HEADER_LEN: usize = 16;
 pub(super) const BATCH_HEADER_LEN: usize = 36;
 const BATCH_TRAILER_LEN: usize = 8;

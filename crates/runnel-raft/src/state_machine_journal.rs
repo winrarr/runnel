@@ -11,9 +11,9 @@ use super::{
     NodeId, PersistenceWriteOperation, PersistenceWriteRole, TypeConfig, persistence_write,
 };
 
-pub(super) const FORMAT_VERSION: u32 = 2;
+pub(super) const FORMAT_VERSION: u32 = 3;
 pub(super) const FILE: &str = "state-machine.log";
-pub(super) const MAX_RECORD_SIZE: u32 = 64 * 1024 * 1024;
+pub(super) const MAX_RECORD_SIZE: u32 = 96 * 1024 * 1024;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -21,6 +21,11 @@ pub(super) struct JournalEntry {
     pub(super) version: u32,
     pub(super) log_id: LogId<NodeId>,
     pub(super) payload: EntryPayload<TypeConfig>,
+}
+
+#[derive(Deserialize)]
+struct JournalRecordVersion {
+    version: u32,
 }
 
 #[derive(Serialize)]
@@ -90,21 +95,29 @@ fn parse(path: &Path) -> Result<(Vec<JournalEntry>, Option<usize>), BrokerError>
             truncated_at = Some(record_start);
             break;
         }
-        let entry: JournalEntry = serde_json::from_slice(&bytes[cursor..cursor + record_len])
+        let record_bytes = &bytes[cursor..cursor + record_len];
+        let version = serde_json::from_slice::<JournalRecordVersion>(record_bytes)
             .map_err(|error| {
                 BrokerError::Cluster(format!(
                     "invalid state-machine journal record in '{}': {error}",
                     path.display()
                 ))
-            })?;
-        if entry.version != FORMAT_VERSION {
+            })?
+            .version;
+        if version != FORMAT_VERSION {
             return Err(BrokerError::Cluster(format!(
                 "unsupported state-machine journal format version {} in '{}' (supported version {})",
-                entry.version,
+                version,
                 path.display(),
                 FORMAT_VERSION
             )));
         }
+        let entry: JournalEntry = serde_json::from_slice(record_bytes).map_err(|error| {
+            BrokerError::Cluster(format!(
+                "invalid state-machine journal record in '{}': {error}",
+                path.display()
+            ))
+        })?;
         entries.push(entry);
         cursor += record_len;
     }
@@ -170,6 +183,16 @@ pub(super) fn is_log_after(candidate: LogId<NodeId>, current: LogId<NodeId>) -> 
 mod tests {
     use super::*;
     use std::io::Write;
+
+    #[test]
+    fn maximum_publish_payload_fits_peer_frame_and_journal_record_bounds() {
+        let public_frame_limit: usize = 64 * 1024 * 1024;
+        let maximum_base64_payload = public_frame_limit.div_ceil(3) * 4;
+        let encoded_command_bound = maximum_base64_payload + 1024 * 1024;
+
+        assert!(encoded_command_bound <= 96 * 1024 * 1024);
+        assert!(encoded_command_bound <= MAX_RECORD_SIZE as usize);
+    }
 
     #[test]
     fn read_recovers_valid_prefix_and_discards_partial_tail() {

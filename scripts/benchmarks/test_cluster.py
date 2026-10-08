@@ -49,6 +49,10 @@ from cluster_scenarios import (  # noqa: E402
     DEFAULT_SNAPSHOT_BUILD_TIMEOUT_SECONDS,
     DEFAULT_SLOW_CONSUMER_BACKPRESSURE_TIMEOUT_SECONDS,
     DEFAULT_SCENARIOS,
+    MAX_PARALLEL_GROUPED_TIMEOUT_SECONDS,
+    DEFAULT_PRELOAD_READINESS_TIMEOUT_SECONDS,
+    MAX_PRELOAD_READINESS_TIMEOUT_SECONDS,
+    default_parallel_grouped_timeout_seconds,
     HotOrderingObservation,
     MAX_HOT_KEY_PROCESSING_DELAY_MS,
     MAX_HOT_ORDERING_CONCURRENCY,
@@ -85,6 +89,7 @@ from cluster_scenarios import (  # noqa: E402
     parse_snapshot_build_messages,
     parse_scenarios,
     poll_until_redelivered,
+    preload,
     publish_batch_request,
     run_follower_failure_recovery,
     run_leader_failure_recovery,
@@ -100,7 +105,13 @@ from cluster_scenarios import (  # noqa: E402
     _persistence_write_counter_snapshot,
     run_slow_consumer_backpressure,
 )
-from common import BenchmarkError, metric, parse_nonnegative_int, percentile  # noqa: E402
+from common import (  # noqa: E402
+    BenchmarkError,
+    BrokerResponseError,
+    metric,
+    parse_nonnegative_int,
+    percentile,
+)
 from profile import summarize_timing_logs  # noqa: E402
 
 
@@ -176,6 +187,223 @@ class _ClientsContext:
 
 
 class ClusterBenchmarkTests(unittest.TestCase):
+    def test_preload_retries_only_stream_not_ready_and_records_first_and_last_outcomes(self) -> None:
+        client = SimpleNamespace(close=lambda: None)
+        cluster = SimpleNamespace(
+            preload_readiness_timeout_seconds=1.0,
+            preload_readiness=[],
+            client=lambda _index: client,
+        )
+        with (
+            patch("cluster_scenarios.create_stream") as create_stream,
+            patch(
+                "cluster_scenarios.publish",
+                side_effect=[
+                    BrokerResponseError("publish", "stream_not_ready", "not active"),
+                    (0, 100),
+                    (1, 100),
+                ],
+            ) as publish,
+            patch("cluster_scenarios.time.sleep") as sleep,
+        ):
+            preload(cluster, "events", "payload", 2)
+
+        create_stream.assert_called_once_with(client, "events")
+        self.assertEqual(publish.call_count, 3)
+        sleep.assert_called_once()
+        report = cluster.preload_readiness[0]
+        self.assertEqual(report["stream"], "events")
+        self.assertTrue(report["completed"])
+        self.assertEqual(report["timeout_seconds"], 1.0)
+        self.assertGreaterEqual(report["readiness_elapsed_seconds"], 0.0)
+        self.assertAlmostEqual(report["readiness_wait_seconds"], 0.025)
+        self.assertEqual(report["retry_count"], 1)
+        self.assertEqual(
+            report["first_outcome"],
+            {
+                "type": "error",
+                "outcome": "retryable",
+                "code": "stream_not_ready",
+                "message": "not active",
+            },
+        )
+        self.assertEqual(report["first_readiness_error"], report["first_outcome"])
+        self.assertEqual(report["last_readiness_error"], report["first_outcome"])
+        self.assertEqual(
+            report["last_outcome"],
+            {"type": "published", "outcome": "confirmed", "offset": 1},
+        )
+
+    def test_preload_does_not_retry_other_broker_errors(self) -> None:
+        client = SimpleNamespace(close=lambda: None)
+        cluster = SimpleNamespace(
+            preload_readiness_timeout_seconds=1.0,
+            preload_readiness=[],
+            client=lambda _index: client,
+        )
+        with (
+            patch("cluster_scenarios.create_stream"),
+            patch(
+                "cluster_scenarios.publish",
+                side_effect=BrokerResponseError("publish", "cluster_error", "unknown"),
+            ) as publish,
+        ):
+            with self.assertRaises(BrokerResponseError):
+                preload(cluster, "events", "payload", 1)
+
+        publish.assert_called_once()
+        self.assertEqual(len(cluster.preload_readiness), 1)
+        self.assertFalse(cluster.preload_readiness[0]["completed"])
+        self.assertEqual(
+            cluster.preload_readiness[0]["first_outcome"]["code"],
+            "cluster_error",
+        )
+        self.assertEqual(
+            cluster.preload_readiness[0]["last_outcome"]["code"],
+            "cluster_error",
+        )
+        self.assertIsNone(cluster.preload_readiness[0]["first_readiness_error"])
+        self.assertIsNone(cluster.preload_readiness[0]["last_readiness_error"])
+
+    def test_preload_readiness_timeout_records_last_transient_error(self) -> None:
+        client = SimpleNamespace(close=lambda: None)
+        cluster = SimpleNamespace(
+            preload_readiness_timeout_seconds=1.0,
+            preload_readiness=[],
+            client=lambda _index: client,
+        )
+        with (
+            patch("cluster_scenarios.create_stream"),
+            patch(
+                "cluster_scenarios.publish",
+                side_effect=BrokerResponseError("publish", "stream_not_ready", "not active"),
+            ) as publish,
+            patch("cluster_scenarios.time.monotonic", side_effect=[0.0, 1.0, 2.0]),
+            patch("cluster_scenarios.time.sleep"),
+        ):
+            with self.assertRaisesRegex(
+                BenchmarkError,
+                "first outcome=.*stream_not_ready.*last outcome=.*stream_not_ready",
+            ):
+                preload(cluster, "events", "payload", 1)
+
+        self.assertEqual(publish.call_count, 2)
+        self.assertEqual(cluster.preload_readiness[0]["completed"], False)
+        self.assertEqual(cluster.preload_readiness[0]["retry_count"], 1)
+        self.assertEqual(
+            cluster.preload_readiness[0]["first_outcome"],
+            cluster.preload_readiness[0]["last_outcome"],
+        )
+        self.assertEqual(
+            cluster.preload_readiness[0]["first_readiness_error"]["code"],
+            "stream_not_ready",
+        )
+        self.assertEqual(
+            cluster.preload_readiness[0]["last_readiness_error"]["code"],
+            "stream_not_ready",
+        )
+
+    def test_parallel_grouped_timeout_scales_with_messages_and_is_bounded(self) -> None:
+        self.assertEqual(default_parallel_grouped_timeout_seconds(100), 30.0)
+        self.assertEqual(default_parallel_grouped_timeout_seconds(1_000), 250.0)
+        with self.assertRaisesRegex(ValueError, "bounded maximum"):
+            default_parallel_grouped_timeout_seconds(
+                int(MAX_PARALLEL_GROUPED_TIMEOUT_SECONDS * 4) + 1
+            )
+
+    def test_parallel_grouped_timeout_can_be_overridden_through_cli(self) -> None:
+        with patch.object(
+            sys,
+            "argv",
+            [
+                "cluster.py",
+                "--scenarios",
+                "parallel_grouped_consume_ack",
+                "--messages",
+                "1000",
+                "--parallel-grouped-timeout-seconds",
+                "180",
+            ],
+        ):
+            args = parse_args()
+
+        self.assertEqual(args.parallel_grouped_timeout_seconds, 180.0)
+        self.assertEqual(args.parallel_grouped_timeout_source, "explicit override")
+
+    def test_parallel_grouped_timeout_cli_uses_workload_default(self) -> None:
+        with patch.object(
+            sys,
+            "argv",
+            [
+                "cluster.py",
+                "--scenarios",
+                "parallel_grouped_consume_ack",
+                "--messages",
+                "1000",
+            ],
+        ):
+            args = parse_args()
+
+        self.assertEqual(args.parallel_grouped_timeout_seconds, 250.0)
+        self.assertEqual(args.parallel_grouped_timeout_source, "workload-aware default")
+
+    def test_preload_readiness_timeout_is_explicit_and_bounded(self) -> None:
+        with patch.object(sys, "argv", ["cluster.py"]):
+            args = parse_args()
+        self.assertEqual(
+            args.preload_readiness_timeout_seconds,
+            DEFAULT_PRELOAD_READINESS_TIMEOUT_SECONDS,
+        )
+        with patch.object(
+            sys,
+            "argv",
+            ["cluster.py", "--preload-readiness-timeout-seconds", "5"],
+        ):
+            args = parse_args()
+        self.assertEqual(args.preload_readiness_timeout_seconds, 5.0)
+        with patch.object(
+            sys,
+            "argv",
+            [
+                "cluster.py",
+                "--preload-readiness-timeout-seconds",
+                str(MAX_PRELOAD_READINESS_TIMEOUT_SECONDS + 1),
+            ],
+        ), self.assertRaises(SystemExit):
+            parse_args()
+
+    def test_development_plaintext_override_is_container_only(self) -> None:
+        node = SimpleNamespace(
+            node_id=1,
+            data_dir=Path("node-1"),
+            broker_port=0,
+            http_port=0,
+            peer_port=7000,
+            peer_address_port=7000,
+        )
+        cluster = Cluster.__new__(Cluster)
+        cluster.nodes = [node]
+        cluster.cluster_name = "test-cluster"
+        cluster.ack_timeout_ms = 1_000
+        cluster._container_name = lambda selected: f"node-{selected.node_id}"
+        cluster.peer_credentials = SimpleNamespace(
+            node=lambda _node_id: SimpleNamespace(
+                trust_bundle=Path("ca.pem"),
+                certificate_chain=Path("tls.crt"),
+                private_key=Path("tls.key"),
+            )
+        )
+
+        cluster.runtime = "container"
+        container_command = cluster._node_command(node, bootstrap=False)
+        self.assertIn("--insecure-development-listen", container_command)
+        self.assertIn("0.0.0.0:4222", container_command)
+
+        cluster.runtime = "process"
+        process_command = cluster._node_command(node, bootstrap=False)
+        self.assertNotIn("--insecure-development-listen", process_command)
+        self.assertIn("127.0.0.1:4222", process_command)
+
     def test_persistence_write_counter_scrape_deltas_are_fixed_and_per_process(self) -> None:
         def metrics(*, successes: int, elapsed: int, offered: int) -> dict[str, float]:
             labels = 'role="raft_log_rewrite",operation="write_all"'
@@ -318,8 +546,13 @@ class ClusterBenchmarkTests(unittest.TestCase):
         self.assertEqual(result["run_id"], "run-id")
         self.assertEqual(result["workload"]["retained_hot_path_messages"], 2048)
         self.assertEqual(result["workload"]["slow_consumer_timeout_seconds"], 60.0)
+        self.assertEqual(
+            result["workload"]["preload_readiness_timeout_seconds"],
+            DEFAULT_PRELOAD_READINESS_TIMEOUT_SECONDS,
+        )
         self.assertNotIn("retained_recovery_messages", result["workload"])
         self.assertEqual(result["backends"]["runnel-cluster"]["startup_seconds"], 2.0)
+        self.assertEqual(result["backends"]["runnel-cluster"]["preload_readiness"], [])
         self.assertEqual(
             result["backends"]["runnel-cluster"]["scenarios"],
             [{"operation": "cluster_retained_hot_path"}],
@@ -1613,8 +1846,8 @@ class ClusterBenchmarkTests(unittest.TestCase):
         self.assertEqual(
             client.request_body["records"],
             [
-                {"key": None, "payload_base64": "cGF5bG9hZA=="},
-                {"key": None, "payload_base64": "cGF5bG9hZA=="},
+                {"key": None, "payload": "payload"},
+                {"key": None, "payload": "payload"},
             ],
         )
 
@@ -1676,7 +1909,7 @@ class ClusterBenchmarkTests(unittest.TestCase):
             return operation()
 
         with (
-            patch("cluster_scenarios.publish_stream") as publish_stream,
+            patch("cluster_scenarios.preload") as preload_mock,
             patch("cluster_scenarios.publish_batch_request", side_effect=publish_batch_message),
             patch("cluster_scenarios.measure_scenario", side_effect=run_measurement),
         ):
@@ -1689,7 +1922,7 @@ class ClusterBenchmarkTests(unittest.TestCase):
                 batch_size=2,
             )
 
-        publish_stream.assert_called_once_with(setup, "events", "payload", 2)
+        preload_mock.assert_called_once_with(cluster, "events", "payload", 2)
         self.assertEqual(result["operation"], "cluster_publish_batch")
         self.assertEqual(result["messages"], 5)
         self.assertEqual(result["latency_sample_count"], 3)
@@ -1804,7 +2037,7 @@ class ClusterBenchmarkTests(unittest.TestCase):
             return operation()
 
         with (
-            patch("cluster_scenarios.publish_stream"),
+            patch("cluster_scenarios.preload"),
             patch("cluster_scenarios.measure_scenario", side_effect=run_measurement),
             patch("cluster_scenarios.publish", return_value=(0, 100)),
         ):
@@ -1853,7 +2086,7 @@ class ClusterBenchmarkTests(unittest.TestCase):
             return operation()
 
         with (
-            patch("cluster_scenarios.publish_stream"),
+            patch("cluster_scenarios.preload"),
             patch("cluster_scenarios.measure_scenario", side_effect=run_measurement),
             patch("cluster_scenarios.publish", side_effect=publish_message),
         ):
@@ -1920,7 +2153,7 @@ class ClusterBenchmarkTests(unittest.TestCase):
             return operation()
 
         with (
-            patch("cluster_scenarios.publish_stream", side_effect=publish_setup),
+            patch("cluster_scenarios.preload", side_effect=publish_setup),
             patch("cluster_scenarios.measure_scenario", side_effect=run_measurement),
             patch("cluster_scenarios.publish", side_effect=publish_message),
         ):

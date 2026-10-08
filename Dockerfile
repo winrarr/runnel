@@ -23,4 +23,4 @@ VOLUME ["/var/lib/runnel"]
 EXPOSE 4222 7000 8080
 
 ENTRYPOINT ["runnel"]
-CMD ["--data-dir", "/var/lib/runnel", "--listen", "0.0.0.0:4222", "--http-listen", "0.0.0.0:8080"]
+CMD ["--data-dir", "/var/lib/runnel"]

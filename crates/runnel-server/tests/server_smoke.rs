@@ -1,16 +1,21 @@
+use std::fs;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, Command, Output, Stdio};
 use std::sync::mpsc;
 use std::thread::sleep;
 use std::time::{Duration, Instant};
 
+use base64::Engine as _;
+use runnel_client::{Client, ClientConfig, ClientSecurityConfig, ClientTlsConfig};
 use runnel_protocol::{
-    BinaryPayload, MAX_PUBLISH_BATCH_RECORDS, PublishBatchRecord, PublishBatchRecordResponse,
-    Request, Response,
+    BatchDeliveryReceipt, BinaryPayload, MAX_PUBLISH_BATCH_RECORDS, PublishBatchRecord,
+    PublishBatchRecordResponse, Request, Response,
 };
+use sha2::Digest as _;
 use tempfile::TempDir;
+use zeroize::Zeroize;
 
 struct RunningServer {
     child: Child,
@@ -26,18 +31,7 @@ impl RunningServer {
     fn start_with_args(data_dir: &Path, extra_args: &[&str]) -> Self {
         let broker_addr = free_addr();
         let http_addr = free_addr();
-        let binary = server_binary();
-        let mut command = Command::new(binary);
-        command.args([
-            "--data-dir",
-            data_dir.to_str().expect("temporary path should be UTF-8"),
-            "--listen",
-            &broker_addr.to_string(),
-            "--http-listen",
-            &http_addr.to_string(),
-        ]);
-        command.args(extra_args);
-        let child = command
+        let child = server_command(data_dir, broker_addr, http_addr, extra_args)
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .spawn()
@@ -47,6 +41,26 @@ impl RunningServer {
         Self {
             child,
             broker_addr,
+            http_addr,
+        }
+    }
+
+    fn start_on(
+        data_dir: &Path,
+        broker_bind_addr: SocketAddr,
+        broker_connect_addr: SocketAddr,
+        extra_args: &[&str],
+    ) -> Self {
+        let http_addr = free_addr();
+        let child = server_command(data_dir, broker_bind_addr, http_addr, extra_args)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("runnel server process should start");
+        wait_for_http(http_addr);
+        Self {
+            child,
+            broker_addr: broker_connect_addr,
             http_addr,
         }
     }
@@ -62,6 +76,31 @@ impl RunningServer {
         }
         self.child.wait().expect("server should be reaped");
     }
+}
+
+fn server_command(
+    data_dir: &Path,
+    broker_addr: SocketAddr,
+    http_addr: SocketAddr,
+    extra_args: &[&str],
+) -> Command {
+    let mut command = Command::new(server_binary());
+    command.args([
+        "--data-dir",
+        data_dir.to_str().expect("temporary path should be UTF-8"),
+        "--listen",
+        &broker_addr.to_string(),
+        "--http-listen",
+        &http_addr.to_string(),
+    ]);
+    command.args(extra_args);
+    command
+}
+
+fn run_startup(data_dir: &Path, broker_addr: SocketAddr, extra_args: &[&str]) -> Output {
+    server_command(data_dir, broker_addr, free_addr(), extra_args)
+        .output()
+        .expect("runnel startup should run")
 }
 
 fn server_binary() -> PathBuf {
@@ -304,8 +343,7 @@ fn network_protocol_persists_acknowledgements_across_restart() {
 fn network_protocol_round_trips_binary_payload_across_restart() {
     let directory = TempDir::new().unwrap();
     let server = RunningServer::start(directory.path());
-    let binary_json =
-        r#"{"op":"publish_bytes","stream":"binary","key":null,"payload_base64":"AAH/Cl8="}"#;
+    let payload = vec![0, 1, 255, b'\n', b'_'];
 
     assert!(matches!(
         request(
@@ -317,19 +355,30 @@ fn network_protocol_round_trips_binary_payload_across_restart() {
         Response::StreamCreated { created: true, .. }
     ));
     assert!(matches!(
-        request_line(server.broker_addr, binary_json),
+        request(
+            server.broker_addr,
+            Request::PublishBytes {
+                stream: "binary".to_owned(),
+                key: None,
+                payload: BinaryPayload::new(payload.clone()),
+                request_id: None,
+            },
+        ),
         Response::Published { offset: 0, .. }
     ));
     assert!(matches!(
-        request_line(
+        request(
             server.broker_addr,
-            r#"{"op":"poll","stream":"binary","consumer":"worker"}"#,
+            Request::Poll {
+                stream: "binary".to_owned(),
+                consumer: "worker".to_owned(),
+            },
         ),
         Response::MessageBytes {
             offset: 0,
-            payload_base64,
+            payload: received,
             ..
-        } if payload_base64.as_bytes() == [0, 1, 255, b'\n', b'_']
+        } if received.as_bytes() == payload
     ));
 
     server.stop();
@@ -345,20 +394,23 @@ fn network_protocol_round_trips_binary_payload_across_restart() {
         ),
         Response::ReplayMessageBytes {
             offset: 0,
-            payload_base64,
+            payload: received,
             ..
-        } if payload_base64.as_bytes() == [0, 1, 255, b'\n', b'_']
+        } if received.as_bytes() == payload
     ));
     assert!(matches!(
-        request_line(
+        request(
             server.broker_addr,
-            r#"{"op":"poll","stream":"binary","consumer":"worker"}"#,
+            Request::Poll {
+                stream: "binary".to_owned(),
+                consumer: "worker".to_owned(),
+            },
         ),
         Response::MessageBytes {
             offset: 0,
-            payload_base64,
+            payload: received,
             ..
-        } if payload_base64.as_bytes() == [0, 1, 255, b'\n', b'_']
+        } if received.as_bytes() == payload
     ));
     assert!(matches!(
         request(
@@ -377,39 +429,264 @@ fn network_protocol_round_trips_binary_payload_across_restart() {
 }
 
 #[test]
-fn network_protocol_rejects_binary_conflicts_before_engine_execution() {
+fn network_protocol_rejects_json_lines_without_processing_the_request() {
     let directory = TempDir::new().unwrap();
     let server = RunningServer::start(directory.path());
+    let mut stream = TcpStream::connect(server.broker_addr).expect("broker should accept TCP");
+    stream
+        .set_read_timeout(Some(Duration::from_secs(2)))
+        .expect("read timeout should be set");
+    stream
+        .write_all(b"{\"op\":\"create_stream\",\"stream\":\"events\"}\n")
+        .unwrap();
+    let mut response = Vec::new();
+    stream.read_to_end(&mut response).unwrap();
+    assert!(response.is_empty(), "v1 JSON must not receive a response");
 
     assert!(matches!(
-        request(
-            server.broker_addr,
-            Request::CreateStream {
-                stream: "binary".to_owned(),
-            },
+        request(server.broker_addr, Request::Health),
+        Response::Health { streams: 0, .. }
+    ));
+}
+
+#[test]
+fn remote_plaintext_startup_is_rejected_without_the_development_override() {
+    let directory = TempDir::new().unwrap();
+    let output = run_startup(directory.path(), "0.0.0.0:0".parse().unwrap(), &[]);
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("non-loopback application listener"));
+
+    let connect_addr = free_addr();
+    let bind_addr = SocketAddr::from(([0, 0, 0, 0], connect_addr.port()));
+    let server = RunningServer::start_on(
+        directory.path(),
+        bind_addr,
+        connect_addr,
+        &["--insecure-development-listen"],
+    );
+    assert!(matches!(
+        request(server.broker_addr, Request::Health),
+        Response::Health { .. }
+    ));
+}
+
+#[test]
+fn invalid_security_policy_fails_before_the_listener_accepts_connections() {
+    let directory = TempDir::new().unwrap();
+    let (certificate, key, policy, _) =
+        write_application_security_files(directory.path(), &[("operator", "operator")]);
+    write_private_file(&policy, br#"{"credentials":[]}"#);
+    let broker_addr = free_addr();
+    let output = run_startup(
+        directory.path(),
+        broker_addr,
+        &[
+            "--app-tls-cert",
+            certificate.to_str().unwrap(),
+            "--app-tls-key",
+            key.to_str().unwrap(),
+            "--credential-policy",
+            policy.to_str().unwrap(),
+        ],
+    );
+    assert!(!output.status.success());
+    let startup_error = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        startup_error.contains("application credential policy is invalid"),
+        "unexpected startup error: {startup_error}"
+    );
+    assert!(TcpStream::connect(broker_addr).is_err());
+}
+
+#[test]
+fn application_tls_and_credentials_are_required_together_and_not_supported_in_raft_mode() {
+    let directory = TempDir::new().unwrap();
+    let certificate = directory.path().join("not-read.pem");
+    let key = directory.path().join("not-read.key");
+    let output = run_startup(
+        directory.path(),
+        free_addr(),
+        &[
+            "--app-tls-cert",
+            certificate.to_str().unwrap(),
+            "--app-tls-key",
+            key.to_str().unwrap(),
+        ],
+    );
+    assert!(!output.status.success());
+    assert!(
+        String::from_utf8_lossy(&output.stderr)
+            .contains("--credential-policy must be configured together")
+    );
+
+    let output = run_startup(
+        directory.path(),
+        free_addr(),
+        &[
+            "--engine",
+            "raft",
+            "--app-tls-cert",
+            certificate.to_str().unwrap(),
+            "--app-tls-key",
+            key.to_str().unwrap(),
+            "--credential-policy",
+            "not-read.json",
+        ],
+    );
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("unsupported with --engine raft"));
+}
+
+#[test]
+fn real_server_tls_authenticates_before_dispatch_and_enforces_roles() {
+    let directory = TempDir::new().unwrap();
+    let (certificate, key, policy, token_paths) = write_application_security_files(
+        directory.path(),
+        &[("operator", "operator"), ("application", "application")],
+    );
+    let broker_connect_addr = free_addr();
+    let broker_bind_addr = SocketAddr::from(([0, 0, 0, 0], broker_connect_addr.port()));
+    let secure_args = [
+        "--app-tls-cert",
+        certificate.to_str().unwrap(),
+        "--app-tls-key",
+        key.to_str().unwrap(),
+        "--credential-policy",
+        policy.to_str().unwrap(),
+        "--insecure-development-listen",
+    ];
+    let server = RunningServer::start_on(
+        directory.path(),
+        broker_bind_addr,
+        broker_connect_addr,
+        &secure_args,
+    );
+
+    let mut plaintext = TcpStream::connect(server.broker_addr).unwrap();
+    plaintext
+        .set_read_timeout(Some(Duration::from_secs(2)))
+        .unwrap();
+    plaintext.write_all(&runnel_protocol::v2::PREFACE).unwrap();
+    let mut plaintext_response = Vec::new();
+    let read_result = plaintext.read_to_end(&mut plaintext_response);
+    assert!(
+        plaintext_response.is_empty() || plaintext_response[0] != 0,
+        "the TLS listener must not return a length-prefixed v2 frame to plaintext"
+    );
+    assert!(
+        read_result.is_ok()
+            || matches!(
+                &read_result,
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        std::io::ErrorKind::ConnectionAborted
+                            | std::io::ErrorKind::ConnectionReset
+                            | std::io::ErrorKind::UnexpectedEof
+                    )
+            ),
+        "TLS listener did not close the rejected plaintext connection: {read_result:?}"
+    );
+    drop(plaintext);
+
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let tls = ClientTlsConfig::new("localhost").with_ca_file(&certificate);
+    let missing_credentials = ClientSecurityConfig::plaintext_development().with_tls(tls.clone());
+    let missing_auth_result = runtime.block_on(Client::connect_with_security(
+        server.broker_addr,
+        ClientConfig::default(),
+        missing_credentials,
+    ));
+    assert!(
+        matches!(
+            &missing_auth_result,
+            Err(runnel_client::ClientError::AuthenticationRequired)
         ),
-        Response::StreamCreated { created: true, .. }
+        "missing-credential connection returned {:?}",
+        missing_auth_result.as_ref().err()
+    );
+
+    let (unknown_token, _) = generate_test_credential();
+    let unknown_token_path = directory.path().join("unknown.token");
+    write_private_file(&unknown_token_path, unknown_token.as_bytes());
+    let mut unknown_token = unknown_token;
+    unknown_token.zeroize();
+    let unknown_credentials = ClientSecurityConfig::plaintext_development()
+        .with_tls(tls.clone())
+        .with_token_file(&unknown_token_path)
+        .unwrap();
+    assert!(matches!(
+        runtime.block_on(Client::connect_with_security(
+            server.broker_addr,
+            ClientConfig::default(),
+            unknown_credentials,
+        )),
+        Err(runnel_client::ClientError::AuthenticationFailed)
+    ));
+
+    let wrong_name = ClientSecurityConfig::plaintext_development()
+        .with_tls(ClientTlsConfig::new("wrong.example").with_ca_file(&certificate))
+        .with_token_file(&token_paths[0])
+        .unwrap();
+    assert!(matches!(
+        runtime.block_on(Client::connect_with_security(
+            server.broker_addr,
+            ClientConfig::default(),
+            wrong_name,
+        )),
+        Err(runnel_client::ClientError::TlsHandshake)
+    ));
+
+    let application_security = ClientSecurityConfig::plaintext_development()
+        .with_tls(tls.clone())
+        .with_token_file(&token_paths[1])
+        .unwrap();
+    let mut application = runtime
+        .block_on(Client::connect_with_security(
+            server.broker_addr,
+            ClientConfig::default(),
+            application_security,
+        ))
+        .unwrap();
+    assert!(matches!(
+        runtime.block_on(application.request(&Request::CreateStream {
+            stream: "denied".to_owned(),
+        })),
+        Ok(Response::Error { code, .. }) if code == "authorization_denied"
+    ));
+
+    let operator_security = ClientSecurityConfig::plaintext_development()
+        .with_tls(tls)
+        .with_token_file(&token_paths[0])
+        .unwrap();
+    let mut operator = runtime
+        .block_on(Client::connect_with_security(
+            server.broker_addr,
+            ClientConfig::default(),
+            operator_security,
+        ))
+        .unwrap();
+    assert!(matches!(
+        runtime.block_on(operator.request(&Request::Health)),
+        Ok(Response::Health { streams: 0, .. })
     ));
     assert!(matches!(
-        request_line(
-            server.broker_addr,
-            r#"{"op":"publish","stream":"binary","key":null,"payload":"text","payload_base64":"AA=="}"#,
-        ),
-        Response::Error { code, .. } if code == "invalid_request"
+        runtime.block_on(operator.request(&Request::CreateStream {
+            stream: "events".to_owned(),
+        })),
+        Ok(Response::StreamCreated { created: true, .. })
     ));
     assert!(matches!(
-        request_line(
-            server.broker_addr,
-            r#"{"op":"publish_bytes","stream":"binary","key":null,"payload_base64":"not base64"}"#,
-        ),
-        Response::Error { code, .. } if code == "invalid_request"
-    ));
-    assert!(matches!(
-        request_line(
-            server.broker_addr,
-            r#"{"op":"poll","stream":"binary","consumer":"worker"}"#,
-        ),
-        Response::Empty { .. }
+        runtime.block_on(application.request(&Request::Publish {
+            stream: "events".to_owned(),
+            key: None,
+            payload: "authorized".to_owned(),
+            request_id: None,
+        })),
+        Ok(Response::Published { offset: 0, .. })
     ));
 }
 
@@ -1383,6 +1660,58 @@ fn network_protocol_reassigns_group_delivery_after_restart() {
 }
 
 #[test]
+fn network_protocol_persists_fixed_retry_delay_across_restart() {
+    let directory = TempDir::new().unwrap();
+    let server = RunningServer::start(directory.path());
+    assert!(matches!(
+        request(
+            server.broker_addr,
+            Request::CreateStream {
+                stream: "events".to_owned(),
+            },
+        ),
+        Response::StreamCreated { .. }
+    ));
+    assert!(matches!(
+        request(
+            server.broker_addr,
+            Request::ConfigureConsumer {
+                stream: "events".to_owned(),
+                consumer: "worker".to_owned(),
+                ack_timeout_ms: 250,
+                max_delivery_attempts: Some(3),
+                retry_delay_ms: 500,
+            },
+        ),
+        Response::ConsumerPolicy {
+            ack_timeout_ms: 250,
+            max_delivery_attempts: Some(3),
+            retry_delay_ms: 500,
+            ..
+        }
+    ));
+    server.stop();
+
+    let server = RunningServer::start(directory.path());
+    assert!(matches!(
+        request(
+            server.broker_addr,
+            Request::InspectConsumer {
+                stream: "events".to_owned(),
+                consumer: "worker".to_owned(),
+            },
+        ),
+        Response::ConsumerPolicy {
+            configured: true,
+            ack_timeout_ms: 250,
+            max_delivery_attempts: Some(3),
+            retry_delay_ms: 500,
+            ..
+        }
+    ));
+}
+
+#[test]
 fn network_protocol_recovers_binary_publish_batch_and_request_ids() {
     let directory = TempDir::new().unwrap();
     let server = RunningServer::start(directory.path());
@@ -1395,12 +1724,12 @@ fn network_protocol_recovers_binary_publish_batch_and_request_ids() {
                 records: vec![
                     PublishBatchRecord {
                         key: Some("order-1".to_owned()),
-                        payload_base64: BinaryPayload::new(vec![0, 1, 255]),
+                        payload: BinaryPayload::new(vec![0, 1, 255]),
                         request_id: Some("batch-1".to_owned()),
                     },
                     PublishBatchRecord {
                         key: None,
-                        payload_base64: BinaryPayload::new(b"second".to_vec()),
+                        payload: BinaryPayload::new(b"second".to_vec()),
                         request_id: Some("batch-2".to_owned()),
                     },
                 ],
@@ -1423,12 +1752,12 @@ fn network_protocol_recovers_binary_publish_batch_and_request_ids() {
                 records: vec![
                     PublishBatchRecord {
                         key: Some("order-1".to_owned()),
-                        payload_base64: BinaryPayload::new(vec![0, 1, 255]),
+                        payload: BinaryPayload::new(vec![0, 1, 255]),
                         request_id: Some("batch-1".to_owned()),
                     },
                     PublishBatchRecord {
                         key: None,
-                        payload_base64: BinaryPayload::new(b"second".to_vec()),
+                        payload: BinaryPayload::new(b"second".to_vec()),
                         request_id: Some("batch-2".to_owned()),
                     },
                 ],
@@ -1450,9 +1779,9 @@ fn network_protocol_recovers_binary_publish_batch_and_request_ids() {
         ),
         Response::MessageBytes {
             offset: 0,
-            payload_base64,
+            payload,
             ..
-        } if payload_base64.as_bytes() == [0, 1, 255]
+        } if payload.as_bytes() == [0, 1, 255]
     ));
     assert!(matches!(
         request(
@@ -1488,7 +1817,7 @@ fn network_protocol_rejects_publish_batches_over_record_bound() {
     let records = (0..=MAX_PUBLISH_BATCH_RECORDS)
         .map(|_| PublishBatchRecord {
             key: None,
-            payload_base64: BinaryPayload::new(Vec::new()),
+            payload: BinaryPayload::new(Vec::new()),
             request_id: None,
         })
         .collect();
@@ -1506,6 +1835,185 @@ fn network_protocol_rejects_publish_batches_over_record_bound() {
 }
 
 #[test]
+fn real_server_rejects_batches_that_could_exceed_the_negotiated_reply_limit_before_effects() {
+    let directory = TempDir::new().unwrap();
+    let server = RunningServer::start(directory.path());
+    assert!(matches!(
+        request(
+            server.broker_addr,
+            Request::CreateStream {
+                stream: "events".to_owned(),
+            },
+        ),
+        Response::StreamCreated { created: true, .. }
+    ));
+
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let config = ClientConfig {
+        max_response_bytes: 1_024,
+        ..ClientConfig::default()
+    };
+    let mut bounded_client = runtime
+        .block_on(Client::connect_with_config(server.broker_addr, config))
+        .unwrap();
+
+    assert!(matches!(
+        runtime.block_on(bounded_client.request(&Request::PublishBatch {
+            stream: "events".to_owned(),
+            records: (0..8)
+                .map(|index| PublishBatchRecord {
+                    key: None,
+                    payload: BinaryPayload::new(format!("record-{index}").into_bytes()),
+                    request_id: None,
+                })
+                .collect(),
+        })),
+        Ok(Response::Error { code, .. }) if code == "response_too_large"
+    ));
+    assert!(matches!(
+        request(
+            server.broker_addr,
+            Request::Publish {
+                stream: "events".to_owned(),
+                key: None,
+                payload: "after-rejected-batch".to_owned(),
+                request_id: None,
+            },
+        ),
+        Response::Published { offset: 0, .. }
+    ));
+
+    let delivered = request(
+        server.broker_addr,
+        Request::PollGroup {
+            stream: "events".to_owned(),
+            consumer: "workers".to_owned(),
+            member: "member-a".to_owned(),
+        },
+    );
+    let (offset, delivery_token) = match delivered {
+        Response::Message {
+            offset,
+            delivery_token: Some(token),
+            ..
+        } => (offset, token),
+        response => panic!("expected a group delivery receipt, got {response:?}"),
+    };
+    let receipts = std::iter::once(BatchDeliveryReceipt {
+        offset,
+        delivery_token: delivery_token.clone(),
+    })
+    .chain((100..107).map(|fake_offset| BatchDeliveryReceipt {
+        offset: fake_offset,
+        delivery_token: "unknown-token".to_owned(),
+    }))
+    .collect();
+    assert!(matches!(
+        runtime.block_on(bounded_client.request(&Request::AckGroupBatch {
+            stream: "events".to_owned(),
+            consumer: "workers".to_owned(),
+            member: "member-a".to_owned(),
+            receipts,
+        })),
+        Ok(Response::Error { code, .. }) if code == "response_too_large"
+    ));
+    assert!(matches!(
+        request(
+            server.broker_addr,
+            Request::AckGroup {
+                stream: "events".to_owned(),
+                consumer: "workers".to_owned(),
+                member: "member-a".to_owned(),
+                offset,
+                delivery_token,
+            },
+        ),
+        Response::Acknowledged {
+            already_acknowledged: false,
+            ..
+        }
+    ));
+}
+
+#[test]
+fn server_response_limit_is_negotiated_and_preflights_batches_before_effects() {
+    use runnel_protocol::v2::{self, ClientHello, ServerHello};
+
+    let directory = TempDir::new().unwrap();
+    let server =
+        RunningServer::start_with_args(directory.path(), &["--max-response-bytes", "1024"]);
+
+    let mut raw = TcpStream::connect(server.broker_addr).unwrap();
+    raw.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+    raw.write_all(&v2::PREFACE).unwrap();
+    let hello = v2::encode_client_hello(&ClientHello::core_v2()).unwrap();
+    raw.write_all(hello.as_bytes()).unwrap();
+    let mut length = [0; 4];
+    raw.read_exact(&mut length).unwrap();
+    let mut body = vec![0; u32::from_be_bytes(length) as usize];
+    raw.read_exact(&mut body).unwrap();
+    let ServerHello::Accepted(accepted) = v2::decode_server_hello(&body).unwrap() else {
+        panic!("server should accept the core v2 Hello");
+    };
+    assert_eq!(accepted.max_outbound_frame_bytes, 1_024);
+    assert_eq!(accepted.server_to_client_frame_bytes, 1_024);
+    drop(raw);
+
+    assert!(matches!(
+        request(
+            server.broker_addr,
+            Request::CreateStream {
+                stream: "events".to_owned(),
+            },
+        ),
+        Response::StreamCreated { created: true, .. }
+    ));
+
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let mut client = runtime
+        .block_on(Client::connect(server.broker_addr))
+        .unwrap();
+    assert!(matches!(
+        runtime.block_on(client.request(&Request::PublishBatch {
+            stream: "events".to_owned(),
+            records: (0..8)
+                .map(|index| PublishBatchRecord {
+                    key: None,
+                    payload: BinaryPayload::new(format!("record-{index}").into_bytes()),
+                    request_id: None,
+                })
+                .collect(),
+        })),
+        Ok(Response::Error { code, .. }) if code == "response_too_large"
+    ));
+    assert!(matches!(
+        request(
+            server.broker_addr,
+            Request::Publish {
+                stream: "events".to_owned(),
+                key: None,
+                payload: "after-rejected-batch".to_owned(),
+                request_id: None,
+            },
+        ),
+        Response::Published { offset: 0, .. }
+    ));
+
+    let metrics = http_metrics(server.http_addr);
+    assert!(
+        metrics
+            .lines()
+            .any(|line| line == "runnel_broker_max_response_bytes 1024")
+    );
+}
+
+#[test]
 fn network_protocol_returns_partial_publish_batch_outcomes() {
     let directory = TempDir::new().unwrap();
     let server = RunningServer::start(directory.path());
@@ -1517,12 +2025,12 @@ fn network_protocol_returns_partial_publish_batch_outcomes() {
                 records: vec![
                     PublishBatchRecord {
                         key: None,
-                        payload_base64: BinaryPayload::new(b"rejected".to_vec()),
+                        payload: BinaryPayload::new(b"rejected".to_vec()),
                         request_id: Some("x".repeat(1_025)),
                     },
                     PublishBatchRecord {
                         key: None,
-                        payload_base64: BinaryPayload::new(b"accepted".to_vec()),
+                        payload: BinaryPayload::new(b"accepted".to_vec()),
                         request_id: Some("accepted".to_owned()),
                     },
                 ],
@@ -1584,12 +2092,12 @@ fn network_protocol_rejects_oversized_rnl1_records_without_consuming_offsets() {
                 records: vec![
                     PublishBatchRecord {
                         key: Some("k".repeat(129)),
-                        payload_base64: BinaryPayload::new(b"rejected".to_vec()),
+                        payload: BinaryPayload::new(b"rejected".to_vec()),
                         request_id: None,
                     },
                     PublishBatchRecord {
                         key: None,
-                        payload_base64: BinaryPayload::new(b"accepted".to_vec()),
+                        payload: BinaryPayload::new(b"accepted".to_vec()),
                         request_id: None,
                     },
                 ],
@@ -1604,75 +2112,90 @@ fn network_protocol_rejects_oversized_rnl1_records_without_consuming_offsets() {
 }
 
 fn request(address: SocketAddr, request: Request) -> Response {
-    let encoded = serde_json::to_string(&request).unwrap();
-    request_line(address, &encoded)
-}
-
-fn request_line(address: SocketAddr, encoded: &str) -> Response {
-    let mut stream = TcpStream::connect(address).expect("broker should accept connections");
-    stream
-        .set_read_timeout(Some(Duration::from_secs(2)))
-        .expect("read timeout should be set");
-    writeln!(stream, "{encoded}").unwrap();
-    let mut response = String::new();
-    BufReader::new(stream).read_line(&mut response).unwrap();
-    serde_json::from_str(&response).unwrap()
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap()
+        .block_on(async move {
+            let mut client = runnel_client::Client::connect(address).await.unwrap();
+            client.request(&request).await.unwrap()
+        })
 }
 
 fn request_through_dropping_proxy(address: SocketAddr, request: Request) -> Response {
+    use runnel_protocol::v2::{self, ServerFrame};
+
+    fn read_frame(stream: &mut TcpStream) -> std::io::Result<Vec<u8>> {
+        let mut length = [0; 4];
+        stream.read_exact(&mut length)?;
+        let length = u32::from_be_bytes(length) as usize;
+        let mut body = vec![0; length];
+        stream.read_exact(&mut body)?;
+        Ok(body)
+    }
+
+    fn write_frame(stream: &mut TcpStream, body: &[u8]) -> std::io::Result<()> {
+        let length = u32::try_from(body.len())
+            .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidData, "frame length"))?;
+        stream.write_all(&length.to_be_bytes())?;
+        stream.write_all(body)
+    }
+
     let listener = TcpListener::bind(("127.0.0.1", 0)).expect("proxy should bind");
     let proxy_addr = listener
         .local_addr()
         .expect("proxy address should be available");
     let (response_sender, response_receiver) = mpsc::channel();
     let proxy = std::thread::spawn(move || {
-        let (client, _) = listener.accept().expect("proxy should accept a client");
-        let mut request_line = String::new();
-        BufReader::new(
-            client
-                .try_clone()
-                .expect("proxy should clone the client connection"),
-        )
-        .read_line(&mut request_line)
-        .expect("proxy should read the client request");
+        let (mut client, _) = listener.accept().expect("proxy should accept a client");
+        let mut broker = TcpStream::connect(address).expect("proxy should reach broker");
+        client
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        broker
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
 
-        let mut broker = TcpStream::connect(address).expect("proxy should reach the broker");
-        broker
-            .set_read_timeout(Some(Duration::from_secs(2)))
-            .expect("proxy read timeout should be set");
-        broker
-            .write_all(request_line.as_bytes())
-            .expect("proxy should forward the request");
-        let mut response = String::new();
-        BufReader::new(broker)
-            .read_line(&mut response)
-            .expect("proxy should read the broker response");
+        let mut preface = [0; runnel_protocol::v2::PREFACE.len()];
+        client.read_exact(&mut preface).unwrap();
+        broker.write_all(&preface).unwrap();
+
+        let client_hello = read_frame(&mut client).unwrap();
+        write_frame(&mut broker, &client_hello).unwrap();
+        let server_hello = read_frame(&mut broker).unwrap();
+        write_frame(&mut client, &server_hello).unwrap();
+
+        let application_request = read_frame(&mut client).unwrap();
+        write_frame(&mut broker, &application_request).unwrap();
+        let application_response = read_frame(&mut broker).unwrap();
+        let response = match v2::decode_server_frame(
+            &application_response,
+            v2::MAX_SERVER_TO_CLIENT_FRAME_BYTES,
+        )
+        .unwrap()
+        {
+            ServerFrame::Application(reply) => reply.response,
+            _ => panic!("broker should return an application response"),
+        };
         response_sender
             .send(response)
             .expect("test should receive the broker response");
-        drop(client);
     });
 
-    let encoded = serde_json::to_string(&request).expect("request should serialize");
-    let mut client = TcpStream::connect(proxy_addr).expect("client should reach the proxy");
-    client
-        .set_read_timeout(Some(Duration::from_secs(2)))
-        .expect("client read timeout should be set");
-    writeln!(client, "{encoded}").expect("client should write the request");
-    let mut response = String::new();
-    assert_eq!(
-        BufReader::new(client)
-            .read_line(&mut response)
-            .expect("client should observe the dropped response"),
-        0,
-        "proxy should close the client connection without forwarding the response"
-    );
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap()
+        .block_on(async move {
+            let mut client = runnel_client::Client::connect(proxy_addr).await.unwrap();
+            let _ = client.request(&request).await;
+        });
 
     let response = response_receiver
-        .recv_timeout(Duration::from_secs(2))
-        .expect("proxy should observe a broker response");
+        .recv_timeout(Duration::from_secs(5))
+        .expect("proxy should observe the broker response");
     proxy.join().expect("proxy should finish cleanly");
-    serde_json::from_str(&response).expect("broker response should be valid JSON")
+    response
 }
 
 fn free_addr() -> SocketAddr {
@@ -1680,6 +2203,60 @@ fn free_addr() -> SocketAddr {
         .unwrap()
         .local_addr()
         .unwrap()
+}
+
+fn write_application_security_files(
+    directory: &Path,
+    roles: &[(&str, &str)],
+) -> (PathBuf, PathBuf, PathBuf, Vec<PathBuf>) {
+    let certificate_path = directory.join("application-cert.pem");
+    let key_path = directory.join("application-key.pem");
+    let policy_path = directory.join("credentials.json");
+    let certificate = rcgen::generate_simple_self_signed(vec!["localhost".to_owned()])
+        .expect("localhost test certificate should generate");
+    fs::write(&certificate_path, certificate.cert.pem()).unwrap();
+    write_private_file(
+        &key_path,
+        certificate.signing_key.serialize_pem().as_bytes(),
+    );
+
+    let mut policy_credentials = Vec::with_capacity(roles.len());
+    let mut token_paths = Vec::with_capacity(roles.len());
+    for (id, role) in roles {
+        let (token, digest) = generate_test_credential();
+        let token_path = directory.join(format!("{id}.token"));
+        write_private_file(&token_path, token.as_bytes());
+        let mut token = token;
+        token.zeroize();
+        token_paths.push(token_path);
+        policy_credentials.push(format!(
+            r#"{{"id":"{id}","sha256":"{digest}","role":"{role}"}}"#
+        ));
+    }
+    write_private_file(
+        &policy_path,
+        format!(r#"{{"credentials":[{}]}}"#, policy_credentials.join(",")).as_bytes(),
+    );
+    (certificate_path, key_path, policy_path, token_paths)
+}
+
+fn generate_test_credential() -> (String, String) {
+    let mut random = [0_u8; 32];
+    getrandom::fill(&mut random).expect("test credential randomness should be available");
+    let token = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(random);
+    random.fill(0);
+    let digest = sha2::Sha256::digest(token.as_bytes());
+    let digest = digest.iter().map(|byte| format!("{byte:02x}")).collect();
+    (token, digest)
+}
+
+fn write_private_file(path: &Path, content: &[u8]) {
+    fs::write(path, content).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(path, fs::Permissions::from_mode(0o600)).unwrap();
+    }
 }
 
 fn http_metrics(address: SocketAddr) -> String {

@@ -3,6 +3,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use runnel_engine::{
     AckBatchItem, AckBatchOutcome, AckBatchRejection, AckBatchResult, ConsumerPolicy,
     DeliveryReceipt, Message, Offset, PollBatchResponseSizer, PollResult, poll_batch_response_len,
+    poll_message_response_upper_bound_parts,
 };
 use serde::{Deserialize, Serialize};
 
@@ -79,6 +80,8 @@ pub(super) struct GroupPollRequest {
     pub(super) stream: String,
     pub(super) consumer: String,
     pub(super) member: String,
+    pub(super) response_member: Option<String>,
+    pub(super) max_response_bytes: usize,
     pub(super) now_ms: u64,
     pub(super) lease_deadline_ms: u64,
     pub(super) max_delivery_attempts: Option<u32>,
@@ -129,23 +132,32 @@ pub(super) fn apply_group_poll(
     if matches!(kind, GroupKind::Metadata) {
         return CommandResponse::StreamNotFound;
     }
+    if !state
+        .streams
+        .get(&request.stream)
+        .is_some_and(StreamState::is_active)
+    {
+        return CommandResponse::StreamNotFound;
+    }
+    if group_poll_response_upper_bound(state, &request, log_id)
+        .is_some_and(|response_bytes| response_bytes > request.max_response_bytes)
+    {
+        return CommandResponse::GroupPollResponseTooLarge {
+            max_bytes: request.max_response_bytes,
+        };
+    }
     let GroupPollRequest {
         stream,
         consumer,
         member,
+        response_member: _,
+        max_response_bytes: _,
         now_ms,
         lease_deadline_ms,
         max_delivery_attempts,
         legacy_ack_timeout_ms,
         policy_version,
     } = request;
-    if !state
-        .streams
-        .get(&stream)
-        .is_some_and(StreamState::is_active)
-    {
-        return CommandResponse::StreamNotFound;
-    }
     let now_ms = observe_lease_clock(state, now_ms);
     let legacy_policy = ConsumerPolicy::legacy(
         legacy_ack_timeout_ms.unwrap_or_default(),
@@ -998,6 +1010,111 @@ fn group_poll_message(
     }
 }
 
+fn group_poll_response_upper_bound(
+    state: &SnapshotState,
+    request: &GroupPollRequest,
+    log_id: openraft::LogId<super::NodeId>,
+) -> Option<usize> {
+    let stream_state = state.streams.get(&request.stream)?;
+    let consumer_key = (request.stream.clone(), request.consumer.clone());
+    let now_ms = state.lease_clock_ms.max(request.now_ms);
+    let mut consumer_state = state
+        .group_consumers
+        .get(&consumer_key)
+        .cloned()
+        .unwrap_or_else(|| GroupConsumerState {
+            committed_offset: state
+                .consumers
+                .get(&consumer_key)
+                .copied()
+                .unwrap_or_default(),
+            ..GroupConsumerState::default()
+        });
+    consumer_state
+        .in_flight
+        .retain(|_, delivery| !lease_expired(delivery.deadline_ms, now_ms));
+
+    if let Some((offset, delivery)) = consumer_state
+        .in_flight
+        .iter()
+        .find(|(_, delivery)| delivery.member == request.member)
+    {
+        let stored = stream_state.messages.get(*offset as usize)?;
+        return Some(poll_message_response_upper_bound_parts(
+            &request.stream,
+            &request.consumer,
+            request.response_member.as_deref(),
+            *offset,
+            stored.key.as_deref(),
+            stored.payload.len(),
+            stored.published_at_ms,
+            Some(&delivery.delivery_token),
+            Some(delivery.delivery_attempt),
+            request.response_member.is_some(),
+        ));
+    }
+
+    let legacy_policy = ConsumerPolicy::legacy(
+        request.legacy_ack_timeout_ms.unwrap_or_default(),
+        request.max_delivery_attempts,
+    );
+    let token = format!("raft-{log_id}");
+    loop {
+        let candidate = stream_state
+            .messages
+            .iter()
+            .enumerate()
+            .map(|(offset, message)| (offset as Offset, message))
+            .filter(|(offset, _)| *offset >= consumer_state.committed_offset)
+            .find(|(offset, message)| {
+                if consumer_state.acknowledged_offsets.contains(offset)
+                    || consumer_state.in_flight.contains_key(offset)
+                {
+                    return false;
+                }
+                message.key.as_ref().is_none_or(|key| {
+                    !consumer_state
+                        .in_flight
+                        .values()
+                        .any(|delivery| delivery.key.as_ref() == Some(key))
+                })
+            });
+        let (offset, stored) = candidate?;
+        let attempts = consumer_state
+            .delivery_attempts
+            .get(&offset)
+            .copied()
+            .unwrap_or_default();
+        let policy = group_policy_for_offset(
+            &consumer_state,
+            offset,
+            attempts,
+            &legacy_policy,
+            request.policy_version,
+        );
+        if policy
+            .max_delivery_attempts
+            .is_some_and(|maximum| attempts >= maximum)
+            && !is_dead_letter_stream(state, &request.stream)
+        {
+            acknowledge_group_offset(&mut consumer_state, offset);
+            continue;
+        }
+        return Some(poll_message_response_upper_bound_parts(
+            &request.stream,
+            &request.consumer,
+            request.response_member.as_deref(),
+            offset,
+            stored.key.as_deref(),
+            stored.payload.len(),
+            stored.published_at_ms,
+            Some(&token),
+            Some(attempts.saturating_add(1)),
+            request.response_member.is_some(),
+        ));
+    }
+}
+
 pub(super) fn apply_group_ack(
     state: &mut SnapshotState,
     request: GroupAckRequest,
@@ -1244,6 +1361,8 @@ mod retry_delay_tests {
             stream: "events".to_owned(),
             consumer: "workers".to_owned(),
             member: member.to_owned(),
+            response_member: None,
+            max_response_bytes: runnel_engine::MAX_CONSUME_BATCH_RESPONSE_BYTES,
             now_ms,
             lease_deadline_ms,
             max_delivery_attempts: None,

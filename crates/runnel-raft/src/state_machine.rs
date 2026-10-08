@@ -28,6 +28,7 @@ pub enum Command {
     Publish {
         stream: String,
         key: Option<String>,
+        #[serde(with = "command_payload")]
         payload: Vec<u8>,
         published_at_ms: u64,
         request_id: Option<String>,
@@ -53,6 +54,10 @@ pub enum Command {
         stream: String,
         consumer: String,
         member: String,
+        #[serde(default)]
+        response_member: Option<String>,
+        #[serde(default = "default_poll_response_limit")]
+        max_response_bytes: usize,
         now_ms: u64,
         lease_deadline_ms: u64,
         max_delivery_attempts: Option<u32>,
@@ -91,6 +96,90 @@ pub enum Command {
     },
 }
 
+/// Keep arbitrary command payloads compact in the JSON peer RPC and journal
+/// formats. JSON's default `Vec<u8>` representation expands each byte into a
+/// decimal integer, which can exceed the bounded peer-frame size by several
+/// times.
+mod command_payload {
+    use base64::Engine as _;
+    use serde::de::Error as _;
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+
+    #[derive(Serialize)]
+    #[serde(untagged)]
+    enum PayloadRef<'a> {
+        Text(&'a str),
+        Binary { base64: String },
+    }
+
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum Payload<'a> {
+        Text(String),
+        Binary {
+            #[serde(borrow)]
+            base64: &'a str,
+        },
+    }
+
+    pub(super) fn serialize<S>(payload: &[u8], serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let encoded = match std::str::from_utf8(payload) {
+            Ok(text)
+                if text
+                    .bytes()
+                    .all(|byte| (b' '..=b'~').contains(&byte) && !matches!(byte, b'"' | b'\\')) =>
+            {
+                PayloadRef::Text(text)
+            }
+            _ => PayloadRef::Binary {
+                base64: base64::engine::general_purpose::STANDARD.encode(payload),
+            },
+        };
+        encoded.serialize(serializer)
+    }
+
+    pub(super) fn deserialize<'de, D>(deserializer: D) -> Result<Vec<u8>, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        match Payload::deserialize(deserializer)? {
+            Payload::Text(text) => Ok(text.into_bytes()),
+            Payload::Binary { base64 } => base64::engine::general_purpose::STANDARD
+                .decode(base64)
+                .map_err(D::Error::custom),
+        }
+    }
+}
+
+#[cfg(test)]
+mod command_payload_tests {
+    use super::Command;
+
+    #[test]
+    fn binary_publish_command_has_bounded_json_expansion() {
+        let payload = vec![0xff; 256 * 1024];
+        let command = Command::Publish {
+            stream: "events".to_owned(),
+            key: None,
+            payload: payload.clone(),
+            published_at_ms: 1,
+            request_id: None,
+        };
+        let encoded = serde_json::to_vec(&command).unwrap();
+        assert!(encoded.len() < 256 * 1024 + (256 * 1024) / 3 + 1024);
+        let Command::Publish {
+            payload: decoded, ..
+        } = serde_json::from_slice::<Command>(&encoded).unwrap()
+        else {
+            panic!("expected Publish command");
+        };
+        assert_eq!(decoded, payload);
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum CommandResponse {
     StreamCreated {
@@ -117,6 +206,9 @@ pub enum CommandResponse {
     },
     GroupPoll {
         result: runnel_engine::PollResult,
+    },
+    GroupPollResponseTooLarge {
+        max_bytes: usize,
     },
     GroupBatchPoll {
         messages: Vec<Message>,
@@ -461,6 +553,8 @@ pub(super) fn apply_command(
             stream,
             consumer,
             member,
+            response_member,
+            max_response_bytes,
             now_ms,
             lease_deadline_ms,
             max_delivery_attempts,
@@ -472,6 +566,8 @@ pub(super) fn apply_command(
                 stream,
                 consumer,
                 member,
+                response_member,
+                max_response_bytes,
                 now_ms,
                 lease_deadline_ms,
                 max_delivery_attempts,
@@ -551,6 +647,10 @@ pub(super) fn apply_command(
             kind,
         ),
     }
+}
+
+fn default_poll_response_limit() -> usize {
+    runnel_engine::MAX_CONSUME_BATCH_RESPONSE_BYTES
 }
 
 fn apply_replay(
