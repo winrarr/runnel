@@ -83,7 +83,7 @@ jobs:
             --inputs benchmark-results/normalized/cluster-comparison-repetition-*.json \
             --output benchmark-results/normalized/cluster-comparison-aggregate.json
       - name: Upload raw and aggregated results
-        uses: actions/upload-artifact@v7.0.1
+        uses: actions/upload-artifact@v7.0.2
         with:
           name: competitor-benchmark-run-${{ github.run_id }}
           path: benchmark-results
