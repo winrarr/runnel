@@ -1662,7 +1662,7 @@ dependencies = [
  "base64",
  "clap",
  "data-encoding",
- "getrandom 0.3.4",
+ "getrandom 0.4.3",
  "rcgen",
  "runnel-client",
  "runnel-core",
