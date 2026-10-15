@@ -101,7 +101,7 @@ jobs:
         with:
           fetch-depth: 0
       - name: Download benchmark result
-        uses: actions/download-artifact@v8.0.1
+        uses: actions/download-artifact@v8.0.2
         with:
           name: competitor-benchmark-run-${{ github.run_id }}
           path: benchmark-results
