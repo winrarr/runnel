@@ -1,0 +1,1789 @@
+{
+  "history_schema_version": 1,
+  "schema_version": 2,
+  "run_id": "aggregate-2026-11-16T11:46:45.691872+00:00",
+  "started_at": "2026-11-16T11:40:19.749423+00:00",
+  "generated_at": "2026-11-16T11:46:45.691872+00:00",
+  "finished_at": "2026-11-16T11:46:45.691872+00:00",
+  "status": "complete",
+  "command": [
+    "scripts/benchmarks/compare.py",
+    "--nodes",
+    "3",
+    "--backends",
+    "kafka,redpanda,nats",
+    "--messages",
+    "10000",
+    "--payload-sizes",
+    "100,1024",
+    "--cpus",
+    "2",
+    "--memory",
+    "2g",
+    "--client-cpus",
+    "1",
+    "--client-memory",
+    "512m",
+    "--output",
+    "benchmark-results/raw/cluster-comparison-1.json"
+  ],
+  "source": {
+    "repository": "winrarr/runnel",
+    "revision": "04ff0e7b42f82bcbfdc79021ec8fee448e6d85e4",
+    "ref": "main",
+    "event": "schedule",
+    "workflow": "Competitor benchmark history",
+    "run_id": "43858956697",
+    "run_url": "https://github.com/winrarr/runnel/actions/runs/43858956697",
+    "profile": "scheduled",
+    "repetitions": 3,
+    "repetition_run_ids": [
+      "20261116114019749423",
+      "20261116114228471551",
+      "20261116114437173631"
+    ]
+  },
+  "environment": {
+    "host": "ip-10-0-140-213",
+    "platform": "Linux-7.0.0-1014-aws-x86_64-with-glibc2.39",
+    "processor": "x86_64",
+    "python": "3.12.3",
+    "cpus": 4,
+    "docker_server": "28.0.4"
+  },
+  "comparison_mode": "three-node replicated durable publish; backend-specific clients; publish-only first slice",
+  "benchmark_suite": "cluster-comparison",
+  "resource_limits": {
+    "broker_cpu": "2",
+    "broker_memory": "2g",
+    "client_cpu": "1",
+    "client_memory": "512m",
+    "client_scope": "Runnel uses an unbounded host-side Python client; native competitor clients run in containers with the declared client limits"
+  },
+  "workload": {
+    "messages": 10000,
+    "payload_sizes_bytes": [
+      100,
+      1024
+    ],
+    "single_node": false,
+    "nodes": 3,
+    "replication_factor": 3,
+    "operations": [
+      "publish"
+    ],
+    "compression": "disabled where the native client exposes the setting"
+  },
+  "comparison_guardrail": {
+    "classification": "native-tool-baseline",
+    "apples_to_apples": false,
+    "ranking_eligible": false,
+    "experimental": true,
+    "mismatch_dimensions": [
+      "acknowledgement",
+      "durability",
+      "replication",
+      "delivery",
+      "batching",
+      "client",
+      "latency"
+    ],
+    "scenario_scope": "publish-only",
+    "reason": "native clients and operation-specific acknowledgement, durability, replication, delivery, batching, client, and latency boundaries are not an apples-to-apples end-to-end ranking"
+  },
+  "aggregate": {
+    "repetitions": 3,
+    "first_generated_at": "2026-11-16T11:42:28.356533+00:00",
+    "last_generated_at": "2026-11-16T11:46:45.691872+00:00"
+  },
+  "repetition_runs": [
+    {
+      "run_id": "20261116114019749423",
+      "generated_at": "2026-11-16T11:42:28.356533+00:00",
+      "source_result": "cluster-comparison-1.json"
+    },
+    {
+      "run_id": "20261116114228471551",
+      "generated_at": "2026-11-16T11:44:37.062660+00:00",
+      "source_result": "cluster-comparison-2.json"
+    },
+    {
+      "run_id": "20261116114437173631",
+      "generated_at": "2026-11-16T11:46:45.691872+00:00",
+      "source_result": "cluster-comparison-3.json"
+    }
+  ],
+  "backends": {
+    "kafka": {
+      "image": "apache/kafka:4.3.1",
+      "image_id": "sha256:47dccc76b32761bc57462b8753144cdbb73a16b123b1d13d3eedb92bb7952b11",
+      "image_ids": [
+        "sha256:47dccc76b32761bc57462b8753144cdbb73a16b123b1d13d3eedb92bb7952b11",
+        "sha256:47dccc76b32761bc57462b8753144cdbb73a16b123b1d13d3eedb92bb7952b11",
+        "sha256:47dccc76b32761bc57462b8753144cdbb73a16b123b1d13d3eedb92bb7952b11"
+      ],
+      "runtime": "container",
+      "cpu_limit": "2",
+      "memory_limit": "2g",
+      "acknowledgement": "Kafka producer performance client with acks=all and idempotence enabled; topic min.insync.replicas=3",
+      "replication": "three broker nodes, one partition, replication factor three, min.insync.replicas three",
+      "measurement_boundary": "Kafka native producer performance client over the Kafka protocol; durable publish only",
+      "measurement_client": "Kafka producer performance client",
+      "client_image": "apache/kafka:4.3.1",
+      "semantic_metadata": {
+        "acknowledgement_boundary": "Kafka producer performance client with acks=all and idempotence enabled; topic min.insync.replicas=3",
+        "replication_topology": "three broker nodes, one partition, replication factor three, min.insync.replicas three",
+        "measurement_boundary": "Kafka native producer performance client over the Kafka protocol; durable publish only",
+        "client_identity": {
+          "name": "Kafka producer performance client",
+          "image": "apache/kafka:4.3.1"
+        },
+        "scenario_classes": [
+          "publish-only"
+        ],
+        "scenario_boundaries": {
+          "publish-only": {
+            "acknowledgement_boundary": "Kafka producer performance client with acks=all and idempotence enabled; topic min.insync.replicas=3",
+            "durability_boundary": "one-partition broker log with replication factor three and min.insync.replicas=3; filesystem flush behavior is not asserted",
+            "replication_topology": "three broker nodes, one partition, replication factor three, min.insync.replicas three",
+            "delivery_boundary": "not applicable to publish-only",
+            "batching_boundary": "Kafka producer perf client uses linger.ms=0 and the default batch.size; native client batching remains possible",
+            "client_boundary": "Kafka producer performance client from apache/kafka:4.3.1",
+            "latency_boundary": "native Kafka producer latency includes client-side batching and reports avg/p50/p95/p99/p99.9/max"
+          }
+        },
+        "comparison": {
+          "classification": "native-tool-baseline",
+          "apples_to_apples": false,
+          "ranking_eligible": false,
+          "experimental": true,
+          "mismatch_dimensions": [
+            "acknowledgement",
+            "durability",
+            "replication",
+            "delivery",
+            "batching",
+            "client",
+            "latency"
+          ]
+        }
+      },
+      "startup_seconds": 0.164746028,
+      "nodes": [
+        {
+          "image": "apache/kafka:4.3.1",
+          "image_id": "sha256:47dccc76b32761bc57462b8753144cdbb73a16b123b1d13d3eedb92bb7952b11",
+          "cpu_limit": "2",
+          "memory_limit": "2g",
+          "startup_seconds": 0.093925839,
+          "resource_samples": {
+            "samples": 25,
+            "cpu_percent_avg": 18.096400000000003,
+            "cpu_percent_max": 109.81,
+            "memory_bytes_avg": 302109425.66400003,
+            "memory_bytes_max": 340158054.4,
+            "memory_percent_avg": 14.0672,
+            "memory_percent_max": 15.84
+          },
+          "log_tail": "}), supportedKRaftVersion=SupportedVersionRange[min_version:0, max_version:1])}) (org.apache.kafka.raft.internals.UpdateVoterHandler)\n[2026-11-16 11:40:32,810] INFO [LogLoader partition=bench-kafka-100-0, dir=/var/lib/kafka/data] Loading producer state till offset 0 (org.apache.kafka.storage.internals.log.UnifiedLog)\n[2026-11-16 11:40:32,851] INFO Created log for partition bench-kafka-100-0 in /var/lib/kafka/data/bench-kafka-100-0 with properties {min.insync.replicas=3} (kafka.log.LogManager)\n[2026-11-16 11:40:32,852] INFO [Partition bench-kafka-100-0 broker=1] No checkpointed highwatermark is found for partition bench-kafka-100-0 (kafka.cluster.Partition)\n[2026-11-16 11:40:32,859] INFO [Partition bench-kafka-100-0 broker=1] Log loaded for partition bench-kafka-100-0 with initial high watermark 0 (kafka.cluster.Partition)\n[2026-11-16 11:40:32,871] INFO [ReplicaFetcherManager on broker 1] Removed fetcher for partitions Set(bench-kafka-100-0) (kafka.server.ReplicaFetcherManager)\n[2026-11-16 11:40:32,906] INFO [ReplicaFetcherThread-0-3]: Starting (kafka.server.ReplicaFetcherThread)\n[2026-11-16 11:40:32,909] INFO [ReplicaFetcherManager on broker 1] Added fetcher to broker 3 for partitions HashMap(bench-kafka-100-0 -> InitialFetchState(Some(SbUMyfdZReObB-nmz0pApA),BrokerEndPoint[id=3, host=runnel-compare-31463-1794829219766309040-kafka-3, port=9092],0,0)) (kafka.server.ReplicaFetcherManager)\n[2026-11-16 11:40:32,912] INFO [ReplicaFetcher replicaId=1, leaderId=3, fetcherId=0] Truncating partition bench-kafka-100-0 with TruncationState(offset=0, completed=true) due to local high watermark 0 (kafka.server.ReplicaFetcherThread)\n[2026-11-16 11:40:32,913] INFO [UnifiedLog partition=bench-kafka-100-0, dir=/var/lib/kafka/data] Truncating to 0 has no effect as the largest offset in the log is -1 (org.apache.kafka.storage.internals.log.UnifiedLog)\n[2026-11-16 11:40:32,928] INFO [DynamicConfigPublisher broker id=1] Updating topic bench-kafka-100 with new configuration : min.insync.replicas -> 3 (kafka.server.metadata.DynamicConfigPublisher)\n[2026-11-16 11:40:50,704] INFO [LogLoader partition=bench-kafka-1024-0, dir=/var/lib/kafka/data] Loading producer state till offset 0 (org.apache.kafka.storage.internals.log.UnifiedLog)\n[2026-11-16 11:40:50,706] INFO Created log for partition bench-kafka-1024-0 in /var/lib/kafka/data/bench-kafka-1024-0 with properties {min.insync.replicas=3} (kafka.log.LogManager)\n[2026-11-16 11:40:50,708] INFO [Partition bench-kafka-1024-0 broker=1] No checkpointed highwatermark is found for partition bench-kafka-1024-0 (kafka.cluster.Partition)\n[2026-11-16 11:40:50,708] INFO [Partition bench-kafka-1024-0 broker=1] Log loaded for partition bench-kafka-1024-0 with initial high watermark 0 (kafka.cluster.Partition)\n[2026-11-16 11:40:50,710] INFO [ReplicaFetcherManager on broker 1] Removed fetcher for partitions Set(bench-kafka-1024-0) (kafka.server.ReplicaFetcherManager)\n[2026-11-16 11:40:50,713] INFO [ReplicaFetcherThread-0-2]: Starting (kafka.server.ReplicaFetcherThread)\n[2026-11-16 11:40:50,714] INFO [ReplicaFetcherManager on broker 1] Added fetcher to broker 2 for partitions HashMap(bench-kafka-1024-0 -> InitialFetchState(Some(MR7ae0j8SWKe-zgivCPhWQ),BrokerEndPoint[id=2, host=runnel-compare-31463-1794829219766309040-kafka-2, port=9092],0,0)) (kafka.server.ReplicaFetcherManager)\n[2026-11-16 11:40:50,714] INFO [DynamicConfigPublisher broker id=1] Updating topic bench-kafka-1024 with new configuration : min.insync.replicas -> 3 (kafka.server.metadata.DynamicConfigPublisher)\n[2026-11-16 11:40:51,715] INFO [ReplicaFetcher replicaId=1, leaderId=2, fetcherId=0] Truncating partition bench-kafka-1024-0 with TruncationState(offset=0, completed=true) due to local high watermark 0 (kafka.server.ReplicaFetcherThread)\n[2026-11-16 11:40:51,716] INFO [UnifiedLog partition=bench-kafka-1024-0, dir=/var/lib/kafka/data] Truncating to 0 has no effect as the largest offset in the log is -1 (org.apache.kafka.storage.internals.log.UnifiedLog)\n"
+        },
+        {
+          "image": "apache/kafka:4.3.1",
+          "image_id": "sha256:47dccc76b32761bc57462b8753144cdbb73a16b123b1d13d3eedb92bb7952b11",
+          "cpu_limit": "2",
+          "memory_limit": "2g",
+          "startup_seconds": 0.106338486,
+          "resource_samples": {
+            "samples": 23,
+            "cpu_percent_avg": 14.270869565217392,
+            "cpu_percent_max": 120.14,
+            "memory_bytes_avg": 325181653.7043478,
+            "memory_bytes_max": 354418688.0,
+            "memory_percent_avg": 15.14304347826087,
+            "memory_percent_max": 16.5
+          },
+          "log_tail": "092 (org.apache.kafka.common.utils.AppInfoParser)\n[2026-11-16 11:40:26,098] INFO [KafkaRaftServer nodeId=2] Kafka Server started (kafka.server.KafkaRaftServer)\n[2026-11-16 11:40:32,826] INFO [LogLoader partition=bench-kafka-100-0, dir=/var/lib/kafka/data] Loading producer state till offset 0 (org.apache.kafka.storage.internals.log.UnifiedLog)\n[2026-11-16 11:40:32,828] INFO Created log for partition bench-kafka-100-0 in /var/lib/kafka/data/bench-kafka-100-0 with properties {min.insync.replicas=3} (kafka.log.LogManager)\n[2026-11-16 11:40:32,832] INFO [Partition bench-kafka-100-0 broker=2] No checkpointed highwatermark is found for partition bench-kafka-100-0 (kafka.cluster.Partition)\n[2026-11-16 11:40:32,836] INFO [Partition bench-kafka-100-0 broker=2] Log loaded for partition bench-kafka-100-0 with initial high watermark 0 (kafka.cluster.Partition)\n[2026-11-16 11:40:32,849] INFO [ReplicaFetcherManager on broker 2] Removed fetcher for partitions Set(bench-kafka-100-0) (kafka.server.ReplicaFetcherManager)\n[2026-11-16 11:40:32,907] INFO [ReplicaFetcherThread-0-3]: Starting (kafka.server.ReplicaFetcherThread)\n[2026-11-16 11:40:32,918] INFO [ReplicaFetcherManager on broker 2] Added fetcher to broker 3 for partitions HashMap(bench-kafka-100-0 -> InitialFetchState(Some(SbUMyfdZReObB-nmz0pApA),BrokerEndPoint[id=3, host=runnel-compare-31463-1794829219766309040-kafka-3, port=9092],0,0)) (kafka.server.ReplicaFetcherManager)\n[2026-11-16 11:40:32,919] INFO [ReplicaFetcher replicaId=2, leaderId=3, fetcherId=0] Truncating partition bench-kafka-100-0 with TruncationState(offset=0, completed=true) due to local high watermark 0 (kafka.server.ReplicaFetcherThread)\n[2026-11-16 11:40:32,926] INFO [UnifiedLog partition=bench-kafka-100-0, dir=/var/lib/kafka/data] Truncating to 0 has no effect as the largest offset in the log is -1 (org.apache.kafka.storage.internals.log.UnifiedLog)\n[2026-11-16 11:40:32,936] INFO [DynamicConfigPublisher broker id=2] Updating topic bench-kafka-100 with new configuration : min.insync.replicas -> 3 (kafka.server.metadata.DynamicConfigPublisher)\n[2026-11-16 11:40:50,693] INFO [ReplicaFetcherManager on broker 2] Removed fetcher for partitions Set(bench-kafka-1024-0) (kafka.server.ReplicaFetcherManager)\n[2026-11-16 11:40:50,712] INFO [LogLoader partition=bench-kafka-1024-0, dir=/var/lib/kafka/data] Loading producer state till offset 0 (org.apache.kafka.storage.internals.log.UnifiedLog)\n[2026-11-16 11:40:50,715] INFO Created log for partition bench-kafka-1024-0 in /var/lib/kafka/data/bench-kafka-1024-0 with properties {min.insync.replicas=3} (kafka.log.LogManager)\n[2026-11-16 11:40:50,719] INFO [Partition bench-kafka-1024-0 broker=2] No checkpointed highwatermark is found for partition bench-kafka-1024-0 (kafka.cluster.Partition)\n[2026-11-16 11:40:50,719] INFO [Partition bench-kafka-1024-0 broker=2] Log loaded for partition bench-kafka-1024-0 with initial high watermark 0 (kafka.cluster.Partition)\n[2026-11-16 11:40:50,728] INFO [DynamicConfigPublisher broker id=2] Updating topic bench-kafka-1024 with new configuration : min.insync.replicas -> 3 (kafka.server.metadata.DynamicConfigPublisher)\n[2026-11-16 11:41:07,724] INFO [NodeToControllerChannelManager id=2 name=heartbeat] Node 1 disconnected. (org.apache.kafka.clients.NetworkClient)\n[2026-11-16 11:41:07,725] INFO [NodeToControllerChannelManager id=2 name=forwarding] Node 1 disconnected. (org.apache.kafka.clients.NetworkClient)\n[2026-11-16 11:41:07,726] INFO [RaftManager id=2] Node 1 disconnected. (org.apache.kafka.clients.NetworkClient)\n[2026-11-16 11:41:07,726] INFO [RaftManager id=2] Cancelled in-flight FETCH request with correlation id 963 due to node 1 being disconnected (elapsed time since creation: 441ms, elapsed time since send: 439ms, throttle time: 0ms, request timeout: 2000ms) (org.apache.kafka.clients.NetworkClient)\n[2026-11-16 11:41:07,724] INFO [NodeToControllerChannelManager id=2 name=registration] Node 1 disconnected. (org.apache.kafka.clients.NetworkClient)\n"
+        },
+        {
+          "image": "apache/kafka:4.3.1",
+          "image_id": "sha256:47dccc76b32761bc57462b8753144cdbb73a16b123b1d13d3eedb92bb7952b11",
+          "cpu_limit": "2",
+          "memory_limit": "2g",
+          "startup_seconds": 0.164746028,
+          "resource_samples": {
+            "samples": 23,
+            "cpu_percent_avg": 15.39304347826087,
+            "cpu_percent_max": 120.52,
+            "memory_bytes_avg": 325099591.2347826,
+            "memory_bytes_max": 347498086.4,
+            "memory_percent_avg": 15.138260869565217,
+            "memory_percent_max": 16.18
+          },
+          "log_tail": "roker id=3] Updating topic bench-kafka-1024 with new configuration : min.insync.replicas -> 3 (kafka.server.metadata.DynamicConfigPublisher)\n[2026-11-16 11:41:07,725] INFO [NodeToControllerChannelManager id=3 name=heartbeat] Node 1 disconnected. (org.apache.kafka.clients.NetworkClient)\n[2026-11-16 11:41:07,725] INFO [NodeToControllerChannelManager id=3 name=forwarding] Node 1 disconnected. (org.apache.kafka.clients.NetworkClient)\n[2026-11-16 11:41:07,727] INFO [NodeToControllerChannelManager id=3 name=registration] Node 1 disconnected. (org.apache.kafka.clients.NetworkClient)\n[2026-11-16 11:41:07,724] INFO [RaftManager id=3] Node 1 disconnected. (org.apache.kafka.clients.NetworkClient)\n[2026-11-16 11:41:07,731] INFO [RaftManager id=3] Cancelled in-flight FETCH request with correlation id 919 due to node 1 being disconnected (elapsed time since creation: 439ms, elapsed time since send: 438ms, throttle time: 0ms, request timeout: 2000ms) (org.apache.kafka.clients.NetworkClient)\n[2026-11-16 11:41:08,730] INFO [ReplicaFetcher replicaId=3, leaderId=2, fetcherId=0] Node 2 disconnected. (org.apache.kafka.clients.NetworkClient)\n[2026-11-16 11:41:08,730] INFO [ReplicaFetcher replicaId=3, leaderId=2, fetcherId=0] Cancelled in-flight FETCH request with correlation id 698 due to node 2 being disconnected (elapsed time since creation: 274ms, elapsed time since send: 274ms, throttle time: 0ms, request timeout: 30000ms) (org.apache.kafka.clients.NetworkClient)\n[2026-11-16 11:41:08,730] INFO [ReplicaFetcher replicaId=3, leaderId=2, fetcherId=0] Client requested connection close from node 2 (org.apache.kafka.clients.NetworkClient)\n[2026-11-16 11:41:08,731] INFO [ReplicaFetcher replicaId=3, leaderId=2, fetcherId=0] Error sending fetch request (sessionId=40471963, epoch=698) to node 2: (org.apache.kafka.clients.FetchSessionHandler)\njava.io.IOException: Connection to 2 was disconnected before the response was read\n\tat org.apache.kafka.clients.NetworkClientUtils.sendAndReceive(NetworkClientUtils.java:111)\n\tat kafka.server.BrokerBlockingSender.sendRequest(BrokerBlockingSender.scala:112)\n\tat kafka.server.RemoteLeaderEndPoint.fetch(RemoteLeaderEndPoint.scala:77)\n\tat kafka.server.AbstractFetcherThread.processFetchRequest(AbstractFetcherThread.scala:325)\n\tat kafka.server.AbstractFetcherThread.$anonfun$maybeFetch$3(AbstractFetcherThread.scala:133)\n\tat java.base/java.util.Optional.ifPresent(Unknown Source)\n\tat kafka.server.AbstractFetcherThread.maybeFetch(AbstractFetcherThread.scala:132)\n\tat kafka.server.AbstractFetcherThread.doWork(AbstractFetcherThread.scala:113)\n\tat kafka.server.ReplicaFetcherThread.doWork(ReplicaFetcherThread.scala:107)\n\tat org.apache.kafka.server.util.ShutdownableThread.run(ShutdownableThread.java:136)\n[2026-11-16 11:41:08,735] WARN [ReplicaFetcher replicaId=3, leaderId=2, fetcherId=0] Error in response for fetch request (type=FetchRequest, replicaId=3, maxWait=500, minBytes=1, maxBytes=10485760, fetchData={}, isolationLevel=read_uncommitted, removed=, replaced=, metadata=(sessionId=40471963, epoch=698), rackId=) (kafka.server.ReplicaFetcherThread)\njava.io.IOException: Connection to 2 was disconnected before the response was read\n\tat org.apache.kafka.clients.NetworkClientUtils.sendAndReceive(NetworkClientUtils.java:111)\n\tat kafka.server.BrokerBlockingSender.sendRequest(BrokerBlockingSender.scala:112)\n\tat kafka.server.RemoteLeaderEndPoint.fetch(RemoteLeaderEndPoint.scala:77)\n\tat kafka.server.AbstractFetcherThread.processFetchRequest(AbstractFetcherThread.scala:325)\n\tat kafka.server.AbstractFetcherThread.$anonfun$maybeFetch$3(AbstractFetcherThread.scala:133)\n\tat java.base/java.util.Optional.ifPresent(Unknown Source)\n\tat kafka.server.AbstractFetcherThread.maybeFetch(AbstractFetcherThread.scala:132)\n\tat kafka.server.AbstractFetcherThread.doWork(AbstractFetcherThread.scala:113)\n\tat kafka.server.ReplicaFetcherThread.doWork(ReplicaFetcherThread.scala:107)\n\tat org.apache.kafka.server.util.ShutdownableThread.run(ShutdownableThread.java:136)\n"
+        }
+      ],
+      "resource_samples": {
+        "nodes": [
+          {
+            "samples": 25,
+            "cpu_percent_avg": 18.096400000000003,
+            "cpu_percent_max": 109.81,
+            "memory_bytes_avg": 302109425.66400003,
+            "memory_bytes_max": 340158054.4,
+            "memory_percent_avg": 14.0672,
+            "memory_percent_max": 15.84
+          },
+          {
+            "samples": 23,
+            "cpu_percent_avg": 14.270869565217392,
+            "cpu_percent_max": 120.14,
+            "memory_bytes_avg": 325181653.7043478,
+            "memory_bytes_max": 354418688.0,
+            "memory_percent_avg": 15.14304347826087,
+            "memory_percent_max": 16.5
+          },
+          {
+            "samples": 23,
+            "cpu_percent_avg": 15.39304347826087,
+            "cpu_percent_max": 120.52,
+            "memory_bytes_avg": 325099591.2347826,
+            "memory_bytes_max": 347498086.4,
+            "memory_percent_avg": 15.138260869565217,
+            "memory_percent_max": 16.18
+          }
+        ],
+        "samples": 23.0,
+        "memory_bytes_avg": 939791919.7866666,
+        "memory_bytes_max": 1044067123.2
+      },
+      "scenarios": [
+        {
+          "operation": "publish",
+          "messages": 10000.0,
+          "message_size_bytes": 100.0,
+          "throughput_messages_per_second": 10060.362173,
+          "latency_microseconds": {
+            "avg": 370340.0,
+            "p50": 369000.0,
+            "p95": 441000.0,
+            "p99": 446000.0,
+            "p999": 447000.0,
+            "max": 703000.0
+          },
+          "resource_samples": {
+            "nodes": [
+              {
+                "samples": 5,
+                "cpu_percent_avg": 3.886,
+                "cpu_percent_max": 5.0,
+                "memory_bytes_avg": 328518860.8,
+                "memory_bytes_max": 329252864.0,
+                "memory_percent_avg": 15.296000000000001,
+                "memory_percent_max": 15.33,
+                "cpu_seconds": 0.6599170000000001,
+                "elapsed_seconds": 7.254727865
+              },
+              {
+                "samples": 4,
+                "cpu_percent_avg": 8.9175,
+                "cpu_percent_max": 25.85,
+                "memory_bytes_avg": 322541977.6,
+                "memory_bytes_max": 331350016.0,
+                "memory_percent_avg": 15.02,
+                "memory_percent_max": 15.43,
+                "cpu_seconds": 0.4972329999999996,
+                "elapsed_seconds": 7.254237222
+              },
+              {
+                "samples": 4,
+                "cpu_percent_avg": 19.4125,
+                "cpu_percent_max": 66.87,
+                "memory_bytes_avg": 323616768.0,
+                "memory_bytes_max": 329252864.0,
+                "memory_percent_avg": 15.07,
+                "memory_percent_max": 15.33,
+                "cpu_seconds": 0.9738539999999993,
+                "elapsed_seconds": 7.253520501
+              }
+            ],
+            "samples": 4.0,
+            "cpu_seconds": 1.991714,
+            "memory_bytes_avg": 936762845.8666666,
+            "memory_bytes_max": 989855744.0,
+            "elapsed_seconds": 7.238191863
+          },
+          "metadata": {
+            "comparison_class": "publish-only",
+            "semantic_boundaries": {
+              "acknowledgement_boundary": "Kafka producer performance client with acks=all and idempotence enabled; topic min.insync.replicas=3",
+              "durability_boundary": "one-partition broker log with replication factor three and min.insync.replicas=3; filesystem flush behavior is not asserted",
+              "replication_topology": "three broker nodes, one partition, replication factor three, min.insync.replicas three",
+              "delivery_boundary": "not applicable to publish-only",
+              "batching_boundary": "Kafka producer perf client uses linger.ms=0 and the default batch.size; native client batching remains possible",
+              "client_boundary": "Kafka producer performance client from apache/kafka:4.3.1",
+              "latency_boundary": "native Kafka producer latency includes client-side batching and reports avg/p50/p95/p99/p99.9/max"
+            }
+          },
+          "repetitions": 3,
+          "repetition_summary": {
+            "throughput_messages_per_second": {
+              "count": 3,
+              "min": 9191.176471,
+              "median": 10060.362173,
+              "max": 10101.010101,
+              "samples": [
+                9191.176471,
+                10101.010101,
+                10060.362173
+              ],
+              "standard_deviation": 419.647110067349,
+              "relative_range_percent": 9.043746282234357,
+              "relative_standard_deviation_percent": 4.1712922740853005
+            },
+            "latency_p50": {
+              "count": 3,
+              "min": 270000.0,
+              "median": 369000.0,
+              "max": 374000.0,
+              "samples": [
+                374000.0,
+                369000.0,
+                270000.0
+              ],
+              "standard_deviation": 47891.08012517107,
+              "relative_range_percent": 28.184281842818425,
+              "relative_standard_deviation_percent": 12.97861250004636
+            },
+            "latency_p99": {
+              "count": 3,
+              "min": 323000.0,
+              "median": 446000.0,
+              "max": 478000.0,
+              "samples": [
+                478000.0,
+                446000.0,
+                323000.0
+              ],
+              "standard_deviation": 66814.83534532,
+              "relative_range_percent": 34.753363228699556,
+              "relative_standard_deviation_percent": 14.980904785946187
+            },
+            "latency_p999": {
+              "count": 3,
+              "min": 328000.0,
+              "median": 447000.0,
+              "max": 482000.0,
+              "samples": [
+                482000.0,
+                447000.0,
+                328000.0
+              ],
+              "standard_deviation": 65914.08549518582,
+              "relative_range_percent": 34.45190156599553,
+              "relative_standard_deviation_percent": 14.74588042397893
+            },
+            "latency_max": {
+              "count": 3,
+              "min": 676000.0,
+              "median": 703000.0,
+              "max": 732000.0,
+              "samples": [
+                732000.0,
+                703000.0,
+                676000.0
+              ],
+              "standard_deviation": 22866.763848189996,
+              "relative_range_percent": 7.965860597439544,
+              "relative_standard_deviation_percent": 3.2527402344509238
+            },
+            "cpu_seconds": {
+              "count": 3,
+              "min": 1.7035639999999992,
+              "median": 1.991714,
+              "max": 2.131003999999999,
+              "samples": [
+                2.131003999999999,
+                1.991714,
+                1.7035639999999992
+              ],
+              "standard_deviation": 0.17799409484586842,
+              "relative_range_percent": 21.460912560739136,
+              "relative_standard_deviation_percent": 8.936729613080413
+            },
+            "memory_bytes_max": {
+              "count": 3,
+              "min": 951897292.8,
+              "median": 989855744.0,
+              "max": 991009177.5999999,
+              "samples": [
+                989855744.0,
+                991009177.5999999,
+                951897292.8
+              ],
+              "standard_deviation": 18171754.514388718,
+              "relative_range_percent": 3.9512711864406733,
+              "relative_standard_deviation_percent": 1.835798258941933
+            },
+            "cpu_efficiency_messages_per_cpu_second": {
+              "count": 3,
+              "min": 4692.623758566387,
+              "median": 5020.8011792857815,
+              "max": 5870.046561209327,
+              "samples": [
+                4692.623758566387,
+                5020.8011792857815,
+                5870.046561209327
+              ],
+              "standard_deviation": 496.1230351851644,
+              "relative_range_percent": 23.450894799431804,
+              "relative_standard_deviation_percent": 9.881351949007843
+            }
+          }
+        },
+        {
+          "operation": "publish",
+          "messages": 10000.0,
+          "message_size_bytes": 1024.0,
+          "throughput_messages_per_second": 3984.063745,
+          "latency_microseconds": {
+            "avg": 865970.0,
+            "p50": 903000.0,
+            "p95": 1284000.0,
+            "p99": 1305000.0,
+            "p999": 1313000.0,
+            "max": 1313000.0
+          },
+          "resource_samples": {
+            "nodes": [
+              {
+                "samples": 7,
+                "cpu_percent_avg": 8.958571428571428,
+                "cpu_percent_max": 46.97,
+                "memory_bytes_avg": 332338673.37142855,
+                "memory_bytes_max": 340158054.4,
+                "memory_percent_avg": 15.475714285714286,
+                "memory_percent_max": 15.84,
+                "cpu_seconds": 0.9392080000000007,
+                "elapsed_seconds": 8.705178517
+              },
+              {
+                "samples": 6,
+                "cpu_percent_avg": 19.276666666666667,
+                "cpu_percent_max": 51.62,
+                "memory_bytes_avg": 335159842.1333333,
+                "memory_bytes_max": 354418688.0,
+                "memory_percent_avg": 15.606666666666667,
+                "memory_percent_max": 16.5,
+                "cpu_seconds": 2.93731,
+                "elapsed_seconds": 8.463141215
+              },
+              {
+                "samples": 6,
+                "cpu_percent_avg": 15.616666666666667,
+                "cpu_percent_max": 22.34,
+                "memory_bytes_avg": 337361851.73333335,
+                "memory_bytes_max": 347183513.6,
+                "memory_percent_avg": 15.708333333333334,
+                "memory_percent_max": 16.17,
+                "cpu_seconds": 1.1111750000000011,
+                "elapsed_seconds": 8.428183044
+              }
+            ],
+            "samples": 5.0,
+            "cpu_seconds": 4.987693000000002,
+            "memory_bytes_avg": 1005311754.24,
+            "memory_bytes_max": 1044067123.2,
+            "elapsed_seconds": 8.705178517
+          },
+          "metadata": {
+            "comparison_class": "publish-only",
+            "semantic_boundaries": {
+              "acknowledgement_boundary": "Kafka producer performance client with acks=all and idempotence enabled; topic min.insync.replicas=3",
+              "durability_boundary": "one-partition broker log with replication factor three and min.insync.replicas=3; filesystem flush behavior is not asserted",
+              "replication_topology": "three broker nodes, one partition, replication factor three, min.insync.replicas three",
+              "delivery_boundary": "not applicable to publish-only",
+              "batching_boundary": "Kafka producer perf client uses linger.ms=0 and the default batch.size; native client batching remains possible",
+              "client_boundary": "Kafka producer performance client from apache/kafka:4.3.1",
+              "latency_boundary": "native Kafka producer latency includes client-side batching and reports avg/p50/p95/p99/p99.9/max"
+            }
+          },
+          "repetitions": 3,
+          "repetition_summary": {
+            "throughput_messages_per_second": {
+              "count": 3,
+              "min": 3875.968992,
+              "median": 3984.063745,
+              "max": 4055.150041,
+              "samples": [
+                4055.150041,
+                3984.063745,
+                3875.968992
+              ],
+              "standard_deviation": 73.66861643413014,
+              "relative_range_percent": 4.497444329922482,
+              "relative_standard_deviation_percent": 1.8490822725059122
+            },
+            "latency_p50": {
+              "count": 3,
+              "min": 862000.0,
+              "median": 903000.0,
+              "max": 945000.0,
+              "samples": [
+                862000.0,
+                903000.0,
+                945000.0
+              ],
+              "standard_deviation": 33885.427874268054,
+              "relative_range_percent": 9.191583610188262,
+              "relative_standard_deviation_percent": 3.752539077992033
+            },
+            "latency_p99": {
+              "count": 3,
+              "min": 1280000.0,
+              "median": 1305000.0,
+              "max": 1429000.0,
+              "samples": [
+                1280000.0,
+                1305000.0,
+                1429000.0
+              ],
+              "standard_deviation": 65151.10641168473,
+              "relative_range_percent": 11.417624521072797,
+              "relative_standard_deviation_percent": 4.992421947255535
+            },
+            "latency_p999": {
+              "count": 3,
+              "min": 1290000.0,
+              "median": 1313000.0,
+              "max": 1442000.0,
+              "samples": [
+                1290000.0,
+                1313000.0,
+                1442000.0
+              ],
+              "standard_deviation": 66894.61031270672,
+              "relative_range_percent": 11.576542269611577,
+              "relative_standard_deviation_percent": 5.094791341409499
+            },
+            "latency_max": {
+              "count": 3,
+              "min": 1290000.0,
+              "median": 1313000.0,
+              "max": 1444000.0,
+              "samples": [
+                1290000.0,
+                1313000.0,
+                1444000.0
+              ],
+              "standard_deviation": 67828.21438506742,
+              "relative_range_percent": 11.72886519421173,
+              "relative_standard_deviation_percent": 5.165895992769796
+            },
+            "cpu_seconds": {
+              "count": 3,
+              "min": 4.983499999999999,
+              "median": 4.987693000000002,
+              "max": 5.526949000000001,
+              "samples": [
+                4.987693000000002,
+                4.983499999999999,
+                5.526949000000001
+              ],
+              "standard_deviation": 0.25520175687004126,
+              "relative_range_percent": 10.895798919460388,
+              "relative_standard_deviation_percent": 5.116629208534711
+            },
+            "memory_bytes_max": {
+              "count": 3,
+              "min": 1041760256.0,
+              "median": 1044067123.2,
+              "max": 1064933785.6,
+              "samples": [
+                1041760256.0,
+                1044067123.2,
+                1064933785.6
+              ],
+              "standard_deviation": 10423007.190911237,
+              "relative_range_percent": 2.21954403936929,
+              "relative_standard_deviation_percent": 0.9983081508174854
+            },
+            "cpu_efficiency_messages_per_cpu_second": {
+              "count": 3,
+              "min": 1809.3164963165027,
+              "median": 2004.9349468782452,
+              "max": 2006.6218521119697,
+              "samples": [
+                2004.9349468782452,
+                2006.6218521119697,
+                1809.3164963165027
+              ],
+              "standard_deviation": 92.61558980540077,
+              "relative_range_percent": 9.840985419635606,
+              "relative_standard_deviation_percent": 4.61938128963269
+            }
+          }
+        }
+      ],
+      "repetition_summary": {
+        "samples": {
+          "count": 3,
+          "min": 22.0,
+          "median": 23.0,
+          "max": 24.0,
+          "samples": [
+            23.0,
+            24.0,
+            22.0
+          ],
+          "standard_deviation": 0.816496580927726,
+          "relative_range_percent": 8.695652173913043,
+          "relative_standard_deviation_percent": 3.5499851344683737
+        },
+        "memory_bytes_avg": {
+          "count": 3,
+          "min": 938099500.6464,
+          "median": 939791919.7866666,
+          "max": 952390670.6031303,
+          "samples": [
+            952390670.6031303,
+            938099500.6464,
+            939791919.7866666
+          ],
+          "standard_deviation": 6375563.969945792,
+          "relative_range_percent": 1.5206738487360554,
+          "relative_standard_deviation_percent": 0.6784016584642534
+        },
+        "memory_bytes_max": {
+          "count": 3,
+          "min": 1042074828.8,
+          "median": 1044067123.2,
+          "max": 1064933785.6,
+          "samples": [
+            1042074828.8,
+            1044067123.2,
+            1064933785.6
+          ],
+          "standard_deviation": 10338271.630081404,
+          "relative_range_percent": 2.189414482273784,
+          "relative_standard_deviation_percent": 0.9901922395942564
+        }
+      },
+      "repetitions": 3
+    },
+    "redpanda": {
+      "image": "docker.redpanda.com/redpandadata/redpanda:v26.2.1",
+      "image_id": "sha256:d97ce2c85cdd77e11db049fb609d18b4bb9c9a6c74e0748751461cc297280b77",
+      "image_ids": [
+        "sha256:d97ce2c85cdd77e11db049fb609d18b4bb9c9a6c74e0748751461cc297280b77",
+        "sha256:d97ce2c85cdd77e11db049fb609d18b4bb9c9a6c74e0748751461cc297280b77",
+        "sha256:d97ce2c85cdd77e11db049fb609d18b4bb9c9a6c74e0748751461cc297280b77"
+      ],
+      "runtime": "container",
+      "cpu_limit": "2",
+      "memory_limit": "2g",
+      "acknowledgement": "Kafka producer performance client with acks=all and idempotence enabled; topic min.insync.replicas=3",
+      "replication": "three broker nodes, one partition, replication factor three, min.insync.replicas three",
+      "measurement_boundary": "Kafka native producer performance client over the Kafka protocol; durable publish only",
+      "measurement_client": "Kafka producer performance client",
+      "client_image": "apache/kafka:4.3.1",
+      "semantic_metadata": {
+        "acknowledgement_boundary": "Kafka producer performance client with acks=all and idempotence enabled; topic min.insync.replicas=3",
+        "replication_topology": "three broker nodes, one partition, replication factor three, min.insync.replicas three",
+        "measurement_boundary": "Kafka native producer performance client over the Kafka protocol; durable publish only",
+        "client_identity": {
+          "name": "Kafka producer performance client",
+          "image": "apache/kafka:4.3.1"
+        },
+        "scenario_classes": [
+          "publish-only"
+        ],
+        "scenario_boundaries": {
+          "publish-only": {
+            "acknowledgement_boundary": "Kafka producer performance client with acks=all and idempotence enabled; topic min.insync.replicas=3",
+            "durability_boundary": "one-partition broker log with replication factor three and min.insync.replicas=3; filesystem flush behavior is not asserted",
+            "replication_topology": "three broker nodes, one partition, replication factor three, min.insync.replicas three",
+            "delivery_boundary": "not applicable to publish-only",
+            "batching_boundary": "Kafka producer perf client uses linger.ms=0 and the default batch.size; native client batching remains possible",
+            "client_boundary": "Kafka producer performance client from apache/kafka:4.3.1",
+            "latency_boundary": "native Kafka producer latency includes client-side batching and reports avg/p50/p95/p99/p99.9/max"
+          }
+        },
+        "comparison": {
+          "classification": "native-tool-baseline",
+          "apples_to_apples": false,
+          "ranking_eligible": false,
+          "experimental": true,
+          "mismatch_dimensions": [
+            "acknowledgement",
+            "durability",
+            "replication",
+            "delivery",
+            "batching",
+            "client",
+            "latency"
+          ]
+        }
+      },
+      "startup_seconds": 0.104729289,
+      "nodes": [
+        {
+          "image": "docker.redpanda.com/redpandadata/redpanda:v26.2.1",
+          "image_id": "sha256:d97ce2c85cdd77e11db049fb609d18b4bb9c9a6c74e0748751461cc297280b77",
+          "cpu_limit": "2",
+          "memory_limit": "2g",
+          "startup_seconds": 0.090266265,
+          "resource_samples": {
+            "samples": 24,
+            "cpu_percent_avg": 1.125,
+            "cpu_percent_max": 5.49,
+            "memory_bytes_avg": 226719607.46666667,
+            "memory_bytes_max": 282171801.6,
+            "memory_percent_avg": 10.556666666666667,
+            "memory_percent_max": 13.14
+          },
+          "log_tail": "  ] raft - [group_id:3, {kafka/bench-redpanda-1024/0}] consensus.cc:1635 - Truncating configurations at -9223372036854775808\nINFO  2026-11-16 11:41:34,876 [shard 0:main] raft - [group_id:3, {kafka/bench-redpanda-1024/0}] state_machine_manager.cc:308 - Applying 'skip_to_end' initial recovery policy for 'write_at_offset' state machine\nINFO  2026-11-16 11:41:34,876 [shard 0:main] raft - [group_id:3, {kafka/bench-redpanda-1024/0}] state_machine_manager.cc:353 - Setting next offset: 0 for: 'write_at_offset' state machine as a part of initial recovery policy.\nINFO  2026-11-16 11:41:34,876 [shard 0:main] raft - [group_id:3, {kafka/bench-redpanda-1024/0}] state_machine_manager.cc:308 - Applying 'read_everything' initial recovery policy for 'log_eviction_stm' state machine\nINFO  2026-11-16 11:41:34,876 [shard 0:main] raft - [group_id:3, {kafka/bench-redpanda-1024/0}] state_machine_manager.cc:308 - Applying 'read_everything' initial recovery policy for 'rm_stm' state machine\nINFO  2026-11-16 11:41:34,876 [shard 0:main] raft - [group_id:3, {kafka/bench-redpanda-1024/0}] state_machine_manager.cc:308 - Applying 'skip_to_end' initial recovery policy for 'partition_properties_stm' state machine\nINFO  2026-11-16 11:41:34,876 [shard 0:main] raft - [group_id:3, {kafka/bench-redpanda-1024/0}] state_machine_manager.cc:353 - Setting next offset: 0 for: 'partition_properties_stm' state machine as a part of initial recovery policy.\nINFO  2026-11-16 11:41:34,876 [shard 0:main] raft - [group_id:3, {kafka/bench-redpanda-1024/0}] consensus.cc:1750 - started raft, log offsets: {start_offset:-9223372036854775808, committed_offset:-9223372036854775808, committed_offset_term:-9223372036854775808, dirty_offset:-9223372036854775808, dirty_offset_term:-9223372036854775808}, term: 0, configuration: {current: {voters: [{id: 1, revision: 23}, {id: 2, revision: 23}, {id: 0, revision: 23}], learners: []}, old:none, revision: 23, update: none, version: 6}\nINFO  2026-11-16 11:41:34,897 [shard 0:rr  ] raft - [group_id:3, {kafka/bench-redpanda-1024/0}] consensus.cc:2005 - Received vote request with larger term from node {id: 1, revision: 23}, received 1, current 0\nINFO  2026-11-16 11:41:34,928 [shard 0:rr  ] storage - segment.cc:849 - Creating new segment /var/lib/redpanda/data/kafka/bench-redpanda-1024/0_23/0-1-v1.log\nINFO  2026-11-16 11:41:34,963 [shard 0:kafk] kafka - create_topics.cc:179 - Created topic(s) {{kafka/bench-redpanda-1024}} successfully\nINFO  2026-11-16 11:41:35,208 [shard 0:main] tx - [{kafka/bench-redpanda-1024/0}] - rm_stm.cc:116 - Setting bootstrap committed offset to: 0\nINFO  2026-11-16 11:41:39,347 [shard 0:clus] cluster - leader_balancer.cc:1026 - skipping partition without replicas in health report: {kafka/bench-redpanda-1024/0} (replicas in topic table: [{node_id: 1, shard: 0}, {node_id: 2, shard: 0}, {node_id: 0, shard: 0}])\nINFO  2026-11-16 11:41:39,347 [shard 0:clus] cluster - leader_balancer.cc:864 - Leadership rebalancer muting node 2 that just restarted (20s. ago)\nINFO  2026-11-16 11:41:39,347 [shard 0:clus] cluster - leader_balancer.cc:864 - Leadership rebalancer muting node 1 that just restarted (20s. ago)\nINFO  2026-11-16 11:41:39,347 [shard 0:clus] cluster - leader_balancer.cc:799 - balancer iteration finished: objective: 6, number of muted groups: 0, number in flight: 0, dispatched in this tick: 0\nINFO  2026-11-16 11:41:44,348 [shard 0:clus] cluster - partition_balancer_planner.cc:452 - node 1: no disk report\nINFO  2026-11-16 11:41:44,348 [shard 0:clus] cluster - partition_balancer_planner.cc:452 - node 2: no disk report\nINFO  2026-11-16 11:41:44,348 [shard 0:clus] cluster - partition_balancer_backend.cc:493 - last status: starting; violations: unavailable nodes: 0, full nodes: 0; nodes to rebalance count: 2; on demand rebalance requested: false; updates in progress: 0; action counts: reassignments: 0, cancellations: 0, node to auto decommission: none, failed: 0; counts rebalancing finished: false, force refresh health report: false\n"
+        },
+        {
+          "image": "docker.redpanda.com/redpandadata/redpanda:v26.2.1",
+          "image_id": "sha256:d97ce2c85cdd77e11db049fb609d18b4bb9c9a6c74e0748751461cc297280b77",
+          "cpu_limit": "2",
+          "memory_limit": "2g",
+          "startup_seconds": 0.104729289,
+          "resource_samples": {
+            "samples": 24,
+            "cpu_percent_avg": 1.235,
+            "cpu_percent_max": 7.03,
+            "memory_bytes_avg": 207937426.7733333,
+            "memory_bytes_max": 282486374.4,
+            "memory_percent_avg": 9.684166666666666,
+            "memory_percent_max": 13.16
+          },
+          "log_tail": "hard 0:main] raft - [group_id:3, {kafka/bench-redpanda-1024/0}] state_machine_manager.cc:308 - Applying 'skip_to_end' initial recovery policy for 'partition_properties_stm' state machine\nINFO  2026-11-16 11:41:34,875 [shard 0:main] raft - [group_id:3, {kafka/bench-redpanda-1024/0}] state_machine_manager.cc:353 - Setting next offset: 0 for: 'partition_properties_stm' state machine as a part of initial recovery policy.\nINFO  2026-11-16 11:41:34,875 [shard 0:main] raft - [group_id:3, {kafka/bench-redpanda-1024/0}] state_machine_manager.cc:308 - Applying 'skip_to_end' initial recovery policy for 'write_at_offset' state machine\nINFO  2026-11-16 11:41:34,875 [shard 0:main] raft - [group_id:3, {kafka/bench-redpanda-1024/0}] state_machine_manager.cc:353 - Setting next offset: 0 for: 'write_at_offset' state machine as a part of initial recovery policy.\nINFO  2026-11-16 11:41:34,876 [shard 0:main] raft - [group_id:3, {kafka/bench-redpanda-1024/0}] consensus.cc:1750 - started raft, log offsets: {start_offset:-9223372036854775808, committed_offset:-9223372036854775808, committed_offset_term:-9223372036854775808, dirty_offset:-9223372036854775808, dirty_offset_term:-9223372036854775808}, term: 0, configuration: {current: {voters: [{id: 1, revision: 23}, {id: 2, revision: 23}, {id: 0, revision: 23}], learners: []}, old:none, revision: 23, update: none, version: 6}\nINFO  2026-11-16 11:41:34,876 [shard 0:rs  ] raft - [group_id:3, {kafka/bench-redpanda-1024/0}] vote_stm.cc:59 - [pre-vote: true] sending vote request to {id: 2, revision: 23} with timeout of 4500 ms\nINFO  2026-11-16 11:41:34,876 [shard 0:rs  ] raft - [group_id:3, {kafka/bench-redpanda-1024/0}] vote_stm.cc:59 - [pre-vote: true] sending vote request to {id: 0, revision: 23} with timeout of 4500 ms\nINFO  2026-11-16 11:41:34,887 [shard 0:rs  ] raft - [group_id:3, {kafka/bench-redpanda-1024/0}] vote_stm.cc:99 - [pre-vote: true] vote reply from {id: 2, revision: 23} - {term: 0, target_node: {id: 1, revision: 23}, vote_granted: true, log_ok: true}\nINFO  2026-11-16 11:41:34,887 [shard 0:rs  ] raft - [group_id:3, {kafka/bench-redpanda-1024/0}] vote_stm.cc:99 - [pre-vote: true] vote reply from {id: 0, revision: 23} - {term: 0, target_node: {id: 1, revision: 23}, vote_granted: true, log_ok: true}\nINFO  2026-11-16 11:41:34,897 [shard 0:rs  ] raft - [group_id:3, {kafka/bench-redpanda-1024/0}] vote_stm.cc:59 - [pre-vote: false] sending vote request to {id: 2, revision: 23} with timeout of 4500 ms\nINFO  2026-11-16 11:41:34,897 [shard 0:rs  ] raft - [group_id:3, {kafka/bench-redpanda-1024/0}] vote_stm.cc:59 - [pre-vote: false] sending vote request to {id: 0, revision: 23} with timeout of 4500 ms\nINFO  2026-11-16 11:41:34,907 [shard 0:rs  ] raft - [group_id:3, {kafka/bench-redpanda-1024/0}] vote_stm.cc:99 - [pre-vote: false] vote reply from {id: 2, revision: 23} - {term: 1, target_node: {id: 1, revision: 23}, vote_granted: true, log_ok: true}\nINFO  2026-11-16 11:41:34,907 [shard 0:rs  ] raft - [group_id:3, {kafka/bench-redpanda-1024/0}] vote_stm.cc:99 - [pre-vote: false] vote reply from {id: 0, revision: 23} - {term: 1, target_node: {id: 1, revision: 23}, vote_granted: true, log_ok: true}\nINFO  2026-11-16 11:41:34,907 [shard 0:rs  ] raft - [group_id:3, {kafka/bench-redpanda-1024/0}] vote_stm.cc:428 - becoming the leader term:1\nINFO  2026-11-16 11:41:34,907 [shard 0:rs  ] storage - segment.cc:849 - Creating new segment /var/lib/redpanda/data/kafka/bench-redpanda-1024/0_23/0-1-v1.log\nINFO  2026-11-16 11:41:34,949 [shard 0:main] tx - [{kafka/bench-redpanda-1024/0}] - rm_stm.cc:116 - Setting bootstrap committed offset to: 0\nINFO  2026-11-16 11:41:34,949 [shard 0:rs  ] raft - [group_id:3, {kafka/bench-redpanda-1024/0}] vote_stm.cc:443 - became the leader term: 1\nINFO  2026-11-16 11:41:50,924 [shard 0:main] rpc - transport.cc:117 - Disconnected from server {host: runnel-compare-31463-1794829219766309040-redpanda-0, port: 33145}: std::__1::system_error (error system:104, recv: Connection reset by peer)\n"
+        },
+        {
+          "image": "docker.redpanda.com/redpandadata/redpanda:v26.2.1",
+          "image_id": "sha256:d97ce2c85cdd77e11db049fb609d18b4bb9c9a6c74e0748751461cc297280b77",
+          "cpu_limit": "2",
+          "memory_limit": "2g",
+          "startup_seconds": 0.102686895,
+          "resource_samples": {
+            "samples": 21,
+            "cpu_percent_avg": 1.2004761904761905,
+            "cpu_percent_max": 5.64,
+            "memory_bytes_avg": 234396681.75238097,
+            "memory_bytes_max": 282905804.8,
+            "memory_percent_avg": 10.914761904761905,
+            "memory_percent_max": 13.18
+          },
+          "log_tail": "83648, revision: -9223372036854775808} term 0 initial_state true\nINFO  2026-11-16 11:41:34,815 [shard 0:rs  ] offset_translator - ntp: {kafka/bench-redpanda-1024/0} - offset_translator.cc:120 - resetting offset translation state\nINFO  2026-11-16 11:41:34,835 [shard 0:rs  ] offset_translator - ntp: {kafka/bench-redpanda-1024/0} - offset_translator.cc:166 - started, state: {base offset/delta: -9223372036854775808/0, map size: 1, last delta: 0}, highest_known_offset: -9223372036854775808\nINFO  2026-11-16 11:41:34,835 [shard 0:rs  ] raft - [group_id:3, {kafka/bench-redpanda-1024/0}] consensus.cc:1608 - Current log offsets: {start_offset:-9223372036854775808, committed_offset:-9223372036854775808, committed_offset_term:-9223372036854775808, dirty_offset:-9223372036854775808, dirty_offset_term:-9223372036854775808}, read bootstrap state: data_seen 0 config_seen 0 eol false commit 0 term 0 prev_idx 0 prev_term 0 config_tracker -9223372036854775808 commit_base_tracker -9223372036854775808 configurations []\nINFO  2026-11-16 11:41:34,835 [shard 0:rs  ] raft - [group_id:3, {kafka/bench-redpanda-1024/0}] consensus.cc:1635 - Truncating configurations at -9223372036854775808\nINFO  2026-11-16 11:41:34,876 [shard 0:main] raft - [group_id:3, {kafka/bench-redpanda-1024/0}] state_machine_manager.cc:308 - Applying 'skip_to_end' initial recovery policy for 'write_at_offset' state machine\nINFO  2026-11-16 11:41:34,876 [shard 0:main] raft - [group_id:3, {kafka/bench-redpanda-1024/0}] state_machine_manager.cc:353 - Setting next offset: 0 for: 'write_at_offset' state machine as a part of initial recovery policy.\nINFO  2026-11-16 11:41:34,876 [shard 0:main] raft - [group_id:3, {kafka/bench-redpanda-1024/0}] state_machine_manager.cc:308 - Applying 'read_everything' initial recovery policy for 'log_eviction_stm' state machine\nINFO  2026-11-16 11:41:34,876 [shard 0:main] raft - [group_id:3, {kafka/bench-redpanda-1024/0}] state_machine_manager.cc:308 - Applying 'read_everything' initial recovery policy for 'rm_stm' state machine\nINFO  2026-11-16 11:41:34,876 [shard 0:main] raft - [group_id:3, {kafka/bench-redpanda-1024/0}] state_machine_manager.cc:308 - Applying 'skip_to_end' initial recovery policy for 'partition_properties_stm' state machine\nINFO  2026-11-16 11:41:34,876 [shard 0:main] raft - [group_id:3, {kafka/bench-redpanda-1024/0}] state_machine_manager.cc:353 - Setting next offset: 0 for: 'partition_properties_stm' state machine as a part of initial recovery policy.\nINFO  2026-11-16 11:41:34,876 [shard 0:main] raft - [group_id:3, {kafka/bench-redpanda-1024/0}] consensus.cc:1750 - started raft, log offsets: {start_offset:-9223372036854775808, committed_offset:-9223372036854775808, committed_offset_term:-9223372036854775808, dirty_offset:-9223372036854775808, dirty_offset_term:-9223372036854775808}, term: 0, configuration: {current: {voters: [{id: 1, revision: 23}, {id: 2, revision: 23}, {id: 0, revision: 23}], learners: []}, old:none, revision: 23, update: none, version: 6}\nINFO  2026-11-16 11:41:34,897 [shard 0:rr  ] raft - [group_id:3, {kafka/bench-redpanda-1024/0}] consensus.cc:2005 - Received vote request with larger term from node {id: 1, revision: 23}, received 1, current 0\nINFO  2026-11-16 11:41:34,928 [shard 0:rr  ] storage - segment.cc:849 - Creating new segment /var/lib/redpanda/data/kafka/bench-redpanda-1024/0_23/0-1-v1.log\nINFO  2026-11-16 11:41:35,208 [shard 0:main] tx - [{kafka/bench-redpanda-1024/0}] - rm_stm.cc:116 - Setting bootstrap committed offset to: 0\nINFO  2026-11-16 11:41:50,924 [shard 0:main] rpc - transport.cc:117 - Disconnected from server {host: runnel-compare-31463-1794829219766309040-redpanda-0, port: 33145}: std::__1::system_error (error system:104, recv: Connection reset by peer)\nINFO  2026-11-16 11:41:51,033 [shard 0:main] rpc - transport.cc:117 - Disconnected from server {host: runnel-compare-31463-1794829219766309040-redpanda-1, port: 33145}: std::__1::system_error (error system:104, recv: Connection reset by peer)\n"
+        }
+      ],
+      "resource_samples": {
+        "nodes": [
+          {
+            "samples": 24,
+            "cpu_percent_avg": 1.125,
+            "cpu_percent_max": 5.49,
+            "memory_bytes_avg": 226719607.46666667,
+            "memory_bytes_max": 282171801.6,
+            "memory_percent_avg": 10.556666666666667,
+            "memory_percent_max": 13.14
+          },
+          {
+            "samples": 24,
+            "cpu_percent_avg": 1.235,
+            "cpu_percent_max": 7.03,
+            "memory_bytes_avg": 207937426.7733333,
+            "memory_bytes_max": 282486374.4,
+            "memory_percent_avg": 9.684166666666666,
+            "memory_percent_max": 13.16
+          },
+          {
+            "samples": 21,
+            "cpu_percent_avg": 1.2004761904761905,
+            "cpu_percent_max": 5.64,
+            "memory_bytes_avg": 234396681.75238097,
+            "memory_bytes_max": 282905804.8,
+            "memory_percent_avg": 10.914761904761905,
+            "memory_percent_max": 13.18
+          }
+        ],
+        "samples": 22.0,
+        "memory_bytes_avg": 645227260.5866667,
+        "memory_bytes_max": 846829977.6
+      },
+      "scenarios": [
+        {
+          "operation": "publish",
+          "messages": 10000.0,
+          "message_size_bytes": 100.0,
+          "throughput_messages_per_second": 11261.261261,
+          "latency_microseconds": {
+            "avg": 232730.0,
+            "p50": 221000.0,
+            "p95": 316000.0,
+            "p99": 323000.0,
+            "p999": 373000.0,
+            "max": 789000.0
+          },
+          "resource_samples": {
+            "nodes": [
+              {
+                "samples": 6,
+                "cpu_percent_avg": 1.8,
+                "cpu_percent_max": 5.49,
+                "memory_bytes_avg": 224290406.39999998,
+                "memory_bytes_max": 270427750.4,
+                "memory_percent_avg": 10.441666666666666,
+                "memory_percent_max": 12.59,
+                "cpu_seconds": 0.12021699999999999,
+                "elapsed_seconds": 6.968251248
+              },
+              {
+                "samples": 5,
+                "cpu_percent_avg": 2.04,
+                "cpu_percent_max": 5.94,
+                "memory_bytes_avg": 215650140.16,
+                "memory_bytes_max": 270427750.4,
+                "memory_percent_avg": 10.040000000000001,
+                "memory_percent_max": 12.59,
+                "cpu_seconds": 0.12439800000000001,
+                "elapsed_seconds": 6.998253475
+              },
+              {
+                "samples": 5,
+                "cpu_percent_avg": 1.9419999999999997,
+                "cpu_percent_max": 5.64,
+                "memory_bytes_avg": 243059916.8,
+                "memory_bytes_max": 270742323.2,
+                "memory_percent_avg": 11.32,
+                "memory_percent_max": 12.61,
+                "cpu_seconds": 0.11555799999999997,
+                "elapsed_seconds": 6.99724256
+              }
+            ],
+            "samples": 5.0,
+            "cpu_seconds": 0.32388700000000004,
+            "memory_bytes_avg": 601515622.4,
+            "memory_bytes_max": 810549248.0,
+            "elapsed_seconds": 6.998253475
+          },
+          "metadata": {
+            "comparison_class": "publish-only",
+            "semantic_boundaries": {
+              "acknowledgement_boundary": "Kafka producer performance client with acks=all and idempotence enabled; topic min.insync.replicas=3",
+              "durability_boundary": "one-partition broker log with replication factor three and min.insync.replicas=3; filesystem flush behavior is not asserted",
+              "replication_topology": "three broker nodes, one partition, replication factor three, min.insync.replicas three",
+              "delivery_boundary": "not applicable to publish-only",
+              "batching_boundary": "Kafka producer perf client uses linger.ms=0 and the default batch.size; native client batching remains possible",
+              "client_boundary": "Kafka producer performance client from apache/kafka:4.3.1",
+              "latency_boundary": "native Kafka producer latency includes client-side batching and reports avg/p50/p95/p99/p99.9/max"
+            }
+          },
+          "repetitions": 3,
+          "repetition_summary": {
+            "throughput_messages_per_second": {
+              "count": 3,
+              "min": 11160.714286,
+              "median": 11261.261261,
+              "max": 12642.225032,
+              "samples": [
+                11160.714286,
+                11261.261261,
+                12642.225032
+              ],
+              "standard_deviation": 675.9392413120567,
+              "relative_range_percent": 13.155815424785214,
+              "relative_standard_deviation_percent": 6.002340462990317
+            },
+            "latency_p50": {
+              "count": 3,
+              "min": 189000.0,
+              "median": 221000.0,
+              "max": 229000.0,
+              "samples": [
+                229000.0,
+                221000.0,
+                189000.0
+              ],
+              "standard_deviation": 17281.975195754294,
+              "relative_range_percent": 18.099547511312217,
+              "relative_standard_deviation_percent": 7.819898278621852
+            },
+            "latency_p99": {
+              "count": 3,
+              "min": 267000.0,
+              "median": 323000.0,
+              "max": 391000.0,
+              "samples": [
+                391000.0,
+                323000.0,
+                267000.0
+              ],
+              "standard_deviation": 50701.74224488412,
+              "relative_range_percent": 38.39009287925697,
+              "relative_standard_deviation_percent": 15.697133821945547
+            },
+            "latency_p999": {
+              "count": 3,
+              "min": 325000.0,
+              "median": 373000.0,
+              "max": 392000.0,
+              "samples": [
+                392000.0,
+                373000.0,
+                325000.0
+              ],
+              "standard_deviation": 28193.773938387334,
+              "relative_range_percent": 17.962466487935657,
+              "relative_standard_deviation_percent": 7.558652530398749
+            },
+            "latency_max": {
+              "count": 3,
+              "min": 732000.0,
+              "median": 789000.0,
+              "max": 800000.0,
+              "samples": [
+                800000.0,
+                789000.0,
+                732000.0
+              ],
+              "standard_deviation": 29803.057263009483,
+              "relative_range_percent": 8.61850443599493,
+              "relative_standard_deviation_percent": 3.777320312168502
+            },
+            "cpu_seconds": {
+              "count": 3,
+              "min": 0.317935,
+              "median": 0.32388700000000004,
+              "max": 0.36017299999999997,
+              "samples": [
+                0.36017299999999997,
+                0.317935,
+                0.32388700000000004
+              ],
+              "standard_deviation": 0.018667109351893627,
+              "relative_range_percent": 13.040967991923088,
+              "relative_standard_deviation_percent": 5.763463600543901
+            },
+            "memory_bytes_max": {
+              "count": 3,
+              "min": 810549248.0,
+              "median": 810549248.0,
+              "max": 811597824.0,
+              "samples": [
+                811597824.0,
+                810549248.0,
+                810549248.0
+              ],
+              "standard_deviation": 494303.46679297683,
+              "relative_range_percent": 0.129366106080207,
+              "relative_standard_deviation_percent": 0.060983767243341744
+            },
+            "cpu_efficiency_messages_per_cpu_second": {
+              "count": 3,
+              "min": 27764.43542408787,
+              "median": 30874.96565160071,
+              "max": 31452.969946687215,
+              "samples": [
+                27764.43542408787,
+                31452.969946687215,
+                30874.96565160071
+              ],
+              "standard_deviation": 1619.8344972323798,
+              "relative_range_percent": 11.94668380921134,
+              "relative_standard_deviation_percent": 5.246433358051038
+            }
+          }
+        },
+        {
+          "operation": "publish",
+          "messages": 10000.0,
+          "message_size_bytes": 1024.0,
+          "throughput_messages_per_second": 7012.622721,
+          "latency_microseconds": {
+            "avg": 219190.0,
+            "p50": 219000.0,
+            "p95": 294000.0,
+            "p99": 298000.0,
+            "p999": 299000.0,
+            "max": 498000.0
+          },
+          "resource_samples": {
+            "nodes": [
+              {
+                "samples": 5,
+                "cpu_percent_avg": 1.638,
+                "cpu_percent_max": 3.84,
+                "memory_bytes_avg": 273909022.71999997,
+                "memory_bytes_max": 282066944.0,
+                "memory_percent_avg": 12.756,
+                "memory_percent_max": 13.14,
+                "cpu_seconds": 0.12460599999999994,
+                "elapsed_seconds": 7.646777025
+              },
+              {
+                "samples": 6,
+                "cpu_percent_avg": 1.9966666666666668,
+                "cpu_percent_max": 7.03,
+                "memory_bytes_avg": 277488162.1333333,
+                "memory_bytes_max": 282486374.4,
+                "memory_percent_avg": 12.924999999999999,
+                "memory_percent_max": 13.16,
+                "cpu_seconds": 0.18499700000000002,
+                "elapsed_seconds": 7.407285325
+              },
+              {
+                "samples": 6,
+                "cpu_percent_avg": 1.4383333333333335,
+                "cpu_percent_max": 3.66,
+                "memory_bytes_avg": 278781405.8666667,
+                "memory_bytes_max": 282905804.8,
+                "memory_percent_avg": 12.981666666666667,
+                "memory_percent_max": 13.18,
+                "cpu_seconds": 0.12512600000000007,
+                "elapsed_seconds": 7.376118946
+              }
+            ],
+            "samples": 6.0,
+            "cpu_seconds": 0.41990099999999997,
+            "memory_bytes_avg": 830178590.72,
+            "memory_bytes_max": 846620262.4,
+            "elapsed_seconds": 7.646777025
+          },
+          "metadata": {
+            "comparison_class": "publish-only",
+            "semantic_boundaries": {
+              "acknowledgement_boundary": "Kafka producer performance client with acks=all and idempotence enabled; topic min.insync.replicas=3",
+              "durability_boundary": "one-partition broker log with replication factor three and min.insync.replicas=3; filesystem flush behavior is not asserted",
+              "replication_topology": "three broker nodes, one partition, replication factor three, min.insync.replicas three",
+              "delivery_boundary": "not applicable to publish-only",
+              "batching_boundary": "Kafka producer perf client uses linger.ms=0 and the default batch.size; native client batching remains possible",
+              "client_boundary": "Kafka producer performance client from apache/kafka:4.3.1",
+              "latency_boundary": "native Kafka producer latency includes client-side batching and reports avg/p50/p95/p99/p99.9/max"
+            }
+          },
+          "repetitions": 3,
+          "repetition_summary": {
+            "throughput_messages_per_second": {
+              "count": 3,
+              "min": 6788.866259,
+              "median": 7012.622721,
+              "max": 7072.135785,
+              "samples": [
+                7072.135785,
+                6788.866259,
+                7012.622721
+              ],
+              "standard_deviation": 121.9518955406826,
+              "relative_range_percent": 4.039423440701025,
+              "relative_standard_deviation_percent": 1.739034030384744
+            },
+            "latency_p50": {
+              "count": 3,
+              "min": 217000.0,
+              "median": 219000.0,
+              "max": 312000.0,
+              "samples": [
+                312000.0,
+                219000.0,
+                217000.0
+              ],
+              "standard_deviation": 44319.54672852851,
+              "relative_range_percent": 43.37899543378995,
+              "relative_standard_deviation_percent": 20.237235949099777
+            },
+            "latency_p99": {
+              "count": 3,
+              "min": 295000.0,
+              "median": 298000.0,
+              "max": 392000.0,
+              "samples": [
+                392000.0,
+                298000.0,
+                295000.0
+              ],
+              "standard_deviation": 45035.788238047106,
+              "relative_range_percent": 32.5503355704698,
+              "relative_standard_deviation_percent": 15.11268061679433
+            },
+            "latency_p999": {
+              "count": 3,
+              "min": 296000.0,
+              "median": 299000.0,
+              "max": 393000.0,
+              "samples": [
+                393000.0,
+                299000.0,
+                296000.0
+              ],
+              "standard_deviation": 45035.788238047106,
+              "relative_range_percent": 32.441471571906355,
+              "relative_standard_deviation_percent": 15.062136534463916
+            },
+            "latency_max": {
+              "count": 3,
+              "min": 423000.0,
+              "median": 498000.0,
+              "max": 512000.0,
+              "samples": [
+                512000.0,
+                423000.0,
+                498000.0
+              ],
+              "standard_deviation": 39075.42563925426,
+              "relative_range_percent": 17.8714859437751,
+              "relative_standard_deviation_percent": 7.846471011898445
+            },
+            "cpu_seconds": {
+              "count": 3,
+              "min": 0.41139300000000006,
+              "median": 0.41990099999999997,
+              "max": 0.43472900000000003,
+              "samples": [
+                0.43472900000000003,
+                0.41139300000000006,
+                0.41990099999999997
+              ],
+              "standard_deviation": 0.009642639933591254,
+              "relative_range_percent": 5.557500458441387,
+              "relative_standard_deviation_percent": 2.296407947014
+            },
+            "memory_bytes_max": {
+              "count": 3,
+              "min": 846515404.8,
+              "median": 846620262.4,
+              "max": 847459123.2,
+              "samples": [
+                847459123.2,
+                846620262.4,
+                846515404.8
+              ],
+              "standard_deviation": 422333.06716030353,
+              "relative_range_percent": 0.11146891255884209,
+              "relative_standard_deviation_percent": 0.049884592410187924
+            },
+            "cpu_efficiency_messages_per_cpu_second": {
+              "count": 3,
+              "min": 23002.836249709588,
+              "median": 23815.137377619965,
+              "max": 24307.65715508042,
+              "samples": [
+                23002.836249709588,
+                24307.65715508042,
+                23815.137377619965
+              ],
+              "standard_deviation": 537.9969484307219,
+              "relative_range_percent": 5.478956029861171,
+              "relative_standard_deviation_percent": 2.2590545664300854
+            }
+          }
+        }
+      ],
+      "repetition_summary": {
+        "samples": {
+          "count": 3,
+          "min": 21.0,
+          "median": 22.0,
+          "max": 23.0,
+          "samples": [
+            21.0,
+            22.0,
+            23.0
+          ],
+          "standard_deviation": 0.816496580927726,
+          "relative_range_percent": 9.090909090909092,
+          "relative_standard_deviation_percent": 3.7113480951260276
+        },
+        "memory_bytes_avg": {
+          "count": 3,
+          "min": 639510308.7393391,
+          "median": 645227260.5866667,
+          "max": 669053715.992381,
+          "samples": [
+            669053715.992381,
+            645227260.5866667,
+            639510308.7393391
+          ],
+          "standard_deviation": 12794080.348801246,
+          "relative_range_percent": 4.57875992811894,
+          "relative_standard_deviation_percent": 1.9828796968634508
+        },
+        "memory_bytes_max": {
+          "count": 3,
+          "min": 846829977.5999999,
+          "median": 846829977.6,
+          "max": 847563980.8,
+          "samples": [
+            847563980.8,
+            846829977.5999999,
+            846829977.6
+          ],
+          "standard_deviation": 346012.4267550782,
+          "relative_range_percent": 0.08667657256067923,
+          "relative_standard_deviation_percent": 0.040859728151772766
+        }
+      },
+      "repetitions": 3
+    },
+    "nats": {
+      "image": "nats:2.14.5-alpine",
+      "image_id": "sha256:9d6f44f99d2bf938cade3056908491a689089af9f69717a5c9c43ea56837e660",
+      "image_ids": [
+        "sha256:9d6f44f99d2bf938cade3056908491a689089af9f69717a5c9c43ea56837e660",
+        "sha256:9d6f44f99d2bf938cade3056908491a689089af9f69717a5c9c43ea56837e660",
+        "sha256:9d6f44f99d2bf938cade3056908491a689089af9f69717a5c9c43ea56837e660"
+      ],
+      "runtime": "container",
+      "cpu_limit": "2",
+      "memory_limit": "2g",
+      "acknowledgement": "JetStream synchronous publish PubAck to a file-backed stream configured with three replicas",
+      "replication": "three NATS servers, file storage, three stream replicas",
+      "measurement_boundary": "nats bench js native synchronous publisher; durable publish only",
+      "measurement_client": "nats bench js native synchronous publisher",
+      "client_image": "natsio/nats-box:0.19.7",
+      "semantic_metadata": {
+        "acknowledgement_boundary": "JetStream synchronous publish PubAck to a file-backed stream configured with three replicas",
+        "replication_topology": "three NATS servers, file storage, three stream replicas",
+        "measurement_boundary": "nats bench js native synchronous publisher; durable publish only",
+        "client_identity": {
+          "name": "nats bench js native synchronous publisher",
+          "image": "natsio/nats-box:0.19.7"
+        },
+        "scenario_classes": [
+          "publish-only"
+        ],
+        "scenario_boundaries": {
+          "publish-only": {
+            "acknowledgement_boundary": "synchronous JetStream PubAck after publishing to the three-replica stream",
+            "durability_boundary": "file-backed stream with three replicas; synchronous PubAck; exact filesystem flush behavior is not asserted",
+            "replication_topology": "three NATS servers, file storage, three stream replicas",
+            "delivery_boundary": "not applicable to publish-only",
+            "batching_boundary": "nats bench js pub sync publishes one message at a time; no explicit client batch",
+            "client_boundary": "nats bench js native synchronous publisher from natsio/nats-box:0.19.7",
+            "latency_boundary": "native synchronous publisher stats measure publish acknowledgement latency and report min/avg/p50/p90/p99/p99.9/max"
+          }
+        },
+        "comparison": {
+          "classification": "native-tool-baseline",
+          "apples_to_apples": false,
+          "ranking_eligible": false,
+          "experimental": true,
+          "mismatch_dimensions": [
+            "acknowledgement",
+            "durability",
+            "replication",
+            "delivery",
+            "batching",
+            "client",
+            "latency"
+          ]
+        }
+      },
+      "startup_seconds": 0.094549883,
+      "nodes": [
+        {
+          "image": "nats:2.14.5-alpine",
+          "image_id": "sha256:9d6f44f99d2bf938cade3056908491a689089af9f69717a5c9c43ea56837e660",
+          "cpu_limit": "2",
+          "memory_limit": "2g",
+          "startup_seconds": 0.092560571,
+          "resource_samples": {
+            "samples": 20,
+            "cpu_percent_avg": 10.6525,
+            "cpu_percent_max": 80.35,
+            "memory_bytes_avg": 21565066.4448,
+            "memory_bytes_max": 47018147.84,
+            "memory_percent_avg": 1.003,
+            "memory_percent_max": 2.19
+          },
+          "log_tail": " 2026/11/16 11:41:52.077731 [INF]   Max Memory:      11.50 GB\n[1] 2026/11/16 11:41:52.077732 [INF]   Max Storage:     63.39 GB\n[1] 2026/11/16 11:41:52.077733 [INF]   Store Directory: \"/data/jetstream\"\n[1] 2026/11/16 11:41:52.077734 [INF]   API Level:       4\n[1] 2026/11/16 11:41:52.077736 [INF] -------------------------------------------\n[1] 2026/11/16 11:41:52.078020 [INF] Starting JetStream cluster\n[1] 2026/11/16 11:41:52.078026 [INF] Creating JetStream metadata controller\n[1] 2026/11/16 11:41:52.078451 [INF] JetStream cluster bootstrapping\n[1] 2026/11/16 11:41:52.079636 [INF] Took 2.048951ms to start JetStream\n[1] 2026/11/16 11:41:52.079894 [INF] Listening for client connections on 0.0.0.0:4222\n[1] 2026/11/16 11:41:52.080123 [INF] Server is ready\n[1] 2026/11/16 11:41:52.080156 [INF] Cluster name is runnel-compare-31463-1794829219766309040-nats-cluster\n[1] 2026/11/16 11:41:52.080233 [INF] Listening for route connections on 0.0.0.0:6222\n[1] 2026/11/16 11:41:52.084805 [ERR] Error trying to connect to route (attempt 1): lookup for host \"runnel-compare-31463-1794829219766309040-nats-2\": lookup runnel-compare-31463-1794829219766309040-nats-2 on 127.0.0.11:53: server misbehaving\n[1] 2026/11/16 11:41:52.084866 [ERR] Error trying to connect to route (attempt 1): lookup for host \"runnel-compare-31463-1794829219766309040-nats-2\": lookup runnel-compare-31463-1794829219766309040-nats-2 on 127.0.0.11:53: server misbehaving\n[1] 2026/11/16 11:41:52.084922 [ERR] Error trying to connect to route (attempt 1): lookup for host \"runnel-compare-31463-1794829219766309040-nats-3\": lookup runnel-compare-31463-1794829219766309040-nats-3 on 127.0.0.11:53: server misbehaving\n[1] 2026/11/16 11:41:52.084998 [ERR] Error trying to connect to route (attempt 1): lookup for host \"runnel-compare-31463-1794829219766309040-nats-3\": lookup runnel-compare-31463-1794829219766309040-nats-3 on 127.0.0.11:53: server misbehaving\n[1] 2026/11/16 11:41:52.180503 [WRN] Waiting for routing to be established...\n[1] 2026/11/16 11:41:52.187696 [INF] 172.18.0.3:59422 - rid:8 - Route connection created\n[1] 2026/11/16 11:41:52.187795 [INF] 172.18.0.3:59426 - rid:9 - Route connection created\n[1] 2026/11/16 11:41:52.189113 [INF] 172.18.0.3:59442 - rid:10 - Route connection created\n[1] 2026/11/16 11:41:52.190292 [INF] 172.18.0.3:59450 - rid:11 - Route connection created\n[1] 2026/11/16 11:41:52.281060 [WRN] JetStream has not established contact with a meta leader\n[1] 2026/11/16 11:41:52.293797 [INF] 172.18.0.4:54422 - rid:12 - Route connection created\n[1] 2026/11/16 11:41:52.294134 [INF] 172.18.0.4:54428 - rid:13 - Route connection created\n[1] 2026/11/16 11:41:52.296170 [INF] 172.18.0.4:54444 - rid:14 - Route connection created\n[1] 2026/11/16 11:41:52.296792 [INF] 172.18.0.4:54456 - rid:15 - Route connection created\n[1] 2026/11/16 11:41:52.509948 [INF] JetStream cluster new metadata leader: runnel-compare-31463-1794829219766309040-nats-3/runnel-compare-31463-1794829219766309040-nats-cluster\n[1] 2026/11/16 11:41:53.086475 [INF] 172.18.0.4:6222 - rid:17 - Route connection created\n[1] 2026/11/16 11:41:53.086547 [INF] 172.18.0.4:6222 - rid:18 - Route connection created\n[1] 2026/11/16 11:41:53.086593 [INF] 172.18.0.3:6222 - rid:19 - Route connection created\n[1] 2026/11/16 11:41:53.086629 [INF] 172.18.0.3:6222 - rid:20 - Route connection created\n[1] 2026/11/16 11:41:53.086710 [INF] 172.18.0.4:6222 - rid:17 - Router connection closed: Duplicate Route - Remote: runnel-compare-31463-1794829219766309040-nats-3\n[1] 2026/11/16 11:41:53.086765 [INF] 172.18.0.4:6222 - rid:18 - Router connection closed: Duplicate Route - Remote: runnel-compare-31463-1794829219766309040-nats-3\n[1] 2026/11/16 11:41:53.086793 [INF] 172.18.0.3:6222 - rid:19 - Router connection closed: Duplicate Route - Remote: runnel-compare-31463-1794829219766309040-nats-2\n[1] 2026/11/16 11:41:53.086830 [INF] 172.18.0.3:6222 - rid:20 - Router connection closed: Duplicate Route - Remote: runnel-compare-31463-1794829219766309040-nats-2\n"
+        },
+        {
+          "image": "nats:2.14.5-alpine",
+          "image_id": "sha256:9d6f44f99d2bf938cade3056908491a689089af9f69717a5c9c43ea56837e660",
+          "cpu_limit": "2",
+          "memory_limit": "2g",
+          "startup_seconds": 0.091055102,
+          "resource_samples": {
+            "samples": 20,
+            "cpu_percent_avg": 10.474499999999999,
+            "cpu_percent_max": 66.99,
+            "memory_bytes_avg": 21343135.3344,
+            "memory_bytes_max": 43295703.04,
+            "memory_percent_avg": 0.994,
+            "memory_percent_max": 2.02
+          },
+          "log_tail": "/11/16 11:41:52.183391 [INF]   Store Directory: \"/data/jetstream\"\n[1] 2026/11/16 11:41:52.183392 [INF]   API Level:       4\n[1] 2026/11/16 11:41:52.183393 [INF] -------------------------------------------\n[1] 2026/11/16 11:41:52.183637 [INF] Starting JetStream cluster\n[1] 2026/11/16 11:41:52.183640 [INF] Creating JetStream metadata controller\n[1] 2026/11/16 11:41:52.184163 [INF] JetStream cluster bootstrapping\n[1] 2026/11/16 11:41:52.185551 [INF] Took 2.304882ms to start JetStream\n[1] 2026/11/16 11:41:52.186014 [INF] Listening for client connections on 0.0.0.0:4222\n[1] 2026/11/16 11:41:52.186182 [INF] Server is ready\n[1] 2026/11/16 11:41:52.186232 [INF] Cluster name is runnel-compare-31463-1794829219766309040-nats-cluster\n[1] 2026/11/16 11:41:52.186344 [INF] Listening for route connections on 0.0.0.0:6222\n[1] 2026/11/16 11:41:52.187490 [INF] 172.18.0.2:6222 - rid:8 - Route connection created\n[1] 2026/11/16 11:41:52.187527 [INF] 172.18.0.2:6222 - rid:9 - Route connection created\n[1] 2026/11/16 11:41:52.189037 [INF] 172.18.0.2:6222 - rid:10 - Route connection created\n[1] 2026/11/16 11:41:52.190232 [ERR] Error trying to connect to route (attempt 1): lookup for host \"runnel-compare-31463-1794829219766309040-nats-3\": lookup runnel-compare-31463-1794829219766309040-nats-3 on 127.0.0.11:53: server misbehaving\n[1] 2026/11/16 11:41:52.190256 [ERR] Error trying to connect to route (attempt 1): lookup for host \"runnel-compare-31463-1794829219766309040-nats-3\": lookup runnel-compare-31463-1794829219766309040-nats-3 on 127.0.0.11:53: server misbehaving\n[1] 2026/11/16 11:41:52.190283 [INF] 172.18.0.2:6222 - rid:11 - Route connection created\n[1] 2026/11/16 11:41:52.285768 [WRN] Waiting for routing to be established...\n[1] 2026/11/16 11:41:52.285824 [WRN] JetStream has not established contact with a meta leader\n[1] 2026/11/16 11:41:52.293797 [INF] 172.18.0.4:60160 - rid:12 - Route connection created\n[1] 2026/11/16 11:41:52.294204 [INF] 172.18.0.4:60164 - rid:13 - Route connection created\n[1] 2026/11/16 11:41:52.295323 [INF] 172.18.0.4:60180 - rid:14 - Route connection created\n[1] 2026/11/16 11:41:52.296206 [INF] 172.18.0.4:60194 - rid:15 - Route connection created\n[1] 2026/11/16 11:41:52.509961 [INF] JetStream cluster new metadata leader: runnel-compare-31463-1794829219766309040-nats-3/runnel-compare-31463-1794829219766309040-nats-cluster\n[1] 2026/11/16 11:41:53.086431 [INF] 172.18.0.2:56632 - rid:16 - Route connection created\n[1] 2026/11/16 11:41:53.086463 [INF] 172.18.0.2:56624 - rid:17 - Route connection created\n[1] 2026/11/16 11:41:53.086950 [INF] 172.18.0.2:56624 - rid:17 - Router connection closed: Client Closed\n[1] 2026/11/16 11:41:53.086976 [INF] 172.18.0.2:56632 - rid:16 - Router connection closed: Client Closed\n[1] 2026/11/16 11:41:53.191350 [INF] 172.18.0.4:6222 - rid:18 - Route connection created\n[1] 2026/11/16 11:41:53.191383 [INF] 172.18.0.4:6222 - rid:19 - Route connection created\n[1] 2026/11/16 11:41:53.191540 [INF] 172.18.0.4:6222 - rid:18 - Router connection closed: Duplicate Route - Remote: runnel-compare-31463-1794829219766309040-nats-3\n[1] 2026/11/16 11:41:53.191614 [INF] 172.18.0.4:6222 - rid:19 - Router connection closed: Duplicate Route - Remote: runnel-compare-31463-1794829219766309040-nats-3\n[1] 2026/11/16 11:41:58.570894 [INF] JetStream cluster new stream leader for '$G > bench100'\n[1] 2026/11/16 11:42:28.053288 [INF] 172.18.0.2:6222 - rid:11 - Router connection closed: Client Closed - Remote: runnel-compare-31463-1794829219766309040-nats-1\n[1] 2026/11/16 11:42:28.053447 [INF] 172.18.0.2:6222 - rid:8 - Router connection closed: Client Closed - Remote: runnel-compare-31463-1794829219766309040-nats-1\n[1] 2026/11/16 11:42:28.053607 [INF] 172.18.0.2:6222 - rid:9 - Router connection closed: Client Closed - Remote: runnel-compare-31463-1794829219766309040-nats-1\n[1] 2026/11/16 11:42:28.053644 [INF] 172.18.0.2:6222 - rid:10 - Router connection closed: Client Closed - Remote: runnel-compare-31463-1794829219766309040-nats-1\n"
+        },
+        {
+          "image": "nats:2.14.5-alpine",
+          "image_id": "sha256:9d6f44f99d2bf938cade3056908491a689089af9f69717a5c9c43ea56837e660",
+          "cpu_limit": "2",
+          "memory_limit": "2g",
+          "startup_seconds": 0.094549883,
+          "resource_samples": {
+            "samples": 20,
+            "cpu_percent_avg": 10.855500000000001,
+            "cpu_percent_max": 103.53,
+            "memory_bytes_avg": 18808727.1424,
+            "memory_bytes_max": 37413191.68,
+            "memory_percent_avg": 0.876,
+            "memory_percent_max": 1.74
+          },
+          "log_tail": ".291368 [INF]   Max Storage:     63.39 GB\n[1] 2026/11/16 11:41:52.291368 [INF]   Store Directory: \"/data/jetstream\"\n[1] 2026/11/16 11:41:52.291369 [INF]   API Level:       4\n[1] 2026/11/16 11:41:52.291371 [INF] -------------------------------------------\n[1] 2026/11/16 11:41:52.291644 [INF] Starting JetStream cluster\n[1] 2026/11/16 11:41:52.291651 [INF] Creating JetStream metadata controller\n[1] 2026/11/16 11:41:52.292035 [INF] JetStream cluster bootstrapping\n[1] 2026/11/16 11:41:52.292748 [INF] Took 1.551028ms to start JetStream\n[1] 2026/11/16 11:41:52.292924 [INF] Listening for client connections on 0.0.0.0:4222\n[1] 2026/11/16 11:41:52.293029 [INF] Server is ready\n[1] 2026/11/16 11:41:52.293051 [INF] Cluster name is runnel-compare-31463-1794829219766309040-nats-cluster\n[1] 2026/11/16 11:41:52.293097 [INF] Listening for route connections on 0.0.0.0:6222\n[1] 2026/11/16 11:41:52.293987 [INF] 172.18.0.3:6222 - rid:8 - Route connection created\n[1] 2026/11/16 11:41:52.294217 [INF] 172.18.0.3:6222 - rid:9 - Route connection created\n[1] 2026/11/16 11:41:52.294293 [INF] 172.18.0.2:6222 - rid:10 - Route connection created\n[1] 2026/11/16 11:41:52.294370 [INF] 172.18.0.2:6222 - rid:11 - Route connection created\n[1] 2026/11/16 11:41:52.295247 [INF] 172.18.0.3:6222 - rid:12 - Route connection created\n[1] 2026/11/16 11:41:52.296203 [INF] 172.18.0.3:6222 - rid:13 - Route connection created\n[1] 2026/11/16 11:41:52.296367 [INF] 172.18.0.2:6222 - rid:14 - Route connection created\n[1] 2026/11/16 11:41:52.296963 [INF] 172.18.0.2:6222 - rid:15 - Route connection created\n[1] 2026/11/16 11:41:52.394073 [WRN] Waiting for routing to be established...\n[1] 2026/11/16 11:41:52.394152 [WRN] JetStream has not established contact with a meta leader\n[1] 2026/11/16 11:41:52.510586 [INF] Self is new JetStream cluster metadata leader\n[1] 2026/11/16 11:41:53.086508 [INF] 172.18.0.2:54860 - rid:16 - Route connection created\n[1] 2026/11/16 11:41:53.086566 [INF] 172.18.0.2:54856 - rid:17 - Route connection created\n[1] 2026/11/16 11:41:53.086907 [INF] 172.18.0.2:54856 - rid:17 - Router connection closed: Client Closed\n[1] 2026/11/16 11:41:53.087003 [INF] 172.18.0.2:54860 - rid:16 - Router connection closed: Client Closed\n[1] 2026/11/16 11:41:53.191421 [INF] 172.18.0.3:54976 - rid:18 - Route connection created\n[1] 2026/11/16 11:41:53.191450 [INF] 172.18.0.3:54986 - rid:19 - Route connection created\n[1] 2026/11/16 11:41:53.191657 [INF] 172.18.0.3:54986 - rid:19 - Router connection closed: Client Closed\n[1] 2026/11/16 11:41:53.191671 [INF] 172.18.0.3:54976 - rid:18 - Router connection closed: Client Closed\n[1] 2026/11/16 11:42:13.167615 [INF] JetStream cluster new stream leader for '$G > bench1024'\n[1] 2026/11/16 11:42:28.053256 [INF] 172.18.0.2:6222 - rid:15 - Router connection closed: Client Closed - Remote: runnel-compare-31463-1794829219766309040-nats-1\n[1] 2026/11/16 11:42:28.053429 [INF] 172.18.0.2:6222 - rid:10 - Router connection closed: Client Closed - Remote: runnel-compare-31463-1794829219766309040-nats-1\n[1] 2026/11/16 11:42:28.053464 [INF] 172.18.0.2:6222 - rid:11 - Router connection closed: Client Closed - Remote: runnel-compare-31463-1794829219766309040-nats-1\n[1] 2026/11/16 11:42:28.053604 [INF] 172.18.0.2:6222 - rid:14 - Router connection closed: Client Closed - Remote: runnel-compare-31463-1794829219766309040-nats-1\n[1] 2026/11/16 11:42:28.130841 [INF] 172.18.0.3:6222 - rid:12 - Router connection closed: Client Closed - Remote: runnel-compare-31463-1794829219766309040-nats-2\n[1] 2026/11/16 11:42:28.130917 [INF] 172.18.0.3:6222 - rid:8 - Router connection closed: Client Closed - Remote: runnel-compare-31463-1794829219766309040-nats-2\n[1] 2026/11/16 11:42:28.130842 [INF] 172.18.0.3:6222 - rid:13 - Router connection closed: Client Closed - Remote: runnel-compare-31463-1794829219766309040-nats-2\n[1] 2026/11/16 11:42:28.131065 [INF] 172.18.0.3:6222 - rid:9 - Router connection closed: Client Closed - Remote: runnel-compare-31463-1794829219766309040-nats-2\n"
+        }
+      ],
+      "resource_samples": {
+        "nodes": [
+          {
+            "samples": 20,
+            "cpu_percent_avg": 10.6525,
+            "cpu_percent_max": 80.35,
+            "memory_bytes_avg": 21565066.4448,
+            "memory_bytes_max": 47018147.84,
+            "memory_percent_avg": 1.003,
+            "memory_percent_max": 2.19
+          },
+          {
+            "samples": 20,
+            "cpu_percent_avg": 10.474499999999999,
+            "cpu_percent_max": 66.99,
+            "memory_bytes_avg": 21343135.3344,
+            "memory_bytes_max": 43295703.04,
+            "memory_percent_avg": 0.994,
+            "memory_percent_max": 2.02
+          },
+          {
+            "samples": 20,
+            "cpu_percent_avg": 10.855500000000001,
+            "cpu_percent_max": 103.53,
+            "memory_bytes_avg": 18808727.1424,
+            "memory_bytes_max": 37413191.68,
+            "memory_percent_avg": 0.876,
+            "memory_percent_max": 1.74
+          }
+        ],
+        "samples": 20.0,
+        "memory_bytes_avg": 61716928.9216,
+        "memory_bytes_max": 127286640.64000002
+      },
+      "scenarios": [
+        {
+          "operation": "publish",
+          "messages": 10000.0,
+          "message_size_bytes": 100.0,
+          "throughput_messages_per_second": 4534.0,
+          "latency_microseconds": {
+            "min": 123.33,
+            "avg": 220.28,
+            "max": 2265.47,
+            "p50": 215.6,
+            "p90": 259.42,
+            "p99": 347.91,
+            "p999": 746.25
+          },
+          "resource_samples": {
+            "nodes": [
+              {
+                "samples": 5,
+                "cpu_percent_avg": 19.728,
+                "cpu_percent_max": 53.77,
+                "memory_bytes_avg": 13233867.9808,
+                "memory_bytes_max": 21978152.96,
+                "memory_percent_avg": 0.6140000000000001,
+                "memory_percent_max": 1.02,
+                "cpu_seconds": 1.5998759999999999,
+                "elapsed_seconds": 6.492716563
+              },
+              {
+                "samples": 5,
+                "cpu_percent_avg": 25.104,
+                "cpu_percent_max": 66.99,
+                "memory_bytes_avg": 17358546.5344,
+                "memory_bytes_max": 23026728.96,
+                "memory_percent_avg": 0.808,
+                "memory_percent_max": 1.07,
+                "cpu_seconds": 2.043481,
+                "elapsed_seconds": 6.233519672
+              },
+              {
+                "samples": 5,
+                "cpu_percent_avg": 14.530000000000001,
+                "cpu_percent_max": 37.58,
+                "memory_bytes_avg": 17816983.9616,
+                "memory_bytes_max": 20164116.48,
+                "memory_percent_avg": 0.8300000000000001,
+                "memory_percent_max": 0.94,
+                "cpu_seconds": 1.1605409999999998,
+                "elapsed_seconds": 6.19916611
+              }
+            ],
+            "samples": 5.0,
+            "cpu_seconds": 4.725982999999999,
+            "memory_bytes_avg": 48908940.0832,
+            "memory_bytes_max": 65168998.400000006,
+            "elapsed_seconds": 6.453629355
+          },
+          "metadata": {
+            "comparison_class": "publish-only",
+            "semantic_boundaries": {
+              "acknowledgement_boundary": "synchronous JetStream PubAck after publishing to the three-replica stream",
+              "durability_boundary": "file-backed stream with three replicas; synchronous PubAck; exact filesystem flush behavior is not asserted",
+              "replication_topology": "three NATS servers, file storage, three stream replicas",
+              "delivery_boundary": "not applicable to publish-only",
+              "batching_boundary": "nats bench js pub sync publishes one message at a time; no explicit client batch",
+              "client_boundary": "nats bench js native synchronous publisher from natsio/nats-box:0.19.7",
+              "latency_boundary": "native synchronous publisher stats measure publish acknowledgement latency and report min/avg/p50/p90/p99/p99.9/max"
+            }
+          },
+          "repetitions": 3,
+          "repetition_summary": {
+            "throughput_messages_per_second": {
+              "count": 3,
+              "min": 4455.0,
+              "median": 4534.0,
+              "max": 4542.0,
+              "samples": [
+                4455.0,
+                4534.0,
+                4542.0
+              ],
+              "standard_deviation": 39.2626483512709,
+              "relative_range_percent": 1.9188354653727393,
+              "relative_standard_deviation_percent": 0.8659604841480126
+            },
+            "latency_p50": {
+              "count": 3,
+              "min": 215.52,
+              "median": 215.6,
+              "max": 219.61,
+              "samples": [
+                219.61,
+                215.6,
+                215.52
+              ],
+              "standard_deviation": 1.9094676395966197,
+              "relative_range_percent": 1.8970315398886846,
+              "relative_standard_deviation_percent": 0.8856528940615119
+            },
+            "latency_p99": {
+              "count": 3,
+              "min": 344.44,
+              "median": 347.91,
+              "max": 349.02,
+              "samples": [
+                347.91,
+                344.44,
+                349.02
+              ],
+              "standard_deviation": 1.95076623122528,
+              "relative_range_percent": 1.3164324106809187,
+              "relative_standard_deviation_percent": 0.5607100201848984
+            },
+            "latency_p999": {
+              "count": 3,
+              "min": 678.88,
+              "median": 746.25,
+              "max": 754.21,
+              "samples": [
+                746.25,
+                754.21,
+                678.88
+              ],
+              "standard_deviation": 33.791332550752664,
+              "relative_range_percent": 10.094472361809052,
+              "relative_standard_deviation_percent": 4.5281517655949965
+            },
+            "latency_max": {
+              "count": 3,
+              "min": 2145.46,
+              "median": 2265.47,
+              "max": 3398.71,
+              "samples": [
+                2145.46,
+                2265.47,
+                3398.71
+              ],
+              "standard_deviation": 564.6307407107371,
+              "relative_range_percent": 55.31964669582913,
+              "relative_standard_deviation_percent": 24.923337793514687
+            },
+            "cpu_seconds": {
+              "count": 3,
+              "min": 4.706528,
+              "median": 4.725982999999999,
+              "max": 4.803897999999999,
+              "samples": [
+                4.803897999999999,
+                4.725982999999999,
+                4.706528
+              ],
+              "standard_deviation": 0.04207158073516549,
+              "relative_range_percent": 2.0603121086131657,
+              "relative_standard_deviation_percent": 0.890218621928295
+            },
+            "memory_bytes_max": {
+              "count": 3,
+              "min": 64801996.8,
+              "median": 65168998.400000006,
+              "max": 66259517.44,
+              "samples": [
+                65168998.400000006,
+                64801996.8,
+                66259517.44
+              ],
+              "standard_deviation": 618985.5829438537,
+              "relative_range_percent": 2.236524537409494,
+              "relative_standard_deviation_percent": 0.9498160139650905
+            },
+            "cpu_efficiency_messages_per_cpu_second": {
+              "count": 3,
+              "min": 2081.64286585602,
+              "median": 2115.961906760985,
+              "max": 2124.708489995173,
+              "samples": [
+                2081.64286585602,
+                2115.961906760985,
+                2124.708489995173
+              ],
+              "standard_deviation": 18.58597819565435,
+              "relative_range_percent": 2.0352740756602663,
+              "relative_standard_deviation_percent": 0.8783701699103311
+            }
+          }
+        },
+        {
+          "operation": "publish",
+          "messages": 10000.0,
+          "message_size_bytes": 1024.0,
+          "throughput_messages_per_second": 4292.0,
+          "latency_microseconds": {
+            "min": 129.91,
+            "avg": 232.73,
+            "max": 4880.75,
+            "p50": 228.52,
+            "p90": 272.4,
+            "p99": 348.51,
+            "p999": 694.51
+          },
+          "resource_samples": {
+            "nodes": [
+              {
+                "samples": 4,
+                "cpu_percent_avg": 27.487499999999997,
+                "cpu_percent_max": 80.35,
+                "memory_bytes_avg": 29040312.32,
+                "memory_bytes_max": 46588231.68,
+                "memory_percent_avg": 1.3525,
+                "memory_percent_max": 2.17,
+                "cpu_seconds": 1.700815,
+                "elapsed_seconds": 6.589368925
+              },
+              {
+                "samples": 4,
+                "cpu_percent_avg": 19.9775,
+                "cpu_percent_max": 58.21,
+                "memory_bytes_avg": 33842790.4,
+                "memory_bytes_max": 43044044.8,
+                "memory_percent_avg": 1.575,
+                "memory_percent_max": 2.0,
+                "cpu_seconds": 1.232676,
+                "elapsed_seconds": 6.62318701
+              },
+              {
+                "samples": 4,
+                "cpu_percent_avg": 35.0175,
+                "cpu_percent_max": 103.53,
+                "memory_bytes_avg": 34089205.76,
+                "memory_bytes_max": 37413191.68,
+                "memory_percent_avg": 1.5899999999999999,
+                "memory_percent_max": 1.74,
+                "cpu_seconds": 2.1680390000000003,
+                "elapsed_seconds": 6.654846335
+              }
+            ],
+            "samples": 4.0,
+            "cpu_seconds": 4.992027,
+            "memory_bytes_avg": 97069301.76,
+            "memory_bytes_max": 126510694.4,
+            "elapsed_seconds": 6.598242717
+          },
+          "metadata": {
+            "comparison_class": "publish-only",
+            "semantic_boundaries": {
+              "acknowledgement_boundary": "synchronous JetStream PubAck after publishing to the three-replica stream",
+              "durability_boundary": "file-backed stream with three replicas; synchronous PubAck; exact filesystem flush behavior is not asserted",
+              "replication_topology": "three NATS servers, file storage, three stream replicas",
+              "delivery_boundary": "not applicable to publish-only",
+              "batching_boundary": "nats bench js pub sync publishes one message at a time; no explicit client batch",
+              "client_boundary": "nats bench js native synchronous publisher from natsio/nats-box:0.19.7",
+              "latency_boundary": "native synchronous publisher stats measure publish acknowledgement latency and report min/avg/p50/p90/p99/p99.9/max"
+            }
+          },
+          "repetitions": 3,
+          "repetition_summary": {
+            "throughput_messages_per_second": {
+              "count": 3,
+              "min": 4195.0,
+              "median": 4292.0,
+              "max": 4298.0,
+              "samples": [
+                4195.0,
+                4292.0,
+                4298.0
+              ],
+              "standard_deviation": 47.20404879056692,
+              "relative_range_percent": 2.3998136067101585,
+              "relative_standard_deviation_percent": 1.0998147434894436
+            },
+            "latency_p50": {
+              "count": 3,
+              "min": 227.52,
+              "median": 228.52,
+              "max": 233.34,
+              "samples": [
+                233.34,
+                228.52,
+                227.52
+              ],
+              "standard_deviation": 2.5408834858940055,
+              "relative_range_percent": 2.546823035182913,
+              "relative_standard_deviation_percent": 1.1118866995860341
+            },
+            "latency_p99": {
+              "count": 3,
+              "min": 339.98,
+              "median": 348.51,
+              "max": 377.12,
+              "samples": [
+                377.12,
+                348.51,
+                339.98
+              ],
+              "standard_deviation": 15.883858333401097,
+              "relative_range_percent": 10.656796074718082,
+              "relative_standard_deviation_percent": 4.5576477958741775
+            },
+            "latency_p999": {
+              "count": 3,
+              "min": 676.72,
+              "median": 694.51,
+              "max": 808.63,
+              "samples": [
+                808.63,
+                694.51,
+                676.72
+              ],
+              "standard_deviation": 58.44285585082234,
+              "relative_range_percent": 18.99324703747966,
+              "relative_standard_deviation_percent": 8.414976868702013
+            },
+            "latency_max": {
+              "count": 3,
+              "min": 4807.76,
+              "median": 4880.75,
+              "max": 5307.66,
+              "samples": [
+                4880.75,
+                5307.66,
+                4807.76
+              ],
+              "standard_deviation": 220.47416028994303,
+              "relative_range_percent": 10.24227833837012,
+              "relative_standard_deviation_percent": 4.517218875991252
+            },
+            "cpu_seconds": {
+              "count": 3,
+              "min": 4.965977,
+              "median": 4.992027,
+              "max": 5.10153,
+              "samples": [
+                5.10153,
+                4.992027,
+                4.965977
+              ],
+              "standard_deviation": 0.05873114384681762,
+              "relative_range_percent": 2.715389960831556,
+              "relative_standard_deviation_percent": 1.176498922117561
+            },
+            "memory_bytes_max": {
+              "count": 3,
+              "min": 125472604.16,
+              "median": 126510694.4,
+              "max": 127045468.16,
+              "samples": [
+                127045468.16,
+                125472604.16,
+                126510694.4
+              ],
+              "standard_deviation": 652985.9181112055,
+              "relative_range_percent": 1.2432656444260255,
+              "relative_standard_deviation_percent": 0.5161507659159648
+            },
+            "cpu_efficiency_messages_per_cpu_second": {
+              "count": 3,
+              "min": 1960.1962548490353,
+              "median": 2003.1942936206074,
+              "max": 2013.7024396206427,
+              "samples": [
+                1960.1962548490353,
+                2003.1942936206074,
+                2013.7024396206427
+              ],
+              "standard_deviation": 23.147268327849225,
+              "relative_range_percent": 2.671043190468531,
+              "relative_standard_deviation_percent": 1.1555178846886818
+            }
+          }
+        }
+      ],
+      "repetition_summary": {
+        "samples": {
+          "count": 3,
+          "min": 20.0,
+          "median": 20.0,
+          "max": 20.0,
+          "samples": [
+            20.0,
+            20.0,
+            20.0
+          ],
+          "standard_deviation": 0.0,
+          "relative_range_percent": 0.0,
+          "relative_standard_deviation_percent": 0.0
+        },
+        "memory_bytes_avg": {
+          "count": 3,
+          "min": 61471824.2816,
+          "median": 61716928.9216,
+          "max": 62543731.0976,
+          "samples": [
+            61716928.9216,
+            61471824.2816,
+            62543731.0976
+          ],
+          "standard_deviation": 458580.2177464121,
+          "relative_range_percent": 1.7368116572385837,
+          "relative_standard_deviation_percent": 0.7430379731450246
+        },
+        "memory_bytes_max": {
+          "count": 3,
+          "min": 126374379.52000001,
+          "median": 127286640.64000002,
+          "max": 127727042.56,
+          "samples": [
+            127727042.56,
+            126374379.52000001,
+            127286640.64000002
+          ],
+          "standard_deviation": 563310.7985616385,
+          "relative_range_percent": 1.062690501688765,
+          "relative_standard_deviation_percent": 0.44255296214064527
+        }
+      },
+      "repetitions": 3
+    }
+  },
+  "source_result": "aggregate"
+}
