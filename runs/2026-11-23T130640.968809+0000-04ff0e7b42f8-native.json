@@ -1,0 +1,2373 @@
+{
+  "history_schema_version": 1,
+  "schema_version": 2,
+  "run_id": "aggregate-2026-11-23T13:06:40.968809+00:00",
+  "started_at": "2026-11-23T13:01:32.664429+00:00",
+  "generated_at": "2026-11-23T13:06:40.968809+00:00",
+  "finished_at": "2026-11-23T13:06:40.968809+00:00",
+  "status": "complete",
+  "command": [
+    "scripts/benchmarks/compare.py",
+    "--backends",
+    "kafka,redpanda,nats",
+    "--messages",
+    "10000",
+    "--payload-sizes",
+    "100,1024",
+    "--cpus",
+    "2",
+    "--memory",
+    "2g",
+    "--client-cpus",
+    "1",
+    "--client-memory",
+    "512m",
+    "--output",
+    "benchmark-results/raw/native-1.json"
+  ],
+  "source": {
+    "repository": "winrarr/runnel",
+    "revision": "04ff0e7b42f82bcbfdc79021ec8fee448e6d85e4",
+    "ref": "main",
+    "event": "schedule",
+    "workflow": "Competitor benchmark history",
+    "run_id": "45179716028",
+    "run_url": "https://github.com/winrarr/runnel/actions/runs/45179716028",
+    "profile": "scheduled",
+    "repetitions": 3,
+    "repetition_run_ids": [
+      "20261123130132664429",
+      "20261123130326652918",
+      "20261123130502870696"
+    ]
+  },
+  "environment": {
+    "host": "ip-10-0-130-36",
+    "platform": "Linux-7.0.0-1014-aws-x86_64-with-glibc2.39",
+    "processor": "x86_64",
+    "python": "3.12.3",
+    "cpus": 4,
+    "docker_server": "28.0.4"
+  },
+  "comparison_mode": "backend-specific clients; single-node first pass; not an apples-to-apples claim",
+  "benchmark_suite": "native-comparison",
+  "resource_limits": {
+    "broker_cpu": "2",
+    "broker_memory": "2g",
+    "client_cpu": "1",
+    "client_memory": "512m",
+    "client_scope": "Runnel uses an unbounded host-side Python client; native competitor clients run in containers with the declared client limits"
+  },
+  "workload": {
+    "messages": 10000,
+    "payload_sizes_bytes": [
+      100,
+      1024
+    ],
+    "single_node": true,
+    "nodes": 1,
+    "replication_factor": 1,
+    "operations": [
+      "publish",
+      "consume"
+    ],
+    "compression": "disabled where the native client exposes the setting"
+  },
+  "comparison_guardrail": {
+    "classification": "native-tool-baseline",
+    "apples_to_apples": false,
+    "ranking_eligible": false,
+    "experimental": true,
+    "mismatch_dimensions": [
+      "acknowledgement",
+      "durability",
+      "replication",
+      "delivery",
+      "batching",
+      "client",
+      "latency"
+    ],
+    "scenario_scope": "publish and consume",
+    "reason": "native clients and operation-specific acknowledgement, durability, replication, delivery, batching, client, and latency boundaries are not an apples-to-apples end-to-end ranking"
+  },
+  "aggregate": {
+    "repetitions": 3,
+    "first_generated_at": "2026-11-23T13:03:26.544703+00:00",
+    "last_generated_at": "2026-11-23T13:06:40.968809+00:00"
+  },
+  "repetition_runs": [
+    {
+      "run_id": "20261123130132664429",
+      "generated_at": "2026-11-23T13:03:26.544703+00:00",
+      "source_result": "native-1.json"
+    },
+    {
+      "run_id": "20261123130326652918",
+      "generated_at": "2026-11-23T13:05:02.756679+00:00",
+      "source_result": "native-2.json"
+    },
+    {
+      "run_id": "20261123130502870696",
+      "generated_at": "2026-11-23T13:06:40.968809+00:00",
+      "source_result": "native-3.json"
+    }
+  ],
+  "backends": {
+    "kafka": {
+      "image": "apache/kafka:4.3.1",
+      "image_id": "sha256:47dccc76b32761bc57462b8753144cdbb73a16b123b1d13d3eedb92bb7952b11",
+      "runtime": "container",
+      "cpu_limit": "2",
+      "memory_limit": "2g",
+      "acknowledgement": "Kafka producer performance client with acks=all; consumer perf client measures fetch throughput without per-record application acknowledgement",
+      "replication": "single broker, one partition, replication factor one",
+      "measurement_boundary": "Kafka producer/consumer performance clients over the Kafka protocol",
+      "measurement_client": "Kafka producer/consumer performance clients",
+      "client_image": "apache/kafka:4.3.1",
+      "semantic_metadata": {
+        "acknowledgement_boundary": "Kafka producer performance client with acks=all; consumer perf client measures fetch throughput without per-record application acknowledgement",
+        "replication_topology": "single broker, one partition, replication factor one",
+        "measurement_boundary": "Kafka producer/consumer performance clients over the Kafka protocol",
+        "client_identity": {
+          "name": "Kafka producer/consumer performance clients",
+          "image": "apache/kafka:4.3.1"
+        },
+        "scenario_classes": [
+          "publish-only",
+          "consume-without-ack"
+        ],
+        "scenario_boundaries": {
+          "publish-only": {
+            "acknowledgement_boundary": "Kafka producer performance client with acks=all",
+            "durability_boundary": "one-partition broker log with replication factor one and acks=all; filesystem flush behavior is not asserted",
+            "replication_topology": "single broker, one partition, replication factor one",
+            "delivery_boundary": "not applicable to publish-only",
+            "batching_boundary": "Kafka producer perf client uses linger.ms=0 and the default batch.size; native client batching remains possible",
+            "client_boundary": "Kafka producer/consumer performance clients from apache/kafka:4.3.1",
+            "latency_boundary": "native Kafka producer latency includes client-side batching and reports avg/p50/p95/p99/p99.9/max"
+          },
+          "consume-without-ack": {
+            "acknowledgement_boundary": "native consumer perf fetch throughput; no per-record application acknowledgement",
+            "durability_boundary": "reads the single broker's log with replication factor one; consumer fetch is not a durability acknowledgement",
+            "replication_topology": "single broker, one partition, replication factor one",
+            "delivery_boundary": "native consumer performance client fetches records through a consumer group; no application-level delivery acknowledgement",
+            "batching_boundary": "native consumer fetch batching; application batch size and per-message processing are not measured",
+            "client_boundary": "Kafka consumer performance client from apache/kafka:4.3.1",
+            "latency_boundary": "per-record consumer latency is unavailable; output reports elapsed fetch throughput"
+          }
+        },
+        "comparison": {
+          "classification": "native-tool-baseline",
+          "apples_to_apples": false,
+          "ranking_eligible": false,
+          "experimental": true,
+          "mismatch_dimensions": [
+            "acknowledgement",
+            "durability",
+            "replication",
+            "delivery",
+            "batching",
+            "client",
+            "latency"
+          ]
+        }
+      },
+      "startup_seconds": 6.640998052,
+      "resource_samples": {
+        "samples": 22.0,
+        "cpu_percent_avg": 20.476363636363637,
+        "cpu_percent_max": 181.05,
+        "memory_bytes_avg": 314206275.0254546,
+        "memory_bytes_max": 343513497.6,
+        "memory_percent_avg": 14.632272727272728,
+        "memory_percent_max": 16.0
+      },
+      "scenarios": [
+        {
+          "operation": "publish",
+          "messages": 10000.0,
+          "message_size_bytes": 100.0,
+          "throughput_messages_per_second": 12330.456227,
+          "latency_microseconds": {
+            "avg": 171960.0,
+            "p50": 186000.0,
+            "p95": 194000.0,
+            "p99": 196000.0,
+            "p999": 197000.0,
+            "max": 597000.0
+          },
+          "resource_samples": {
+            "samples": 2.0,
+            "cpu_percent_avg": 19.505,
+            "cpu_percent_max": 34.57,
+            "memory_bytes_avg": 303877324.79999995,
+            "memory_bytes_max": 305764761.6,
+            "memory_percent_avg": 14.15,
+            "memory_percent_max": 14.24,
+            "cpu_seconds": 0.42485700000000026,
+            "elapsed_seconds": 3.015884744
+          },
+          "metadata": {
+            "comparison_class": "publish-only",
+            "semantic_boundaries": {
+              "acknowledgement_boundary": "Kafka producer performance client with acks=all",
+              "durability_boundary": "one-partition broker log with replication factor one and acks=all; filesystem flush behavior is not asserted",
+              "replication_topology": "single broker, one partition, replication factor one",
+              "delivery_boundary": "not applicable to publish-only",
+              "batching_boundary": "Kafka producer perf client uses linger.ms=0 and the default batch.size; native client batching remains possible",
+              "client_boundary": "Kafka producer/consumer performance clients from apache/kafka:4.3.1",
+              "latency_boundary": "native Kafka producer latency includes client-side batching and reports avg/p50/p95/p99/p99.9/max"
+            }
+          },
+          "repetitions": 3,
+          "repetition_summary": {
+            "throughput_messages_per_second": {
+              "count": 3,
+              "min": 11961.722488,
+              "median": 12330.456227,
+              "max": 14204.545455,
+              "samples": [
+                12330.456227,
+                14204.545455,
+                11961.722488
+              ],
+              "standard_deviation": 981.9724971304348,
+              "relative_range_percent": 18.189294262193563,
+              "relative_standard_deviation_percent": 7.963796951650577
+            },
+            "latency_p50": {
+              "count": 3,
+              "min": 148000.0,
+              "median": 186000.0,
+              "max": 219000.0,
+              "samples": [
+                186000.0,
+                148000.0,
+                219000.0
+              ],
+              "standard_deviation": 29009.57696271277,
+              "relative_range_percent": 38.17204301075269,
+              "relative_standard_deviation_percent": 15.596546754146651
+            },
+            "latency_p99": {
+              "count": 3,
+              "min": 189000.0,
+              "median": 196000.0,
+              "max": 281000.0,
+              "samples": [
+                196000.0,
+                189000.0,
+                281000.0
+              ],
+              "standard_deviation": 41817.06190858782,
+              "relative_range_percent": 46.93877551020408,
+              "relative_standard_deviation_percent": 21.33523566764685
+            },
+            "latency_p999": {
+              "count": 3,
+              "min": 190000.0,
+              "median": 197000.0,
+              "max": 281000.0,
+              "samples": [
+                197000.0,
+                190000.0,
+                281000.0
+              ],
+              "standard_deviation": 41346.772008895154,
+              "relative_range_percent": 46.192893401015226,
+              "relative_standard_deviation_percent": 20.988209141571144
+            },
+            "latency_max": {
+              "count": 3,
+              "min": 589000.0,
+              "median": 597000.0,
+              "max": 626000.0,
+              "samples": [
+                597000.0,
+                589000.0,
+                626000.0
+              ],
+              "standard_deviation": 15895.492023421819,
+              "relative_range_percent": 6.197654941373535,
+              "relative_standard_deviation_percent": 2.6625614779601037
+            },
+            "cpu_seconds": {
+              "count": 3,
+              "min": 0.41339099999999984,
+              "median": 0.42485700000000026,
+              "max": 0.48508499999999977,
+              "samples": [
+                0.42485700000000026,
+                0.48508499999999977,
+                0.41339099999999984
+              ],
+              "standard_deviation": 0.03144467942275757,
+              "relative_range_percent": 16.874854362762033,
+              "relative_standard_deviation_percent": 7.401238398509981
+            },
+            "cpu_percent_max": {
+              "count": 3,
+              "min": 4.67,
+              "median": 34.57,
+              "max": 36.01,
+              "samples": [
+                36.01,
+                4.67,
+                34.57
+              ],
+              "standard_deviation": 14.4463728627254,
+              "relative_range_percent": 90.65663870407867,
+              "relative_standard_deviation_percent": 41.78875574985653
+            },
+            "memory_bytes_max": {
+              "count": 3,
+              "min": 305345331.2,
+              "median": 305764761.6,
+              "max": 317299097.6,
+              "samples": [
+                305345331.2,
+                317299097.6,
+                305764761.6
+              ],
+              "standard_deviation": 5538846.249366679,
+              "relative_range_percent": 3.909465020576143,
+              "relative_standard_deviation_percent": 1.8114730488834325
+            },
+            "cpu_efficiency_messages_per_cpu_second": {
+              "count": 3,
+              "min": 20614.94377274087,
+              "median": 23537.33138444228,
+              "max": 24190.173467733945,
+              "samples": [
+                23537.33138444228,
+                20614.94377274087,
+                24190.173467733945
+              ],
+              "standard_deviation": 1554.5209876965944,
+              "relative_range_percent": 15.189613625256737,
+              "relative_standard_deviation_percent": 6.604491232698124
+            }
+          }
+        },
+        {
+          "operation": "consume",
+          "messages": 10000.0,
+          "message_size_bytes": 100.0,
+          "elapsed_milliseconds": 876.0,
+          "throughput_messages_per_second": 11415.5251,
+          "throughput_megabytes_per_second": 1.0887,
+          "latency_available": 0.0,
+          "resource_samples": {
+            "samples": 4.0,
+            "cpu_percent_avg": 4.21,
+            "cpu_percent_max": 8.39,
+            "memory_bytes_avg": 322541977.6,
+            "memory_bytes_max": 337536614.4,
+            "memory_percent_avg": 15.0175,
+            "memory_percent_max": 15.72,
+            "cpu_seconds": 0.9070729999999996,
+            "elapsed_seconds": 3.497470424
+          },
+          "metadata": {
+            "comparison_class": "consume-without-ack",
+            "semantic_boundaries": {
+              "acknowledgement_boundary": "native consumer perf fetch throughput; no per-record application acknowledgement",
+              "durability_boundary": "reads the single broker's log with replication factor one; consumer fetch is not a durability acknowledgement",
+              "replication_topology": "single broker, one partition, replication factor one",
+              "delivery_boundary": "native consumer performance client fetches records through a consumer group; no application-level delivery acknowledgement",
+              "batching_boundary": "native consumer fetch batching; application batch size and per-message processing are not measured",
+              "client_boundary": "Kafka consumer performance client from apache/kafka:4.3.1",
+              "latency_boundary": "per-record consumer latency is unavailable; output reports elapsed fetch throughput"
+            }
+          },
+          "repetitions": 3,
+          "repetition_summary": {
+            "throughput_messages_per_second": {
+              "count": 3,
+              "min": 11325.0283,
+              "median": 11415.5251,
+              "max": 12224.9389,
+              "samples": [
+                12224.9389,
+                11415.5251,
+                11325.0283
+              ],
+              "standard_deviation": 404.5820145440966,
+              "relative_range_percent": 7.883216865775182,
+              "relative_standard_deviation_percent": 3.5441384518010177
+            },
+            "elapsed_milliseconds": {
+              "count": 3,
+              "min": 818.0,
+              "median": 876.0,
+              "max": 883.0,
+              "samples": [
+                818.0,
+                876.0,
+                883.0
+              ],
+              "standard_deviation": 29.13188402192118,
+              "relative_range_percent": 7.4200913242009126,
+              "relative_standard_deviation_percent": 3.325557536748993
+            },
+            "throughput_megabytes_per_second": {
+              "count": 3,
+              "min": 1.08,
+              "median": 1.0887,
+              "max": 1.1659,
+              "samples": [
+                1.1659,
+                1.0887,
+                1.08
+              ],
+              "standard_deviation": 0.03860676394392851,
+              "relative_range_percent": 7.890144208689249,
+              "relative_standard_deviation_percent": 3.5461342834507676
+            },
+            "cpu_seconds": {
+              "count": 3,
+              "min": 0.9058440000000001,
+              "median": 0.9070729999999996,
+              "max": 0.9912009999999993,
+              "samples": [
+                0.9070729999999996,
+                0.9058440000000001,
+                0.9912009999999993
+              ],
+              "standard_deviation": 0.039951148327258976,
+              "relative_range_percent": 9.41015772710678,
+              "relative_standard_deviation_percent": 4.404402768824449
+            },
+            "cpu_percent_max": {
+              "count": 3,
+              "min": 6.84,
+              "median": 8.39,
+              "max": 76.59,
+              "samples": [
+                6.84,
+                76.59,
+                8.39
+              ],
+              "standard_deviation": 32.52128362916951,
+              "relative_range_percent": 831.3468414779499,
+              "relative_standard_deviation_percent": 387.61959033575096
+            },
+            "memory_bytes_max": {
+              "count": 3,
+              "min": 336697753.6,
+              "median": 337536614.4,
+              "max": 341730918.4,
+              "samples": [
+                336697753.6,
+                337536614.4,
+                341730918.4
+              ],
+              "standard_deviation": 2201732.1814666013,
+              "relative_range_percent": 1.4911463187325116,
+              "relative_standard_deviation_percent": 0.6522943252779754
+            },
+            "cpu_efficiency_messages_per_cpu_second": {
+              "count": 3,
+              "min": 10088.771096881466,
+              "median": 11024.47101831937,
+              "max": 11039.428422553992,
+              "samples": [
+                11024.47101831937,
+                11039.428422553992,
+                10088.771096881466
+              ],
+              "standard_deviation": 444.6605968820083,
+              "relative_range_percent": 8.623155923697547,
+              "relative_standard_deviation_percent": 4.033396215955537
+            }
+          }
+        },
+        {
+          "operation": "publish",
+          "messages": 10000.0,
+          "message_size_bytes": 1024.0,
+          "throughput_messages_per_second": 5959.475566,
+          "latency_microseconds": {
+            "avg": 430590.0,
+            "p50": 482000.0,
+            "p95": 540000.0,
+            "p99": 577000.0,
+            "p999": 581000.0,
+            "max": 582000.0
+          },
+          "resource_samples": {
+            "samples": 3.0,
+            "cpu_percent_avg": 10.066666666666666,
+            "cpu_percent_max": 21.61,
+            "memory_bytes_avg": 336243370.6666667,
+            "memory_bytes_max": 343513497.6,
+            "memory_percent_avg": 15.656666666666666,
+            "memory_percent_max": 16.0,
+            "cpu_seconds": 1.1364619999999999,
+            "elapsed_seconds": 3.834502149
+          },
+          "metadata": {
+            "comparison_class": "publish-only",
+            "semantic_boundaries": {
+              "acknowledgement_boundary": "Kafka producer performance client with acks=all",
+              "durability_boundary": "one-partition broker log with replication factor one and acks=all; filesystem flush behavior is not asserted",
+              "replication_topology": "single broker, one partition, replication factor one",
+              "delivery_boundary": "not applicable to publish-only",
+              "batching_boundary": "Kafka producer perf client uses linger.ms=0 and the default batch.size; native client batching remains possible",
+              "client_boundary": "Kafka producer/consumer performance clients from apache/kafka:4.3.1",
+              "latency_boundary": "native Kafka producer latency includes client-side batching and reports avg/p50/p95/p99/p99.9/max"
+            }
+          },
+          "repetitions": 3,
+          "repetition_summary": {
+            "throughput_messages_per_second": {
+              "count": 3,
+              "min": 5868.544601,
+              "median": 5959.475566,
+              "max": 6153.846154,
+              "samples": [
+                5868.544601,
+                6153.846154,
+                5959.475566
+              ],
+              "standard_deviation": 118.99829224708736,
+              "relative_range_percent": 4.787360059460646,
+              "relative_standard_deviation_percent": 1.996791343956445
+            },
+            "latency_p50": {
+              "count": 3,
+              "min": 473000.0,
+              "median": 482000.0,
+              "max": 562000.0,
+              "samples": [
+                473000.0,
+                562000.0,
+                482000.0
+              ],
+              "standard_deviation": 40002.77768133386,
+              "relative_range_percent": 18.464730290456433,
+              "relative_standard_deviation_percent": 8.299331469156401
+            },
+            "latency_p99": {
+              "count": 3,
+              "min": 517000.0,
+              "median": 577000.0,
+              "max": 641000.0,
+              "samples": [
+                517000.0,
+                641000.0,
+                577000.0
+              ],
+              "standard_deviation": 50631.56678946007,
+              "relative_range_percent": 21.49046793760832,
+              "relative_standard_deviation_percent": 8.774968247740047
+            },
+            "latency_p999": {
+              "count": 3,
+              "min": 522000.0,
+              "median": 581000.0,
+              "max": 644000.0,
+              "samples": [
+                522000.0,
+                644000.0,
+                581000.0
+              ],
+              "standard_deviation": 49815.21409725703,
+              "relative_range_percent": 20.998278829604132,
+              "relative_standard_deviation_percent": 8.574047176808438
+            },
+            "latency_max": {
+              "count": 3,
+              "min": 522000.0,
+              "median": 582000.0,
+              "max": 644000.0,
+              "samples": [
+                522000.0,
+                644000.0,
+                582000.0
+              ],
+              "standard_deviation": 49808.522251607596,
+              "relative_range_percent": 20.962199312714777,
+              "relative_standard_deviation_percent": 8.558165335327764
+            },
+            "cpu_seconds": {
+              "count": 3,
+              "min": 1.0594739999999998,
+              "median": 1.1364619999999999,
+              "max": 1.2455569999999998,
+              "samples": [
+                1.0594739999999998,
+                1.2455569999999998,
+                1.1364619999999999
+              ],
+              "standard_deviation": 0.07634407061164315,
+              "relative_range_percent": 16.373886676369295,
+              "relative_standard_deviation_percent": 6.71769672999565
+            },
+            "cpu_percent_max": {
+              "count": 3,
+              "min": 18.35,
+              "median": 21.61,
+              "max": 85.72,
+              "samples": [
+                18.35,
+                85.72,
+                21.61
+              ],
+              "standard_deviation": 31.018697945307476,
+              "relative_range_percent": 311.75381767700145,
+              "relative_standard_deviation_percent": 143.53863001067782
+            },
+            "memory_bytes_max": {
+              "count": 3,
+              "min": 342255206.4,
+              "median": 343513497.6,
+              "max": 343513497.6,
+              "samples": [
+                343513497.6,
+                342255206.4,
+                343513497.6
+              ],
+              "standard_deviation": 593164.1601515947,
+              "relative_range_percent": 0.36630036630038015,
+              "relative_standard_deviation_percent": 0.17267564864141008
+            },
+            "cpu_efficiency_messages_per_cpu_second": {
+              "count": 3,
+              "min": 8028.536630599805,
+              "median": 8799.23833792947,
+              "max": 9438.645969603785,
+              "samples": [
+                9438.645969603785,
+                8028.536630599805,
+                8799.23833792947
+              ],
+              "standard_deviation": 576.5059110297772,
+              "relative_range_percent": 16.025356796231417,
+              "relative_standard_deviation_percent": 6.551770606607225
+            }
+          }
+        },
+        {
+          "operation": "consume",
+          "messages": 10000.0,
+          "message_size_bytes": 1024.0,
+          "elapsed_milliseconds": 691.0,
+          "throughput_messages_per_second": 14471.78,
+          "throughput_megabytes_per_second": 14.1326,
+          "latency_available": 0.0,
+          "resource_samples": {
+            "samples": 4.0,
+            "cpu_percent_avg": 4.765,
+            "cpu_percent_max": 8.52,
+            "memory_bytes_avg": 338978406.4,
+            "memory_bytes_max": 342255206.4,
+            "memory_percent_avg": 15.7875,
+            "memory_percent_max": 15.94,
+            "cpu_seconds": 0.1482600000000005,
+            "elapsed_seconds": 3.303888059
+          },
+          "metadata": {
+            "comparison_class": "consume-without-ack",
+            "semantic_boundaries": {
+              "acknowledgement_boundary": "native consumer perf fetch throughput; no per-record application acknowledgement",
+              "durability_boundary": "reads the single broker's log with replication factor one; consumer fetch is not a durability acknowledgement",
+              "replication_topology": "single broker, one partition, replication factor one",
+              "delivery_boundary": "native consumer performance client fetches records through a consumer group; no application-level delivery acknowledgement",
+              "batching_boundary": "native consumer fetch batching; application batch size and per-message processing are not measured",
+              "client_boundary": "Kafka consumer performance client from apache/kafka:4.3.1",
+              "latency_boundary": "per-record consumer latency is unavailable; output reports elapsed fetch throughput"
+            }
+          },
+          "repetitions": 3,
+          "repetition_summary": {
+            "throughput_messages_per_second": {
+              "count": 3,
+              "min": 14326.6476,
+              "median": 14471.78,
+              "max": 14925.3731,
+              "samples": [
+                14471.78,
+                14925.3731,
+                14326.6476
+              ],
+              "standard_deviation": 255.0124916869805,
+              "relative_range_percent": 4.137193213274389,
+              "relative_standard_deviation_percent": 1.7621363210813077
+            },
+            "elapsed_milliseconds": {
+              "count": 3,
+              "min": 670.0,
+              "median": 691.0,
+              "max": 698.0,
+              "samples": [
+                691.0,
+                670.0,
+                698.0
+              ],
+              "standard_deviation": 11.897712198383164,
+              "relative_range_percent": 4.052098408104197,
+              "relative_standard_deviation_percent": 1.7218107378267966
+            },
+            "throughput_megabytes_per_second": {
+              "count": 3,
+              "min": 13.9909,
+              "median": 14.1326,
+              "max": 14.5756,
+              "samples": [
+                14.1326,
+                14.5756,
+                13.9909
+              ],
+              "standard_deviation": 0.24904305294912799,
+              "relative_range_percent": 4.13724297015411,
+              "relative_standard_deviation_percent": 1.762188507062593
+            },
+            "cpu_seconds": {
+              "count": 3,
+              "min": 0.1365780000000001,
+              "median": 0.1482600000000005,
+              "max": 0.222646000000001,
+              "samples": [
+                0.1365780000000001,
+                0.1482600000000005,
+                0.222646000000001
+              ],
+              "standard_deviation": 0.03811888820810819,
+              "relative_range_percent": 58.05207068663202,
+              "relative_standard_deviation_percent": 25.710837857890233
+            },
+            "cpu_percent_max": {
+              "count": 3,
+              "min": 4.12,
+              "median": 8.52,
+              "max": 12.29,
+              "samples": [
+                8.52,
+                4.12,
+                12.29
+              ],
+              "standard_deviation": 3.3386923587935837,
+              "relative_range_percent": 95.8920187793427,
+              "relative_standard_deviation_percent": 39.18653003278854
+            },
+            "memory_bytes_max": {
+              "count": 3,
+              "min": 338794905.6,
+              "median": 342255206.4,
+              "max": 343932928.0,
+              "samples": [
+                338794905.6,
+                342255206.4,
+                343932928.0
+              ],
+              "standard_deviation": 2139254.947574258,
+              "relative_range_percent": 1.5012254901960715,
+              "relative_standard_deviation_percent": 0.6250467217360811
+            },
+            "cpu_efficiency_messages_per_cpu_second": {
+              "count": 3,
+              "min": 44914.34833771976,
+              "median": 67449.0759476593,
+              "max": 73218.23426906232,
+              "samples": [
+                73218.23426906232,
+                67449.0759476593,
+                44914.34833771976
+              ],
+              "standard_deviation": 12212.048217532443,
+              "relative_range_percent": 41.96334128180862,
+              "relative_standard_deviation_percent": 18.10558268731366
+            }
+          }
+        }
+      ],
+      "repetition_summary": {
+        "samples": {
+          "count": 3,
+          "min": 22.0,
+          "median": 22.0,
+          "max": 23.0,
+          "samples": [
+            22.0,
+            23.0,
+            22.0
+          ],
+          "standard_deviation": 0.4714045207910317,
+          "relative_range_percent": 4.545454545454546,
+          "relative_standard_deviation_percent": 2.1427478217774167
+        },
+        "cpu_percent_avg": {
+          "count": 3,
+          "min": 19.92909090909091,
+          "median": 20.476363636363637,
+          "max": 22.76869565217391,
+          "samples": [
+            19.92909090909091,
+            22.76869565217391,
+            20.476363636363637
+          ],
+          "standard_deviation": 1.2300699440666327,
+          "relative_range_percent": 13.86771984279569,
+          "relative_standard_deviation_percent": 6.007267530071461
+        },
+        "cpu_percent_max": {
+          "count": 3,
+          "min": 179.04,
+          "median": 181.05,
+          "max": 181.68,
+          "samples": [
+            181.05,
+            179.04,
+            181.68
+          ],
+          "standard_deviation": 1.125788612484607,
+          "relative_range_percent": 1.4581607290803726,
+          "relative_standard_deviation_percent": 0.6218108878677752
+        },
+        "memory_bytes_avg": {
+          "count": 3,
+          "min": 313471318.57454544,
+          "median": 314206275.0254546,
+          "max": 315839753.3495652,
+          "samples": [
+            313471318.57454544,
+            315839753.3495652,
+            314206275.0254546
+          ],
+          "standard_deviation": 989831.3943739859,
+          "relative_range_percent": 0.7537834102224383,
+          "relative_standard_deviation_percent": 0.31502597912590935
+        },
+        "memory_bytes_max": {
+          "count": 3,
+          "min": 342255206.4,
+          "median": 343513497.6,
+          "max": 343932928.0,
+          "samples": [
+            343513497.6,
+            342255206.4,
+            343932928.0
+          ],
+          "standard_deviation": 712894.5980646898,
+          "relative_range_percent": 0.4884004884004953,
+          "relative_standard_deviation_percent": 0.20753030173353218
+        },
+        "memory_percent_avg": {
+          "count": 3,
+          "min": 14.59772727272727,
+          "median": 14.632272727272728,
+          "max": 14.709130434782608,
+          "samples": [
+            14.59772727272727,
+            14.709130434782608,
+            14.632272727272728
+          ],
+          "standard_deviation": 0.046560784822225545,
+          "relative_range_percent": 0.7613524168921191,
+          "relative_standard_deviation_percent": 0.31820610297566465
+        },
+        "memory_percent_max": {
+          "count": 3,
+          "min": 15.94,
+          "median": 16.0,
+          "max": 16.02,
+          "samples": [
+            16.0,
+            15.94,
+            16.02
+          ],
+          "standard_deviation": 0.033993463423951986,
+          "relative_range_percent": 0.5000000000000004,
+          "relative_standard_deviation_percent": 0.21245914639969993
+        }
+      },
+      "repetitions": 3
+    },
+    "redpanda": {
+      "image": "docker.redpanda.com/redpandadata/redpanda:v26.2.1",
+      "image_id": "sha256:d97ce2c85cdd77e11db049fb609d18b4bb9c9a6c74e0748751461cc297280b77",
+      "runtime": "container",
+      "cpu_limit": "2",
+      "memory_limit": "2g",
+      "acknowledgement": "Kafka producer performance client with acks=all; consumer perf client measures fetch throughput without per-record application acknowledgement",
+      "replication": "single broker, one partition, replication factor one",
+      "measurement_boundary": "Kafka producer/consumer performance clients over the Kafka protocol",
+      "measurement_client": "Kafka producer/consumer performance clients",
+      "client_image": "apache/kafka:4.3.1",
+      "semantic_metadata": {
+        "acknowledgement_boundary": "Kafka producer performance client with acks=all; consumer perf client measures fetch throughput without per-record application acknowledgement",
+        "replication_topology": "single broker, one partition, replication factor one",
+        "measurement_boundary": "Kafka producer/consumer performance clients over the Kafka protocol",
+        "client_identity": {
+          "name": "Kafka producer/consumer performance clients",
+          "image": "apache/kafka:4.3.1"
+        },
+        "scenario_classes": [
+          "publish-only",
+          "consume-without-ack"
+        ],
+        "scenario_boundaries": {
+          "publish-only": {
+            "acknowledgement_boundary": "Kafka producer performance client with acks=all",
+            "durability_boundary": "one-partition broker log with replication factor one and acks=all; filesystem flush behavior is not asserted",
+            "replication_topology": "single broker, one partition, replication factor one",
+            "delivery_boundary": "not applicable to publish-only",
+            "batching_boundary": "Kafka producer perf client uses linger.ms=0 and the default batch.size; native client batching remains possible",
+            "client_boundary": "Kafka producer/consumer performance clients from apache/kafka:4.3.1",
+            "latency_boundary": "native Kafka producer latency includes client-side batching and reports avg/p50/p95/p99/p99.9/max"
+          },
+          "consume-without-ack": {
+            "acknowledgement_boundary": "native consumer perf fetch throughput; no per-record application acknowledgement",
+            "durability_boundary": "reads the single broker's log with replication factor one; consumer fetch is not a durability acknowledgement",
+            "replication_topology": "single broker, one partition, replication factor one",
+            "delivery_boundary": "native consumer performance client fetches records through a consumer group; no application-level delivery acknowledgement",
+            "batching_boundary": "native consumer fetch batching; application batch size and per-message processing are not measured",
+            "client_boundary": "Kafka consumer performance client from apache/kafka:4.3.1",
+            "latency_boundary": "per-record consumer latency is unavailable; output reports elapsed fetch throughput"
+          }
+        },
+        "comparison": {
+          "classification": "native-tool-baseline",
+          "apples_to_apples": false,
+          "ranking_eligible": false,
+          "experimental": true,
+          "mismatch_dimensions": [
+            "acknowledgement",
+            "durability",
+            "replication",
+            "delivery",
+            "batching",
+            "client",
+            "latency"
+          ]
+        }
+      },
+      "startup_seconds": 0.803463022,
+      "resource_samples": {
+        "samples": 20.0,
+        "cpu_percent_avg": 1.212,
+        "cpu_percent_max": 2.47,
+        "memory_bytes_avg": 232752414.71999997,
+        "memory_bytes_max": 282905804.8,
+        "memory_percent_avg": 10.838,
+        "memory_percent_max": 13.17
+      },
+      "scenarios": [
+        {
+          "operation": "publish",
+          "messages": 10000.0,
+          "message_size_bytes": 100.0,
+          "throughput_messages_per_second": 11198.208287,
+          "latency_microseconds": {
+            "avg": 225150.0,
+            "p50": 209000.0,
+            "p95": 309000.0,
+            "p99": 318000.0,
+            "p999": 375000.0,
+            "max": 791000.0
+          },
+          "resource_samples": {
+            "samples": 3.0,
+            "cpu_percent_avg": 0.8833333333333333,
+            "cpu_percent_max": 2.07,
+            "memory_bytes_avg": 133064294.39999999,
+            "memory_bytes_max": 134322585.6,
+            "memory_percent_avg": 6.196666666666666,
+            "memory_percent_max": 6.25,
+            "cpu_seconds": 0.040239,
+            "elapsed_seconds": 3.028709806
+          },
+          "metadata": {
+            "comparison_class": "publish-only",
+            "semantic_boundaries": {
+              "acknowledgement_boundary": "Kafka producer performance client with acks=all",
+              "durability_boundary": "one-partition broker log with replication factor one and acks=all; filesystem flush behavior is not asserted",
+              "replication_topology": "single broker, one partition, replication factor one",
+              "delivery_boundary": "not applicable to publish-only",
+              "batching_boundary": "Kafka producer perf client uses linger.ms=0 and the default batch.size; native client batching remains possible",
+              "client_boundary": "Kafka producer/consumer performance clients from apache/kafka:4.3.1",
+              "latency_boundary": "native Kafka producer latency includes client-side batching and reports avg/p50/p95/p99/p99.9/max"
+            }
+          },
+          "repetitions": 3,
+          "repetition_summary": {
+            "throughput_messages_per_second": {
+              "count": 3,
+              "min": 11135.857461,
+              "median": 11198.208287,
+              "max": 12626.262626,
+              "samples": [
+                11135.857461,
+                12626.262626,
+                11198.208287
+              ],
+              "standard_deviation": 688.3583027350321,
+              "relative_range_percent": 13.309318123062699,
+              "relative_standard_deviation_percent": 6.147039643244958
+            },
+            "latency_p50": {
+              "count": 3,
+              "min": 183000.0,
+              "median": 209000.0,
+              "max": 219000.0,
+              "samples": [
+                209000.0,
+                183000.0,
+                219000.0
+              ],
+              "standard_deviation": 15173.075568988055,
+              "relative_range_percent": 17.22488038277512,
+              "relative_standard_deviation_percent": 7.259844769850744
+            },
+            "latency_p99": {
+              "count": 3,
+              "min": 262000.0,
+              "median": 318000.0,
+              "max": 390000.0,
+              "samples": [
+                390000.0,
+                262000.0,
+                318000.0
+              ],
+              "standard_deviation": 52391.687211702665,
+              "relative_range_percent": 40.25157232704403,
+              "relative_standard_deviation_percent": 16.475373337013416
+            },
+            "latency_p999": {
+              "count": 3,
+              "min": 323000.0,
+              "median": 375000.0,
+              "max": 393000.0,
+              "samples": [
+                393000.0,
+                323000.0,
+                375000.0
+              ],
+              "standard_deviation": 29679.77238606942,
+              "relative_range_percent": 18.666666666666668,
+              "relative_standard_deviation_percent": 7.9146059696185125
+            },
+            "latency_max": {
+              "count": 3,
+              "min": 739000.0,
+              "median": 791000.0,
+              "max": 804000.0,
+              "samples": [
+                804000.0,
+                739000.0,
+                791000.0
+              ],
+              "standard_deviation": 28083.20969310073,
+              "relative_range_percent": 8.217446270543615,
+              "relative_standard_deviation_percent": 3.55034256549946
+            },
+            "cpu_seconds": {
+              "count": 3,
+              "min": 0.03953900000000002,
+              "median": 0.040239,
+              "max": 0.04224899999999998,
+              "samples": [
+                0.03953900000000002,
+                0.040239,
+                0.04224899999999998
+              ],
+              "standard_deviation": 0.001148632036622487,
+              "relative_range_percent": 6.734759810134354,
+              "relative_standard_deviation_percent": 2.854524308811072
+            },
+            "cpu_percent_max": {
+              "count": 3,
+              "min": 2.01,
+              "median": 2.07,
+              "max": 2.25,
+              "samples": [
+                2.25,
+                2.01,
+                2.07
+              ],
+              "standard_deviation": 0.10198039027185579,
+              "relative_range_percent": 11.594202898550735,
+              "relative_standard_deviation_percent": 4.9265889020220195
+            },
+            "memory_bytes_max": {
+              "count": 3,
+              "min": 134217728.0,
+              "median": 134322585.6,
+              "max": 134322585.6,
+              "samples": [
+                134217728.0,
+                134322585.6,
+                134322585.6
+              ],
+              "standard_deviation": 49430.346679294875,
+              "relative_range_percent": 0.07806401249023756,
+              "relative_standard_deviation_percent": 0.03679972839898555
+            },
+            "cpu_efficiency_messages_per_cpu_second": {
+              "count": 3,
+              "min": 236691.99270988672,
+              "median": 248515.12214518254,
+              "max": 252914.84357216913,
+              "samples": [
+                252914.84357216913,
+                248515.12214518254,
+                236691.99270988672
+              ],
+              "standard_deviation": 6850.181087457962,
+              "relative_range_percent": 6.527912958473821,
+              "relative_standard_deviation_percent": 2.7564443677822092
+            }
+          }
+        },
+        {
+          "operation": "consume",
+          "messages": 10000.0,
+          "message_size_bytes": 100.0,
+          "elapsed_milliseconds": 710.0,
+          "throughput_messages_per_second": 14084.507,
+          "throughput_megabytes_per_second": 1.3432,
+          "latency_available": 0.0,
+          "resource_samples": {
+            "samples": 3.0,
+            "cpu_percent_avg": 1.843333333333333,
+            "cpu_percent_max": 2.06,
+            "memory_bytes_avg": 270113177.59999996,
+            "memory_bytes_max": 270952038.4,
+            "memory_percent_avg": 12.579999999999998,
+            "memory_percent_max": 12.62,
+            "cpu_seconds": 0.03977700000000001,
+            "elapsed_seconds": 3.902806922
+          },
+          "metadata": {
+            "comparison_class": "consume-without-ack",
+            "semantic_boundaries": {
+              "acknowledgement_boundary": "native consumer perf fetch throughput; no per-record application acknowledgement",
+              "durability_boundary": "reads the single broker's log with replication factor one; consumer fetch is not a durability acknowledgement",
+              "replication_topology": "single broker, one partition, replication factor one",
+              "delivery_boundary": "native consumer performance client fetches records through a consumer group; no application-level delivery acknowledgement",
+              "batching_boundary": "native consumer fetch batching; application batch size and per-message processing are not measured",
+              "client_boundary": "Kafka consumer performance client from apache/kafka:4.3.1",
+              "latency_boundary": "per-record consumer latency is unavailable; output reports elapsed fetch throughput"
+            }
+          },
+          "repetitions": 3,
+          "repetition_summary": {
+            "throughput_messages_per_second": {
+              "count": 3,
+              "min": 12987.013,
+              "median": 14084.507,
+              "max": 16155.0889,
+              "samples": [
+                16155.0889,
+                14084.507,
+                12987.013
+              ],
+              "standard_deviation": 1313.5409054580684,
+              "relative_range_percent": 22.493338957480017,
+              "relative_standard_deviation_percent": 9.326140456730707
+            },
+            "elapsed_milliseconds": {
+              "count": 3,
+              "min": 619.0,
+              "median": 710.0,
+              "max": 770.0,
+              "samples": [
+                619.0,
+                710.0,
+                770.0
+              ],
+              "standard_deviation": 62.07701310111139,
+              "relative_range_percent": 21.267605633802816,
+              "relative_standard_deviation_percent": 8.743241281846675
+            },
+            "throughput_megabytes_per_second": {
+              "count": 3,
+              "min": 1.2385,
+              "median": 1.3432,
+              "max": 1.5407,
+              "samples": [
+                1.5407,
+                1.3432,
+                1.2385
+              ],
+              "standard_deviation": 0.12529661696239935,
+              "relative_range_percent": 22.498511018463375,
+              "relative_standard_deviation_percent": 9.328217462954091
+            },
+            "cpu_seconds": {
+              "count": 3,
+              "min": 0.03668900000000003,
+              "median": 0.03977700000000001,
+              "max": 0.092836,
+              "samples": [
+                0.03668900000000003,
+                0.03977700000000001,
+                0.092836
+              ],
+              "standard_deviation": 0.025770954438411205,
+              "relative_range_percent": 141.15443598059173,
+              "relative_standard_deviation_percent": 64.78858244314856
+            },
+            "cpu_percent_max": {
+              "count": 3,
+              "min": 2.03,
+              "median": 2.06,
+              "max": 2.12,
+              "samples": [
+                2.03,
+                2.06,
+                2.12
+              ],
+              "standard_deviation": 0.03741657386773953,
+              "relative_range_percent": 4.368932038834966,
+              "relative_standard_deviation_percent": 1.8163385372689091
+            },
+            "memory_bytes_max": {
+              "count": 3,
+              "min": 270742323.2,
+              "median": 270952038.4,
+              "max": 271266611.2,
+              "samples": [
+                271266611.2,
+                270742323.2,
+                270952038.4
+              ],
+              "standard_deviation": 215461.88591924057,
+              "relative_range_percent": 0.19349845201238391,
+              "relative_standard_deviation_percent": 0.07952030447586424
+            },
+            "cpu_efficiency_messages_per_cpu_second": {
+              "count": 3,
+              "min": 107716.83398681546,
+              "median": 251401.56371772627,
+              "max": 272561.25814276736,
+              "samples": [
+                272561.25814276736,
+                251401.56371772627,
+                107716.83398681546
+              ],
+              "standard_deviation": 73232.29281715165,
+              "relative_range_percent": 65.57016659651299,
+              "relative_standard_deviation_percent": 29.12960911387842
+            }
+          }
+        },
+        {
+          "operation": "publish",
+          "messages": 10000.0,
+          "message_size_bytes": 1024.0,
+          "throughput_messages_per_second": 7132.667618,
+          "latency_microseconds": {
+            "avg": 168800.0,
+            "p50": 196000.0,
+            "p95": 215000.0,
+            "p99": 278000.0,
+            "p999": 280000.0,
+            "max": 475000.0
+          },
+          "resource_samples": {
+            "samples": 3.0,
+            "cpu_percent_avg": 1.9733333333333334,
+            "cpu_percent_max": 2.18,
+            "memory_bytes_avg": 274726912.0,
+            "memory_bytes_max": 281332940.8,
+            "memory_percent_avg": 12.79,
+            "memory_percent_max": 13.1,
+            "cpu_seconds": 0.10503699999999999,
+            "elapsed_seconds": 3.50478999
+          },
+          "metadata": {
+            "comparison_class": "publish-only",
+            "semantic_boundaries": {
+              "acknowledgement_boundary": "Kafka producer performance client with acks=all",
+              "durability_boundary": "one-partition broker log with replication factor one and acks=all; filesystem flush behavior is not asserted",
+              "replication_topology": "single broker, one partition, replication factor one",
+              "delivery_boundary": "not applicable to publish-only",
+              "batching_boundary": "Kafka producer perf client uses linger.ms=0 and the default batch.size; native client batching remains possible",
+              "client_boundary": "Kafka producer/consumer performance clients from apache/kafka:4.3.1",
+              "latency_boundary": "native Kafka producer latency includes client-side batching and reports avg/p50/p95/p99/p99.9/max"
+            }
+          },
+          "repetitions": 3,
+          "repetition_summary": {
+            "throughput_messages_per_second": {
+              "count": 3,
+              "min": 7092.198582,
+              "median": 7132.667618,
+              "max": 8410.428932,
+              "samples": [
+                7132.667618,
+                8410.428932,
+                7092.198582
+              ],
+              "standard_deviation": 612.1041100708733,
+              "relative_range_percent": 18.48158950619421,
+              "relative_standard_deviation_percent": 8.58169962281948
+            },
+            "latency_p50": {
+              "count": 3,
+              "min": 103000.0,
+              "median": 196000.0,
+              "max": 308000.0,
+              "samples": [
+                196000.0,
+                308000.0,
+                103000.0
+              ],
+              "standard_deviation": 83810.63310954178,
+              "relative_range_percent": 104.59183673469387,
+              "relative_standard_deviation_percent": 42.76052709670499
+            },
+            "latency_p99": {
+              "count": 3,
+              "min": 176000.0,
+              "median": 278000.0,
+              "max": 473000.0,
+              "samples": [
+                278000.0,
+                473000.0,
+                176000.0
+              ],
+              "standard_deviation": 123215.2587953294,
+              "relative_range_percent": 106.83453237410072,
+              "relative_standard_deviation_percent": 44.32203553788827
+            },
+            "latency_p999": {
+              "count": 3,
+              "min": 178000.0,
+              "median": 280000.0,
+              "max": 475000.0,
+              "samples": [
+                280000.0,
+                475000.0,
+                178000.0
+              ],
+              "standard_deviation": 123215.2587953294,
+              "relative_range_percent": 106.07142857142857,
+              "relative_standard_deviation_percent": 44.0054495697605
+            },
+            "latency_max": {
+              "count": 3,
+              "min": 420000.0,
+              "median": 475000.0,
+              "max": 489000.0,
+              "samples": [
+                420000.0,
+                475000.0,
+                489000.0
+              ],
+              "standard_deviation": 29780.67979225607,
+              "relative_range_percent": 14.526315789473685,
+              "relative_standard_deviation_percent": 6.269616798369698
+            },
+            "cpu_seconds": {
+              "count": 3,
+              "min": 0.104402,
+              "median": 0.10503699999999999,
+              "max": 0.10665799999999998,
+              "samples": [
+                0.10503699999999999,
+                0.104402,
+                0.10665799999999998
+              ],
+              "standard_deviation": 0.0009498773020179356,
+              "relative_range_percent": 2.147814579624304,
+              "relative_standard_deviation_percent": 0.9043263821490862
+            },
+            "cpu_percent_max": {
+              "count": 3,
+              "min": 2.14,
+              "median": 2.18,
+              "max": 2.47,
+              "samples": [
+                2.18,
+                2.47,
+                2.14
+              ],
+              "standard_deviation": 0.14704496666741854,
+              "relative_range_percent": 15.137614678899084,
+              "relative_standard_deviation_percent": 6.745181957221033
+            },
+            "memory_bytes_max": {
+              "count": 3,
+              "min": 281123225.6,
+              "median": 281332940.8,
+              "max": 281647513.6,
+              "samples": [
+                281647513.6,
+                281332940.8,
+                281123225.6
+              ],
+              "standard_deviation": 215461.88591924057,
+              "relative_range_percent": 0.18635855385762207,
+              "relative_standard_deviation_percent": 0.07658608526486514
+            },
+            "cpu_efficiency_messages_per_cpu_second": {
+              "count": 3,
+              "min": 93757.6178064468,
+              "median": 95204.54696916326,
+              "max": 95783.60567805215,
+              "samples": [
+                95204.54696916326,
+                95783.60567805215,
+                93757.6178064468
+              ],
+              "standard_deviation": 852.0263328058592,
+              "relative_range_percent": 2.128036880698111,
+              "relative_standard_deviation_percent": 0.8949428991892902
+            }
+          }
+        },
+        {
+          "operation": "consume",
+          "messages": 10000.0,
+          "message_size_bytes": 1024.0,
+          "elapsed_milliseconds": 665.0,
+          "throughput_messages_per_second": 15037.594,
+          "throughput_megabytes_per_second": 14.6852,
+          "latency_available": 0.0,
+          "resource_samples": {
+            "samples": 3.0,
+            "cpu_percent_avg": 0.9975,
+            "cpu_percent_max": 2.14,
+            "memory_bytes_avg": 282031991.4666667,
+            "memory_bytes_max": 282905804.8,
+            "memory_percent_avg": 13.133333333333333,
+            "memory_percent_max": 13.17,
+            "cpu_seconds": 0.03792100000000004,
+            "elapsed_seconds": 3.784774427
+          },
+          "metadata": {
+            "comparison_class": "consume-without-ack",
+            "semantic_boundaries": {
+              "acknowledgement_boundary": "native consumer perf fetch throughput; no per-record application acknowledgement",
+              "durability_boundary": "reads the single broker's log with replication factor one; consumer fetch is not a durability acknowledgement",
+              "replication_topology": "single broker, one partition, replication factor one",
+              "delivery_boundary": "native consumer performance client fetches records through a consumer group; no application-level delivery acknowledgement",
+              "batching_boundary": "native consumer fetch batching; application batch size and per-message processing are not measured",
+              "client_boundary": "Kafka consumer performance client from apache/kafka:4.3.1",
+              "latency_boundary": "per-record consumer latency is unavailable; output reports elapsed fetch throughput"
+            }
+          },
+          "repetitions": 3,
+          "repetition_summary": {
+            "throughput_messages_per_second": {
+              "count": 3,
+              "min": 14992.5037,
+              "median": 15037.594,
+              "max": 15948.9633,
+              "samples": [
+                15037.594,
+                15948.9633,
+                14992.5037
+              ],
+              "standard_deviation": 440.63616921304697,
+              "relative_range_percent": 6.360456333639545,
+              "relative_standard_deviation_percent": 2.930230522336532
+            },
+            "elapsed_milliseconds": {
+              "count": 3,
+              "min": 627.0,
+              "median": 665.0,
+              "max": 667.0,
+              "samples": [
+                665.0,
+                627.0,
+                667.0
+              ],
+              "standard_deviation": 18.40289832245635,
+              "relative_range_percent": 6.015037593984962,
+              "relative_standard_deviation_percent": 2.7673531311964434
+            },
+            "throughput_megabytes_per_second": {
+              "count": 3,
+              "min": 14.6411,
+              "median": 14.6852,
+              "max": 15.5752,
+              "samples": [
+                14.6852,
+                15.5752,
+                14.6411
+              ],
+              "standard_deviation": 0.4303212779101476,
+              "relative_range_percent": 6.360825865497241,
+              "relative_standard_deviation_percent": 2.9303058719673385
+            },
+            "cpu_seconds": {
+              "count": 3,
+              "min": 0.03755999999999993,
+              "median": 0.03792100000000004,
+              "max": 0.03884500000000002,
+              "samples": [
+                0.03792100000000004,
+                0.03755999999999993,
+                0.03884500000000002
+              ],
+              "standard_deviation": 0.0005411224958875639,
+              "relative_range_percent": 3.3886237177292013,
+              "relative_standard_deviation_percent": 1.4269731702422492
+            },
+            "cpu_percent_max": {
+              "count": 3,
+              "min": 0.36,
+              "median": 2.14,
+              "max": 2.14,
+              "samples": [
+                2.14,
+                0.36,
+                2.14
+              ],
+              "standard_deviation": 0.8391000470080364,
+              "relative_range_percent": 83.17757009345796,
+              "relative_standard_deviation_percent": 39.21028257046899
+            },
+            "memory_bytes_max": {
+              "count": 3,
+              "min": 282800947.2,
+              "median": 282905804.8,
+              "max": 282905804.8,
+              "samples": [
+                282905804.8,
+                282800947.2,
+                282905804.8
+              ],
+              "standard_deviation": 49430.346679308925,
+              "relative_range_percent": 0.037064492216465066,
+              "relative_standard_deviation_percent": 0.017472369191665636
+            },
+            "cpu_efficiency_messages_per_cpu_second": {
+              "count": 3,
+              "min": 257433.3891105675,
+              "median": 263706.12589330424,
+              "max": 266240.68157614535,
+              "samples": [
+                263706.12589330424,
+                266240.68157614535,
+                257433.3891105675
+              ],
+              "standard_deviation": 3701.9454319338715,
+              "relative_range_percent": 3.3398133758717736,
+              "relative_standard_deviation_percent": 1.4038147272436448
+            }
+          }
+        }
+      ],
+      "repetition_summary": {
+        "samples": {
+          "count": 3,
+          "min": 20.0,
+          "median": 20.0,
+          "max": 20.0,
+          "samples": [
+            20.0,
+            20.0,
+            20.0
+          ],
+          "standard_deviation": 0.0,
+          "relative_range_percent": 0.0,
+          "relative_standard_deviation_percent": 0.0
+        },
+        "cpu_percent_avg": {
+          "count": 3,
+          "min": 0.8880000000000001,
+          "median": 1.212,
+          "max": 1.556,
+          "samples": [
+            1.556,
+            0.8880000000000001,
+            1.212
+          ],
+          "standard_deviation": 0.2727505983291125,
+          "relative_range_percent": 55.115511551155116,
+          "relative_standard_deviation_percent": 22.504174779629746
+        },
+        "cpu_percent_max": {
+          "count": 3,
+          "min": 2.14,
+          "median": 2.47,
+          "max": 10.09,
+          "samples": [
+            10.09,
+            2.47,
+            2.14
+          ],
+          "standard_deviation": 3.672356191874639,
+          "relative_range_percent": 321.8623481781376,
+          "relative_standard_deviation_percent": 148.67838833500562
+        },
+        "memory_bytes_avg": {
+          "count": 3,
+          "min": 225941913.6,
+          "median": 232752414.71999997,
+          "max": 232846786.56,
+          "samples": [
+            232846786.56,
+            232752414.71999997,
+            225941913.6
+          ],
+          "standard_deviation": 3232974.2436930733,
+          "relative_range_percent": 2.966617110420331,
+          "relative_standard_deviation_percent": 1.3890185618835902
+        },
+        "memory_bytes_max": {
+          "count": 3,
+          "min": 282800947.2,
+          "median": 282905804.8,
+          "max": 282905804.8,
+          "samples": [
+            282905804.8,
+            282800947.2,
+            282905804.8
+          ],
+          "standard_deviation": 49430.346679308925,
+          "relative_range_percent": 0.037064492216465066,
+          "relative_standard_deviation_percent": 0.017472369191665636
+        },
+        "memory_percent_avg": {
+          "count": 3,
+          "min": 10.5215,
+          "median": 10.838,
+          "max": 10.8435,
+          "samples": [
+            10.8435,
+            10.838,
+            10.5215
+          ],
+          "standard_deviation": 0.15051264251070604,
+          "relative_range_percent": 2.9710278649197357,
+          "relative_standard_deviation_percent": 1.388749238888227
+        },
+        "memory_percent_max": {
+          "count": 3,
+          "min": 13.17,
+          "median": 13.17,
+          "max": 13.18,
+          "samples": [
+            13.18,
+            13.17,
+            13.17
+          ],
+          "standard_deviation": 0.004714045207910216,
+          "relative_range_percent": 0.07593014426727249,
+          "relative_standard_deviation_percent": 0.03579381327190748
+        }
+      },
+      "repetitions": 3
+    },
+    "nats": {
+      "image": "nats:2.14.5-alpine",
+      "image_id": "sha256:9d6f44f99d2bf938cade3056908491a689089af9f69717a5c9c43ea56837e660",
+      "runtime": "container",
+      "cpu_limit": "2",
+      "memory_limit": "2g",
+      "acknowledgement": "JetStream synchronous publish PubAck; durable consumer explicit acknowledgement with synchronous double acknowledgement",
+      "replication": "single NATS server, file storage, one replica",
+      "measurement_boundary": "nats bench js native benchmark client",
+      "measurement_client": "nats bench js native benchmark client",
+      "client_image": "natsio/nats-box:0.19.7",
+      "semantic_metadata": {
+        "acknowledgement_boundary": "JetStream synchronous publish PubAck; durable consumer explicit acknowledgement with synchronous double acknowledgement",
+        "replication_topology": "single NATS server, file storage, one replica",
+        "measurement_boundary": "nats bench js native benchmark client",
+        "client_identity": {
+          "name": "nats bench js native benchmark client",
+          "image": "natsio/nats-box:0.19.7"
+        },
+        "scenario_classes": [
+          "publish-only",
+          "consume-with-ack"
+        ],
+        "scenario_boundaries": {
+          "publish-only": {
+            "acknowledgement_boundary": "synchronous JetStream PubAck after publishing to the file-backed stream",
+            "durability_boundary": "file-backed stream with one replica; synchronous PubAck; exact filesystem flush behavior is not asserted",
+            "replication_topology": "single NATS server, file storage, one replica",
+            "delivery_boundary": "not applicable to publish-only",
+            "batching_boundary": "nats bench js pub sync publishes one message at a time; no explicit client batch",
+            "client_boundary": "nats bench js native synchronous publisher from natsio/nats-box:0.19.7",
+            "latency_boundary": "native synchronous publisher stats measure publish acknowledgement latency and report min/avg/p50/p90/p99/p99.9/max"
+          },
+          "consume-with-ack": {
+            "acknowledgement_boundary": "explicit consumer acknowledgement with synchronous double acknowledgement",
+            "durability_boundary": "file-backed consumer on a one-replica stream; the double acknowledgement confirms the consumer acknowledgement",
+            "replication_topology": "single NATS server, file storage, one replica",
+            "delivery_boundary": "pull consumer with deliver=all and replay=instant; one explicit acknowledgement per message",
+            "batching_boundary": "nats bench js consume uses --batch=1 with explicit acknowledgement and double acknowledgement",
+            "client_boundary": "nats bench js native consumer from natsio/nats-box:0.19.7",
+            "latency_boundary": "per-message consumer latency is unavailable; output reports acknowledged consume throughput"
+          }
+        },
+        "comparison": {
+          "classification": "native-tool-baseline",
+          "apples_to_apples": false,
+          "ranking_eligible": false,
+          "experimental": true,
+          "mismatch_dimensions": [
+            "acknowledgement",
+            "durability",
+            "replication",
+            "delivery",
+            "batching",
+            "client",
+            "latency"
+          ]
+        }
+      },
+      "startup_seconds": 0.143378909,
+      "resource_samples": {
+        "samples": 14.0,
+        "cpu_percent_avg": 15.655,
+        "cpu_percent_max": 75.89,
+        "memory_bytes_avg": 24386801.937066667,
+        "memory_bytes_max": 55364812.8,
+        "memory_percent_avg": 1.1353333333333333,
+        "memory_percent_max": 2.58
+      },
+      "scenarios": [
+        {
+          "operation": "publish",
+          "messages": 10000.0,
+          "message_size_bytes": 100.0,
+          "throughput_messages_per_second": 14588.0,
+          "latency_microseconds": {
+            "min": 21.65,
+            "avg": 68.38,
+            "max": 1069.6,
+            "p50": 67.67,
+            "p90": 87.96,
+            "p99": 113.38,
+            "p999": 265.81
+          },
+          "resource_samples": {
+            "samples": 1.0,
+            "cpu_percent_avg": 30.87,
+            "cpu_percent_max": 33.05,
+            "memory_bytes_avg": 10288627.712,
+            "memory_bytes_max": 11051991.04,
+            "memory_percent_avg": 0.48,
+            "memory_percent_max": 0.51,
+            "cpu_seconds": 0.617445,
+            "elapsed_seconds": 0.831978459
+          },
+          "metadata": {
+            "comparison_class": "publish-only",
+            "semantic_boundaries": {
+              "acknowledgement_boundary": "synchronous JetStream PubAck after publishing to the file-backed stream",
+              "durability_boundary": "file-backed stream with one replica; synchronous PubAck; exact filesystem flush behavior is not asserted",
+              "replication_topology": "single NATS server, file storage, one replica",
+              "delivery_boundary": "not applicable to publish-only",
+              "batching_boundary": "nats bench js pub sync publishes one message at a time; no explicit client batch",
+              "client_boundary": "nats bench js native synchronous publisher from natsio/nats-box:0.19.7",
+              "latency_boundary": "native synchronous publisher stats measure publish acknowledgement latency and report min/avg/p50/p90/p99/p99.9/max"
+            }
+          },
+          "repetitions": 3,
+          "repetition_summary": {
+            "throughput_messages_per_second": {
+              "count": 3,
+              "min": 14483.0,
+              "median": 14588.0,
+              "max": 15137.0,
+              "samples": [
+                14588.0,
+                15137.0,
+                14483.0
+              ],
+              "standard_deviation": 286.7716861895539,
+              "relative_range_percent": 4.483136824787497,
+              "relative_standard_deviation_percent": 1.9658053618697144
+            },
+            "latency_p50": {
+              "count": 3,
+              "min": 64.85,
+              "median": 67.67,
+              "max": 68.3,
+              "samples": [
+                67.67,
+                64.85,
+                68.3
+              ],
+              "standard_deviation": 1.500066665185253,
+              "relative_range_percent": 5.098271021131968,
+              "relative_standard_deviation_percent": 2.2167380895304465
+            },
+            "latency_p99": {
+              "count": 3,
+              "min": 110.09,
+              "median": 113.38,
+              "max": 114.53,
+              "samples": [
+                110.09,
+                113.38,
+                114.53
+              ],
+              "standard_deviation": 1.8814946777023356,
+              "relative_range_percent": 3.9160345739989397,
+              "relative_standard_deviation_percent": 1.6594590560084104
+            },
+            "latency_p999": {
+              "count": 3,
+              "min": 265.14,
+              "median": 265.81,
+              "max": 305.71,
+              "samples": [
+                265.81,
+                305.71,
+                265.14
+              ],
+              "standard_deviation": 18.968933080756596,
+              "relative_range_percent": 15.262781686166807,
+              "relative_standard_deviation_percent": 7.136275189329444
+            },
+            "latency_max": {
+              "count": 3,
+              "min": 956.0,
+              "median": 1069.6,
+              "max": 1114.93,
+              "samples": [
+                1069.6,
+                1114.93,
+                956.0
+              ],
+              "standard_deviation": 66.84851348800179,
+              "relative_range_percent": 14.858825729244584,
+              "relative_standard_deviation_percent": 6.249861021690519
+            },
+            "cpu_seconds": {
+              "count": 3,
+              "min": 0.582329,
+              "median": 0.617445,
+              "max": 0.617697,
+              "samples": [
+                0.617445,
+                0.582329,
+                0.617697
+              ],
+              "standard_deviation": 0.01661355665981519,
+              "relative_range_percent": 5.728121533092026,
+              "relative_standard_deviation_percent": 2.690694176779339
+            },
+            "cpu_percent_max": {
+              "count": 3,
+              "min": 30.87,
+              "median": 33.05,
+              "max": 68.44,
+              "samples": [
+                68.44,
+                30.87,
+                33.05
+              ],
+              "standard_deviation": 17.219850947864405,
+              "relative_range_percent": 113.67624810892585,
+              "relative_standard_deviation_percent": 52.10242344285751
+            },
+            "memory_bytes_max": {
+              "count": 3,
+              "min": 10288627.712,
+              "median": 11051991.04,
+              "max": 11104419.84,
+              "samples": [
+                10288627.712,
+                11104419.84,
+                11051991.04
+              ],
+              "standard_deviation": 372825.4202276694,
+              "relative_range_percent": 7.38140417457306,
+              "relative_standard_deviation_percent": 3.3733778726232977
+            },
+            "cpu_efficiency_messages_per_cpu_second": {
+              "count": 3,
+              "min": 16189.167180672723,
+              "median": 16195.774522427098,
+              "max": 17172.423149113303,
+              "samples": [
+                16195.774522427098,
+                17172.423149113303,
+                16189.167180672723
+              ],
+              "standard_deviation": 461.96181858185986,
+              "relative_range_percent": 6.071064814337943,
+              "relative_standard_deviation_percent": 2.852360150742765
+            }
+          }
+        },
+        {
+          "operation": "consume_ack",
+          "messages": 10000.0,
+          "message_size_bytes": 100.0,
+          "throughput_messages_per_second": 7746.0,
+          "latency_available": 0.0,
+          "resource_samples": {
+            "samples": 2.0,
+            "cpu_percent_avg": 18.814999999999998,
+            "cpu_percent_max": 35.69,
+            "memory_bytes_avg": 14071889.92,
+            "memory_bytes_max": 14313062.4,
+            "memory_percent_avg": 0.655,
+            "memory_percent_max": 0.67,
+            "cpu_seconds": 1.173051,
+            "elapsed_seconds": 1.452131279
+          },
+          "metadata": {
+            "comparison_class": "consume-with-ack",
+            "semantic_boundaries": {
+              "acknowledgement_boundary": "explicit consumer acknowledgement with synchronous double acknowledgement",
+              "durability_boundary": "file-backed consumer on a one-replica stream; the double acknowledgement confirms the consumer acknowledgement",
+              "replication_topology": "single NATS server, file storage, one replica",
+              "delivery_boundary": "pull consumer with deliver=all and replay=instant; one explicit acknowledgement per message",
+              "batching_boundary": "nats bench js consume uses --batch=1 with explicit acknowledgement and double acknowledgement",
+              "client_boundary": "nats bench js native consumer from natsio/nats-box:0.19.7",
+              "latency_boundary": "per-message consumer latency is unavailable; output reports acknowledged consume throughput"
+            }
+          },
+          "repetitions": 3,
+          "repetition_summary": {
+            "throughput_messages_per_second": {
+              "count": 3,
+              "min": 7724.0,
+              "median": 7746.0,
+              "max": 7931.0,
+              "samples": [
+                7931.0,
+                7746.0,
+                7724.0
+              ],
+              "standard_deviation": 92.83078991129806,
+              "relative_range_percent": 2.672347017815647,
+              "relative_standard_deviation_percent": 1.1984351912122135
+            },
+            "cpu_seconds": {
+              "count": 3,
+              "min": 1.157106,
+              "median": 1.173051,
+              "max": 1.1802000000000001,
+              "samples": [
+                1.157106,
+                1.1802000000000001,
+                1.173051
+              ],
+              "standard_deviation": 0.009653347502291696,
+              "relative_range_percent": 1.9687123577747403,
+              "relative_standard_deviation_percent": 0.8229264969972913
+            },
+            "cpu_percent_max": {
+              "count": 3,
+              "min": 35.48,
+              "median": 35.69,
+              "max": 63.77,
+              "samples": [
+                63.77,
+                35.48,
+                35.69
+              ],
+              "standard_deviation": 13.286813011403453,
+              "relative_range_percent": 79.26590081255256,
+              "relative_standard_deviation_percent": 37.22839173831172
+            },
+            "memory_bytes_max": {
+              "count": 3,
+              "min": 13778288.64,
+              "median": 14313062.4,
+              "max": 14512291.84,
+              "samples": [
+                13778288.64,
+                14313062.4,
+                14512291.84
+              ],
+              "standard_deviation": 309916.84220797924,
+              "relative_range_percent": 5.128205128205123,
+              "relative_standard_deviation_percent": 2.16527276656028
+            },
+            "cpu_efficiency_messages_per_cpu_second": {
+              "count": 3,
+              "min": 8473.140145738009,
+              "median": 8524.77854756528,
+              "max": 8642.250580327127,
+              "samples": [
+                8642.250580327127,
+                8473.140145738009,
+                8524.77854756528
+              ],
+              "standard_deviation": 70.76136902089033,
+              "relative_range_percent": 1.9837516440519958,
+              "relative_standard_deviation_percent": 0.8300669469132443
+            }
+          }
+        },
+        {
+          "operation": "publish",
+          "messages": 10000.0,
+          "message_size_bytes": 1024.0,
+          "throughput_messages_per_second": 14070.0,
+          "latency_microseconds": {
+            "min": 23.09,
+            "avg": 70.9,
+            "max": 3349.02,
+            "p50": 70.54,
+            "p90": 90.74,
+            "p99": 117.2,
+            "p999": 298.31
+          },
+          "resource_samples": {
+            "samples": 1.0,
+            "cpu_percent_avg": 36.6,
+            "cpu_percent_max": 73.02,
+            "memory_bytes_avg": 32191283.2,
+            "memory_bytes_max": 32191283.2,
+            "memory_percent_avg": 1.5,
+            "memory_percent_max": 1.5,
+            "cpu_seconds": 0.641146,
+            "elapsed_seconds": 0.875012398
+          },
+          "metadata": {
+            "comparison_class": "publish-only",
+            "semantic_boundaries": {
+              "acknowledgement_boundary": "synchronous JetStream PubAck after publishing to the file-backed stream",
+              "durability_boundary": "file-backed stream with one replica; synchronous PubAck; exact filesystem flush behavior is not asserted",
+              "replication_topology": "single NATS server, file storage, one replica",
+              "delivery_boundary": "not applicable to publish-only",
+              "batching_boundary": "nats bench js pub sync publishes one message at a time; no explicit client batch",
+              "client_boundary": "nats bench js native synchronous publisher from natsio/nats-box:0.19.7",
+              "latency_boundary": "native synchronous publisher stats measure publish acknowledgement latency and report min/avg/p50/p90/p99/p99.9/max"
+            }
+          },
+          "repetitions": 3,
+          "repetition_summary": {
+            "throughput_messages_per_second": {
+              "count": 3,
+              "min": 13691.0,
+              "median": 14070.0,
+              "max": 14376.0,
+              "samples": [
+                14376.0,
+                14070.0,
+                13691.0
+              ],
+              "standard_deviation": 280.1789110947186,
+              "relative_range_percent": 4.8685145700071075,
+              "relative_standard_deviation_percent": 1.9913213297421364
+            },
+            "latency_p50": {
+              "count": 3,
+              "min": 69.36,
+              "median": 70.54,
+              "max": 72.66,
+              "samples": [
+                69.36,
+                70.54,
+                72.66
+              ],
+              "standard_deviation": 1.365316406145068,
+              "relative_range_percent": 4.67819676779132,
+              "relative_standard_deviation_percent": 1.935520847951613
+            },
+            "latency_p99": {
+              "count": 3,
+              "min": 112.41,
+              "median": 117.2,
+              "max": 117.2,
+              "samples": [
+                112.41,
+                117.2,
+                117.2
+              ],
+              "standard_deviation": 2.2580276545890445,
+              "relative_range_percent": 4.087030716723555,
+              "relative_standard_deviation_percent": 1.9266447564752938
+            },
+            "latency_p999": {
+              "count": 3,
+              "min": 285.99,
+              "median": 298.31,
+              "max": 303.82,
+              "samples": [
+                285.99,
+                303.82,
+                298.31
+              ],
+              "standard_deviation": 7.45394302813394,
+              "relative_range_percent": 5.97700378800576,
+              "relative_standard_deviation_percent": 2.4987238202319535
+            },
+            "latency_max": {
+              "count": 3,
+              "min": 3190.75,
+              "median": 3349.02,
+              "max": 3440.12,
+              "samples": [
+                3440.12,
+                3190.75,
+                3349.02
+              ],
+              "standard_deviation": 103.028582765496,
+              "relative_range_percent": 7.4460588470657045,
+              "relative_standard_deviation_percent": 3.0763800385036815
+            },
+            "cpu_seconds": {
+              "count": 3,
+              "min": 0.6312959999999999,
+              "median": 0.641146,
+              "max": 0.6592159999999998,
+              "samples": [
+                0.6312959999999999,
+                0.641146,
+                0.6592159999999998
+              ],
+              "standard_deviation": 0.011561784752652415,
+              "relative_range_percent": 4.354702361084674,
+              "relative_standard_deviation_percent": 1.8032998338369755
+            },
+            "cpu_percent_max": {
+              "count": 3,
+              "min": 34.65,
+              "median": 73.02,
+              "max": 75.89,
+              "samples": [
+                34.65,
+                73.02,
+                75.89
+              ],
+              "standard_deviation": 18.800801992350102,
+              "relative_range_percent": 56.477677348671605,
+              "relative_standard_deviation_percent": 25.7474691760478
+            },
+            "memory_bytes_max": {
+              "count": 3,
+              "min": 25270681.6,
+              "median": 32191283.2,
+              "max": 32820428.8,
+              "samples": [
+                25270681.6,
+                32191283.2,
+                32820428.8
+              ],
+              "standard_deviation": 3420351.402931669,
+              "relative_range_percent": 23.452768729641694,
+              "relative_standard_deviation_percent": 10.625085622345335
+            },
+            "cpu_efficiency_messages_per_cpu_second": {
+              "count": 3,
+              "min": 15169.534720031072,
+              "median": 15597.071493856314,
+              "max": 15840.429845904302,
+              "samples": [
+                15840.429845904302,
+                15597.071493856314,
+                15169.534720031072
+              ],
+              "standard_deviation": 277.3107463568356,
+              "relative_range_percent": 4.301417263731182,
+              "relative_standard_deviation_percent": 1.7779667578369969
+            }
+          }
+        },
+        {
+          "operation": "consume_ack",
+          "messages": 10000.0,
+          "message_size_bytes": 1024.0,
+          "throughput_messages_per_second": 7429.0,
+          "latency_available": 0.0,
+          "resource_samples": {
+            "samples": 2.0,
+            "cpu_percent_avg": 23.73,
+            "cpu_percent_max": 70.8,
+            "memory_bytes_avg": 48496640.0,
+            "memory_bytes_max": 55207526.4,
+            "memory_percent_avg": 2.26,
+            "memory_percent_max": 2.57,
+            "cpu_seconds": 1.244246,
+            "elapsed_seconds": 1.510119129
+          },
+          "metadata": {
+            "comparison_class": "consume-with-ack",
+            "semantic_boundaries": {
+              "acknowledgement_boundary": "explicit consumer acknowledgement with synchronous double acknowledgement",
+              "durability_boundary": "file-backed consumer on a one-replica stream; the double acknowledgement confirms the consumer acknowledgement",
+              "replication_topology": "single NATS server, file storage, one replica",
+              "delivery_boundary": "pull consumer with deliver=all and replay=instant; one explicit acknowledgement per message",
+              "batching_boundary": "nats bench js consume uses --batch=1 with explicit acknowledgement and double acknowledgement",
+              "client_boundary": "nats bench js native consumer from natsio/nats-box:0.19.7",
+              "latency_boundary": "per-message consumer latency is unavailable; output reports acknowledged consume throughput"
+            }
+          },
+          "repetitions": 3,
+          "repetition_summary": {
+            "throughput_messages_per_second": {
+              "count": 3,
+              "min": 7349.0,
+              "median": 7429.0,
+              "max": 7613.0,
+              "samples": [
+                7613.0,
+                7429.0,
+                7349.0
+              ],
+              "standard_deviation": 110.5300361390011,
+              "relative_range_percent": 3.5536411360883027,
+              "relative_standard_deviation_percent": 1.4878184969578827
+            },
+            "cpu_seconds": {
+              "count": 3,
+              "min": 1.201975,
+              "median": 1.244246,
+              "max": 1.2488160000000001,
+              "samples": [
+                1.201975,
+                1.244246,
+                1.2488160000000001
+              ],
+              "standard_deviation": 0.02108659822414862,
+              "relative_range_percent": 3.7646092492963716,
+              "relative_standard_deviation_percent": 1.6947290346240713
+            },
+            "cpu_percent_max": {
+              "count": 3,
+              "min": 35.49,
+              "median": 70.8,
+              "max": 100.71,
+              "samples": [
+                100.71,
+                35.49,
+                70.8
+              ],
+              "standard_deviation": 26.65635759063867,
+              "relative_range_percent": 92.11864406779661,
+              "relative_standard_deviation_percent": 37.65022258564784
+            },
+            "memory_bytes_max": {
+              "count": 3,
+              "min": 54861496.32,
+              "median": 55207526.4,
+              "max": 55364812.8,
+              "samples": [
+                54861496.32,
+                55364812.8,
+                55207526.4
+              ],
+              "standard_deviation": 210238.83427329652,
+              "relative_range_percent": 0.9116809116809057,
+              "relative_standard_deviation_percent": 0.3808155300239942
+            },
+            "cpu_efficiency_messages_per_cpu_second": {
+              "count": 3,
+              "min": 8007.584784307695,
+              "median": 8036.9958995246925,
+              "max": 8319.640591526446,
+              "samples": [
+                8319.640591526446,
+                8036.9958995246925,
+                8007.584784307695
+              ],
+              "standard_deviation": 140.685568411744,
+              "relative_range_percent": 3.882741899087014,
+              "relative_standard_deviation_percent": 1.750474557540388
+            }
+          }
+        }
+      ],
+      "repetition_summary": {
+        "samples": {
+          "count": 3,
+          "min": 13.0,
+          "median": 14.0,
+          "max": 15.0,
+          "samples": [
+            13.0,
+            15.0,
+            14.0
+          ],
+          "standard_deviation": 0.816496580927726,
+          "relative_range_percent": 14.285714285714285,
+          "relative_standard_deviation_percent": 5.832118435198043
+        },
+        "cpu_percent_avg": {
+          "count": 3,
+          "min": 12.059333333333333,
+          "median": 15.655,
+          "max": 20.716923076923077,
+          "samples": [
+            20.716923076923077,
+            12.059333333333333,
+            15.655
+          ],
+          "standard_deviation": 3.5513024869252705,
+          "relative_range_percent": 55.3023937629495,
+          "relative_standard_deviation_percent": 22.684781136539574
+        },
+        "cpu_percent_max": {
+          "count": 3,
+          "min": 73.02,
+          "median": 75.89,
+          "max": 100.71,
+          "samples": [
+            100.71,
+            73.02,
+            75.89
+          ],
+          "standard_deviation": 12.432061597158997,
+          "relative_range_percent": 36.487020687837656,
+          "relative_standard_deviation_percent": 16.381686120910523
+        },
+        "memory_bytes_avg": {
+          "count": 3,
+          "min": 23889948.987076923,
+          "median": 24386801.937066667,
+          "max": 24776053.321142856,
+          "samples": [
+            23889948.987076923,
+            24386801.937066667,
+            24776053.321142856
+          ],
+          "standard_deviation": 362638.53824269236,
+          "relative_range_percent": 3.6335405370193308,
+          "relative_standard_deviation_percent": 1.4870278570290953
+        },
+        "memory_bytes_max": {
+          "count": 3,
+          "min": 55207526.4,
+          "median": 55364812.8,
+          "max": 55448698.88,
+          "samples": [
+            55448698.88,
+            55364812.8,
+            55207526.4
+          ],
+          "standard_deviation": 99966.68953655362,
+          "relative_range_percent": 0.43560606060606816,
+          "relative_standard_deviation_percent": 0.18055997027872842
+        },
+        "memory_percent_avg": {
+          "count": 3,
+          "min": 1.113076923076923,
+          "median": 1.1353333333333333,
+          "max": 1.1535714285714285,
+          "samples": [
+            1.113076923076923,
+            1.1353333333333333,
+            1.1535714285714285
+          ],
+          "standard_deviation": 0.016558921364026098,
+          "relative_range_percent": 3.566750337155496,
+          "relative_standard_deviation_percent": 1.4585074601314827
+        },
+        "memory_percent_max": {
+          "count": 3,
+          "min": 2.57,
+          "median": 2.58,
+          "max": 2.58,
+          "samples": [
+            2.58,
+            2.58,
+            2.57
+          ],
+          "standard_deviation": 0.004714045207910426,
+          "relative_range_percent": 0.3875968992248151,
+          "relative_standard_deviation_percent": 0.1827149305391638
+        }
+      },
+      "repetitions": 3
+    }
+  },
+  "source_result": "aggregate"
+}
